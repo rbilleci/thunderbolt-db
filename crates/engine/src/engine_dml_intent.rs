@@ -138,10 +138,35 @@ impl Engine {
             return Err(route_err("binary WAL records are disabled"));
         }
         if !self.insert_unique_wave_batchable(&catalog, table) {
-            return Err(route_err(
-                "wave-batched device PK validation is unavailable (table not elided yet, \
-                 constraints present, or device write-locate flags disabled)",
-            ));
+            // E2.5c-1 ELISION RE-ENTRY: a REOPENED lanes-mode engine is intent-only (classic
+            // writes are refused once activated), so the classic warm-up that normally enters
+            // elision lazily can never run again — without this arm a recovered database could
+            // not prepare any route and would be permanently read-only. When the elision flags
+            // are live and the table is eligible, admit it with REAL device backing (populate
+            // first; a driverless box falls through to the error below) and enter elision here;
+            // the PK-index cache self-heals on first probe (rebuild-on-miss). A fresh engine
+            // whose caller prepares before warming benefits identically — the arm is the same
+            // lazy entry the wave append performs, hoisted to the explicit opt-in surface.
+            let reentered = self.host_install_elision_enabled()
+                && self.auto_admit_on_commit_enabled()
+                && !self.table_install_elided(table_name)
+                && self.table_elision_eligible(&catalog, table_name)
+                && self
+                    .populate_relational_residency_snapshot_shared(table_name)
+                    .ok()
+                    .is_some_and(|snapshot| {
+                        snapshot.is_valid() && snapshot.device_memory_proof.is_some()
+                    })
+                && {
+                    self.set_table_install_elided(table_name, true);
+                    true
+                };
+            if !(reentered && self.insert_unique_wave_batchable(&catalog, table)) {
+                return Err(route_err(
+                    "wave-batched device PK validation is unavailable (table not elided yet, \
+                     constraints present, or device write-locate flags disabled)",
+                ));
+            }
         }
         // E2.2(a): precompute the integer conflict slots — one per unique index, keyed by the
         // stable (table_oid, column_id) identity + the row's i32 value at wave time. Every column

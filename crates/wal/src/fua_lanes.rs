@@ -527,6 +527,119 @@ pub fn recover_lanes(
     Ok(recover_lanes_detailed(base_path.as_ref(), lane_count)?.records)
 }
 
+/// DISK-AUTHORITATIVE lane count for an existing lane set at `base_path`: `Some(N)` when lane
+/// segment files for exactly lanes `0..N` exist beside the base, `None` when no lane files exist
+/// (not a lanes database). A gapped id set is a clear error — the database is missing a lane's
+/// files and any merge over it would silently truncate at the first seq the missing lane owned.
+pub fn discover_lane_count(base_path: impl AsRef<Path>) -> Result<Option<usize>, EngineError> {
+    let base = base_path.as_ref();
+    let ids = discover_lane_ids(base);
+    let Some(&max_id) = ids.iter().next_back() else {
+        return Ok(None);
+    };
+    let expected: BTreeSet<usize> = (0..=max_id).collect();
+    if ids != expected {
+        return Err(EngineError::Durability(format!(
+            "FUA WAL lane set at {} has a gapped lane id set {:?} (expected exactly 0..={}); a \
+             lane's segment files are missing — refusing a merge that would silently drop its seqs",
+            base.display(),
+            ids,
+            max_id
+        )));
+    }
+    Ok(Some(max_id + 1))
+}
+
+/// REPAIR a lane set after a crash-mid-wave: durably discard every frame whose seqs lie ABOVE
+/// the cross-lane contiguous cut (orphans stranded behind a gap left by a lane whose frame never
+/// became durable). Those seqs were NEVER acknowledged — an ack requires the cut to cover it —
+/// so discarding them loses nothing a client saw; keeping them would collide with the reopened
+/// set's fresh claims of the same global seqs. Returns the number of orphan records discarded.
+///
+/// Within one lane frames carry strictly increasing `first_seq`, and no durable frame straddles
+/// the cut (a frame's seqs are all-durable, so the first missing seq can never fall inside one);
+/// the orphans are therefore a frame SUFFIX of each affected lane's segment chain, dropped via
+/// [`gpu_db_write_conveyor::invalidate_frame_log_suffix`] on each segment holding them.
+///
+/// SHADOWED orphans (audit note): an orphan sitting BEHIND a torn-payload frame in its own lane
+/// is invisible to the scan and stays on disk un-zeroed. This is safe: the scan always stops at
+/// the torn frame (its bytes never heal), reopen appends only to FRESH higher-id segments
+/// (recovered segments are byte-frozen), so the shadowed frame can never re-enter recovery; and
+/// if it somehow did, the cross-lane duplicate-seq check refuses the merge fail-closed.
+pub fn repair_lane_orphans(
+    base_path: impl AsRef<Path>,
+    lane_count: usize,
+) -> Result<u64, EngineError> {
+    let base = base_path.as_ref();
+    let recovery = recover_lanes_detailed(base, lane_count)?;
+    let orphans = (recovery.total_scanned - recovery.records.len()) as u64;
+    if orphans == 0 {
+        return Ok(0);
+    }
+    let cut = recovery.next_seq;
+    for lane_id in 0..lane_count {
+        let lane_base = lane_base_path(base, lane_id);
+        for segment_path in fua_segment_paths_sorted(&lane_base)? {
+            let frames = recover_frame_log_by_scan(&segment_path).map_err(|err| {
+                EngineError::Durability(format!(
+                    "failed to scan FUA WAL lane {lane_id} segment {} for orphan repair: {err}",
+                    segment_path.display()
+                ))
+            })?;
+            // First frame at/above the cut (orphan frames never straddle it; see above).
+            if let Some(first_orphan) = frames.iter().position(|frame| frame.first_seq >= cut) {
+                gpu_db_write_conveyor::invalidate_frame_log_suffix(
+                    &segment_path,
+                    first_orphan as u64,
+                )
+                .map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to invalidate orphan frames in FUA WAL lane {lane_id} segment {}: \
+                         {err}",
+                        segment_path.display()
+                    ))
+                })?;
+            }
+        }
+    }
+    // Fail-closed verification: the repaired set must recover CLEAN at the same cut.
+    let verify = recover_lanes_detailed(base, lane_count)?;
+    if verify.records.len() != verify.total_scanned || verify.next_seq != cut {
+        return Err(EngineError::Durability(format!(
+            "FUA WAL lane orphan repair at {} did not converge (cut {} -> {}, {} record(s) still \
+             above it); recover offline",
+            base.display(),
+            cut,
+            verify.next_seq,
+            verify.total_scanned - verify.records.len()
+        )));
+    }
+    Ok(orphans)
+}
+
+/// Data capacity (bytes) of an existing lane segment beside `base_path` — the geometry a REOPEN
+/// continues with (disk-authoritative: env defaults in the reopening process must not silently
+/// change an existing database's segment size). `None` when no lane segment exists.
+pub fn lane_segment_capacity_bytes(
+    base_path: impl AsRef<Path>,
+) -> Result<Option<u64>, EngineError> {
+    let base = base_path.as_ref();
+    for lane_id in discover_lane_ids(base) {
+        let lane_base = lane_base_path(base, lane_id);
+        if let Some(segment_path) = fua_segment_paths_sorted(&lane_base)?.first() {
+            let capacity =
+                gpu_db_write_conveyor::frame_log_capacity_bytes(segment_path).map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to read FUA WAL lane segment header {}: {err}",
+                        segment_path.display()
+                    ))
+                })?;
+            return Ok(Some(capacity));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +826,85 @@ mod tests {
             "reopen over a torn tail with orphans above the cut must fail closed"
         );
         cleanup(&base, lane_count);
+    }
+
+    #[test]
+    fn orphan_repair_makes_a_torn_set_reopenable_and_discards_only_unacked_seqs() {
+        let base = test_base("orphan-repair");
+        let lane_count = 3usize;
+        let total = 12u64;
+        {
+            let set = FuaWalLaneSet::create(&base, lane_count, 2, SEGMENT_BYTES).expect("create");
+            append_round_robin(&set, total);
+            set.wait_durable(total).expect("durable");
+        }
+        // Same crash-mid-wave shape as the torn-tail test: seq 7 (lane 1) tears; seqs 8, 9, 10,
+        // 11 are durable ORPHANS above the cut of 7 (never acknowledgeable — the cut held at 7).
+        corrupt_frame(&base, lane_count, 7);
+        let dropped = repair_lane_orphans(&base, lane_count).expect("repair");
+        assert_eq!(
+            dropped, 3,
+            "seqs 8, 9, 11 were durable orphans (10 tore with 7's frame chain)"
+        );
+        // After the repair, recovery is CLEAN and reopen works.
+        let records = recover_lanes(&base, lane_count).expect("recover repaired");
+        assert_eq!(records.len(), 7);
+        {
+            let set = FuaWalLaneSet::reopen(&base, lane_count, 2, SEGMENT_BYTES)
+                .expect("reopen repaired");
+            assert_eq!(set.durable_cut(), 7);
+            // Continue appending the previously-gapped seqs — no duplicate-seq collision.
+            for seq in 7..20 {
+                let lane = (seq % lane_count as u64) as usize;
+                set.append(lane, seq, &[record(seq)]).expect("append");
+            }
+            set.wait_durable(20).expect("durable after repair");
+        }
+        let records = recover_lanes(&base, lane_count).expect("recover continued");
+        assert_eq!(records.len(), 20);
+        for (seq, rec) in records.iter().enumerate() {
+            assert_eq!(rec, &record(seq as u64));
+        }
+        // Idempotent on a clean set.
+        assert_eq!(
+            repair_lane_orphans(&base, lane_count).expect("noop repair"),
+            0
+        );
+        cleanup(&base, lane_count);
+    }
+
+    #[test]
+    fn discover_lane_count_is_disk_authoritative() {
+        let base = test_base("discover");
+        assert_eq!(
+            discover_lane_count(&base).expect("no files"),
+            None,
+            "no lane files -> not a lanes database"
+        );
+        {
+            let set = FuaWalLaneSet::create(&base, 4, 2, SEGMENT_BYTES).expect("create");
+            append_round_robin(&set, 8);
+            set.wait_durable(8).expect("durable");
+        }
+        assert_eq!(discover_lane_count(&base).expect("discover"), Some(4));
+        assert_eq!(
+            lane_segment_capacity_bytes(&base)
+                .expect("capacity")
+                .expect("segment exists"),
+            SEGMENT_BYTES as u64,
+            "reopen geometry is read from the on-disk header"
+        );
+        // Remove lane 2's files entirely: a GAPPED id set must be a clear error, not a silent
+        // partial merge.
+        for path in fua_segment_paths_sorted(&lane_base_path(&base, 2)).expect("paths") {
+            std::fs::remove_file(path).expect("remove lane 2");
+        }
+        let err = discover_lane_count(&base).expect_err("gap must error");
+        assert!(
+            matches!(&err, EngineError::Durability(msg) if msg.contains("gapped lane id set")),
+            "unexpected error: {err:?}"
+        );
+        cleanup(&base, 4);
     }
 
     // ---- CutState (the cross-lane merger) unit + property tests ----

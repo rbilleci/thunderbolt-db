@@ -406,91 +406,39 @@ impl Engine {
         // seq block is claimed the engine is intent-only (fail-loud guard). Recovery replays the
         // serial log, then the lane merge over the disjoint higher seq range.
         #[cfg(unix)]
-        {
-            let lane_count = engine_intent_lanes::intent_lane_count();
-            if lane_count >= 2 {
-                let fence_lanes: usize = std::env::var("GPU_DB_INTENT_LANE_FENCES")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|&n| n >= 1)
-                    .unwrap_or(16);
-                // Default stays SMALL (64MiB): every lanes engine prewrites segment_bytes x2
-                // (active + pre-staged) PER LANE at open — a big default quota-bombs test
-                // tempdirs. M-TPS deployments should set GPU_DB_INTENT_LANE_SEGMENT_BYTES
-                // to 512MiB+: rolls (drain + swap + the pre-stager's prewrite-fsync FLUSH)
-                // are the lane tail's dominant stall, and 64MiB rolls every ~15s/lane at
-                // 1.6M TPS (same total log bytes either way — only roll cadence changes;
-                // measured p99 191ms -> 90.5ms at 512MiB).
-                let lane_segment_bytes: usize = std::env::var("GPU_DB_INTENT_LANE_SEGMENT_BYTES")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|&n| n > 0)
-                    .unwrap_or(64 << 20);
-                let wal_lanes = gpu_db_wal::FuaWalLaneSet::create(
-                    &lane_base_path,
-                    lane_count,
-                    fence_lanes,
-                    lane_segment_bytes,
-                )
-                .expect("failed to create intent WAL lanes (GPU_DB_INTENT_LANES)");
-                engine.intent_lanes =
-                    Some(std::sync::Arc::new(engine_intent_lanes::IntentLaneState {
-                        lane_count,
-                        fence_lanes,
-                        // Start FULL-WIDTH: a high-load flood then never pays
-                        // an up-flip barrier at cold start (the measured
-                        // 0.6-1.2s spike); a low-load workload instead pays
-                        // one cheap down-flip (draining <= DOWN_AT items).
-                        active_lanes: std::sync::atomic::AtomicUsize::new(lane_count),
-                        resize_holding: std::sync::atomic::AtomicBool::new(false),
-                        resize_hold: std::sync::Mutex::new(Vec::new()),
-                        resize_leader: std::sync::Mutex::new(None),
-                        resize_low_since: std::sync::Mutex::new(None),
-                        stat_resizes: std::sync::atomic::AtomicU64::new(0),
-                        stat_resize_ns: std::sync::atomic::AtomicU64::new(0),
-                        outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                        wal_lanes,
-                        applied: std::sync::Mutex::new(engine_intent_lanes::SeqCut::default()),
-                        applied_mirror: std::sync::atomic::AtomicU64::new(0),
-                        activated: std::sync::atomic::AtomicBool::new(false),
-                        base_seq: std::sync::atomic::AtomicU64::new(0),
-                        queues: (0..lane_count).map(|_| Default::default()).collect(),
-                        ledgers: (0..lane_count).map(|_| Default::default()).collect(),
-                        settle: (0..lane_count).map(|_| Default::default()).collect(),
-                        device_apply_lock: std::sync::Mutex::new(()),
-                        pump_cursor: std::sync::atomic::AtomicU64::new(0),
-                        pump_guards: (0..lane_count).map(|_| Default::default()).collect(),
-                        pending_since: (0..lane_count).map(|_| Default::default()).collect(),
-                        stat_waves: std::sync::atomic::AtomicU64::new(0),
-                        stat_items: std::sync::atomic::AtomicU64::new(0),
-                        stat_drain_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_conflict_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_patch_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_settle_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_acklag_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_settled_waves: std::sync::atomic::AtomicU64::new(0),
-                        stat_validate_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_claim_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_append_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_apply_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_encode_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_publish_ns: std::sync::atomic::AtomicU64::new(0),
-                        ts_reservation: std::sync::atomic::AtomicU64::new(0),
-                        validate_queue: std::sync::Mutex::new(Vec::new()),
-                        validate_leader: std::sync::Mutex::new(()),
-                        stat_coalesced_launches: std::sync::atomic::AtomicU64::new(0),
-                        stat_coalesced_requests: std::sync::atomic::AtomicU64::new(0),
-                        seq_oracle: std::sync::atomic::AtomicU64::new(0),
-                        apply_queue: std::sync::Mutex::new(Vec::new()),
-                        apply_poisoned: std::sync::atomic::AtomicBool::new(false),
-                        stat_apply_launches: std::sync::atomic::AtomicU64::new(0),
-                        stat_apply_requests: std::sync::atomic::AtomicU64::new(0),
-                        stat_validate_leader_ns: std::sync::atomic::AtomicU64::new(0),
-                        stat_apply_leader_ns: std::sync::atomic::AtomicU64::new(0),
-                    }));
-            }
-        }
         engine
+            .attach_fresh_intent_lanes(&lane_base_path)
+            .expect("failed to create intent WAL lanes (GPU_DB_INTENT_LANES)");
+        engine
+    }
+
+    /// Construct a FRESH N-lane intent pipeline at `lane_base_path` when `GPU_DB_INTENT_LANES`
+    /// opts in (>= 2). Used by the durable constructor AND the non-lanes reopen paths (a
+    /// reopened database accepts lane intents exactly like a fresh one; activation then seeds
+    /// `base_seq` from the recovered commit index). Errors propagate (audit finding: an
+    /// ENOSPC/EDQUOT during the per-lane segment prewrite must not panic a reopen of an
+    /// otherwise-valid database); the infallible constructor `expect`s at its call site.
+    #[cfg(unix)]
+    fn attach_fresh_intent_lanes(
+        &mut self,
+        lane_base_path: &std::path::Path,
+    ) -> Result<(), EngineError> {
+        let lane_count = engine_intent_lanes::intent_lane_count();
+        if lane_count < 2 {
+            return Ok(());
+        }
+        let fence_lanes = engine_intent_lanes::intent_lane_fences();
+        let lane_segment_bytes = engine_intent_lanes::intent_lane_segment_bytes();
+        let wal_lanes = gpu_db_wal::FuaWalLaneSet::create(
+            lane_base_path,
+            lane_count,
+            fence_lanes,
+            lane_segment_bytes,
+        )?;
+        self.intent_lanes = Some(std::sync::Arc::new(
+            engine_intent_lanes::IntentLaneState::fresh(lane_count, fence_lanes, wal_lanes),
+        ));
+        Ok(())
     }
 
     /// Open (recover) a durable database from an existing WAL `segment_path` and keep writing to it.
@@ -539,18 +487,13 @@ impl Engine {
         planner_cfg: PlannerConfig,
     ) -> Result<Self, EngineError> {
         let segment_path = segment_path.as_ref();
-        // E2.5b-2 stage 4 (v1): REFUSE reopen when intent-lane files exist. The lane logs hold
-        // seqs ABOVE the serial log's range; replaying them requires the serial-then-lanes merge
-        // (recover_lanes ordered by global seq), which is the E2.5c slice. Failing loudly here is
-        // strictly safer than replaying a prefix and silently dropping acknowledged lane commits.
+        // E2.5c-1: intent-lane files beside the base identify a LANES-MODE database. Its history
+        // is the serial log (pre-activation DDL/warm-up) followed by the lane merge (explicit
+        // global seqs above `base_seq`); reopen replays serial-then-lanes and continues appending
+        // to the SAME lane set (disk-authoritative — the on-disk lane count wins over env).
         #[cfg(unix)]
         if Self::intent_lane_files_exist(segment_path) {
-            return Err(EngineError::Durability(format!(
-                "intent-lane WAL files exist beside {} (<base>.lane-<L>.fua.*): lanes-mode reopen \
-                 is not wired yet (E2.5c); recover offline via gpu_db_wal::recover_lanes or start \
-                 a fresh database path",
-                segment_path.display()
-            )));
+            return Self::open_lanes_durable_wal_segment(segment_path, planner_cfg);
         }
         // E1 step 3 — reopen is DISK-AUTHORITATIVE (not env-authoritative): a FUA log lives in
         // `<segment_path>.fua.*` frame-log segments (NO plain serial segment file), a serial log in
@@ -603,6 +546,10 @@ impl Engine {
                 )?;
                 engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
                 engine.commit_state_mut().wal = wal;
+                // E2.5c-1: a reopened database accepts lane intents like a fresh one (no lane
+                // files existed here, so the set is created fresh; activation seeds base_seq
+                // from the recovered commit index).
+                engine.attach_fresh_intent_lanes(segment_path)?;
                 return Ok(engine);
             }
         }
@@ -617,6 +564,183 @@ impl Engine {
         let records = recovery.records.clone();
         engine.commit_state_mut().wal =
             WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
+        #[cfg(unix)]
+        engine.attach_fresh_intent_lanes(segment_path)?;
+        Ok(engine)
+    }
+
+    /// E2.5c-1 — reopen a LANES-MODE durable database: replay the serial log's pre-activation
+    /// prefix, then the lane merge ([`gpu_db_wal::recover_lanes`], explicit global seqs), REPAIR
+    /// any never-acknowledged orphan frames a crash-mid-wave stranded above the cross-lane cut
+    /// (they would collide with the reopened set's fresh claims of the same seqs), and continue
+    /// appending: the serial WAL reopens for durability bookkeeping (classic writes stay refused
+    /// once activated — the v1 intent-only contract survives reopen) and the lane set reopens
+    /// with the activation latch, `base_seq`, the seq oracle, and the applied cut pre-seeded
+    /// from the recovered history.
+    ///
+    /// DISK-AUTHORITATIVE: the lane count and per-lane segment capacity come from the on-disk
+    /// set (env must not silently reshape an existing database); `GPU_DB_INTENT_LANE_SEGMENT_BYTES`
+    /// still overrides the capacity of NEW segments when explicitly set.
+    #[cfg(unix)]
+    fn open_lanes_durable_wal_segment(
+        segment_path: &std::path::Path,
+        planner_cfg: PlannerConfig,
+    ) -> Result<Self, EngineError> {
+        let lane_count = gpu_db_wal::discover_lane_count(segment_path)?.ok_or_else(|| {
+            EngineError::Durability(format!(
+                "lanes reopen of {} found no lane files (raced a cleanup?)",
+                segment_path.display()
+            ))
+        })?;
+        // The serial (pre-activation) prefix: disk-authoritative backend detection, exactly as
+        // the non-lanes reopen below — a FUA log lives in `<base>.fua.*`, a serial log in the
+        // plain `<base>` file; both present is ambiguous and refused.
+        let fua_present = gpu_db_wal::fua_wal_segments_exist(segment_path);
+        let serial_present = segment_path.exists();
+        if fua_present && serial_present {
+            return Err(EngineError::Durability(format!(
+                "both serial and FUA WAL segments exist beside {}; refusing an ambiguous \
+                 mixed-backend reopen (remove one backend's segments to disambiguate)",
+                segment_path.display()
+            )));
+        }
+        // Lane repair BEFORE recovery: durably discard orphan frames above the cross-lane cut
+        // (never acknowledged — acks gate on cut coverage — so nothing a client saw is lost;
+        // see `gpu_db_wal::repair_lane_orphans`).
+        let repaired = gpu_db_wal::repair_lane_orphans(segment_path, lane_count)?;
+        if repaired > 0 {
+            eprintln!(
+                "[gpu-db] lanes reopen of {}: discarded {repaired} never-acknowledged orphan \
+                 record(s) stranded above the durable cut by a crash mid-wave",
+                segment_path.display()
+            );
+        }
+        let lane_records = gpu_db_wal::recover_lanes(segment_path, lane_count)?;
+
+        let mut engine = Self::with_planner_config(planner_cfg);
+        // Replay serial-then-lanes WITHOUT durable backing (no segment I/O), then install the
+        // continuation backends. The serial prefix's record count IS `base_seq`: activation
+        // seeded the oracle from `repl.peek_next_index()` while the serial log was the only
+        // log, and the v1 guard refuses classic writes afterwards, so the serial log froze at
+        // exactly that index.
+        let serial_records: Vec<gpu_db_wal::WalRecord>;
+        let serial_recovery: Option<gpu_db_wal::WalSegmentRecovery>;
+        if fua_present {
+            serial_records = gpu_db_wal::recover_fua_wal_records(segment_path)?;
+            serial_recovery = None;
+        } else if serial_present {
+            let recovery = recover_wal_segment(segment_path)?;
+            serial_records = recovery.records.clone();
+            serial_recovery = Some(recovery);
+        } else {
+            serial_records = Vec::new();
+            serial_recovery = None;
+        }
+        let initial_index = engine.commit_state().repl.peek_next_index();
+        for record in &serial_records {
+            engine.commit_mutation(record.txn_id, record.payload.clone())?;
+        }
+        let base_seq = engine.commit_state().repl.peek_next_index();
+        if base_seq != initial_index + serial_records.len() as u64 {
+            return Err(EngineError::Durability(format!(
+                "lanes reopen of {}: serial replay advanced the commit index to {base_seq} \
+                 (started at {initial_index}) but the serial log holds {} record(s); the lane \
+                 base seq would be wrong — refusing",
+                segment_path.display(),
+                serial_records.len()
+            )));
+        }
+        for record in &lane_records {
+            engine.commit_mutation(record.txn_id, record.payload.clone())?;
+        }
+        let lane_record_count = lane_records.len() as u64;
+        let next_seq = engine.commit_state().repl.peek_next_index();
+        if next_seq != base_seq + lane_record_count {
+            return Err(EngineError::Durability(format!(
+                "lanes reopen of {}: lane replay advanced the commit index to {next_seq}, \
+                 expected {} — refusing an inconsistent seq space",
+                segment_path.display(),
+                base_seq + lane_record_count
+            )));
+        }
+
+        // Install the serial WAL continuation (fua/serial/fresh per what is on disk). Classic
+        // writes are refused after activation, so an ACTIVATED database never appends here —
+        // but a lanes-mode database that never activated continues its classic warm-up exactly
+        // like a non-lanes reopen.
+        let wal = if fua_present {
+            let (lanes, segment_bytes) = match WalDurability::from_env() {
+                WalDurability::FuaFencePool {
+                    lanes,
+                    segment_bytes,
+                } => (lanes, segment_bytes),
+                _ => (
+                    WalDurability::DEFAULT_FUA_LANES,
+                    WalDurability::DEFAULT_FUA_SEGMENT_BYTES,
+                ),
+            };
+            WalBuffer::with_recovered_fua_durable_segment(
+                segment_path,
+                serial_records,
+                lanes,
+                segment_bytes,
+            )?
+        } else if let Some(recovery) = &serial_recovery {
+            WalBuffer::with_recovered_durable_segment(segment_path, serial_records, recovery)?
+        } else {
+            // No serial log on disk (a lanes database whose serial WAL never flushed): create a
+            // fresh durable buffer per env, exactly like the durable constructor.
+            match WalDurability::from_env() {
+                WalDurability::FuaFencePool {
+                    lanes,
+                    segment_bytes,
+                } => WalBuffer::with_fua_durable_segment(segment_path, lanes, segment_bytes)?,
+                #[allow(unreachable_patterns)]
+                _ => WalBuffer::with_durable_segment(segment_path),
+            }
+        };
+        engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
+        engine.commit_state_mut().wal = wal;
+
+        // Reopen the lane set over the repaired logs and pre-seed the lane state from the
+        // recovered history: the lane-local cut continues at `lane_record_count`, the oracle at
+        // the next global seq, and (when any lane record exists) the activation latch stays
+        // latched — the intent-only contract survives reopen. A lanes database that never
+        // activated (lane files exist from construction, zero lane records) reopens
+        // UNACTIVATED and seeds normally on its first wave.
+        let fence_lanes = engine_intent_lanes::intent_lane_fences();
+        let lane_segment_bytes = match std::env::var("GPU_DB_INTENT_LANE_SEGMENT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+        {
+            Some(explicit) => explicit,
+            None => gpu_db_wal::lane_segment_capacity_bytes(segment_path)?
+                .map(|capacity| capacity as usize)
+                .unwrap_or_else(engine_intent_lanes::intent_lane_segment_bytes),
+        };
+        let wal_lanes = gpu_db_wal::FuaWalLaneSet::reopen(
+            segment_path,
+            lane_count,
+            fence_lanes,
+            lane_segment_bytes,
+        )?;
+        let state = engine_intent_lanes::IntentLaneState::fresh(lane_count, fence_lanes, wal_lanes);
+        if lane_record_count > 0 {
+            use std::sync::atomic::Ordering;
+            state.base_seq.store(base_seq, Ordering::Release);
+            state
+                .seq_oracle
+                .store(base_seq + lane_record_count, Ordering::Release);
+            *state.applied.lock().unwrap_or_else(|p| p.into_inner()) =
+                engine_intent_lanes::SeqCut::with_base(lane_record_count);
+            state
+                .applied_mirror
+                .store(lane_record_count, Ordering::Release);
+            // Latch LAST (matches the activation ordering law: state first, latch last).
+            state.activated.store(true, Ordering::Release);
+        }
+        engine.intent_lanes = Some(std::sync::Arc::new(state));
         Ok(engine)
     }
 
@@ -629,6 +753,17 @@ impl Engine {
         segment_path: impl AsRef<std::path::Path>,
     ) -> Result<Self, EngineError> {
         let segment_path = segment_path.as_ref();
+        // Checkpoint rotation is a SERIAL-log mechanism; a lanes-mode database's history spans
+        // the serial log AND the lane logs, and cross-lane checkpoint/truncation is the E2.5c-2
+        // slice. Refuse loudly rather than replay a checkpoint that silently drops lane commits.
+        #[cfg(unix)]
+        if Self::intent_lane_files_exist(segment_path) {
+            return Err(EngineError::Durability(format!(
+                "intent-lane WAL files exist beside {}: checkpoint-based reopen does not cover \
+                 lane logs yet (E2.5c-2); reopen via open_durable_wal_segment instead",
+                segment_path.display()
+            )));
+        }
         let (_control, checkpoint_records) = read_wal_checkpoint(control_path)?;
         let mut recovery = recover_wal_segment(segment_path)?;
         // W1b — the checkpoint/truncation crash window: `checkpoint_and_truncate_durable_wal`

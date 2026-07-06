@@ -530,10 +530,8 @@ impl FuaFrameLogAppender {
             }
         }
         let slot = &log.slots[(frame_id as usize) % FRAME_SLOTS];
-        log.publish_ns[(frame_id as usize) % FRAME_SLOTS].store(
-            log.stat_base.elapsed().as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        log.publish_ns[(frame_id as usize) % FRAME_SLOTS]
+            .store(log.stat_base.elapsed().as_nanos() as u64, Ordering::Relaxed);
         slot.fenced.store(false, Ordering::Relaxed);
         slot.offset
             .store(self.next_offset as u64, Ordering::Relaxed);
@@ -643,6 +641,89 @@ pub fn recover_frame_log_by_scan(
     Ok(frames)
 }
 
+/// Read a frame log's data capacity (bytes) from its file header — the geometry a reopened
+/// lane continues with (disk-authoritative; a reopen must not silently change segment sizes
+/// under an existing database because env defaults differ from the creating process's).
+pub fn frame_log_capacity_bytes(path: impl AsRef<std::path::Path>) -> std::io::Result<u64> {
+    let mut file = std::fs::File::open(path)?;
+    let file_header: FrameLogFileHeader = read_struct_at(&mut file, 0)?;
+    if file_header.magic != FRAME_LOG_MAGIC
+        || file_header.version != FRAME_LOG_VERSION
+        || file_header.header_bytes as usize != FRAME_LOG_HEADER_BYTES
+        || file_header.capacity_bytes == 0
+    {
+        return Err(invalid_data("invalid FUA frame log header"));
+    }
+    Ok(file_header.capacity_bytes)
+}
+
+/// DURABLY invalidate every frame from `frame_id` on in a frame-log segment by zeroing the
+/// first invalidated frame's aligned block (scan recovery validates frames in chain order and
+/// stops at the first invalid header, so the whole suffix drops). Returns the number of valid
+/// frames that were invalidated (0 when the chain ends before `frame_id` — nothing to do).
+///
+/// Safety of the CALLER's semantics, not this function's: the dropped frames' payloads are
+/// destroyed. The lane-set orphan repair uses this on frames strictly ABOVE the cross-lane
+/// contiguous durable cut — sequences that were never acknowledged (acks gate on cut
+/// coverage), so discarding them loses nothing a client was told was durable.
+pub fn invalidate_frame_log_suffix(
+    path: impl AsRef<std::path::Path>,
+    frame_id: u64,
+) -> std::io::Result<u64> {
+    let path = path.as_ref();
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let file_header: FrameLogFileHeader = read_struct_at(&mut file, 0)?;
+    if file_header.magic != FRAME_LOG_MAGIC
+        || file_header.version != FRAME_LOG_VERSION
+        || file_header.header_bytes as usize != FRAME_LOG_HEADER_BYTES
+        || file_header.capacity_bytes == 0
+        || file_header.segment_id as u32 == 0
+    {
+        return Err(invalid_data("invalid FUA frame log header"));
+    }
+    let expected_epoch = file_header.segment_id as u32;
+    let capacity = file_header.capacity_bytes;
+    // Header-only walk of the valid frame chain (same validation as scan recovery) to find the
+    // byte offset of `frame_id` and count the valid frames from there.
+    let mut offset = 0_u64;
+    let mut expected_frame = 0_u64;
+    let mut invalidate_at: Option<u64> = None;
+    let mut invalidated = 0_u64;
+    while offset + FRAME_HEADER_BYTES as u64 <= capacity {
+        let header: FrameHeader =
+            read_struct_at(&mut file, FRAME_LOG_HEADER_BYTES as u64 + offset)?;
+        if header.magic != FRAME_MAGIC
+            || header.epoch != expected_epoch
+            || header.frame_id != expected_frame
+            || header.header_crc != header_crc(&header)
+            || header.payload_bytes == 0
+        {
+            break;
+        }
+        let padded = padded_frame_bytes(header.payload_bytes as usize) as u64;
+        if offset + padded > capacity {
+            break;
+        }
+        if expected_frame == frame_id {
+            invalidate_at = Some(offset);
+        }
+        if expected_frame >= frame_id {
+            invalidated += 1;
+        }
+        offset += padded;
+        expected_frame += 1;
+    }
+    let Some(invalidate_at) = invalidate_at else {
+        return Ok(0); // chain ends before frame_id — nothing to invalidate
+    };
+    // Zero one aligned block at the first dropped frame: its header (and the chain behind it)
+    // becomes unambiguous garbage to the scan.
+    let zeros = vec![0_u8; FRAME_ALIGN];
+    write_all_at(&file, &zeros, FRAME_LOG_HEADER_BYTES as u64 + invalidate_at)?;
+    file.sync_all()?;
+    Ok(invalidated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +817,47 @@ mod tests {
         let frames = recover_frame_log_by_scan(&path).expect("scan second life");
         assert_eq!(frames.len(), 1, "previous-life frames must be rejected");
         assert_eq!(frames[0].payload, payload(64, 0xEE));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn invalidate_suffix_drops_frames_durably_and_reports_capacity() {
+        let path = test_path("invalidate-suffix");
+        {
+            let log = unsafe { FuaFrameLog::create(config(&path, 7)).expect("create") };
+            let pool = log.spawn_fence_pool(2);
+            let mut appender = log.appender();
+            for index in 0..6_u64 {
+                appender
+                    .publish_frame(&payload(700, index as u8), index * 4, 4)
+                    .expect("publish");
+            }
+            appender.finish();
+            pool.join().expect("pool");
+        }
+        assert_eq!(
+            frame_log_capacity_bytes(&path).expect("capacity"),
+            1 << 20,
+            "header capacity must round-trip"
+        );
+        // Chain ends before the requested frame: nothing to invalidate.
+        assert_eq!(
+            invalidate_frame_log_suffix(&path, 6).expect("noop"),
+            0,
+            "no frame 6 exists"
+        );
+        assert_eq!(recover_frame_log_by_scan(&path).expect("scan").len(), 6);
+        // Drop frames 4..6.
+        assert_eq!(invalidate_frame_log_suffix(&path, 4).expect("drop"), 2);
+        let frames = recover_frame_log_by_scan(&path).expect("scan after drop");
+        assert_eq!(frames.len(), 4, "suffix from frame 4 must be gone");
+        for (index, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.frame_id, index as u64);
+            assert_eq!(frame.payload, payload(700, index as u8));
+        }
+        // Idempotent: re-invalidating the same suffix is a no-op.
+        assert_eq!(invalidate_frame_log_suffix(&path, 4).expect("again"), 0);
+        assert_eq!(recover_frame_log_by_scan(&path).expect("scan").len(), 4);
         let _ = std::fs::remove_file(&path);
     }
 

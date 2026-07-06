@@ -2490,8 +2490,7 @@ impl Engine {
         // (throughput regime). One configuration serves both ends.
         let wave_max = crate::engine_intent_lanes::intent_lane_wave_max();
         let min_wave = crate::engine_intent_lanes::intent_lane_min_wave();
-        let outstanding =
-            lanes.outstanding.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let outstanding = lanes.outstanding.load(std::sync::atomic::Ordering::Relaxed) as usize;
         let ship_target = (outstanding
             / (lanes.lane_count * crate::engine_intent_lanes::intent_lane_ship_div()))
         .clamp(1, min_wave);

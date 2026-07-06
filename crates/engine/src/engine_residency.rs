@@ -7228,6 +7228,18 @@ impl Engine {
         self.populate_relational_residency_snapshot_inner(&mut guard, table, gpu_id)
     }
 
+    /// E2.5c-1: `&self` residency admission for the route ELISION RE-ENTRY arm — a reopened
+    /// lanes-mode engine is intent-only, so the `&mut` operator warm path is unreachable from
+    /// the surfaces it still exposes. Same latch + producer as the operator path.
+    pub(crate) fn populate_relational_residency_snapshot_shared(
+        &self,
+        table: &str,
+    ) -> Result<RelationalResidencySnapshot, ExecuteError> {
+        let gpu_id = self.planner.default_gpu_id();
+        let mut guard = self.ddl_catalog();
+        self.populate_relational_residency_snapshot_inner(&mut guard, table, gpu_id)
+    }
+
     /// `&mut self` entry for the benchmark residency installers.
     fn admit_relational_residency_snapshot(
         &mut self,

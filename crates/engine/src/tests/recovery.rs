@@ -2232,3 +2232,195 @@ fn w5a_binary_records_interleave_with_text_and_survive_rotation() {
     let _ = std::fs::remove_file(&checkpoint);
     let _ = std::fs::remove_file(&path);
 }
+
+/// E2.5c-1 — LANES-MODE REOPEN: the on-disk lane logs (fabricated exactly as an activated 2-lane
+/// engine writes them: WalRecords with binary insert payloads at LANE-LOCAL global seqs tiling
+/// [0, N)) replay AFTER the serial log's pre-activation prefix; the reopened engine is ACTIVATED
+/// (classic writes refused fail-loud — the v1 intent-only contract survives reopen), its lane
+/// cut/oracle continue from the recovered history, and a second reopen is idempotent.
+#[test]
+fn lanes_reopen_replays_serial_then_lane_merge_and_guards_classic_writes() {
+    let path = test_wal_path("lanes-reopen");
+    // Serial pre-activation history (pinned to the serial backend, env-proof): DDL + 2 rows.
+    let row_base = {
+        let e = serial_durable_engine(&path);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO t VALUES (1, 10)").unwrap();
+        e.execute_text(3, "INSERT INTO t VALUES (2, 20)").unwrap();
+        // Lane records must continue the row-id allocation exactly where the serial history
+        // left it (the real lane pump claims blocks from this same allocator).
+        e.read_state.mvcc.current_row_id()
+    };
+    // Fabricate the lane logs beside the serial segment: 4 covered-insert records across 2
+    // lanes, at LANE-LOCAL global seqs tiling [0, 4).
+    {
+        let set = gpu_db_wal::FuaWalLaneSet::create(&path, 2, 2, 1 << 20).expect("create lanes");
+        for (seq, (id, v)) in [(100, 1000), (101, 1010), (102, 1020), (103, 1030)]
+            .iter()
+            .enumerate()
+        {
+            let values = vec![SqlValue::Int4(*id), SqlValue::Int4(*v)];
+            let payload = crate::wal_binary::try_encode_binary_insert(
+                "t",
+                &[(row_base + seq as u64, values.as_slice())],
+            )
+            .expect("binary encode");
+            let record = gpu_db_wal::WalRecord {
+                txn_id: 100 + seq as u64,
+                payload: payload.into(),
+            };
+            set.append(seq % 2, seq as u64, &[record]).expect("append");
+        }
+        set.wait_durable(4).expect("lane records durable");
+    }
+    let select_all = |engine: &Engine| -> Vec<Vec<SqlValue>> {
+        let Command::Select(select) = parse_command("SELECT id, v FROM t ORDER BY id").unwrap()
+        else {
+            unreachable!()
+        };
+        engine
+            .execute_relational_select(&select)
+            .unwrap()
+            .rows
+            .into_boxed()
+    };
+    let reopened = Engine::open_durable_wal_segment(&path).expect("lanes reopen must succeed");
+    let rows = select_all(&reopened);
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(20)],
+            vec![SqlValue::Int4(100), SqlValue::Int4(1000)],
+            vec![SqlValue::Int4(101), SqlValue::Int4(1010)],
+            vec![SqlValue::Int4(102), SqlValue::Int4(1020)],
+            vec![SqlValue::Int4(103), SqlValue::Int4(1030)],
+        ],
+        "serial prefix then lane merge, in global seq order"
+    );
+    // The reopened lane state continues the recovered history: durable/applied cuts at 4
+    // (lane-local), so the reopened set's next claims can never collide with recovered seqs.
+    let stats = reopened.intent_lane_stats().expect("lanes state installed");
+    assert_eq!(stats.7, 4, "lane durable cut continues at the merge end");
+    assert_eq!(stats.8, 4, "applied cut pre-seeded to the merge end");
+    // v1 contract survives reopen: classic DML is refused fail-loud.
+    let err = reopened
+        .execute_text(9, "INSERT INTO t VALUES (7, 70)")
+        .expect_err("classic write after lanes activation must be refused");
+    assert!(
+        err.to_string().contains("intent lanes are ACTIVE"),
+        "expected the intent-only refusal, got: {err}"
+    );
+    drop(reopened);
+    // Idempotent second reopen (nothing new was committed).
+    let again = Engine::open_durable_wal_segment(&path).expect("second lanes reopen");
+    assert_eq!(select_all(&again), rows, "second reopen is idempotent");
+    drop(again);
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+    cleanup_lane_files(&path);
+}
+
+/// E2.5c-1 — CRASH-MID-WAVE fault injection: one lane's frame never became durable (a GAP in the
+/// global seq space) while other lanes' later frames did (durable ORPHANS above the cut — never
+/// acknowledgeable, since acks gate on cut coverage). Reopen must replay exactly the contiguous
+/// prefix, durably DISCARD the orphans (they would collide with fresh claims of the same seqs),
+/// and be idempotent across a second reopen.
+#[test]
+fn lanes_reopen_discards_unacked_orphans_above_the_cut() {
+    let path = test_wal_path("lanes-orphans");
+    let row_base = {
+        let e = serial_durable_engine(&path);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO t VALUES (1, 10)").unwrap();
+        e.read_state.mvcc.current_row_id()
+    };
+    // Lane 0 holds seqs [0, 3); lane 1 holds seqs [5, 8). Seqs 3..5 belonged to a wave whose
+    // frame CRASHED before its FUA fence — the exact on-disk shape of a crash mid-wave.
+    {
+        let set = gpu_db_wal::FuaWalLaneSet::create(&path, 2, 2, 1 << 20).expect("create lanes");
+        let make_record = |seq: u64| {
+            let values = vec![SqlValue::Int4(1000 + seq as i32), SqlValue::Int4(0)];
+            let payload = crate::wal_binary::try_encode_binary_insert(
+                "t",
+                &[(row_base + seq, values.as_slice())],
+            )
+            .expect("binary encode");
+            gpu_db_wal::WalRecord {
+                txn_id: 200 + seq,
+                payload: payload.into(),
+            }
+        };
+        for seq in 0..3u64 {
+            set.append(0, seq, &[make_record(seq)]).expect("lane 0");
+        }
+        for seq in 5..8u64 {
+            set.append(1, seq, &[make_record(seq)]).expect("lane 1");
+        }
+        // Cut holds at the gap: only [0, 3) is contiguous.
+        set.wait_durable(3).expect("contiguous prefix durable");
+        // Give the orphan frames time to fence too (they must be ON DISK for the repair to
+        // have something to discard; the drop drains the pools either way).
+    }
+    // Premise: recovery sees the orphan shape (3 contiguous records, 3 orphans above the gap).
+    assert_eq!(
+        gpu_db_wal::recover_lanes(&path, 2).expect("recover").len(),
+        3,
+        "premise: the contiguous prefix ends at the gap"
+    );
+    let reopened = Engine::open_durable_wal_segment(&path).expect("orphaned lanes reopen");
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+        unreachable!()
+    };
+    let counted = |engine: &Engine| -> Vec<Vec<SqlValue>> {
+        engine
+            .execute_relational_select(&count)
+            .unwrap()
+            .rows
+            .into_boxed()
+    };
+    assert_eq!(
+        counted(&reopened),
+        vec![vec![SqlValue::Int8(4)]],
+        "1 serial row + exactly the 3 contiguous lane rows (orphans discarded, never acked)"
+    );
+    drop(reopened);
+    // The repair was DURABLE and PHYSICAL (audit non-vacuity pin): a raw wal-level reopen
+    // FAILS CLOSED whenever any durable frame survives above the cut, so its success here
+    // proves the orphan frames are gone from disk — recover_lanes alone truncates at the gap
+    // and would pass even against a no-op repair.
+    drop(
+        gpu_db_wal::FuaWalLaneSet::reopen(&path, 2, 2, 1 << 20)
+            .expect("wal-level reopen must succeed: orphans were physically discarded"),
+    );
+    assert_eq!(
+        gpu_db_wal::recover_lanes(&path, 2)
+            .expect("recover repaired")
+            .len(),
+        3,
+        "orphan frames were durably discarded"
+    );
+    let again = Engine::open_durable_wal_segment(&path).expect("second reopen after repair");
+    assert_eq!(counted(&again), vec![vec![SqlValue::Int8(4)]]);
+    drop(again);
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+    cleanup_lane_files(&path);
+}
+
+/// Remove every `<base>.lane-<L>.fua.*` file a lanes test left beside its base path.
+fn cleanup_lane_files(path: &std::path::Path) {
+    let (Some(parent), Some(stem)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.lane-", stem.to_string_lossy());
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}

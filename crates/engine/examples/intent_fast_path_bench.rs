@@ -393,8 +393,7 @@ fn run_arm(
                         );
                     }
                 }
-                if let Some((drain, conflict, patch, settle)) =
-                    engine.intent_lane_hostpass_stats()
+                if let Some((drain, conflict, patch, settle)) = engine.intent_lane_hostpass_stats()
                 {
                     eprintln!(
                         "    [pump host us/wave: drain {:.1} conflict {:.1} patch {:.1} settle {:.1}]",

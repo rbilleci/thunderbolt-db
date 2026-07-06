@@ -1423,8 +1423,8 @@ mod fua_frame_log;
 mod fua_wal;
 #[cfg(unix)]
 pub use fua_frame_log::{
-    recover_frame_log_by_scan, FrameHandle, FuaFrameLog, FuaFrameLogAppender, FuaFrameLogConfig,
-    FuaFrameLogFencePool, RecoveredFrame,
+    frame_log_capacity_bytes, invalidate_frame_log_suffix, recover_frame_log_by_scan, FrameHandle,
+    FuaFrameLog, FuaFrameLogAppender, FuaFrameLogConfig, FuaFrameLogFencePool, RecoveredFrame,
 };
 #[cfg(unix)]
 mod wal_segment;

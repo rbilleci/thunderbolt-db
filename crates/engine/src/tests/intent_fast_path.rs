@@ -45,6 +45,28 @@ fn covered_insert_route_requires_covered_shape() {
     );
 }
 
+/// Commit ONE covered-insert intent via the submit/poll surface — the lanes-mode write entry
+/// (the blocking classic-shaped path is refused once the lanes activate).
+fn commit_intent_via_submit(
+    engine: &Engine,
+    txn_ids: &AtomicU64,
+    route: &CoveredInsertRoute,
+    params: &[i32],
+) -> Result<(), ExecuteError> {
+    let mut ticket = engine
+        .submit_covered_insert_intent(txn_ids.fetch_add(1, Ordering::Relaxed), route, params)
+        .expect("submit intent");
+    let mut spins = 0u64;
+    loop {
+        engine.drive_commit_wave();
+        if let Some(result) = engine.poll_intent(&mut ticket) {
+            return result;
+        }
+        spins += 1;
+        assert!(spins < 10_000_000, "intent never settled");
+    }
+}
+
 fn select_all_rows(engine: &Engine) -> Vec<Vec<SqlValue>> {
     engine
         .execute_relational_select_text("SELECT id, v FROM t ORDER BY id")
@@ -113,7 +135,13 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
     }
     assert!(warmed, "table never entered elision on a GPU box");
 
-    // The covered route + concurrent intents through the fast path.
+    // The covered route + concurrent intents through the fast path. In LANES mode the
+    // submit/poll surface is the write entry (the blocking classic-shaped path is refused
+    // once the lanes activate); serial mode keeps the blocking path.
+    let lanes_mode = std::env::var("GPU_DB_INTENT_LANES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n >= 2);
     let route = engine.prepare_covered_insert_route("t").unwrap();
     assert_eq!(route.table(), "t");
     assert_eq!(route.column_count(), 2);
@@ -125,13 +153,17 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
             scope.spawn(move || {
                 for i in 0..100_i32 {
                     let id = w * 1_000 + i;
-                    engine
-                        .execute_covered_insert_intent(
-                            txn_ids.fetch_add(1, Ordering::Relaxed),
-                            route,
-                            &[id, id + 7],
-                        )
-                        .unwrap();
+                    if lanes_mode {
+                        commit_intent_via_submit(engine, txn_ids, route, &[id, id + 7]).unwrap();
+                    } else {
+                        engine
+                            .execute_covered_insert_intent(
+                                txn_ids.fetch_add(1, Ordering::Relaxed),
+                                route,
+                                &[id, id + 7],
+                            )
+                            .unwrap();
+                    }
                 }
             });
         }
@@ -140,9 +172,17 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
     // SQL semantics: a duplicate PK through the intent path raises the same
     // 23505 the classic path raises (wave-batched device locate verdict), and
     // commits nothing.
-    let err = engine
-        .execute_covered_insert_intent(txn_ids.fetch_add(1, Ordering::Relaxed), &route, &[7, 99])
-        .unwrap_err();
+    let err = if lanes_mode {
+        commit_intent_via_submit(&engine, &txn_ids, &route, &[7, 99]).unwrap_err()
+    } else {
+        engine
+            .execute_covered_insert_intent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &route,
+                &[7, 99],
+            )
+            .unwrap_err()
+    };
     assert!(
         err.to_string()
             .contains("duplicate key value violates unique index"),
@@ -160,22 +200,10 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
     assert!(engine.wal_unflushed_count() == 0);
     drop(engine); // crash
 
-    // E2.5b-2 v1 contract pin: lanes-mode reopen is REFUSED fail-loud (the
-    // serial-then-lanes merge replay is E2.5c). In lanes mode this test pins
-    // the refusal instead of the replay.
-    if std::env::var("GPU_DB_INTENT_LANES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .is_some_and(|n| n >= 2)
-    {
-        let refused = Engine::open_durable_wal_segment(&path);
-        let err = format!("{:?}", refused.err().expect("lanes reopen must refuse"));
-        assert!(
-            err.contains("intent-lane WAL files exist"),
-            "expected the documented lanes-reopen refusal, got: {err}"
-        );
-        return;
-    }
+    // E2.5c-1: lanes-mode reopen REPLAYS serial-then-lanes and CONTINUES appending. In lanes
+    // mode this test additionally proves the reopened engine accepts new intent commits (the
+    // route's elision re-entry arm re-admits the recovered table) and that a SECOND reopen
+    // replays the post-reopen commits too.
     // Disk-authoritative FUA reopen: replay the frame log (binary row-op
     // records decode+install; no SQL re-parse for covered inserts) and verify
     // the store is row-identical.
@@ -188,16 +216,72 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         .populate_relational_residency_snapshot("t")
         .expect("populate residency after recovery");
     assert!(snapshot.is_valid());
-    drop(recovered);
+    if lanes_mode {
+        // The v1 intent-only contract survives reopen: classic DML refused fail-loud.
+        let err = recovered
+            .execute_dml_concurrent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                "INSERT INTO t VALUES (900000, 0)",
+            )
+            .expect_err("classic write after lanes reopen must be refused");
+        assert!(
+            err.to_string().contains("intent lanes are ACTIVE"),
+            "expected the intent-only refusal, got: {err}"
+        );
+        // CONTINUE APPENDING: re-arm the runtime flags, re-prepare the route (the E2.5c-1
+        // elision re-entry admits the recovered table with real device backing), and commit
+        // fresh intents through the reopened lane set.
+        recovered.set_auto_admit_on_commit(true);
+        recovered.set_host_install_elision_enabled(true);
+        recovered.set_binary_wal_records_enabled(true);
+        recovered.set_device_write_locate_enabled(true);
+        recovered.set_device_write_locate_wave_batch_enabled(true);
+        recovered.set_constrained_elision_enabled(true);
+        let route = recovered
+            .prepare_covered_insert_route("t")
+            .expect("route re-prepares after reopen (elision re-entry)");
+        for i in 0..50_i32 {
+            commit_intent_via_submit(&recovered, &txn_ids, &route, &[10_000 + i, i])
+                .expect("post-reopen intent commits");
+        }
+        // Duplicate of a PRE-CRASH committed PK still raises 23505 through the reopened
+        // validate path (the recovered device index sees the replayed rows).
+        let err = commit_intent_via_submit(&recovered, &txn_ids, &route, &[7, 1])
+            .expect_err("pre-crash PK must still conflict after reopen");
+        assert!(
+            err.to_string()
+                .contains("duplicate key value violates unique index"),
+            "{err}"
+        );
+        let mid = select_all_rows(&recovered);
+        assert_eq!(
+            mid.len(),
+            before.len() + 50,
+            "50 post-reopen commits visible"
+        );
+        drop(recovered);
+        // SECOND reopen: the post-reopen lane commits replay above the first history.
+        let recovered_again = Engine::open_durable_wal_segment(&path).unwrap();
+        let after_again = select_all_rows(&recovered_again);
+        assert_eq!(
+            mid, after_again,
+            "second reopen must be row-identical including post-reopen lane commits"
+        );
+        drop(recovered_again);
+    } else {
+        drop(recovered);
+    }
 
-    // Cleanup: serial sidecar + FUA frame segments.
+    // Cleanup: serial sidecar + FUA frame segments + lane segments.
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
     let _ = std::fs::remove_file(&path);
     if let (Some(parent), Some(stem)) = (path.parent(), path.file_name()) {
-        let prefix = format!("{}.fua.", stem.to_string_lossy());
+        let fua_prefix = format!("{}.fua.", stem.to_string_lossy());
+        let lane_prefix = format!("{}.lane-", stem.to_string_lossy());
         if let Ok(entries) = std::fs::read_dir(parent) {
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&fua_prefix) || name.starts_with(&lane_prefix) {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }

@@ -20,7 +20,10 @@ pub use fua::{fua_wal_segments_exist, recover_fua_wal_records};
 #[cfg(unix)]
 mod fua_lanes;
 #[cfg(unix)]
-pub use fua_lanes::{encode_lane_frame_payload, recover_lanes, FuaWalLaneSet};
+pub use fua_lanes::{
+    discover_lane_count, encode_lane_frame_payload, lane_segment_capacity_bytes, recover_lanes,
+    repair_lane_orphans, FuaWalLaneSet,
+};
 
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";

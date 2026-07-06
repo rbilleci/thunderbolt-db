@@ -272,7 +272,6 @@ pub(crate) struct ApplySlot {
     pub(crate) failed: AtomicBool,
 }
 
-
 /// Min items before a lane wave ships (`GPU_DB_INTENT_LANE_MIN_WAVE`, default 192).
 pub(crate) fn intent_lane_min_wave() -> usize {
     std::env::var("GPU_DB_INTENT_LANE_MIN_WAVE")
@@ -335,6 +334,71 @@ pub(crate) struct LaneSettle {
 }
 
 impl IntentLaneState {
+    /// A fresh (never-activated) lane state over `wal_lanes`. Shared by the durable
+    /// constructor and the reopen path (which then pre-seeds the activation latch,
+    /// `base_seq`, the seq oracle, and the applied cut from the recovered history
+    /// before the state is installed — single-threaded, so plain stores suffice).
+    pub(crate) fn fresh(
+        lane_count: usize,
+        fence_lanes: usize,
+        wal_lanes: gpu_db_wal::FuaWalLaneSet,
+    ) -> Self {
+        Self {
+            lane_count,
+            fence_lanes,
+            // Start FULL-WIDTH: a high-load flood then never pays an up-flip
+            // barrier at cold start (the measured 0.6-1.2s spike); a low-load
+            // workload instead pays one cheap down-flip (draining <= DOWN_AT
+            // items).
+            active_lanes: std::sync::atomic::AtomicUsize::new(lane_count),
+            resize_holding: AtomicBool::new(false),
+            resize_hold: Mutex::new(Vec::new()),
+            resize_leader: Mutex::new(None),
+            resize_low_since: Mutex::new(None),
+            stat_resizes: AtomicU64::new(0),
+            stat_resize_ns: AtomicU64::new(0),
+            outstanding: std::sync::Arc::new(AtomicU64::new(0)),
+            wal_lanes,
+            applied: Mutex::new(SeqCut::default()),
+            applied_mirror: AtomicU64::new(0),
+            activated: AtomicBool::new(false),
+            base_seq: AtomicU64::new(0),
+            queues: (0..lane_count).map(|_| Default::default()).collect(),
+            ledgers: (0..lane_count).map(|_| Default::default()).collect(),
+            settle: (0..lane_count).map(|_| Default::default()).collect(),
+            device_apply_lock: Mutex::new(()),
+            pump_cursor: AtomicU64::new(0),
+            pump_guards: (0..lane_count).map(|_| Default::default()).collect(),
+            pending_since: (0..lane_count).map(|_| Default::default()).collect(),
+            stat_waves: AtomicU64::new(0),
+            stat_items: AtomicU64::new(0),
+            stat_drain_ns: AtomicU64::new(0),
+            stat_conflict_ns: AtomicU64::new(0),
+            stat_patch_ns: AtomicU64::new(0),
+            stat_settle_ns: AtomicU64::new(0),
+            stat_acklag_ns: AtomicU64::new(0),
+            stat_settled_waves: AtomicU64::new(0),
+            stat_validate_ns: AtomicU64::new(0),
+            stat_claim_ns: AtomicU64::new(0),
+            stat_append_ns: AtomicU64::new(0),
+            stat_apply_ns: AtomicU64::new(0),
+            stat_encode_ns: AtomicU64::new(0),
+            stat_publish_ns: AtomicU64::new(0),
+            ts_reservation: AtomicU64::new(0),
+            validate_queue: Mutex::new(Vec::new()),
+            validate_leader: Mutex::new(()),
+            stat_coalesced_launches: AtomicU64::new(0),
+            stat_coalesced_requests: AtomicU64::new(0),
+            seq_oracle: AtomicU64::new(0),
+            apply_queue: Mutex::new(Vec::new()),
+            apply_poisoned: AtomicBool::new(false),
+            stat_apply_launches: AtomicU64::new(0),
+            stat_apply_requests: AtomicU64::new(0),
+            stat_validate_leader_ns: AtomicU64::new(0),
+            stat_apply_leader_ns: AtomicU64::new(0),
+        }
+    }
+
     /// The lanes' visibility frontier in LANE-LOCAL seq space (local seq =
     /// global seq - base_seq; the lane logs tile [0, N) exactly, per the
     /// FuaWalLaneSet contract — the pre-activation range lives in the serial
@@ -498,6 +562,32 @@ pub(crate) fn intent_lane_count() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 2)
         .unwrap_or(1)
+}
+
+/// Fence lanes per WAL lane (`GPU_DB_INTENT_LANE_FENCES`, default 16) — the per-lane FUA
+/// fence-pool depth.
+pub(crate) fn intent_lane_fences() -> usize {
+    std::env::var("GPU_DB_INTENT_LANE_FENCES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(16)
+}
+
+/// Per-lane WAL segment capacity (`GPU_DB_INTENT_LANE_SEGMENT_BYTES`).
+///
+/// Default stays SMALL (64MiB): every lanes engine prewrites segment_bytes x2 (active +
+/// pre-staged) PER LANE at open — a big default quota-bombs test tempdirs. M-TPS deployments
+/// should set GPU_DB_INTENT_LANE_SEGMENT_BYTES to 512MiB+: rolls (drain + swap + the
+/// pre-stager's prewrite-fsync FLUSH) are the lane tail's dominant stall, and 64MiB rolls
+/// every ~15s/lane at 1.6M TPS (same total log bytes either way — only roll cadence changes;
+/// measured p99 191ms -> 90.5ms at 512MiB).
+pub(crate) fn intent_lane_segment_bytes() -> usize {
+    std::env::var("GPU_DB_INTENT_LANE_SEGMENT_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64 << 20)
 }
 
 #[cfg(test)]
