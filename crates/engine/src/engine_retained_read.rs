@@ -1020,6 +1020,7 @@ impl Engine {
                 return None;
             }
             let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
+                table,
                 &table.name,
                 shard.shard_id,
                 filter_idx,
@@ -1111,6 +1112,7 @@ impl Engine {
             // (ptr,row_count)-validated). None = the shard has DUP keys -> decline the whole
             // locate to the scan, exactly like the host `ShardPkProbe::Declined`.
             let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
+                table,
                 &table.name,
                 shard.shard_id,
                 filter_idx,
@@ -1857,6 +1859,7 @@ impl Engine {
     /// not rebuilt every batch).
     fn ensure_shard_pk_device_index(
         &self,
+        table: &RelationalTable,
         table_name: &str,
         shard_id: u32,
         col_idx: usize,
@@ -1875,7 +1878,15 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(entry) = cache.get(&cache_key) {
-                if entry.resident_device_ptr == device_ptr && entry.row_count == row_count {
+                // E2.5b-2: tolerate a NEWER index than the caller's shard snapshot
+                // (entry.row_count >= row_count, same buffer). Concurrent lane
+                // applies extend the index at the append chokepoint; a probe
+                // against a superset is safe — extra rows only add count>0 hits,
+                // which the authoritative visible_row_with_value check filters at
+                // the needle's read snapshot. Requiring EQUALITY here caused a
+                // rebuild ping-pong under lanes (a stale-snapshot rebuild kept
+                // clobbering the newer entry): measured 16.5ms/wave validate.
+                if entry.resident_device_ptr == device_ptr && entry.row_count >= row_count {
                     return entry
                         .device_index
                         .clone()
@@ -1883,24 +1894,82 @@ impl Engine {
                 }
             }
         }
-        // Miss / stale ptr: build the host hash table + upload to device, OUTSIDE the lock.
+        // Miss / stale ptr: rebuild. UNDER LANES the rebuild takes the device-apply
+        // lock and uses the LIVE shard basis: a rebuild at a stale caller snapshot
+        // while append-side extensions continue would leave a HOLE (rows S..B
+        // absent from the index) => false-negative duplicate checks. The guard
+        // excludes applies during the rebuild, and the live count re-converges the
+        // extension chain (entry.row_count == the next apply's base) instead of
+        // looping through rebuild-per-wave. Cache HITS above stay lock-free.
+        let _lane_rebuild_guard = self.intent_lanes.as_ref().map(|lanes| {
+            lanes
+                .device_apply_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        let (build_memory, build_offset, build_row_count) = if self.intent_lanes.is_some() {
+            // Re-check under the guard: another prober may have rebuilt already.
+            {
+                let cache = self
+                    .read_state
+                    .residency
+                    .shard_pk_device_index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(entry) = cache.get(&cache_key) {
+                    if entry.row_count >= row_count {
+                        return entry
+                            .device_index
+                            .clone()
+                            .map(|di| (di, entry.table_mask, entry.hash_shift));
+                    }
+                }
+            }
+            let shards = self.read_state.residency.shards.load();
+            let live = shards
+                .get(table_name)?
+                .iter()
+                .find(|shard| shard.shard_id == shard_id)?
+                .clone();
+            let live_memory = live.device_memory.clone()?;
+            let live_offset = shard_i32_filter_offset(&live, table, col_idx)?;
+            let live_rows = live.row_count;
+            (live_memory, live_offset, live_rows)
+        } else {
+            (Arc::clone(device_memory), filter_offset, row_count)
+        };
+        let device_ptr = build_memory.device_ptr();
+        self.read_state
+            .residency
+            .lane_diag_rebuilds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let row_count = build_row_count;
         let row_count_u64 = row_count as u64;
         if row_count == 0 || row_count_u64 >= u32::MAX as u64 {
             return None;
         }
-        let keys = device_memory
-            .read_resident_i32_column(filter_offset, row_count)
+        let keys = build_memory
+            .read_resident_i32_column(build_offset, row_count)
             .ok()?;
         if keys.len() != row_count {
             return None;
         }
+        // GROWTH HEADROOM (E2.5b-2): size the rebuilt table for 2x the current
+        // rows, not 1x. The builder's natural rule next_pow2(rows*2) can land
+        // capacity EXACTLY at the current row count (whenever rows*2 is a power
+        // of two), so the very next append re-drops the entry and the probe
+        // rebuilds again — measured as 222 O(rows) rebuilds in one 8s lane run
+        // (~seconds of DtoH+build+HtoD). Sizing for 2x makes the drop->rebuild
+        // cadence geometric: log2(final/initial) rebuilds per shard lifetime.
+        // The table only ever holds `keys` (real rows); the extra slots are
+        // empty probe space (sparser = faster linear probing).
         let (device_index, table_mask, hash_shift) =
-            match build_int4_pk_hash_table_host(&keys, row_count_u64) {
+            match build_int4_pk_hash_table_host(&keys, row_count_u64.saturating_mul(2)) {
                 Some((index, table_mask, hash_shift)) => {
                     let index_bytes: Vec<u8> =
                         index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
                     let runtime = self.cuda_driver_probe_runtime();
-                    let gpu_id = device_memory.metadata().gpu_id;
+                    let gpu_id = build_memory.metadata().gpu_id;
                     // An upload failure (e.g. OOM) is TRANSIENT -> return None WITHOUT caching (retry next
                     // batch); the caller falls back to the host path meanwhile.
                     let Ok(mem) = runtime.retain_device_memory_copy(gpu_id, &index_bytes) else {
@@ -1915,17 +1984,27 @@ impl Engine {
         let entry = CachedShardPkDeviceIndex {
             resident_device_ptr: device_ptr,
             row_count,
-            _resident_guard: Arc::clone(device_memory),
+            _resident_guard: Arc::clone(&build_memory),
             device_index,
             table_mask,
             hash_shift,
         };
-        self.read_state
-            .residency
-            .shard_pk_device_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(cache_key, entry);
+        {
+            let mut cache = self
+                .read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Do not replace a NEWER entry built/extended concurrently (same
+            // ping-pong hazard as the hit path, from the insert side).
+            let newer_exists = cache.get(&cache_key).is_some_and(|existing| {
+                existing.resident_device_ptr == device_ptr && existing.row_count > row_count
+            });
+            if !newer_exists {
+                cache.insert(cache_key, entry);
+            }
+        }
         result
     }
 
@@ -2008,6 +2087,7 @@ impl Engine {
             // D4: the buffer rides the loaded descriptor (one-snapshot capture).
             let device_memory = shard.device_memory.clone()?;
             let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
+                table,
                 &table.name,
                 shard.shard_id,
                 filter_idx,

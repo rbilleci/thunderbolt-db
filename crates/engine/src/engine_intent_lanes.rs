@@ -120,6 +120,71 @@ pub(crate) struct IntentLaneState {
     /// lane concurrently; try_lock keeps each lane's pipeline single-writer
     /// (the loser moves on — another lane has work).
     pub(crate) pump_guards: Vec<Mutex<()>>,
+    /// Wave-formation pacing (the conveyor laws): a lane ships a wave only when
+    /// its queue holds >= min_wave items OR the age deadline passed since the
+    /// first pending item. Without this, N pumps drain instantly, waves shrink
+    /// to a handful of items, and the fixed per-wave costs (device validate,
+    /// the brief seq-claim lock, the apply lock) explode per item — measured:
+    /// lanes=4 collapsed to 132k TPS on 1-item waves before pacing.
+    pub(crate) pending_since: Vec<Mutex<Option<std::time::Instant>>>,
+    /// Diagnostics (GPU_DB_BENCH_LANESTATS): per-stage nanos summed across all
+    /// lane waves — divides by `stat_waves`/`stat_items` for per-wave/per-item
+    /// attribution of the pump pipeline.
+    pub(crate) stat_waves: AtomicU64,
+    pub(crate) stat_items: AtomicU64,
+    pub(crate) stat_validate_ns: AtomicU64,
+    pub(crate) stat_claim_ns: AtomicU64,
+    pub(crate) stat_append_ns: AtomicU64,
+    pub(crate) stat_apply_ns: AtomicU64,
+    /// Lock-free commit-timestamp reservation: the highest micros reserved by
+    /// any lane wave. Waves CAS-reserve [base, base+k) OUTSIDE the commit lock
+    /// (the per-winner map insert under that lock was the measured 8-lane
+    /// convoy: ~2us/item of lock hold). Seeded from the classic path's
+    /// max_commit_timestamp under the FIRST wave's lock (classic writes are
+    /// guarded off after activation, so the two never interleave afterwards).
+    pub(crate) ts_reservation: AtomicU64,
+    /// Per-lane commit-timestamp side maps (txn_id -> micros). Lane records
+    /// never enter the serial WalBuffer, so the archive/PITR consumers of
+    /// wal_commit_timestamps_micros never look these txns up — the side maps
+    /// retain the stamps for the E2.5c lane-archive slice.
+    pub(crate) ts_side: Vec<Mutex<std::collections::HashMap<u64, u64>>>,
+}
+
+impl IntentLaneState {
+    /// Reserve `k` strictly-monotonic commit timestamps >= wall clock,
+    /// returning the base (range [base, base+k)). Lock-free CAS max loop.
+    pub(crate) fn reserve_timestamps(&self, wall_micros: u64, k: u64) -> u64 {
+        let mut current = self.ts_reservation.load(Ordering::Relaxed);
+        loop {
+            let base = wall_micros.max(current.saturating_add(1));
+            match self.ts_reservation.compare_exchange_weak(
+                current,
+                base + (k - 1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return base,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+/// Min items before a lane wave ships (`GPU_DB_INTENT_LANE_MIN_WAVE`, default 192).
+pub(crate) fn intent_lane_min_wave() -> usize {
+    std::env::var("GPU_DB_INTENT_LANE_MIN_WAVE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(512)
+}
+
+/// Age deadline for an under-min wave (`GPU_DB_INTENT_LANE_GROUP_US`, default 200).
+pub(crate) fn intent_lane_group_us() -> u64 {
+    std::env::var("GPU_DB_INTENT_LANE_GROUP_US")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300)
 }
 
 /// One lane wave awaiting the visible cut: `[first_seq, end_seq)` plus the
@@ -173,6 +238,30 @@ impl IntentLaneState {
 /// `GPU_DB_INTENT_LANES` (default 1 = lanes mode OFF; >= 2 enables). Read once
 /// at engine construction, like the other write-path knobs.
 impl crate::Engine {
+    /// Lane diagnostics for benches: (waves, items, validate_ns, claim_ns,
+    /// append_ns, apply_ns, durable_cut, applied_cut). None when lanes are off.
+    pub fn intent_lane_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64, u64, u64)> {
+        let lanes = self.intent_lanes.as_ref()?;
+        Some((
+            lanes.stat_waves.load(Ordering::Relaxed),
+            lanes.stat_items.load(Ordering::Relaxed),
+            lanes.stat_validate_ns.load(Ordering::Relaxed),
+            lanes.stat_claim_ns.load(Ordering::Relaxed),
+            lanes.stat_append_ns.load(Ordering::Relaxed),
+            lanes.stat_apply_ns.load(Ordering::Relaxed),
+            lanes.wal_lanes.durable_cut(),
+            lanes.applied_mirror.load(Ordering::Acquire),
+        ))
+    }
+
+    /// Diagnostics: PK device-index rebuild count (the expensive miss path).
+    pub fn pk_index_rebuilds_diag(&self) -> u64 {
+        self.read_state
+            .residency
+            .lane_diag_rebuilds
+            .load(Ordering::Relaxed)
+    }
+
     /// V1 intent-only contract: once the first lane seq block is claimed, classic
     /// DML/DDL writes are refused fail-loud — a classic record appended to the
     /// serial WAL AFTER lane activation would interleave two ordered logs with

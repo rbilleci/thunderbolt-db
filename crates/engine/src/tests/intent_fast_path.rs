@@ -160,6 +160,22 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
     assert!(engine.wal_unflushed_count() == 0);
     drop(engine); // crash
 
+    // E2.5b-2 v1 contract pin: lanes-mode reopen is REFUSED fail-loud (the
+    // serial-then-lanes merge replay is E2.5c). In lanes mode this test pins
+    // the refusal instead of the replay.
+    if std::env::var("GPU_DB_INTENT_LANES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n >= 2)
+    {
+        let refused = Engine::open_durable_wal_segment(&path);
+        let err = format!("{:?}", refused.err().expect("lanes reopen must refuse"));
+        assert!(
+            err.contains("intent-lane WAL files exist"),
+            "expected the documented lanes-reopen refusal, got: {err}"
+        );
+        return;
+    }
     // Disk-authoritative FUA reopen: replay the frame log (binary row-op
     // records decode+install; no SQL re-parse for covered inserts) and verify
     // the store is row-identical.

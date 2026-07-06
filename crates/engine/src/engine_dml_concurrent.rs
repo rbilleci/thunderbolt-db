@@ -2430,11 +2430,33 @@ impl Engine {
         // settle matured waves first: acks lead each iteration
         let progressed = self.settle_intent_lane(&lanes, lane);
 
+        // Wave-formation pacing (the conveyor laws): accumulate to min_wave or
+        // the age deadline; tiny waves pay the fixed per-wave costs per item.
         let wave_max = crate::engine_intent_lanes::intent_lane_wave_max();
+        let min_wave = crate::engine_intent_lanes::intent_lane_min_wave();
+        let group_window =
+            std::time::Duration::from_micros(crate::engine_intent_lanes::intent_lane_group_us());
         let batch: Vec<CommitWaveItem> = {
             let mut queue = lanes.queues[lane]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if queue.is_empty() {
+                return progressed;
+            }
+            if queue.len() < min_wave {
+                let mut since = lanes.pending_since[lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let started = since.get_or_insert_with(std::time::Instant::now);
+                if started.elapsed() < group_window {
+                    return progressed; // let the wave fill
+                }
+                *since = None;
+            } else {
+                *lanes.pending_since[lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
             let n = queue.len().min(wave_max);
             queue.drain(..n).collect()
         };
@@ -2442,8 +2464,20 @@ impl Engine {
             return progressed;
         }
 
-        // device validate (committed-dup 23505 verdicts), off-lock
+        // device validate (committed-dup 23505 verdicts), off-lock: the PK-index
+        // cache tolerates newer-than-snapshot entries (see
+        // ensure_shard_pk_device_index), so concurrent lane applies no longer
+        // force rebuilds and the probe needs no device-section serialization.
+        let stat_start = Instant::now();
         let violations = self.wave_batch_validate_unique(&batch);
+        lanes.stat_validate_ns.fetch_add(
+            stat_start.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
+        lanes.stat_waves.fetch_add(1, AtomicOrdering::Relaxed);
+        lanes
+            .stat_items
+            .fetch_add(batch.len() as u64, AtomicOrdering::Relaxed);
 
         // private-ledger conflicts + intra-wave same-slot dedup (lowest position wins)
         let mut winners: Vec<CommitWaveItem> = Vec::with_capacity(batch.len());
@@ -2511,6 +2545,7 @@ impl Engine {
 
         // THE shared touch: one brief commit lock — seq block claim + timestamps
         let wall_clock = current_timestamp_micros();
+        let stat_start = Instant::now();
         let first_seq = {
             let mut commit = self.commit_state();
             let first = match commit.repl.propose_batch(payloads) {
@@ -2532,6 +2567,10 @@ impl Engine {
             commit.repl.mark_applied(first + k - 1);
             first
         };
+        lanes.stat_claim_ns.fetch_add(
+            stat_start.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
         // activation latch: the first claimed block fixes base_seq (lane-local
         // seq space = global - base; the lane logs tile [0, N) exactly)
         if !lanes
@@ -2566,7 +2605,13 @@ impl Engine {
             return true;
         }
 
+        lanes.stat_append_ns.fetch_add(
+            stat_start.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
+
         // device apply (v1: serialized across lanes — shared per-table device offsets)
+        let stat_start = Instant::now();
         let mut pending: WavePendingAppends = BTreeMap::new();
         let mut committed: Vec<(usize, Index, bool)> = Vec::with_capacity(winners.len());
         for (offset, item) in winners.iter().enumerate() {
@@ -2596,6 +2641,10 @@ impl Engine {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.flush_wave_pending_appends(&mut pending, &mut committed, &winners);
         }
+        lanes.stat_apply_ns.fetch_add(
+            stat_start.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
         self.read_state
             .residency
             .host_install_elisions

@@ -440,6 +440,15 @@ impl Engine {
                         device_apply_lock: std::sync::Mutex::new(()),
                         pump_cursor: std::sync::atomic::AtomicU64::new(0),
                         pump_guards: (0..lane_count).map(|_| Default::default()).collect(),
+                        pending_since: (0..lane_count).map(|_| Default::default()).collect(),
+                        stat_waves: std::sync::atomic::AtomicU64::new(0),
+                        stat_items: std::sync::atomic::AtomicU64::new(0),
+                        stat_validate_ns: std::sync::atomic::AtomicU64::new(0),
+                        stat_claim_ns: std::sync::atomic::AtomicU64::new(0),
+                        stat_append_ns: std::sync::atomic::AtomicU64::new(0),
+                        stat_apply_ns: std::sync::atomic::AtomicU64::new(0),
+                        ts_reservation: std::sync::atomic::AtomicU64::new(0),
+                        ts_side: (0..lane_count).map(|_| Default::default()).collect(),
                     }));
             }
         }

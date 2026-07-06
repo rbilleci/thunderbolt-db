@@ -563,6 +563,9 @@ pub(crate) struct ResidencyReadState {
     /// M1: count of PK locates served by the DEVICE write-locate kernel (non-vacuity: proves the
     /// device path FIRED, not a silent fallback to the host probe / scan).
     pub(crate) device_write_locate_hits: std::sync::atomic::AtomicU64,
+    /// E2.5b-2 diagnostics: PK device-index REBUILDS (cache miss -> DtoH column
+    /// read + host hash build + HtoD upload — the expensive path).
+    pub(crate) lane_diag_rebuilds: std::sync::atomic::AtomicU64,
     pub(crate) pk_index_writer_extends: std::sync::atomic::AtomicU64,
     pub(crate) pk_index_prober_extends: std::sync::atomic::AtomicU64,
     pub(crate) pk_index_rebuilds: std::sync::atomic::AtomicU64,

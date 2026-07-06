@@ -70,6 +70,15 @@ fn build_engine(segment: &std::path::Path) -> Result<Engine, Box<dyn Error>> {
     e.set_device_write_locate_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
     e.set_constrained_elision_enabled(true);
+    // GPU_DB_BENCH_SHARD_TARGET: pre-size the open shard (rows) to control
+    // rollover frequency in-run (rollovers serialize under the apply path and,
+    // in lanes mode, stall the global cut).
+    if let Some(target) = std::env::var("GPU_DB_BENCH_SHARD_TARGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        e.set_shard_size_target(target);
+    }
     Ok(e)
 }
 
@@ -331,6 +340,20 @@ fn run_arm(
             items as f64 / waves.max(1) as f64,
             nanos as f64 / items.max(1) as f64 / 1e3,
         );
+        if let Some((lw, li, val, claim, app, apply, durable, applied)) = engine.intent_lane_stats()
+        {
+            let rb = engine.pk_index_rebuilds_diag();
+            if lw > 0 {
+                eprintln!(
+                    "    [lanes: waves {lw}  items/wave {:.1}  us/wave: validate {:.1} claim {:.1} wal-append {:.1} device-apply {:.1}  cuts: durable {durable} applied {applied}  pk-rebuilds {rb}]",
+                    li as f64 / lw as f64,
+                    val as f64 / lw as f64 / 1e3,
+                    claim as f64 / lw as f64 / 1e3,
+                    app as f64 / lw as f64 / 1e3,
+                    apply as f64 / lw as f64 / 1e3,
+                );
+            }
+        }
         let d = &gpu_db_engine::engine_dml_concurrent_wave_device_stats();
         let (loc, app, idx) = (
             d[0].swap(0, Ordering::Relaxed),
