@@ -703,6 +703,22 @@ impl Engine {
         &self,
         item: CommitWaveItem,
     ) -> Result<CommitWaveOutcome, ExecuteError> {
+        // E2.5b-2: lanes mode routes single-slot intents to their PK lane (same
+        // PK -> same lane = single-winner without cross-lane coordination).
+        // Multi/zero-slot items (classic shapes) stay on the classic queue —
+        // they are pre-activation-only under the intent-only contract.
+        if let Some(lanes) = &self.intent_lanes {
+            if item.write_set.unique_slots_i32.len() == 1 && item.binary_wal_template.is_some() {
+                let outcome = Arc::clone(&item.outcome);
+                let pk = item.write_set.unique_slots_i32[0].1;
+                let lane = lanes.lane_for_pk(pk);
+                lanes.queues[lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push_back(item);
+                return Ok(outcome);
+            }
+        }
         self.enqueue_commit_wave_item(item)
     }
 
@@ -731,6 +747,17 @@ impl Engine {
     /// share a few OS threads with no per-commit park/wake — the disruptor ingress the mandate
     /// calls for. `take_if_done` on a submitted ticket observes the result.
     pub fn drive_commit_wave(&self) -> bool {
+        // E2.5b-2: in lanes mode a pump call advances one lane's pipeline (round-robin);
+        // the classic wave machinery below still services pre-activation traffic.
+        if let Some(lanes) = &self.intent_lanes {
+            let lane = (lanes
+                .pump_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % lanes.lane_count as u64) as usize;
+            if self.drive_intent_lane(lane) {
+                return true;
+            }
+        }
         // Prefer claiming a pending tail (cheap, unblocks acks) before taking sequencer duty.
         if self.try_finish_pending_wave_tail() {
             return true;
@@ -2384,6 +2411,238 @@ impl Engine {
     /// panic-on-post-durable-apply-failure wedge philosophy, and matches the D1 append-only
     /// writer's fail-closed poisoning of the segment backing on real I/O errors. The SERIALIZED
     /// commit path (`commit_mutation_at`) keeps its inline flush and clean per-statement abort.
+    /// E2.5b-2 stage 3b — one pump iteration for intent lane `lane`: the N-lane
+    /// parallel ordered cut. Single-writer per lane (try_lock guard); the ONLY
+    /// shared-state touch is one brief commit lock per wave (global seq-block
+    /// claim + timestamp merge). Everything else — device validate, private
+    /// ledger, lane WAL append, device apply — runs lane-parallel. Outcomes
+    /// settle exclusively behind the visible cut (durable AND applied AND
+    /// published), so an ack can never precede any lower seq's durability.
+    pub(crate) fn drive_intent_lane(&self, lane: usize) -> bool {
+        let Some(lanes) = self.intent_lanes.as_ref().map(std::sync::Arc::clone) else {
+            return false;
+        };
+        let Ok(_pump_guard) = lanes.pump_guards[lane].try_lock() else {
+            return false; // another pump owns this lane right now
+        };
+        // settle matured waves first: acks lead each iteration
+        let mut progressed = self.settle_intent_lane(&lanes, lane);
+
+        let wave_max = crate::engine_intent_lanes::intent_lane_wave_max();
+        let batch: Vec<CommitWaveItem> = {
+            let mut queue = lanes.queues[lane]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let n = queue.len().min(wave_max);
+            queue.drain(..n).collect()
+        };
+        if batch.is_empty() {
+            return progressed;
+        }
+        progressed = true;
+
+        // device validate (committed-dup 23505 verdicts), off-lock
+        let violations = self.wave_batch_validate_unique(&batch);
+
+        // private-ledger conflicts + intra-wave same-slot dedup (lowest position wins)
+        let mut winners: Vec<CommitWaveItem> = Vec::with_capacity(batch.len());
+        {
+            let ledger = lanes.ledgers[lane]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut wave_slots: std::collections::HashSet<crate::write_path::IntUniqueSlotKey> =
+                std::collections::HashSet::with_capacity(batch.len());
+            for (position, item) in batch.into_iter().enumerate() {
+                if let Some(err) = violations.get(&position) {
+                    item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        err.clone(),
+                    ))));
+                    continue;
+                }
+                if ledger.conflicts(&item.write_set, item.read_snapshot) {
+                    let read_snapshot = item.read_snapshot;
+                    item.set_outcome(Err(ExecuteError::Serialization(format!(
+                        "write-write conflict on a key committed after read snapshot {read_snapshot}"
+                    ))));
+                    continue;
+                }
+                if item
+                    .write_set
+                    .unique_slots_i32
+                    .iter()
+                    .any(|slot| !wave_slots.insert(*slot))
+                {
+                    item.set_outcome(Err(ExecuteError::Serialization(
+                        "intra-wave duplicate key: an earlier same-wave insert holds this unique slot"
+                            .to_string(),
+                    )));
+                    continue;
+                }
+                winners.push(item);
+            }
+        }
+        let k = winners.len() as u64;
+        if k == 0 {
+            return true;
+        }
+
+        // row-id block (atomic claim — safe under concurrent lanes) + W5a patches
+        let row_id_base = self.read_state.mvcc.claim_row_id_block(k);
+        let mut payloads: Vec<std::sync::Arc<[u8]>> = Vec::with_capacity(winners.len());
+        let mut wal_records: Vec<WalRecord> = Vec::with_capacity(winners.len());
+        for (offset, item) in winners.iter().enumerate() {
+            let (template, wal_offset) = item
+                .binary_wal_template
+                .as_ref()
+                .expect("lane intents carry a binary WAL template");
+            let off = *wal_offset as usize;
+            let row_id = row_id_base + offset as u64;
+            let mut payload: std::sync::Arc<[u8]> = std::sync::Arc::from(&template[..]);
+            std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
+                [off..off + 8]
+                .copy_from_slice(&row_id.to_le_bytes());
+            wal_records.push(WalRecord {
+                txn_id: item.txn_id,
+                payload: payload.clone(),
+            });
+            payloads.push(payload);
+        }
+
+        // THE shared touch: one brief commit lock — seq block claim + timestamps
+        let wall_clock = current_timestamp_micros();
+        let first_seq = {
+            let mut commit = self.commit_state();
+            let first = match commit.repl.propose_batch(payloads) {
+                Ok(first) => first,
+                Err(err) => {
+                    let message = format!("lane wave propose failed: {err}");
+                    for item in winners {
+                        item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
+                            message.clone(),
+                        ))));
+                    }
+                    return true;
+                }
+            };
+            let base_ts = wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
+            for (offset, item) in winners.iter().enumerate() {
+                commit.record_commit_timestamp(item.txn_id, base_ts + offset as u64);
+            }
+            commit.repl.mark_applied(first + k - 1);
+            first
+        };
+        // activation latch: the first claimed block fixes base_seq (lane-local
+        // seq space = global - base; the lane logs tile [0, N) exactly)
+        if !lanes
+            .activated
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            lanes
+                .base_seq
+                .store(first_seq, std::sync::atomic::Ordering::Release);
+        }
+        let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
+        let local_first = first_seq - base;
+
+        // record winners into the lane's private ledger at their global seqs
+        {
+            let mut ledger = lanes.ledgers[lane]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (offset, item) in winners.iter().enumerate() {
+                ledger.record(&item.write_set, first_seq + offset as u64);
+            }
+        }
+
+        // OFF-LOCK: durable lane append (per-lane fence pool pipelines the fsync)
+        if let Err(err) = lanes.wal_lanes.append(lane, local_first, &wal_records) {
+            let message = format!("lane WAL append failed: {err}");
+            for item in winners {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
+                    message.clone(),
+                ))));
+            }
+            return true;
+        }
+
+        // device apply (v1: serialized across lanes — shared per-table device offsets)
+        let mut pending: WavePendingAppends = BTreeMap::new();
+        let mut committed: Vec<(usize, Index, bool)> = Vec::with_capacity(winners.len());
+        for (offset, item) in winners.iter().enumerate() {
+            let delta = item
+                .offlock_delta
+                .as_ref()
+                .expect("lane intents carry an off-lock delta");
+            let crate::write_path::PreparedMutation::Insert {
+                table,
+                inserted_rows,
+                ..
+            } = &delta.mutation
+            else {
+                unreachable!("lane intents gate to single-row inserts");
+            };
+            let commit_seq = first_seq + offset as u64;
+            let entry = pending.entry(table.clone()).or_default();
+            entry.3.push(commit_seq);
+            entry.0.push(inserted_rows[0].1.clone());
+            entry.1.push(row_id_base + offset as u64);
+            entry.2.push((offset, commit_seq));
+        }
+        {
+            let _device_guard = lanes
+                .device_apply_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.flush_wave_pending_appends(&mut pending, &mut committed, &winners);
+        }
+        self.read_state
+            .residency
+            .host_install_elisions
+            .fetch_add(k, std::sync::atomic::Ordering::Relaxed);
+
+        // applied cut + settlement queue; outcomes wait for the visible cut
+        lanes.record_applied(local_first, local_first + k);
+        lanes.settle[lane]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(crate::engine_intent_lanes::LaneSettle {
+                end_seq: local_first + k,
+                winners,
+            });
+        self.settle_intent_lane(&lanes, lane);
+        true
+    }
+
+    /// Settle every lane wave whose end seq the visible cut covers (durable AND
+    /// applied), publishing `committed_seq` to the global cut first so a polled
+    /// Ok is never observable before the commit is readable.
+    fn settle_intent_lane(
+        &self,
+        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
+        lane: usize,
+    ) -> bool {
+        let local_cut = lanes.visible_local_cut();
+        let global_cut = lanes.visible_global_cut();
+        if global_cut > 0 {
+            self.publish_committed_seq(global_cut);
+        }
+        let mut settled = false;
+        let mut queue = lanes.settle[lane]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while queue
+            .front()
+            .is_some_and(|entry| entry.end_seq <= local_cut)
+        {
+            let entry = queue.pop_front().expect("front checked");
+            for item in entry.winners {
+                item.set_outcome(Ok(()));
+            }
+            settled = true;
+        }
+        settled
+    }
+
     fn wait_group_durable(&self, wal_position: usize) -> Result<(), EngineError> {
         // E1 step 2 — FUA fence-pool backend: no single-flusher election. Every committer whose
         // record isn't yet covered runs its own `begin_group_flush` + `job.commit()` concurrently;

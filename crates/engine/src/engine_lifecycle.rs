@@ -439,6 +439,7 @@ impl Engine {
                         settle: (0..lane_count).map(|_| Default::default()).collect(),
                         device_apply_lock: std::sync::Mutex::new(()),
                         pump_cursor: std::sync::atomic::AtomicU64::new(0),
+                        pump_guards: (0..lane_count).map(|_| Default::default()).collect(),
                     }));
             }
         }

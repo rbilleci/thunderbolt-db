@@ -116,6 +116,10 @@ pub(crate) struct IntentLaneState {
     /// Round-robin pump cursor: each `drive_commit_wave` call in lanes mode
     /// advances one lane's pipeline.
     pub(crate) pump_cursor: AtomicU64,
+    /// SINGLE-WRITER guard per lane: round-robin pumps may land on the same
+    /// lane concurrently; try_lock keeps each lane's pipeline single-writer
+    /// (the loser moves on — another lane has work).
+    pub(crate) pump_guards: Vec<Mutex<()>>,
 }
 
 /// One lane wave awaiting the visible cut: `[first_seq, end_seq)` plus the
@@ -126,13 +130,24 @@ pub(crate) struct LaneSettle {
 }
 
 impl IntentLaneState {
-    /// The lanes' visibility frontier: every global seq below this is durable
-    /// in its WAL lane AND device-applied. `committed_seq` may publish up to
-    /// (but never past) this value for lane-claimed seqs.
-    pub(crate) fn visible_cut(&self) -> u64 {
+    /// The lanes' visibility frontier in LANE-LOCAL seq space (local seq =
+    /// global seq - base_seq; the lane logs tile [0, N) exactly, per the
+    /// FuaWalLaneSet contract — the pre-activation range lives in the serial
+    /// log and never touches the lanes). Every local seq below this is durable
+    /// in its WAL lane AND device-applied.
+    pub(crate) fn visible_local_cut(&self) -> u64 {
         self.wal_lanes
             .durable_cut()
             .min(self.applied_mirror.load(Ordering::Acquire))
+    }
+
+    /// The GLOBAL visibility frontier the engine may publish for lane-claimed
+    /// seqs: base + local cut (0 pre-activation: nothing to publish).
+    pub(crate) fn visible_global_cut(&self) -> u64 {
+        if !self.activated.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.base_seq.load(Ordering::Acquire) + self.visible_local_cut()
     }
 
     /// Record a lane wave's applied block and refresh the lock-free mirror.
@@ -157,6 +172,15 @@ impl IntentLaneState {
 
 /// `GPU_DB_INTENT_LANES` (default 1 = lanes mode OFF; >= 2 enables). Read once
 /// at engine construction, like the other write-path knobs.
+/// Max items drained per lane wave (`GPU_DB_INTENT_LANE_WAVE_MAX`, default 1024).
+pub(crate) fn intent_lane_wave_max() -> usize {
+    std::env::var("GPU_DB_INTENT_LANE_WAVE_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1024)
+}
+
 pub(crate) fn intent_lane_count() -> usize {
     std::env::var("GPU_DB_INTENT_LANES")
         .ok()
