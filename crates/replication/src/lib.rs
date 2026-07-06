@@ -1244,6 +1244,8 @@ impl LocalReplicator {
             return Err(EngineError::NotLeader);
         }
         let first = self.next_index;
+        let payloads = payloads.into_iter();
+        self.entries.reserve(payloads.size_hint().0);
         for payload in payloads {
             let idx = self.next_index;
             self.next_index += 1;

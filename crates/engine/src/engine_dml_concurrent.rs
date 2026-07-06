@@ -2479,8 +2479,12 @@ impl Engine {
             .stat_items
             .fetch_add(batch.len() as u64, AtomicOrdering::Relaxed);
 
-        // private-ledger conflicts + intra-wave same-slot dedup (lowest position wins)
+        // private-ledger conflicts + intra-wave same-slot dedup (lowest position wins).
+        // PASS-FUSION: integer slots are extracted here once (winner_slots) so the
+        // post-claim ledger record never re-walks the fat items.
         let mut winners: Vec<CommitWaveItem> = Vec::with_capacity(batch.len());
+        let mut winner_slots: Vec<crate::write_path::IntUniqueSlotKey> =
+            Vec::with_capacity(batch.len());
         {
             let ledger = lanes.ledgers[lane]
                 .lock()
@@ -2513,6 +2517,7 @@ impl Engine {
                     )));
                     continue;
                 }
+                winner_slots.push(item.write_set.unique_slots_i32[0]);
                 winners.push(item);
             }
         }
@@ -2529,6 +2534,7 @@ impl Engine {
         // separate encode_record_into pass that was measured at ~1.4us/record
         // of cold Arc re-walks (1.4ms of a 1000-record wave).
         let mut frame_payload: Vec<u8> = Vec::with_capacity(winners.len() * 24 + 4096);
+        let mut winner_rows: Vec<(String, Vec<SqlValue>)> = Vec::with_capacity(winners.len());
         for (offset, item) in winners.iter().enumerate() {
             let (template, wal_offset) = item
                 .binary_wal_template
@@ -2542,6 +2548,20 @@ impl Engine {
                 .copy_from_slice(&row_id.to_le_bytes());
             gpu_db_wal::encode_wal_record_parts_into(&mut frame_payload, item.txn_id, &payload);
             payloads.push(payload);
+            // fused (table, values) extraction: same item walk, warm cache
+            let delta = item
+                .offlock_delta
+                .as_ref()
+                .expect("lane intents carry an off-lock delta");
+            let crate::write_path::PreparedMutation::Insert {
+                table,
+                inserted_rows,
+                ..
+            } = &delta.mutation
+            else {
+                unreachable!("lane intents gate to single-row inserts");
+            };
+            winner_rows.push((table.clone(), inserted_rows[0].1.clone()));
         }
 
         // THE shared touch: one brief commit lock — seq block claim + timestamps
@@ -2585,13 +2605,14 @@ impl Engine {
         let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
         let local_first = first_seq - base;
 
-        // record winners into the lane's private ledger at their global seqs
+        // record winners into the lane's private ledger at their global seqs —
+        // from the slots extracted in the conflict pass (no fat-item re-walk)
         {
             let mut ledger = lanes.ledgers[lane]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (offset, item) in winners.iter().enumerate() {
-                ledger.record(&item.write_set, first_seq + offset as u64);
+            for (offset, slot) in winner_slots.iter().enumerate() {
+                ledger.record_int_slot(*slot, first_seq + offset as u64);
             }
         }
 
@@ -2622,23 +2643,11 @@ impl Engine {
         let stat_start = Instant::now();
         let mut pending: WavePendingAppends = BTreeMap::new();
         let mut committed: Vec<(usize, Index, bool)> = Vec::with_capacity(winners.len());
-        for (offset, item) in winners.iter().enumerate() {
-            let delta = item
-                .offlock_delta
-                .as_ref()
-                .expect("lane intents carry an off-lock delta");
-            let crate::write_path::PreparedMutation::Insert {
-                table,
-                inserted_rows,
-                ..
-            } = &delta.mutation
-            else {
-                unreachable!("lane intents gate to single-row inserts");
-            };
+        for (offset, (table, values)) in winner_rows.into_iter().enumerate() {
             let commit_seq = first_seq + offset as u64;
-            let entry = pending.entry(table.clone()).or_default();
+            let entry = pending.entry(table).or_default();
             entry.3.push(commit_seq);
-            entry.0.push(inserted_rows[0].1.clone());
+            entry.0.push(values);
             entry.1.push(row_id_base + offset as u64);
             entry.2.push((offset, commit_seq));
         }

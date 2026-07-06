@@ -254,6 +254,12 @@ impl RecentCommitsLedger {
     /// Record a committed write-set at `commit_seq` (the highest writer of each key wins — commits
     /// are assigned monotonically increasing `commit_seq` under the commit_mutex, so a later commit
     /// always overwrites with a larger value).
+    /// E2.5b-2 — record ONE integer unique slot (the lane pump's fused-pass
+    /// form; equivalent to `record` for a write-set holding exactly this slot).
+    pub(crate) fn record_int_slot(&mut self, slot: IntUniqueSlotKey, commit_seq: Index) {
+        self.unique_slots_i32.insert(slot, commit_seq);
+    }
+
     pub(crate) fn record(&mut self, write_set: &WriteSet, commit_seq: Index) {
         for key in &write_set.rows {
             self.rows.insert(key.clone(), commit_seq);
