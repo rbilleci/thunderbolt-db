@@ -1,0 +1,237 @@
+//! E2.5b-2 — N-lane intent commit pipeline (the disruptor-mandate stage graph).
+//!
+//! The measured wall since E2.3 is the single serial ordered cut (~1.7us/item ≈
+//! 625k TPS). This module parallelizes the CUT ITSELF: covered-INSERT intents
+//! hash by PK to one of N lanes; each lane is a SINGLE-WRITER pipeline (own
+//! ingress queue, own private integer conflict ledger, own `FuaWalLaneSet`
+//! WAL lane with its own fence pool), and the only shared-state touch is ONE
+//! brief `CommitState` lock per WAVE (global commit-seq block claim via
+//! `propose_batch` + timestamp merge). Visibility publishes exclusively at the
+//! CROSS-LANE CONTIGUOUS CUT: `committed_seq` advances to S only when every
+//! global seq < S is durable in its WAL lane (the lane set's cut) AND applied
+//! (this module's `SeqCut`), so a reader can never observe seq N ahead of any
+//! seq below N — the fence-pool law, lifted to the engine.
+//!
+//! V1 scoping (honest, enforced): lanes mode is INTENT-ONLY once the first
+//! lane seq is claimed. Classic/DDL writes before lane activation (schema DDL,
+//! elision warm-up) run on the classic path and land in the serial WAL;
+//! recovery replays the serial log first, then the lane merge (disjoint,
+//! contiguous seq ranges). A classic write AFTER activation fails loudly with
+//! a clear error rather than risking a mixed-order log. Same-PK intents land
+//! in the same lane by construction (hash routing), preserving single-winner
+//! 23505 without cross-lane coordination.
+
+// Stage 1 of the lane wiring (see module docs): the types land with their unit
+// tests; construction + lane pumps arrive in the next staged commit. The allow
+// is removed the moment `engine_lifecycle` constructs `IntentLaneState`.
+#![allow(dead_code)]
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// Cross-lane APPLIED cut: lanes report disjoint contiguous global-seq blocks
+/// `[start, end)` as their waves finish device apply; `advance` returns the
+/// largest S such that every seq < S is applied. Mirrors the interval-merge
+/// law of the WAL lane set's durable cut (property-tested there); this is the
+/// engine-side twin for the apply stage.
+#[derive(Debug, Default)]
+pub(crate) struct SeqCut {
+    /// The contiguous applied prefix `[base, cut)` is implicit; `pending`
+    /// holds applied blocks stranded behind a gap, keyed by start.
+    cut: u64,
+    pending: BTreeMap<u64, u64>,
+}
+
+impl SeqCut {
+    pub(crate) fn with_base(base: u64) -> Self {
+        Self {
+            cut: base,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    /// Record `[start, end)` as applied and advance the contiguous cut as far
+    /// as possible. Blocks may arrive in any order; overlaps are a caller bug
+    /// (each global seq is claimed by exactly one lane wave) and are rejected
+    /// fail-closed via debug_assert + skip.
+    pub(crate) fn record(&mut self, start: u64, end: u64) -> u64 {
+        debug_assert!(start <= end, "SeqCut block must be a forward range");
+        debug_assert!(
+            start >= self.cut,
+            "SeqCut block below the cut: seq {start} was already applied (double apply?)"
+        );
+        if start > end || start < self.cut {
+            return self.cut;
+        }
+        self.pending.insert(start, end);
+        while let Some((&start, &end)) = self.pending.first_key_value() {
+            if start != self.cut {
+                break;
+            }
+            self.pending.remove(&start);
+            self.cut = end;
+        }
+        self.cut
+    }
+
+    pub(crate) fn cut(&self) -> u64 {
+        self.cut
+    }
+}
+
+/// Runtime state for lanes mode. Constructed only when
+/// `GPU_DB_INTENT_LANES=N>=2` at engine build; `None` keeps every existing
+/// path byte-identical.
+pub(crate) struct IntentLaneState {
+    /// Number of lanes (>= 2).
+    pub(crate) lane_count: usize,
+    /// The multi-lane durable WAL (per-lane fence pools + cross-lane durable cut).
+    pub(crate) wal_lanes: gpu_db_wal::FuaWalLaneSet,
+    /// Cross-lane applied cut (device apply completion), advanced under the mutex;
+    /// mirrored lock-free for pollers.
+    pub(crate) applied: Mutex<SeqCut>,
+    pub(crate) applied_mirror: AtomicU64,
+    /// Set once the first lane seq block is claimed; classic writes then fail
+    /// loudly (v1 intent-only contract — see module docs).
+    pub(crate) activated: AtomicBool,
+    /// First global seq owned by the lanes (everything below it lives in the
+    /// serial WAL from the pre-activation warm-up; recovery replays serial
+    /// then lanes over disjoint ranges).
+    pub(crate) base_seq: AtomicU64,
+}
+
+impl IntentLaneState {
+    /// The lanes' visibility frontier: every global seq below this is durable
+    /// in its WAL lane AND device-applied. `committed_seq` may publish up to
+    /// (but never past) this value for lane-claimed seqs.
+    pub(crate) fn visible_cut(&self) -> u64 {
+        self.wal_lanes
+            .durable_cut()
+            .min(self.applied_mirror.load(Ordering::Acquire))
+    }
+
+    /// Record a lane wave's applied block and refresh the lock-free mirror.
+    pub(crate) fn record_applied(&self, start: u64, end: u64) -> u64 {
+        let cut = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(start, end);
+        self.applied_mirror.fetch_max(cut, Ordering::AcqRel);
+        cut
+    }
+
+    /// Route a PK to its lane. Fibonacci mixing over the i32 key: same PK →
+    /// same lane, uniform spread; MUST stay in sync with any WAL-side routing
+    /// assumptions (there are none: lanes are content-agnostic).
+    pub(crate) fn lane_for_pk(&self, pk: i32) -> usize {
+        let mixed = (pk as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((mixed >> 40) % self.lane_count as u64) as usize
+    }
+}
+
+/// `GPU_DB_INTENT_LANES` (default 1 = lanes mode OFF; >= 2 enables). Read once
+/// at engine construction, like the other write-path knobs.
+pub(crate) fn intent_lane_count() -> usize {
+    std::env::var("GPU_DB_INTENT_LANES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 2)
+        .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seq_cut_advances_in_order_and_holds_at_gaps() {
+        let mut cut = SeqCut::with_base(10);
+        assert_eq!(cut.cut(), 10);
+        // out-of-order blocks hold behind the gap at 10
+        assert_eq!(cut.record(20, 30), 10);
+        assert_eq!(cut.record(14, 20), 10);
+        // the gap-filling block releases everything contiguous
+        assert_eq!(cut.record(10, 14), 30);
+        assert_eq!(cut.cut(), 30);
+        // empty block at the frontier is a no-op that still reports the cut
+        assert_eq!(cut.record(30, 30), 30);
+        assert_eq!(cut.record(31, 40), 30);
+        assert_eq!(cut.record(30, 31), 40);
+    }
+
+    #[test]
+    fn seq_cut_random_tilings_match_brute_force() {
+        // deterministic pseudo-random tiling: split [0, 4096) into blocks,
+        // apply in shuffled order, assert the cut equals the brute-force
+        // contiguous frontier after every step.
+        let mut seed = 0xDEAD_BEEF_u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..50 {
+            let mut blocks = Vec::new();
+            let mut at = 0_u64;
+            while at < 4096 {
+                let len = 1 + (rand() % 96);
+                let end = (at + len).min(4096);
+                blocks.push((at, end));
+                at = end;
+            }
+            // shuffle
+            for i in (1..blocks.len()).rev() {
+                let j = (rand() % (i as u64 + 1)) as usize;
+                blocks.swap(i, j);
+            }
+            let mut cut = SeqCut::with_base(0);
+            let mut applied: Vec<(u64, u64)> = Vec::new();
+            for &(start, end) in &blocks {
+                applied.push((start, end));
+                let got = cut.record(start, end);
+                // brute force: sort applied, walk contiguous from 0
+                let mut sorted = applied.clone();
+                sorted.sort_unstable();
+                let mut expect = 0_u64;
+                for &(s, e) in &sorted {
+                    if s == expect {
+                        expect = e;
+                    } else if s < expect {
+                        unreachable!("tiling produced overlap");
+                    } else {
+                        break;
+                    }
+                }
+                assert_eq!(got, expect, "cut diverged from brute force");
+            }
+            assert_eq!(cut.cut(), 4096);
+        }
+    }
+
+    #[test]
+    fn lane_routing_is_stable_and_spread() {
+        let state_lanes = 4_usize;
+        let mixed = |pk: i32| {
+            let m = (pk as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            ((m >> 40) % state_lanes as u64) as usize
+        };
+        // stability: same pk always maps to the same lane
+        for pk in [0, 1, -1, i32::MAX, i32::MIN, 42_424_242] {
+            assert_eq!(mixed(pk), mixed(pk));
+        }
+        // spread: 64k sequential pks should hit every lane substantially
+        let mut counts = [0_usize; 4];
+        for pk in 0..65_536_i32 {
+            counts[mixed(pk)] += 1;
+        }
+        for (lane, count) in counts.iter().enumerate() {
+            assert!(
+                *count > 65_536 / 8,
+                "lane {lane} starved: {count} of 65536 sequential pks"
+            );
+        }
+    }
+}
