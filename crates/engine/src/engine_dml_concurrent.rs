@@ -36,6 +36,65 @@ fn wave_tail_pipeline_depth() -> u64 {
     })
 }
 
+/// E2.4a — VARIANT 1 (shared-WAL sharded sequencing): the number of PARALLEL shard workers the
+/// sequencer fans a homogeneous covered-INSERT-intent wave out to. `1` (default) = the E2.3 serial
+/// sequencer, byte-identical. `N>1` moves the per-item conflict check/record (per-shard private
+/// integer ledger for intent-only slots; same-PK → same shard → single-winner 23505 preserved),
+/// the value clone, and the WAL-record clone OFF the ordered critical section into N workers hashing
+/// on the row's unique-slot key; the ordered WAL append + global commit-seq claim + device-append
+/// buffer stay under ONE thin serial cut (the ~0.3-0.4us/item floor).
+fn intent_sequencer_shards() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_DB_INTENT_SEQUENCER_SHARDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
+}
+
+/// E2.4a — minimum wave size before the sharded fan-out is worth its `std::thread::scope`
+/// fork/join. Below this the serial sequencer runs (tiny waves are latency-bound, not
+/// throughput-bound, and the thread hand-off would dominate).
+const SHARD_MIN_WAVE: usize = 64;
+
+/// E2.4a — the per-table batched device-append accumulator shape (rows / row-ids / (position,seq) /
+/// per-row birth stamps). Shared by the serial and sharded sequencer paths so the wave-batched
+/// open-shard append (one HtoD per table per wave) stays a single code path.
+type WavePendingAppends = BTreeMap<
+    String,
+    (
+        Vec<Vec<SqlValue>>,
+        Vec<u64>,
+        Vec<(usize, Index)>,
+        Vec<Index>,
+    ),
+>;
+
+/// E2.4a — one shard worker's verdict for a wave position: either a retryable/duplicate abort
+/// (outcome set verbatim in the serial cut) or a Commit carrying the cloned row image and the
+/// cloned W5a WAL record (row id still the encode-time placeholder; the serial cut patches it with
+/// the wave-assigned id). Built entirely off the commit lock by [`Engine::shard_prepare_intents`].
+enum ShardVerdict {
+    Commit {
+        table: String,
+        values: Vec<SqlValue>,
+        wal_record: Vec<u8>,
+        wal_offset: usize,
+    },
+    Abort(ExecuteError),
+}
+
+/// E2.4a — the deterministic shard of a unique slot: a fibonacci-hash mix of the packed slot id and
+/// the i32 value, folded to `[0, shards)`. Same `(slot_id, value)` → same shard, which is what keeps
+/// two writers of the same unique slot on the same worker (single-winner conflict detection).
+fn shard_index(slot_id: u64, value: i32, shards: usize) -> usize {
+    let mixed = slot_id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (value as u32 as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    (mixed % shards as u64) as usize
+}
+
 /// W2b — max sequenced-but-unpublished wave tails outstanding in the durability pipeline. Depth 1
 /// forced one fsync per wave (the sequencer stalled at the gate for ~the full fdatasync — a
 /// measured 14% durable-arm REGRESSION); at depth N consecutive waves' records coalesce into
@@ -1174,6 +1233,26 @@ impl Engine {
         &self,
         batch: Vec<CommitWaveItem>,
     ) -> Option<(CommitWaveTail, BTreeSet<String>)> {
+        // E2.4a VARIANT 1 — shared-WAL sharded sequencing. When the whole wave is homogeneous
+        // covered-INSERT intents (the flagship OLTP shape), fan the expensive per-item prep
+        // (conflict check/record, value + WAL-record clones) out to N parallel shard workers and
+        // keep only the ordered WAL append + global commit-seq claim + device-append buffer under a
+        // thin serial cut. A mixed wave (any non-intent / classic item) keeps the fully-serial path
+        // below, byte-identical: the sharded conflict verdict is computed from a shared-ledger
+        // SNAPSHOT + a per-shard private dedup set, which is only equivalent to the serial
+        // record-as-you-go ledger when no in-wave classic write can slip a same-slot record between
+        // the snapshot and the serial cut (a homogeneous-intent wave has none).
+        let shards = intent_sequencer_shards();
+        if shards > 1 && batch.len() >= SHARD_MIN_WAVE && self.auto_admit_on_commit_enabled() {
+            let wave_catalog_seq = self.catalog_snapshot().commit_seq;
+            if self.device_write_locate_wave_batch_enabled()
+                && batch
+                    .iter()
+                    .all(|item| self.item_sharded_intent_eligible(item, wave_catalog_seq))
+            {
+                return self.sequence_commit_wave_sharded(batch, shards);
+            }
+        }
         let guard = CommitWaveBatchGuard {
             engine: self,
             items: &batch,
@@ -1237,87 +1316,12 @@ impl Engine {
         // visible only at the tail publish either way). D3 (ADR-013 pre1, LANDED): each buffered
         // row carries its own birth stamp (`InsertPerRow`) since the batch spans multiple commit
         // seqs; the stamps + the hwm publish with the row_count bump at flush.
-        let mut pending_appends: BTreeMap<
-            String,
-            (
-                Vec<Vec<SqlValue>>,
-                Vec<u64>,
-                Vec<(usize, Index)>,
-                Vec<Index>,
-            ),
-        > = BTreeMap::new();
+        let mut pending_appends: WavePendingAppends = BTreeMap::new();
+        // E2.4a — the pending-append flush is a shared method (`flush_wave_pending_appends`) so the
+        // serial and sharded sequencer paths keep ONE wave-batched open-shard append code path.
         let flush_appends =
-            |pending: &mut BTreeMap<
-                String,
-                (
-                    Vec<Vec<SqlValue>>,
-                    Vec<u64>,
-                    Vec<(usize, Index)>,
-                    Vec<Index>,
-                ),
-            >,
-             committed: &mut Vec<(usize, Index, bool)>| {
-                if pending.is_empty() {
-                    return;
-                }
-                for (table, (rows, row_ids, items, stamps)) in std::mem::take(pending) {
-                    // D3 (ADR-013 pre1): the batched flush spans MULTIPLE commit seqs — each row
-                    // carries its own birth stamp (the per-row slice the D3-COMPOSE note called for).
-                    let appended = self.auto_admit_on_commit_enabled()
-                        && self.try_append_resident_int4_open_shard(
-                            &table,
-                            &rows,
-                            crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
-                            Some(&row_ids),
-                        );
-                    if appended {
-                        // A4e elide-entry (audit B1 eligibility), once per flushed table.
-                        if self.host_install_elision_enabled() && !self.table_install_elided(&table)
-                        {
-                            let snapshot = self.catalog_snapshot();
-                            if self.table_elision_eligible(&snapshot, &table) {
-                                self.set_table_install_elided(&table, true);
-                            }
-                        }
-                    } else {
-                        // A4e rehydrate-on-unhandled: the batch's rows were never installed (elided
-                        // apply skip) NOR appended — they ride the rehydration as upserts over the
-                        // gather at the batch's first seq - 1 (device state is complete through it:
-                        // flushes happen in seq order).
-                        if self.table_install_elided(&table) {
-                            let first_seq = items.first().map(|(_, seq)| *seq).unwrap_or_default();
-                            let last_seq = items.last().map(|(_, seq)| *seq).unwrap_or_default();
-                            let upserts: std::collections::BTreeMap<u64, Vec<SqlValue>> =
-                                row_ids.iter().copied().zip(rows.iter().cloned()).collect();
-                            let catalog_table = self
-                                .relational_catalog_table(&table)
-                                .expect("an elided table is in the catalog");
-                            self.rehydrate_elided_table(
-                                &catalog_table,
-                                first_seq.saturating_sub(1),
-                                &upserts,
-                                &Default::default(),
-                                last_seq,
-                            )
-                            .unwrap_or_else(|err| {
-                                panic!(
-                                    "commit-path invariant violation: elided rehydration for the \
-                                 batched append on {table} failed: {err}"
-                                )
-                            });
-                        }
-                        for (position, seq) in &items {
-                            self.invalidate_relational_residency_tables_concurrent(
-                                &batch[*position].residency_tables,
-                                batch[*position].txn_id,
-                                *seq,
-                            );
-                        }
-                    }
-                    for (position, seq) in items {
-                        committed.push((position, seq, appended));
-                    }
-                }
+            |pending: &mut WavePendingAppends, committed: &mut Vec<(usize, Index, bool)>| {
+                self.flush_wave_pending_appends(pending, committed, &batch);
             };
         // M1 design B: WAVE-TIME BATCHED PK-UNIQUE VALIDATION. Eligible INSERTs deferred their
         // unique check off-lock (`prepare_insert`); validate the whole wave here with ONE device
@@ -1843,6 +1847,376 @@ impl Engine {
             },
             admit_tables,
         ))
+    }
+
+    /// A4e / E2.4a — flush the wave-batched device open-shard append: ONE
+    /// `try_append_resident_int4_open_shard` per (table, flush) with per-row birth stamps (the
+    /// batch spans commit seqs), the lazy elide-entry on first successful append, and the
+    /// rehydrate-on-unhandled / invalidate fallback when the device declines. Extracted from the
+    /// serial sequencer's inner closure so the sharded sequencer shares the exact same append path.
+    fn flush_wave_pending_appends(
+        &self,
+        pending: &mut WavePendingAppends,
+        committed: &mut Vec<(usize, Index, bool)>,
+        batch: &[CommitWaveItem],
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        for (table, (rows, row_ids, items, stamps)) in std::mem::take(pending) {
+            // D3 (ADR-013 pre1): the batched flush spans MULTIPLE commit seqs — each row
+            // carries its own birth stamp (the per-row slice the D3-COMPOSE note called for).
+            let appended = self.auto_admit_on_commit_enabled()
+                && self.try_append_resident_int4_open_shard(
+                    &table,
+                    &rows,
+                    crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
+                    Some(&row_ids),
+                );
+            if appended {
+                // A4e elide-entry (audit B1 eligibility), once per flushed table.
+                if self.host_install_elision_enabled() && !self.table_install_elided(&table) {
+                    let snapshot = self.catalog_snapshot();
+                    if self.table_elision_eligible(&snapshot, &table) {
+                        self.set_table_install_elided(&table, true);
+                    }
+                }
+            } else {
+                // A4e rehydrate-on-unhandled: the batch's rows were never installed (elided
+                // apply skip) NOR appended — they ride the rehydration as upserts over the
+                // gather at the batch's first seq - 1 (device state is complete through it:
+                // flushes happen in seq order).
+                if self.table_install_elided(&table) {
+                    let first_seq = items.first().map(|(_, seq)| *seq).unwrap_or_default();
+                    let last_seq = items.last().map(|(_, seq)| *seq).unwrap_or_default();
+                    let upserts: std::collections::BTreeMap<u64, Vec<SqlValue>> =
+                        row_ids.iter().copied().zip(rows.iter().cloned()).collect();
+                    let catalog_table = self
+                        .relational_catalog_table(&table)
+                        .expect("an elided table is in the catalog");
+                    self.rehydrate_elided_table(
+                        &catalog_table,
+                        first_seq.saturating_sub(1),
+                        &upserts,
+                        &Default::default(),
+                        last_seq,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "commit-path invariant violation: elided rehydration for the \
+                             batched append on {table} failed: {err}"
+                        )
+                    });
+                }
+                for (position, seq) in &items {
+                    self.invalidate_relational_residency_tables_concurrent(
+                        &batch[*position].residency_tables,
+                        batch[*position].txn_id,
+                        *seq,
+                    );
+                }
+            }
+            for (position, seq) in items {
+                committed.push((position, seq, appended));
+            }
+        }
+    }
+
+    /// E2.4a — is `item` a covered-INSERT intent the SHARDED sequencer can fan out? The exact serial
+    /// `intent_fast` gate (catalog generation unchanged since prepare, pre-encoded binary WAL
+    /// template, reuse-eligible single-row off-lock delta, table still elided) PLUS a single
+    /// integer unique slot and no other conflict dimension. The single-slot restriction is what
+    /// makes "hash the unique slot → shard" a CORRECT same-conflict-slot-same-worker partition: a
+    /// row with two unique columns could collide with a different row on its SECOND column while
+    /// hashing to a different shard, so those (and every non-intent item) stay on the serial path.
+    fn item_sharded_intent_eligible(&self, item: &CommitWaveItem, wave_catalog_seq: Index) -> bool {
+        wave_catalog_seq == item.prepared_catalog_seq
+            && item.binary_wal_template.is_some()
+            && item.write_set.unique_slots_i32.len() == 1
+            && item.write_set.unique_slots.is_empty()
+            && item.write_set.rows.is_empty()
+            && matches!(&item.offlock_delta, Some(d)
+                if Self::reresolve_reuse_eligible(d)
+                    && matches!(&d.mutation,
+                        crate::write_path::PreparedMutation::Insert { inserted_rows, .. }
+                            if inserted_rows.len() == 1))
+            && match &item.cmd {
+                Command::Insert(insert) => self.table_install_elided(&insert.table),
+                _ => false,
+            }
+    }
+
+    /// E2.4a VARIANT 1 — sequence a HOMOGENEOUS covered-INSERT-intent wave with N parallel shard
+    /// workers over ONE ordered WAL + ONE global commit-seq.
+    ///
+    /// Stage 1 (device, coordinator): the wave-batched PK-unique locate — one device call, the
+    /// committed-dup 23505 verdicts. Stage 2 (N parallel workers, NO commit lock): each worker
+    /// owns the wave positions whose unique slot hashes to its shard and, in wave-position order,
+    /// runs the SI conflict check against a shared-ledger SNAPSHOT + a per-shard PRIVATE dedup set
+    /// (same-slot → same shard, so the lowest-position writer wins — byte-identical to the serial
+    /// record-as-you-go single-winner), then clones the row image + WAL record. Stage 3 (thin
+    /// serial cut, commit lock): walk the wave in order, and for each committing item claim the
+    /// next commit-seq + integer row id, patch the WAL record's row id, append + propose, record the
+    /// commit timestamp + the write-set into the SHARED ledger (classic-path interop), advance the
+    /// elided row-id allocator, and buffer the row into the per-table device append. The device
+    /// append flushes ONCE per table at the tail (one HtoD/wave); the durability tail is returned
+    /// for the W2 pipeline exactly as the serial path.
+    fn sequence_commit_wave_sharded(
+        &self,
+        batch: Vec<CommitWaveItem>,
+        shards: usize,
+    ) -> Option<(CommitWaveTail, BTreeSet<String>)> {
+        let guard = CommitWaveBatchGuard {
+            engine: self,
+            items: &batch,
+        };
+        let wall_clock = current_timestamp_micros();
+        let n = batch.len();
+
+        // Stage 1 — the wave-batched device PK-unique locate (committed-dup 23505 verdicts). One
+        // device call, off the commit lock, identical to the serial path.
+        let hostphase = wave_host_phase_timing_enabled();
+        let wave_validate_started = hostphase.then(Instant::now);
+        let wave_unique_violations = self.wave_batch_validate_unique(&batch);
+        if let Some(started) = wave_validate_started {
+            WAVE_HOST_STATS[0]
+                .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }
+
+        let mut commit = self.commit_state();
+
+        // Stage 2 — parallel shard prep against the shared-ledger snapshot (`&commit.ledger` is
+        // borrowed immutably by the scoped workers; the coordinator resumes mutable use after join).
+        let shard_started = hostphase.then(Instant::now);
+        let mut verdicts =
+            self.shard_prepare_intents(&batch, &commit.ledger, &wave_unique_violations, shards);
+        if let Some(started) = shard_started {
+            // Charge the parallel prep to the conflict bucket (it subsumes conflict + reresolve).
+            WAVE_HOST_STATS[1]
+                .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }
+
+        // Stage 3 — the thin serial cut: ordered WAL append + global commit-seq + device buffer.
+        let mut wave_tail: Option<(Index, usize)> = None;
+        let mut committed: Vec<(usize, Index, bool)> = Vec::with_capacity(n);
+        let mut pending_appends: WavePendingAppends = BTreeMap::new();
+        let mut next_row_id = self.read_state.mvcc.current_row_id();
+        let cut_started = hostphase.then(Instant::now);
+        for position in 0..n {
+            match verdicts[position]
+                .take()
+                .expect("every position has a verdict")
+            {
+                ShardVerdict::Abort(err) => {
+                    batch[position].set_outcome(Err(err));
+                }
+                ShardVerdict::Commit {
+                    table,
+                    values,
+                    mut wal_record,
+                    wal_offset,
+                } => {
+                    let commit_seq = commit.repl.peek_next_index();
+                    let row_id = next_row_id;
+                    // Patch the pre-encoded W5a record's 8-byte row id (the only wave-time field).
+                    wal_record[wal_offset..wal_offset + 8].copy_from_slice(&row_id.to_le_bytes());
+                    let wal_payload: std::sync::Arc<[u8]> = std::sync::Arc::from(wal_record);
+                    let wal_len_before = commit.wal.len();
+                    commit.wal.append(WalRecord {
+                        txn_id: batch[position].txn_id,
+                        payload: wal_payload.clone(),
+                    });
+                    let wal_position = commit.wal.len();
+                    let token = match commit.repl.propose(wal_payload) {
+                        Ok(token) => token,
+                        Err(err) => {
+                            commit.wal.truncate(wal_len_before);
+                            batch[position].set_outcome(Err(ExecuteError::Engine(err)));
+                            continue;
+                        }
+                    };
+                    debug_assert_eq!(
+                        token.index, commit_seq,
+                        "the sequencer is the single proposer: the proposed index must equal the peek"
+                    );
+                    if let Err(err) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
+                        commit.repl.rollback_unapplied_from(commit_seq);
+                        commit.wal.truncate(wal_len_before);
+                        batch[position].set_outcome(Err(ExecuteError::Engine(err)));
+                        continue;
+                    }
+                    let timestamp_micros =
+                        wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
+                    commit.record_commit_timestamp(batch[position].txn_id, timestamp_micros);
+                    // Classic-path interop: record the write-set into the SHARED ledger (in wave
+                    // order) so later waves and the classic path see this commit. Same-slot dups
+                    // were already resolved by the workers (single-winner), so no two committed
+                    // items share a slot here — recording every winner is conflict-free.
+                    commit.ledger.record(&batch[position].write_set, commit_seq);
+                    // Elided apply == advance the row-id allocator + the elision counter (host store
+                    // skipped), exactly `apply_delta`'s elided-insert branch for one row.
+                    self.read_state.mvcc.advance_row_id(1);
+                    self.read_state
+                        .residency
+                        .host_install_elisions
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    commit.repl.mark_applied(commit_seq);
+                    next_row_id = self.read_state.mvcc.current_row_id();
+                    let entry = pending_appends.entry(table).or_default();
+                    entry.3.push(commit_seq);
+                    entry.0.push(values);
+                    entry.1.push(row_id);
+                    entry.2.push((position, commit_seq));
+                    wave_tail = Some((commit_seq, wal_position));
+                }
+            }
+        }
+        self.flush_wave_pending_appends(&mut pending_appends, &mut committed, &batch);
+        if let Some(started) = cut_started {
+            // Charge the ordered serial cut (WAL append + commit-seq + shared-ledger record +
+            // device buffer) to the `sequence` bucket — raw nanos; the bench divides by items.
+            WAVE_HOST_STATS[3]
+                .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }
+        // Prune the ledger once per wave below the oldest active snapshot (same as serial).
+        if let Some((last_seq, _)) = wave_tail {
+            let prune_boundary = self
+                .active_snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .oldest()
+                .map(|oldest| oldest.saturating_sub(1))
+                .unwrap_or(last_seq);
+            commit.ledger.prune_below(prune_boundary);
+        }
+        // === leave the commit critical section BEFORE the fsync (D3b group commit) ===
+        drop(commit);
+
+        let Some((last_seq, last_position)) = wave_tail else {
+            // Every item aborted pre-durable; outcomes are already set.
+            std::mem::forget(guard);
+            return None;
+        };
+
+        // Post-publish auto_admit re-admissions stay a SEQUENCER duty (identical to serial).
+        let mut admit_tables: BTreeSet<String> = BTreeSet::new();
+        if self.auto_admit_on_commit_enabled() {
+            for (position, _seq, appended) in &committed {
+                if !appended {
+                    admit_tables.extend(batch[*position].residency_tables.iter().cloned());
+                }
+            }
+        }
+        std::mem::forget(guard);
+        Some((
+            CommitWaveTail {
+                batch,
+                committed,
+                last_seq,
+                last_position,
+                armed: true,
+            },
+            admit_tables,
+        ))
+    }
+
+    /// E2.4a — the parallel shard-prep pass (Stage 2 of [`Engine::sequence_commit_wave_sharded`]).
+    /// Partitions the wave's positions across `shards` workers by hashing each row's single unique
+    /// slot (so same-slot rows land in the same worker) and, per worker, computes a per-position
+    /// [`ShardVerdict`] in wave-position order: 23505 for a committed-dup (device-locate verdict),
+    /// a retryable serialization abort for a shared-ledger conflict OR an intra-wave same-slot
+    /// duplicate (the per-shard private dedup set — lowest position wins), else a Commit carrying
+    /// the cloned row image + the cloned (still-placeholder-row-id) WAL record. `shared_ledger` is
+    /// read-only for the whole pass (the coordinator holds the commit lock and does not mutate it
+    /// until after join), so the workers see a consistent snapshot of all pre-wave commits.
+    fn shard_prepare_intents(
+        &self,
+        batch: &[CommitWaveItem],
+        shared_ledger: &crate::write_path::RecentCommitsLedger,
+        unique_violations: &std::collections::BTreeMap<usize, String>,
+        shards: usize,
+    ) -> Vec<Option<ShardVerdict>> {
+        let n = batch.len();
+        // Assign each position to a shard by its single unique slot (same slot → same shard).
+        let shard_of: Vec<usize> = (0..n)
+            .map(|pos| {
+                let (slot_id, value) = batch[pos].write_set.unique_slots_i32[0];
+                shard_index(slot_id, value, shards)
+            })
+            .collect();
+        let shard_of = &shard_of;
+        let mut results: Vec<Option<ShardVerdict>> = (0..n).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..shards)
+                .map(|s| {
+                    scope.spawn(move || {
+                        let mut private: std::collections::HashSet<crate::write_path::IntUniqueSlotKey> =
+                            std::collections::HashSet::new();
+                        let mut out: Vec<(usize, ShardVerdict)> = Vec::new();
+                        for pos in 0..n {
+                            if shard_of[pos] != s {
+                                continue;
+                            }
+                            let item = &batch[pos];
+                            let verdict = if let Some(msg) = unique_violations.get(&pos) {
+                                // Committed-dup: the same 23505 the serial device-locate verdict raises.
+                                ShardVerdict::Abort(ExecuteError::Engine(EngineError::ApplyFailed(
+                                    msg.clone(),
+                                )))
+                            } else if shared_ledger
+                                .conflicts(&item.write_set, item.read_snapshot)
+                            {
+                                let rs = item.read_snapshot;
+                                ShardVerdict::Abort(ExecuteError::Serialization(format!(
+                                    "write-write conflict on a key committed after read snapshot {rs}"
+                                )))
+                            } else {
+                                let slot = item.write_set.unique_slots_i32[0];
+                                if !private.insert(slot) {
+                                    // Intra-wave same-slot duplicate: the later position loses,
+                                    // exactly the serial integer-ledger first-committer-wins verdict.
+                                    let rs = item.read_snapshot;
+                                    ShardVerdict::Abort(ExecuteError::Serialization(format!(
+                                        "write-write conflict on a key committed after read snapshot {rs}"
+                                    )))
+                                } else {
+                                    let (template, offset) = item
+                                        .binary_wal_template
+                                        .as_ref()
+                                        .expect("sharded eligibility requires a binary WAL template");
+                                    let delta = item
+                                        .offlock_delta
+                                        .as_ref()
+                                        .expect("sharded eligibility requires an off-lock delta");
+                                    let crate::write_path::PreparedMutation::Insert {
+                                        table,
+                                        inserted_rows,
+                                        ..
+                                    } = &delta.mutation
+                                    else {
+                                        unreachable!("sharded eligibility gates to single-row inserts");
+                                    };
+                                    ShardVerdict::Commit {
+                                        table: table.clone(),
+                                        values: inserted_rows[0].1.clone(),
+                                        wal_record: template.to_vec(),
+                                        wal_offset: *offset as usize,
+                                    }
+                                }
+                            };
+                            out.push((pos, verdict));
+                        }
+                        out
+                    })
+                })
+                .collect();
+            for handle in handles {
+                for (pos, verdict) in handle.join().expect("shard worker panicked") {
+                    results[pos] = Some(verdict);
+                }
+            }
+        });
+        results
     }
 
     /// W2 — finish one pipelined wave tail: ONE group-durability wait covering every record the

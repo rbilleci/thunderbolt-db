@@ -336,6 +336,96 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
     );
 }
 
+/// E2.4a VARIANT 1 — SAME-PK single-winner ACROSS SHARD WORKERS. A LARGE homogeneous-intent wave
+/// (>= `SHARD_MIN_WAVE`) containing a duplicate PK takes the sharded sequencer when
+/// `GPU_DB_INTENT_SEQUENCER_SHARDS>1`; the duplicate must still resolve to exactly one winner (the
+/// per-shard private dedup set — same PK hashes to the same worker), and every distinct PK commits.
+/// Robust to either mode: under the default (shards=1, serial) the same invariant holds via the
+/// shared integer ledger. Run the sharded arm with `GPU_DB_INTENT_SEQUENCER_SHARDS=4`.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_intent_sharded_wave_same_pk_single_winner() {
+    let mut engine = Engine::new_local();
+    let txn_ids = AtomicU64::new(2);
+    let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
+        return; // driverless box
+    };
+
+    // Build ONE wave (submit everything before pumping): 200 distinct PKs plus a duplicate of the
+    // first, all in [600000, 600200). 201 items >= SHARD_MIN_WAVE forces the sharded fan-out.
+    const BASE: i32 = 600_000;
+    const DISTINCT: i32 = 200;
+    let mut tickets: Vec<_> = (0..DISTINCT)
+        .map(|i| {
+            engine
+                .submit_covered_insert_intent(
+                    txn_ids.fetch_add(1, Ordering::Relaxed),
+                    &route,
+                    &[BASE + i, i],
+                )
+                .expect("submit distinct")
+        })
+        .collect();
+    // The duplicate: same PK as position 0, later wave position → it must be the loser.
+    tickets.push(
+        engine
+            .submit_covered_insert_intent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &route,
+                &[BASE, 999],
+            )
+            .expect("submit dup"),
+    );
+
+    let mut results: Vec<Option<Result<(), _>>> = (0..tickets.len()).map(|_| None).collect();
+    let mut reaped = 0usize;
+    let mut spins = 0u32;
+    while reaped < tickets.len() {
+        engine.drive_commit_wave();
+        for (ticket, slot) in tickets.iter_mut().zip(results.iter_mut()) {
+            if slot.is_none() {
+                if let Some(result) = engine.poll_intent(ticket) {
+                    *slot = Some(result);
+                    reaped += 1;
+                }
+            }
+        }
+        spins += 1;
+        assert!(spins < 1_000_000, "sharded wave failed to drain");
+    }
+
+    let oks = results
+        .iter()
+        .filter(|r| r.as_ref().unwrap().is_ok())
+        .count();
+    let errs: Vec<String> = results
+        .iter()
+        .filter_map(|r| r.as_ref().unwrap().as_ref().err().map(|e| e.to_string()))
+        .collect();
+    assert_eq!(
+        oks,
+        DISTINCT as usize,
+        "every distinct PK commits; exactly the duplicate loses ({} errs: {:?})",
+        errs.len(),
+        errs
+    );
+    assert_eq!(errs.len(), 1, "exactly one loser (the duplicate): {errs:?}");
+    assert!(
+        errs[0].contains("conflict") || errs[0].contains("duplicate key"),
+        "duplicate loses as a first-committer-wins conflict: {}",
+        errs[0]
+    );
+
+    let count = engine
+        .execute_relational_select_text("SELECT COUNT(*) FROM t WHERE id >= 600000 AND id < 700000")
+        .unwrap();
+    assert!(
+        format!("{:?}", count.rows.row(0).first()).contains(&format!("({DISTINCT})")),
+        "exactly {DISTINCT} distinct rows visible: {:?}",
+        count.rows.row(0).first()
+    );
+}
+
 /// Rows the warm-up phase inserted (ids >= 1_000_000).
 fn warm_count(rows: &[Vec<SqlValue>]) -> usize {
     rows.iter()
