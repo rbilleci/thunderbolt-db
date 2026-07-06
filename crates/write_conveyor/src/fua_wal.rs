@@ -145,6 +145,11 @@ impl PaddedAtomicU64 {
     pub(crate) fn fetch_add(&self, value: u64) -> u64 {
         self.0.fetch_add(value, Ordering::AcqRel)
     }
+    pub(crate) fn compare_exchange(&self, current: u64, new: u64) -> bool {
+        self.0
+            .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
 }
 
 /// Optional per-block pipeline timestamps (nanoseconds from an internal base

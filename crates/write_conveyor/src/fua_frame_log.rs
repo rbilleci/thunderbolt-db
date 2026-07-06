@@ -148,6 +148,15 @@ pub struct FuaFrameLog {
     fences_completed: PaddedAtomicU64,
     publishing_finished: AtomicBool,
     fence_failed: AtomicBool,
+    /// PARK-WHEN-IDLE for fence lanes: idle lanes previously `yield_now`-spun
+    /// waiting for frames — with many lane sets (N logs x 16 lanes) the
+    /// spinning threads starve the whole host at low load (measured: 160
+    /// threads -> 6x ack inflation). Lanes spin briefly, then park here; the
+    /// appender wakes ONE parked lane per publish (any lane can serve any
+    /// frame — claims are CAS'd after wake, never pre-assigned). The hot path
+    /// (frames arriving within the spin window) never touches the mutex.
+    park: Mutex<usize>,
+    park_wake: std::sync::Condvar,
 }
 
 const FRAME_SLOTS: usize = 4096; // bounds in-flight frames; pacing keeps use << this
@@ -214,6 +223,8 @@ impl FuaFrameLog {
                 })
                 .collect(),
             published_frames: PaddedAtomicU64::zero(),
+            park: Mutex::new(0),
+            park_wake: std::sync::Condvar::new(),
             appender_taken: AtomicBool::new(false),
             fence_cursor: PaddedAtomicU64::zero(),
             durable_frontier: Mutex::new(0),
@@ -278,25 +289,81 @@ impl FuaFrameLog {
     }
 
     fn fence_lane_loop(&self) -> std::io::Result<u64> {
+        // Spin briefly before parking: at high rates the next frame lands
+        // within the window and the mutex is never touched.
+        const SPINS_BEFORE_PARK: u32 = 2_000;
         let mut fenced = 0_u64;
         loop {
-            let frame = self.fence_cursor.fetch_add(1);
-            loop {
-                if self.published_frames.load_acquire() > frame {
-                    break;
+            // WAIT for an unclaimed published frame, then CAS-claim it. Claims
+            // are taken only when work exists, so any parked lane can serve
+            // any frame and a single `notify_one` per publish suffices (no
+            // pre-assigned frame = no missed-wake hang, no thundering herd).
+            let frame = loop {
+                let claimed = self.fence_cursor.load_acquire();
+                let published = self.published_frames.load_acquire();
+                if published > claimed {
+                    if self.fence_cursor.compare_exchange(claimed, claimed + 1) {
+                        break claimed;
+                    }
+                    continue; // lost the claim race; re-check immediately
                 }
-                if self.publishing_finished.load(Ordering::Acquire)
-                    && self.published_frames.load_acquire() <= frame
-                {
+                if self.publishing_finished.load(Ordering::Acquire) {
                     return Ok(fenced);
                 }
-                std::thread::yield_now();
-            }
+                let mut spins = 0_u32;
+                let should_park = loop {
+                    let published = self.published_frames.load_acquire();
+                    if published > self.fence_cursor.load_acquire()
+                        || self.publishing_finished.load(Ordering::Acquire)
+                    {
+                        break false;
+                    }
+                    spins += 1;
+                    if spins >= SPINS_BEFORE_PARK {
+                        break true;
+                    }
+                    std::thread::yield_now();
+                };
+                if should_park {
+                    let mut parked = self.park.lock().unwrap_or_else(|p| p.into_inner());
+                    // Re-check UNDER the mutex (the publisher notifies under
+                    // it) so a publish between our check and the wait cannot
+                    // be missed.
+                    if self.published_frames.load_acquire() <= self.fence_cursor.load_acquire()
+                        && !self.publishing_finished.load(Ordering::Acquire)
+                    {
+                        *parked += 1;
+                        parked = self
+                            .park_wake
+                            .wait(parked)
+                            .unwrap_or_else(|p| p.into_inner());
+                        *parked = parked.saturating_sub(1);
+                    }
+                }
+            };
             if let Err(error) = self.fence_frame(frame) {
                 self.fence_failed.store(true, Ordering::Release);
+                // Wake everyone so sibling lanes observe the failure/finish
+                // promptly instead of parking forever.
+                self.park_wake.notify_all();
                 return Err(error);
             }
             fenced += 1;
+        }
+    }
+
+    /// Wake fence lanes after state they wait on changed (a publish or
+    /// finish). One frame needs one lane; `finish`/failure wake all.
+    fn wake_fence_lanes(&self, all: bool) {
+        // The mutex bounds the race with a parking lane (it re-checks under
+        // the lock before waiting); an EMPTY critical section is enough.
+        let parked = self.park.lock().unwrap_or_else(|p| p.into_inner());
+        if *parked > 0 {
+            if all {
+                self.park_wake.notify_all();
+            } else {
+                self.park_wake.notify_one();
+            }
         }
     }
 
@@ -446,6 +513,7 @@ impl FuaFrameLogAppender {
         self.next_offset += padded;
         self.next_frame = frame_id + 1;
         log.published_frames.store_release(self.next_frame);
+        log.wake_fence_lanes(false);
         Ok(FrameHandle {
             frame_id,
             last_seq: first_seq + seq_count as u64,
@@ -455,6 +523,7 @@ impl FuaFrameLogAppender {
     /// Declare publishing finished so fence lanes can drain and exit.
     pub fn finish(self) {
         self.log.publishing_finished.store(true, Ordering::Release);
+        self.log.wake_fence_lanes(true);
     }
 }
 
