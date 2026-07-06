@@ -406,6 +406,13 @@ duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — 
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
 at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
 
+**POST-PARK RECORD (2026-07-06): 1,677,904 sustained @ 12 drivers — the driver knee moved up once the
+fence threads stopped spinning.** With parked fence lanes the old 10-driver knee no longer binds:
+12 drivers / 10 pumps / window 6144 (73.7k population) = best-of-3 {1.23, 1.60, 1.68}M — the 1,677,904
+run beats the old 1,662,843 record at HALF the tail (p50 21.1 p90 30.8 vs p90 44.9); mean ~1.5M with
+±15% run variance. 14-16 drivers, 12 pumps, windows 7168/8192: all worse. Champion bench config is now
+WRITERS=12 (rest unchanged).
+
 **WORKLOAD ADAPTIVITY + THE FENCE-SPIN ARTIFACT (2026-07-06, user mandate: one system that adapts —
 minimal latency at low load, full throughput at high load).** TWO shipped mechanisms:
 (1) **FENCE-LANE PARK (write_conveyor/fua_frame_log.rs) — the decisive fix.** Idle fence lanes
