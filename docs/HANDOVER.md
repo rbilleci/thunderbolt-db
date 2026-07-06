@@ -406,6 +406,27 @@ duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — 
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
 at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
 
+**MEGA-FUSE RECON (2026-07-06): fused validate+apply sized; full probe-insert fusion blocked by host
+ordering, a bounded apply-fuse slice is available.** Validate chain = `wave_batch_locate_hit_counts_direct`
+(engine_retained_read.rs:1092) → `submit_multi_shard_i32_write_locate` (execution/src/lib.rs:11706, the
+proven M1 write-locate PTX), 4 driver calls per coalesced launch (needles HtoD, desc HtoD, launch, count
+DtoH). Apply chain = `lane_apply_merged` → `try_append_to_resident_open_shard` in-place branch: column
+append + created_by stamp + row_id stamp (3 HtoDs) + `submit_i32_index_insert` (4 calls) ≈ 7 driver
+calls/pass. SHARED STATE: both stages use the SAME per-shard device hash-index buffers and descriptors
+(validate probes, apply CAS-inserts) — one kernel could probe→branch→insert. BLOCKERS for the full fuse:
+winner selection needs the host SI ledger + WAL commit order (row ids/commit seqs are assigned
+post-conflict post-WAL propose; a device miss is not a commit), and count>0 hits still need the host
+tombstone recheck. REALISTIC SLICE: (a) fuse append+stamps+index_insert into ONE apply launch (~5 driver
+calls saved/pass, all buffers already shared); (b) feed validate's miss-set directly as the insert set;
+defer true probe-insert fusion until ordering is pre-resolved host-side and passed in. Expected gain is
+bounded (~10-20%: apply is already off the pump's critical path post-no-reap; validate's wait is
+coalescer-round queueing, not driver-call count) — the 2M+ jump likely needs the deeper redesign where
+winner identity is pre-resolved so probe-insert can fuse. VALIDATE-OVERLAP negative (tried, reverted):
+async-submit validate + overlapped ledger pass = statistically neutral best-of-3 {1.21,1.31,1.49}M —
+conflict pass hid behind the locate (130→80µs) but the coalescer-round wait dominates. Timeline
+observation: single seconds reach 2.08M; run-to-run and second-to-second variance ±30% is now the
+dominant unexplained factor.
+
 **NO-REAP PIPELINE + THE VALIDATE WALL (2026-07-06, `782213d9`): the pump is now fully non-blocking on
 apply; the remaining wall is the INLINE DEVICE VALIDATE.** No-reap: LaneSettle carries the ApplySlot,
 settlement queues at apply-push time, `drive_apply_queue_once` opportunistic leader passes, apply-failure
