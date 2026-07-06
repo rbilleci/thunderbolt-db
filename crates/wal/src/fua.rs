@@ -121,6 +121,16 @@ impl FuaWalBackend {
                 ))
             })?;
         }
+        // A plain serial WAL file at `<base>` is NOT ours to clobber — it may be a durable serial
+        // log, and it would later trip the mixed-backend reopen refusal. Fail closed and make the
+        // operator remove it deliberately (we only ever manage `<base>.fua.*` segments here).
+        if base_path.is_file() {
+            return Err(EngineError::Durability(format!(
+                "cannot create a fresh FUA WAL at {}: a plain serial WAL file already exists there; \
+                 remove it (it may be a durable serial log) before creating a FUA log",
+                base_path.display()
+            )));
+        }
         remove_stale_segments(&base_path);
         let segment_id = 1;
         let log = open_segment(&base_path, segment_id, segment_bytes)?;
@@ -333,7 +343,15 @@ impl FuaWalBackend {
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     // Slot ring momentarily full despite pacing (shouldn't happen with lanes <<
-                    // ring); back off and retry.
+                    // ring); back off and retry. Re-check the fail-closed state EVERY iteration so a
+                    // poisoned/fence-failed backend aborts here instead of spinning forever.
+                    if active.log.fence_failed() {
+                        self.set_poison("FUA fence lane failed");
+                        return Err(self.poison_error("FUA fence lane failed"));
+                    }
+                    if let Some(reason) = self.poison_reason() {
+                        return Err(self.poison_error(&reason));
+                    }
                     std::thread::yield_now();
                 }
                 Err(err) => {

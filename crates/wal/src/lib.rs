@@ -7402,4 +7402,144 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
+
+    /// E1 torn-tail crash safety: a crash that leaves the LAST frame's payload corrupt must recover
+    /// to the durable cut BEFORE the torn frame (the torn commit was never acknowledged), and a
+    /// reopen must chain new appends contiguously above that cut WITHOUT ever resurrecting the torn
+    /// frame.
+    #[cfg(unix)]
+    #[test]
+    fn fua_torn_tail_recovers_to_cut_and_reopen_chains_contiguously() {
+        // On-disk frame-log layout (crate `gpu_db_write_conveyor::fua_frame_log`): a 4096B file
+        // header, then each frame is a 64B header + payload padded up to a 4096B block. With tiny,
+        // individually-flushed records every frame is exactly one 4096B block, so frame `i`'s header
+        // sits at `4096 * (i + 1)` and its payload starts 64B later.
+        const FRAME_LOG_HEADER_BYTES: u64 = 4096;
+        const FRAME_ALIGN: u64 = 4096;
+        const FRAME_HEADER_BYTES: u64 = 64;
+
+        let base = fua_test_base("torn_tail");
+        // txn 5 is the record whose frame we tear; 1..=4 form the durable prefix.
+        let pre_tear = vec![
+            rec(1, b"CREATE TABLE t (id INT)"),
+            rec(2, b"INSERT INTO t (id) VALUES (1)"),
+            rec(3, b"INSERT INTO t (id) VALUES (2)"),
+            rec(4, b"INSERT INTO t (id) VALUES (3)"),
+        ];
+        let torn = rec(5, b"INSERT INTO t (id) VALUES (99)");
+
+        // Life 1: append + group-flush each record as its OWN frame (one 4096B block each) into a
+        // single large segment (no roll), then clean-drop so the file is fully written and closed.
+        {
+            let mut wal = WalBuffer::with_fua_durable_segment(&base, 8, 1 << 20).expect("create");
+            for record in pre_tear.iter().chain(std::iter::once(&torn)) {
+                wal.append(record.clone());
+                wal.flush_all().expect("flush frame");
+            }
+            assert_eq!(wal.flushed_count(), pre_tear.len() + 1);
+        }
+        // All five frames live in segment id 1 (no roll at 1 MiB); before tearing, all recover.
+        let seg1 = base.with_file_name("wal.segment.fua.1");
+        assert!(seg1.is_file(), "single un-rolled segment at id 1");
+        assert_eq!(
+            recover_fua_wal_records(&base)
+                .expect("pre-tear recover")
+                .len(),
+            pre_tear.len() + 1,
+            "all frames recover before the tear"
+        );
+
+        // Corrupt the LAST frame's first payload byte so its payload CRC fails on scan.
+        let last_frame_index = pre_tear.len() as u64; // 0-based index of txn 5's frame
+        let payload_offset =
+            FRAME_LOG_HEADER_BYTES + last_frame_index * FRAME_ALIGN + FRAME_HEADER_BYTES;
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&seg1)
+                .expect("open segment for corruption");
+            file.seek(SeekFrom::Start(payload_offset)).expect("seek");
+            let mut byte = [0u8; 1];
+            file.read_exact(&mut byte).expect("read payload byte");
+            byte[0] ^= 0xFF; // flip -> payload CRC no longer matches the frame header
+            file.seek(SeekFrom::Start(payload_offset))
+                .expect("seek back");
+            file.write_all(&byte).expect("write corrupted byte");
+            file.sync_all().expect("persist corruption");
+        }
+
+        // Recovery stops at the durable cut BEFORE the torn frame: only the pre-tear prefix.
+        let recovered_1 = recover_fua_wal_records(&base).expect("torn recover");
+        assert_eq!(
+            recovered_1, pre_tear,
+            "recovery stops at the durable cut before the torn frame"
+        );
+
+        // Reopen above the recovered cut, append more records, flush, clean-drop.
+        let post = vec![
+            rec(6, b"UPDATE t SET id = 4 WHERE id = 1"),
+            rec(7, b"DELETE FROM t WHERE id = 2"),
+        ];
+        {
+            let mut wal = WalBuffer::with_recovered_fua_durable_segment(
+                &base,
+                recovered_1.clone(),
+                8,
+                1 << 20,
+            )
+            .expect("reopen after tear");
+            assert_eq!(
+                wal.flushed_count(),
+                pre_tear.len(),
+                "reopen reports the durable cut as already durable"
+            );
+            for record in &post {
+                wal.append(record.clone());
+            }
+            wal.flush_all().expect("flush after reopen");
+            assert_eq!(wal.flushed_count(), pre_tear.len() + post.len());
+        }
+
+        // Re-recover across both segments: the history chains contiguously (pre-tear ++ new), with
+        // no gap and the torn frame (txn 5) NEVER resurrected.
+        let mut expected = pre_tear.clone();
+        expected.extend(post.clone());
+        let recovered_2 = recover_fua_wal_records(&base).expect("recover after reopen");
+        assert_eq!(
+            recovered_2, expected,
+            "post-reopen history chains pre-tear ++ new records with no gap"
+        );
+        assert!(
+            !recovered_2.iter().any(|r| r.txn_id == 5),
+            "the torn frame (txn 5) is never resurrected"
+        );
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+    }
+
+    /// A fresh FUA create must REFUSE to clobber a plain serial WAL file sitting at `<base>` — it
+    /// might be a durable serial log, and it would later trip the mixed-backend reopen refusal.
+    #[cfg(unix)]
+    #[test]
+    fn fua_create_refuses_to_clobber_a_plain_serial_file() {
+        let base = fua_test_base("serial_guard");
+        // A leftover plain serial WAL file exactly at `<base>`.
+        fs::write(&base, b"pretend durable serial WAL").expect("write serial file");
+
+        let err = WalBuffer::with_fua_durable_segment(&base, 8, 1 << 20)
+            .expect_err("fresh FUA create must fail when a plain serial file is present");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plain serial WAL file") && msg.contains("remove it"),
+            "error must tell the operator to remove the serial file: {msg}"
+        );
+        // Fail-closed: the serial file is NOT deleted, and no FUA segment was created.
+        assert!(base.is_file(), "serial file must be left intact");
+        assert!(
+            !fua_wal_segments_exist(&base),
+            "no FUA segment should be created on the refused path"
+        );
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+    }
 }
