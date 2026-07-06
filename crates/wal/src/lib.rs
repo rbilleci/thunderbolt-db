@@ -22,7 +22,7 @@ mod fua_lanes;
 #[cfg(unix)]
 pub use fua_lanes::{
     discover_lane_count, encode_lane_frame_payload, lane_segment_capacity_bytes, recover_lanes,
-    repair_lane_orphans, FuaWalLaneSet,
+    recover_lanes_from, repair_lane_orphans, repair_lane_orphans_from, FuaWalLaneSet,
 };
 
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
@@ -1515,6 +1515,178 @@ pub fn wal_checkpoint_segment_path(segment_path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("wal.segment");
     segment_path.with_file_name(format!("{file_name}.checkpoint"))
+}
+
+/// E2.5c-2 — the LANES CHECKPOINT (`<base>.lanes-checkpoint` + `<base>.lanes-checkpoint.seg.<cut>`):
+/// the database's history up to the checkpoint boundary lives in a GENERATION-pathed checkpoint
+/// segment (serial prefix ++ lane records `[0, lane_cut)` in global-merge order); lane logs are
+/// then only required to be contiguous FROM `lane_cut` (segments below it may be pruned /
+/// recycled). The SIDECAR IS THE SINGLE COMMIT POINT (audit finding: a control-file/sidecar
+/// split let a crash between two commit artifacts strand a repeat checkpoint unopenable): it
+/// names the segment file it commits to, it is written atomically (temp + rename + parent-dir
+/// fsync) only AFTER that segment is durable, each generation writes a NEW segment path (the
+/// prior checkpoint is never overwritten), and pruning runs only after the sidecar commit. A
+/// crash before the sidecar rename leaves the OLD checkpoint fully intact; after it, the NEW
+/// one — there is no intermediate state.
+pub fn lanes_checkpoint_sidecar_path(segment_path: &Path) -> PathBuf {
+    let file_name = segment_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wal.segment");
+    segment_path.with_file_name(format!("{file_name}.lanes-checkpoint"))
+}
+
+/// The generation-pathed checkpoint segment for baseline `lane_cut` (monotonic per database, so
+/// successive checkpoints never overwrite each other). See [`lanes_checkpoint_sidecar_path`].
+pub fn lanes_checkpoint_segment_path(segment_path: &Path, lane_cut: u64) -> PathBuf {
+    let file_name = segment_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wal.segment");
+    segment_path.with_file_name(format!("{file_name}.lanes-checkpoint.seg.{lane_cut}"))
+}
+
+const LANES_CHECKPOINT_MAGIC: &str = "gpu-db-lanes-checkpoint v1";
+
+/// A committed lanes checkpoint: the frozen serial prefix length, the lane baseline, and the
+/// full merged record history `serial ++ lanes[0, lane_cut)`.
+pub struct LanesCheckpoint {
+    pub serial_records: u64,
+    pub lane_cut: u64,
+    pub records: Vec<WalRecord>,
+}
+
+/// Commit a lanes checkpoint: write `records` (`== serial ++ lanes[0, lane_cut)`) to the NEW
+/// generation segment, fsync it durable, then atomically commit the sidecar naming it, then
+/// best-effort remove older generations. See [`lanes_checkpoint_sidecar_path`] for the crash
+/// contract. The CALLER prunes lane segments only after this returns.
+pub fn write_lanes_checkpoint(
+    segment_path: &Path,
+    serial_records: u64,
+    lane_cut: u64,
+    records: &[WalRecord],
+) -> Result<(), EngineError> {
+    if records.len() as u64 != serial_records + lane_cut {
+        return Err(EngineError::Durability(format!(
+            "lanes checkpoint of {} holds {} record(s) but declares serial {serial_records} + \
+             lane cut {lane_cut}",
+            segment_path.display(),
+            records.len()
+        )));
+    }
+    let seg_path = lanes_checkpoint_segment_path(segment_path, lane_cut);
+    write_wal_segment(&seg_path, records)?; // atomic temp + rename
+    sync_wal_parent_dir(&seg_path)?;
+    let seg_name = seg_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            EngineError::Durability(format!(
+                "lanes checkpoint segment path {} has no file name",
+                seg_path.display()
+            ))
+        })?
+        .to_string();
+    // THE COMMIT POINT: the sidecar rename. Before it, recovery reads the old checkpoint (or
+    // none); after it, the new one.
+    let path = lanes_checkpoint_sidecar_path(segment_path);
+    let temp = path.with_extension("lanes-checkpoint.tmp");
+    let body = format!("{LANES_CHECKPOINT_MAGIC} {serial_records} {lane_cut} {seg_name}\n");
+    (|| -> std::io::Result<()> {
+        {
+            let mut file = fs::File::create(&temp)?;
+            std::io::Write::write_all(&mut file, body.as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&temp, &path)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })()
+    .map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to commit lanes checkpoint sidecar {}: {err}",
+            path.display()
+        ))
+    })?;
+    // Retire older generations (best-effort; a leftover is re-collected next checkpoint).
+    if let (Some(parent), Some(stem)) = (
+        segment_path.parent().filter(|p| !p.as_os_str().is_empty()),
+        segment_path.file_name().and_then(|n| n.to_str()),
+    ) {
+        let prefix = format!("{stem}.lanes-checkpoint.seg.");
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Some(gen) = name
+                        .strip_prefix(&prefix)
+                        .and_then(|g| g.parse::<u64>().ok())
+                    {
+                        if gen < lane_cut {
+                            let _ = fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the committed lanes checkpoint: `Ok(None)` when absent (never checkpointed), the full
+/// [`LanesCheckpoint`] when present, and a loud error on any malformed/inconsistent state (a
+/// committed sidecar whose segment is missing or record-count-inconsistent must never silently
+/// re-derive a wrong baseline).
+pub fn read_lanes_checkpoint(segment_path: &Path) -> Result<Option<LanesCheckpoint>, EngineError> {
+    let path = lanes_checkpoint_sidecar_path(segment_path);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(EngineError::Durability(format!(
+                "failed to read lanes checkpoint sidecar {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let malformed = || {
+        EngineError::Durability(format!(
+            "malformed lanes checkpoint sidecar {} (content {content:?})",
+            path.display()
+        ))
+    };
+    let rest = content
+        .strip_prefix(LANES_CHECKPOINT_MAGIC)
+        .ok_or_else(malformed)?;
+    let mut fields = rest.split_whitespace();
+    let serial_records = fields
+        .next()
+        .and_then(|f| f.parse::<u64>().ok())
+        .ok_or_else(malformed)?;
+    let lane_cut = fields
+        .next()
+        .and_then(|f| f.parse::<u64>().ok())
+        .ok_or_else(malformed)?;
+    let seg_name = fields.next().ok_or_else(malformed)?.to_string();
+    if fields.next().is_some() {
+        return Err(malformed());
+    }
+    let seg_path = path.with_file_name(&seg_name);
+    let records = read_wal_segment(&seg_path)?;
+    if records.len() as u64 != serial_records + lane_cut {
+        return Err(EngineError::Durability(format!(
+            "lanes checkpoint segment {} holds {} record(s) but its sidecar commits to serial \
+             {serial_records} + lane cut {lane_cut}; refusing an inconsistent checkpoint",
+            seg_path.display(),
+            records.len()
+        )));
+    }
+    Ok(Some(LanesCheckpoint {
+        serial_records,
+        lane_cut,
+        records,
+    }))
 }
 
 const WAL_TAIL_MAGIC: &str = "GPUDBWALTAIL1";

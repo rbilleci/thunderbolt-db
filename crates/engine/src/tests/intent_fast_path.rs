@@ -267,7 +267,21 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
             mid, after_again,
             "second reopen must be row-identical including post-reopen lane commits"
         );
+        // E2.5c-2: LANES CHECKPOINT on the live recovered engine, then a THIRD reopen through
+        // the checkpoint path (sidecar commit + checkpoint-then-suffix replay) with row parity.
+        let baseline = recovered_again
+            .checkpoint_intent_lanes()
+            .expect("lanes checkpoint on the recovered engine");
         drop(recovered_again);
+        let recovered_from_checkpoint = Engine::open_durable_wal_segment_auto(&path).unwrap();
+        assert_eq!(
+            mid,
+            select_all_rows(&recovered_from_checkpoint),
+            "checkpointed reopen must be row-identical"
+        );
+        drop(recovered_from_checkpoint);
+        let _ = std::fs::remove_file(gpu_db_wal::lanes_checkpoint_sidecar_path(&path));
+        let _ = std::fs::remove_file(gpu_db_wal::lanes_checkpoint_segment_path(&path, baseline));
     } else {
         drop(recovered);
     }

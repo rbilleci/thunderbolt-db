@@ -223,6 +223,97 @@ impl Engine {
         }
     }
 
+    /// E2.5c-2 — LANES CHECKPOINT + TRUNCATION: bound the lane logs. Persists the FULL history
+    /// (the frozen pre-activation serial prefix, then the lane merge up to the cross-lane
+    /// durable cut) as a generation-pathed checkpoint segment committed by the atomic sidecar
+    /// (`<base>.lanes-checkpoint` — THE single commit point; see
+    /// [`gpu_db_wal::write_lanes_checkpoint`] for the crash contract), then retires every
+    /// rolled-away lane segment fully below the cut — one per lane feeds the backend's RECYCLE
+    /// pool (the pre-stager reuses its written extents on the next roll, skipping the prewrite
+    /// whose fsync is a device-wide NVMe FLUSH), the rest are deleted. Recover with
+    /// [`Engine::open_durable_wal_segment`], which reads the checkpoint and replays
+    /// checkpoint-then-lane-suffix. Safe under live intent traffic (the durable prefix is
+    /// byte-frozen; a raced scan fails closed with a retryable error).
+    ///
+    /// Requires ACTIVATED lanes (a pre-activation database checkpoints via the classic
+    /// [`Engine::checkpoint_and_truncate_durable_wal`]). Returns the new baseline (the lane cut).
+    pub fn checkpoint_intent_lanes(&self) -> Result<u64, EngineError> {
+        let lanes = self.intent_lanes.as_ref().ok_or_else(|| {
+            EngineError::Durability(
+                "checkpoint_intent_lanes requires lanes mode (GPU_DB_INTENT_LANES >= 2)"
+                    .to_string(),
+            )
+        })?;
+        if !lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(EngineError::Durability(
+                "intent lanes are not activated: checkpoint the serial WAL via \
+                 checkpoint_and_truncate_durable_wal instead"
+                    .to_string(),
+            ));
+        }
+        let _flight = lanes.checkpoint_lock.try_lock().map_err(|_| {
+            EngineError::Durability("a lanes checkpoint is already in progress".to_string())
+        })?;
+        let base = lanes.wal_lanes.base_path().to_path_buf();
+        let cut = lanes.wal_lanes.durable_cut();
+        // The serial prefix froze at activation (classic writes are refused), so the live
+        // WalBuffer holds exactly the pre-activation history.
+        let serial_records = {
+            let commit = self.commit_state();
+            if !commit.wal.is_durable() {
+                return Err(EngineError::Durability(
+                    "checkpoint_intent_lanes requires a durable WAL segment".to_string(),
+                ));
+            }
+            commit.wal.flushed_records().to_vec()
+        };
+        let serial_count = serial_records.len() as u64;
+        // Prior checkpoint (if any): its lane records [0, baseline) chain into the new one.
+        let prior = gpu_db_wal::read_lanes_checkpoint(&base)?;
+        let (baseline, prior_lane_records) = match prior {
+            Some(checkpoint) => {
+                if checkpoint.serial_records != serial_count {
+                    return Err(EngineError::Durability(format!(
+                        "lanes checkpoint records a serial prefix of {} but the live WAL holds \
+                         {serial_count}; the frozen-serial invariant is violated — refusing",
+                        checkpoint.serial_records
+                    )));
+                }
+                let mut records = checkpoint.records;
+                records.drain(..serial_count as usize);
+                (checkpoint.lane_cut, records)
+            }
+            None => (0, Vec::new()),
+        };
+        if cut == baseline {
+            // Nothing new to checkpoint — but still sweep (audit nit): a prior run that
+            // committed its checkpoint and then failed the prune leaves below-baseline
+            // segments lingering; the retry lands here and must reclaim the space.
+            lanes.wal_lanes.truncate_segments_below(cut)?;
+            return Ok(cut);
+        }
+        let mut checkpoint_records = serial_records;
+        checkpoint_records.extend(prior_lane_records);
+        // The lane suffix [baseline, cut): the durable prefix is byte-frozen, so a concurrent
+        // scan reliably reads it; a torn in-flight frame ABOVE the cut just ends the scan there.
+        let suffix = gpu_db_wal::recover_lanes_from(&base, lanes.lane_count, baseline)?;
+        let take = (cut - baseline) as usize;
+        if suffix.len() < take {
+            return Err(EngineError::Durability(format!(
+                "lanes checkpoint scan recovered {} record(s) above baseline {baseline} but the \
+                 durable cut is {cut}; the scan raced a roll — retry the checkpoint",
+                suffix.len()
+            )));
+        }
+        checkpoint_records.extend(suffix.into_iter().take(take));
+        // ONE commit point (segment durable first, then the atomic sidecar rename), THEN prune.
+        gpu_db_wal::write_lanes_checkpoint(&base, serial_count, cut, &checkpoint_records)?;
+        // Prune: retire rolled-away lane segments fully below the new baseline (recycle one per
+        // lane, delete the rest).
+        lanes.wal_lanes.truncate_segments_below(cut)?;
+        Ok(cut)
+    }
+
     /// AUDIT F5 guard: archive/PITR excludes lane commits in lanes mode (the
     /// lane logs are not archived until E2.5c). Fail loudly rather than
     /// persist a timeline that silently drops every lane insert.

@@ -66,8 +66,9 @@ enum PrestageSlot {
     Empty,
     /// The background thread is prewriting segment `id` at the temp path.
     Pending(u64),
-    /// Segment `id` is prewritten at the temp path, ready to rename + swap in.
-    Ready(u64, Arc<FuaFrameLog>),
+    /// Segment `id` is prewritten at the temp path, ready to rename + swap in; the bool
+    /// records whether it was RECYCLED from a retired file (telemetry).
+    Ready(u64, Arc<FuaFrameLog>, bool),
     /// Pre-create failed; the next roll surfaces this and wedges the backend.
     Failed(String),
 }
@@ -103,6 +104,15 @@ pub(crate) struct FuaWalBackend {
     stats: Mutex<WalGroupCommitStats>,
     /// See [`PrestageSlot`]: the next segment, prewritten off the roll path.
     prestaged: Arc<(Mutex<PrestageSlot>, Condvar)>,
+    /// RECYCLE pool (E2.5c-2): retired segment files offered back by checkpoint truncation.
+    /// The pre-stager consumes one instead of prewriting a fresh file — the retired file's
+    /// extents are already WRITTEN, so the ~100ms prewrite (whose fsync is a device-wide NVMe
+    /// FLUSH landing during live FUA fencing) is skipped entirely. Epoch safety: the file gets
+    /// a fresh monotonic segment id, so its previous life's frames are scan-rejected
+    /// (`WAL_SEGMENT_FLAG_EPOCH_STAMPED` law, frame-log epoch field).
+    recycle_pool: Arc<Mutex<Vec<PathBuf>>>,
+    /// Segments actually recycled into service (non-vacuity telemetry).
+    stat_recycled: AtomicU64,
 }
 
 impl std::fmt::Debug for FuaWalBackend {
@@ -176,6 +186,8 @@ impl FuaWalBackend {
             poisoned: std::sync::atomic::AtomicBool::new(false),
             stats: Mutex::new(WalGroupCommitStats::default()),
             prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
+            recycle_pool: Arc::new(Mutex::new(Vec::new())),
+            stat_recycled: AtomicU64::new(0),
         };
         backend.kick_prestage();
         Ok(backend)
@@ -242,6 +254,8 @@ impl FuaWalBackend {
             poisoned: std::sync::atomic::AtomicBool::new(false),
             stats: Mutex::new(WalGroupCommitStats::default()),
             prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
+            recycle_pool: Arc::new(Mutex::new(Vec::new())),
+            stat_recycled: AtomicU64::new(0),
         };
         backend.kick_prestage();
         Ok(backend)
@@ -289,6 +303,74 @@ impl FuaWalBackend {
     pub(crate) fn fence_latency_stats(&self) -> (u64, u64) {
         let active = self.lock_active();
         active.log.fence_latency_stats()
+    }
+
+    /// Segments recycled into service by the pre-stager (non-vacuity telemetry).
+    pub(crate) fn recycled_segments(&self) -> u64 {
+        self.stat_recycled.load(Ordering::Relaxed)
+    }
+
+    /// E2.5c-2 CHECKPOINT TRUNCATION: retire every NON-ACTIVE segment whose frames all lie
+    /// below `cut_end` (its records are checkpoint-covered and never needed by recovery again —
+    /// the caller made the checkpoint + its baseline sidecar durable FIRST). One retired file is
+    /// kept in the recycle pool for the pre-stager; the rest are deleted. Returns the number of
+    /// segments retired. Concurrent-safe with live appends: the active segment (and anything
+    /// newer) is never touched, and retired segments are by definition rolled-away (drained,
+    /// byte-frozen).
+    pub(crate) fn retire_segments_below(&self, cut_end: u64) -> Result<usize, EngineError> {
+        let active_id = self.lock_active().segment_id;
+        let Some(stem) = self.base_path.file_name().and_then(|n| n.to_str()) else {
+            return Ok(0);
+        };
+        let mut retired = 0usize;
+        for path in fua_segment_paths_sorted(&self.base_path)? {
+            let Some(id) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|name| parse_segment_id(name, stem))
+            else {
+                continue;
+            };
+            if id >= active_id {
+                continue; // never touch the active (or a newer) segment
+            }
+            {
+                // Already offered to the recycle pool by an earlier pass — leave it for the
+                // pre-stager (deleting it here would strand a dangling pool entry).
+                let pool = self.recycle_pool.lock().unwrap_or_else(|p| p.into_inner());
+                if pool.iter().any(|pooled| pooled == &path) {
+                    continue;
+                }
+            }
+            let frames = recover_frame_log_by_scan(&path).map_err(|err| {
+                EngineError::Durability(format!(
+                    "failed to scan FUA WAL segment {} for retirement: {err}",
+                    path.display()
+                ))
+            })?;
+            let max_end = frames
+                .iter()
+                .map(|frame| frame.first_seq + frame.seq_count as u64)
+                .max()
+                .unwrap_or(0);
+            if max_end > cut_end {
+                continue; // still holds records above the checkpoint baseline
+            }
+            let mut pool = self.recycle_pool.lock().unwrap_or_else(|p| p.into_inner());
+            if pool.is_empty() {
+                pool.push(path);
+            } else {
+                drop(pool);
+                std::fs::remove_file(&path).map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to delete retired FUA WAL segment {}: {err}",
+                        path.display()
+                    ))
+                })?;
+            }
+            retired += 1;
+        }
+        Ok(retired)
     }
 
     pub(crate) fn group_commit_stats(&self) -> WalGroupCommitStats {
@@ -420,21 +502,49 @@ impl FuaWalBackend {
         let slot = Arc::clone(&self.prestaged);
         let temp = prestage_file_path(&self.base_path);
         let segment_bytes = self.segment_bytes;
+        let recycle_pool = Arc::clone(&self.recycle_pool);
         std::thread::spawn(move || {
             // A stale temp from a crashed prior life (or an unrolled leftover) is ours to clobber.
             let _ = std::fs::remove_file(&temp);
-            let config = FuaFrameLogConfig {
-                path: temp,
-                segment_id: id,
-                capacity_bytes: segment_bytes,
+            // RECYCLE arm (E2.5c-2): reuse a retired segment file when one is offered — its
+            // extents are already written, so the whole prewrite (fallocate + zero-fill + the
+            // fsync that lands a device-wide NVMe FLUSH during live fencing) is skipped. The
+            // fresh monotonic id epoch-stamps the header so the previous life's frames are
+            // scan-rejected. Any recycle failure (geometry drift, rename error) falls back to
+            // the fresh-create arm — recycle is an optimization, never a correctness gate.
+            let recycled = recycle_pool
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop()
+                .and_then(|retired| {
+                    std::fs::rename(&retired, &temp).ok()?;
+                    let config = FuaFrameLogConfig {
+                        path: temp.clone(),
+                        segment_id: id,
+                        capacity_bytes: segment_bytes,
+                    };
+                    // Safety: the temp path is owned exclusively by this backend (one prestage
+                    // in flight; renamed to its final segment name before any other opener).
+                    unsafe { FuaFrameLog::recycle(config) }.ok()
+                });
+            let result = match recycled {
+                Some(log) => Ok((log, true)),
+                None => {
+                    // Fresh create (a failed recycle above may have left a stale temp — clobber).
+                    let _ = std::fs::remove_file(&temp);
+                    let config = FuaFrameLogConfig {
+                        path: temp,
+                        segment_id: id,
+                        capacity_bytes: segment_bytes,
+                    };
+                    // Safety: as above — exclusive temp-path ownership.
+                    unsafe { FuaFrameLog::create(config) }.map(|log| (log, false))
+                }
             };
-            // Safety: the temp path is owned exclusively by this backend (one prestage in flight;
-            // the file is renamed to its final segment name before any other opener exists).
-            let result = unsafe { FuaFrameLog::create(config) };
             let (lock, cvar) = &*slot;
             let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             *guard = match result {
-                Ok(log) => PrestageSlot::Ready(id, log),
+                Ok((log, was_recycled)) => PrestageSlot::Ready(id, log, was_recycled),
                 Err(err) => PrestageSlot::Failed(format!("{err}")),
             };
             cvar.notify_all();
@@ -449,9 +559,9 @@ impl FuaWalBackend {
     fn take_prestaged(&self) -> Result<(u64, Arc<FuaFrameLog>), EngineError> {
         let (lock, cvar) = &*self.prestaged;
         let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-        let (id, log) = loop {
+        let (id, log, was_recycled) = loop {
             match std::mem::replace(&mut *guard, PrestageSlot::Empty) {
-                PrestageSlot::Ready(id, log) => break (id, log),
+                PrestageSlot::Ready(id, log, was_recycled) => break (id, log, was_recycled),
                 PrestageSlot::Failed(reason) => {
                     return Err(EngineError::Durability(format!(
                         "FUA segment pre-create failed: {reason}"
@@ -486,6 +596,9 @@ impl FuaWalBackend {
                 "failed to fsync FUA WAL directory after segment rename: {err}"
             ))
         })?;
+        if was_recycled {
+            self.stat_recycled.fetch_add(1, Ordering::Relaxed);
+        }
         Ok((id, log))
     }
 

@@ -604,10 +604,18 @@ impl Engine {
                 segment_path.display()
             )));
         }
+        // E2.5c-2: a lanes CHECKPOINT shifts the lane merge to its baseline — records below it
+        // live in the checkpoint segment (which embeds the serial prefix too; the atomic
+        // sidecar is the single commit point) and the lane logs may be pruned below it.
+        let lanes_checkpoint = gpu_db_wal::read_lanes_checkpoint(segment_path)?;
+        let baseline = lanes_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.lane_cut)
+            .unwrap_or(0);
         // Lane repair BEFORE recovery: durably discard orphan frames above the cross-lane cut
         // (never acknowledged — acks gate on cut coverage — so nothing a client saw is lost;
         // see `gpu_db_wal::repair_lane_orphans`).
-        let repaired = gpu_db_wal::repair_lane_orphans(segment_path, lane_count)?;
+        let repaired = gpu_db_wal::repair_lane_orphans_from(segment_path, lane_count, baseline)?;
         if repaired > 0 {
             eprintln!(
                 "[gpu-db] lanes reopen of {}: discarded {repaired} never-acknowledged orphan \
@@ -615,14 +623,14 @@ impl Engine {
                 segment_path.display()
             );
         }
-        let lane_records = gpu_db_wal::recover_lanes(segment_path, lane_count)?;
+        let lane_records = gpu_db_wal::recover_lanes_from(segment_path, lane_count, baseline)?;
 
         let mut engine = Self::with_planner_config(planner_cfg);
-        // Replay serial-then-lanes WITHOUT durable backing (no segment I/O), then install the
-        // continuation backends. The serial prefix's record count IS `base_seq`: activation
-        // seeded the oracle from `repl.peek_next_index()` while the serial log was the only
-        // log, and the v1 guard refuses classic writes afterwards, so the serial log froze at
-        // exactly that index.
+        // Replay (checkpoint | serial)-then-lanes WITHOUT durable backing (no segment I/O),
+        // then install the continuation backends. The serial prefix's record count IS
+        // `base_seq`: activation seeded the oracle from `repl.peek_next_index()` while the
+        // serial log was the only log, and the v1 guard refuses classic writes afterwards, so
+        // the serial log froze at exactly that index.
         let serial_records: Vec<gpu_db_wal::WalRecord>;
         let serial_recovery: Option<gpu_db_wal::WalSegmentRecovery>;
         if fua_present {
@@ -637,23 +645,49 @@ impl Engine {
             serial_recovery = None;
         }
         let initial_index = engine.commit_state().repl.peek_next_index();
-        for record in &serial_records {
-            engine.commit_mutation(record.txn_id, record.payload.clone())?;
-        }
-        let base_seq = engine.commit_state().repl.peek_next_index();
-        if base_seq != initial_index + serial_records.len() as u64 {
+        let serial_count = if let Some(checkpoint) = &lanes_checkpoint {
+            // CHECKPOINT REPLAY: the checkpoint segment holds serial ++ lanes[0, lane_cut)
+            // (count-verified against its commit sidecar by read_lanes_checkpoint); the
+            // on-disk serial log is its (frozen) head and is NOT replayed again — it is only
+            // installed below as the WalBuffer continuation.
+            if !serial_records.is_empty()
+                && serial_records.len() as u64 != checkpoint.serial_records
+            {
+                return Err(EngineError::Durability(format!(
+                    "lanes reopen of {}: the serial log holds {} record(s) but the checkpoint \
+                     froze it at {}; the frozen-serial invariant is violated — refusing",
+                    segment_path.display(),
+                    serial_records.len(),
+                    checkpoint.serial_records
+                )));
+            }
+            for record in &checkpoint.records {
+                engine.commit_mutation(record.txn_id, record.payload.clone())?;
+            }
+            checkpoint.serial_records
+        } else {
+            for record in &serial_records {
+                engine.commit_mutation(record.txn_id, record.payload.clone())?;
+            }
+            serial_records.len() as u64
+        };
+        let base_seq = initial_index + serial_count;
+        let replayed_prefix = engine.commit_state().repl.peek_next_index();
+        if replayed_prefix != base_seq + baseline {
             return Err(EngineError::Durability(format!(
-                "lanes reopen of {}: serial replay advanced the commit index to {base_seq} \
-                 (started at {initial_index}) but the serial log holds {} record(s); the lane \
-                 base seq would be wrong — refusing",
+                "lanes reopen of {}: prefix replay advanced the commit index to \
+                 {replayed_prefix} (started at {initial_index}) but expected {} (serial \
+                 {serial_count} + lane baseline {baseline}); the lane base seq would be wrong — \
+                 refusing",
                 segment_path.display(),
-                serial_records.len()
+                base_seq + baseline
             )));
         }
         for record in &lane_records {
             engine.commit_mutation(record.txn_id, record.payload.clone())?;
         }
-        let lane_record_count = lane_records.len() as u64;
+        // Lane-local history length: checkpointed lane records + the recovered suffix.
+        let lane_record_count = baseline + lane_records.len() as u64;
         let next_seq = engine.commit_state().repl.peek_next_index();
         if next_seq != base_seq + lane_record_count {
             return Err(EngineError::Durability(format!(
@@ -719,11 +753,12 @@ impl Engine {
                 .map(|capacity| capacity as usize)
                 .unwrap_or_else(engine_intent_lanes::intent_lane_segment_bytes),
         };
-        let wal_lanes = gpu_db_wal::FuaWalLaneSet::reopen(
+        let wal_lanes = gpu_db_wal::FuaWalLaneSet::reopen_from(
             segment_path,
             lane_count,
             fence_lanes,
             lane_segment_bytes,
+            baseline,
         )?;
         let state = engine_intent_lanes::IntentLaneState::fresh(lane_count, fence_lanes, wal_lanes);
         if lane_record_count > 0 {
@@ -827,6 +862,13 @@ impl Engine {
         segment_path: impl AsRef<std::path::Path>,
     ) -> Result<Self, EngineError> {
         let segment_path = segment_path.as_ref();
+        // E2.5c-2: a LANES database routes through the plain open, which itself detects the
+        // lanes checkpoint sidecar and replays checkpoint-then-lane-suffix (the serial
+        // checkpoint-open below cannot cover lane logs).
+        #[cfg(unix)]
+        if Self::intent_lane_files_exist(segment_path) {
+            return Self::open_durable_wal_segment(segment_path);
+        }
         let control_path = gpu_db_wal::wal_checkpoint_control_path(segment_path);
         if control_path.exists() {
             Self::open_durable_wal_segment_with_checkpoint(control_path, segment_path)

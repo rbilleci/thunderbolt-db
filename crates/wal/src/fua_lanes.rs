@@ -204,8 +204,23 @@ impl FuaWalLaneSet {
         fence_lanes: usize,
         segment_bytes: usize,
     ) -> Result<Self, EngineError> {
+        Self::reopen_from(base, lane_count, fence_lanes, segment_bytes, 0)
+    }
+
+    /// [`Self::reopen`] over a CHECKPOINTED lane set: records below `baseline` live in an
+    /// external checkpoint (see the engine's lanes checkpoint) and the lane logs are only
+    /// required to be contiguous FROM `baseline`; frames fully below it may have been pruned
+    /// (or may still exist — the crash window between the checkpoint write and the prune —
+    /// and are then skipped as checkpoint-covered duplicates).
+    pub fn reopen_from(
+        base: impl Into<PathBuf>,
+        lane_count: usize,
+        fence_lanes: usize,
+        segment_bytes: usize,
+        baseline: u64,
+    ) -> Result<Self, EngineError> {
         let base = base.into();
-        let recovery = recover_lanes_detailed(&base, lane_count)?;
+        let recovery = recover_lanes_detailed(&base, lane_count, baseline)?;
         if recovery.records.len() != recovery.total_scanned {
             return Err(EngineError::Durability(format!(
                 "cannot reopen FUA WAL lane set at {}: {} durable record(s) lie ABOVE the global \
@@ -213,7 +228,7 @@ impl FuaWalLaneSet {
                  reopening so no acked seq is lost",
                 base.display(),
                 recovery.total_scanned - recovery.records.len(),
-                recovery.records.len(),
+                recovery.next_seq,
             )));
         }
         let mut lanes = Vec::with_capacity(lane_count);
@@ -349,6 +364,28 @@ impl FuaWalLaneSet {
         advanced
     }
 
+    /// E2.5c-2 CHECKPOINT TRUNCATION, lock-step with the cross-lane cut: retire every rolled-away
+    /// lane segment whose frames all lie below `baseline` (the checkpoint's lane cut — the caller
+    /// made the checkpoint + baseline sidecar DURABLE first; records below it are never read
+    /// again). Per lane, one retired file feeds the backend's RECYCLE pool (the pre-stager
+    /// reuses its written extents on the next roll); the rest are deleted. Returns segments
+    /// retired across all lanes. Safe under live appends (active segments are never touched).
+    pub fn truncate_segments_below(&self, baseline: u64) -> Result<usize, EngineError> {
+        let mut retired = 0usize;
+        for lane in &self.lanes {
+            retired += lane.backend.retire_segments_below(baseline)?;
+        }
+        Ok(retired)
+    }
+
+    /// Segments recycled into service across all lanes (non-vacuity telemetry).
+    pub fn recycled_segments(&self) -> u64 {
+        self.lanes
+            .iter()
+            .map(|lane| lane.backend.recycled_segments())
+            .sum()
+    }
+
     /// Aggregate publish->fence-done latency across all lanes' ACTIVE
     /// segments: (total ns, fenced frames).
     pub fn fence_latency_stats(&self) -> (u64, u64) {
@@ -405,18 +442,26 @@ impl FuaWalLaneSet {
 /// Rich result of a lane-set merge recovery (the reopen path needs the torn-tail detection and the
 /// per-lane continuation baselines; [`recover_lanes`] exposes only `records`).
 struct LaneRecovery {
-    /// Records in ascending GLOBAL seq, up to (exclusive) the first missing seq.
+    /// Records in ascending GLOBAL seq from the baseline, up to (exclusive) the first missing seq.
     records: Vec<WalRecord>,
-    /// Total records scanned across all lanes (>= `records.len()`; a surplus means orphans above
-    /// the cut — a torn tail).
+    /// Total records AT/ABOVE the baseline scanned across all lanes (>= `records.len()`; a
+    /// surplus means orphans above the cut — a torn tail). Below-baseline records (checkpoint-
+    /// covered, possibly not yet pruned) are skipped and not counted.
     total_scanned: usize,
-    /// The next global seq to assign on reopen (== `records.len()`).
+    /// The next global seq to assign on reopen (== `baseline + records.len()`).
     next_seq: u64,
     /// Per-lane highest durable global end (the lane's reopen continuation baseline).
     lane_ends: Vec<u64>,
 }
 
-fn recover_lanes_detailed(base: &Path, lane_count: usize) -> Result<LaneRecovery, EngineError> {
+/// Merge recovery from `baseline` upward: records below `baseline` live in an external
+/// checkpoint and are skipped (they may still be on disk — the checkpoint-then-prune crash
+/// window); contiguity is enforced from `baseline`. `baseline == 0` is the plain full merge.
+fn recover_lanes_detailed(
+    base: &Path,
+    lane_count: usize,
+    baseline: u64,
+) -> Result<LaneRecovery, EngineError> {
     if lane_count == 0 {
         return Err(EngineError::Durability(
             "FUA WAL lane set recovery requires at least one lane".to_string(),
@@ -429,7 +474,7 @@ fn recover_lanes_detailed(base: &Path, lane_count: usize) -> Result<LaneRecovery
         return Ok(LaneRecovery {
             records: Vec::new(),
             total_scanned: 0,
-            next_seq: 0,
+            next_seq: baseline,
             lane_ends,
         });
     }
@@ -471,6 +516,11 @@ fn recover_lanes_detailed(base: &Path, lane_count: usize) -> Result<LaneRecovery
                 }
                 for (offset, record) in decoded.into_iter().enumerate() {
                     let seq = frame.first_seq + offset as u64;
+                    if seq < baseline {
+                        // Checkpoint-covered (the prune may not have removed this frame yet —
+                        // the checkpoint-then-prune crash window). Skip, don't count.
+                        continue;
+                    }
                     if by_seq.insert(seq, record).is_some() {
                         return Err(EngineError::Durability(format!(
                             "FUA WAL lane set at {} has duplicate global seq {seq} (lane {lane_id} \
@@ -486,16 +536,18 @@ fn recover_lanes_detailed(base: &Path, lane_count: usize) -> Result<LaneRecovery
     }
 
     let total_scanned = by_seq.len();
-    // Contiguous global prefix from 0; the first missing seq (a torn tail in some lane, or an
-    // unclaimed seq) truncates the global history there — fail-closed.
+    // Contiguous global prefix from the baseline; the first missing seq (a torn tail in some
+    // lane, or an unclaimed seq) truncates the global history there — fail-closed.
     let mut records = Vec::new();
-    for (expected_seq, (seq, record)) in by_seq.into_iter().enumerate() {
-        if seq != expected_seq as u64 {
+    let mut expected_seq = baseline;
+    for (seq, record) in by_seq {
+        if seq != expected_seq {
             break;
         }
         records.push(record);
+        expected_seq += 1;
     }
-    let next_seq = records.len() as u64;
+    let next_seq = baseline + records.len() as u64;
     Ok(LaneRecovery {
         records,
         total_scanned,
@@ -524,7 +576,18 @@ pub fn recover_lanes(
     base_path: impl AsRef<Path>,
     lane_count: usize,
 ) -> Result<Vec<WalRecord>, EngineError> {
-    Ok(recover_lanes_detailed(base_path.as_ref(), lane_count)?.records)
+    Ok(recover_lanes_detailed(base_path.as_ref(), lane_count, 0)?.records)
+}
+
+/// [`recover_lanes`] over a CHECKPOINTED lane set: the merged records FROM `baseline` upward
+/// (records below it live in the external checkpoint; on-disk frames below it — the
+/// checkpoint-then-prune crash window — are skipped).
+pub fn recover_lanes_from(
+    base_path: impl AsRef<Path>,
+    lane_count: usize,
+    baseline: u64,
+) -> Result<Vec<WalRecord>, EngineError> {
+    Ok(recover_lanes_detailed(base_path.as_ref(), lane_count, baseline)?.records)
 }
 
 /// DISK-AUTHORITATIVE lane count for an existing lane set at `base_path`: `Some(N)` when lane
@@ -570,8 +633,19 @@ pub fn repair_lane_orphans(
     base_path: impl AsRef<Path>,
     lane_count: usize,
 ) -> Result<u64, EngineError> {
+    repair_lane_orphans_from(base_path, lane_count, 0)
+}
+
+/// [`repair_lane_orphans`] over a CHECKPOINTED lane set (contiguity from `baseline`; see
+/// [`recover_lanes_from`]). The caller MUST pass the checkpoint baseline when one exists —
+/// repairing a pruned set from 0 would see an empty from-zero prefix and discard everything.
+pub fn repair_lane_orphans_from(
+    base_path: impl AsRef<Path>,
+    lane_count: usize,
+    baseline: u64,
+) -> Result<u64, EngineError> {
     let base = base_path.as_ref();
-    let recovery = recover_lanes_detailed(base, lane_count)?;
+    let recovery = recover_lanes_detailed(base, lane_count, baseline)?;
     let orphans = (recovery.total_scanned - recovery.records.len()) as u64;
     if orphans == 0 {
         return Ok(0);
@@ -603,7 +677,7 @@ pub fn repair_lane_orphans(
         }
     }
     // Fail-closed verification: the repaired set must recover CLEAN at the same cut.
-    let verify = recover_lanes_detailed(base, lane_count)?;
+    let verify = recover_lanes_detailed(base, lane_count, baseline)?;
     if verify.records.len() != verify.total_scanned || verify.next_seq != cut {
         return Err(EngineError::Durability(format!(
             "FUA WAL lane orphan repair at {} did not converge (cut {} -> {}, {} record(s) still \
@@ -870,6 +944,119 @@ mod tests {
             repair_lane_orphans(&base, lane_count).expect("noop repair"),
             0
         );
+        cleanup(&base, lane_count);
+    }
+
+    /// E2.5c-2 — the full truncation/recycle/baseline arc: force multi-segment lanes with tiny
+    /// segments, checkpoint-truncate at the cut, verify (a) rolled-away segments are physically
+    /// retired, (b) baseline recovery returns exactly the suffix, (c) reopen_from continues
+    /// appending above the baseline, and (d) the pre-stager RECYCLES a retired file (telemetry
+    /// counter — output equality can't prove reuse).
+    #[test]
+    fn checkpoint_truncation_retires_segments_and_recycles_into_the_prestager() {
+        let base = test_base("truncate-recycle");
+        let lane_count = 2usize;
+        // Tiny segments: one 4KiB frame per record + 4KiB header -> capacity 16KiB holds 3
+        // frames, so 30 records/lane roll through ~10 segments per lane.
+        let tiny = 16 << 10;
+        let total = 60u64;
+        {
+            let set = FuaWalLaneSet::create(&base, lane_count, 2, tiny).expect("create");
+            append_round_robin(&set, total);
+            set.wait_durable(total).expect("durable");
+        }
+        let files_per_lane = |lane: usize| {
+            fua_segment_paths_sorted(&lane_base_path(&base, lane))
+                .expect("paths")
+                .len()
+        };
+        let before = files_per_lane(0) + files_per_lane(1);
+        assert!(
+            before > 6,
+            "premise: rolls produced many segments ({before})"
+        );
+
+        // Checkpoint at the full cut (baseline 60): everything is checkpoint-covered.
+        {
+            let set =
+                FuaWalLaneSet::reopen_from(&base, lane_count, 2, tiny, total).expect("reopen");
+            let retired = set.truncate_segments_below(total).expect("truncate");
+            assert!(
+                retired >= before.saturating_sub(4),
+                "most rolled-away segments must retire (retired {retired} of {before})"
+            );
+            let after = files_per_lane(0) + files_per_lane(1);
+            assert!(
+                after < before,
+                "files must shrink: {before} -> {after} (retired {retired})"
+            );
+            // Baseline recovery over the truncated set: empty suffix, clean.
+            assert_eq!(
+                recover_lanes_from(&base, lane_count, total)
+                    .expect("recover from baseline")
+                    .len(),
+                0
+            );
+            // Continue appending above the baseline; enough volume to force ROLLS so the
+            // pre-stager consumes the recycled files.
+            for seq in total..total + 40 {
+                let lane = (seq % lane_count as u64) as usize;
+                set.append(lane, seq, &[record(seq)]).expect("append");
+            }
+            set.wait_durable(total + 40).expect("durable suffix");
+            assert!(
+                set.recycled_segments() >= 1,
+                "the pre-stager must have RECYCLED at least one retired segment (got {})",
+                set.recycled_segments()
+            );
+            // The suffix recovers from the baseline.
+            let suffix = recover_lanes_from(&base, lane_count, total).expect("suffix");
+            assert_eq!(suffix.len(), 40);
+            for (offset, rec) in suffix.iter().enumerate() {
+                assert_eq!(rec, &record(total + offset as u64));
+            }
+        }
+        // Plain from-zero recovery over a truncated set must NOT be trusted — and fails
+        // closed: the from-zero contiguous prefix is empty (seq 0 was pruned), so everything
+        // above reads as orphans.
+        let from_zero = recover_lanes(&base, lane_count).expect("from-zero scan");
+        assert_eq!(
+            from_zero.len(),
+            0,
+            "pruned set has no from-zero prefix (the sidecar baseline is REQUIRED)"
+        );
+        cleanup(&base, lane_count);
+    }
+
+    /// AUDIT (partial-cut boundary): truncation at a MID-HISTORY baseline must retire exactly
+    /// the segments whose every record is below it and KEEP any straddling segment — an
+    /// off-by-one (`>=` vs `>`) would delete a record above the baseline, which the baseline
+    /// recovery assertion catches record-for-record.
+    #[test]
+    fn partial_cut_truncation_keeps_straddling_segments() {
+        let base = test_base("partial-cut");
+        let lane_count = 2usize;
+        let tiny = 16 << 10; // 3 one-record 4KiB frames per segment
+        let total = 30u64;
+        {
+            let set = FuaWalLaneSet::create(&base, lane_count, 2, tiny).expect("create");
+            append_round_robin(&set, total);
+            set.wait_durable(total).expect("durable");
+            // Truncate at a baseline that falls MID-SEGMENT in both lanes: lane 0 owns evens
+            // {12, 14, 16} in one segment, lane 1 owns odds {13, 15, 17} — baseline 14 keeps
+            // both (each holds records >= 14) and retires everything strictly below.
+            let retired = set.truncate_segments_below(14).expect("truncate");
+            assert!(retired >= 2, "fully-below segments must retire ({retired})");
+        }
+        let suffix = recover_lanes_from(&base, lane_count, 14).expect("recover from 14");
+        assert_eq!(
+            suffix.len(),
+            (total - 14) as usize,
+            "every record >= 14 survives"
+        );
+        for (offset, rec) in suffix.iter().enumerate() {
+            assert_eq!(rec, &record(14 + offset as u64));
+        }
         cleanup(&base, lane_count);
     }
 

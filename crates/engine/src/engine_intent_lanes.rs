@@ -234,6 +234,9 @@ pub(crate) struct IntentLaneState {
     /// the serial-resource test for the coalesced device stages.
     pub(crate) stat_validate_leader_ns: AtomicU64,
     pub(crate) stat_apply_leader_ns: AtomicU64,
+    /// E2.5c-2: single-flight guard for the lanes checkpoint (concurrent checkpoints would
+    /// interleave sidecar writes and double-truncate).
+    pub(crate) checkpoint_lock: Mutex<()>,
 }
 
 /// One lane's pending locate request (see `IntentLaneState::validate_queue`).
@@ -396,6 +399,7 @@ impl IntentLaneState {
             stat_apply_requests: AtomicU64::new(0),
             stat_validate_leader_ns: AtomicU64::new(0),
             stat_apply_leader_ns: AtomicU64::new(0),
+            checkpoint_lock: Mutex::new(()),
         }
     }
 

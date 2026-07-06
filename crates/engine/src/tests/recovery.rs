@@ -2424,3 +2424,144 @@ fn cleanup_lane_files(path: &std::path::Path) {
         }
     }
 }
+
+/// E2.5c-2 — LANES CHECKPOINT + TRUNCATION arc: checkpoint an activated lanes database
+/// (checkpoint segment embeds serial ++ lane merge; sidecar records the split + baseline),
+/// verify rolled-away lane segments are PHYSICALLY pruned, then fabricate a post-checkpoint
+/// lane suffix and prove the auto-open replays checkpoint-then-suffix with row parity.
+#[test]
+fn lanes_checkpoint_truncates_prunes_and_reopens_with_suffix() {
+    let path = test_wal_path("lanes-ckpt");
+    let row_base = {
+        let e = serial_durable_engine(&path);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO t VALUES (1, 10)").unwrap();
+        e.read_state.mvcc.current_row_id()
+    };
+    // Fabricate a 2-lane history with TINY segments (16KiB = 3 one-record frames per segment)
+    // so 24 records roll through ~4 segments per lane — the truncation premise.
+    let tiny = 16 << 10;
+    let make_record = |seq: u64, id: i32| {
+        let values = vec![SqlValue::Int4(id), SqlValue::Int4(0)];
+        let payload = crate::wal_binary::try_encode_binary_insert(
+            "t",
+            &[(row_base + seq, values.as_slice())],
+        )
+        .expect("binary encode");
+        gpu_db_wal::WalRecord {
+            txn_id: 300 + seq,
+            payload: payload.into(),
+        }
+    };
+    {
+        let set = gpu_db_wal::FuaWalLaneSet::create(&path, 2, 2, tiny).expect("create lanes");
+        for seq in 0..24u64 {
+            set.append(
+                (seq % 2) as usize,
+                seq,
+                &[make_record(seq, 1000 + seq as i32)],
+            )
+            .expect("append");
+        }
+        set.wait_durable(24).expect("durable");
+    }
+    let lane_file_count = || {
+        let (parent, stem) = (path.parent().unwrap(), path.file_name().unwrap());
+        let prefix = format!("{}.lane-", stem.to_string_lossy());
+        std::fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .count()
+    };
+    let before = lane_file_count();
+    assert!(
+        before >= 8,
+        "premise: rolls produced many segments ({before})"
+    );
+
+    let counted = |engine: &Engine| -> i64 {
+        let Command::Select(count) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+            unreachable!()
+        };
+        match engine
+            .execute_relational_select(&count)
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("count returned {other:?}"),
+        }
+    };
+    {
+        let reopened = Engine::open_durable_wal_segment(&path).expect("lanes reopen");
+        assert_eq!(counted(&reopened), 25, "1 serial + 24 lane rows");
+        let cut = reopened
+            .checkpoint_intent_lanes()
+            .expect("lanes checkpoint");
+        assert_eq!(cut, 24, "baseline = the cross-lane durable cut");
+        let after = lane_file_count();
+        assert!(
+            after < before,
+            "rolled-away lane segments must be pruned: {before} -> {after}"
+        );
+        // Idempotent re-checkpoint at the same cut (early-returns; the committed
+        // checkpoint is untouched).
+        assert_eq!(
+            reopened.checkpoint_intent_lanes().expect("re-checkpoint"),
+            24
+        );
+    }
+    // Post-checkpoint lane SUFFIX (fabricated continuation commits above the baseline).
+    {
+        let set = gpu_db_wal::FuaWalLaneSet::reopen_from(&path, 2, 2, tiny, 24)
+            .expect("wal-level reopen from baseline");
+        for seq in 24..30u64 {
+            set.append(
+                (seq % 2) as usize,
+                seq,
+                &[make_record(seq, 2000 + seq as i32)],
+            )
+            .expect("append suffix");
+        }
+        set.wait_durable(30).expect("suffix durable");
+    }
+    // AUTO open (exercises the lanes routing past the serial checkpoint-open): replays the
+    // checkpoint, then the lane suffix; the reopened engine is intent-only.
+    let again = Engine::open_durable_wal_segment_auto(&path).expect("auto reopen");
+    assert_eq!(
+        counted(&again),
+        31,
+        "1 serial + 24 checkpointed + 6 suffix rows"
+    );
+    let err = again
+        .execute_text(9, "INSERT INTO t VALUES (7, 70)")
+        .expect_err("classic write refused after checkpointed reopen");
+    assert!(err.to_string().contains("intent lanes are ACTIVE"), "{err}");
+    let stats = again.intent_lane_stats().expect("lanes installed");
+    assert_eq!(stats.7, 30, "durable cut continues above the checkpoint");
+    assert_eq!(stats.8, 30, "applied cut continues above the checkpoint");
+    drop(again);
+    // AUDIT (repeat-checkpoint crash window): a NEW generation segment written but whose
+    // sidecar commit never happened must be IGNORED — the sidecar is the single commit point,
+    // so reopen replays the OLD committed checkpoint + the lane suffix, identically. The
+    // orphan's content is DIVERGENT garbage (audit nit): a wrong design that read the highest
+    // generation instead of the sidecar-named file would fail loudly, not coincidentally pass.
+    std::fs::write(
+        gpu_db_wal::lanes_checkpoint_segment_path(&path, 30),
+        b"torn uncommitted checkpoint generation",
+    )
+    .expect("plant an uncommitted next-generation segment");
+    let after_crash_window = Engine::open_durable_wal_segment_auto(&path)
+        .expect("reopen must ignore an uncommitted checkpoint generation");
+    assert_eq!(counted(&after_crash_window), 31, "state unchanged");
+    drop(after_crash_window);
+    let _ = std::fs::remove_file(gpu_db_wal::lanes_checkpoint_segment_path(&path, 30));
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(gpu_db_wal::lanes_checkpoint_sidecar_path(&path));
+    let _ = std::fs::remove_file(gpu_db_wal::lanes_checkpoint_segment_path(&path, 24));
+    let _ = std::fs::remove_file(&path);
+    cleanup_lane_files(&path);
+}
