@@ -136,6 +136,8 @@ pub(crate) struct IntentLaneState {
     pub(crate) stat_claim_ns: AtomicU64,
     pub(crate) stat_append_ns: AtomicU64,
     pub(crate) stat_apply_ns: AtomicU64,
+    pub(crate) stat_encode_ns: AtomicU64,
+    pub(crate) stat_publish_ns: AtomicU64,
     /// Lock-free commit-timestamp reservation: the highest micros reserved by
     /// any lane wave. Waves CAS-reserve [base, base+k) OUTSIDE the commit lock
     /// (the per-winner map insert under that lock was the measured 8-lane
@@ -240,17 +242,23 @@ impl IntentLaneState {
 impl crate::Engine {
     /// Lane diagnostics for benches: (waves, items, validate_ns, claim_ns,
     /// append_ns, apply_ns, durable_cut, applied_cut). None when lanes are off.
-    pub fn intent_lane_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64, u64, u64)> {
+    #[allow(clippy::type_complexity)]
+    pub fn intent_lane_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)> {
         let lanes = self.intent_lanes.as_ref()?;
         Some((
             lanes.stat_waves.load(Ordering::Relaxed),
             lanes.stat_items.load(Ordering::Relaxed),
             lanes.stat_validate_ns.load(Ordering::Relaxed),
             lanes.stat_claim_ns.load(Ordering::Relaxed),
-            lanes.stat_append_ns.load(Ordering::Relaxed),
+            lanes.stat_encode_ns.load(Ordering::Relaxed),
+            lanes.stat_publish_ns.load(Ordering::Relaxed),
             lanes.stat_apply_ns.load(Ordering::Relaxed),
             lanes.wal_lanes.durable_cut(),
             lanes.applied_mirror.load(Ordering::Acquire),
+            self.read_state
+                .residency
+                .lane_diag_rebuilds
+                .load(Ordering::Relaxed),
         ))
     }
 

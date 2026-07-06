@@ -340,16 +340,17 @@ fn run_arm(
             items as f64 / waves.max(1) as f64,
             nanos as f64 / items.max(1) as f64 / 1e3,
         );
-        if let Some((lw, li, val, claim, app, apply, durable, applied)) = engine.intent_lane_stats()
+        if let Some((lw, li, val, claim, enc, publ, apply, durable, applied, rb)) =
+            engine.intent_lane_stats()
         {
-            let rb = engine.pk_index_rebuilds_diag();
             if lw > 0 {
                 eprintln!(
-                    "    [lanes: waves {lw}  items/wave {:.1}  us/wave: validate {:.1} claim {:.1} wal-append {:.1} device-apply {:.1}  cuts: durable {durable} applied {applied}  pk-rebuilds {rb}]",
+                    "    [lanes: waves {lw}  items/wave {:.1}  us/wave: validate {:.1} claim {:.1} encode {:.1} publish {:.1} device-apply {:.1}  cuts: durable {durable} applied {applied}  pk-rebuilds {rb}]",
                     li as f64 / lw as f64,
                     val as f64 / lw as f64 / 1e3,
                     claim as f64 / lw as f64 / 1e3,
-                    app as f64 / lw as f64 / 1e3,
+                    enc as f64 / lw as f64 / 1e3,
+                    publ as f64 / lw as f64 / 1e3,
                     apply as f64 / lw as f64 / 1e3,
                 );
             }

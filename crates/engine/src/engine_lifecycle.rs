@@ -447,6 +447,8 @@ impl Engine {
                         stat_claim_ns: std::sync::atomic::AtomicU64::new(0),
                         stat_append_ns: std::sync::atomic::AtomicU64::new(0),
                         stat_apply_ns: std::sync::atomic::AtomicU64::new(0),
+                        stat_encode_ns: std::sync::atomic::AtomicU64::new(0),
+                        stat_publish_ns: std::sync::atomic::AtomicU64::new(0),
                         ts_reservation: std::sync::atomic::AtomicU64::new(0),
                         ts_side: (0..lane_count).map(|_| Default::default()).collect(),
                     }));

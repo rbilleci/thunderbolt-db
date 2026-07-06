@@ -20,7 +20,7 @@ pub use fua::{fua_wal_segments_exist, recover_fua_wal_records};
 #[cfg(unix)]
 mod fua_lanes;
 #[cfg(unix)]
-pub use fua_lanes::{recover_lanes, FuaWalLaneSet};
+pub use fua_lanes::{encode_lane_frame_payload, recover_lanes, FuaWalLaneSet};
 
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
@@ -4411,6 +4411,18 @@ fn write_record(file: &mut File, record: &WalRecord) -> Result<(), EngineError> 
 }
 
 /// Serialize one record (header + payload) onto `buf` in the on-disk segment format.
+/// Encode one record's envelope+payload into `buf` from raw parts — the fused
+/// single-pass form for lane pumps (payload bytes are warm from the row-id
+/// patch that immediately precedes this in the caller's loop).
+pub fn encode_wal_record_parts_into(buf: &mut Vec<u8>, txn_id: TxnId, payload: &[u8]) {
+    let payload_len = payload.len() as u64;
+    let checksum = wal_record_checksum(txn_id, payload_len, payload);
+    buf.extend_from_slice(&txn_id.to_le_bytes());
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.extend_from_slice(&checksum.to_le_bytes());
+    buf.extend_from_slice(payload);
+}
+
 fn encode_record_into(buf: &mut Vec<u8>, record: &WalRecord) -> Result<(), EngineError> {
     let payload_len = u64::try_from(record.payload.len()).map_err(|_| {
         EngineError::Durability("WAL record payload length exceeds u64".to_string())
@@ -4510,17 +4522,22 @@ fn parse_control_value<'a>(
 }
 
 fn wal_record_checksum(txn_id: TxnId, payload_len: u64, payload: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in txn_id
-        .to_le_bytes()
-        .into_iter()
-        .chain(payload_len.to_le_bytes())
-        .chain(payload.iter().copied())
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    // FNV-1a, BYTE-IDENTICAL to the original chained-iterator form (same
+    // format, same values) but in tight slice loops: the chained iterator
+    // defeated optimization and was measured at ~1.5us per ~100B record on
+    // the lane pump's encode stage (1.5ms of a 1000-record wave).
+    #[inline]
+    fn fnv_step(mut hash: u64, bytes: &[u8]) -> u64 {
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
     }
-    hash
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    hash = fnv_step(hash, &txn_id.to_le_bytes());
+    hash = fnv_step(hash, &payload_len.to_le_bytes());
+    fnv_step(hash, payload)
 }
 
 fn wal_object_checksum(bytes: &[u8]) -> u64 {

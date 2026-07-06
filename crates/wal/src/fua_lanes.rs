@@ -266,11 +266,38 @@ impl FuaWalLaneSet {
         let seq_count = u32::try_from(records.len()).map_err(|_| {
             EngineError::Durability("FUA WAL lane frame record count exceeds u32".to_string())
         })?;
-        let mut payload = Vec::new();
-        for record in records {
-            encode_record_into(&mut payload, record)?;
-        }
+        let payload = encode_lane_frame_payload(records)?;
         let end = first_seq + records.len() as u64;
+        self.append_encoded_inner(lane_ref, &payload, first_seq, end, seq_count)
+    }
+
+    /// Two-phase append for instrumented callers: publish an already-encoded
+    /// payload (from [`encode_lane_frame_payload`]) covering [first_seq, end).
+    pub fn append_encoded(
+        &self,
+        lane: usize,
+        first_seq: u64,
+        end: u64,
+        seq_count: u32,
+        payload: &[u8],
+    ) -> Result<(), EngineError> {
+        let Some(lane_ref) = self.lanes.get(lane) else {
+            return Err(EngineError::Durability(format!(
+                "FUA WAL lane set append to lane {lane} but only {} lane(s) exist",
+                self.lanes.len()
+            )));
+        };
+        self.append_encoded_inner(lane_ref, payload, first_seq, end, seq_count)
+    }
+
+    fn append_encoded_inner(
+        &self,
+        lane_ref: &Lane,
+        payload: &[u8],
+        first_seq: u64,
+        end: u64,
+        seq_count: u32,
+    ) -> Result<(), EngineError> {
         // Record the interval BEFORE publishing so the cut can never observe a durable frame whose
         // interval it has not yet seen. If the publish then fails, the interval sits un-absorbable
         // in the queue (its frame never becomes durable) and the cut holds — fail-closed.
@@ -448,6 +475,15 @@ fn recover_lanes_detailed(base: &Path, lane_count: usize) -> Result<LaneRecovery
 /// Because the cross-lane cut only advances when a seq is durable in its lane, every ACKED seq is
 /// strictly below the cut and is always recovered: nothing acked is lost. A `lane_count` that does
 /// not match the on-disk database is a clear error.
+/// Encode a lane frame payload (the record run) for [`FuaWalLaneSet::append_encoded`].
+pub fn encode_lane_frame_payload(records: &[WalRecord]) -> Result<Vec<u8>, EngineError> {
+    let mut payload = Vec::with_capacity(records.iter().map(|r| r.payload.len() + 32).sum());
+    for record in records {
+        encode_record_into(&mut payload, record)?;
+    }
+    Ok(payload)
+}
+
 pub fn recover_lanes(
     base_path: impl AsRef<Path>,
     lane_count: usize,

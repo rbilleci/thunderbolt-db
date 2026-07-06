@@ -2524,7 +2524,11 @@ impl Engine {
         // row-id block (atomic claim — safe under concurrent lanes) + W5a patches
         let row_id_base = self.read_state.mvcc.claim_row_id_block(k);
         let mut payloads: Vec<std::sync::Arc<[u8]>> = Vec::with_capacity(winners.len());
-        let mut wal_records: Vec<WalRecord> = Vec::with_capacity(winners.len());
+        // FUSED patch+envelope pass: the frame payload is assembled in the same
+        // loop that patches each record (bytes are cache-warm), replacing the
+        // separate encode_record_into pass that was measured at ~1.4us/record
+        // of cold Arc re-walks (1.4ms of a 1000-record wave).
+        let mut frame_payload: Vec<u8> = Vec::with_capacity(winners.len() * 24 + 4096);
         for (offset, item) in winners.iter().enumerate() {
             let (template, wal_offset) = item
                 .binary_wal_template
@@ -2536,10 +2540,7 @@ impl Engine {
             std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
                 [off..off + 8]
                 .copy_from_slice(&row_id.to_le_bytes());
-            wal_records.push(WalRecord {
-                txn_id: item.txn_id,
-                payload: payload.clone(),
-            });
+            gpu_db_wal::encode_wal_record_parts_into(&mut frame_payload, item.txn_id, &payload);
             payloads.push(payload);
         }
 
@@ -2594,8 +2595,16 @@ impl Engine {
             }
         }
 
-        // OFF-LOCK: durable lane append (per-lane fence pool pipelines the fsync)
-        if let Err(err) = lanes.wal_lanes.append(lane, local_first, &wal_records) {
+        // OFF-LOCK: durable lane append (envelope already fused into the patch
+        // pass above; stat_encode retired into the claim-adjacent patch time)
+        let stat_start = Instant::now();
+        if let Err(err) = lanes.wal_lanes.append_encoded(
+            lane,
+            local_first,
+            local_first + k,
+            k as u32,
+            &frame_payload,
+        ) {
             let message = format!("lane WAL append failed: {err}");
             for item in winners {
                 item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
@@ -2604,8 +2613,7 @@ impl Engine {
             }
             return true;
         }
-
-        lanes.stat_append_ns.fetch_add(
+        lanes.stat_publish_ns.fetch_add(
             stat_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
         );
