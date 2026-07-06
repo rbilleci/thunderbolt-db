@@ -223,12 +223,28 @@ impl Engine {
         }
     }
 
+    /// AUDIT F5 guard: archive/PITR excludes lane commits in lanes mode (the
+    /// lane logs are not archived until E2.5c). Fail loudly rather than
+    /// persist a timeline that silently drops every lane insert.
+    fn intent_lanes_archive_guard(&self) -> Result<(), EngineError> {
+        if let Some(lanes) = &self.intent_lanes {
+            if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(EngineError::Durability(
+                    "intent lanes are ACTIVE: WAL archive/PITR does not cover lane commits yet                      (E2.5c); archival in lanes mode is refused rather than silently incomplete"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn persist_durable_wal_archive(
         &self,
         manifest_path: impl AsRef<std::path::Path>,
         segment_dir: impl AsRef<std::path::Path>,
         records_per_segment: usize,
     ) -> Result<WalArchiveManifest, EngineError> {
+        self.intent_lanes_archive_guard()?;
         let record_timestamps = self.durable_wal_record_timestamps();
         write_wal_archive_with_timestamps(
             manifest_path,

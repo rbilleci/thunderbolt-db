@@ -2590,31 +2590,37 @@ impl Engine {
                 .seq_oracle
                 .fetch_add(k, std::sync::atomic::Ordering::AcqRel)
         } else {
+            // AUDIT F1 (CRITICAL): double-checked activation UNDER the commit
+            // lock. peek_next_index does not advance, so two lanes' first
+            // waves racing the old check-then-act would both seed the oracle
+            // at the same base and claim DUPLICATE global seqs — acked
+            // commits then fail recovery (overlapping lane claims). Exactly
+            // one seeder exists now (latch set LAST, under the lock); the
+            // race loser re-reads the seeded oracle.
             let commit = self.commit_state();
-            lanes.ts_reservation.fetch_max(
-                commit.max_commit_timestamp_micros,
-                std::sync::atomic::Ordering::AcqRel,
-            );
-            let first = commit.repl.peek_next_index();
-            lanes
-                .seq_oracle
-                .store(first + k, std::sync::atomic::Ordering::Release);
-            first
+            if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
+                drop(commit);
+                lanes
+                    .seq_oracle
+                    .fetch_add(k, std::sync::atomic::Ordering::AcqRel)
+            } else {
+                let first = commit.repl.peek_next_index();
+                lanes
+                    .seq_oracle
+                    .store(first + k, std::sync::atomic::Ordering::Release);
+                lanes
+                    .base_seq
+                    .store(first, std::sync::atomic::Ordering::Release);
+                lanes
+                    .activated
+                    .store(true, std::sync::atomic::Ordering::Release);
+                first
+            }
         };
         lanes.stat_claim_ns.fetch_add(
             stat_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
         );
-        // activation latch: the first claimed block fixes base_seq (lane-local
-        // seq space = global - base; the lane logs tile [0, N) exactly)
-        if !lanes
-            .activated
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            lanes
-                .base_seq
-                .store(first_seq, std::sync::atomic::Ordering::Release);
-        }
         let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
         let local_first = first_seq - base;
 
@@ -2660,6 +2666,7 @@ impl Engine {
         let stat_start = Instant::now();
         let apply_slot = std::sync::Arc::new(crate::engine_intent_lanes::ApplySlot {
             done: std::sync::atomic::AtomicBool::new(false),
+            failed: std::sync::atomic::AtomicBool::new(false),
         });
         {
             let mut rows = Vec::with_capacity(winners.len());
@@ -2691,6 +2698,16 @@ impl Engine {
         }
         loop {
             if apply_slot.done.load(std::sync::atomic::Ordering::Acquire) {
+                if apply_slot.failed.load(std::sync::atomic::Ordering::Acquire) {
+                    // AUDIT F2: the merged apply failed — these rows were NOT
+                    // applied; fail the winners loudly instead of settling.
+                    for item in winners {
+                        item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                            "lane apply leader failed; wave not applied".to_string(),
+                        ))));
+                    }
+                    return true;
+                }
                 break;
             }
             let Ok(_leader) = lanes.device_apply_lock.try_lock() else {
@@ -2715,16 +2732,34 @@ impl Engine {
                 .fetch_add(batch.len() as u64, AtomicOrdering::Relaxed);
             let leader_started = Instant::now();
             let mut batch = batch;
-            self.lane_apply_merged(&mut batch);
+            // AUDIT F2: a leader panic (rehydrate invariant, catalog expect)
+            // must not strand waiters spinning on `done` forever nor poison
+            // the leader lock into a permanent livelock. Catch, fail every
+            // drained request loudly, and resume (the panic is re-raised
+            // after waiters are released so the invariant violation still
+            // surfaces).
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.lane_apply_merged(&mut batch)
+            }));
             lanes.stat_apply_leader_ns.fetch_add(
                 leader_started.elapsed().as_nanos() as u64,
                 AtomicOrdering::Relaxed,
             );
-            for request in batch {
+            let failed = outcome.is_err();
+            for request in &batch {
+                if failed {
+                    request
+                        .slot
+                        .failed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 request
                     .slot
                     .done
                     .store(true, std::sync::atomic::Ordering::Release);
+            }
+            if let Err(panic) = outcome {
+                std::panic::resume_unwind(panic);
             }
         }
         lanes.stat_apply_ns.fetch_add(
@@ -2961,6 +2996,25 @@ impl Engine {
         lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
         lane: usize,
     ) -> bool {
+        // AUDIT F3: an ASYNC durability failure (fence pool poison after the
+        // append returned Ok) permanently stalls the durable cut; without this
+        // check the applied-but-undurable waves would hang their clients
+        // forever instead of wedging loudly like the classic path.
+        if let Some(reason) = lanes.wal_lanes.poison_reason() {
+            let mut queue = lanes.settle[lane]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut settled = false;
+            while let Some(entry) = queue.pop_front() {
+                for item in entry.winners {
+                    item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(format!(
+                        "intent lane WAL poisoned: {reason}"
+                    )))));
+                }
+                settled = true;
+            }
+            return settled;
+        }
         let local_cut = lanes.visible_local_cut();
         let global_cut = lanes.visible_global_cut();
         if global_cut > 0 {

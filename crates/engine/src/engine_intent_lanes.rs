@@ -145,11 +145,6 @@ pub(crate) struct IntentLaneState {
     /// max_commit_timestamp under the FIRST wave's lock (classic writes are
     /// guarded off after activation, so the two never interleave afterwards).
     pub(crate) ts_reservation: AtomicU64,
-    /// Per-lane commit-timestamp side maps (txn_id -> micros). Lane records
-    /// never enter the serial WalBuffer, so the archive/PITR consumers of
-    /// wal_commit_timestamps_micros never look these txns up — the side maps
-    /// retain the stamps for the E2.5c lane-archive slice.
-    pub(crate) ts_side: Vec<Mutex<std::collections::HashMap<u64, u64>>>,
     /// Cross-lane device-validate coalescing (v1 of the device-stage
     /// aggregator): lanes push locate requests; one leader drains matching
     /// requests, launches ONE kernel over the concatenated needles, and
@@ -209,26 +204,9 @@ pub(crate) struct ApplyRequest {
 /// covered this request's rows.
 pub(crate) struct ApplySlot {
     pub(crate) done: AtomicBool,
-}
-
-impl IntentLaneState {
-    /// Reserve `k` strictly-monotonic commit timestamps >= wall clock,
-    /// returning the base (range [base, base+k)). Lock-free CAS max loop.
-    pub(crate) fn reserve_timestamps(&self, wall_micros: u64, k: u64) -> u64 {
-        let mut current = self.ts_reservation.load(Ordering::Relaxed);
-        loop {
-            let base = wall_micros.max(current.saturating_add(1));
-            match self.ts_reservation.compare_exchange_weak(
-                current,
-                base + (k - 1),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return base,
-                Err(observed) => current = observed,
-            }
-        }
-    }
+    /// AUDIT F2: set when the apply leader panicked/poisoned before covering
+    /// this request — the waiter must fail its winners, not settle them.
+    pub(crate) failed: AtomicBool,
 }
 
 /// Min items before a lane wave ships (`GPU_DB_INTENT_LANE_MIN_WAVE`, default 192).

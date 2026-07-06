@@ -143,6 +143,15 @@ impl Engine {
             return Ok(());
         };
         let last_txn_id = *last_txn_id;
+        // AUDIT F4: the batch committer is a serial-WAL appender + repl
+        // proposer like commit_mutation_at — same lanes-activation guard, or
+        // its repl seqs would collide with oracle-claimed lane seqs.
+        if let Err(error) = self.intent_lanes_write_guard() {
+            return Err(BatchCommitFailure {
+                rolled_back: true,
+                error,
+            });
+        }
         if self.repl_role() != Role::Leader {
             return Err(BatchCommitFailure {
                 rolled_back: true,
