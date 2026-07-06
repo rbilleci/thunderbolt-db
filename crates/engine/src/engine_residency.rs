@@ -6836,7 +6836,19 @@ impl Engine {
             // exceeds it — a large admit is one dense shard) so it seals + rolls over at the target rather
             // than growing unbounded. The single buffer is uncapped (its cap is the 536M guard above).
             if self.shard_residency_enabled() {
-                doubled.min(self.shard_size_target()).max(row_count)
+                // E2.5b-2: FIRST-CAPACITY FLOOR (restores the archived W1b lesson).
+                // Without it the open shard is born at ~2x the warm-up rows and
+                // RE-ADMITS geometrically as it fills — each re-admission is a
+                // full device gather+re-upload (hundreds of ms at multi-M rows),
+                // measured as the periodic stalls capping sustained lane TPS.
+                let floor: usize = std::env::var("GPU_DB_OPEN_SHARD_FLOOR_ROWS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(262_144);
+                doubled
+                    .max(floor.next_power_of_two())
+                    .min(self.shard_size_target())
+                    .max(row_count)
             } else {
                 doubled
             }

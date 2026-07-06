@@ -2016,37 +2016,44 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         });
-        let (build_memory, build_offset, build_row_count) = if self.intent_lanes.is_some() {
-            // Re-check under the guard: another prober may have rebuilt already.
-            {
-                let cache = self
-                    .read_state
-                    .residency
-                    .shard_pk_device_index
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(entry) = cache.get(&cache_key) {
-                    if entry.row_count >= row_count {
-                        return entry
-                            .device_index
-                            .clone()
-                            .map(|di| (di, entry.table_mask, entry.hash_shift));
+        let (build_memory, build_offset, build_row_count, build_capacity_rows) =
+            if self.intent_lanes.is_some() {
+                // Re-check under the guard: another prober may have rebuilt already.
+                {
+                    let cache = self
+                        .read_state
+                        .residency
+                        .shard_pk_device_index
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(entry) = cache.get(&cache_key) {
+                        if entry.row_count >= row_count {
+                            return entry
+                                .device_index
+                                .clone()
+                                .map(|di| (di, entry.table_mask, entry.hash_shift));
+                        }
                     }
                 }
-            }
-            let shards = self.read_state.residency.shards.load();
-            let live = shards
-                .get(table_name)?
-                .iter()
-                .find(|shard| shard.shard_id == shard_id)?
-                .clone();
-            let live_memory = live.device_memory.clone()?;
-            let live_offset = shard_i32_filter_offset(&live, table, col_idx)?;
-            let live_rows = live.row_count;
-            (live_memory, live_offset, live_rows)
-        } else {
-            (Arc::clone(device_memory), filter_offset, row_count)
-        };
+                let shards = self.read_state.residency.shards.load();
+                let live = shards
+                    .get(table_name)?
+                    .iter()
+                    .find(|shard| shard.shard_id == shard_id)?
+                    .clone();
+                let live_memory = live.device_memory.clone()?;
+                let live_offset = shard_i32_filter_offset(&live, table, col_idx)?;
+                let live_rows = live.row_count;
+                // CAPACITY-SIZED INDEX: size the hash table once for the shard's
+                // full capacity (clamped to the builder's 2^30 slot limit via the
+                // sizing_rows argument), so capacity-exhaustion rebuilds are
+                // impossible for the shard's lifetime — only ptr changes
+                // (re-admission) rebuild, and the floor above makes those rare.
+                let capacity_rows = live.capacity as u64;
+                (live_memory, live_offset, live_rows, capacity_rows)
+            } else {
+                (Arc::clone(device_memory), filter_offset, row_count, 0_u64)
+            };
         let device_ptr = build_memory.device_ptr();
         self.read_state
             .residency
@@ -2072,8 +2079,17 @@ impl Engine {
         // cadence geometric: log2(final/initial) rebuilds per shard lifetime.
         // The table only ever holds `keys` (real rows); the extra slots are
         // empty probe space (sparser = faster linear probing).
+        let sizing_rows = if self.intent_lanes.is_some() {
+            // lanes: size for the shard's capacity once (see live rebuild note)
+            row_count_u64
+                .saturating_mul(2)
+                .max(build_capacity_rows.saturating_mul(2))
+                .min(1_u64 << 29)
+        } else {
+            row_count_u64.saturating_mul(2)
+        };
         let (device_index, table_mask, hash_shift) =
-            match build_int4_pk_hash_table_host(&keys, row_count_u64.saturating_mul(2)) {
+            match build_int4_pk_hash_table_host(&keys, sizing_rows) {
                 Some((index, table_mask, hash_shift)) => {
                     let index_bytes: Vec<u8> =
                         index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
