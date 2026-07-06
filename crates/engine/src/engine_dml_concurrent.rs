@@ -528,7 +528,8 @@ impl Engine {
     /// vs. the previous per-commit critical section: one mutex hand-off + one group-fsync wait +
     /// one publish PER WAVE instead of per commit, and the apply loop runs back-to-back on one
     /// core (the sequencer) instead of bouncing the MVCC structures across every writer's cache.
-    fn commit_dml_concurrent(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_dml_concurrent(
         &self,
         txn_id: u64,
         cmd: Command,

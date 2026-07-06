@@ -91,6 +91,8 @@ mod engine_ddl_objects;
 mod engine_ddl_pubsub_role;
 mod engine_ddl_table;
 mod engine_dml_concurrent;
+mod engine_dml_intent;
+pub use engine_dml_intent::CoveredInsertRoute;
 mod engine_dml_prepare;
 pub(crate) use engine_dml_prepare::InsertPrepareValidation;
 mod engine_expr;

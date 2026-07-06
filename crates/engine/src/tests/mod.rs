@@ -17,6 +17,7 @@ static NEXT_TEST_WAL_PATH_ID: AtomicU64 = AtomicU64::new(1);
 // Feature test modules (P0 §9.6), grouped by what they exercise — read order
 // roughly follows the engine: read path, write path, then catalog/durability.
 mod concurrency; // &self read path, stage-3 reader/writer + value-index
+mod intent_fast_path; // E2.1 covered-INSERT intent route + FUA recovery parity
 mod mvcc_bundles; // provenance frames + bundle/occurrence filters
 mod mvcc_joins; // labeled-branch + join-side projection/ordering
 mod mvcc_provenance; // provenance + source-composition + value-chain queries
