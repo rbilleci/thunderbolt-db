@@ -753,6 +753,11 @@ pub(crate) struct RelationalResidentShard {
     /// AFTER every i32 section, capacity-strided (the single-buffer layout, so the shared
     /// offset helpers address both). Empty on int4-only lineages (the pre-slice universe).
     pub(crate) resident_device_int8_columns: Vec<String>,
+    /// TYPE-COVERAGE #14 (numeric slice): the b128-SECTION columns (Numeric / Uuid — both 16-byte
+    /// fixed-width) this shard's payload carries, in catalog order — laid out AFTER every i32 and
+    /// i64 section, capacity-strided (16 bytes/row), so the shared offset helpers address them.
+    /// Empty on int4/int8-only lineages. Mirrors `resident_device_int8_columns` at double width.
+    pub(crate) resident_device_numeric_columns: Vec<String>,
     pub(crate) resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     /// M3-for-shards: per-column NULL validity bitmaps carried in THIS shard's device payload (1 = valid,
     /// 0 = NULL), in catalog order, one entry per column that contains a NULL. The sharded scan's unified
@@ -815,6 +820,7 @@ impl PartialEq for RelationalResidentShard {
             && self.count_header_byte_offset == other.count_header_byte_offset
             && self.resident_device_int4_columns == other.resident_device_int4_columns
             && self.resident_device_int8_columns == other.resident_device_int8_columns
+            && self.resident_device_numeric_columns == other.resident_device_numeric_columns
             && self.resident_device_text_columns == other.resident_device_text_columns
             && self.resident_device_null_columns == other.resident_device_null_columns
             && self.gpu_id == other.gpu_id

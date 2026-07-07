@@ -108,7 +108,12 @@ impl Engine {
                             // gathers the i64 sections too, so Int8/Timestamp columns route
                             // to the GPU general path when the flag admitted them to shards
                             // (without the flag such tables are never shard-resident and the
-                            // shards.load() check below keeps this arm false).
+                            // shards.load() check below keeps this arm false). TYPE-COVERAGE
+                            // numeric slice: the b128 sections (Numeric / Uuid, 16-byte) are
+                            // now gathered by the unified exec source too, so those columns
+                            // route to the GPU sort as well -- a plain-column ORDER BY over a
+                            // numeric/uuid table no longer falls through to the CPU pinned
+                            // path (the sharded b128 ORDER BY differential).
                             matches!(
                                 c.ty,
                                 SqlType::Int4
@@ -116,6 +121,8 @@ impl Engine {
                                     | SqlType::Date
                                     | SqlType::Int8
                                     | SqlType::Timestamp
+                                    | SqlType::Numeric { .. }
+                                    | SqlType::Uuid
                             )
                         }) && self
                             .read_state

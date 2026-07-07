@@ -142,38 +142,50 @@ pub(crate) fn resident_route_query_shape(
             None
         }
         SelectProjection::Columns(columns) => {
-            if columns.is_empty()
-                || select.distinct
-                || select.limit.is_some()
-                || columns.iter().any(|column| {
-                    table
-                        .columns
-                        .iter()
-                        .position(|candidate| candidate.name == *column)
-                        .is_none_or(|idx| {
-                            !matches!(table.columns[idx].ty, SqlType::Int4 | SqlType::Text)
-                        })
-                })
+            if columns.is_empty() || select.distinct || select.limit.is_some() {
+                return None;
+            }
+            // R-ver (read version resolution) + TYPE-COVERAGE #14 (numeric): an UNFILTERED projection
+            // (`SELECT <cols> FROM t`, no WHERE) has no resident-route shape today, so it drops to the
+            // CPU-pinned host path — which REHYDRATES + de-elides an ELIDED table (and, for a numeric-
+            // bearing elided table, the device gather then DECLINES numeric -> a hard error). Route it
+            // on-device iff every projected column is a DEVICE-SERVABLE FIXED-WIDTH type
+            // (int4/int8/date/timestamp/int2/numeric/uuid — the general executor + the recompaction
+            // gather serve every fixed-width section, with the SV3b visibility conjunct threaded). A
+            // text/bool column keeps the projection on the host path (variable-length is out of scope).
+            // Placed BEFORE the int4-only FILTERED-shape logic below.
+            if bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty()
             {
+                let all_servable = bound.selected_indexes.iter().all(|&idx| {
+                    matches!(
+                        table.columns[idx].ty,
+                        SqlType::Int4
+                            | SqlType::Int8
+                            | SqlType::Date
+                            | SqlType::Timestamp
+                            | SqlType::Int2
+                            | SqlType::Numeric { .. }
+                            | SqlType::Uuid
+                    )
+                });
+                return all_servable.then(|| "int4_projection_all".to_string());
+            }
+            // FILTERED projection shapes below are int4-only (the device locate + int4 filter VM).
+            if columns.iter().any(|column| {
+                table
+                    .columns
+                    .iter()
+                    .position(|candidate| candidate.name == *column)
+                    .is_none_or(|idx| {
+                        !matches!(table.columns[idx].ty, SqlType::Int4 | SqlType::Text)
+                    })
+            }) {
                 return None;
             }
             let selected_has_text = bound
                 .selected_indexes
                 .iter()
                 .any(|idx| table.columns[*idx].ty == SqlType::Text);
-            // R-ver (read version resolution): an UNFILTERED projection (`SELECT <cols> FROM t`,
-            // no WHERE) has no resident-route shape today, so it drops to the CPU-pinned host path,
-            // which REHYDRATES + de-elides an ELIDED table (versioned OR not — the cliff is the
-            // unroutable shape, not versioning). The sharded unified executor already serves a plain
-            // projection (predicate = None) with the SV3b `deleted_by` visibility conjunct threaded,
-            // so classify the unfiltered int4 case and route it there (int4-only for now — an elided
-            // table carries no text columns; the general executor's text projection is out of scope).
-            if bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty() {
-                if selected_has_text {
-                    return None;
-                }
-                return Some("int4_projection_all".to_string());
-            }
             let filter_groups = if !bound.filter_groups.is_empty() {
                 bound.filter_groups.clone()
             } else if !bound.filters.is_empty() {
@@ -220,13 +232,25 @@ pub(crate) fn resident_route_query_shape(
             // excluded by the guards above; distinct at the top). Any non-int4 column or a LIMIT
             // keeps `SELECT *` on the CPU path (the general executor treats All == Columns of every
             // column, so an all-int4 table projects every column with the SV3b visibility conjunct).
-            let unfiltered =
-                bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty();
-            let all_int4 = table
-                .columns
-                .iter()
-                .all(|column| matches!(column.ty, SqlType::Int4));
-            (unfiltered && all_int4 && select.limit.is_none())
+            let unfiltered = bound.filter.is_none()
+                && bound.filters.is_empty()
+                && bound.filter_groups.is_empty();
+            // TYPE-COVERAGE #14: `SELECT *` routes on-device iff EVERY column is a device-servable
+            // fixed-width type (int4/int8/date/timestamp/int2/numeric/uuid). A text/bool column keeps
+            // `SELECT *` on the host path.
+            let all_fixed_width = table.columns.iter().all(|column| {
+                matches!(
+                    column.ty,
+                    SqlType::Int4
+                        | SqlType::Int8
+                        | SqlType::Date
+                        | SqlType::Timestamp
+                        | SqlType::Int2
+                        | SqlType::Numeric { .. }
+                        | SqlType::Uuid
+                )
+            });
+            (unfiltered && all_fixed_width && select.limit.is_none())
                 .then(|| "int4_projection_all".to_string())
         }
         _ => None,

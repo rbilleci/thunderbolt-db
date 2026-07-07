@@ -2655,6 +2655,11 @@ impl Engine {
         // 4-mod-8 case), same per-shard uniformity guard, same positional-ordinal DtoD plan.
         let int8_columns = shards[0].resident_device_int8_columns.clone();
         let num_int8_cols = int8_columns.len();
+        // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) 16-byte section, recompacted after
+        // the i64 sections into the unified buffer (else a numeric column read on a MULTI-SHARD
+        // table would miss its bytes — a correctness hole, not an optimization).
+        let numeric_columns = shards[0].resident_device_numeric_columns.clone();
+        let num_numeric_cols = numeric_columns.len();
 
         // Gather each shard's (device_ptr, row_count) by running the SAME identity/validity precheck the
         // probes did (via `source_for`), accumulate `total_row_count`, and build the device-to-device copy
@@ -2679,6 +2684,12 @@ impl Engine {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "resident shard {} int8 column layout {:?} does not match shard 0 layout {:?}",
                     shard.shard_id, shard.resident_device_int8_columns, int8_columns
+                ))));
+            }
+            if shard.resident_device_numeric_columns != numeric_columns {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident shard {} b128 column layout {:?} does not match shard 0 layout {:?}",
+                    shard.shard_id, shard.resident_device_numeric_columns, numeric_columns
                 ))));
             }
             shard_ptrs.push((
@@ -2733,8 +2744,31 @@ impl Engine {
                 rows_before = rows_before.saturating_add(row_count);
             }
         }
+        let int8_end_bytes = int4_bytes + (total_row_count as u64) * 8 * (num_int8_cols as u64);
+        // TYPE-COVERAGE #14 (numeric): the b128 sections sit immediately after the i64 sections in
+        // BOTH the shard payloads (per-shard stride = capacity*16) and the unified buffer (stride =
+        // total_row_count*16). The per-shard section base = 8 + num_int4*cap*4 + num_int8*cap*8.
+        for ordinal in 0..num_numeric_cols {
+            let mut rows_before = 0_u64;
+            for (device_ptr, row_count, capacity) in &shard_ptrs {
+                let row_count = *row_count as u64;
+                let capacity = *capacity as u64;
+                segments.push(gpu_db_execution::RecompactSegment {
+                    src_device_ptr: *device_ptr,
+                    src_byte_offset: 8
+                        + (num_int4_cols as u64) * capacity * 4
+                        + (num_int8_cols as u64) * capacity * 8
+                        + (ordinal as u64) * capacity * 16,
+                    dst_byte_offset: int8_end_bytes
+                        + (ordinal as u64) * (total_row_count as u64) * 16
+                        + rows_before * 16,
+                    byte_len: row_count.saturating_mul(16),
+                });
+                rows_before = rows_before.saturating_add(row_count);
+            }
+        }
         let fixed_section_bytes =
-            int4_bytes + (total_row_count as u64) * 8 * (num_int8_cols as u64);
+            int8_end_bytes + (total_row_count as u64) * 16 * (num_numeric_cols as u64);
 
         // SV3b/SV6 MVCC visibility gather: if ANY surviving shard is VERSIONED (carries an on-demand
         // `deleted_by` and/or `created_by` region), append the corresponding co-resident DENSE i64 column(s)
@@ -2914,6 +2948,7 @@ impl Engine {
             proof,
             int4_columns,
             int8_columns,
+            numeric_columns,
             unified_null_columns,
         );
         Ok(ShardedUnifiedExecSource {
@@ -3100,13 +3135,25 @@ impl Engine {
         // only `indices`/`indices_u64`). So thread the versioned buffer's `visibility` through to
         // them instead of refusing. (`visibility` is `None` for a version-free buffer -> byte-identical.)
         if select.distinct {
-            return self.execute_resident_distinct_via_general(select, Some(&unified_src), visibility);
+            return self.execute_resident_distinct_via_general(
+                select,
+                Some(&unified_src),
+                visibility,
+            );
         }
         if select.group_by.is_some() {
-            return self.execute_resident_grouped_via_general(select, Some(&unified_src), visibility);
+            return self.execute_resident_grouped_via_general(
+                select,
+                Some(&unified_src),
+                visibility,
+            );
         }
         if !select.order_by.is_empty() {
-            return self.execute_resident_grouped_via_general(select, Some(&unified_src), visibility);
+            return self.execute_resident_grouped_via_general(
+                select,
+                Some(&unified_src),
+                visibility,
+            );
         }
 
         // All-empty handling (pins byte-identicality with slice 1): the general SUM/MIN/MAX/AVG hard-error

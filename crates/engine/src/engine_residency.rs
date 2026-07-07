@@ -434,12 +434,18 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
     if !column_types.iter().all(|ty| {
         matches!(
             ty,
-            SqlType::Int4 | SqlType::Date | SqlType::Int2 | SqlType::Int8 | SqlType::Timestamp
+            SqlType::Int4
+                | SqlType::Date
+                | SqlType::Int2
+                | SqlType::Int8
+                | SqlType::Timestamp
+                // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) 16-byte section.
+                | SqlType::Numeric { .. }
+                | SqlType::Uuid
         )
     }) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "open-shard append supports fixed-width (i32/i64) sections only (this slice)"
-                .to_string(),
+            "open-shard append supports fixed-width (i32/i64/b128) sections only".to_string(),
         )));
     }
     // Row-arity guard: a malformed (short/long) row must return the fallback Err, never panic on the
@@ -459,10 +465,19 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
         .filter(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
         .count();
     let i64_section_base = header_bytes + num_i32_cols * capacity * std::mem::size_of::<i32>();
+    // TYPE-COVERAGE #14 (numeric): the b128 section follows the i64 sections — base = i64_base +
+    // num_i64*capacity*8; each b128 column strides capacity*16 (matches the payload builder).
+    let num_i64_cols = column_types
+        .iter()
+        .filter(|ty| matches!(ty, SqlType::Int8 | SqlType::Timestamp))
+        .count();
+    let numeric_section_base =
+        i64_section_base + num_i64_cols * capacity * std::mem::size_of::<i64>();
     // Column chunks FIRST, header LAST (the partial-failure contract: never advertise un-written rows).
     let mut chunks = Vec::with_capacity(column_types.len() + 1);
     let mut i32_ordinal = 0_usize;
     let mut i64_ordinal = 0_usize;
+    let mut numeric_ordinal = 0_usize;
     for (col_idx, ty) in column_types.iter().enumerate() {
         match ty {
             SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
@@ -506,6 +521,32 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
                 }
                 chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
                 i64_ordinal += 1;
+            }
+            SqlType::Numeric { .. } | SqlType::Uuid => {
+                // TYPE-COVERAGE #14 (numeric): the b128 (16-byte) section — numeric = i128 mantissa
+                // LE, uuid = raw 16 bytes, NULL = 16 zero bytes (validity bitmap marks the row).
+                // Byte-identical to the payload builder's numeric/uuid section encoding.
+                let width = 16_usize;
+                let section_start = numeric_section_base + numeric_ordinal * capacity * width;
+                let byte_offset = (section_start + row_start * width) as u64;
+                let mut bytes = Vec::with_capacity(appended * width);
+                for row in new_rows {
+                    match &row[col_idx] {
+                        SqlValue::Numeric(value) => {
+                            bytes.extend_from_slice(&value.mantissa.to_le_bytes())
+                        }
+                        SqlValue::Uuid(uuid) => bytes.extend_from_slice(uuid),
+                        SqlValue::Null => bytes.extend_from_slice(&[0u8; 16]),
+                        _ => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "open-shard b128 append encountered a non-numeric/uuid value"
+                                    .to_string(),
+                            )))
+                        }
+                    }
+                }
+                chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
+                numeric_ordinal += 1;
             }
             _ => unreachable!("the section guard above rejects non-fixed-width columns"),
         }
@@ -4657,7 +4698,8 @@ mod capacity_payload_tests {
                 .unwrap();
             // UPDATE id=2: the new version appends into the SAME open shard as the old -> a
             // same-shard twin (old at the lower row-index / earlier probe slot).
-            e.execute_text(3, "UPDATE t SET v = 999 WHERE id = 2").unwrap();
+            e.execute_text(3, "UPDATE t SET v = 999 WHERE id = 2")
+                .unwrap();
             // (1) point read of the live updated key.
             let point = e
                 .execute_relational_select_text("SELECT id, v FROM t WHERE id = 2")
@@ -4721,8 +4763,11 @@ mod capacity_payload_tests {
             let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
                 .map(|k| format!("({k},{})", k * 10))
                 .collect();
-            e.execute_text(seq, &format!("INSERT INTO t (id, v) VALUES {}", vals.join(",")))
-                .unwrap();
+            e.execute_text(
+                seq,
+                &format!("INSERT INTO t (id, v) VALUES {}", vals.join(",")),
+            )
+            .unwrap();
             seq += 1;
         }
         if !e.table_install_elided("t") {
@@ -4751,7 +4796,9 @@ mod capacity_payload_tests {
         );
         assert_eq!(rows.len(), 199, "exactly one of the 200 rows is tombstoned");
         // A second scan still does not de-elide (idempotent, not a one-shot).
-        let _ = e.execute_relational_select_text("SELECT id, v FROM t").unwrap();
+        let _ = e
+            .execute_relational_select_text("SELECT id, v FROM t")
+            .unwrap();
         assert!(e.table_install_elided("t"), "repeat scan stays elided");
         // `SELECT *` (SelectProjection::All) over the all-int4 table ALSO stays elided + hides the
         // tombstone (the classifier's All arm routes it on-device too).
@@ -4765,9 +4812,77 @@ mod capacity_payload_tests {
             "SELECT * over a versioned elided table must NOT de-elide"
         );
         assert_eq!(star.len(), 199, "SELECT * hides the tombstoned row too");
-        assert!(!star
-            .iter()
-            .any(|r| r.first() == Some(&SqlValue::Int4(50))));
+        assert!(!star.iter().any(|r| r.first() == Some(&SqlValue::Int4(50))));
+    }
+
+    /// TYPE-COVERAGE #14 (numeric): a NUMERIC value column rides the device-authoritative / elided
+    /// fast path — the table ELIDES, INSERTs append device-authoritatively into the b128 (16-byte)
+    /// section, the table rolls over to MULTIPLE shards, and reads over the numeric column match the
+    /// CPU (host) oracle byte-for-byte — proving the correctness-critical recompaction GATHER of the
+    /// b128 section into the unified multi-shard buffer. Sabotage: dropping the numeric gather
+    /// segment (or the shard/unified descriptor's numeric labels) reads garbage -> the differential
+    /// diverges.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn numeric_column_elides_appends_and_reads_multishard() {
+        let run = |device: bool| -> (bool, usize, Vec<Vec<SqlValue>>) {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(device);
+            e.set_host_install_elision_enabled(device);
+            e.set_constrained_elision_enabled(device);
+            e.set_device_write_locate_enabled(device);
+            e.set_device_write_locate_wave_batch_enabled(device);
+            e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the gather
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, amt NUMERIC(20,4))")
+                .unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                // amt = a distinct 4-scale decimal per row (id.frac) so a wrong gather is visible.
+                let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k}, {k}.{:04})", (k * 7) % 10000))
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, amt) VALUES {}", vals.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            let elided = e.table_install_elided("t");
+            let shard_count = e.resident_shard_count("t");
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, amt FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            (elided, shard_count, rows)
+        };
+        let (on_elided, on_shards, on_rows) = run(true);
+        let (_off_elided, _off_shards, off_rows) = run(false);
+        if on_rows.is_empty() {
+            return; // driverless box
+        }
+        assert!(
+            on_elided,
+            "a NUMERIC-bearing table must be device-authoritative (elided)"
+        );
+        assert!(
+            on_shards >= 2,
+            "the table must roll over to MULTIPLE shards (exercise the recompaction gather), saw {on_shards}"
+        );
+        assert_eq!(
+            on_rows, off_rows,
+            "elided multi-shard numeric read == CPU host oracle (the b128 gather is correct)"
+        );
+        // Spot-check a numeric value is not a zeroed/garbage placeholder.
+        assert!(
+            on_rows
+                .iter()
+                .any(|r| matches!(r.get(1), Some(SqlValue::Numeric(_)))),
+            "amt materializes as a real NUMERIC (not dropped/zeroed): {:?}",
+            on_rows.first()
+        );
     }
 
     /// R-ver PART 2: GROUP BY / DISTINCT / ORDER BY over a VERSIONED elided sharded table must
@@ -4794,8 +4909,11 @@ mod capacity_payload_tests {
             let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
                 .map(|k| format!("({k},{})", k / 40))
                 .collect();
-            e.execute_text(seq, &format!("INSERT INTO t (id, g) VALUES {}", vals.join(",")))
-                .unwrap();
+            e.execute_text(
+                seq,
+                &format!("INSERT INTO t (id, g) VALUES {}", vals.join(",")),
+            )
+            .unwrap();
             seq += 1;
         }
         if !e.table_install_elided("t") {
@@ -4812,7 +4930,8 @@ mod capacity_payload_tests {
             .into_boxed();
         let mut counts: std::collections::BTreeMap<i32, i64> = Default::default();
         for row in &grouped {
-            if let (Some(&SqlValue::Int4(g)), Some(&SqlValue::Int8(c))) = (row.first(), row.get(1)) {
+            if let (Some(&SqlValue::Int4(g)), Some(&SqlValue::Int8(c))) = (row.first(), row.get(1))
+            {
                 counts.insert(g, c);
             }
         }
@@ -4820,7 +4939,11 @@ mod capacity_payload_tests {
             !counts.contains_key(&0),
             "the fully-tombstoned group 0 must NOT appear in GROUP BY: {counts:?}"
         );
-        assert_eq!(counts.get(&1), Some(&40), "surviving group counts are visible-only");
+        assert_eq!(
+            counts.get(&1),
+            Some(&40),
+            "surviving group counts are visible-only"
+        );
         assert_eq!(
             counts.values().sum::<i64>(),
             160,
@@ -4841,7 +4964,11 @@ mod capacity_payload_tests {
             })
             .collect();
         gs.sort_unstable();
-        assert_eq!(gs, vec![1, 2, 3, 4], "DISTINCT g excludes the fully-tombstoned group 0");
+        assert_eq!(
+            gs,
+            vec![1, 2, 3, 4],
+            "DISTINCT g excludes the fully-tombstoned group 0"
+        );
 
         // ORDER BY: the ordered scan starts at id=40 (0..39 tombstoned), 160 visible rows.
         let ordered = e
@@ -7058,6 +7185,10 @@ impl Engine {
                         | SqlType::Int2
                         | SqlType::Int8
                         | SqlType::Timestamp
+                        // TYPE-COVERAGE #14 (numeric): the b128 (16-byte) section rides the payload
+                        // after the i64 sections; Numeric + Uuid share it (same fixed width).
+                        | SqlType::Numeric { .. }
+                        | SqlType::Uuid
                 )
             });
         // A PURELY-int4 table is laid down with capacity HEADROOM (~2x rows, power-of-two) so committed
@@ -7251,13 +7382,17 @@ impl Engine {
                 // "large admit is one dense shard") must reach the append fn's ROLLOVER branch —
                 // the in-place branch checks headroom itself. Gating headroom here made every
                 // bulk-admitted lineage decline appends outright -> O(table) re-admit per commit.
-                int4_appendable: snapshot.resident_device_numeric_columns.is_empty()
-                    && snapshot.resident_device_bool_columns.is_empty()
+                // TYPE-COVERAGE #14 (numeric): appendable = every column rides a FIXED-WIDTH section
+                // (i32 / i64 / b128) — no bool / text / NULL sections. The b128 (Numeric/Uuid) count
+                // joins the i32+i64 count so a numeric-bearing open shard appends in place instead of
+                // O(table) re-admitting per commit (the chunk encoder writes its 16-byte arm).
+                int4_appendable: snapshot.resident_device_bool_columns.is_empty()
                     && snapshot.resident_device_text_columns.is_empty()
                     && snapshot.resident_device_null_columns.is_empty()
                     && snapshot.column_count
                         == snapshot.resident_device_int4_columns.len()
-                            + snapshot.resident_device_int8_columns.len(),
+                            + snapshot.resident_device_int8_columns.len()
+                            + snapshot.resident_device_numeric_columns.len(),
                 // S-d3: the zone map (min/max per int4 column) for shard pruning.
                 resident_device_int4_column_stats: snapshot
                     .resident_device_int4_column_stats
@@ -7268,6 +7403,8 @@ impl Engine {
                 resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
                 // TYPE-COVERAGE track 2 slice 2: the i64 section rides the same payload.
                 resident_device_int8_columns: snapshot.resident_device_int8_columns.clone(),
+                // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) section rides the same payload.
+                resident_device_numeric_columns: snapshot.resident_device_numeric_columns.clone(),
                 resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
                 // M3-for-shards: carry the payload's per-column NULL validity bitmaps so the sharded scan's
                 // recompaction can rebuild them into the unified buffer (this re-admit path is the ONLY
@@ -7895,6 +8032,12 @@ impl Engine {
                     | gpu_db_sql::SqlType::Int2
                     | gpu_db_sql::SqlType::Int8
                     | gpu_db_sql::SqlType::Timestamp
+                    // TYPE-COVERAGE #14 (numeric): b128 (Numeric/Uuid) VALUE columns ride the
+                    // fixed-width section + section-aware append. (The unique-index gate below still
+                    // requires an i32-section key — device locate probes i32 only — so numeric stays
+                    // a value column, not a PK/unique key.)
+                    | gpu_db_sql::SqlType::Numeric { .. }
+                    | gpu_db_sql::SqlType::Uuid
             )
         }) && table.indexes.iter().all(|index| {
             // The A2/A3 device locate probes i32-SECTION keys only: a unique index on an
@@ -8222,6 +8365,7 @@ impl Engine {
             row_start,
             shard_int4_names,
             shard_int8_names,
+            shard_numeric_names,
             gpu_id,
             schema,
             max_shard_id,
@@ -8243,6 +8387,7 @@ impl Engine {
                 open.row_start,
                 open.resident_device_int4_columns.clone(),
                 open.resident_device_int8_columns.clone(),
+                open.resident_device_numeric_columns.clone(),
                 open.gpu_id,
                 open.schema.clone(),
                 table_shards.iter().map(|s| s.shard_id).max().unwrap_or(0),
@@ -8271,11 +8416,14 @@ impl Engine {
             .map(|column| column.ty)
             .collect();
         let column_count = column_types.len();
-        if shard_int4_names.len() + shard_int8_names.len() != column_count {
+        if shard_int4_names.len() + shard_int8_names.len() + shard_numeric_names.len()
+            != column_count
+        {
             return false;
         }
         let num_i32_cols = shard_int4_names.len();
         let num_i64_cols = shard_int8_names.len();
+        let num_numeric_cols = shard_numeric_names.len();
 
         // FITS the open shard's headroom -> append IN PLACE (1b-ii on the shard path).
         if row_count.checked_add(k).is_some_and(|end| end <= capacity) {
@@ -8315,7 +8463,8 @@ impl Engine {
             // (replacing the ~8 driver calls of the unfused chain below). Int4-only shards
             // (the covered-INSERT shape); ineligible falls through to the unfused sequence,
             // byte-identical to before the flag.
-            let fused = if self.fused_apply_enabled() && num_i64_cols == 0 {
+            let fused = if self.fused_apply_enabled() && num_i64_cols == 0 && num_numeric_cols == 0
+            {
                 let append_started =
                     crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
                         .then(std::time::Instant::now);
@@ -8394,9 +8543,10 @@ impl Engine {
                     }
                 }
             }
-            let appended_bytes =
-                (k * (num_i32_cols * std::mem::size_of::<i32>()
-                    + num_i64_cols * std::mem::size_of::<i64>())) as u64;
+            let appended_bytes = (k
+                * (num_i32_cols * std::mem::size_of::<i32>()
+                    + num_i64_cols * std::mem::size_of::<i64>()
+                    + num_numeric_cols * 16)) as u64;
             // S-d3: extend the open shard's zone map (min/max per int4 column) to cover the appended
             // rows. The stats vector is INT4-ORDINAL-aligned, so iterate only the i32-section catalog
             // columns, in order (stage ii: i64 columns carry no zone map — they simply never prune).
@@ -8544,18 +8694,21 @@ impl Engine {
             capacity: new_capacity,
             int4_appendable: true,
             resident_device_int4_column_stats: int4_stats,
-            // Audit NOTE adopted: count i64 columns at 8 bytes (was a telemetry undercount
-            // vs the admit path; allocated_bytes was always correct).
+            // Audit NOTE adopted: count i64 columns at 8 bytes + b128 (Numeric/Uuid) columns at
+            // 16 bytes (was a telemetry undercount vs the admit path; allocated_bytes was always
+            // correct).
             resident_bytes: (8 + k
                 * (num_i32_cols * std::mem::size_of::<i32>()
-                    + num_i64_cols * std::mem::size_of::<i64>()))
-                as u64,
+                    + num_i64_cols * std::mem::size_of::<i64>()
+                    + num_numeric_cols * 16)) as u64,
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
             resident_device_int4_columns: shard_int4_names.clone(),
             resident_device_int8_columns: shard_int8_names.clone(),
+            // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) section rides the rollover payload.
+            resident_device_numeric_columns: shard_numeric_names.clone(),
             resident_device_text_columns: Vec::new(),
-            // Rollover shards are int4-only + NULL-free by precondition (the caller rejects NULLs).
+            // Rollover shards are fixed-width (i32/i64/b128) + NULL-free by precondition (NULLs rejected).
             resident_device_null_columns: Vec::new(),
             gpu_id,
             schema,
@@ -9554,6 +9707,7 @@ impl Engine {
                 count_header_byte_offset: 0,
                 resident_device_int4_columns: shard.resident_device_int4_columns,
                 resident_device_int8_columns: Vec::new(), // benchmark chunks are int4-only
+                resident_device_numeric_columns: Vec::new(),
                 resident_device_text_columns: shard.resident_device_text_columns,
                 // Benchmark installs carry no NULL metadata (dense, read-only, NULL-free chunks).
                 resident_device_null_columns: Vec::new(),
@@ -10097,7 +10251,9 @@ impl Engine {
             // TYPE-COVERAGE track 2 slice 2: the shard's i64 section labels ride the synthesized
             // descriptor so the shared offset helpers address it (layout == single-buffer).
             resident_device_int8_columns: shard.resident_device_int8_columns.clone(),
-            resident_device_numeric_columns: Vec::new(),
+            // TYPE-COVERAGE #14 (numeric): the shard's b128 (Numeric/Uuid) section labels ride the
+            // descriptor (layout == single-buffer, so the shared 16-byte offset helper addresses it).
+            resident_device_numeric_columns: shard.resident_device_numeric_columns.clone(),
             resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: shard.resident_device_text_columns.clone(),
             // M3-for-shards: carry the shard's own per-column NULL bitmaps (offsets are relative to the
@@ -10137,6 +10293,9 @@ impl Engine {
         // TYPE-COVERAGE track 2 slice 2: the i64-section columns recompacted into the unified
         // buffer (after every i32 section, total_row_count-strided). Empty pre-slice.
         int8_columns: Vec<String>,
+        // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) columns recompacted into the unified
+        // buffer (after every i32 + i64 section, total_row_count-strided at 16 bytes). Empty pre-slice.
+        numeric_columns: Vec<String>,
         // M3-for-shards: the per-column NULL bitmaps recompacted into the unified buffer (offsets ABSOLUTE
         // in that buffer). Empty when no surviving shard carries a NULL — byte-identical to the pre-M3 read.
         null_columns: Vec<ResidentDeviceNullBitmapLayout>,
@@ -10154,7 +10313,7 @@ impl Engine {
             resident_device_int4_columns,
             resident_device_int4_column_stats: Vec::new(),
             resident_device_int8_columns: int8_columns,
-            resident_device_numeric_columns: Vec::new(),
+            resident_device_numeric_columns: numeric_columns,
             resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: Vec::new(),
             resident_device_null_columns: null_columns,
@@ -11241,13 +11400,21 @@ impl Engine {
             if shard.device_memory.is_none() {
                 has_all_device_memory = false;
             }
+            // TYPE-COVERAGE #14 (numeric): a required column must sit in SOME fixed-width device
+            // section — int4 / int8 / b128 (Numeric/Uuid). (Filter columns are still int4 by shape
+            // definition; only the projected columns can be i64/b128, which the general executor +
+            // the recompaction gather serve.) Text/bool required columns are never classified here.
             if !required_int4_columns.is_empty()
-                && required_int4_columns
-                    .iter()
-                    .any(|column| !shard.resident_device_int4_columns.contains(column))
+                && required_int4_columns.iter().any(|column| {
+                    !shard.resident_device_int4_columns.contains(column)
+                        && !shard.resident_device_int8_columns.contains(column)
+                        && !shard.resident_device_numeric_columns.contains(column)
+                })
             {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
+                // (Message kept as "int4 projection layout" for the p8 route tests; the check now
+                // also accepts i64/b128 sections — a truly-missing column still rejects here.)
                 decision.reason = format!(
                     "resident shard {} lacks required int4 projection layout",
                     shard.shard_id
