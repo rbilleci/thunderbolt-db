@@ -5,17 +5,19 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-07. **Base:** `main` @ `aaaac1fe`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
+**Updated:** 2026-07-07. **Base:** `main` @ `b16f791f`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
 the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first), updates are
 SUSTAINABLE (F3/U4 version-aware device PK index — dup-tolerant, mixed bench 1.4M TPS / 3 rebuilds),
-and **R-ver (read version resolution) COMPLETE — PART 1 + PART 2 MERGED**: reads over versioned
-elided tables no longer de-elide/refuse — plain `SELECT`/`SELECT *` route on-device (PART 1) and
-GROUP BY / DISTINCT / ORDER BY thread the SV3b/SV6 visibility conjunct through the sharded sub-bridges
-(PART 2). So MIXED OLTP (read+write on one hot table) is now fully GPU-native for the int4-PK shapes.
-Five adversarial audits across U2/F3/U4/R-ver all MERGE-SAFE; every CRITICAL (U2 replay lock-step;
-F3/U4 write-locate first-match) fixed + sabotage-verified + regression-gated. **NEXT: TYPE COVERAGE
-(#14)** → CPU-engine deletion (ADR-006, the charter's finish line). See memory `u2-lane-update-design`,
-`type-coverage-14`.
+**R-ver (read version resolution) COMPLETE — PART 1 + PART 2 MERGED** (reads over versioned elided
+tables no longer de-elide/refuse — plain `SELECT`/`SELECT *` on-device + GROUP BY / DISTINCT / ORDER
+BY thread the SV3b/SV6 visibility conjunct through the sharded sub-bridges), so MIXED OLTP is fully
+GPU-native for the int4-PK shapes. **TYPE COVERAGE #14 — NUMERIC/UUID (b128) MERGED (`b16f791f`):**
+16-byte fixed-width value columns (NUMERIC via LE mantissa, UUID via raw bytes) now ride the elided
+device shard path — admit/append/rollover, the b128 recompaction gather into the unified exec source,
+plain-column ORDER BY routes to the GPU sort. Six adversarial audits across U2/F3/U4/R-ver/numeric all
+MERGE-SAFE; every CRITICAL fixed + sabotage-verified + regression-gated. **NEXT TYPE COVERAGE #14
+tracks:** bool (bitmap), text LAST (variable-length), compound PKs (don't parse today) → CPU-engine
+deletion (ADR-006, the charter's finish line). See memory `type-coverage-14`, `u2-lane-update-design`.
 
 ---
 
