@@ -26,12 +26,16 @@ pub(crate) const WAL_BINARY_TAG: u8 = 0xFF;
 const WAL_BINARY_VERSION: u8 = 1;
 /// Op codes.
 const OP_INSERT: u8 = 1;
-/// U1 (W5b): a covered lane DELETE, logged BY KEY — replay re-resolves the key against the
-/// replayed state (deterministic: all ops on a key are lane-serialized in seq order, cross-key
-/// ops commute), so the record needs no resolved tuple/row ids. 0-row deletes never reach the
-/// WAL (the pump's pre-claim filter completes them without a seq), so a durable delete record
-/// re-resolving to 0 rows at replay is corruption-or-determinism-bug — the apply arm is LOUD.
+/// W5b: a covered lane DELETE, logged BY KEY — replay re-resolves the key against the replayed
+/// state (deterministic: all ops on a key are lane-serialized in seq order, cross-key ops
+/// commute). WAL-FIRST: a 0-row delete DOES reach the WAL (the locate moved to apply), and its
+/// replay re-resolve to 0 rows is a legal no-op (not corruption).
 const OP_DELETE_BY_KEY: u8 = 2;
+/// U2 (W5b): a covered lane UPDATE, logged BY KEY + the new row image + the new version's row id.
+/// Replay re-resolves the key: a visible old version → tombstone it + append the new image at
+/// `new_row_id`; no visible version → a 0-row no-op (the row id is still consumed, keeping the
+/// allocator in lock-step with the live path that claimed it before the apply-time locate).
+const OP_UPDATE_BY_KEY: u8 = 3;
 
 /// The decoded form of a v1 binary INSERT record.
 pub(crate) struct BinaryInsertRecord {
@@ -50,10 +54,22 @@ pub(crate) struct BinaryDeleteByKeyRecord {
     pub(crate) pk_value: i32,
 }
 
+/// The decoded form of a W5b by-key UPDATE record (U2).
+pub(crate) struct BinaryUpdateByKeyRecord {
+    pub(crate) table: String,
+    pub(crate) pk_column: String,
+    pub(crate) pk_value: i32,
+    /// The new version's reserved row id (claimed live before the apply-time locate).
+    pub(crate) new_row_id: u64,
+    /// The new row image in `encode_relational_row`'s cell encoding (all columns, new values).
+    pub(crate) new_row_encoded: String,
+}
+
 /// A decoded binary WAL record of any op (the tag dispatch for apply/replay consumers).
 pub(crate) enum BinaryWalRecord {
     Insert(BinaryInsertRecord),
     DeleteByKey(BinaryDeleteByKeyRecord),
+    UpdateByKey(BinaryUpdateByKeyRecord),
 }
 
 /// Encode a W5b by-key DELETE record. `None` on width-exceeding names (caller falls back to the
@@ -78,12 +94,89 @@ pub(crate) fn encode_binary_delete_by_key(
     Some(out)
 }
 
+/// Encode a W5b by-key UPDATE record (U2): table + pk column/value + the new version's row id +
+/// the new row image (all columns). `None` on width-exceeding shapes (caller falls back to SQL
+/// text). `new_row` is the full post-image in catalog order.
+pub(crate) fn encode_binary_update_by_key(
+    table: &str,
+    pk_column: &str,
+    pk_value: i32,
+    new_row_id: u64,
+    new_row: &[SqlValue],
+) -> Option<Vec<u8>> {
+    if table.len() > u16::MAX as usize || pk_column.len() > u16::MAX as usize {
+        return None;
+    }
+    let encoded = encode_relational_row(new_row);
+    let encoded_bytes = encoded.as_bytes();
+    if encoded_bytes.len() > u32::MAX as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity(
+        3 + 2 + table.len() + 2 + pk_column.len() + 4 + 8 + 4 + encoded_bytes.len(),
+    );
+    out.push(WAL_BINARY_TAG);
+    out.push(WAL_BINARY_VERSION);
+    out.push(OP_UPDATE_BY_KEY);
+    out.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    out.extend_from_slice(table.as_bytes());
+    out.extend_from_slice(&(pk_column.len() as u16).to_le_bytes());
+    out.extend_from_slice(pk_column.as_bytes());
+    out.extend_from_slice(&pk_value.to_le_bytes());
+    out.extend_from_slice(&new_row_id.to_le_bytes());
+    out.extend_from_slice(&(encoded_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(encoded_bytes);
+    Some(out)
+}
+
 /// Decode ANY binary record (op dispatch). Errors are LOUD (`Durability`) — a tagged record
 /// that fails to decode is corruption-or-version-skew, never silently skipped.
 pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, EngineError> {
     let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
     match payload.get(2) {
         Some(&OP_INSERT) => decode_binary_insert(payload).map(BinaryWalRecord::Insert),
+        Some(&OP_UPDATE_BY_KEY) => {
+            let mut at = 0usize;
+            let mut take = |n: usize| -> Result<&[u8], EngineError> {
+                let end = at.checked_add(n).ok_or_else(|| fail("length overflow"))?;
+                let slice = payload.get(at..end).ok_or_else(|| fail("truncated"))?;
+                at = end;
+                Ok(slice)
+            };
+            if take(1)?[0] != WAL_BINARY_TAG {
+                return Err(fail("missing tag"));
+            }
+            if take(1)?[0] != WAL_BINARY_VERSION {
+                return Err(fail("unsupported version"));
+            }
+            if take(1)?[0] != OP_UPDATE_BY_KEY {
+                return Err(fail("op dispatch mismatch"));
+            }
+            let table_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+            let table = std::str::from_utf8(take(table_len)?)
+                .map_err(|_| fail("non-utf8 table name"))?
+                .to_string();
+            let column_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+            let pk_column = std::str::from_utf8(take(column_len)?)
+                .map_err(|_| fail("non-utf8 column name"))?
+                .to_string();
+            let pk_value = i32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+            let new_row_id = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
+            let enc_len = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+            let new_row_encoded = std::str::from_utf8(take(enc_len)?)
+                .map_err(|_| fail("non-utf8 row encoding"))?
+                .to_string();
+            if at != payload.len() {
+                return Err(fail("trailing bytes"));
+            }
+            Ok(BinaryWalRecord::UpdateByKey(BinaryUpdateByKeyRecord {
+                table,
+                pk_column,
+                pk_value,
+                new_row_id,
+                new_row_encoded,
+            }))
+        }
         Some(&OP_DELETE_BY_KEY) => {
             let mut at = 0usize;
             let mut take = |n: usize| -> Result<&[u8], EngineError> {
@@ -268,7 +361,7 @@ mod w5b_tests {
                 assert_eq!(record.pk_column, "id");
                 assert_eq!(record.pk_value, -73);
             }
-            BinaryWalRecord::Insert(_) => panic!("decoded the wrong op"),
+            _ => panic!("decoded the wrong op"),
         }
         assert!(decode_binary_record(&payload[..payload.len() - 1]).is_err());
         let mut trailing = payload.clone();
@@ -278,5 +371,30 @@ mod w5b_tests {
         let mut skewed = payload;
         skewed[2] = 99;
         assert!(decode_binary_record(&skewed).is_err());
+    }
+
+    /// U2 (W5b): the by-key UPDATE record round-trips (table + pk + new_row_id + new image)
+    /// through the op-dispatch decoder; truncation/trailing bytes fail LOUDLY.
+    #[test]
+    fn w5b_update_by_key_round_trips_and_fails_loud() {
+        let new_row = [SqlValue::Int4(42), SqlValue::Int4(999)];
+        let payload =
+            encode_binary_update_by_key("public_t", "id", 42, 7_000_001, &new_row).unwrap();
+        assert!(is_binary_wal_record(&payload));
+        assert!(std::str::from_utf8(&payload).is_err()); // 0xFF tag -> invalid UTF-8
+        match decode_binary_record(&payload).unwrap() {
+            BinaryWalRecord::UpdateByKey(record) => {
+                assert_eq!(record.table, "public_t");
+                assert_eq!(record.pk_column, "id");
+                assert_eq!(record.pk_value, 42);
+                assert_eq!(record.new_row_id, 7_000_001);
+                assert_eq!(record.new_row_encoded, encode_relational_row(&new_row));
+            }
+            _ => panic!("decoded the wrong op"),
+        }
+        assert!(decode_binary_record(&payload[..payload.len() - 1]).is_err());
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert!(decode_binary_record(&trailing).is_err());
     }
 }

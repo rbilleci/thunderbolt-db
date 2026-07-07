@@ -815,6 +815,10 @@ impl Engine {
                         tables.insert(record.table);
                         continue;
                     }
+                    Ok(crate::wal_binary::BinaryWalRecord::UpdateByKey(record)) => {
+                        tables.insert(record.table);
+                        continue;
+                    }
                     Err(_) => return None,
                 }
             }
@@ -985,6 +989,18 @@ impl Engine {
                     rows,
                     write_set,
                 }));
+            }
+            crate::wal_binary::BinaryWalRecord::UpdateByKey(record) => {
+                // U2 CHECKPOINT STUB: the WAL layer (OP_UPDATE_BY_KEY encode/decode) is in place,
+                // but the pump does not yet EMIT update records, so this replay arm is unreachable
+                // today. The real arm (re-resolve by key → tombstone old + install the new image
+                // at `new_row_id`, with allocator lock-step incl. the 0-row case) is the next U2
+                // step. Fail LOUDLY if a record ever reaches here before it is implemented.
+                return Err(EngineError::Durability(format!(
+                    "U2 not yet implemented: W5b UPDATE record for \"{}\" ({} = {}) has no replay \
+                     arm — the pump must not emit these until the arm lands",
+                    record.table, record.pk_column, record.pk_value
+                )));
             }
         };
         let table = cat
