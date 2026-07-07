@@ -3656,6 +3656,17 @@ impl Engine {
                 }
                 continue;
             }
+            // AUDIT F1 (U1, MEDIUM adopted): a tombstone decline on a NON-elided table has no
+            // recovery arm below — falling through would advance the cut and ack Ok(1) for a
+            // delete that never applied (silent live/durable divergence until restart). Fail
+            // LOUDLY: the panic rides the apply leader's catch_unwind (F2), failing the waiters
+            // and poisoning the lanes; recovery replays the durable W5b records.
+            if !tombstones_ok && !self.table_install_elided(table) {
+                panic!(
+                    "commit-path invariant violation: lane tombstones declined on the \
+                     non-elided table \"{table}\" — refusing to ack an unapplied delete"
+                );
+            }
             // Fallback (rare on the lanes path — intents gate on elided,
             // auto-admit tables): rehydrate the merged batch as upserts +
             // key-resolved removals and invalidate per txn, mirroring
