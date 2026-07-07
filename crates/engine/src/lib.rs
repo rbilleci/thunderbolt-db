@@ -93,7 +93,7 @@ mod engine_ddl_table;
 mod engine_dml_concurrent;
 mod engine_dml_intent;
 mod engine_intent_lanes;
-pub use engine_dml_intent::{CoveredInsertRoute, IntentTicket};
+pub use engine_dml_intent::{CoveredInsertRoute, IntentTicket, SynchronousCommit};
 mod engine_dml_prepare;
 pub(crate) use engine_dml_prepare::InsertPrepareValidation;
 mod engine_expr;

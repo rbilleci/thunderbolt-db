@@ -68,11 +68,24 @@ fn commit_intent_via_submit(
 }
 
 fn select_all_rows(engine: &Engine) -> Vec<Vec<SqlValue>> {
-    engine
-        .execute_relational_select_text("SELECT id, v FROM t ORDER BY id")
-        .expect("select id, v")
-        .rows
-        .into_boxed()
+    // ASYNC-COMMIT read-back contract (GPU_DB_SYNCHRONOUS_COMMIT=off arm):
+    // acked rows become READABLE once the visible cut covers them (<= ~one
+    // fence). The ORDER BY path refuses a half-visible versioned shard
+    // (SV3b/SV6 wiring), so pump until the window closes instead of failing.
+    let mut spins = 0u32;
+    loop {
+        engine.drive_commit_wave();
+        match engine.execute_relational_select_text("SELECT id, v FROM t ORDER BY id") {
+            Ok(result) => return result.rows.into_boxed(),
+            Err(err) => {
+                spins += 1;
+                assert!(
+                    spins < 10_000_000,
+                    "visibility never caught up for ORDER BY read-back: {err}"
+                );
+            }
+        }
+    }
 }
 
 /// The full E2.1 arc on real hardware: warm a PK'd int4 table into elision,
@@ -553,4 +566,127 @@ fn warm_count(rows: &[Vec<SqlValue>]) -> usize {
     rows.iter()
         .filter(|row| matches!(row[0], SqlValue::Int4(id) if id >= 1_000_000))
         .count()
+}
+
+/// PG-MODEL ASYNC COMMIT (`SynchronousCommit::Off`, per statement): async
+/// intents ack at the APPLIED cut while their WAL frames fence behind the
+/// ack; a clean drain + reopen recovers EVERY acked row (the loss window
+/// exists only under power failure, by contract). Mixed sync/async waves
+/// settle both tiers; the engine default flips via
+/// `set_synchronous_commit_default` and per-statement mode overrides it.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_async_commit_acks_early_and_recovers_clean_drain() {
+    let path = test_wal_path("intent-async-commit");
+    let mut engine = Engine::with_durable_wal_segment(&path);
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+
+    let txn_ids = AtomicU64::new(2);
+    engine
+        .execute_dml_concurrent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            "INSERT INTO t VALUES (1000000, 0)",
+        )
+        .unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("t")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return; // driverless box
+    }
+    let mut warmed = false;
+    for i in 0..10_000_i32 {
+        engine
+            .execute_dml_concurrent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
+            )
+            .unwrap();
+        if engine.table_install_elided("t") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "table never entered elision on a GPU box");
+    let route = engine.prepare_covered_insert_route("t").unwrap();
+
+    // MIXED WAVES: alternate strict and async intents; every one must ack Ok.
+    let mut tickets: Vec<_> = (0..200_i32)
+        .map(|i| {
+            let mode = if i % 2 == 0 {
+                crate::SynchronousCommit::Off
+            } else {
+                crate::SynchronousCommit::On
+            };
+            engine
+                .submit_covered_insert_intent_with_commit(
+                    txn_ids.fetch_add(1, Ordering::Relaxed),
+                    &route,
+                    &[i, i + 1],
+                    mode,
+                )
+                .expect("submit intent")
+        })
+        .collect();
+    let mut reaped = 0usize;
+    let mut spins = 0u32;
+    while reaped < tickets.len() {
+        engine.drive_commit_wave();
+        for ticket in tickets.iter_mut() {
+            if let Some(result) = engine.poll_intent(ticket) {
+                result.expect("distinct-PK intent commits in both modes");
+                reaped += 1;
+            }
+        }
+        spins += 1;
+        assert!(spins < 10_000_000, "mixed sync/async batch never drained");
+    }
+
+    // ENGINE-DEFAULT flip: plain submits now run async; they must still ack.
+    engine.set_synchronous_commit_default(crate::SynchronousCommit::Off);
+    let mut tickets: Vec<_> = (1000..1100_i32)
+        .map(|i| {
+            engine
+                .submit_covered_insert_intent(
+                    txn_ids.fetch_add(1, Ordering::Relaxed),
+                    &route,
+                    &[i, i + 1],
+                )
+                .expect("submit intent (async default)")
+        })
+        .collect();
+    let mut reaped = 0usize;
+    let mut spins = 0u32;
+    while reaped < tickets.len() {
+        engine.drive_commit_wave();
+        for ticket in tickets.iter_mut() {
+            if let Some(result) = engine.poll_intent(ticket) {
+                result.expect("async-default intent commits");
+                reaped += 1;
+            }
+        }
+        spins += 1;
+        assert!(spins < 10_000_000, "async-default batch never drained");
+    }
+
+    // CLEAN DRAIN + REOPEN: every acked row (async included) recovers — the
+    // async loss window exists only under power failure, never a clean stop.
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment(&path).expect("reopen recovers");
+    let count = recovered
+        .execute_relational_select_text("SELECT COUNT(*) FROM t WHERE id < 2000")
+        .unwrap();
+    assert!(
+        format!("{:?}", count.rows.row(0).first()).contains("(300)"),
+        "all 300 acked rows (200 mixed + 100 async-default) must survive reopen: {:?}",
+        count.rows.row(0).first()
+    );
 }

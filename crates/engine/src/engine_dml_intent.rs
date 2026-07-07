@@ -33,6 +33,30 @@
 
 use super::*;
 
+/// Commit durability mode for a single intent — the PostgreSQL
+/// `synchronous_commit` model, per statement.
+///
+/// * `On` (the default): the ack waits for the wave's WAL frames to be
+///   FUA-durable AND device-applied — a returned `Ok` survives power failure.
+/// * `Off` (ASYNC COMMIT, opt-in): the ack waits only for device apply; the
+///   WAL frames are still published in commit order and fenced by the
+///   pipeline behind the ack. A power failure may lose a suffix of
+///   async-acked intents (bounded by the fence pipeline depth, typically a
+///   few milliseconds), but NEVER consistency: recovery replays the ordered
+///   durable prefix, exactly like PostgreSQL's async commit. A process crash
+///   (without power loss) loses nothing the drive completed.
+///
+/// Deliberate deviation from PostgreSQL, documented: visibility stays gated
+/// on the STRICT cut, so readers can never observe a row a power failure
+/// could revoke; an async writer's own read-back lags its ack by at most
+/// about one fence (~1ms on consumer NVMe). The engine-wide default is
+/// `GPU_DB_SYNCHRONOUS_COMMIT` (on) / [`Engine::set_synchronous_commit_default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SynchronousCommit {
+    On,
+    Off,
+}
+
 /// A prepared covered-INSERT route: the immutable per-statement shape checks,
 /// captured once so per-intent execution is allocation-lean and validation is
 /// O(1). Obtain via [`Engine::prepare_covered_insert_route`]; invalidated by
@@ -92,6 +116,19 @@ impl CoveredInsertRoute {
 }
 
 impl Engine {
+    /// Set the engine-wide DEFAULT commit mode (the pg server-default analog;
+    /// per-statement overrides via
+    /// [`Engine::submit_covered_insert_intent_with_commit`] always win).
+    /// No-op on a non-lanes engine (the classic path is always strict).
+    pub fn set_synchronous_commit_default(&self, mode: SynchronousCommit) {
+        if let Some(lanes) = &self.intent_lanes {
+            lanes.synchronous_commit_default.store(
+                mode == SynchronousCommit::On,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
     /// Prepare a covered-INSERT route for `table`: the E2.1 intent fast path's
     /// per-statement handle. Errors unless the table is CURRENTLY the covered
     /// flagship shape:
@@ -296,14 +333,42 @@ impl Engine {
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
             outstanding: None,
+            synchronous: true,
         })
     }
 
+    /// Submit with the ENGINE-DEFAULT commit mode (see [`SynchronousCommit`]).
     pub fn submit_covered_insert_intent(
         &self,
         txn_id: u64,
         route: &CoveredInsertRoute,
         params: &[i32],
+    ) -> Result<IntentTicket, ExecuteError> {
+        let mode = if self
+            .intent_lanes
+            .as_ref()
+            .is_some_and(|lanes| {
+                !lanes
+                    .synchronous_commit_default
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            }) {
+            SynchronousCommit::Off
+        } else {
+            SynchronousCommit::On
+        };
+        self.submit_covered_insert_intent_with_commit(txn_id, route, params, mode)
+    }
+
+    /// Submit with an EXPLICIT per-statement commit mode — the PostgreSQL
+    /// `SET LOCAL synchronous_commit` analog (see [`SynchronousCommit`] for
+    /// the exact durability contract of each mode). Non-lanes engines ignore
+    /// `Off` and stay strict (the classic path always acks durable).
+    pub fn submit_covered_insert_intent_with_commit(
+        &self,
+        txn_id: u64,
+        route: &CoveredInsertRoute,
+        params: &[i32],
+        mode: SynchronousCommit,
     ) -> Result<IntentTicket, ExecuteError> {
         self.check_intent_params(route, params)?;
         // LEAN LANE PATH: in lanes mode, build the compact LaneIntent and push
@@ -313,7 +378,9 @@ impl Engine {
             std::mem::forget(self.register_active_snapshot(read_snapshot));
             let snapshot_hold =
                 Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
-            if let Some(intent) = self.build_lane_intent(txn_id, route, params, read_snapshot) {
+            if let Some(mut intent) = self.build_lane_intent(txn_id, route, params, read_snapshot)
+            {
+                intent.synchronous = mode == SynchronousCommit::On;
                 let outcome = std::sync::Arc::clone(&intent.outcome);
                 // Single lane-ingress point: `submit_lane_intent` carries the
                 // resize-barrier Dekker protocol (count-then-check, hold-queue

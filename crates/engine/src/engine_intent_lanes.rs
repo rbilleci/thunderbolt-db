@@ -113,6 +113,11 @@ pub(crate) struct IntentLaneState {
     /// narrow under load is a throughput emergency, staying too wide at low
     /// load costs little (fence lanes park).
     pub(crate) resize_low_since: Mutex<Option<std::time::Instant>>,
+    /// Engine-wide default commit mode (the PostgreSQL `synchronous_commit`
+    /// server default): true = strict durable acks. Seeded from
+    /// `GPU_DB_SYNCHRONOUS_COMMIT`; per-statement override via
+    /// `Engine::submit_covered_insert_intent_with_commit`.
+    pub(crate) synchronous_commit_default: AtomicBool,
     /// Diagnostics: completed resizes + total barrier nanos.
     pub(crate) stat_resizes: AtomicU64,
     pub(crate) stat_resize_ns: AtomicU64,
@@ -308,6 +313,20 @@ pub(crate) fn intent_lane_subframes() -> usize {
         .unwrap_or(0)
 }
 
+/// Server default for the commit mode (`GPU_DB_SYNCHRONOUS_COMMIT`, default
+/// `on` — the PostgreSQL model): `off`/`0`/`false` makes ASYNC COMMIT the
+/// default for intents that don't specify a mode. Strict mode is always
+/// available per statement regardless of the default.
+pub(crate) fn synchronous_commit_default_from_env() -> bool {
+    !matches!(
+        std::env::var("GPU_DB_SYNCHRONOUS_COMMIT")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false"
+    )
+}
+
 /// Adaptive ship-target divisor (`GPU_DB_INTENT_LANE_SHIP_DIV`, default 2):
 /// a lane ships when its queue reaches outstanding/(div * lanes). Larger
 /// divisors ship SMALLER waves sooner — lower formation wait (the oldest
@@ -339,7 +358,18 @@ pub(crate) fn intent_lane_group_us() -> u64 {
 /// the cut gates settlement. `apply_slot.failed` covers the failure path.
 pub(crate) struct LaneSettle {
     pub(crate) end_seq: u64,
+    /// Winners acking at the STRICT gate (visible cut = durable AND applied).
     pub(crate) winners: Vec<crate::engine_dml_concurrent::LaneIntent>,
+    /// Winners that opted into ASYNC COMMIT (`SynchronousCommit::Off`, the
+    /// PostgreSQL `synchronous_commit = off` model): acked as soon as the
+    /// APPLIED cut covers the wave — their WAL frames are still published in
+    /// order and fenced by the pipeline, but the ack does not wait for the
+    /// fence. Power failure may lose a suffix of async-acked intents (never
+    /// consistency: recovery replays the ordered durable prefix).
+    pub(crate) async_winners: Vec<crate::engine_dml_concurrent::LaneIntent>,
+    /// True once `async_winners` were settled (the entry then waits only for
+    /// the strict gate to settle `winners` and pop).
+    pub(crate) async_settled: bool,
     pub(crate) apply_slot: std::sync::Arc<ApplySlot>,
     /// When the wave's WAL frames were published — settle accumulates
     /// publish→settle lag into `stat_acklag_ns` (the fence+cut+settle share
@@ -369,6 +399,7 @@ impl IntentLaneState {
             resize_hold: Mutex::new(Vec::new()),
             resize_leader: Mutex::new(None),
             resize_low_since: Mutex::new(None),
+            synchronous_commit_default: AtomicBool::new(synchronous_commit_default_from_env()),
             stat_resizes: AtomicU64::new(0),
             stat_resize_ns: AtomicU64::new(0),
             outstanding: std::sync::Arc::new(AtomicU64::new(0)),

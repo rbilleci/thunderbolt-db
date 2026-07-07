@@ -500,6 +500,26 @@ conflict pass hid behind the locate (130→80µs) but the coalescer-round wait d
 observation: single seconds reach 2.08M; run-to-run and second-to-second variance ±30% is now the
 dominant unexplained factor.
 
+**ASYNC COMMIT — the PostgreSQL `synchronous_commit` model, per statement (2026-07-07, user-directed).**
+`SynchronousCommit::{On,Off}` on the intent path: `On` (default) acks at the STRICT gate (FUA-durable AND
+device-applied — unchanged); `Off` (opt-in, per statement via
+`Engine::submit_covered_insert_intent_with_commit`, engine default via `GPU_DB_SYNCHRONOUS_COMMIT` /
+`Engine::set_synchronous_commit_default`) acks at the APPLIED cut while the WAL frames fence behind the
+ack. CONTRACT (documented on the enum): a power failure may lose a suffix of async-acked intents (bounded
+by the fence pipeline, typically ms), NEVER consistency — recovery replays the ordered durable prefix; a
+clean drain loses nothing (GPU-tested). DELIBERATE DEVIATION from pg: visibility stays gated on the
+STRICT cut, so readers can never observe a row a power failure could revoke; the async writer's own
+read-back lags its ack by <= ~one fence (~1ms consumer NVMe) — and the half-visible window surfaces the
+pre-existing SV3b/SV6 ORDER-BY refusal to eager readers (retry-until-visible; see the test helper).
+MECHANICS: winners partition at settle-enqueue (`LaneSettle::{winners, async_winners, async_settled}`),
+two-tier settle (async tier at `applied_mirror`, strict tier + pop at the min cut; poison paths drain
+both), and the RESIZE BARRIER now also waits for the visible cut to cover the claimed seq frontier —
+async items leave `outstanding` before durability, and an applied-but-invisible row would reopen the
+duplicate-key hole the merge audit closed. **A/B (512 clients, all defaults otherwise): async p50 0.40ms
+p90 0.53ms p99 0.74ms @ 968k TPS vs sync p50 1.08 p90 1.39 @ 414k — the original sub-1ms p90 SLO is MET
+on consumer hardware under the bounded-loss contract; sync baseline unchanged; 61k async 1.67M (ties the
+peak — high load is validate/apply-bound, not durability-bound).**
+
 **NO-REAP PIPELINE + THE VALIDATE WALL (2026-07-06, `782213d9`): the pump is now fully non-blocking on
 apply; the remaining wall is the INLINE DEVICE VALIDATE.** No-reap: LaneSettle carries the ApplySlot,
 settlement queues at apply-push time, `drive_apply_queue_once` opportunistic leader passes, apply-failure

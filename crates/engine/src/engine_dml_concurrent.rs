@@ -231,6 +231,10 @@ pub(crate) struct LaneIntent {
     /// Live-population decrement handle (see `IntentLaneState::outstanding`);
     /// None outside lanes mode.
     pub(crate) outstanding: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// PostgreSQL `synchronous_commit` model: true (default) acks at the
+    /// STRICT gate (durable AND applied); false acks at the APPLIED cut
+    /// (async commit — bounded loss on power failure, consistency preserved).
+    pub(crate) synchronous: bool,
 }
 
 impl LaneIntent {
@@ -2830,12 +2834,20 @@ impl Engine {
         // covers the failure path. Same-slot safety holds without the device
         // index seeing this wave: the lane ledger recorded the winners at
         // claim and PK-hash routing pins a PK to one lane.
+        // Partition by commit mode (pg `synchronous_commit`): async winners
+        // ack at the APPLIED cut, strict winners at the visible (durable AND
+        // applied) cut. Same wave, same WAL frames, same apply — only the
+        // ack gate differs.
+        let (async_winners, winners): (Vec<LaneIntent>, Vec<LaneIntent>) =
+            winners.into_iter().partition(|item| !item.synchronous);
         lanes.settle[lane]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push_back(crate::engine_intent_lanes::LaneSettle {
                 end_seq: local_first + k,
                 winners,
+                async_winners,
+                async_settled: false,
                 apply_slot,
                 published_at: std::time::Instant::now(),
             });
@@ -2925,7 +2937,34 @@ impl Engine {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let drain_started = Instant::now();
         let mut drained = true;
-        while lanes.outstanding.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        // The barrier must ALSO wait for the VISIBLE cut to cover every
+        // claimed seq: async-commit winners leave `outstanding` at the
+        // APPLIED cut, but the post-flip snapshot-refresh safety argument
+        // needs their commits VISIBLE (covered by committed_seq) — an
+        // applied-but-not-yet-durable row is invisible to the authoritative
+        // recheck and would reopen the duplicate-key hole the merge audit
+        // closed.
+        let claimed_frontier = |lanes: &crate::engine_intent_lanes::IntentLaneState| -> u64 {
+            if !lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
+                return 0;
+            }
+            let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
+            lanes
+                .seq_oracle
+                .load(std::sync::atomic::Ordering::Acquire)
+                .saturating_sub(base)
+        };
+        // AUDIT (minor): after a WAL-append failure the claimed frontier
+        // contains seqs that can never become durable — skip the frontier
+        // wait once the WAL is poisoned (the engine is wedging loudly via the
+        // settle drain anyway) so resize keeps failing OPEN in 5s, not
+        // permanently spinning.
+        let wal_poisoned = |lanes: &crate::engine_intent_lanes::IntentLaneState| -> bool {
+            lanes.wal_peek().is_some_and(|wal| wal.is_poisoned())
+        };
+        while lanes.outstanding.load(std::sync::atomic::Ordering::SeqCst) > 0
+            || (!wal_poisoned(lanes) && lanes.visible_local_cut() < claimed_frontier(lanes))
+        {
             for lane in 0..lanes.lane_count {
                 self.drive_intent_lane(lane);
             }
@@ -2938,6 +2977,15 @@ impl Engine {
             lanes
                 .active_lanes
                 .store(target, std::sync::atomic::Ordering::Release);
+            // AUDIT (async-commit slice, MUST-FIX): the loop above waits for
+            // the VISIBLE cut to cover the claimed frontier, but committed_seq
+            // is only published inside settle — a fence completing between the
+            // last settle and the loop exit leaves committed_seq BEHIND the
+            // frontier, and the re-route's refreshed snapshots (which read
+            // committed_seq) would miss a just-fenced async commit: the
+            // duplicate-key hole again. Publish the covering cut HERE, before
+            // any held intent re-routes.
+            self.publish_committed_seq(lanes.visible_global_cut());
             lanes
                 .stat_resizes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3381,7 +3429,7 @@ impl Engine {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut settled = false;
             while let Some(entry) = queue.pop_front() {
-                for item in entry.winners {
+                for item in entry.winners.into_iter().chain(entry.async_winners) {
                     item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
                         reason.clone(),
                     ))));
@@ -3399,6 +3447,29 @@ impl Engine {
         let mut queue = lanes.settle[lane]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // ASYNC COMMIT tier (pg `synchronous_commit = off`): winners that
+        // opted out of the durability wait ack as soon as the APPLIED cut
+        // covers their wave — the WAL fence keeps running behind them.
+        // Visibility (`publish_committed_seq` above) stays gated on the
+        // STRICT cut, so readers never observe a row a power failure could
+        // revoke; the async writer's own read-back lags by <= ~one fence
+        // (documented deviation from pg, which exposes async commits
+        // immediately).
+        let applied_cut = lanes
+            .applied_mirror
+            .load(std::sync::atomic::Ordering::Acquire);
+        for entry in queue.iter_mut() {
+            if entry.end_seq > applied_cut {
+                break;
+            }
+            if !entry.async_settled {
+                entry.async_settled = true;
+                for item in entry.async_winners.drain(..) {
+                    item.set_outcome(Ok(()));
+                }
+                settled = true;
+            }
+        }
         while queue
             .front()
             .is_some_and(|entry| entry.end_seq <= local_cut)
@@ -3418,7 +3489,7 @@ impl Engine {
             lanes
                 .stat_settled_waves
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            for item in entry.winners {
+            for item in entry.winners.into_iter().chain(entry.async_winners) {
                 item.set_outcome(Ok(()));
             }
             settled = true;

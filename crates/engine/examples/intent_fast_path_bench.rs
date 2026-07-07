@@ -135,6 +135,13 @@ fn run_arm(
     // This decouples the single-writer sequencer from ingress/ack so the sequencer stays hot on
     // one core instead of the role bouncing across every driver (the measured per-item inflation
     // 0.89 -> 2.7us). `0` (default) keeps the self-pumping driver loop unchanged.
+    // GPU_DB_BENCH_ASYNC_COMMIT=1: drive the pg-style ASYNC COMMIT mode
+    // (ack at the applied cut; WAL fence pipelined behind the ack).
+    let commit_mode = if std::env::var("GPU_DB_BENCH_ASYNC_COMMIT").as_deref() == Ok("1") {
+        gpu_db_engine::SynchronousCommit::Off
+    } else {
+        gpu_db_engine::SynchronousCommit::On
+    };
     let pumps: usize = std::env::var("GPU_DB_BENCH_PUMPS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -206,8 +213,12 @@ fn run_arm(
                                 let id = (w as i64 * stride + i) as i32;
                                 i += 1;
                                 let submitted = Instant::now();
-                                match engine.submit_covered_insert_intent(txn_id, &route, &[id, 1])
-                                {
+                                match engine.submit_covered_insert_intent_with_commit(
+                                    txn_id,
+                                    &route,
+                                    &[id, 1],
+                                    commit_mode,
+                                ) {
                                     Ok(ticket) => *slot = Some((ticket, submitted)),
                                     Err(err) => return Err(format!("driver {w} submit: {err}")),
                                 }
