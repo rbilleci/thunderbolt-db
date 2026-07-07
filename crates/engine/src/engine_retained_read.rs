@@ -3339,6 +3339,50 @@ mod cross_shard_pk_index_tests {
         );
     }
 
+    /// U1 (sabotage-sensitive twin of the GPU reinsert test, whose row outcomes survive a
+    /// broken skip via the decline->scan net): a dead-below-boundary twin must be SKIPPED so
+    /// the rebuild succeeds; the same twin above the boundary (or with no skip) collides and
+    /// declines. Deleting the skip arm in `build_int4_pk_hash_table_host_visible` FAILS this
+    /// (sabotage-verified 2026-07-07).
+    #[test]
+    fn visibility_aware_rebuild_skips_dead_twin_below_boundary() {
+        let keys = [10_i32, 20, 10, 30]; // row 0 = dead twin of row 2
+        let live = 0x7F7F_7F7F_7F7F_7F7Fu64;
+        let stamps = [5_u64, live, live, live];
+        let (index, mask, shift) =
+            crate::engine_retained_read::build_int4_pk_hash_table_host_visible(
+                &keys,
+                8,
+                Some(&stamps),
+                7,
+            )
+            .expect("dead twin below boundary is skipped");
+        let mut probe = ((10_u32.wrapping_mul(0x9E37_79B1)) >> shift) & mask;
+        let found = loop {
+            let entry = index[probe as usize];
+            assert_ne!(entry, 0, "key 10 must be indexed");
+            if (entry >> 32) as u32 == 10 {
+                break (entry & 0xFFFF_FFFF) as u32;
+            }
+            probe = (probe + 1) & mask;
+        };
+        assert_eq!(found, 3, "the LIVE twin (row 2, packed row+1=3) is indexed");
+        assert!(
+            crate::engine_retained_read::build_int4_pk_hash_table_host_visible(
+                &keys,
+                8,
+                Some(&stamps),
+                4
+            )
+            .is_none(),
+            "a twin dead ABOVE the boundary still collides (readers may need it)"
+        );
+        assert!(
+            crate::engine_retained_read::build_int4_pk_hash_table_host_visible(&keys, 8, None, 7)
+                .is_none()
+        );
+    }
+
     /// The per-shard bloom (sub-slice 2) has NO FALSE NEGATIVES (every built key -> maybe_contains true --
     /// the load-bearing membership-prune invariant, so a present key's shard is NEVER skipped) and a sane
     /// false-positive rate (most absent keys -> false = skippable). Includes 0, negatives, and a large set.
