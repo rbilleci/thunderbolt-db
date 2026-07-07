@@ -1,9 +1,11 @@
 # Lane UPDATE/DELETE Intents — Tier 1 v1 Design (PROPOSAL, UNACCEPTED — review round 1 incorporated)
 
-> Status: **design prep only** (user-directed 2026-07-07; no code). **Rev 2** — incorporates the
-> mega-fuse author's review (2026-07-07) against the SHIPPED mega-fuse (`4291cdb0`, default-OFF,
-> pump-inline verdicts, single-shard probe, suffix-trim law). Decision points for the user are
-> marked **[DECIDE]**; previously-open ones now carry their ratified answers.
+> Status: **design prep only** (user-directed 2026-07-07; no code). **Rev 3** — rev 2
+> incorporated the mega-fuse author's review (against `4291cdb0`: pump-inline verdicts,
+> single-shard probe, suffix-trim law); rev 3 applies the NO-FEATURE-FLAGS mandate — the mega
+> arm now lives on `feature/mega-fuse` (removed from main), all flag/flip language replaced by
+> branch discipline (§9). Decision points for the user are marked **[DECIDE]**;
+> previously-open ones carry their ratified answers.
 >
 > **Review changelog (all points adopted):** §3 rewritten against the shipped contract — the
 > CLASSIC lane pipeline is the base arm, mega op-codes deferred to U4; locate joins the existing
@@ -56,11 +58,12 @@ routes pin the assignment column set (catalog order).
 
 ## 3. Pipeline integration — the CLASSIC lane pipeline is the base arm
 
-**Shipped reality this rev binds to:** the default engine runs the classic pipeline (inline
-coalesced validate at the pump → optimistic publish → no-reap apply coalescer). The mega-fuse is
-default-OFF (per-wave blocking launch loses to the coalescers at both load ends). U/D therefore
-ship on the classic arm; mega op-codes are the U4 optimization arm, contingent on the follow-up
-that flips mega's economics (cross-lane mega coalescer + WAL-first reorder).
+**Shipped reality this rev binds to:** main runs the classic pipeline ONLY (inline coalesced
+validate at the pump → optimistic publish → no-reap apply coalescer). The mega-fuse lost its A/B
+(per-wave blocking launch loses to the coalescers at both load ends) and was moved to
+`feature/mega-fuse` per the no-feature-flags mandate. U/D therefore ship on the classic arm;
+mega op-codes are the U4 arm, developed on that branch and mergeable only as a REPLACEMENT if
+the economics follow-up (cross-lane mega coalescer + WAL-first reorder) wins.
 
 ### 3.1 Routing and wave formation — unchanged
 PK-hash lane routing serializes every op on a key through one lane in submit order. Mixed-op
@@ -219,9 +222,9 @@ stands — correct over convenient.
   shape) at champion config + 512-client floor; rows-affected-weighted TPS with latency pairing.
   Insert-only baseline to preserve: {1.50, 1.41, 1.50}M. The mixed arm also SIZES: 0-row-update
   frequency (U4 gate), rebuild frequency post-U1-fix (kernel-replacement gate).
-- Full suites: engine default+fua arms, GPU intent suites (serial + lanes=2/6), MEGA suites
-  (mega-arm regression must stay green with U/D intents present — mega waves must refuse/route
-  around U/D items until U4), wal crate, clippy; TMPDIR hygiene.
+- Full suites: engine default+fua arms, GPU intent suites (serial + lanes=2/6), wal crate,
+  clippy; TMPDIR hygiene. (MEGA suites live on `feature/mega-fuse`; rebasing that branch over
+  U1/U2 must teach mega waves to refuse/route around U/D items until U4 adds the op codes.)
 
 ## 9. Slice plan (ratified order) + remaining decisions
 
@@ -234,15 +237,14 @@ stands — correct over convenient.
 - **U4 — mega-arm op codes** + tail-allocated update slots + VACUUM unpin decision + (if still
   needed) kernel index-entry replacement — gated on the mega economics follow-up and the U1/U2
   mixed-bench measurements.
-- **U5 — default flip** of the U/D intent path.
-
-**Flag discipline (per the no-flag-proliferation mandate, 2026-07-07):** the U/D path ships
-behind ONE flag whose WRITTEN EXPIRY is U5 — at the flip the flag and the refuse-U/D arm are
-DELETED in the same slice, not left as config. `GPU_DB_BENCH_MIX` is a bench knob, not product
-config. U4's mega arm carries no new flag: it extends `GPU_DB_MEGA_FUSE`, whose own
-expiry/deletion decision belongs to the mega economics follow-up — if that follow-up loses, the
-mega U/D op codes are never written; if it wins, the classic-vs-mega A/B verdict slice deletes
-the losing arm.
+**Branch discipline — NO feature flags (user mandate 2026-07-07, supersedes rev 2's flag
+addendum):** there is no U/D flag and no "default flip" slice. Each slice develops on a BRANCH
+and merges only when correct and complete — at which point lane U/D intents simply ARE the
+engine's behavior (there is no old arm to keep: post-activation U/D was a refusal, so U1/U2 are
+pure new capability; the refusal error for still-uncovered shapes remains until U3). The U4 mega
+arm develops on `feature/mega-fuse` and returns to main only as a REPLACEMENT for the classic
+arm if its economics win — the losing arm is deleted in the same merge. `GPU_DB_BENCH_MIX` is a
+bench-only knob, never read by the engine.
 
 Remaining **[DECIDE]**s: U4's VACUUM `max_created_by` unpin (§3.6); PK-update v2 (cross-lane
 two-phase vs quiesce-only — defer until a workload demands it); who implements U1

@@ -161,7 +161,10 @@ append/rollover design), (4) compound PKs (rejected at parse today), (5) the mix
 ## The per-iteration protocol (NON-NEGOTIABLE)
 
 1. **MEASURE first** — reproduce/confirm before changing code.
-2. **Smallest correct slice behind a default-OFF flag** — byte-identical to HEAD until the flip.
+2. **Smallest correct slice on a BRANCH — NO feature flags (user mandate 2026-07-07):** a path
+   merges only when correct AND complete, and it merges AS the path (the arm it replaces is deleted
+   in the same merge); unfinished or losing paths stay on their branch (learnings in docs/memory).
+   Product config stays ~5 documented settings (docs/CONFIG.md); bench knobs never read by the engine.
 3. **GPU-native solution (the charter)** — data-plane hot path on the device, not the host.
 4. **Differentials**: GPU == CPU == the SQL SPEC (memory `sql-spec-over-cpu-parity`). Prove the new path
    FIRED (a counter), not a silent fallback.
