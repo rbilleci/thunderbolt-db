@@ -5,7 +5,9 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-07. **Base:** `main` @ `3d1d7d55` (everything below is MERGED; no local branch debt).
+**Updated:** 2026-07-07. **Base:** `main` @ `6856ebcd`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
+lane DELETE intents COMPLETE + merged (WAL-first, fence-bound acks); lane UPDATE (U2) CHECKPOINTED on
+`feature/lane-update-intents` @ `9d85e1ca` (WAL layer done, resume via memory `u2-lane-update-design`).
 
 ---
 
@@ -101,7 +103,31 @@ lanes loudly — the apply-before-append inversion must never silently serve pha
 index-decline documented as perf cost. Gates: MEGA suites 4/4 (default/lanes6/async arms), FULL GPU sweep
 371/371, engine 491/491 both arms.
 
-## >>> PREVIOUS NEXT ACTION (executed above): THE MEGA-FUSE (user-ratified 2026-07-07) <<<
+## >>> THE ONE NEXT ACTION: RESUME U2 (lane UPDATE intents) <<<
+
+**Branch `feature/lane-update-intents` @ `9d85e1ca` — the W5b `OP_UPDATE_BY_KEY` WAL layer is DONE
++ committed + codec-tested; the replay arm is a LOUD STUB.** Resume via memory
+`u2-lane-update-design` (the full remaining plan). An UPDATE rides the merged WAL-first delete
+architecture: tombstone-OLD + append-NEW, both AT APPLY (off the pump critical path). Remaining:
+op model (`LaneOpKind::Update`), route + submit API, pump WAL-first (claim seq + new-version
+row_id, WAL the record, no pump-time locate), APPLY REORDER (locate old → tombstone → CONDITIONAL
+new-version append), the CORRECTNESS-CRITICAL replay arm (allocator lock-step incl. the 0-row
+case), rows-affected, gates + audit + merge. Known cost: UPDATE creates a dead twin (F3/U4 rebuild
+churn under readers).
+
+**TIER-1 DELETE PATH COMPLETE + MERGED (2026-07-07):** lane DELETE intents (U1) shipped, then made
+WAL-FIRST — the delete locate + tombstone + rows-affected moved OFF the pump critical path to
+apply-time, so a delete's ack is FENCE-BOUND (512-client mix=20% p50 1.58→1.19ms, at the
+insert-only 1.13 floor). Merges: U1 core + rebuild fix, perf lever B (batched tombstone scatter
+kernel — mix=20% 808K→1.34M), WAL-first (`6856ebcd`, supersedes the reverted lever A). All
+opus-audited MERGE-SAFE. Two tracked non-blocking follow-ups (memory
+`u1-lane-delete-implementation`): F1 duplicate same-key deletes double-count (likely unreachable),
+F2 0-row deletes record a ledger slot → retryable same-key-insert abort. The mixed I/D bench arm
+(`GPU_DB_BENCH_MIX_DELETE`, bench-only) is merged for sizing.
+
+---
+
+## >>> PREVIOUS NEXT ACTION (executed + reverted): THE MEGA-FUSE (user-ratified 2026-07-07) <<<
 
 **Fuse validate+insert into ONE device launch over the merged cross-lane batch, by pre-resolving winner
 identity host-side.** This is the only remaining structural 2M+ lever — config space is EXHAUSTED at ~1.5M
