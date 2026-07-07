@@ -24,6 +24,22 @@ impl Engine {
     pub fn recover_from_durable_wal_file(
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, EngineError> {
+        let path = path.as_ref();
+        // E2.5c-3 default-flip compatibility (merge audit): the DEFAULT engine
+        // writes the FUA frame-log layout (`<base>.fua.*`) and, once intents
+        // ran, the lane layout (`<base>.lane-N.fua.*`) — there is no plain
+        // serial segment file for the read below, and pre-flip callers of
+        // this API got "No such file or directory" after a crash. Dispatch on
+        // the on-disk shape exactly like `open_durable_wal_segment` (which
+        // also repairs crash-stranded lane orphans). Genuine serial segments
+        // keep the original byte-identical replay path.
+        #[cfg(unix)]
+        if !path.exists()
+            && (Self::intent_lane_files_exist(path)
+                || gpu_db_wal::fua_wal_segments_exist(path))
+        {
+            return Self::open_durable_wal_segment(path);
+        }
         let records = read_wal_segment(path)?;
         Self::recover_from_durable_wal(&records)
     }
