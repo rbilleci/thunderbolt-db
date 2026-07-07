@@ -279,8 +279,8 @@ pub(crate) struct ApplyRequest {
     pub(crate) row_ids: Vec<u64>,
     pub(crate) stamps: Vec<u64>,
     pub(crate) txn_ids: Vec<u64>,
-    /// U1: DELETE winners — the tombstone pass's targets (resolved by the wave's
-    /// visible-locate, identity-pinned for the apply-time liveness recheck).
+    /// U1 WAL-first: DELETE winners as UNRESOLVED by-key tombstones — the apply LOCATES them
+    /// (device visible-locate at the delete's read snapshot), off the pump's critical path.
     pub(crate) tombstones: Vec<LaneTombstone>,
     /// The wave's WHOLE claimed seq block `[seq_first, seq_first + seq_len)` — the applied-cut
     /// advance covers every claimed seq regardless of the insert/delete mix (U1: `stamps` is
@@ -290,29 +290,22 @@ pub(crate) struct ApplyRequest {
     pub(crate) slot: std::sync::Arc<ApplySlot>,
 }
 
-/// U1: one delete winner's resolved tombstone target, as located by the wave's coalesced
-/// device visible-locate.
-#[derive(Clone)]
-pub(crate) struct LaneTombstoneTarget {
-    pub(crate) shard_id: u32,
-    pub(crate) slot: u32,
-    /// The located shard's MAIN device region at locate time — the apply-time cell-liveness
-    /// identity (a VACUUM/re-admit between locate and apply re-clusters slots; the tombstone
-    /// pass must decline on identity mismatch, never stamp a re-clustered slot).
-    pub(crate) region: std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>,
-}
-
-/// U1: a tombstone work item inside an [`ApplyRequest`] — target + its commit seq (the
-/// `deleted_by` stamp value) + the by-key identity for the rare rehydrate fallback.
+/// U1 WAL-first: an UNRESOLVED by-key tombstone — the apply locates the visible target itself
+/// (device visible-locate at `read_snapshot`), so the pump never blocks on the delete locate.
+/// The record is already by-key durable (W5b), so `seq` is claimed and fenced before this
+/// resolves; a 0-row outcome is a durable no-op (replay re-resolves the same 0 rows).
 pub(crate) struct LaneTombstone {
-    pub(crate) shard_id: u32,
-    pub(crate) slot: u32,
+    /// The commit seq — the `deleted_by` stamp value if a visible row is located.
     pub(crate) seq: u64,
-    pub(crate) region: std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>,
-    /// The pk column's catalog position (fallback key resolution).
+    /// The pk column's catalog position (the locate filter index).
     pub(crate) filter_idx: u32,
-    /// The pk value (fallback key resolution).
+    /// The pk value (the locate needle).
     pub(crate) pk: i32,
+    /// The delete's read snapshot — the visibility the apply-time locate evaluates at.
+    pub(crate) read_snapshot: u64,
+    /// The shared cell the apply writes the resolved rows-affected (0 or 1) into; the settle
+    /// reads it to ack. Shared with the delete's `LaneIntent.rows_affected_cell`.
+    pub(crate) rows_affected: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Apply completion: `done` flips after the merged append (or its fallback)

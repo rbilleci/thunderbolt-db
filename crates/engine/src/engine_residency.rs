@@ -9556,12 +9556,21 @@ impl Engine {
     /// generation-independent). `keys` are `(column_index, value)`; a key with no visible match
     /// at `read_txn` resolves to nothing (its delete was against a row this gather cannot see —
     /// impossible for a wave-located 1-row target, but the resolve is total rather than lossy).
+    /// Returns `(row-id removals for the rehydrate, the KEY VALUES that matched a visible row)`
+    /// — the matched-key set lets the WAL-first delete fallback set each delete's rows-affected
+    /// (1 if its key matched, else 0).
     pub(crate) fn resolve_elided_row_ids_by_int4_key(
         &self,
         table: &RelationalTable,
         read_txn: u64,
         keys: &[(usize, i32)],
-    ) -> Result<std::collections::BTreeSet<u64>, EngineError> {
+    ) -> Result<
+        (
+            std::collections::BTreeSet<u64>,
+            std::collections::HashSet<i32>,
+        ),
+        EngineError,
+    > {
         if keys.is_empty() {
             return Ok(Default::default());
         }
@@ -9574,14 +9583,16 @@ impl Engine {
                 ))
             })?;
         let mut removals = std::collections::BTreeSet::new();
+        let mut matched_keys = std::collections::HashSet::new();
         for (row_id, values) in &gathered {
             for &(column, key) in keys {
                 if values.get(column) == Some(&SqlValue::Int4(key)) {
                     removals.insert(*row_id);
+                    matched_keys.insert(key);
                 }
             }
         }
-        Ok(removals)
+        Ok((removals, matched_keys))
     }
 
     pub(crate) fn rehydrate_elided_table(

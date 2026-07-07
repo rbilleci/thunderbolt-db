@@ -362,6 +362,7 @@ impl Engine {
             outstanding: None,
             synchronous: true,
             rows_affected: 1,
+            rows_affected_cell: None,
         })
     }
 
@@ -613,9 +614,11 @@ impl Engine {
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
             outstanding: None,
             synchronous: true,
-            // A delete that reaches the wave located exactly one live row (0-row deletes
-            // complete at the pre-claim filter and never carry this value).
-            rows_affected: 1,
+            // WAL-FIRST: the delete's rows-affected (0 or 1) is resolved at APPLY (the locate
+            // moved off the pump critical path); this cell carries it back to the settle. Init 0
+            // = "no visible row" (a safe default a never-applied delete would report).
+            rows_affected: 0,
+            rows_affected_cell: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
         })
     }
 

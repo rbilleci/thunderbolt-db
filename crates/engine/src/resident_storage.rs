@@ -620,6 +620,13 @@ thread_local! {
     /// commit_mutex and self-deadlock. False for every client read. See
     /// [`Engine::skip_leader_check_during_internal_read`].
     pub(crate) static MVCC_READ_SKIPS_LEADER_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// U1 WAL-FIRST: set (RAII-scoped) while this thread is the LANE APPLY LEADER — it already
+    /// holds `device_apply_lock`, so a PK-index rebuild triggered by the apply-time delete
+    /// visible-locate (`ensure_shard_pk_device_index`) must SKIP re-taking that lock or it
+    /// self-deadlocks. The leader's exclusivity already gives the rebuild the exclusion the
+    /// guard provides. False for every off-lock prober.
+    pub(crate) static LANE_APPLY_LEADER_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A loaded, immutable view of one table's rows for the read path: either the pinned published

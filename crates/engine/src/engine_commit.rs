@@ -972,16 +972,13 @@ impl Engine {
                     filter_groups: Vec::new(),
                 };
                 let applied = self.apply_delete(cat, delete, entry.index)?;
-                // LOUD 0-row net: a durable W5b delete record exists only because the live pump
-                // located exactly one visible row (0-row deletes never claim a seq / enter the
-                // WAL). Re-resolving to nothing here is corruption or a replay-determinism bug —
-                // never silently skipped.
+                // WAL-FIRST: a W5b record is claimed + fenced BEFORE the visible target is
+                // located (the locate moved to apply), so a 0-row delete DOES reach the WAL. At
+                // replay it re-resolves to the SAME 0 rows deterministically (all ops on a key
+                // are lane-serialized in seq order) — a legal no-op, not corruption. `None` =
+                // 0 rows applied; the delete simply affected nothing.
                 let Some((table, rows, write_set)) = applied else {
-                    return Err(EngineError::Durability(format!(
-                        "W5b delete record for \"{}\" ({} = {}) re-resolved to 0 rows at replay \
-                         — the live commit located exactly one; refusing the inconsistent replay",
-                        record.table, record.pk_column, record.pk_value
-                    )));
+                    return Ok(None);
                 };
                 return Ok(Some(AppliedRowMutation::Delete {
                     table,

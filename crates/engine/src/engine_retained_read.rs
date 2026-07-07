@@ -2137,12 +2137,21 @@ impl Engine {
         // excludes applies during the rebuild, and the live count re-converges the
         // extension chain (entry.row_count == the next apply's base) instead of
         // looping through rebuild-per-wave. Cache HITS above stay lock-free.
-        let _lane_rebuild_guard = self.intent_lanes.as_ref().map(|lanes| {
-            lanes
-                .device_apply_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        });
+        // U1 WAL-FIRST: the apply LEADER already holds `device_apply_lock` (the delete
+        // visible-locate rebuilds under it), so re-taking it here would self-deadlock — skip the
+        // guard when the leader thread-local is set; the leader's exclusivity already gives the
+        // rebuild what the guard provides.
+        let apply_leader = crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(|f| f.get());
+        let _lane_rebuild_guard = if apply_leader {
+            None
+        } else {
+            self.intent_lanes.as_ref().map(|lanes| {
+                lanes
+                    .device_apply_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+        };
         let (build_memory, build_offset, build_row_count, build_capacity_rows) =
             if self.intent_lanes.is_some() {
                 // Re-check under the guard: another prober may have rebuilt already.
