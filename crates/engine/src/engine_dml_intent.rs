@@ -315,21 +315,11 @@ impl Engine {
                 Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
             if let Some(intent) = self.build_lane_intent(txn_id, route, params, read_snapshot) {
                 let outcome = std::sync::Arc::clone(&intent.outcome);
-                // ACTIVE-LANE RESIZE barrier: while a resize leader drains the
-                // in-flight population, new intents divert to the hold queue
-                // (not counted as outstanding) and re-route after the flip.
-                if lanes
-                    .resize_holding
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    lanes
-                        .resize_hold
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push(intent);
-                } else {
-                    crate::Engine::enqueue_lane_intent(lanes, intent);
-                }
+                // Single lane-ingress point: `submit_lane_intent` carries the
+                // resize-barrier Dekker protocol (count-then-check, hold-queue
+                // divert with strand guard, post-barrier snapshot refresh on
+                // re-route) — see the CRITICAL-audit notes there.
+                self.submit_lane_intent(lanes, intent);
                 return Ok(IntentTicket {
                     outcome: Some(outcome),
                     snapshot_hold,

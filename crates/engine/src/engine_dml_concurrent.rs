@@ -2913,13 +2913,19 @@ impl Engine {
         if leader.is_some_and(|last| last.elapsed() < DWELL) {
             return; // dwell: no flapping
         }
-        // BARRIER: divert new submits, drain everything in flight.
+        // BARRIER: divert new submits, drain everything in flight. SeqCst on
+        // the holding store pairs with the SeqCst increment-then-check in
+        // `submit_lane_intent` (Dekker): a submit that observed holding=false
+        // has its `outstanding` increment ordered before our drain reads, so
+        // the drain below cannot miss it (AUDIT: the uncounted-straggler
+        // TOCTOU admitted a same-PK intent into the old epoch after the last
+        // drain observation).
         lanes
             .resize_holding
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let drain_started = Instant::now();
         let mut drained = true;
-        while lanes.outstanding.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        while lanes.outstanding.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             for lane in 0..lanes.lane_count {
                 self.drive_intent_lane(lane);
             }
@@ -2942,35 +2948,101 @@ impl Engine {
         }
         lanes
             .resize_holding
-            .store(false, std::sync::atomic::Ordering::Release);
-        // Re-route the held intents through the (possibly new) epoch.
-        let held: Vec<LaneIntent> = std::mem::take(
-            &mut *lanes
-                .resize_hold
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        for intent in held {
-            Self::enqueue_lane_intent(lanes, intent);
-        }
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // Re-route the held intents through the (possibly new) epoch, with a
+        // POST-BARRIER read snapshot. AUDIT (CRITICAL): a held intent carries
+        // the snapshot it captured at submit — PRE-flip. The barrier's safety
+        // argument ("every prior commit precedes every post-flip snapshot, so
+        // the device validate alone catches old duplicates") holds only for
+        // post-flip snapshots: with the stale one, a same-PK commit that
+        // settled during the drain is invisible to the authoritative recheck
+        // (committed after the stale snapshot) AND unknown to the new lane's
+        // ledger (it was recorded in the old lane) — a silent duplicate-key
+        // admission. `committed_seq()` here covers every drained commit by
+        // construction (the drain waited for settle, which publishes before
+        // outcomes). The ticket's registered snapshot hold keeps the OLD
+        // value — a conservative GC boundary, harmless. For covered INSERTs a
+        // fresher snapshot is strictly safer: it can only turn an admission
+        // into a duplicate-key/serialization rejection, never the reverse.
+        self.rescue_held_intents(lanes);
         *leader = Some(Instant::now());
     }
 
-    /// Route one intent to its PK lane, counting it into the live population.
-    /// The single lane-ingress point (submit fast path + hold-queue release).
-    pub(crate) fn enqueue_lane_intent(
+    /// Lane-ingress with the resize-barrier Dekker protocol: count the intent
+    /// into the live population FIRST (SeqCst), THEN check the barrier. If the
+    /// barrier is up, back the count out and divert to the hold queue; the
+    /// resize leader's `holding=true (SeqCst)` -> `outstanding` drain reads
+    /// pair with this increment -> check, so every intent is either counted
+    /// (and drained before the flip) or diverted (and re-routed after it with
+    /// a refreshed snapshot). The SINGLE lane-ingress point.
+    pub(crate) fn submit_lane_intent(
+        &self,
         lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
         mut intent: LaneIntent,
     ) {
         lanes
             .outstanding
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if lanes
+            .resize_holding
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            lanes
+                .outstanding
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            lanes
+                .resize_hold
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(intent);
+            // STRAND GUARD: if the barrier released between our check and the
+            // push, the leader's hold-queue take may already be done and
+            // nothing would ever route this intent (until the next resize).
+            // Re-check AFTER the push: holding still true means the current
+            // leader's take (which happens after its holding=false store) is
+            // still ahead of us and will collect the item; holding false is
+            // ambiguous, so self-rescue — take whatever is held and route it
+            // with a fresh post-barrier snapshot (same rule as the leader's
+            // re-inject; double-takes are safe, mem::take is atomic and each
+            // taker routes only what it got).
+            if !lanes
+                .resize_holding
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.rescue_held_intents(lanes);
+            }
+            return;
+        }
         intent.outstanding = Some(std::sync::Arc::clone(&lanes.outstanding));
         let lane = lanes.lane_for_pk(intent.slot.1);
         lanes.queues[lane]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push_back(intent);
+    }
+
+    /// Drain the resize hold queue outside an active barrier and route the
+    /// items with a fresh read snapshot (see the CRITICAL-audit note in
+    /// `maybe_resize_lanes`: held intents must never carry a pre-flip
+    /// snapshot into the new epoch).
+    fn rescue_held_intents(
+        &self,
+        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
+    ) {
+        let held: Vec<LaneIntent> = std::mem::take(
+            &mut *lanes
+                .resize_hold
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if held.is_empty() {
+            return;
+        }
+        let refreshed_snapshot = self.committed_seq();
+        for mut intent in held {
+            intent.read_snapshot = refreshed_snapshot;
+            self.submit_lane_intent(lanes, intent);
+        }
     }
 
     /// ONE opportunistic apply-leader pass: if the device lock is free and the
@@ -3039,9 +3111,17 @@ impl Engine {
                     // cut is GLOBAL-gating (every lane's acks wait on it);
                     // deferring it to the owning pump measurably inflated
                     // every ack (depth-2 v1: p50 21ms -> 28ms, sustained -10%).
+                    // AUDIT (minor): `done` is stored BEFORE the cut advance
+                    // so "cut covers the wave" always implies "its slot is
+                    // done" — the settle-side debug_assert's precondition.
+                    request
+                        .slot
+                        .done
+                        .store(true, std::sync::atomic::Ordering::Release);
                     let local = first - base;
                     lanes.record_applied(local, local + len as u64);
                     applied_rows += len as u64;
+                    continue;
                 }
                 request
                     .slot

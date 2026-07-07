@@ -504,48 +504,61 @@ impl FuaWalBackend {
         let segment_bytes = self.segment_bytes;
         let recycle_pool = Arc::clone(&self.recycle_pool);
         std::thread::spawn(move || {
-            // A stale temp from a crashed prior life (or an unrolled leftover) is ours to clobber.
-            let _ = std::fs::remove_file(&temp);
-            // RECYCLE arm (E2.5c-2): reuse a retired segment file when one is offered — its
-            // extents are already written, so the whole prewrite (fallocate + zero-fill + the
-            // fsync that lands a device-wide NVMe FLUSH during live fencing) is skipped. The
-            // fresh monotonic id epoch-stamps the header so the previous life's frames are
-            // scan-rejected. Any recycle failure (geometry drift, rename error) falls back to
-            // the fresh-create arm — recycle is an optimization, never a correctness gate.
-            let recycled = recycle_pool
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pop()
-                .and_then(|retired| {
-                    std::fs::rename(&retired, &temp).ok()?;
-                    let config = FuaFrameLogConfig {
-                        path: temp.clone(),
-                        segment_id: id,
-                        capacity_bytes: segment_bytes,
-                    };
-                    // Safety: the temp path is owned exclusively by this backend (one prestage
-                    // in flight; renamed to its final segment name before any other opener).
-                    unsafe { FuaFrameLog::recycle(config) }.ok()
-                });
-            let result = match recycled {
-                Some(log) => Ok((log, true)),
-                None => {
-                    // Fresh create (a failed recycle above may have left a stale temp — clobber).
+            // AUDIT (minor): the slot MUST leave Pending even if this body
+            // panics — Drop and take_prestaged wait on the Ready/Failed
+            // transition with no timeout; a panicking pre-stager wedges
+            // FAIL-CLOSED (Failed) instead of hanging shutdown/roll.
+            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> std::io::Result<(Arc<FuaFrameLog>, bool)> {
+                    // A stale temp from a crashed prior life (or an unrolled leftover) is ours
+                    // to clobber.
                     let _ = std::fs::remove_file(&temp);
-                    let config = FuaFrameLogConfig {
-                        path: temp,
-                        segment_id: id,
-                        capacity_bytes: segment_bytes,
-                    };
-                    // Safety: as above — exclusive temp-path ownership.
-                    unsafe { FuaFrameLog::create(config) }.map(|log| (log, false))
-                }
-            };
+                    // RECYCLE arm (E2.5c-2): reuse a retired segment file when one is offered —
+                    // its extents are already written, so the whole prewrite (fallocate +
+                    // zero-fill + the fsync that lands a device-wide NVMe FLUSH during live
+                    // fencing) is skipped. The fresh monotonic id epoch-stamps the header so the
+                    // previous life's frames are scan-rejected. Any recycle failure (geometry
+                    // drift, rename error) falls back to the fresh-create arm — recycle is an
+                    // optimization, never a correctness gate.
+                    let recycled = recycle_pool
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .pop()
+                        .and_then(|retired| {
+                            std::fs::rename(&retired, &temp).ok()?;
+                            let config = FuaFrameLogConfig {
+                                path: temp.clone(),
+                                segment_id: id,
+                                capacity_bytes: segment_bytes,
+                            };
+                            // Safety: the temp path is owned exclusively by this backend (one
+                            // prestage in flight; renamed to its final segment name before any
+                            // other opener).
+                            unsafe { FuaFrameLog::recycle(config) }.ok()
+                        });
+                    match recycled {
+                        Some(log) => Ok((log, true)),
+                        None => {
+                            // Fresh create (a failed recycle above may have left a stale temp —
+                            // clobber).
+                            let _ = std::fs::remove_file(&temp);
+                            let config = FuaFrameLogConfig {
+                                path: temp.clone(),
+                                segment_id: id,
+                                capacity_bytes: segment_bytes,
+                            };
+                            // Safety: as above — exclusive temp-path ownership.
+                            unsafe { FuaFrameLog::create(config) }.map(|log| (log, false))
+                        }
+                    }
+                },
+            ));
             let (lock, cvar) = &*slot;
             let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-            *guard = match result {
-                Ok((log, was_recycled)) => PrestageSlot::Ready(id, log, was_recycled),
-                Err(err) => PrestageSlot::Failed(format!("{err}")),
+            *guard = match body {
+                Ok(Ok((log, was_recycled))) => PrestageSlot::Ready(id, log, was_recycled),
+                Ok(Err(err)) => PrestageSlot::Failed(format!("{err}")),
+                Err(_) => PrestageSlot::Failed("pre-stager thread panicked".to_string()),
             };
             cvar.notify_all();
         });
