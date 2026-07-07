@@ -2197,6 +2197,23 @@ impl Engine {
         if keys.len() != row_count {
             return None;
         }
+        // U1 (visibility-aware rebuild): read the shard's deleted_by stamps (absent region =
+        // all-live) and skip rows dead at or below the GC boundary — see
+        // `build_int4_pk_hash_table_host_visible`. Boundary = the oldest registered snapshot
+        // (or committed_seq if none): a row dead at or below it is invisible to every current
+        // AND future reader (future snapshots bind at >= committed_seq >= any published stamp).
+        let deleted_stamps: Option<Vec<u64>> = self
+            .read_state
+            .residency
+            .shard_deleted_by_memory
+            .get(&(table_name.to_string(), shard_id))
+            .and_then(|region| region.read_resident_u64_column(0, row_count).ok());
+        let gc_boundary = self
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .oldest()
+            .unwrap_or_else(|| self.committed_seq());
         // GROWTH HEADROOM (E2.5b-2): size the rebuilt table for 2x the current
         // rows, not 1x. The builder's natural rule next_pow2(rows*2) can land
         // capacity EXACTLY at the current row count (whenever rows*2 is a power
@@ -2215,23 +2232,27 @@ impl Engine {
         } else {
             row_count_u64.saturating_mul(2)
         };
-        let (device_index, table_mask, hash_shift) =
-            match build_int4_pk_hash_table_host(&keys, sizing_rows) {
-                Some((index, table_mask, hash_shift)) => {
-                    let index_bytes: Vec<u8> =
-                        index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
-                    let runtime = self.cuda_driver_probe_runtime();
-                    let gpu_id = build_memory.metadata().gpu_id;
-                    // An upload failure (e.g. OOM) is TRANSIENT -> return None WITHOUT caching (retry next
-                    // batch); the caller falls back to the host path meanwhile.
-                    let Ok(mem) = runtime.retain_device_memory_copy(gpu_id, &index_bytes) else {
-                        return None;
-                    };
-                    (Some(Arc::new(mem)), table_mask, hash_shift)
-                }
-                // Duplicate / oversize key column -> declined; CACHE `None` so it is not rebuilt every batch.
-                None => (None, 0, 0),
-            };
+        let (device_index, table_mask, hash_shift) = match build_int4_pk_hash_table_host_visible(
+            &keys,
+            sizing_rows,
+            deleted_stamps.as_deref(),
+            gc_boundary,
+        ) {
+            Some((index, table_mask, hash_shift)) => {
+                let index_bytes: Vec<u8> =
+                    index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
+                let runtime = self.cuda_driver_probe_runtime();
+                let gpu_id = build_memory.metadata().gpu_id;
+                // An upload failure (e.g. OOM) is TRANSIENT -> return None WITHOUT caching (retry next
+                // batch); the caller falls back to the host path meanwhile.
+                let Ok(mem) = runtime.retain_device_memory_copy(gpu_id, &index_bytes) else {
+                    return None;
+                };
+                (Some(Arc::new(mem)), table_mask, hash_shift)
+            }
+            // Duplicate / oversize key column -> declined; CACHE `None` so it is not rebuilt every batch.
+            None => (None, 0, 0),
+        };
         let result = device_index.clone().map(|di| (di, table_mask, hash_shift));
         let entry = CachedShardPkDeviceIndex {
             resident_device_ptr: device_ptr,
@@ -2918,6 +2939,26 @@ pub(crate) fn build_int4_pk_hash_table_host(
     keys: &[i32],
     row_count: u64,
 ) -> Option<(Vec<u64>, u32, u32)> {
+    build_int4_pk_hash_table_host_visible(keys, row_count, None, 0)
+}
+
+/// U1 (visibility-aware rebuild): like [`build_int4_pk_hash_table_host`], but rows whose
+/// `deleted_by` stamp is at or below `gc_boundary` are SKIPPED — dead at or below the oldest
+/// active snapshot means invisible to EVERY current and future reader, so omitting them from
+/// the index loses nothing (the index also serves point reads at old snapshots — rows dead
+/// ABOVE the boundary must stay indexed, which is why this is boundary-gated and not a blanket
+/// tombstone skip). This is what keeps a delete→reinsert shard indexable: without the skip the
+/// rebuild sees the dead twin + the live reinsert as a duplicate and DECLINES PERMANENTLY
+/// (every later locate degrades to the scan). Twins deleted ABOVE the boundary still collide
+/// and decline — a transient bounded by the active-snapshot window, sized by the mixed bench.
+/// The LIVE fill (0x7F7F..) is above any real boundary, so live rows are never skipped, and a
+/// missing region (`None`) means every row is live — no special cases.
+pub(crate) fn build_int4_pk_hash_table_host_visible(
+    keys: &[i32],
+    row_count: u64,
+    deleted_by: Option<&[u64]>,
+    gc_boundary: u64,
+) -> Option<(Vec<u64>, u32, u32)> {
     // A 0-row shard makes `table_size = 1` -> `hash_shift = 32`, and `key >> 32` is a u32 shift-overflow
     // (panics in debug/test, silently masks in release). Decline (the scan handles 0 rows as an empty match);
     // R1's caller `build_wave_resident_int4_index` already returns None for 0 rows BEFORE delegating, so this
@@ -2935,6 +2976,12 @@ pub(crate) fn build_int4_pk_hash_table_host(
     let hash_shift = 32 - table_size.trailing_zeros();
     let mut index = vec![0_u64; table_size as usize];
     for (row, &key) in keys.iter().enumerate() {
+        if deleted_by
+            .and_then(|stamps| stamps.get(row))
+            .is_some_and(|&stamp| stamp <= gc_boundary)
+        {
+            continue; // dead below the boundary: invisible to every possible reader
+        }
         let key_bits = key as u32;
         let mut slot = (key_bits.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
         let mut probes = 0_u32;

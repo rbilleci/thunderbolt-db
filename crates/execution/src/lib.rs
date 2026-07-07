@@ -1030,6 +1030,37 @@ impl CudaResidentDeviceMemory {
         Ok(out)
     }
 
+    /// U1: the u64 twin of [`Self::read_resident_i32_column`] — the visibility-aware index
+    /// rebuild reads the shard's `deleted_by` stamps to skip rows dead below the GC boundary.
+    pub fn read_resident_u64_column(
+        &self,
+        byte_offset: u64,
+        count: usize,
+    ) -> Result<Vec<u64>, CudaRuntimeProbeError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = count
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let end = byte_offset
+            .checked_add(bytes as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if end > self.metadata.allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(bytes));
+        }
+        self.primary.set_current()?;
+        let mut out = vec![0_u64; count];
+        check_cuda(unsafe {
+            (self.primary.cu_memcpy_dtoh)(
+                out.as_mut_ptr().cast::<c_void>(),
+                self.device_ptr + byte_offset,
+                bytes,
+            )
+        })?;
+        Ok(out)
+    }
+
     /// Slice 1a (GPU-native writes): append `chunks` IN PLACE into this allocation's headroom — one
     /// `cuMemcpyHtoD` to `device_ptr + byte_offset` per chunk, with NO reallocation and NO
     /// device-to-device recompaction, so an OPEN shard grows without re-uploading the rows it already
