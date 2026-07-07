@@ -2146,6 +2146,12 @@ impl Engine {
         // unified multi-shard buffer recompacted by `execute_resident_sharded_via_general`), so
         // the same on-device grouped/distinct/ordered path serves the sharded shapes.
         src: Option<&ResidentExecSource>,
+        // R-ver PART 2: the SV3b/SV6 visibility for a VERSIONED unified `src` — threaded into
+        // `indices` so GROUP BY / DISTINCT / ORDER BY group/sort/dedup over VISIBLE rows only
+        // (tombstoned + too-new versions never reach the keys). MUST be `None` for a `src: None`
+        // caller (with_binding builds + resolves the unified source's visibility itself — the
+        // debug_assert there enforces it).
+        visibility: Option<ResidentVisibility>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         // Normalize the legacy 1-aggregate grouped projection (GroupedCount / GroupedSum / GroupedAvg /
         // GroupedMin / GroupedMax produced by the hand-rolled parser) to the general GroupedAggregates
@@ -2182,7 +2188,9 @@ impl Engine {
             bound,
             copin_s,
             predicate.as_ref(),
-            None, // SV3b visibility: this bridge does not carry a co-resident deleted_by column
+            // R-ver PART 2: forward the versioned unified src's visibility so the grouped/ordered
+            // survivors are the VISIBLE rows (was hard-`None`, which forced the caller refusal).
+            visibility,
             &order_by_exprs,
             &order_by_nulls_first,
             None,
@@ -3086,27 +3094,19 @@ impl Engine {
         // checked first; a grouped select may ALSO carry ORDER BY and must take the grouped path. The plain
         // scalar/projection shapes fall through to the COUNT-precheck + single run below (unchanged).
         //
-        // SV3b scope: these sub-bridges re-bind internally and do NOT yet thread the visibility filter, so a
-        // versioned shard reaching them would leak tombstoned rows. Reject with a clean error rather than
-        // return wrong rows. (Inert in production until DELETE tombstoning is wired -- SV4; the gate tests
-        // exercise the plain projection + scalar-aggregate path below, which IS visibility-correct.)
-        if visibility.is_some()
-            && (select.distinct || select.group_by.is_some() || !select.order_by.is_empty())
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident visibility filter (SV3b) is not yet wired through the DISTINCT / GROUP BY / \
-                 ORDER BY sharded sub-bridges"
-                    .to_string(),
-            )));
-        }
+        // R-ver PART 2: the reshaping sub-bridges are visibility-correct — they route back into
+        // `execute_resident_expr_select_with_binding`, whose survivor `indices` fold in the SV3b/SV6
+        // visibility BEFORE group/sort/dedup (verified: every grouped/distinct/ordered kernel reads
+        // only `indices`/`indices_u64`). So thread the versioned buffer's `visibility` through to
+        // them instead of refusing. (`visibility` is `None` for a version-free buffer -> byte-identical.)
         if select.distinct {
-            return self.execute_resident_distinct_via_general(select, Some(&unified_src));
+            return self.execute_resident_distinct_via_general(select, Some(&unified_src), visibility);
         }
         if select.group_by.is_some() {
-            return self.execute_resident_grouped_via_general(select, Some(&unified_src));
+            return self.execute_resident_grouped_via_general(select, Some(&unified_src), visibility);
         }
         if !select.order_by.is_empty() {
-            return self.execute_resident_grouped_via_general(select, Some(&unified_src));
+            return self.execute_resident_grouped_via_general(select, Some(&unified_src), visibility);
         }
 
         // All-empty handling (pins byte-identicality with slice 1): the general SUM/MIN/MAX/AVG hard-error
@@ -3336,6 +3336,9 @@ impl Engine {
         // `Some(src)` forwards an injected source to the grouped bridge it synthesizes (S10c slice 2b:
         // the unified multi-shard buffer), so DISTINCT runs on-device over the whole table.
         src: Option<&ResidentExecSource>,
+        // R-ver PART 2: the versioned unified src's visibility, forwarded to the grouped bridge so
+        // the distinct SET is over VISIBLE rows only. `None` for a `src: None` caller.
+        visibility: Option<ResidentVisibility>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let SelectProjection::Columns(columns) = &select.projection else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -3359,7 +3362,7 @@ impl Engine {
                 value_column: None,
             }],
         };
-        let mut result = self.execute_resident_grouped_via_general(&grouped, src)?;
+        let mut result = self.execute_resident_grouped_via_general(&grouped, src, visibility)?;
         // Drop the trailing COUNT(*) column -> the bare distinct keys (column 0 is the group key).
         // `columns` is now `Arc`-shared; `make_mut` gives an owned `&mut Vec` (no clone — this freshly
         // produced result holds the only reference).
@@ -4672,9 +4675,10 @@ impl Engine {
         // HERE — one resolution point for every `src: None` caller (the SQL->Expr PG path, the
         // parity-test wrapper, the CTAS/view bridges), so the general executor serves sharded tables
         // uniformly (zero-copy at one surviving shard; recompaction otherwise). The unified source
-        // carries its own SV3b/SV6 visibility, which OVERRIDES the caller's `None`; a VERSIONED table
-        // with a reshaping clause (DISTINCT / GROUP BY / ORDER BY / HAVING) clean-errors — those paths
-        // do not thread the visibility conjuncts yet (never a tombstone leak). Single-buffer tables and
+        // carries its own SV3b/SV6 visibility, which OVERRIDES the caller's `None`. R-ver PART 2: a
+        // VERSIONED table with a reshaping clause (DISTINCT / GROUP BY / ORDER BY / HAVING) is now
+        // SERVED — the visibility resolved below flows into the survivor `indices` (folded in BEFORE
+        // group/sort/dedup), so no tombstoned/too-new row reaches a key. Single-buffer tables and
         // `src: Some` callers are byte-identical.
         let sharded_unified: Option<ShardedUnifiedExecSource> = if src.is_none()
             && self.relational_residency_entry(&table.name).is_none()
@@ -4686,23 +4690,7 @@ impl Engine {
                 .get(&table.name)
                 .is_some_and(|shards| !shards.is_empty())
         {
-            let unified = self.build_sharded_unified_exec_source(table, predicate, copin_s)?;
-            if unified.visibility.is_some()
-                && (select.distinct
-                    || select.group_by.is_some()
-                    || !select.order_by.is_empty()
-                    || !select.having_groups.is_empty()
-                    || !order_by_exprs.is_empty()
-                    || group_key_expr.is_some()
-                    || !group_key_columns.is_empty())
-            {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident visibility filter (SV3b/SV6) is not yet wired through the DISTINCT / \
-                     GROUP BY / ORDER BY paths for a versioned sharded table"
-                        .to_string(),
-                )));
-            }
-            Some(unified)
+            Some(self.build_sharded_unified_exec_source(table, predicate, copin_s)?)
         } else {
             None
         };

@@ -9732,7 +9732,7 @@ fn gpu_s8_bridge_matches_general_grouped_differential() {
             panic!("not a SELECT: {sql}");
         };
         let bridge = e
-            .execute_resident_grouped_via_general(&select, None)
+            .execute_resident_grouped_via_general(&select, None, None)
             .unwrap_or_else(|err| panic!("bridge failed for {sql}: {err:?}"));
         let general = e
             .execute_resident_expr_select_sql(sql)
@@ -9792,7 +9792,7 @@ fn audit_s8_filtered_grouped_having_order_limit() {
     );
     // The bridge produces the same result called directly as through the dispatch.
     assert_eq!(
-        e.execute_resident_grouped_via_general(&select, None)
+        e.execute_resident_grouped_via_general(&select, None, None)
             .unwrap()
             .rows,
         result.rows.into_boxed()
@@ -9870,7 +9870,7 @@ fn audit_s8_where_and_or_dnf_matches_general() {
             unreachable!()
         };
         let bridge = e
-            .execute_resident_grouped_via_general(&select, None)
+            .execute_resident_grouped_via_general(&select, None, None)
             .unwrap();
         let general = e.execute_resident_expr_select_sql(sql).unwrap();
         assert_eq!(bridge.columns, general.columns, "{sql}");

@@ -494,19 +494,19 @@ impl Engine {
             // fast path. Byte-identical to the retired probe on non-NULL data; PG-correct on NULLs (a NULL is
             // UNKNOWN under LIKE 3VL so it is excluded, whereas the NULL-blind probe's empty placeholder span
             // matched `LIKE '%'`). Covers text + CTAS + view uniformly.
-            "text_prefix_like_count" => self.execute_resident_grouped_via_general(select, None),
+            "text_prefix_like_count" => self.execute_resident_grouped_via_general(select, None, None),
             // S10a: an int4 COUNT(*) with multiple filter groups (OR of AND-groups, all int4) routes to the
             // `&Select`->general bridge as a CountAll + the rebuilt int4 DNF predicate -- byte-identical to the
             // retired probe on non-NULL data; PG-correct on NULLs (a NULL fails the predicate via 3VL instead
             // of the probe's phantom Int4(0)).
-            "int4_filter_group_count" => self.execute_resident_grouped_via_general(select, None),
+            "int4_filter_group_count" => self.execute_resident_grouped_via_general(select, None, None),
             // S8: grouped int4 aggregates route to the general on-device executor via the
             // `&Select`->general BRIDGE (it does ORDER BY / HAVING / LIMIT ON-DEVICE), retiring the
             // legacy resident-probe grouped methods whose `!gpu_ordered` branch host-finalized
             // sort/HAVING/LIMIT. Because the dispatch sees `&Select`, this covers the text entry AND
             // CTAS AND view/matview uniformly.
             "int4_grouped_aggregate" | "int4_filtered_grouped_aggregate" => {
-                self.execute_resident_grouped_via_general(select, None)
+                self.execute_resident_grouped_via_general(select, None, None)
             }
             // S10a (projection batch): the non-grouped int4 projection shapes (a single-column range-filtered
             // projection; equality; multi-column / composite-AND equality; and a mixed text+int4 projection)
@@ -525,7 +525,7 @@ impl Engine {
             | "int4_equality_multi_column_projection"
             | "int4_composite_equality_multi_column_projection"
             | "int4_equality_mixed_column_projection" => {
-                self.execute_resident_grouped_via_general(select, None)
+                self.execute_resident_grouped_via_general(select, None, None)
             }
             // S10a: a single-int4-column ordered projection (`SELECT a FROM t WHERE a <range> ORDER BY a
             // LIMIT n`) routes to the SAME `&Select`->general bridge as the grouped shapes. For a
@@ -533,14 +533,14 @@ impl Engine {
             // plain-projection path (WHERE predicate VM + GPU sort + LIMIT/OFFSET window, S1/S2.1/S4) --
             // byte-identical to the legacy `int4_ordered_projection` probe (the projected column IS the
             // sort key, so tied values are identical output rows). Covers text + CTAS + view uniformly.
-            "int4_ordered_projection" => self.execute_resident_grouped_via_general(select, None),
+            "int4_ordered_projection" => self.execute_resident_grouped_via_general(select, None, None),
             // S10b: a single-int4-column SELECT DISTINCT routes through the `&Select`->general DISTINCT
             // bridge (`SELECT DISTINCT a` == `GROUP BY a` `COUNT(*)` with the count dropped) -- one row per
             // distinct key ON THE DEVICE, retiring the probes that deduped on a HOST `BTreeSet` (a §1
             // violation relabeled as GPU). Covers text + CTAS + view uniformly. NULL/no-ORDER-BY results
             // become PG-correct (NULL group kept, not a phantom 0; default order key-ASC, deterministic).
             "int4_distinct_projection" | "int4_filtered_distinct_projection" => {
-                self.execute_resident_distinct_via_general(select, None)
+                self.execute_resident_distinct_via_general(select, None, None)
             }
             shape => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident route accepted unsupported execution shape: {shape}"

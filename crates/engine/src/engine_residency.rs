@@ -4770,6 +4770,97 @@ mod capacity_payload_tests {
             .any(|r| r.first() == Some(&SqlValue::Int4(50))));
     }
 
+    /// R-ver PART 2: GROUP BY / DISTINCT / ORDER BY over a VERSIONED elided sharded table must
+    /// HIDE tombstoned rows (they used to hard-REFUSE — "SV3b not wired through the reshaping
+    /// sub-bridges" — because those bridges dropped `visibility`). Now the visibility is threaded
+    /// into the survivor `indices` BEFORE group/sort/dedup. Fully tombstoning group 0 makes it
+    /// vanish from the grouped counts AND the distinct set; the ordered scan starts past it.
+    /// Sabotage: reverting the `visibility` threading either re-errors or leaks group 0's 40 rows.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn grouped_ordered_distinct_over_versioned_elided_hides_tombstones() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_host_install_elision_enabled(true);
+        e.set_constrained_elision_enabled(true);
+        e.set_device_write_locate_enabled(true);
+        e.set_device_write_locate_wave_batch_enabled(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, g INT)")
+            .unwrap();
+        let mut seq = 2u64;
+        for chunk in 0..2_i64 {
+            // g = id / 40 -> ids 0..199 form 5 groups (0..4) of 40 rows each.
+            let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                .map(|k| format!("({k},{})", k / 40))
+                .collect();
+            e.execute_text(seq, &format!("INSERT INTO t (id, g) VALUES {}", vals.join(",")))
+                .unwrap();
+            seq += 1;
+        }
+        if !e.table_install_elided("t") {
+            return;
+        }
+        // Fully tombstone GROUP 0 (ids 0..39) -> versioned shards; g=0 has NO visible rows.
+        e.execute_text(seq, "DELETE FROM t WHERE id < 40").unwrap();
+
+        // GROUP BY: group 0 must be ABSENT; each surviving group counts 40; 160 rows total.
+        let grouped = e
+            .execute_relational_select_text("SELECT g, COUNT(*) FROM t GROUP BY g")
+            .unwrap()
+            .rows
+            .into_boxed();
+        let mut counts: std::collections::BTreeMap<i32, i64> = Default::default();
+        for row in &grouped {
+            if let (Some(&SqlValue::Int4(g)), Some(&SqlValue::Int8(c))) = (row.first(), row.get(1)) {
+                counts.insert(g, c);
+            }
+        }
+        assert!(
+            !counts.contains_key(&0),
+            "the fully-tombstoned group 0 must NOT appear in GROUP BY: {counts:?}"
+        );
+        assert_eq!(counts.get(&1), Some(&40), "surviving group counts are visible-only");
+        assert_eq!(
+            counts.values().sum::<i64>(),
+            160,
+            "160 visible rows across groups 1..4"
+        );
+
+        // DISTINCT: {1,2,3,4} — group 0 gone.
+        let distinct = e
+            .execute_relational_select_text("SELECT DISTINCT g FROM t")
+            .unwrap()
+            .rows
+            .into_boxed();
+        let mut gs: Vec<i32> = distinct
+            .iter()
+            .filter_map(|r| match r.first() {
+                Some(&SqlValue::Int4(g)) => Some(g),
+                _ => None,
+            })
+            .collect();
+        gs.sort_unstable();
+        assert_eq!(gs, vec![1, 2, 3, 4], "DISTINCT g excludes the fully-tombstoned group 0");
+
+        // ORDER BY: the ordered scan starts at id=40 (0..39 tombstoned), 160 visible rows.
+        let ordered = e
+            .execute_relational_select_text("SELECT id FROM t WHERE id >= 0 ORDER BY id LIMIT 300")
+            .unwrap()
+            .rows
+            .into_boxed();
+        assert_eq!(ordered.len(), 160, "ORDER BY returns the 160 visible rows");
+        assert_eq!(
+            ordered.first().and_then(|r| r.first()),
+            Some(&SqlValue::Int4(40)),
+            "first ordered id is 40 — ids 0..39 are hidden, not leaked"
+        );
+        assert!(
+            e.table_install_elided("t"),
+            "grouped/distinct/ordered reads over a versioned table stay elided (routed on-device)"
+        );
+    }
+
     /// M1 design B — WAVE-TIME batched validation differential: an elided PK'd table runs the
     /// constraint+DML gauntlet with wave-batch ON (device_write_locate + wave_batch) vs the
     /// host-probe oracle (both off). Every outcome (incl 23505 text) + read must match — the
@@ -6329,12 +6420,18 @@ mod capacity_payload_tests {
             vec![vec![SqlValue::Int8(3)]],
             "COUNT drops by exactly the tombstoned row (visibility-only program over the unified buffer)"
         );
-        // The DISTINCT / GROUP BY / ORDER BY paths do not yet thread the visibility conjuncts, so a
-        // VERSIONED sharded table must CLEAN-ERROR there (never silently leak the tombstoned row into a
-        // sorted result). Flip this assertion deliberately when visibility is wired through those paths.
-        assert!(
-            e.execute_relational_select_text("SELECT id, balance FROM nn ORDER BY id DESC").is_err(),
-            "versioned sharded + ORDER BY must clean-error until visibility threads through the sort path"
+        // R-ver PART 2: the DISTINCT / GROUP BY / ORDER BY paths now THREAD the SV3b/SV6 visibility
+        // conjunct (into the survivor `indices` before the sort), so a versioned sharded ORDER BY
+        // returns the VISIBLE rows sorted — the tombstoned (3,30) is hidden, NULLs preserved.
+        // (This assertion was deliberately flipped from the pre-PART-2 clean-error.)
+        assert_eq!(
+            run("SELECT id, balance FROM nn ORDER BY id DESC"),
+            vec![
+                vec![SqlValue::Int4(4), SqlValue::Null],
+                vec![SqlValue::Int4(2), SqlValue::Null],
+                vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+            ],
+            "versioned sharded ORDER BY: id DESC over the VISIBLE rows (tombstoned id=3 hidden)"
         );
     }
 

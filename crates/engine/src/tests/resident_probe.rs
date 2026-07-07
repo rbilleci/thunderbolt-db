@@ -347,7 +347,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_resident_grouped_via_general(&grouped_sum_select, None)
+        .execute_resident_grouped_via_general(&grouped_sum_select, None, None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -360,7 +360,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_resident_grouped_via_general(&projection_select, None)
+        .execute_resident_grouped_via_general(&projection_select, None, None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -374,7 +374,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
     // resident-probe ordered method was retired); with no retained device memory it errors cleanly,
     // like the grouped bridge above.
     let err = e
-        .execute_resident_grouped_via_general(&ordered_projection_select, None)
+        .execute_resident_grouped_via_general(&ordered_projection_select, None, None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -388,7 +388,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
     // resident-probe distinct methods were retired); with no retained device memory it errors cleanly,
     // like the grouped/ordered bridges above.
     let err = e
-        .execute_resident_distinct_via_general(&distinct_projection_select, None)
+        .execute_resident_distinct_via_general(&distinct_projection_select, None, None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
