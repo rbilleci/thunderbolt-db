@@ -8491,15 +8491,14 @@ impl Engine {
                 region
             }
         };
-        let chunks: Vec<CudaOwnedDeviceMemoryChunk> = slots
-            .iter()
-            .map(|&(slot, stamp)| CudaOwnedDeviceMemoryChunk {
-                // The region is JUST deleted_by (0-based): slot `s`'s stamp is at byte `s * 8`.
-                byte_offset: u64::from(slot) * width,
-                bytes: stamp.to_le_bytes().to_vec(),
-            })
-            .collect();
-        region.append_owned_chunks(chunks).is_ok()
+        // U1 perf lever B: ONE scatter launch (2 HtoDs + 1 kernel) instead of N per-slot HtoD
+        // chunks — the measured device-apply cost (~468us/wave at ~75 tombstones). The region is
+        // JUST deleted_by (0-based u64s): slot `s`'s stamp is at byte `s*8`, which the scatter
+        // kernel computes from the slot index directly. `width` is unused on this path now.
+        let _ = width;
+        let slot_ids: Vec<u32> = slots.iter().map(|&(slot, _)| slot).collect();
+        let stamps: Vec<u64> = slots.iter().map(|&(_, stamp)| stamp).collect();
+        region.scatter_u64_slots(&slot_ids, &stamps).is_ok()
     }
 
     /// RETIREMENT A1: stamp the row-identity region for `k` just-appended contiguous slots

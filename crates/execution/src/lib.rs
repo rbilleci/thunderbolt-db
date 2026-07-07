@@ -12168,6 +12168,55 @@ DONE:
 /// (`(key<<32)|(row+1)`, fib `key*0x9E3779B1 >> shift & mask`, 256 cap). Overflow (256 probes) ->
 /// decline (the caller drops the cache -> a full rebuild at the grown size, mirroring the host
 /// extend's load rule). ASCII-only.
+/// U1 perf lever B: the SCATTER kernel — `region[slots[t]] = values[t]` (u64 store), one thread
+/// per (slot, value) pair. Replaces N per-slot HtoD chunks with 2 HtoDs + 1 launch on the lane
+/// tombstone path. Bounds are the caller's contract (slots pre-checked < capacity). ASCII-only.
+const SCATTER_U64_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_scatter_u64(
+    .param .u64 region_ptr,
+    .param .u32 count,
+    .param .u64 slots_ptr,
+    .param .u64 values_ptr
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<10>;
+
+    ld.param.u64 %rd1, [region_ptr];
+    ld.param.u32 %r1, [count];
+    ld.param.u64 %rd2, [slots_ptr];
+    ld.param.u64 %rd3, [values_ptr];
+
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mad.lo.u32 %r5, %r3, %r4, %r2;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra DONE;
+
+    // value = values[t]
+    mul.wide.u32 %rd4, %r5, 8;
+    add.u64 %rd5, %rd3, %rd4;
+    ld.global.u64 %rd6, [%rd5];
+    // slot = slots[t]  (u32)
+    mul.wide.u32 %rd7, %r5, 4;
+    add.u64 %rd8, %rd2, %rd7;
+    ld.global.u32 %r2, [%rd8];
+    // region[slot] = value  (slot * 8 bytes)
+    mul.wide.u32 %rd9, %r2, 8;
+    add.u64 %rd9, %rd1, %rd9;
+    st.global.u64 [%rd9], %rd6;
+
+DONE:
+    ret;
+}
+"#;
+
 const INDEX_INSERT_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -12568,6 +12617,130 @@ impl CudaResidentDeviceMemory {
             )
         })?;
         Ok(decline[0] != 0)
+    }
+
+    /// U1 perf lever B: SCATTER `values[t]` into `deleted_by[slots[t]]` in ONE launch (a single
+    /// `slots` HtoD + a single `values` HtoD + one kernel), replacing the per-slot
+    /// `append_owned_chunks` HtoD loop the lane tombstone pass used (measured device-apply
+    /// ~468us/wave at ~75 tombstones = N tiny HtoDs). `self` is the `deleted_by` region (u64
+    /// array, slot `s` at byte `s*8`); the caller guarantees every `slot < capacity` (bounds
+    /// pre-checked host-side, exactly as the chunk path relied on `append_owned_chunks`'
+    /// per-chunk check). Synchronous: null-stream launch + `cuCtxSynchronize`, so the stamps are
+    /// device-visible before return (the caller then publishes / settles). ASCII-only PTX.
+    pub fn scatter_u64_slots(
+        &self,
+        slots: &[u32],
+        values: &[u64],
+    ) -> Result<(), CudaRuntimeProbeError> {
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        if slots.is_empty() {
+            return Ok(());
+        }
+        if slots.len() != values.len() {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(slots.len()));
+        }
+        if self.device_ptr() == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let count = u32::try_from(slots.len())
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(slots.len()))?;
+        let slots_bytes = std::mem::size_of_val(slots);
+        let values_bytes = std::mem::size_of_val(values);
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_memcpy_htod = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_ctx_synchronize = unsafe {
+            primary
+                .lib()
+                .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let slots_guard = primary.lease_device_buffer_owned(slots_bytes)?;
+        let values_guard = primary.lease_device_buffer_owned(values_bytes)?;
+
+        let mut ptx = Vec::with_capacity(SCATTER_U64_PTX.len() + 1);
+        ptx.extend_from_slice(SCATTER_U64_PTX);
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_resident_scatter_u64", &ptx)?;
+
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                slots_guard.ptr,
+                slots.as_ptr().cast::<c_void>(),
+                slots_bytes,
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                values_guard.ptr,
+                values.as_ptr().cast::<c_void>(),
+                values_bytes,
+            )
+        })?;
+
+        let mut region_arg = self.device_ptr();
+        let mut count_arg = count;
+        let mut slots_arg = slots_guard.ptr;
+        let mut values_arg = values_guard.ptr;
+        let mut args = [
+            (&mut region_arg as *mut u64).cast::<c_void>(),
+            (&mut count_arg as *mut u32).cast::<c_void>(),
+            (&mut slots_arg as *mut u64).cast::<c_void>(),
+            (&mut values_arg as *mut u64).cast::<c_void>(),
+        ];
+        let threads_per_block: u32 = 128;
+        let blocks = count.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        // No DtoH output to fence the scatter; ctx-synchronize so the stamps are device-visible
+        // before the caller publishes (matches the append_owned_chunks synchronous contract).
+        check_cuda(unsafe { cu_ctx_synchronize() })?;
+        drop(slots_guard);
+        drop(values_guard);
+        Ok(())
     }
 
     /// M1 (charter-pure): probe a BATCH of int4 `needles` against ALL `shards`' DEVICE hash indexes in
