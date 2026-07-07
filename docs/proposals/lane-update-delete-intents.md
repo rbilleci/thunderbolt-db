@@ -1,8 +1,17 @@
-# Lane UPDATE/DELETE Intents — Tier 1 v1 Design (PROPOSAL, UNACCEPTED)
+# Lane UPDATE/DELETE Intents — Tier 1 v1 Design (PROPOSAL, UNACCEPTED — review round 1 incorporated)
 
-> Status: **design prep only** (user-directed 2026-07-07; no code). Depends on the mega-fuse
-> slice (in flight, other session) — §3.4 states the exact contract this design consumes from it.
-> Author lane: main session. Decision points for the user are marked **[DECIDE]**.
+> Status: **design prep only** (user-directed 2026-07-07; no code). **Rev 2** — incorporates the
+> mega-fuse author's review (2026-07-07) against the SHIPPED mega-fuse (`4291cdb0`, default-OFF,
+> pump-inline verdicts, single-shard probe, suffix-trim law). Decision points for the user are
+> marked **[DECIDE]**; previously-open ones now carry their ratified answers.
+>
+> **Review changelog (all points adopted):** §3 rewritten against the shipped contract — the
+> CLASSIC lane pipeline is the base arm, mega op-codes deferred to U4; locate joins the existing
+> coalesced validate launch (pump-time verdicts, no settle-side channel); 0-row ops filter
+> PRE-CLAIM (no WAL record, no burned slot — the suffix-trim hazard is mega-arm-only); the
+> visibility-aware duplicate-tolerant index rebuild moves INTO U1; §7's replay claim corrected
+> (frozen serial prefix — flat refusal stays until U3 specs lane-seq-space entry); outcome
+> plumbing = widen `CommitWaveOutcome` to `Result<u64>`; second-unique-column tables v1-excluded.
 
 ## 1. Problem and scope
 
@@ -10,7 +19,7 @@
 `intent_lanes_write_guard` refuses ALL classic DML/DDL ("v1 lanes contract"). The lane fast path
 covers exactly one op: covered INSERT on int4-PK elided tables. A database that can never UPDATE,
 DELETE, or run DDL after its first fast write is not a production engine. Tier 1 closes the DML
-half of that cliff (DDL quiesce rides the same escape hatch, §7).
+half of that cliff; the DDL/non-covered half is U3 (§7).
 
 **v1 covered shapes** (mirroring the insert route's discipline — O(1) shape proof at prepare,
 per-intent execution allocation-lean):
@@ -18,200 +27,223 @@ per-intent execution allocation-lean):
 - `DELETE FROM t WHERE <pk_col> = $1`
 - `UPDATE t SET <non-pk assignments, all INT4 constants/params> WHERE <pk_col> = $1`
 
-Same table eligibility as `prepare_covered_insert_route`: strictly-INT4 columns, elided
-(device-authoritative), FK/CHECK-free, no inbound FK, unique indexes all-i32, binary WAL records
-enabled. Rows-affected result is 0 or 1 by construction.
+Same table eligibility as `prepare_covered_insert_route`, plus (ratified): **tables with any
+unique i32 index beyond the PK are v1-excluded at route prepare** — the simplest shape proof; a
+partial-coverage rule invites drift bugs. Rows-affected is 0 or 1 by construction.
 
-**v1 exclusions** (fall back to the §7 escape hatch, never silently degraded):
-- UPDATE of the PK column itself (delete+insert of a *different* key = two lanes; cross-lane
-  atomicity is a v2 protocol — see §9).
-- Non-PK predicates, multi-row statements, RETURNING, secondary unique columns beyond the PK'd
-  shape's existing slots.
+**v1 exclusions** (refused with a clear error until U3; never silently degraded):
+- UPDATE of the PK column itself (cross-lane atomicity — v2, §9).
+- Non-PK predicates, multi-row statements, RETURNING.
 
 ## 2. The op model
 
-`LaneIntent` generalizes to carry an op kind (structurally: keep the flat struct, add
-`op: LaneOpKind { Insert, Delete, Update }` + optional fields; the insert fields stay as-is so
-the hot insert path is byte-identical when the flag is off):
+`LaneIntent` gains `op: LaneOpKind { Insert, Delete, Update }` + optional fields; the insert
+fields stay as-is so the hot insert path is byte-identical when no U/D intents exist.
 
-- **Delete** `{ slot (pk_slot_id, pk_value), read_snapshot, template (W5b delete record), ... }`
-  — no `values`, no row-id reservation, no headroom slot.
-- **Update** `{ slot, new_values (full post-image, catalog order), read_snapshot, template }`
-  — reserves ONE headroom row slot + row_id for the new version (MVCC: update = tombstone old +
-  append new, exactly the classic `PreparedMutation::Update` semantics — never in-place value
-  mutation, readers at older snapshots keep the old version).
+- **Delete** `{ slot (pk_slot_id, pk_value), read_snapshot, template (W5b delete record) }` —
+  no values, no row-id/headroom reservation.
+- **Update** `{ slot, new_values (full post-image, catalog order), read_snapshot, template }` —
+  reserves ONE headroom slot + row_id for the new version ONLY after the locate confirms 1 row
+  (§3.3). MVCC: update = tombstone old + append new (classic `PreparedMutation::Update`
+  semantics; never in-place mutation — readers at older snapshots keep the old version).
 
-**Outcome plumbing:** `poll_intent` today yields `Result<(), ExecuteError>`. Update/delete need
-rows-affected. **[DECIDE]** (a) widen `CommitWaveOutcome` to `Result<u64>` engine-wide (insert = 1),
-or (b) new `poll_intent_rows` beside it. (a) is cleaner; touches every settle site — do it in the
-first slice while the surface is small.
+**Outcome plumbing (ratified):** widen `CommitWaveOutcome` to `Result<u64, ExecuteError>`
+(insert = 1) engine-wide, in U1 while the surface is smallest. `poll_intent` returns the count.
 
-**Routes:** `prepare_covered_delete_route` / `prepare_covered_update_route` returning route
-structs that precompute: pk slot id + column index, catalog_seq, W5b record prefix + patch
-offsets, and the synthesized-SQL fallback prefix. Update routes additionally pin the assignment
-column set (catalog order) so a param vector maps positionally.
+**Routes:** `prepare_covered_delete_route` / `prepare_covered_update_route`: pk slot id + column
+index, catalog_seq, W5b record prefix + patch offsets, synthesized-SQL fallback prefix; update
+routes pin the assignment column set (catalog order).
 
-## 3. Pipeline integration (per pump stage)
+## 3. Pipeline integration — the CLASSIC lane pipeline is the base arm
 
-The disruptor law holds: nothing blocks before the ack except the client's own poll; the pump
-gains NO new inline device waits (that's what the mega-fuse just removed for inserts).
+**Shipped reality this rev binds to:** the default engine runs the classic pipeline (inline
+coalesced validate at the pump → optimistic publish → no-reap apply coalescer). The mega-fuse is
+default-OFF (per-wave blocking launch loses to the coalescers at both load ends). U/D therefore
+ship on the classic arm; mega op-codes are the U4 optimization arm, contingent on the follow-up
+that flips mega's economics (cross-lane mega coalescer + WAL-first reorder).
 
-### 3.1 Routing and wave formation
-Same PK-hash lane routing (`lane_for_pk(pk)`): every op on a key serializes through ONE lane in
-submit order. Mixed-op waves are allowed (one drain = one wave, ops interleaved). The resize
-barrier's epoch argument is unchanged (all ops drain at the flip; apply-time device state catches
-cross-epoch conflicts).
+### 3.1 Routing and wave formation — unchanged
+PK-hash lane routing serializes every op on a key through one lane in submit order. Mixed-op
+waves allowed. Resize-barrier epoch argument unchanged.
 
-### 3.2 Host conflict pass (the ledger)
-The lane ledger stays the SI authority for the un-applied window; the invariant
-(seq ≤ snapshot ⟹ within visible cut ⟹ applied ⟹ device-visible) already proven for inserts
-covers update/delete probes at apply time too. Per-op rules:
+### 3.2 Locate joins the existing validate launch (no new inline wait)
+`lane_validate_unique` already runs ONE coalesced multi-shard write-locate launch per round over
+the wave's insert needles (`submit_multi_shard_i32_write_locate` — whose kernel ALREADY outputs
+`(shard, slot)` hit arrays; the counts-only wrapper discards them). U/D needles join the SAME
+launch with a mixed needle set:
+
+- **insert needle** → hit count (dup verdict, as today);
+- **delete/update needle** → hit locations `(shard, slot)` + count.
+
+Hits get the same authoritative host recheck at the item's snapshot (`visible_row_with_value`
+semantics): a DEAD hit (tombstoned twin) resolves to **0 rows** for U/D — correct SQL semantics
+(deleting a dead row affects nothing) — and to **insert-proceeds** for inserts (unchanged).
+Zero additional launches; the locate rides the validate coalescer's existing amortization.
+
+### 3.3 Conflict pass, 0-row filter, claim
+Ledger rules (unchanged from rev 1 — first-updater-wins):
 
 | op | ledger check (slot, snapshot) | on pass, record |
 |---|---|---|
-| INSERT | conflict if slot seq > snapshot (ww) | slot → my seq |
-| DELETE | conflict if slot seq > snapshot (first-updater-wins; the version I read moved) | slot → my seq |
-| UPDATE | same as DELETE | slot → my seq |
+| INSERT | conflict if slot seq > snapshot | slot → my seq |
+| DELETE | conflict if slot seq > snapshot | slot → my seq |
+| UPDATE | conflict if slot seq > snapshot | slot → my seq |
 
-Intra-wave same-slot: **first op wins, later ops in the same wave get retryable serialization
-errors** (v1; matches the insert dup rule, avoids in-wave dependency chains). A client doing
-delete→insert on the same key pipelined must poll the delete before submitting the insert
-(document on the API).
+Intra-wave same-slot: first op wins; later same-wave ops get retryable serialization errors.
+**Differential expectation (pinned per review):** insert-after-delete of the same key within the
+ledger window surfaces as a SERIALIZATION error on the lane path where the classic path may
+raise 23505 — both SI-defensible; tests expect the serialization error and document the
+divergence.
 
-### 3.3 Claim + optimistic publish (unchanged shape)
-Seq block claimed for all wave winners (dense); row-id block claimed only for insert/update
-members (update's new version). W5b binary records (§5) are patched + frame-encoded in the same
-fused patch pass and published at pump time, BEFORE the verdict exists — deliberately, to keep
-publish parallel on the pumps (mega-fuse audit trap #3). This is safe because update/delete
-records are **by-key + re-resolving at replay** (§5), unlike insert records: a 0-row live outcome
-replays as a 0-row outcome deterministically. No abort markers needed for update/delete.
+**The 0-row filter (new, and the load-bearing simplification):** locate verdicts exist BEFORE
+the claim. A U/D whose needle resolved to 0 live rows completes at the conflict pass with
+`Ok(0)` — **no seq claim, no WAL record, no headroom slot, no durability wait** (nothing was
+written; PG-consistent). Consequences:
+- No burned update slots in the base arm — **the suffix-trim/interior-sentinel hazard (review
+  point 4) cannot occur on the classic arm at all**; it is confined to the U4 mega arm (§9).
+- No 0-row records to replay; W5b records exist only for 1-row outcomes.
 
-### 3.4 Verdict-at-apply — the mega-fuse contract this design consumes
-Required from the in-flight mega-fuse slice (audit checklist enforces these anyway):
-1. per-item verdict array DtoH from the fused apply launch;
-2. `ApplySlot` verdict publication (visible to settle before `done`);
-3. settle-side per-item outcome dispatch (Err/count, cut-gated);
-4. multi-shard probe descriptor table in the staging image;
-5. leader-side validate fallback when the fused path can't run.
+TOCTOU safety of locate-before-claim: all same-key ops are lane-serialized and intra-wave
+same-slot ops are first-wins-rejected, so a located live row cannot be tombstoned by anyone else
+between locate and apply; the apply-time `deleted_by` CAS is therefore guaranteed-win
+(debug-asserted, not a verdict).
 
-The kernel gains a per-item **op code**. Thread j:
-- **INSERT** (as mega-fuse): sealed probe → open CAS-insert → scatter/stamp or sentinel+verdict.
-- **DELETE**: probe ALL shards for pk (write-locate math). Miss → verdict `0 rows`. Hit
-  (shard s, row r) → `atom.global.cas.b64 deleted_by[s][r] 0 → my_seq`; CAS-loss (already
-  tombstoned by an earlier wave — ledger makes same-slot races impossible, so loss can only be a
-  DEAD twin, i.e. tombstoned long ago) → verdict `0 rows`; win → verdict `1 row`.
-- **UPDATE**: DELETE step; on `1 row` also do the INSERT step for the new version (headroom slot
-  reserved at pump). On `0 rows` the reserved slot burns with the never-visible sentinel (same
-  mechanism as a rejected insert; slot leak is bounded by 0-row-update rate, reclaimed by VACUUM).
+### 3.4 Claim + optimistic publish — unchanged shape
+Seq block for wave winners (dense; 1-row U/D members included), row-id block only for
+insert/update members. W5b records patched + frame-encoded in the fused patch pass, published at
+pump time. Publish stays parallel on the pumps (never leader-side — the shipped mega audit's
+saturation math). Safe without markers because U/D records are by-key + re-resolving at replay
+(§5); the shipped INSERT loser mechanism (every claimed seq WAL-covered via EMPTY no-op records)
+is orthogonal and unchanged.
 
-Visibility correctness of device-side tombstoning: `deleted_by` stamps are monotonically
-published u64 stores; a reader at snapshot < my seq evaluates `deleted_by > snapshot` → row still
-visible — the same argument that admits SV6 created_by stamping concurrent with readers. The
-stamp lands BEFORE the verdict DtoH (launch-completion order), and outcome/visibility publication
-is cut-gated as ever.
+### 3.5 Apply — tombstone work rides the apply coalescer
+`ApplyRequest` gains parallel tombstone vectors: `(shard, slot, seq)` per 1-row U/D member.
+`lane_apply_merged`'s leader pass adds ONE batched device stamp launch per merged pass (all
+lanes' pending tombstones in one kernel: `atom.global.cas.b64 deleted_by[shard][slot] 0 → seq`),
+alongside the existing merged append (update new-versions ride the append exactly like inserts).
+No verdict DtoH — outcomes were resolved at the pump (§3.3); settle stays winners-only,
+matching the shipped shape. `done`/cut advance semantics unchanged.
 
-**deleted_by sidecar availability (the one real allocation problem):** `shard_deleted_by_memory`
-is ON-DEMAND — allocated at a shard's first delete. The kernel cannot allocate. Rule: the leader
-materializes the sidecar (zeroed alloc, one HtoD-free memset) for any target shard lacking it
-BEFORE the launch, driven by a cheap host check over the wave's op set. First-delete-per-shard
-pays a one-time alloc on the leader (~amortized nil); every later wave is pure kernel.
-**[DECIDE]** alternatively pre-materialize at lane-table admission (48M rows = 384MB/shard of
-always-allocated sidecar) — simpler leader, fatter memory. Recommend on-demand + leader check.
+Stamp visibility correctness: monotonic u64 stores; a reader at snapshot < seq evaluates
+`deleted_by > snapshot` → still visible (the SV6 stamping-under-readers argument). Stamps land
+before the cut covers the wave, and visibility publication is cut-gated as ever.
 
-### 3.5 Settle
-`LaneSettle` items carry op kind; settle reads the slot verdicts: insert winners Ok(1),
-update/delete Ok(verdict rows), kernel-rejected inserts Err(23505) behind the marker gate
-(mega-fuse), catalog-drift/ledger rejects Err at pump (unchanged). Async-commit (`Off`) applies
-to update/delete identically (ack at applied cut; bounded-loss contract covers "acked delete
-undone by power failure" the same way it covers inserts — the WHOLE suffix vanishes together;
-recovery replays the ordered durable prefix so no torn read-your-writes state).
+**deleted_by sidecar (ratified: on-demand):** `shard_deleted_by_memory` allocates on a shard's
+first delete. The apply LEADER materializes missing sidecars for the merged batch's target
+shards before the stamp launch (one-time zeroed alloc per shard; every later wave is pure
+kernel). Pre-materializing at admission (384MB/shard at the 48M floor) rejected.
 
-## 4. SI semantics summary (must match the classic path + SQL spec)
+### 3.6 The mega arm (U4, deferred)
+When the mega economics flip (cross-lane mega coalescer + WAL-first reorder), U/D become per-item
+op codes in `MEGA_FUSE_PTX` (probe-at-apply): delete = probe→CAS-stamp; update = probe→stamp +
+append. That arm re-opens the 0-row-at-apply problem: burned update slots are INTERIOR sentinels
+under the shipped SUFFIX-TRIM LAW (only tail losers trim; an interior sentinel pins
+`max_created_by = Index::MAX` → ORDER-BY refused until rollover). Spec for U4, gated on U1/U2
+measurements: (a) allocate update slots at the wave TAIL so burns trim; (b) the mixed bench must
+show the 0-row-update rate before accepting any residual pin; (c) **[DECIDE at U4]** whether
+VACUUM's dense rebuild resets `max_created_by` (today nothing unpins a shard). Consuming
+verdicts stays wherever the insert arm consumes them (pump-inline today; deferred if the
+coalesced-mega follow-up moves them) — U/D op semantics do not depend on the location.
 
-- DELETE of a never-existing key → Ok(0). DELETE of a dead key → Ok(0). No error.
-- DELETE/UPDATE where the key's version changed after my snapshot → serialization error (ledger).
-- UPDATE post-image violating a unique slot other than the PK: v1 shape has PK as the only unique
-  slot and PK-updates are excluded → structurally impossible; assert in route prepare (if a
-  second unique i32 column exists, the UPDATE shape is only covered when it doesn't assign that
-  column — enforced at route prepare **[DECIDE]** or v1-exclude such tables entirely).
-- INSERT after DELETE of the same key (different intents, in order): delete tombstones; insert
-  probe hits the DEAD index twin → mega-fuse dead-twin path. v1: that path is
-  decline→cache-drop→rebuild — correct but O(shard) per occurrence. Under a delete-heavy OLTP mix
-  this becomes COMMON: v1.1 should teach the kernel **index-entry replacement** (probe hit → load
-  `deleted_by[row]` → nonzero ⟹ dead ⟹ CAS the index entry old→new packed) so reinsert is O(1).
-  Gate v1 with a mixed-workload bench arm to size the cliff first (§8).
+## 4. Dead twins and the index — visibility-aware rebuild lands IN U1 (review point 5)
 
-## 5. W5b binary records + replay
+Delete→reinsert leaves a dead index entry; today the incremental insert CAS-hits it → decline →
+host rebuild — and the rebuild indexes `[0, row_count)` INCLUDING dead rows' keys, so the rebuild
+collides on the same key and **declines permanently**: any delete workload degrades the whole
+locate path, not once but forever. Fix in U1 (host-side, cheap relative to kernel entry
+replacement):
+
+1. **Duplicate-tolerant build:** same-key entries occupy separate slots (open addressing already
+   permits it); probes already return up to `max_hits` per needle + host visibility recheck —
+   uniqueness semantics are unaffected. This alone removes the permanent decline.
+2. **GC-boundary skip (refinement over "skip tombstoned"):** the PK index serves POINT READS as
+   well as write-locate — a reader at an old snapshot must still find a dead version. The
+   rebuild may omit only rows whose `deleted_by` < the active-snapshot GC boundary (the ledger
+   prune boundary — no live reader can see them); twins above the boundary stay indexed and are
+   handled by (1).
+
+Kernel-level index-entry replacement (probe hit → dead check → CAS old→new packed entry) remains
+the U4/v1.1 optimization if the mixed bench shows rebuild frequency still hurts.
+
+## 5. W5b binary records + replay (unchanged from rev 1, now 1-row-only)
 
 New op codes in `wal_binary.rs` (tag 0xFF, version bump):
 - `OP_DELETE_BY_KEY { table, pk_col, pk_value }`
 - `OP_UPDATE_BY_KEY { table, pk_col, pk_value, new_row_id, new_row_image }`
 
-Replay (`apply_binary_wal_entry` arms): re-resolve the pk against the HOST store at replay time
-(visible version at replay-now), tombstone / tombstone+install. Determinism: replay runs in
-global seq order; all ops on a key were lane-serialized in that same order live; ops on different
-keys commute — so replay's resolve reproduces the live verdict, including 0-row outcomes. This is
-the property that lets update/delete keep optimistic publish with NO abort markers. The insert
-marker mechanism (mega-fuse) is orthogonal and unchanged.
+Replay (`apply_binary_wal_entry` arms): re-resolve the pk against the HOST store at replay time,
+tombstone / tombstone+install. Determinism: replay runs in global seq order; all ops on a key
+were lane-serialized in that order live; cross-key ops commute — replay reproduces the live
+outcome. 0-row ops never reach the WAL (§3.3), so every U/D record replays to exactly 1 row
+(assert LOUDLY at replay: a 0-row re-resolve of a durable U/D record is corruption or a
+determinism bug, never silently skipped). No abort/no-op records needed for U/D.
 
-Checkpoint/truncation: records ride the existing lane frames; `checkpoint_intent_lanes` is
-op-agnostic (it snapshots applied state). Archive/PITR stays refused in lanes mode (unchanged).
+Checkpoint/truncation: op-agnostic (checkpoints snapshot applied state). Archive/PITR stays
+refused in lanes mode.
 
-## 6. Read path, elision, VACUUM
+## 6. Read path, elision, VACUUM (unchanged from rev 1)
 
-- Mask-VM visibility already evaluates sparse deleted_by (SV0–SV6) — no reader changes.
-- Elision: deletes/updates on elided tables keep the shards authoritative; rehydration
-  (`visible_relational_rows`) already understands tombstones. The rehydrate fallback arm in
-  `lane_apply_merged` must grow update/delete equivalents (tombstone via host store) — rare path,
-  same panic-on-invariant discipline.
-- VACUUM #5 churn triggers now actually fire on lane tables (deletes create the dead-row churn it
-  was built for). The deferred-tail auto-trigger must be verified against lane-applied tombstones
-  (counter + regression), and vacuum's drain interaction with lanes uses the existing
-  drain/commit-lock/recheck loop (post-Lorentz fix).
+- Mask-VM visibility already evaluates sparse deleted_by — no reader changes.
+- Elision: rehydration understands tombstones; `lane_apply_merged`'s rare rehydrate fallback arm
+  grows tombstone equivalents (host store), same panic-on-invariant discipline.
+- VACUUM #5 churn triggers now fire on lane tables; verify the deferred-tail auto-trigger against
+  lane-applied tombstones (counter + regression); vacuum's lane interaction uses the existing
+  drain/commit-lock/recheck loop.
 
-## 7. The escape hatch: QUIESCE for non-covered writes
+## 7. Non-covered writes: flat refusal stays until U3 (corrected per review)
 
-Reuse the resize-barrier machinery as a general **lane quiesce**: divert submits to the hold
-queue → drain every lane to settlement → run the classic statement(s) under the commit lock
-(serial WAL append — the serial+lanes merge replay already interleaves correctly by seq) →
-resume routing. Exposed as `Engine::execute_dml_quiesced` (and the DDL twin), replacing the flat
-refusal. Bounded cost = one barrier (measured 1.7–260ms depending on population). Non-covered
-writes become CORRECT-but-slow instead of impossible — the right production posture.
-**[DECIDE]**: v1 includes this, or stays refuse-only while UPDATE/DELETE intents land first.
+Rev 1 claimed the serial+lanes merge replay "already interleaves correctly by seq" — **wrong**:
+reopen replays the serial log as a FROZEN PREFIX (`base_seq` = serial record count at
+activation; the lanes own everything above; `next_seq == base_seq + lane_record_count` is
+asserted). A post-activation serial append would replay out of position or trip the assert.
+Quiesced classic writes must enter the LANE seq space. U3 spec sketch (design work, not assumed):
+quiesce barrier (reuse the resize-barrier drain) → execute the classic statement under the
+commit lock → encode its record(s) AS LANE RECORDS through a designated lane with claimed lane
+seqs (the serial log stays frozen) → resume. Until U3 lands, the v1 contract's flat refusal
+stands — correct over convenient.
 
 ## 8. Gates, counters, benchmarks
 
-- Counters: per-op wave counts, verdict histograms (1-row/0-row/dead-twin/decline), sidecar
-  materializations, quiesce count+duration. Prove-the-path-fired discipline throughout.
-- Differentials: lane UPDATE/DELETE vs classic path on a non-activated twin engine (GPU==CPU==
-  spec), including 0-row cases, snapshot-conflict cases, delete→reinsert, update-then-read at
-  old/new snapshots.
-- Sabotage: break deleted_by CAS (skip stamp) → visibility test FAILS; break replay re-resolve →
-  recovery parity FAILS; break ledger delete rule → lost-update test FAILS.
-- Recovery: durable WAL replay parity incl. interleaved insert/update/delete + crash-mid-wave
-  orphan repair; reopen-continues with mixed ops.
-- Bench: `intent_fast_path_bench` mixed arm `GPU_DB_BENCH_MIX=I:U:D` (e.g. 70:20:10 core-banking
-  shape) at the champion config + 512-client floor; report rows-affected-weighted TPS with the
-  standard latency pairing. Baseline to beat: insert-only {1.50,1.41,1.50}M.
-- Full suites: engine default+fua arms, GPU intent suites (serial + lanes=2/6), wal crate,
-  clippy; TMPDIR hygiene.
+- Counters: per-op wave counts, locate verdict histogram (1-row / 0-row / dead-hit), 0-row
+  pre-claim filters, sidecar materializations, duplicate-tolerant rebuild count, rebuild
+  GC-boundary skips. Prove-the-path-fired discipline throughout.
+- Differentials vs classic path on a non-activated twin: 0-row cases, snapshot conflicts,
+  delete→reinsert (EXPECT serialization error in-window, 23505/insert-ok per visibility
+  outside), update-then-read at old/new snapshots, GPU==CPU==spec.
+- Sabotage: skip the deleted_by CAS → visibility test FAILS; break replay re-resolve → recovery
+  parity FAILS; break the ledger delete rule → lost-update test FAILS; break duplicate-tolerant
+  rebuild → delete→reinsert locate test FAILS.
+- Recovery: durable replay parity incl. interleaved I/U/D + crash-mid-wave orphan repair +
+  reopen-continues with mixed ops; the LOUD 0-row-replay assert sabotage-verified.
+- Bench: `intent_fast_path_bench` mixed arm `GPU_DB_BENCH_MIX=I:U:D` (70:20:10 core-banking
+  shape) at champion config + 512-client floor; rows-affected-weighted TPS with latency pairing.
+  Insert-only baseline to preserve: {1.50, 1.41, 1.50}M. The mixed arm also SIZES: 0-row-update
+  frequency (U4 gate), rebuild frequency post-U1-fix (kernel-replacement gate).
+- Full suites: engine default+fua arms, GPU intent suites (serial + lanes=2/6), MEGA suites
+  (mega-arm regression must stay green with U/D intents present — mega waves must refuse/route
+  around U/D items until U4), wal crate, clippy; TMPDIR hygiene.
 
-## 9. Open decisions for the user (besides inline [DECIDE]s)
+## 9. Slice plan (ratified order) + remaining decisions
 
-1. **Slice order.** Proposed: U1 delete-only end-to-end (op model, ledger rule, kernel delete
-   arm, W5b delete record, replay, gates) → U2 update (rides U1 + insert machinery) → U3 quiesce
-   escape hatch → U4 dead-twin index replacement (sized by the U1/U2 mixed bench) → U5 default
-   flip. Delete-first because it exercises every new mechanism with the smallest surface.
-2. **PK-update v2**: cross-lane two-phase (tombstone in lane A gated on insert-claim in lane B)
-   vs quiesce-only forever. Defer until a workload demands it.
-3. **Whether Tier 1 waits for the mega-fuse to MERGE** or develops against its WIP contract in a
-   worktree. Contact surface is severe (same kernel, same ApplySlot/settle code) — recommend:
-   wait for merge, then U1.
+- **U1 — DELETE end-to-end (classic arm):** LaneOpKind + routes, mixed-needle locate in the
+  validate launch, ledger rule, 0-row pre-claim filter, `Result<u64>` outcome widening, apply-
+  coalescer tombstone launch + leader sidecar materialization, W5b delete record + replay arm +
+  LOUD assert, **visibility-aware duplicate-tolerant index rebuild**, full gate set.
+- **U2 — UPDATE** (rides U1 + insert machinery: post-locate slot reservation, tombstone+append).
+- **U3 — quiesce escape hatch** with the lane-seq-space entry protocol (§7).
+- **U4 — mega-arm op codes** + tail-allocated update slots + VACUUM unpin decision + (if still
+  needed) kernel index-entry replacement — gated on the mega economics follow-up and the U1/U2
+  mixed-bench measurements.
+- **U5 — default flip** of the U/D intent path.
 
-## 10. Contact surfaces (for multi-agent coordination)
+Remaining **[DECIDE]**s: U4's VACUUM `max_created_by` unpin (§3.6); PK-update v2 (cross-lane
+two-phase vs quiesce-only — defer until a workload demands it); who implements U1
+(mega-fuse author offered; ownership is the user's call).
 
-`crates/execution/src/lib.rs` (fused kernel + submit), `engine_dml_concurrent.rs` (pump, ledger
-pass, settle), `engine_intent_lanes.rs` (LaneIntent/ApplyRequest/ApplySlot), `engine_dml_intent.rs`
-(routes/API), `wal_binary.rs` (+ its `engine_commit.rs` apply arms), `engine_residency.rs`
-(sidecar materialization, rehydrate fallback), `engine_lifecycle.rs` (replay arms). All overlap
-the mega-fuse slice except wal_binary/lifecycle.
+## 10. Contact surfaces
+
+`engine_dml_concurrent.rs` (validate launch, conflict pass, apply coalescer, mega routing guard),
+`engine_intent_lanes.rs` (LaneIntent/ApplyRequest), `engine_dml_intent.rs` (routes/API/outcome
+widening), `wal_binary.rs` + `engine_commit.rs` (W5b + apply arms), `engine_residency.rs`
+(sidecar materialization, index rebuild fix, rehydrate fallback), `engine_lifecycle.rs` (replay),
+`execution/src/lib.rs` (locate wrapper returning locations; stamp kernel; U4 mega op codes).
