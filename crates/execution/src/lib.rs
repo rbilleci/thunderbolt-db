@@ -11967,6 +11967,160 @@ DONE:
 }
 "#;
 
+/// MEGA-FUSE (2M+ structural lever): PROBE-FIRST fused validate+apply. Byte-layout identical to
+/// FUSED_APPLY_PTX with TWO changes: (1) the PK index probe/CAS runs FIRST and yields a
+/// PER-NEEDLE verdict (0 = inserted/winner, 1 = key already present, 2 = 256-probe overflow)
+/// written to `staging + verdict_off + j*4` (`verdict_off` u64 lives in the previously-reserved
+/// header word at offset 72); the header decline flag (offset 28) is set ONLY on overflow.
+/// (2) non-winners still scatter their column values (minimal divergence) but their
+/// `created_by` stamp is the NEVER-VISIBLE sentinel 0xFFFFFFFFFFFFFFFF — the slot is burned,
+/// hidden from every snapshot forever. The host decides what a verdict-1 means (true duplicate
+/// vs tombstone-exonerated) with its authoritative snapshot recheck. pk index is REQUIRED
+/// (the host gates pk_col != 0xFFFFFFFF). ASCII-only.
+const MEGA_FUSE_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_mega_fuse(
+    .param .u64 staging_ptr
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<34>;
+
+    ld.param.u64 %rd1, [staging_ptr];
+    ld.global.u32 %r1, [%rd1+0];      // k
+    ld.global.u32 %r2, [%rd1+4];      // num_cols
+
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mad.lo.u32 %r8, %r6, %r7, %r5;    // j
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra DONE;
+
+    setp.ne.u32 %p2, %r8, 0;
+    @%p2 bra HDRDONE;
+    ld.global.u64 %rd6, [%rd1+56];
+    ld.global.u64 %rd7, [%rd1+64];
+    st.global.u64 [%rd6], %rd7;
+HDRDONE:
+
+    // values base = staging + 80 + num_cols*8
+    cvt.u64.u32 %rd2, %r2;
+    shl.b64 %rd3, %rd2, 3;
+    add.u64 %rd4, %rd1, 80;           // col_dest table base
+    add.u64 %rd5, %rd4, %rd3;         // values base
+
+    // PROBE/CAS FIRST: key = values[pk_col*k + j]
+    ld.global.u32 %r14, [%rd1+8];     // pk_col (host guarantees valid)
+    mad.lo.u32 %r15, %r14, %r1, %r8;
+    mul.wide.u32 %rd25, %r15, 4;
+    add.u64 %rd26, %rd5, %rd25;
+    ld.global.s32 %r16, [%rd26];      // key
+    ld.global.u32 %r17, [%rd1+12];    // base_row
+    add.u32 %r17, %r17, %r8;
+    add.u32 %r17, %r17, 1;
+    cvt.u64.u32 %rd6, %r17;
+    cvt.u64.u32 %rd7, %r16;
+    shl.b64 %rd8, %rd7, 32;
+    or.b64 %rd9, %rd8, %rd6;          // packed (key<<32)|(row+1)
+    ld.global.u32 %r18, [%rd1+16];    // mask
+    ld.global.u32 %r19, [%rd1+20];    // shift
+    ld.global.u64 %rd10, [%rd1+32];   // index_ptr
+    mul.lo.u32 %r20, %r16, 2654435761;
+    shr.u32 %r21, %r20, %r19;
+    and.b32 %r21, %r21, %r18;
+    mov.u32 %r22, 0;
+    mov.u32 %r24, 0;                  // verdict: 0 = inserted
+INSLOOP:
+    mul.wide.u32 %rd11, %r21, 8;
+    add.u64 %rd12, %rd10, %rd11;
+    mov.u64 %rd13, 0;
+    atom.global.cas.b64 %rd27, [%rd12], %rd13, %rd9;
+    setp.eq.u64 %p5, %rd27, 0;
+    @%p5 bra PROBED;
+    shr.u64 %rd14, %rd27, 32;
+    cvt.u32.u64 %r23, %rd14;
+    setp.eq.s32 %p5, %r23, %r16;
+    @%p5 bra ISDUP;
+    add.u32 %r21, %r21, 1;
+    and.b32 %r21, %r21, %r18;
+    add.u32 %r22, %r22, 1;
+    setp.ge.u32 %p5, %r22, 256;
+    @%p5 bra ISOVF;
+    bra INSLOOP;
+ISDUP:
+    mov.u32 %r24, 1;
+    bra PROBED;
+ISOVF:
+    mov.u32 %r24, 2;
+    mov.u32 %r23, 1;
+    st.global.u32 [%rd1+28], %r23;    // header decline flag = overflow only
+PROBED:
+    // verdict store: staging + verdict_off + j*4
+    ld.global.u64 %rd28, [%rd1+72];
+    add.u64 %rd29, %rd1, %rd28;
+    mul.wide.u32 %rd30, %r8, 4;
+    add.u64 %rd31, %rd29, %rd30;
+    st.global.u32 [%rd31], %r24;
+
+    // COLUMN SCATTER (always; non-winners hidden by the sentinel stamp)
+    mov.u32 %r9, 0;
+COLLOOP:
+    setp.ge.u32 %p2, %r9, %r2;
+    @%p2 bra COLDONE;
+    mad.lo.u32 %r10, %r9, %r1, %r8;
+    mul.wide.u32 %rd6, %r10, 4;
+    add.u64 %rd7, %rd5, %rd6;
+    ld.global.s32 %r11, [%rd7];
+    mul.wide.u32 %rd8, %r9, 8;
+    add.u64 %rd9, %rd4, %rd8;
+    ld.global.u64 %rd10, [%rd9];
+    mul.wide.u32 %rd11, %r8, 4;
+    add.u64 %rd12, %rd10, %rd11;
+    st.global.s32 [%rd12], %r11;
+    add.u32 %r9, %r9, 1;
+    bra COLLOOP;
+COLDONE:
+
+    // stamps base = values_base + round8(num_cols*k*4)
+    mul.lo.u32 %r12, %r2, %r1;
+    mul.wide.u32 %rd13, %r12, 4;
+    add.u64 %rd13, %rd13, 7;
+    and.b64 %rd13, %rd13, 0xfffffffffffffff8;
+    add.u64 %rd14, %rd5, %rd13;       // stamps base
+    mul.wide.u32 %rd15, %r8, 8;
+    add.u64 %rd16, %rd14, %rd15;
+    ld.global.u64 %rd17, [%rd16];
+    // non-winner: created_by = NEVER-VISIBLE sentinel
+    setp.eq.u32 %p6, %r24, 0;
+    @%p6 bra STAMPOK;
+    mov.u64 %rd17, 0xffffffffffffffff;
+STAMPOK:
+    ld.global.u64 %rd18, [%rd1+40];
+    add.u64 %rd19, %rd18, %rd15;
+    st.global.u64 [%rd19], %rd17;
+
+    // row ids (optional)
+    ld.global.u32 %r13, [%rd1+24];
+    setp.eq.u32 %p3, %r13, 0;
+    @%p3 bra DONE;
+    cvt.u64.u32 %rd20, %r1;
+    shl.b64 %rd20, %rd20, 3;
+    add.u64 %rd21, %rd14, %rd20;
+    add.u64 %rd21, %rd21, %rd15;
+    ld.global.u64 %rd22, [%rd21];
+    ld.global.u64 %rd23, [%rd1+48];
+    add.u64 %rd24, %rd23, %rd15;
+    st.global.u64 [%rd24], %rd22;
+DONE:
+    ret;
+}
+"#;
+
 /// M1 (charter-pure, ledger #24): the INCREMENTAL device-index INSERT kernel — lock-free
 /// open-addressing insert of the k APPENDED keys into an existing device hash, so the device
 /// index is APPEND-MAINTAINED (O(k)) instead of REBUILT O(rows) every wave (the measured
@@ -12239,6 +12393,164 @@ impl CudaResidentDeviceMemory {
             )
         })?;
         Ok(decline != 0)
+    }
+
+    /// MEGA-FUSE submit: one staging HtoD + one launch + one verdicts DtoH (which completes the
+    /// launch). Returns the PER-NEEDLE verdicts (0 = inserted winner, 1 = key already present in
+    /// the device index — the caller's authoritative snapshot recheck decides true-dup vs
+    /// tombstone-exonerated, 2 = probe overflow — the caller invalidates the index cache). The
+    /// index is REQUIRED. Same partial-failure contract as `submit_i32_fused_apply`: an error
+    /// leaves only INVISIBLE headroom mutated (non-winner slots additionally carry the
+    /// never-visible created_by sentinel).
+    pub fn submit_i32_mega_fuse(
+        &self,
+        request: &FusedApplyRequest<'_>,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        let num_cols = request.col_dests.len();
+        let k = request.stamps.len();
+        if k == 0 || num_cols == 0 {
+            return Ok(Vec::new());
+        }
+        if request.values.len() != num_cols * k {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                request.values.len(),
+            ));
+        }
+        if let Some((row_ids, _)) = request.row_ids {
+            if row_ids.len() != k {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(row_ids.len()));
+            }
+        }
+        // The probe IS the point: an index is mandatory here.
+        let Some((index_ptr, index_mask, index_shift, pk_col, base_row)) = request.index else {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        };
+        let k_u32 = u32::try_from(k).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(k))?;
+        let cols_u32 = u32::try_from(num_cols)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(num_cols))?;
+
+        let values_bytes = num_cols * k * 4;
+        let values_padded = values_bytes.div_ceil(8) * 8;
+        let header_bytes = 80 + num_cols * 8;
+        let row_ids_bytes = if request.row_ids.is_some() { k * 8 } else { 0 };
+        let verdict_off = header_bytes + values_padded + k * 8 + row_ids_bytes;
+        let total = verdict_off + k * 4;
+        let mut staging = vec![0_u8; total];
+        staging[0..4].copy_from_slice(&k_u32.to_le_bytes());
+        staging[4..8].copy_from_slice(&cols_u32.to_le_bytes());
+        staging[8..12].copy_from_slice(&pk_col.to_le_bytes());
+        staging[12..16].copy_from_slice(&base_row.to_le_bytes());
+        staging[16..20].copy_from_slice(&index_mask.to_le_bytes());
+        staging[20..24].copy_from_slice(&index_shift.to_le_bytes());
+        staging[24..28].copy_from_slice(&u32::from(request.row_ids.is_some()).to_le_bytes());
+        // 28..32 = overflow decline flag, zeroed by this upload.
+        staging[32..40].copy_from_slice(&index_ptr.to_le_bytes());
+        staging[40..48].copy_from_slice(&request.created_by_dest.to_le_bytes());
+        let row_id_dest = request.row_ids.map(|(_, dest)| dest).unwrap_or(0);
+        staging[48..56].copy_from_slice(&row_id_dest.to_le_bytes());
+        staging[56..64].copy_from_slice(&request.header_dest.to_le_bytes());
+        staging[64..72].copy_from_slice(&request.header_value.to_le_bytes());
+        staging[72..80].copy_from_slice(&(verdict_off as u64).to_le_bytes());
+        for (c, dest) in request.col_dests.iter().enumerate() {
+            staging[80 + c * 8..80 + c * 8 + 8].copy_from_slice(&dest.to_le_bytes());
+        }
+        let values_off = header_bytes;
+        for (i, value) in request.values.iter().enumerate() {
+            staging[values_off + i * 4..values_off + i * 4 + 4]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        let stamps_off = values_off + values_padded;
+        for (i, stamp) in request.stamps.iter().enumerate() {
+            staging[stamps_off + i * 8..stamps_off + i * 8 + 8]
+                .copy_from_slice(&stamp.to_le_bytes());
+        }
+        if let Some((row_ids, _)) = request.row_ids {
+            let row_ids_off = stamps_off + k * 8;
+            for (i, row_id) in row_ids.iter().enumerate() {
+                staging[row_ids_off + i * 8..row_ids_off + i * 8 + 8]
+                    .copy_from_slice(&row_id.to_le_bytes());
+            }
+        }
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_memcpy_htod = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_memcpy_dtoh = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let staging_guard = primary.lease_device_buffer_owned(total)?;
+        let mut ptx = Vec::with_capacity(MEGA_FUSE_PTX.len() + 1);
+        ptx.extend_from_slice(MEGA_FUSE_PTX);
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_resident_i32_mega_fuse", &ptx)?;
+
+        check_cuda(unsafe {
+            cu_memcpy_htod(staging_guard.ptr, staging.as_ptr().cast::<c_void>(), total)
+        })?;
+        let mut staging_arg = staging_guard.ptr;
+        let mut args = [(&mut staging_arg as *mut u64).cast::<c_void>()];
+        let threads_per_block: u32 = 128;
+        let blocks = k_u32.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        // The verdicts DtoH completes the launch (default stream) — stamps and the row-count
+        // header are device-visible before the caller acts on the verdicts.
+        let mut verdicts = vec![0_u32; k];
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                verdicts.as_mut_ptr().cast::<c_void>(),
+                staging_guard.ptr + verdict_off as u64,
+                k * 4,
+            )
+        })?;
+        Ok(verdicts)
     }
 
     /// M1 (ledger #24): insert `keys` (the APPENDED tail, at device rows `base_row..`) INTO this

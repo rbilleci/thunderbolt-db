@@ -327,6 +327,13 @@ pub(crate) fn synchronous_commit_default_from_env() -> bool {
     )
 }
 
+/// MEGA-FUSE flag (`GPU_DB_MEGA_FUSE=1`, default OFF): eligible covered-INSERT
+/// waves skip the separate device validate and run the probe-first fused
+/// validate+insert kernel instead (one launch; see `Engine::mega_fuse_wave`).
+pub(crate) fn mega_fuse_enabled() -> bool {
+    std::env::var("GPU_DB_MEGA_FUSE").as_deref() == Ok("1")
+}
+
 /// Adaptive ship-target divisor (`GPU_DB_INTENT_LANE_SHIP_DIV`, default 2):
 /// a lane ships when its queue reaches outstanding/(div * lanes). Larger
 /// divisors ship SMALLER waves sooner — lower formation wait (the oldest

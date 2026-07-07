@@ -64,7 +64,37 @@ combined read+write gate has never been run (Tier 3 below).
 
 ---
 
-## >>> THE ONE NEXT ACTION: THE MEGA-FUSE (user-ratified 2026-07-07) <<<
+## MEGA-FUSE: EXECUTED (2026-07-07) — mechanism proven, ships DEFAULT-OFF, launch economics documented
+
+The ratified next action ran end-to-end: recon → design → implementation → bug-find → fix → gates → A/B →
+adversarial audit → ship. `GPU_DB_MEGA_FUSE=1` (default OFF) runs eligible covered-INSERT waves through ONE
+probe-first device pass (`MEGA_FUSE_PTX`): host pre-resolves winner identity (ledger + dedup + seq/row-id
+claims), the kernel probes the PK hash index per row (CAS), inserts winners, scatters values + stamps, and
+returns per-row verdicts; verdict-1 rows get the authoritative snapshot recheck (visible = 23505,
+tombstone-exonerated = classic-path requeue via the `no_mega` marker), and EVERY claimed seq is WAL-covered
+(winners' records + EMPTY no-op records — replay-verified against the positional seq math and reopen
+oracle seeding). **The separate validate launch is GONE on fused waves: 220 → 3µs/wave, 218k+ waves fired.**
+
+**THE SUFFIX-TRIM LAW (found via the parity test's deliberate dup-PK probe):** a non-winner slot stamped
+with the never-visible sentinel must NOT be published — tail losers are TRIMMED (row_count advances by the
+winner prefix only; the device header word is re-corrected; hwm stays the real winner max), else the shard
+pins permanently versioned and the ORDER-BY paths refuse forever. Interior losers (rare²) still pin
+(`max_created_by = Index::MAX`, published atomically with the row-count advance) — correct, documented cost.
+
+**HONEST A/B (why default-OFF): the per-wave blocking launch loses to the classic coalescers at BOTH ends.**
+61k: mega {1.19, 1.26, 1.66}M vs classic {1.49, 1.54, 1.54}M — classic amortizes validate across lanes and
+applies ~3 waves/launch asynchronously; mega serializes one launch per wave under the device lock. 512cl:
+mega 290-300k @ p50 1.4ms vs classic 393-416k @ 1.10-1.26ms — mega launches BEFORE the WAL append,
+serializing device time ahead of the fence and reintroducing the inline device wait no-reap removed.
+**FOLLOW-UP that would flip the economics: (1) a CROSS-LANE MEGA COALESCER (one probe-insert launch over
+all lanes' pending waves — the per-needle verdict design already supports it) + (2) WAL-FIRST reorder
+(append winners optimistically, launch overlapping the fence, reconcile losers via the empty-record
+mechanism).** Audit: MERGE-SAFE default-OFF; one MEDIUM adopted (mega WAL-append failure now poisons the
+lanes loudly — the apply-before-append inversion must never silently serve phantom rows); interior-loser
+index-decline documented as perf cost. Gates: MEGA suites 4/4 (default/lanes6/async arms), FULL GPU sweep
+371/371, engine 491/491 both arms.
+
+## >>> PREVIOUS NEXT ACTION (executed above): THE MEGA-FUSE (user-ratified 2026-07-07) <<<
 
 **Fuse validate+insert into ONE device launch over the merged cross-lane batch, by pre-resolving winner
 identity host-side.** This is the only remaining structural 2M+ lever — config space is EXHAUSTED at ~1.5M

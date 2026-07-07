@@ -334,6 +334,7 @@ impl Engine {
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
             outstanding: None,
             synchronous: true,
+            no_mega: false,
         })
     }
 

@@ -235,6 +235,12 @@ pub(crate) struct LaneIntent {
     /// STRICT gate (durable AND applied); false acks at the APPLIED cut
     /// (async commit — bounded loss on power failure, consistency preserved).
     pub(crate) synchronous: bool,
+    /// MEGA-FUSE requeue marker: a tombstone-EXONERATED (or overflow) item can
+    /// never win through the probe-first kernel (the CAS always finds its key)
+    /// — its retry wave must take the CLASSIC path, whose declined-index apply
+    /// fallback completes the insert. Any marked item in a batch disables the
+    /// mega hint for that wave.
+    pub(crate) no_mega: bool,
 }
 
 impl LaneIntent {
@@ -2548,12 +2554,24 @@ impl Engine {
             AtomicOrdering::Relaxed,
         );
 
+        // MEGA-FUSE decision (task #11, flag-gated, default OFF): when the wave is the
+        // covered single-table shape and the open shard's PK device index is live at the
+        // current basis (a cheap pre-claim HINT — nothing is claimed yet, so a classic
+        // fallback is free), the separate device validate below is SKIPPED entirely: the
+        // fused probe-first kernel IS the validate, launched after the host pre-resolves
+        // winner identity (ledger conflicts + intra-wave dedup + seq/row-id claims).
+        let mega_wave = crate::engine_intent_lanes::mega_fuse_enabled()
+            && self.mega_fuse_hint(&batch);
         // device validate (committed-dup 23505 verdicts), off-lock and LEAN:
         // needles come straight from the intents' integer slots (no AST walk);
         // the locate goes through the cross-lane coalescer; count>0 hits get
         // the same authoritative visibility recheck as the classic path.
         let stat_start = Instant::now();
-        let violations = self.lane_validate_unique(&batch);
+        let violations = if mega_wave {
+            std::collections::BTreeMap::new()
+        } else {
+            self.lane_validate_unique(&batch)
+        };
         lanes.stat_validate_ns.fetch_add(
             stat_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
@@ -2700,6 +2718,25 @@ impl Engine {
         );
         let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
         let local_first = first_seq - base;
+
+        if mega_wave {
+            // The fused arm settles/fails/requeues every winner itself and appends the
+            // full claimed seq range (losers as empty no-op records). It never falls
+            // back — the wave skipped the separate validate, and the seqs are claimed.
+            return self.mega_fuse_wave(
+                &lanes,
+                lane,
+                winners,
+                &winner_slots,
+                &frame_payload,
+                &record_ends,
+                wal_lanes,
+                first_seq,
+                local_first,
+                row_id_base,
+                k,
+            );
+        }
 
         // record winners into the lane's private ledger at their global seqs —
         // from the slots extracted in the conflict pass (no fat-item re-walk)
@@ -3091,6 +3128,310 @@ impl Engine {
             intent.read_snapshot = refreshed_snapshot;
             self.submit_lane_intent(lanes, intent);
         }
+    }
+
+    /// MEGA-FUSE pre-claim HINT: is this wave the covered shape the fused probe-first
+    /// kernel can take — uniform table, uniform (current) catalog generation, and the
+    /// open shard int4-only with EXACTLY ONE live PK device index at the current basis
+    /// with headroom for the wave? Read-only and cheap; a false positive is resolved
+    /// under the device lock (requeue-all), a false negative just runs the classic path.
+    fn mega_fuse_hint(&self, batch: &[LaneIntent]) -> bool {
+        let Some(first) = batch.first() else {
+            return false;
+        };
+        let table_name = &first.table;
+        let catalog = self.catalog_snapshot();
+        if batch.iter().any(|item| {
+            item.no_mega
+                || item.prepared_catalog_seq != catalog.commit_seq
+                || item.table != *table_name
+        }) {
+            return false;
+        }
+        if !catalog.relational_catalog.contains_key(&**table_name) {
+            return false;
+        }
+        self.mega_shard_ready(table_name, batch.len())
+    }
+
+    /// The shard-side half of the hint: open shard valid + int4-only + fits `k` more rows +
+    /// exactly one live cached PK device index at the current basis.
+    fn mega_shard_ready(&self, table: &str, k: usize) -> bool {
+        if !self.device_write_locate_enabled() {
+            return false;
+        }
+        let pressured_gpus = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .clone();
+        let shards = self.read_state.residency.shards.load();
+        let Some(table_shards) = shards.get(table) else {
+            return false;
+        };
+        let Some(open) = table_shards.last() else {
+            return false;
+        };
+        if !open.int4_appendable
+            || !open.is_valid(pressured_gpus.contains(&open.gpu_id))
+            || !open.resident_device_int8_columns.is_empty()
+            || open.row_count.checked_add(k).map_or(true, |end| end > open.capacity)
+        {
+            return false;
+        }
+        let Some(device) = self
+            .read_state
+            .residency
+            .shard_device_memory
+            .get(&(table.to_string(), open.shard_id))
+        else {
+            return false;
+        };
+        let device_ptr = device.device_ptr();
+        let cache = self
+            .read_state
+            .residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut live = 0usize;
+        let column_count =
+            open.resident_device_int4_columns.len() + open.resident_device_int8_columns.len();
+        for col_idx in 0..column_count {
+            if let Some(entry) = cache.get(&(table.to_string(), open.shard_id, col_idx)) {
+                if entry.resident_device_ptr == device_ptr
+                    && entry.row_count == open.row_count
+                    && entry.device_index.is_some()
+                {
+                    live += 1;
+                }
+            }
+        }
+        live == 1
+    }
+
+    /// MEGA-FUSE wave executor (task #11): winner identity is already pre-resolved
+    /// (ledger conflicts + intra-wave dedup + seq/row-id claims) and the separate device
+    /// validate was skipped — ONE probe-first kernel launch (under `device_apply_lock`,
+    /// serializing with the classic apply coalescer) probes the PK index per row,
+    /// CAS-inserts winners, scatters values + stamps, and returns per-row verdicts. The
+    /// wave then: verdict-0 winners settle normally; verdict-1 rows run the authoritative
+    /// snapshot recheck (visible = 23505, tombstone-EXONERATED = requeue for a fresh seq);
+    /// verdict-2 (overflow) and every under-lock failure = requeue-all. EVERY claimed seq
+    /// is covered by the appended frame — non-winners as EMPTY no-op records (replay =
+    /// `Ok(None)`, one commit-index tick), so recovery's positional seq math, the reopen
+    /// oracle seeding, and orphan repair all hold. Always returns true (wave handled).
+    #[allow(clippy::too_many_arguments)]
+    fn mega_fuse_wave(
+        &self,
+        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
+        lane: usize,
+        mut winners: Vec<LaneIntent>,
+        winner_slots: &[crate::write_path::IntUniqueSlotKey],
+        frame_payload: &[u8],
+        record_ends: &[usize],
+        wal_lanes: &gpu_db_wal::FuaWalLaneSet,
+        first_seq: u64,
+        local_first: u64,
+        row_id_base: u64,
+        k: u64,
+    ) -> bool {
+        let table_name: std::sync::Arc<str> = std::sync::Arc::clone(
+            &winners
+                .first()
+                .expect("mega wave has at least one winner")
+                .table,
+        );
+        let new_rows: Vec<Vec<SqlValue>> = winners
+            .iter_mut()
+            .map(|item| std::mem::take(&mut item.values))
+            .collect();
+        let stamps: Vec<Index> = (0..k).map(|offset| first_seq + offset).collect();
+        let row_ids: Vec<u64> = (0..k).map(|offset| row_id_base + offset).collect();
+
+        // The launch mutates the open shard + PK index — mutually exclusive with the
+        // classic apply coalescer's leader (same lock, same extension-chain rule).
+        let stat_start = Instant::now();
+        let outcome = {
+            let _leader = lanes
+                .device_apply_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.try_append_open_shard_mega(&table_name, &new_rows, &stamps, Some(&row_ids))
+        };
+        lanes.stat_apply_ns.fetch_add(
+            stat_start.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
+        let verdicts = match outcome {
+            crate::engine_residency::MegaAppendOutcome::Applied { verdicts } => verdicts,
+            _ => {
+                // Basis drifted under the lock / device failure: REQUEUE-ALL. The claimed
+                // seqs burn as an all-empty frame (the cut stays whole), every intent
+                // retries with a fresh seq next wave (outcomes stay pending; `outstanding`
+                // stays counted), and the classic path re-validates on the retry.
+                let mut payload = Vec::with_capacity(k as usize * 8);
+                for item in winners.iter() {
+                    gpu_db_wal::encode_wal_record_parts_into(&mut payload, item.txn_id, &[]);
+                }
+                if let Err(err) =
+                    wal_lanes.append_encoded(lane, local_first, local_first + k, k as u32, &payload)
+                {
+                    let message = format!("lane WAL append failed: {err}");
+                    for item in winners {
+                        item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
+                            message.clone(),
+                        ))));
+                    }
+                    return true;
+                }
+                lanes.record_applied(local_first, local_first + k);
+                let mut queue = lanes.queues[lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for (item, values) in winners.into_iter().zip(new_rows) {
+                    let mut item = item;
+                    item.values = values;
+                    item.no_mega = true;
+                    queue.push_back(item);
+                }
+                return true;
+            }
+        };
+
+        // VERDICT RESOLUTION. Winner records keep their pre-encoded bytes; every other
+        // seq becomes an EMPTY no-op record. Order is the ORIGINAL wave order — the
+        // positional seq math depends on it.
+        let catalog = self.catalog_snapshot();
+        let table = catalog.relational_catalog.get(&*table_name);
+        let mut payload: Vec<u8> = Vec::with_capacity(frame_payload.len());
+        let mut settle_winners: Vec<LaneIntent> = Vec::with_capacity(winners.len());
+        let mut requeue: Vec<LaneIntent> = Vec::new();
+        {
+            let mut ledger = lanes.ledgers[lane]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (offset, (item, values)) in winners.into_iter().zip(new_rows).enumerate() {
+                let verdict = verdicts[offset];
+                let record_start = if offset == 0 {
+                    0
+                } else {
+                    record_ends[offset - 1]
+                };
+                if verdict == 0 {
+                    payload.extend_from_slice(&frame_payload[record_start..record_ends[offset]]);
+                    ledger.record_int_slot(winner_slots[offset], first_seq + offset as u64);
+                    settle_winners.push(item);
+                    continue;
+                }
+                // Non-winner: the seq is burned with an empty record either way.
+                gpu_db_wal::encode_wal_record_parts_into(&mut payload, item.txn_id, &[]);
+                if verdict == 1 {
+                    // Key present in the index: authoritative snapshot recheck decides.
+                    let visible = table.is_some_and(|table| {
+                        matches!(
+                            self.visible_row_with_value(
+                                table,
+                                crate::StorageVisibility {
+                                    read_txn_id: item.read_snapshot,
+                                },
+                                item.filter_idx as usize,
+                                &SqlValue::Int4(item.slot.1),
+                                None,
+                            ),
+                            Ok(true)
+                        )
+                    });
+                    if visible {
+                        let index_name = table
+                            .and_then(|table| {
+                                table
+                                    .columns
+                                    .get(item.filter_idx as usize)
+                                    .map(|column| format!("{}_{}_key", table.name, column.name))
+                            })
+                            .unwrap_or_else(|| format!("{}_key", table_name));
+                        item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            format!("duplicate key value violates unique index \"{index_name}\""),
+                        ))));
+                        continue;
+                    }
+                    // Tombstone-EXONERATED: the row must still insert — retry next wave.
+                }
+                // verdict 2 (overflow) or exonerated: requeue with restored values,
+                // marked so the retry wave takes the classic path (never mega —
+                // the probe would find the key again forever: requeue livelock).
+                let mut item = item;
+                item.values = values;
+                item.no_mega = true;
+                requeue.push(item);
+            }
+        }
+        if !requeue.is_empty() {
+            let mut queue = lanes.queues[lane]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for item in requeue {
+                queue.push_back(item);
+            }
+        }
+
+        // Durable append: ONE frame covering the FULL claimed range (mega waves skip the
+        // sub-frame splitter — mixed winner/empty tiling keeps this simple in v1).
+        let stat_start = Instant::now();
+        if let Err(err) =
+            wal_lanes.append_encoded(lane, local_first, local_first + k, k as u32, &payload)
+        {
+            // AUDIT (mega slice, MEDIUM): the mega arm applies BEFORE the durable
+            // append — a failed append here leaves winner rows committed-visible
+            // while their clients hear "failed" (torn, until crash). Wedge the
+            // lanes LOUDLY and totally (the applied cut is holed anyway; poison
+            // makes every later settle drain with errors instead of a silent
+            // stall serving phantom rows).
+            lanes
+                .apply_poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            let message = format!("lane WAL append failed: {err}");
+            for item in settle_winners {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
+                    message.clone(),
+                ))));
+            }
+            return true;
+        }
+        lanes.stat_publish_ns.fetch_add(
+            stat_start.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
+
+        // Apply completed AT the launch: advance the cut ourselves (recon Q4: nothing
+        // requires the apply coalescer) and mark the settle entry's slot done up front.
+        lanes.record_applied(local_first, local_first + k);
+        self.read_state
+            .residency
+            .host_install_elisions
+            .fetch_add(settle_winners.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let apply_slot = std::sync::Arc::new(crate::engine_intent_lanes::ApplySlot {
+            done: std::sync::atomic::AtomicBool::new(true),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (async_winners, sync_winners): (Vec<LaneIntent>, Vec<LaneIntent>) = settle_winners
+            .into_iter()
+            .partition(|item| !item.synchronous);
+        lanes.settle[lane]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(crate::engine_intent_lanes::LaneSettle {
+                end_seq: local_first + k,
+                winners: sync_winners,
+                async_winners,
+                async_settled: false,
+                apply_slot,
+                published_at: std::time::Instant::now(),
+            });
+        self.settle_intent_lane(lanes, lane);
+        true
     }
 
     /// ONE opportunistic apply-leader pass: if the device lock is free and the
