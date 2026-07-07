@@ -1,5 +1,15 @@
 # HANDOVER — Remaining Work on the Durable Write Path (post-E2.5c)
 
+> **MERGED TO MAIN 2026-07-07 (`ce1f3354`)** after a final adversarial merge audit (opus) of the
+> previously-unaudited perf slices. Findings adopted at `45e91eaf`: CRITICAL resize-barrier
+> duplicate-key hole (held/straggler intents crossed the epoch flip with pre-flip snapshots —
+> fixed with a single-ingress Dekker protocol, post-barrier snapshot refresh on every hold-queue
+> re-route, and a strand guard) + two minors (apply done/cut store ordering; pre-stager panic
+> guard). The merge gate also caught a PRE-EXISTING default-flip break: the public
+> `recover_from_durable_wal_file` could not read the new default fua/lanes layout (fixed at
+> `ce1f3354` with layout dispatch). Final merge ledger: workspace 1174/1174 (default arm),
+> engine 491/491 (explicit-serial arm), FULL GPU sweep 370/370, intent suites lanes=2/6 green.
+
 Written 2026-07-06, end of the E2.5c hardening + default-flip campaign (commits
 `5bd9c3a0..a994ad85` on `codex/durable-write-throughput`, all pushed, every slice
 independently opus-audited). Companion to `docs/HANDOVER.md` and `docs/WRITE_CONVEYOR.md`.
