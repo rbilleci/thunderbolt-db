@@ -12847,9 +12847,9 @@ impl CudaResidentDeviceMemory {
             .len()
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        let needle_bytes = needles.len() * std::mem::size_of::<i32>();
-        let snapshot_bytes = snapshots.len() * std::mem::size_of::<u64>();
-        let desc_bytes = desc.len() * std::mem::size_of::<u64>();
+        let needle_bytes = std::mem::size_of_val(needles);
+        let snapshot_bytes = std::mem::size_of_val(snapshots);
+        let desc_bytes = std::mem::size_of_val(desc.as_slice());
 
         let primary = self.primary_arc();
         primary.set_current()?;
