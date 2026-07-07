@@ -3478,11 +3478,13 @@ impl Engine {
                 tombstones.append(&mut batch[i].tombstones);
             }
             // WAL-FIRST APPLY ORDER: APPEND inserts FIRST (device-visible + indexed), THEN
-            // LOCATE + tombstone deletes. A delete reaching apply always targets a PRE-batch
-            // row — the pump's SI conflict check aborts any delete whose target was written
-            // after its read snapshot, so a same-batch insert (seq > the delete's snapshot) is
-            // never a delete's target, and the visible-locate's created_by<=snapshot filter
-            // excludes it anyway. So this order is safe for insert-then-delete and reinsert alike.
+            // LOCATE + tombstone deletes. The locate runs at each delete's read_snapshot, and its
+            // created_by<=snapshot<deleted_by filter selects EXACTLY the version the delete's
+            // snapshot saw — so append-vs-locate order is immaterial: a same-batch reinsert
+            // (created_by = its seq > the delete's snapshot) is filtered OUT, while a same-batch
+            // insert the delete's snapshot DID see (created_by <= snapshot) is correctly targeted.
+            // (Audit note: "a same-batch insert is never a target" is NOT the invariant — the
+            // visibility filter is what makes every case semantically correct, not append order.)
             let appended = rows.is_empty()
                 || (self.auto_admit_on_commit_enabled()
                     && self.try_append_resident_int4_open_shard(
@@ -3647,7 +3649,13 @@ impl Engine {
             match locate.counts.get(i).copied() {
                 Some(0) => counts.push(0),
                 Some(1) => {
-                    let shard_id = locate.shard_ids[i];
+                    // AUDIT (finding 3): index the parallel output vectors defensively — a short
+                    // slot/shard vector from the device declines to the fallback, never panics.
+                    let (Some(&shard_id), Some(&slot)) =
+                        (locate.shard_ids.get(i), locate.slots.get(i))
+                    else {
+                        return false;
+                    };
                     let Some((_, region)) = locate.probed.iter().find(|(id, _)| *id == shard_id)
                     else {
                         return false;
@@ -3656,7 +3664,7 @@ impl Engine {
                         .entry((shard_id, region.device_ptr()))
                         .or_insert_with(|| (std::sync::Arc::clone(region), Vec::new()))
                         .1
-                        .push((locate.slots[i], tombstone.seq));
+                        .push((slot, tombstone.seq));
                     counts.push(1);
                 }
                 _ => return false, // ambiguous multiplicity / missing -> fallback
