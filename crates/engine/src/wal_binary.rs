@@ -129,6 +129,15 @@ pub(crate) fn encode_binary_update_by_key(
     Some(out)
 }
 
+/// U2: the byte offset of the 8-byte `new_row_id` field inside an `OP_UPDATE_BY_KEY` record for
+/// `(table, pk_column)` — the pump patches the row id it claims at wave formation here, exactly as
+/// an INSERT patches its row id at [`CoveredInsertRoute`]'s `binary_row_id_offset`. Layout:
+/// tag(1) + version(1) + op(1) + table_len(2) + table + pkcol_len(2) + pkcol + pk_value(4), then
+/// the `new_row_id`. Stable given the encoding above; a `debug_assert` in the pump cross-checks it.
+pub(crate) fn binary_update_new_row_id_offset(table: &str, pk_column: &str) -> usize {
+    3 + 2 + table.len() + 2 + pk_column.len() + 4
+}
+
 /// Decode ANY binary record (op dispatch). Errors are LOUD (`Durability`) — a tagged record
 /// that fails to decode is corruption-or-version-skew, never silently skipped.
 pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, EngineError> {
@@ -396,5 +405,23 @@ mod w5b_tests {
         let mut trailing = payload.clone();
         trailing.push(0);
         assert!(decode_binary_record(&trailing).is_err());
+
+        // PUMP PATCH OFFSET (non-vacuous): the pump stamps its claimed row id at
+        // `binary_update_new_row_id_offset` into a PLACEHOLDER-0 record; patching there must land
+        // EXACTLY on the decoded new_row_id (a wrong offset = silent identity corruption).
+        let placeholder =
+            encode_binary_update_by_key("public_t", "id", 42, 0, &new_row).unwrap();
+        assert_eq!(placeholder.len(), payload.len(), "placeholder is byte-width identical");
+        let off = binary_update_new_row_id_offset("public_t", "id");
+        let mut patched = placeholder.clone();
+        patched[off..off + 8].copy_from_slice(&7_000_001u64.to_le_bytes());
+        assert_eq!(
+            patched, payload,
+            "patching the placeholder at the offset reproduces the fully-encoded record"
+        );
+        match decode_binary_record(&patched).unwrap() {
+            BinaryWalRecord::UpdateByKey(record) => assert_eq!(record.new_row_id, 7_000_001),
+            _ => panic!("decoded the wrong op"),
+        }
     }
 }

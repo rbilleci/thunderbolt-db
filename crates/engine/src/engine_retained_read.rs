@@ -950,7 +950,13 @@ impl Engine {
                         continue;
                     }
                     if dup {
-                        entry.device_index = None; // dup appended key -> monotone DECLINE
+                        // F3/U4: the insert kernel now PLACES version twins, so `dup` no longer
+                        // means "duplicate key" — it fires ONLY on a 256-probe OVERFLOW (a shard
+                        // whose live+twin fan-out overran the probe cap). Drop the index so the
+                        // next probe rebuilds at the grown, boundary-gated size (dead-below-GC
+                        // twins are dropped there). A pathological hot-key with >256 un-GC'd
+                        // versions stays declined until its readers release — a bounded transient.
+                        entry.device_index = None;
                     }
                     entry.row_count = new_count;
                 }
@@ -2246,6 +2252,15 @@ impl Engine {
             sizing_rows,
             deleted_stamps.as_deref(),
             gc_boundary,
+            // F3/U4: place MVCC version twins (dead-old + live-new sharing a pk) rather than
+            // declining — BUT only on a VERSIONED shard (one that carries a `deleted_by` region).
+            // A version twin can only exist where a delete/update tombstoned the old, so a versioned
+            // shard's same-key duplicates are twins the dup-tolerant visible/write-locate resolves;
+            // the read-path first-match dense probe declines versioned shards outright, so this is
+            // safe for it. A DELETE-FREE shard has no versions, so a same-key duplicate is a genuine
+            // DATA duplicate (a non-unique-key table) that MUST still decline the whole shard — the
+            // first-match probe cannot resolve it. `deleted_stamps.is_some()` is exactly that gate.
+            deleted_stamps.is_some(),
         ) {
             Some((index, table_mask, hash_shift)) => {
                 let index_bytes: Vec<u8> =
@@ -2948,7 +2963,8 @@ pub(crate) fn build_int4_pk_hash_table_host(
     keys: &[i32],
     row_count: u64,
 ) -> Option<(Vec<u64>, u32, u32)> {
-    build_int4_pk_hash_table_host_visible(keys, row_count, None, 0)
+    // Legacy HOST index (first-match probe): keep the unique-key decline on a duplicate.
+    build_int4_pk_hash_table_host_visible(keys, row_count, None, 0, false)
 }
 
 /// U1 (visibility-aware rebuild): like [`build_int4_pk_hash_table_host`], but rows whose
@@ -2967,6 +2983,13 @@ pub(crate) fn build_int4_pk_hash_table_host_visible(
     row_count: u64,
     deleted_by: Option<&[u64]>,
     gc_boundary: u64,
+    // F3/U4: when true, a same-key occupant is a MVCC VERSION TWIN (an updated key's dead-old +
+    // live-new both above the GC boundary) and is placed at the next probe slot rather than
+    // declining — the DEVICE index is probed by the dup-tolerant `visible-locate` kernel, which
+    // walks the chain and resolves the snapshot-visible version. When false (the legacy HOST index,
+    // probed first-match) a dup key still declines the whole table (that probe cannot resolve
+    // versions). Boundary-gated dedup below still drops dead-below-GC rows first in both modes.
+    dup_tolerant: bool,
 ) -> Option<(Vec<u64>, u32, u32)> {
     // A 0-row shard makes `table_size = 1` -> `hash_shift = 32`, and `key >> 32` is a u32 shift-overflow
     // (panics in debug/test, silently masks in release). Decline (the scan handles 0 rows as an empty match);
@@ -3000,9 +3023,10 @@ pub(crate) fn build_int4_pk_hash_table_host_visible(
                 index[slot as usize] = ((key_bits as u64) << 32) | (row as u64 + 1);
                 break;
             }
-            if (occupant >> 32) as u32 == key_bits {
-                return None;
+            if !dup_tolerant && (occupant >> 32) as u32 == key_bits {
+                return None; // unique (host) index: a duplicate physical key declines the table
             }
+            // F3/U4 dup_tolerant OR a different-key collision: probe onward to the next slot.
             slot = (slot + 1) & table_mask;
             probes += 1;
             if probes >= 256 {
@@ -3364,6 +3388,7 @@ mod cross_shard_pk_index_tests {
                 8,
                 Some(&stamps),
                 7,
+                false, // unique (host) mode: this test asserts the decline-on-dup behavior
             )
             .expect("dead twin below boundary is skipped");
         let mut probe = ((10_u32.wrapping_mul(0x9E37_79B1)) >> shift) & mask;
@@ -3381,15 +3406,54 @@ mod cross_shard_pk_index_tests {
                 &keys,
                 8,
                 Some(&stamps),
-                4
+                4,
+                false, // unique mode: above-boundary twin collides -> declines
             )
             .is_none(),
             "a twin dead ABOVE the boundary still collides (readers may need it)"
         );
         assert!(
-            crate::engine_retained_read::build_int4_pk_hash_table_host_visible(&keys, 8, None, 7)
-                .is_none()
+            crate::engine_retained_read::build_int4_pk_hash_table_host_visible(
+                &keys, 8, None, 7, false
+            )
+            .is_none()
         );
+    }
+
+    /// F3/U4 (dup-tolerant DEVICE index): an above-boundary version twin is PLACED at the next
+    /// probe slot (not declined), so the dup-tolerant visible-locate can resolve the snapshot-
+    /// visible version. Sabotage: forcing `dup_tolerant = false` makes this build decline (None).
+    #[test]
+    fn dup_tolerant_build_places_above_boundary_twin() {
+        let keys = [10_i32, 20, 10, 30]; // rows 0 and 2 share key 10 (an updated key's twin)
+        let live = 0x7F7F_7F7F_7F7F_7F7Fu64;
+        // Old (row 0) tombstoned at seq 6, ABOVE the gc_boundary (4) -> still reader-visible ->
+        // both versions must be indexed.
+        let stamps = [6_u64, live, live, live];
+        let (index, mask, shift) =
+            crate::engine_retained_read::build_int4_pk_hash_table_host_visible(
+                &keys,
+                8,
+                Some(&stamps),
+                4,
+                true, // dup-tolerant DEVICE mode
+            )
+            .expect("dup-tolerant build must place the twin, not decline");
+        // BOTH physical rows for key 10 (row 0 packed 1, row 2 packed 3) are present in the chain.
+        let mut probe = ((10_u32.wrapping_mul(0x9E37_79B1)) >> shift) & mask;
+        let mut found: Vec<u32> = Vec::new();
+        loop {
+            let entry = index[probe as usize];
+            if entry == 0 {
+                break;
+            }
+            if (entry >> 32) as u32 == 10 {
+                found.push((entry & 0xFFFF_FFFF) as u32);
+            }
+            probe = (probe + 1) & mask;
+        }
+        found.sort_unstable();
+        assert_eq!(found, vec![1, 3], "both twins (packed row+1 = 1 and 3) are indexed");
     }
 
     /// The per-shard bloom (sub-slice 2) has NO FALSE NEGATIVES (every built key -> maybe_contains true --

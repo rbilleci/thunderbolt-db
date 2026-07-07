@@ -180,6 +180,12 @@ pub(crate) enum AppliedRowMutation {
         /// them (A1). `None` for any unparseable key -> the commit arm declines the incremental
         /// path (re-admit, always correct).
         row_ids: Option<Vec<u64>>,
+        /// U2: the OLD versions' row-ids to REMOVE on an elided-rehydrate fallback. A classic
+        /// in-place update reuses the old id for the new version (`row_ids == old ids`), so the
+        /// upsert overwrites and no explicit removal is needed (`None`). A U2 lane update installs
+        /// the new version at a FRESH `new_row_id` (a dead twin), so the tombstoned old must be
+        /// removed explicitly or the rehydrate leaves two live rows sharing the pk.
+        old_row_ids: Option<Vec<u64>>,
         write_set: WriteSet,
     },
 }

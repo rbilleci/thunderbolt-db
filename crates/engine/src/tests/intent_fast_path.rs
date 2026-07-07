@@ -1066,3 +1066,461 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
         "post-recovery dead key reports zero rows"
     );
 }
+
+/// U2: poll one covered-UPDATE intent to completion, driving the pipeline. `new_values` is the
+/// FULL new row (all columns); `Ok(n)` = rows affected (0 or 1 by the covered shape).
+fn commit_update_via_submit(
+    engine: &Engine,
+    txn_ids: &AtomicU64,
+    route: &crate::CoveredUpdateRoute,
+    new_values: &[i32],
+) -> Result<u64, ExecuteError> {
+    let mut ticket = engine.submit_covered_update_intent(
+        txn_ids.fetch_add(1, Ordering::Relaxed),
+        route,
+        new_values,
+    )?;
+    let mut spins = 0u64;
+    loop {
+        engine.drive_commit_wave();
+        if let Some(result) = engine.poll_intent(&mut ticket) {
+            return result;
+        }
+        spins += 1;
+        assert!(spins < 10_000_000, "update intent never settled");
+    }
+}
+
+/// U2 END-TO-END: covered lane UPDATE intents — 1-row full-row replace (new image visible, old
+/// hidden), 0-row update (missing key: the CONDITIONAL append fires nothing), chained updates,
+/// update-then-delete (the delete locates the new version through the dropped-then-rebuilt index),
+/// rows-affected reporting, and the FIRED counters for the device visible-locate + in-place
+/// tombstone (a silent fallback would pass output parity while abandoning the design).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_lane_update_intents_end_to_end() {
+    let path = test_wal_path("lane-update-e2e");
+    let prior_durability = std::env::var("GPU_DB_WAL_DURABILITY").ok();
+    std::env::set_var("GPU_DB_WAL_DURABILITY", "fua");
+    let mut engine = Engine::with_durable_wal_segment(&path);
+    match &prior_durability {
+        Some(value) => std::env::set_var("GPU_DB_WAL_DURABILITY", value),
+        None => std::env::remove_var("GPU_DB_WAL_DURABILITY"),
+    }
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    // v1 exclusion probe target: a second unique i32 index makes the UPDATE route refuse.
+    engine
+        .execute_text(2, "CREATE TABLE t2 (a INT PRIMARY KEY, b INT UNIQUE)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+
+    let txn_ids = AtomicU64::new(10);
+    engine
+        .execute_dml_concurrent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            "INSERT INTO t VALUES (1000000, 0)",
+        )
+        .unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("t")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return; // driverless box
+    }
+    let mut warmed = false;
+    for i in 0..10_000_i32 {
+        engine
+            .execute_dml_concurrent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
+            )
+            .unwrap();
+        if engine.table_install_elided("t") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "table never entered elision on a GPU box");
+
+    let insert_route = engine.prepare_covered_insert_route("t").unwrap();
+    let mut update_route = engine.prepare_covered_update_route("t").unwrap();
+    assert_eq!(update_route.table(), "t");
+
+    let lanes_mode = crate::engine_intent_lanes::intent_lane_count() >= 2;
+    if !lanes_mode {
+        // Serial arm: update intents are lanes-only — the refusal is loud, not a fallback.
+        let err = engine
+            .submit_covered_update_intent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &update_route,
+                &[1, 1],
+            )
+            .map(|_| ())
+            .expect_err("update intents must refuse without lanes");
+        assert!(err.to_string().contains("intent-lanes"), "{err}");
+        return;
+    }
+
+    // Seed rows 0..200 as (id, id + 7); every insert reports rows_affected == 1.
+    for id in 0..200_i32 {
+        let rows =
+            commit_intent_via_submit(&engine, &txn_ids, &insert_route, &[id, id + 7]).unwrap();
+        assert_eq!(rows, 1, "covered insert reports exactly one row");
+    }
+    let locates_before = engine
+        .read_state
+        .residency
+        .device_visible_locate_hits
+        .load(Ordering::Relaxed);
+    let tombstones_before = engine
+        .read_state
+        .residency
+        .lane_tombstone_applies
+        .load(Ordering::Relaxed);
+
+    // KNOWN CLIFF (U1/U2 exit finding, open board): a read-back over an update/delete-VERSIONED
+    // elided shard falls into the rehydrating host arm and DE-ELIDES the table (the plain scan
+    // lacks the deleted_by visibility conjunct). The covered route's re-prepare carries the elision
+    // RE-ENTRY arm — so this test re-prepares the update route after EVERY de-eliding read, exactly
+    // as the delete e2e does. (Un-versioning is VACUUM's job; the mixed read+write gate is Tier-3.)
+
+    // 1-ROW UPDATE (full-row replace): key 50 (id=50, v=57) -> (id=50, v=9999).
+    assert_eq!(
+        commit_update_via_submit(&engine, &txn_ids, &update_route, &[50, 9999]).unwrap(),
+        1,
+        "updating a visible row affects exactly one row"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "an in-place lane update must not de-elide the table (fallback fired?)"
+    );
+    let rows = select_rows_unordered_sorted(&engine); // DE-ELIDES the versioned shard
+    let fifty: Vec<_> = rows
+        .iter()
+        .filter(|row| row.first() == Some(&SqlValue::Int4(50)))
+        .collect();
+    assert_eq!(fifty.len(), 1, "the updated key is visible EXACTLY once (old twin hidden)");
+    assert_eq!(fifty[0].get(1), Some(&SqlValue::Int4(9999)), "new image wins");
+    let rows_before_zero = rows.len();
+
+    // 0-ROW UPDATE (missing key): the CONDITIONAL append must fire NOTHING.
+    update_route = engine.prepare_covered_update_route("t").unwrap(); // re-enter elision
+    assert_eq!(
+        commit_update_via_submit(&engine, &txn_ids, &update_route, &[987_654, 1]).unwrap(),
+        0,
+        "updating a never-existing key affects zero rows"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "0-row updates must not de-elide"
+    );
+    assert_eq!(
+        select_rows_unordered_sorted(&engine).len(),
+        rows_before_zero,
+        "a 0-row update must not append a phantom row"
+    );
+
+    // CHAINED UPDATE: key 50 again -> (50, 8888); the new image wins, still exactly once.
+    update_route = engine.prepare_covered_update_route("t").unwrap(); // re-enter elision
+    assert_eq!(
+        commit_update_via_submit(&engine, &txn_ids, &update_route, &[50, 8888]).unwrap(),
+        1,
+        "chained update of the same key affects one row"
+    );
+    let rows = select_rows_unordered_sorted(&engine); // DE-ELIDES
+    let fifty: Vec<_> = rows
+        .iter()
+        .filter(|row| row.first() == Some(&SqlValue::Int4(50)))
+        .collect();
+    assert_eq!(fifty.len(), 1, "chained update leaves the key visible exactly once");
+    assert_eq!(fifty[0].get(1), Some(&SqlValue::Int4(8888)), "latest image wins");
+
+    // UPDATE-THEN-DELETE: update key 60, then delete it — the delete must locate the NEW version
+    // through the pk index that the update's dead-twin append dropped then a locate rebuilt.
+    update_route = engine.prepare_covered_update_route("t").unwrap(); // re-enter elision
+    assert_eq!(
+        commit_update_via_submit(&engine, &txn_ids, &update_route, &[60, 4242]).unwrap(),
+        1,
+        "update the target of the delete"
+    );
+    let delete_route = engine.prepare_covered_delete_route("t").unwrap();
+    assert_eq!(
+        commit_delete_via_submit(&engine, &txn_ids, &delete_route, 60).unwrap(),
+        1,
+        "the updated row is locatable + deletable (index survived the dead twin)"
+    );
+    assert!(
+        !select_rows_unordered_sorted(&engine)
+            .iter()
+            .any(|row| row.first() == Some(&SqlValue::Int4(60))),
+        "the updated-then-deleted key must not be visible"
+    );
+
+    // v1 exclusion: a second unique i32 index refuses the UPDATE route at prepare.
+    let err = engine.prepare_covered_update_route("t2").unwrap_err();
+    assert!(
+        err.to_string().contains("ONLY unique i32 index")
+            || err.to_string().contains("not covered"),
+        "{err}"
+    );
+
+    // FIRED counters: the device visible-locate ran and tombstones were stamped in place for the
+    // update-olds (a silent fallback would pass every assertion above while abandoning the design).
+    assert!(
+        engine
+            .read_state
+            .residency
+            .device_visible_locate_hits
+            .load(Ordering::Relaxed)
+            > locates_before,
+        "the coalesced device visible-locate never fired for updates"
+    );
+    assert!(
+        engine
+            .read_state
+            .residency
+            .lane_tombstone_applies
+            .load(Ordering::Relaxed)
+            >= tombstones_before + 3,
+        "in-place tombstone stamps never fired for update-olds"
+    );
+}
+
+/// U2 RECOVERY (THE ALLOCATOR HIGH-WATER GATE): a mixed insert/update/delete history — including a
+/// 0-ROW update and CHAINED updates — replays to a row-identical store AND a preserved row-id
+/// allocator high-water. Non-vacuity: the 0-row update's `new_row_id` is claimed + WAL-durable but
+/// installs nothing, so replay MUST advance the allocator by 1 for it too, or the recovered
+/// high-water lands 1 short of the live one — which the `live_hwm == recovered_hwm` assertion below
+/// catches (row-value parity alone does NOT, since every version installs at its EXPLICIT id).
+/// (Deliberately NOT asserting `next_row_id == record.new_row_id` per record: the pump claims the
+/// row-id and seq blocks as SEPARATE lock-free fetch_adds across concurrent lanes, so per-record
+/// positional equality is a FALSE invariant — see the replay arm's note in engine_commit.rs.)
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_lane_update_recovery_replays_row_identical() {
+    let path = test_wal_path("lane-update-recovery");
+    let prior_durability = std::env::var("GPU_DB_WAL_DURABILITY").ok();
+    std::env::set_var("GPU_DB_WAL_DURABILITY", "fua");
+    let mut engine = Engine::with_durable_wal_segment(&path);
+    match &prior_durability {
+        Some(value) => std::env::set_var("GPU_DB_WAL_DURABILITY", value),
+        None => std::env::remove_var("GPU_DB_WAL_DURABILITY"),
+    }
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    let txn_ids = AtomicU64::new(10);
+    engine
+        .execute_dml_concurrent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            "INSERT INTO t VALUES (1000000, 0)",
+        )
+        .unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("t")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let mut warmed = false;
+    for i in 0..10_000_i32 {
+        engine
+            .execute_dml_concurrent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
+            )
+            .unwrap();
+        if engine.table_install_elided("t") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "table never entered elision on a GPU box");
+    if crate::engine_intent_lanes::intent_lane_count() < 2 {
+        return; // lanes-only surface
+    }
+
+    let insert_route = engine.prepare_covered_insert_route("t").unwrap();
+    let mut update_route = engine.prepare_covered_update_route("t").unwrap();
+    for id in 0..100_i32 {
+        assert_eq!(
+            commit_intent_via_submit(&engine, &txn_ids, &insert_route, &[id, id]).unwrap(),
+            1
+        );
+    }
+    // Update the evens below 40 to (id, id + 5000) — one row each. Each update's dead-twin append
+    // versions the shard and can de-elide it (the F3/U4 rebuild-decline cliff), so re-prepare
+    // (re-enter elision) after each update for the NEXT one. The WAL records this writes are
+    // UNCHANGED by the host-side rehydration, so replay parity is unaffected.
+    for id in (0..40_i32).step_by(2) {
+        assert_eq!(
+            commit_update_via_submit(&engine, &txn_ids, &update_route, &[id, id + 5000]).unwrap(),
+            1
+        );
+        update_route = engine.prepare_covered_update_route("t").unwrap();
+    }
+    // 0-ROW update of a missing key: a durable record that installs nothing but BURNS the row id.
+    assert_eq!(
+        commit_update_via_submit(&engine, &txn_ids, &update_route, &[555_555, 1]).unwrap(),
+        0
+    );
+    update_route = engine.prepare_covered_update_route("t").unwrap();
+    // CHAINED update AFTER the 0-row burn (its new_row_id only aligns at replay if the 0-row
+    // update advanced the allocator): key 2 -> (2, 22222).
+    assert_eq!(
+        commit_update_via_submit(&engine, &txn_ids, &update_route, &[2, 22222]).unwrap(),
+        1
+    );
+    update_route = engine.prepare_covered_update_route("t").unwrap();
+    // UPDATE-THEN-DELETE across the crash boundary: update key 10, then delete it.
+    assert_eq!(
+        commit_update_via_submit(&engine, &txn_ids, &update_route, &[10, 99999]).unwrap(),
+        1
+    );
+    let delete_route = engine.prepare_covered_delete_route("t").unwrap();
+    assert_eq!(
+        commit_delete_via_submit(&engine, &txn_ids, &delete_route, 10).unwrap(),
+        1
+    );
+    let before = select_rows_unordered_sorted(&engine);
+    // Capture the LIVE allocator high-water: recovery must reconstruct it exactly (every
+    // row-consuming record — insert row, 1-row update, AND 0-row update — advances by 1).
+    let live_hwm = engine.read_state.mvcc.current_row_id();
+    drop(engine); // crash
+
+    let recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    recovered.set_auto_admit_on_commit(true);
+    recovered.set_host_install_elision_enabled(true);
+    recovered.set_binary_wal_records_enabled(true);
+    recovered.set_device_write_locate_enabled(true);
+    recovered.set_device_write_locate_wave_batch_enabled(true);
+    recovered.set_constrained_elision_enabled(true);
+    let after = select_rows_unordered_sorted(&recovered);
+    assert_eq!(before, after, "replayed store must be row-identical");
+    // THE 0-ROW-ADVANCE GATE (non-vacuous): the recovered high-water must EQUAL the live one. A
+    // dropped 0-row-update advance lands it 1 short, and a post-recovery insert would then reuse a
+    // live id. Row-value parity above cannot see this (explicit-id installs); this can.
+    assert_eq!(
+        recovered.read_state.mvcc.current_row_id(),
+        live_hwm,
+        "recovery must reconstruct the row-id allocator high-water exactly (0-row updates included)"
+    );
+    // The recovered engine still updates through the intent surface (route re-prepare exercises
+    // the elision re-entry arm on a recovered lanes engine).
+    let txn_ids = AtomicU64::new(1_000_000);
+    let update_route = recovered.prepare_covered_update_route("t").unwrap();
+    assert_eq!(
+        commit_update_via_submit(&recovered, &txn_ids, &update_route, &[1, 4321]).unwrap(),
+        1,
+        "post-recovery update locates and rewrites"
+    );
+    assert_eq!(
+        commit_update_via_submit(&recovered, &txn_ids, &update_route, &[555_555, 7]).unwrap(),
+        0,
+        "post-recovery dead key reports zero rows"
+    );
+}
+
+/// F3/U4 (THE VERSION-AWARE-INDEX GATE): many CONSECUTIVE covered updates on distinct keys, with
+/// the update route prepared ONCE and NEVER re-prepared, must all succeed and the table must stay
+/// ELIDED throughout. Before F3/U4 the dead-twin append dropped the pk-index cache, the next
+/// update's locate rebuild declined on the above-boundary twin, the apply rehydrated + de-elided,
+/// and this route DRIFTED (submit returns Err) within a handful of updates. With the dup-tolerant
+/// index the twin is placed at the next probe slot, the visible-locate resolves it, and the index
+/// stays valid — so the route never drifts and pk-index rebuilds stay BOUNDED (geometric load
+/// cadence, not one-per-update). Sabotage: reverting the insert-kernel flip fails this promptly.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_lane_update_sustained_stays_elided() {
+    let path = test_wal_path("lane-update-sustained");
+    let prior_durability = std::env::var("GPU_DB_WAL_DURABILITY").ok();
+    std::env::set_var("GPU_DB_WAL_DURABILITY", "fua");
+    let mut engine = Engine::with_durable_wal_segment(&path);
+    match &prior_durability {
+        Some(value) => std::env::set_var("GPU_DB_WAL_DURABILITY", value),
+        None => std::env::remove_var("GPU_DB_WAL_DURABILITY"),
+    }
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    let txn_ids = AtomicU64::new(10);
+    engine
+        .execute_dml_concurrent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            "INSERT INTO t VALUES (1000000, 0)",
+        )
+        .unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("t")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let mut warmed = false;
+    for i in 0..10_000_i32 {
+        engine
+            .execute_dml_concurrent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
+            )
+            .unwrap();
+        if engine.table_install_elided("t") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "table never entered elision on a GPU box");
+    if crate::engine_intent_lanes::intent_lane_count() < 2 {
+        return; // lanes-only surface
+    }
+
+    let insert_route = engine.prepare_covered_insert_route("t").unwrap();
+    for id in 0..200_i32 {
+        assert_eq!(
+            commit_intent_via_submit(&engine, &txn_ids, &insert_route, &[id, id]).unwrap(),
+            1
+        );
+    }
+    // Prepare the update route ONCE — the whole point is that we NEVER re-prepare it.
+    let update_route = engine.prepare_covered_update_route("t").unwrap();
+    let rebuilds_before = engine.pk_index_rebuilds_diag();
+    // 150 consecutive updates on distinct committed keys, no re-prepare, no reads in between.
+    for id in 0..150_i32 {
+        assert_eq!(
+            commit_update_via_submit(&engine, &txn_ids, &update_route, &[id, id + 100_000])
+                .unwrap(),
+            1,
+            "update {id} must apply on the still-elided device path (route must not drift)"
+        );
+        assert!(
+            engine.table_install_elided("t"),
+            "the dup-tolerant index must keep the table elided across update {id} (no dead-twin \
+             de-elision)"
+        );
+    }
+    // Rebuilds must stay BOUNDED (geometric load cadence), not ~one-per-update.
+    let rebuilds = engine.pk_index_rebuilds_diag() - rebuilds_before;
+    assert!(
+        rebuilds < 30,
+        "pk-index rebuilds must stay bounded under sustained updates, saw {rebuilds}"
+    );
+}

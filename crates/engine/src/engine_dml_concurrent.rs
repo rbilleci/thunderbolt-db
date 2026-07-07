@@ -219,13 +219,17 @@ impl CommitWaveDone {
     }
 }
 
-/// U1: the lane-op kind. INSERT is the E2 flagship; DELETE is the first Tier-1 mutation op —
-/// covered by-PK, target resolved by the coalesced device VISIBLE-LOCATE at wave formation
-/// (0-row deletes complete Ok(0) BEFORE any seq/WAL/row-id claim).
+/// U1/U2: the lane-op kind. INSERT is the E2 flagship; DELETE + UPDATE are the Tier-1 mutation
+/// ops — covered by-PK, target resolved by the coalesced device VISIBLE-LOCATE at APPLY (WAL-first:
+/// the locate moved off the pump critical path). An UPDATE rides the delete's tombstone plus an
+/// insert's append: tombstone-OLD + append-NEW at a fresh `new_row_id` claimed at the pump (a dead
+/// twin sharing the pk), the append CONDITIONAL on the old-version locate (a 0-row update appends
+/// nothing but still burns the claimed row id, keeping replay's allocator in lock-step).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaneOpKind {
     Insert,
     Delete,
+    Update,
 }
 
 /// E2.5b-2 LEAN LANE ITEM: everything the lane pump needs, ~112B + the value
@@ -233,8 +237,9 @@ pub(crate) enum LaneOpKind {
 /// pump's host passes were the measured final wall (~6.5ms/lane cycle of cold
 /// cache traffic at ~925-item waves); this struct is the fix.
 pub(crate) struct LaneIntent {
-    /// U1: which op this intent performs (Insert rides every existing path
-    /// unchanged; Delete adds the visible-locate + tombstone arms).
+    /// U1/U2: which op this intent performs (Insert rides every existing path
+    /// unchanged; Delete adds the visible-locate + tombstone arms; Update adds a
+    /// conditional new-version append on top of the delete's locate + tombstone).
     pub(crate) op: LaneOpKind,
     pub(crate) txn_id: u64,
     pub(crate) slot: crate::write_path::IntUniqueSlotKey,
@@ -255,10 +260,11 @@ pub(crate) struct LaneIntent {
     pub(crate) synchronous: bool,
     /// U1: the rows-affected count a settled Ok reports for INSERT intents (always 1).
     pub(crate) rows_affected: u64,
-    /// U1 WAL-first: a DELETE's rows-affected is resolved at APPLY (the locate moved off the
-    /// pump critical path), so the outcome comes from this shared cell the apply writes (0 or
-    /// 1). `None` for inserts — they use `rows_affected`. Shared with the delete's
-    /// `LaneTombstone.rows_affected`; the settle reads it after the applied cut covers the wave.
+    /// U1/U2 WAL-first: a DELETE's (and UPDATE's) rows-affected is resolved at APPLY (the locate
+    /// moved off the pump critical path), so the outcome comes from this shared cell the apply
+    /// writes (0 or 1). `None` for inserts — they use `rows_affected`. Shared with the delete's
+    /// `LaneTombstone.rows_affected` / the update's `LaneUpdate.rows_affected`; the settle reads it
+    /// after the applied cut covers the wave.
     pub(crate) rows_affected_cell: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
@@ -2681,18 +2687,21 @@ impl Engine {
         };
 
         // row-id block (atomic claim — safe under concurrent lanes) + W5a patches.
-        // U1: ONLY inserts consume row ids — the allocator must stay in exact lock-step with
-        // replay, which advances it per INSERT record row (`rows_consumed`); a delete claiming
-        // an id would skew every later replayed insert's identity.
+        // U1/U2: INSERTS and UPDATES consume row ids — the allocator must stay in exact lock-step
+        // with replay, which advances it per INSERT record row (`rows_consumed`) and per UPDATE
+        // record (the new version, incl. the 0-row case). DELETES consume none. Ids are assigned in
+        // WINNERS ORDER (== seq order), so a single running offset feeds both the insert row-id
+        // patch and the update `new_row_id` patch below, and replay re-derives the identical
+        // assignment record-by-record. A delete claiming an id would skew every later identity.
         let patch_started = Instant::now();
-        let insert_count = winners
+        let row_consuming_count = winners
             .iter()
-            .filter(|item| item.op == LaneOpKind::Insert)
+            .filter(|item| item.op != LaneOpKind::Delete)
             .count() as u64;
-        let row_id_base = if insert_count > 0 {
-            self.read_state.mvcc.claim_row_id_block(insert_count)
+        let row_id_base = if row_consuming_count > 0 {
+            self.read_state.mvcc.claim_row_id_block(row_consuming_count)
         } else {
-            0 // no insert in this wave; never read
+            0 // no insert/update in this wave; never read
         };
         // FUSED patch+envelope pass: the frame payload is assembled in the same
         // loop that patches each record (bytes are cache-warm), replacing the
@@ -2702,13 +2711,17 @@ impl Engine {
         // Per-record end offsets: sub-frame publishing splits the payload on
         // record boundaries (see `intent_lane_subframes`).
         let mut record_ends: Vec<usize> = Vec::with_capacity(winners.len());
-        let mut insert_offset = 0u64;
+        let mut row_alloc_offset = 0u64;
         for item in winners.iter() {
             match item.op {
-                LaneOpKind::Insert => {
+                LaneOpKind::Insert | LaneOpKind::Update => {
+                    // INSERT patches its row id; UPDATE patches its new version's `new_row_id` —
+                    // both at `row_id_offset` (8 LE bytes) in the pre-encoded template, drawing the
+                    // next id from the shared block in winners order (a delete in between draws
+                    // none, so its record slides by unpatched).
                     let off = item.row_id_offset as usize;
-                    let row_id = row_id_base + insert_offset;
-                    insert_offset += 1;
+                    let row_id = row_id_base + row_alloc_offset;
+                    row_alloc_offset += 1;
                     let mut payload: std::sync::Arc<[u8]> =
                         std::sync::Arc::from(&item.template[..]);
                     std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
@@ -2887,15 +2900,19 @@ impl Engine {
             let mut txn_ids = Vec::with_capacity(winners.len());
             let mut row_ids = Vec::with_capacity(winners.len());
             let mut tombstones: Vec<crate::engine_intent_lanes::LaneTombstone> = Vec::new();
+            let mut updates: Vec<crate::engine_intent_lanes::LaneUpdate> = Vec::new();
             let table_name = winners
                 .first()
                 .map(|item| item.table.to_string())
                 .unwrap_or_default();
-            // U1: split the wave — INSERT winners feed the merged append (rows/stamps/
-            // row_ids parallel, insert-dense); DELETE winners feed the tombstone pass.
-            // The request's seq range covers the WHOLE claimed block regardless of mix
-            // (the applied cut must advance over every claimed seq or acks hang).
-            let mut apply_insert_offset = 0u64;
+            // U1/U2: split the wave — INSERT winners feed the merged append (rows/stamps/
+            // row_ids parallel, insert-dense); DELETE winners feed the tombstone pass; UPDATE
+            // winners feed the locate-tombstone-then-conditional-append pass. Inserts and updates
+            // draw contiguous ids from `row_id_base` in winners order via the SAME running offset
+            // the patch loop used, so an update's applied `new_row_id` == its WAL-patched one.
+            // The request's seq range covers the WHOLE claimed block regardless of mix (the applied
+            // cut must advance over every claimed seq or acks hang).
+            let mut row_alloc_offset = 0u64;
             for (offset, item) in winners.iter_mut().enumerate() {
                 let seq = first_seq + offset as u64;
                 match item.op {
@@ -2903,8 +2920,8 @@ impl Engine {
                         rows.push(std::mem::take(&mut item.values));
                         stamps.push(seq);
                         txn_ids.push(item.txn_id);
-                        row_ids.push(row_id_base + apply_insert_offset);
-                        apply_insert_offset += 1;
+                        row_ids.push(row_id_base + row_alloc_offset);
+                        row_alloc_offset += 1;
                     }
                     LaneOpKind::Delete => {
                         // WAL-FIRST: an UNRESOLVED by-key tombstone — the apply locates the
@@ -2922,6 +2939,27 @@ impl Engine {
                             rows_affected: cell,
                         });
                     }
+                    LaneOpKind::Update => {
+                        // WAL-FIRST: an UNRESOLVED by-key update — the apply locates the visible
+                        // old version, tombstones it, and CONDITIONALLY appends the new image at
+                        // this claimed `new_row_id` (only if the old located to one row). The
+                        // new_row_id is the SAME id the patch loop stamped into the WAL record.
+                        let new_row_id = row_id_base + row_alloc_offset;
+                        row_alloc_offset += 1;
+                        let cell = item
+                            .rows_affected_cell
+                            .clone()
+                            .expect("an update intent carries its rows-affected cell");
+                        updates.push(crate::engine_intent_lanes::LaneUpdate {
+                            seq,
+                            filter_idx: item.filter_idx,
+                            pk: item.slot.1,
+                            read_snapshot: item.read_snapshot,
+                            new_row_id,
+                            new_values: std::mem::take(&mut item.values),
+                            rows_affected: cell,
+                        });
+                    }
                 }
             }
             lanes
@@ -2935,6 +2973,7 @@ impl Engine {
                     stamps,
                     txn_ids,
                     tombstones,
+                    updates,
                     seq_first: first_seq,
                     seq_len: k,
                     slot: std::sync::Arc::clone(&apply_slot),
@@ -3348,9 +3387,10 @@ impl Engine {
                 );
                 continue;
             }
-            // U1: DELETE items resolve via `lane_locate_deletes` (visible-locate); the
-            // insert-dup validate has nothing to check for them.
-            if item.op == LaneOpKind::Delete {
+            // U1/U2: DELETE and UPDATE items resolve via the apply-time visible-locate; the
+            // insert-dup validate has nothing to check for them (their pk is EXPECTED to exist —
+            // a dup verdict would wrongly reject the very row they mutate).
+            if item.op != LaneOpKind::Insert {
                 continue;
             }
             let key = (&*item.table, item.filter_idx);
@@ -3469,6 +3509,7 @@ impl Engine {
             let mut row_ids: Vec<u64> = Vec::with_capacity(total);
             let mut stamps: Vec<Index> = Vec::with_capacity(total);
             let mut tombstones: Vec<crate::engine_intent_lanes::LaneTombstone> = Vec::new();
+            let mut updates: Vec<crate::engine_intent_lanes::LaneUpdate> = Vec::new();
             for &i in &requests {
                 // MOVE the row vectors (pointer moves) — the leader was cloning
                 // every merged row's SqlValues, ~1900 heap allocs per wave.
@@ -3476,6 +3517,7 @@ impl Engine {
                 row_ids.extend_from_slice(&batch[i].row_ids);
                 stamps.extend_from_slice(&batch[i].stamps);
                 tombstones.append(&mut batch[i].tombstones);
+                updates.append(&mut batch[i].updates);
             }
             // WAL-FIRST APPLY ORDER: APPEND inserts FIRST (device-visible + indexed), THEN
             // LOCATE + tombstone deletes. The locate runs at each delete's read_snapshot, and its
@@ -3511,18 +3553,24 @@ impl Engine {
             // resolves rows-affected BY KEY.
             let deletes_ok = tombstones.is_empty()
                 || (appended && self.apply_lane_tombstones_device(table, &tombstones));
-            if appended && deletes_ok {
+            // U2 WAL-FIRST: LOCATE the update-olds, tombstone them, and CONDITIONALLY append the
+            // new versions (only the 1-row updates append). Sets each update's rows-affected cell
+            // (0 or 1). Runs only if the insert append succeeded (a failed append rehydrates the
+            // whole batch anyway); a decline routes to the rehydrate fallback (by-key resolution).
+            let updates_ok = updates.is_empty()
+                || (appended && self.apply_lane_updates_device(table, &updates));
+            if appended && deletes_ok && updates_ok {
                 continue;
             }
-            // AUDIT F1 (U1, MEDIUM adopted): a delete decline on a NON-elided table has no
-            // recovery arm below — falling through would advance the cut and ack for a delete
+            // AUDIT F1 (U1, MEDIUM adopted): a delete/update decline on a NON-elided table has no
+            // recovery arm below — falling through would advance the cut and ack for a mutation
             // that never applied (silent live/durable divergence until restart). Fail LOUDLY:
             // the panic rides the apply leader's catch_unwind (F2), failing the waiters and
             // poisoning the lanes; recovery replays the durable W5b records.
-            if !deletes_ok && !self.table_install_elided(table) {
+            if (!deletes_ok || !updates_ok) && !self.table_install_elided(table) {
                 panic!(
-                    "commit-path invariant violation: lane deletes declined on the \
-                     non-elided table \"{table}\" — refusing to ack an unapplied delete"
+                    "commit-path invariant violation: lane deletes/updates declined on the \
+                     non-elided table \"{table}\" — refusing to ack an unapplied mutation"
                 );
             }
             // Fallback (rare on the lanes path — intents gate on elided,
@@ -3538,6 +3586,7 @@ impl Engine {
                     .copied()
                     .into_iter()
                     .chain(tombstones.first().map(|t| t.seq))
+                    .chain(updates.first().map(|u| u.seq))
                     .min()
                     .unwrap_or_default();
                 let last_seq = stamps
@@ -3545,17 +3594,19 @@ impl Engine {
                     .copied()
                     .into_iter()
                     .chain(tombstones.last().map(|t| t.seq))
+                    .chain(updates.last().map(|u| u.seq))
                     .max()
                     .unwrap_or_default();
-                let upserts: BTreeMap<u64, Vec<SqlValue>> =
+                let gather_snapshot = first_seq.saturating_sub(1);
+                let mut upserts: BTreeMap<u64, Vec<SqlValue>> =
                     row_ids.iter().copied().zip(rows.iter().cloned()).collect();
                 let catalog_table = self
                     .relational_catalog_table(table)
                     .expect("an elided table is in the catalog");
-                let (removals, matched_keys) = self
+                let (mut removals, matched_keys) = self
                     .resolve_elided_row_ids_by_int4_key(
                         &catalog_table,
-                        first_seq.saturating_sub(1),
+                        gather_snapshot,
                         &tombstones
                             .iter()
                             .map(|t| (t.filter_idx as usize, t.pk))
@@ -3576,9 +3627,40 @@ impl Engine {
                         std::sync::atomic::Ordering::Release,
                     );
                 }
+                // U2 WAL-FIRST fallback: resolve the update-olds BY KEY too. A matched old =
+                // remove it (its resolved row id joins `removals`) + upsert the new version at its
+                // claimed `new_row_id` (the CONDITIONAL append, done here by hand); an unmatched
+                // (0-row) update removes nothing and appends nothing. Rows-affected = matched.
+                if !updates.is_empty() {
+                    let (update_removals, update_matched) = self
+                        .resolve_elided_row_ids_by_int4_key(
+                            &catalog_table,
+                            gather_snapshot,
+                            &updates
+                                .iter()
+                                .map(|u| (u.filter_idx as usize, u.pk))
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "commit-path invariant violation: update key resolution for \
+                                 the merged lane fallback on {table} failed: {err}"
+                            )
+                        });
+                    removals.extend(update_removals);
+                    for update in &updates {
+                        let matched = update_matched.contains(&update.pk);
+                        if matched {
+                            upserts.insert(update.new_row_id, update.new_values.clone());
+                        }
+                        update
+                            .rows_affected
+                            .store(u64::from(matched), std::sync::atomic::Ordering::Release);
+                    }
+                }
                 self.rehydrate_elided_table(
                     &catalog_table,
-                    first_seq.saturating_sub(1),
+                    gather_snapshot,
                     &upserts,
                     &removals,
                     last_seq,
@@ -3684,6 +3766,126 @@ impl Engine {
         // FULL success — publish rows-affected (deletes ack from these cells) + counters.
         for (tombstone, count) in tombstones.iter().zip(counts.iter()) {
             tombstone
+                .rows_affected
+                .store(*count, std::sync::atomic::Ordering::Release);
+        }
+        if stamped_rows > 0 {
+            self.add_tombstone_churn(table, stamped_rows);
+            self.read_state
+                .residency
+                .lane_tombstone_applies
+                .fetch_add(stamped_rows, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// U2 WAL-FIRST: LOCATE the update-olds, tombstone them, and CONDITIONALLY append the new
+    /// versions on the DEVICE, at apply time (off the pump critical path). ONE visible-locate over
+    /// all keys at their read snapshots resolves each to zero or one visible row. A 1-row update
+    /// tombstones the located old (scatter, grouped by shard with the cell-liveness recheck, EXACTLY
+    /// the delete pass) AND appends its new image at the claimed `new_row_id` — a dead twin sharing
+    /// the pk, so the append's index CAS collides with the still-indexed old and DROPS the pk-index
+    /// cache (the next locate rebuilds it visibility-aware, skipping dead-below-GC twins; this is the
+    /// F3/U4 dead-twin cost). A 0-row update appends NOTHING (the CONDITIONAL append) but its
+    /// `new_row_id` was already claimed + WAL-durable, so replay stays in allocator lock-step. Every
+    /// update's rows-affected cell is set only on FULL success. Returns `false` on ANY decline
+    /// (declined locate, ambiguous multiplicity, stale cell, stamp/append failure) WITHOUT setting
+    /// cells — the caller's rehydrate fallback then resolves by key. Runs under the apply leader lock.
+    fn apply_lane_updates_device(
+        &self,
+        table: &str,
+        updates: &[crate::engine_intent_lanes::LaneUpdate],
+    ) -> bool {
+        use std::collections::BTreeMap;
+        if updates.is_empty() {
+            return true;
+        }
+        // Covered-update shape: one unique pk column, so a single (table, filter) group.
+        let filter_idx = updates[0].filter_idx;
+        if updates.iter().any(|u| u.filter_idx != filter_idx) {
+            return false; // mixed filters -> fallback (not reachable on the covered shape)
+        }
+        let catalog = self.catalog_snapshot();
+        let Some(rel) = catalog.relational_catalog.get(table) else {
+            return false;
+        };
+        let needles: Vec<i32> = updates.iter().map(|u| u.pk).collect();
+        let snapshots: Vec<u64> = updates.iter().map(|u| u.read_snapshot).collect();
+        let Some(locate) =
+            self.wave_batch_visible_locate(rel, filter_idx as usize, &needles, &snapshots)
+        else {
+            return false; // device decline -> rehydrate fallback resolves by key
+        };
+        // Resolve each update to 0 or 1 rows; collect the 1-row olds grouped by (shard, region) for
+        // the batched tombstone scatter (identical to the delete pass) AND, in the SAME order, the
+        // 1-row updates' new-version append inputs (new image, birth seq = its own seq, new row id).
+        type TombstoneGroup = (
+            std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>,
+            Vec<(u32, Index)>,
+        );
+        let mut counts: Vec<u64> = Vec::with_capacity(updates.len());
+        let mut groups: BTreeMap<(u32, u64), TombstoneGroup> = BTreeMap::new();
+        let mut append_rows: Vec<Vec<SqlValue>> = Vec::new();
+        let mut append_stamps: Vec<Index> = Vec::new();
+        let mut append_row_ids: Vec<u64> = Vec::new();
+        for (i, update) in updates.iter().enumerate() {
+            match locate.counts.get(i).copied() {
+                Some(0) => counts.push(0),
+                Some(1) => {
+                    // AUDIT (finding 3, delete-parity): index the parallel output vectors
+                    // defensively — a short slot/shard vector from the device declines, never panics.
+                    let (Some(&shard_id), Some(&slot)) =
+                        (locate.shard_ids.get(i), locate.slots.get(i))
+                    else {
+                        return false;
+                    };
+                    let Some((_, region)) = locate.probed.iter().find(|(id, _)| *id == shard_id)
+                    else {
+                        return false;
+                    };
+                    groups
+                        .entry((shard_id, region.device_ptr()))
+                        .or_insert_with(|| (std::sync::Arc::clone(region), Vec::new()))
+                        .1
+                        .push((slot, update.seq));
+                    append_rows.push(update.new_values.clone());
+                    append_stamps.push(update.seq);
+                    append_row_ids.push(update.new_row_id);
+                    counts.push(1);
+                }
+                _ => return false, // ambiguous multiplicity / missing -> fallback
+            }
+        }
+        // TOMBSTONE every 1-row old FIRST (fresh-from-locate regions, before any append can
+        // roll the open shard), cell-liveness recheck gating each shard group — the delete pass.
+        let mut stamped_rows = 0u64;
+        for ((shard_id, _ptr), (region, slots)) in &groups {
+            if !self.shard_write_locate_cell_live(table, *shard_id, region) {
+                return false;
+            }
+            if !self.tombstone_resident_shard_slots_stamped(table, *shard_id, slots) {
+                return false;
+            }
+            stamped_rows += slots.len() as u64;
+        }
+        // CONDITIONAL new-version append: only the 1-row updates append (0-row updates appended
+        // nothing above). The new versions carry created_by = their own seq, so no reader below
+        // the (not-yet-advanced) cut sees them; a decline here leaves the olds tombstoned but the
+        // news unappended — the rehydrate fallback rebuilds the table correctly (gather sees the
+        // old live at first_seq-1, delta removes it + upserts the new version).
+        if !append_rows.is_empty()
+            && !self.try_append_resident_int4_open_shard(
+                table,
+                &append_rows,
+                crate::engine_residency::AppendCreatedBy::InsertPerRow(&append_stamps),
+                Some(&append_row_ids),
+            )
+        {
+            return false; // append decline (rollover / null / not-int4-resident) -> fallback
+        }
+        // FULL success — publish rows-affected (updates ack from these cells) + churn counters.
+        for (update, count) in updates.iter().zip(counts.iter()) {
+            update
                 .rows_affected
                 .store(*count, std::sync::atomic::Ordering::Release);
         }

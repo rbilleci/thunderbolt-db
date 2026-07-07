@@ -282,6 +282,10 @@ pub(crate) struct ApplyRequest {
     /// U1 WAL-first: DELETE winners as UNRESOLVED by-key tombstones — the apply LOCATES them
     /// (device visible-locate at the delete's read snapshot), off the pump's critical path.
     pub(crate) tombstones: Vec<LaneTombstone>,
+    /// U2 WAL-first: UPDATE winners as UNRESOLVED by-key locate-then-tombstone-then-append ops —
+    /// the apply LOCATES the visible old version, tombstones it, and CONDITIONALLY appends the new
+    /// version (only if the old located to one row), off the pump's critical path.
+    pub(crate) updates: Vec<LaneUpdate>,
     /// The wave's WHOLE claimed seq block `[seq_first, seq_first + seq_len)` — the applied-cut
     /// advance covers every claimed seq regardless of the insert/delete mix (U1: `stamps` is
     /// insert-only and can no longer stand in for the block).
@@ -305,6 +309,31 @@ pub(crate) struct LaneTombstone {
     pub(crate) read_snapshot: u64,
     /// The shared cell the apply writes the resolved rows-affected (0 or 1) into; the settle
     /// reads it to ack. Shared with the delete's `LaneIntent.rows_affected_cell`.
+    pub(crate) rows_affected: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// U2 WAL-first: an UNRESOLVED by-key UPDATE — the apply locates the visible old version itself
+/// (device visible-locate at `read_snapshot`), tombstones it, and CONDITIONALLY appends the new
+/// version at `new_row_id` (only when the locate found exactly one visible row). The record is
+/// already by-key durable (W5b: pk + `new_row_id` + new image), so `seq` and `new_row_id` are
+/// claimed and fenced before this resolves; a 0-row outcome is a durable no-op that appends
+/// nothing — but the `new_row_id` is still consumed, keeping replay's allocator in lock-step.
+pub(crate) struct LaneUpdate {
+    /// The commit seq — the `deleted_by` stamp on the located old version AND the `created_by`
+    /// stamp on the appended new version.
+    pub(crate) seq: u64,
+    /// The pk column's catalog position (the locate filter index).
+    pub(crate) filter_idx: u32,
+    /// The pk value (the locate needle; unchanged by a covered update).
+    pub(crate) pk: i32,
+    /// The update's read snapshot — the visibility the apply-time locate evaluates at.
+    pub(crate) read_snapshot: u64,
+    /// The new version's reserved row id (claimed live at the pump before the apply-time locate).
+    pub(crate) new_row_id: u64,
+    /// The new row image (all columns, catalog order) — appended iff the old located to one row.
+    pub(crate) new_values: Vec<crate::SqlValue>,
+    /// The shared cell the apply writes the resolved rows-affected (0 or 1) into; the settle reads
+    /// it to ack. Shared with the update's `LaneIntent.rows_affected_cell`.
     pub(crate) rows_affected: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 

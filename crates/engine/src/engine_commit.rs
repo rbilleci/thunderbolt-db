@@ -502,11 +502,21 @@ impl Engine {
                 }
             }
             AppliedRowMutation::Update {
-                new_rows, row_ids, ..
+                new_rows,
+                row_ids,
+                old_row_ids,
+                ..
             } => {
                 if let Some(ids) = row_ids {
                     for (row_id, row) in ids.iter().zip(new_rows.iter()) {
                         upserts.insert(*row_id, row.clone());
+                    }
+                }
+                // U2: remove the tombstoned OLD versions (the new versions ride fresh ids). Classic
+                // in-place updates set this `None` (reused id -> the upsert above overwrites).
+                if let Some(olds) = old_row_ids {
+                    for old in olds {
+                        removals.insert(*old);
                     }
                 }
             }
@@ -991,16 +1001,104 @@ impl Engine {
                 }));
             }
             crate::wal_binary::BinaryWalRecord::UpdateByKey(record) => {
-                // U2 CHECKPOINT STUB: the WAL layer (OP_UPDATE_BY_KEY encode/decode) is in place,
-                // but the pump does not yet EMIT update records, so this replay arm is unreachable
-                // today. The real arm (re-resolve by key → tombstone old + install the new image
-                // at `new_row_id`, with allocator lock-step incl. the 0-row case) is the next U2
-                // step. Fail LOUDLY if a record ever reaches here before it is implemented.
-                return Err(EngineError::Durability(format!(
-                    "U2 not yet implemented: W5b UPDATE record for \"{}\" ({} = {}) has no replay \
-                     arm — the pump must not emit these until the arm lands",
-                    record.table, record.pk_column, record.pk_value
-                )));
+                // U2 (W5b) replay — allocator lock-step, BYTE-IDENTICAL to the live lane apply
+                // (tombstone-OLD + append-NEW at the pump-claimed `new_row_id`, a dead twin sharing
+                // the pk). Re-resolve the key against the replayed state (deterministic: all ops on
+                // a key are lane-serialized in this same seq order). A 1-row update tombstones the
+                // visible old + installs the new image at the EXPLICIT `new_row_id`; a 0-row update
+                // installs nothing BUT still consumes the row id — the live pump claimed it BEFORE
+                // the apply-time locate found 0, so replay MUST advance the allocator by 1 in BOTH
+                // branches or every later record's identity collides.
+                let table = cat
+                    .relational_catalog
+                    .get(&record.table)
+                    .ok_or_else(|| {
+                        EngineError::Durability(format!(
+                            "binary WAL update record targets unknown relation \"{}\"",
+                            record.table
+                        ))
+                    })?
+                    .clone();
+                let new_values = decode_relational_row(&record.new_row_encoded, &table.columns)
+                    .map_err(|err| {
+                        EngineError::Durability(format!(
+                            "binary WAL update record image decode failed for \"{}\": {err}",
+                            record.table
+                        ))
+                    })?;
+                // NOTE (audit CRITICAL): do NOT assert `current_row_id() == new_row_id`. The pump
+                // claims the row-id block (`claim_row_id_block`) and the seq block
+                // (`seq_oracle.fetch_add`) as SEPARATE lock-free fetch_adds with no lock spanning
+                // them, and lanes pump CONCURRENTLY — so global row-id order is NOT global seq
+                // order (a lower-seq wave can hold a higher row-id base). Replay walks records in
+                // seq order, so the allocator position need not equal a given record's claimed id.
+                // Correctness does NOT need it to: like the INSERT replay arm, we install at the
+                // EXPLICIT `new_row_id` (globally unique from the live fetch_add — no collision) and
+                // advance the allocator by exactly 1 (both branches), so the final high-water =
+                // base + (row-consuming records) regardless of order. An assert here would
+                // manufacture a spurious, unrecoverable `Durability` failure under ordinary
+                // concurrent update/insert traffic.
+                // Tombstone the visible old version by key (the delete arm's re-resolve, verbatim).
+                let delete = Delete {
+                    table: record.table.clone(),
+                    filter: None,
+                    filters: vec![gpu_db_sql::SelectFilter {
+                        column: record.pk_column.clone(),
+                        op: gpu_db_sql::SelectFilterOp::Eq,
+                        value: SqlValue::Int4(record.pk_value),
+                    }],
+                    filter_groups: Vec::new(),
+                };
+                // Capture the old version's row-id(s) from the delete's write-set (same parse as
+                // `elided_commit_delta::Delete`) so an elided-rehydrate fallback REMOVES the old —
+                // the new version lands at a FRESH `new_row_id`, so without this the rehydrate
+                // would leave two live rows sharing the pk (audit MEDIUM).
+                let (old_rows, old_row_ids) = match self.apply_delete(cat, delete, entry.index)? {
+                    Some((_, rows, del_write_set)) => {
+                        let prefix = relational_key_prefix(&record.table);
+                        let ids: Vec<u64> = del_write_set
+                            .rows
+                            .iter()
+                            .filter_map(|r| {
+                                crate::engine_residency::parse_relational_row_id(&r.row_key, &prefix)
+                            })
+                            .collect();
+                        (rows, ids)
+                    }
+                    None => (Vec::new(), Vec::new()),
+                };
+                if old_rows.is_empty() {
+                    // 0-row update: a durable no-op that still burned the claimed `new_row_id`.
+                    // Advance the allocator by 1 to keep replay in lock-step with the live pump.
+                    self.read_state.mvcc.advance_row_id(1);
+                    return Ok(None);
+                }
+                // 1-row update: install the new version at the EXPLICIT `new_row_id` (byte-identical
+                // to live); the Insert delta advances the allocator by `rows_consumed = 1`.
+                let row_key = relational_row_key(&record.table, record.new_row_id);
+                let mut write_set = WriteSet::default();
+                write_set.add_unique_slots(&table, &new_values);
+                let delta = WriteDelta {
+                    write_set: write_set.clone(),
+                    rows_consumed: 1,
+                    mutation: PreparedMutation::Insert {
+                        table: record.table.clone(),
+                        inserted_rows: vec![(row_key, new_values.clone())],
+                        value_index_entries: BTreeMap::new(),
+                        seq_advances: BTreeMap::new(),
+                    },
+                };
+                self.apply_delta(delta, entry.index, None)?;
+                return Ok(Some(AppliedRowMutation::Update {
+                    table: record.table,
+                    old_rows,
+                    new_rows: vec![new_values],
+                    row_ids: Some(vec![record.new_row_id]),
+                    // U2: the new version rides a FRESH id -> the elided-rehydrate must remove the
+                    // tombstoned old (which apply_delete no-op'd on an elided table) explicitly.
+                    old_row_ids: Some(old_row_ids),
+                    write_set,
+                }));
             }
         };
         let table = cat
@@ -1293,6 +1391,9 @@ impl Engine {
                         old_rows,
                         new_rows,
                         row_ids,
+                        // Classic in-place update REUSES the old row-id for the new version, so the
+                        // elided-rehydrate upsert overwrites it — no separate removal needed.
+                        old_row_ids: None,
                         write_set,
                     },
                 );

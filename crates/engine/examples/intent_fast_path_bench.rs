@@ -36,6 +36,8 @@ struct WriterSample {
     completions_millis: Vec<u64>,
     /// U1 mixed workload: covered DELETEs this writer completed (0 for insert-only / non-driver).
     deletes: u64,
+    /// U2 mixed workload: covered UPDATEs this writer completed (0 for insert-only / non-driver).
+    updates: u64,
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -160,6 +162,19 @@ fn run_arm(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
         .clamp(0, 49);
+    // U2 MIXED I/U WORKLOAD (Driver arm only, bench-only knob): GPU_DB_BENCH_MIX_UPDATE=P makes
+    // ~P% of the driver's ops covered full-row UPDATEs of an OLDER committed live key (a trailing
+    // cursor, every update a guaranteed 1-row hit). This measures the update cost + the F3/U4
+    // DEAD-TWIN churn: an update versions the shard and, under the in-flight window's active
+    // readers, its dead twin sits above the GC boundary → the pk-index rebuild declines → the
+    // locate declines → rehydrate → DE-ELIDE. So each writer re-prepares its update route on drift
+    // (the elision RE-ENTRY arm); the reported throughput is dominated by that rehydrate churn
+    // until the kernel index-entry-replacement fix (F3/U4) lands. 0 (default) = insert-only.
+    let mix_update: i64 = std::env::var("GPU_DB_BENCH_MIX_UPDATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+        .clamp(0, 49);
     let segment = wal_dir.join(format!("intent-{name}-c{writers}.wal"));
     remove_segment_files(&segment);
     let engine = build_engine(&segment)?;
@@ -226,24 +241,42 @@ fn run_arm(
                     // full of in-flight tickets, pump the wave, reap completions, record per-client
                     // end-to-end latency (submit -> durable+published poll), and refill.
                     // U1: the third tuple field is the op kind (true = DELETE) for the mix report.
-                    let mut inflight: Vec<Option<(gpu_db_engine::IntentTicket, Instant, bool)>> =
+                    // U1/U2: op code per in-flight slot — 0 = insert, 1 = delete, 2 = update.
+                    let mut inflight: Vec<Option<(gpu_db_engine::IntentTicket, Instant, u8)>> =
                         (0..window).map(|_| None).collect();
-                    // U1 mixed workload: `d` (delete cursor) trails `i` (insert cursor) with a
-                    // settle lag so its target is always a fully-committed live key.
+                    // U1/U2 mixed workload: `d`/`u` (delete/update cursors) trail `i` (insert
+                    // cursor) with a settle lag so their target is always a fully-committed live key.
                     let mut d = 0_i64;
+                    let mut u = 0_i64;
                     const DELETE_LAG: i64 = 4096;
                     let mut deletes = 0_u64;
+                    let mut updates = 0_u64;
+                    // U2: this writer's OWN update route (re-prepared on drift — see mix_update).
+                    let mut update_route = if mix_update > 0 {
+                        Some(
+                            engine
+                                .prepare_covered_update_route("t")
+                                .map_err(|e| format!("driver {w} update route: {e}"))?,
+                        )
+                    } else {
+                        None
+                    };
                     while !stop.load(Ordering::Relaxed) {
                         for slot in inflight.iter_mut() {
                             if slot.is_none() {
                                 let txn_id = txn_ids.fetch_add(1, Ordering::Relaxed);
-                                // Delete an older live key iff the mix quota is under target AND a
-                                // lagged committed target exists; else insert a fresh key.
+                                // Delete OR update an older live key iff its mix quota is under
+                                // target AND a lagged committed target exists; else insert a fresh
+                                // key. Delete takes priority when both quotas want a slot.
                                 let want_delete = mix_delete > 0
                                     && d + DELETE_LAG < i
                                     && d * 100 < mix_delete * (i + d);
+                                let want_update = !want_delete
+                                    && mix_update > 0
+                                    && u + DELETE_LAG < i
+                                    && u * 100 < mix_update * (i + u);
                                 let submitted = Instant::now();
-                                let (ticket, is_delete) = if want_delete {
+                                let (ticket, op) = if want_delete {
                                     let key = (w as i64 * stride + d) as i32;
                                     d += 1;
                                     let route = delete_route
@@ -255,9 +288,41 @@ fn run_arm(
                                         key,
                                         commit_mode,
                                     ) {
-                                        Ok(t) => (t, true),
+                                        Ok(t) => (t, 1u8),
                                         Err(err) => {
                                             return Err(format!("driver {w} delete submit: {err}"))
+                                        }
+                                    }
+                                } else if want_update {
+                                    let key = (w as i64 * stride + u) as i32;
+                                    // Full-row replace (key, key+1). On DRIFT (the dead-twin
+                                    // de-elision cliff) re-prepare the route (elision re-entry) and
+                                    // SKIP this slot — the next iteration retries with the fresh
+                                    // route. `u` advances only on a submitted update, so no target
+                                    // is skipped. The borrow is scoped so the reassign is legal.
+                                    let result = {
+                                        let route = update_route
+                                            .as_ref()
+                                            .expect("update route present when mix_update > 0");
+                                        engine.submit_covered_update_intent_with_commit(
+                                            txn_id,
+                                            route,
+                                            &[key, key.wrapping_add(1)],
+                                            commit_mode,
+                                        )
+                                    };
+                                    match result {
+                                        Ok(t) => {
+                                            u += 1;
+                                            (t, 2u8)
+                                        }
+                                        Err(_) => {
+                                            if let Ok(fresh) =
+                                                engine.prepare_covered_update_route("t")
+                                            {
+                                                update_route = Some(fresh);
+                                            }
+                                            continue;
                                         }
                                     }
                                 } else {
@@ -269,13 +334,13 @@ fn run_arm(
                                         &[id, 1],
                                         commit_mode,
                                     ) {
-                                        Ok(t) => (t, false),
+                                        Ok(t) => (t, 0u8),
                                         Err(err) => {
                                             return Err(format!("driver {w} submit: {err}"))
                                         }
                                     }
                                 };
-                                *slot = Some((ticket, submitted, is_delete));
+                                *slot = Some((ticket, submitted, op));
                             }
                         }
                         // With dedicated pumps the drivers ONLY submit + poll (the pump threads
@@ -284,13 +349,26 @@ fn run_arm(
                             engine.drive_commit_wave();
                         }
                         for slot in inflight.iter_mut() {
-                            if let Some((ticket, submitted, is_delete)) = slot {
+                            if let Some((ticket, submitted, op)) = slot {
                                 if let Some(result) = engine.poll_intent(ticket) {
                                     let rows =
                                         result.map_err(|err| format!("driver {w}: {err}"))?;
-                                    if *is_delete {
-                                        deletes += 1;
-                                        debug_assert_eq!(rows, 1, "trailing-cursor delete misses");
+                                    match *op {
+                                        1 => {
+                                            deletes += 1;
+                                            debug_assert_eq!(
+                                                rows, 1,
+                                                "trailing-cursor delete misses"
+                                            );
+                                        }
+                                        2 => {
+                                            updates += 1;
+                                            debug_assert_eq!(
+                                                rows, 1,
+                                                "trailing-cursor update misses"
+                                            );
+                                        }
+                                        _ => {}
                                     }
                                     latencies_nanos.push(submitted.elapsed().as_nanos() as u64);
                                     completions_millis
@@ -307,14 +385,16 @@ fn run_arm(
                     while pending > 0 {
                         engine.drive_commit_wave();
                         for slot in inflight.iter_mut() {
-                            if let Some((ticket, submitted, is_delete)) = slot {
+                            if let Some((ticket, submitted, op)) = slot {
                                 if let Some(result) = engine.poll_intent(ticket) {
                                     let rows =
                                         result.map_err(|err| format!("driver {w} drain: {err}"))?;
-                                    if *is_delete {
-                                        deletes += 1;
-                                        let _ = rows;
+                                    match *op {
+                                        1 => deletes += 1,
+                                        2 => updates += 1,
+                                        _ => {}
                                     }
+                                    let _ = rows;
                                     latencies_nanos.push(submitted.elapsed().as_nanos() as u64);
                                     completions_millis
                                         .push(run_started.elapsed().as_millis() as u64);
@@ -328,6 +408,7 @@ fn run_arm(
                         latencies_nanos,
                         completions_millis,
                         deletes,
+                        updates,
                     });
                 }
                 while !stop.load(Ordering::Relaxed) {
@@ -353,6 +434,7 @@ fn run_arm(
                     latencies_nanos,
                     completions_millis,
                     deletes: 0,
+                    updates: 0,
                 })
             })
         })
@@ -478,11 +560,14 @@ fn run_arm(
     // the visible-locate + in-place tombstone counts prove the device arms fired; pk-rebuilds
     // shows the visibility-aware rebuild stays bounded under delete-versioning churn).
     let total_deletes: u64 = samples.iter().map(|s| s.deletes).sum();
-    if total_deletes > 0 {
+    let total_updates: u64 = samples.iter().map(|s| s.updates).sum();
+    if total_deletes > 0 || total_updates > 0 {
         eprintln!(
-            "    [mix I/D: ops {total}  deletes {total_deletes} ({:.1}%)  \
-             visible-locates {}  tombstone-applies {}  pk-rebuilds {}]",
+            "    [mix I/U/D: ops {total}  deletes {total_deletes} ({:.1}%)  \
+             updates {total_updates} ({:.1}%)  visible-locates {}  tombstone-applies {}  \
+             pk-rebuilds {}]",
             total_deletes as f64 * 100.0 / total.max(1) as f64,
+            total_updates as f64 * 100.0 / total.max(1) as f64,
             engine.device_visible_locate_hits(),
             engine.lane_tombstone_applies(),
             engine.pk_index_rebuilds_diag(),

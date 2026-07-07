@@ -11975,6 +11975,16 @@ FOUND:
     st.global.u32 [%rd20], %r17;
 INCCOUNT:
     add.u32 %r9, %r9, 1;
+    // F3/U4: ADVANCE past this match and keep probing THIS shard for MVCC version twins (the
+    // dup-tolerant index now holds an updated key's old + new physical rows in the same shard).
+    // Only an empty slot / 256-cap ends the shard. The caller resolves visibility across the
+    // returned hits exactly as it already does for the cross-shard (old-in-A, new-in-B) case.
+    add.u32 %r14, %r14, 1;
+    and.b32 %r14, %r14, %r11;
+    add.u32 %r15, %r15, 1;
+    setp.ge.u32 %p3, %r15, 256;
+    @%p3 bra NEXTSHARD;
+    bra PROBE;
 NEXTSHARD:
     add.u32 %r10, %r10, 1;
     bra SHARD;
@@ -12139,10 +12149,9 @@ INSLOOP:
     atom.global.cas.b64 %rd27, [%rd12], %rd13, %rd9;
     setp.eq.u64 %p5, %rd27, 0;
     @%p5 bra DONE;
-    shr.u64 %rd14, %rd27, 32;
-    cvt.u32.u64 %r23, %rd14;
-    setp.eq.s32 %p5, %r23, %r16;
-    @%p5 bra DUP;
+    // F3/U4: occupied slot (ANY key, incl. our own = a version twin) -> probe onward, place the
+    // twin at the next empty slot (dup-tolerant visible-locate resolves versions at probe time).
+    // Only a 256-probe overflow declines.
     add.u32 %r21, %r21, 1;
     and.b32 %r21, %r21, %r18;
     add.u32 %r22, %r22, 1;
@@ -12277,11 +12286,11 @@ INSLOOP:
     atom.global.cas.b64 %rd13, [%rd11], %rd12, %rd9;
     setp.eq.u64 %p2, %rd13, 0;
     @%p2 bra DONE;
-    // occupied: is it OUR key? (old >> 32) == key_bits -> DUP
-    shr.u64 %rd14, %rd13, 32;
-    cvt.u32.u64 %r14, %rd14;
-    setp.eq.s32 %p3, %r14, %r9;
-    @%p3 bra DUP;
+    // F3/U4: an occupied slot (ANY key, INCLUDING our own = an MVCC version twin) is a collision
+    // -> probe onward to the next empty slot and place the twin there. The dup-tolerant
+    // visible-locate walks the whole chain and resolves the snapshot-visible version at probe time,
+    // so a key legitimately holds >1 physical slot (old + new) until the old drops below the GC
+    // boundary and a rebuild reclaims it. Only a 256-probe overflow declines (rebuild at grown size).
     add.u32 %r12, %r12, 1;
     and.b32 %r12, %r12, %r1;
     add.u32 %r13, %r13, 1;

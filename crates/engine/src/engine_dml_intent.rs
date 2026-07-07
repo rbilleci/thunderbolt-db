@@ -141,6 +141,35 @@ impl CoveredDeleteRoute {
     }
 }
 
+/// U2: a prepared covered-UPDATE route — the by-PK full-row-replace shape (`UPDATE t SET
+/// <every non-pk col> = $.. WHERE <pk_col> = $pk`, all columns INT4). v1 requires the pk to be
+/// the table's ONLY unique i32 index (same ratified exclusion as the delete route). Obtain via
+/// [`Engine::prepare_covered_update_route`]; invalidated by any DDL. There is NO classic fallback
+/// arm: an eligibility-drifted submit returns a retryable error (honest refusal over a fabricated
+/// count). Unlike the delete route, the WAL record cannot be pre-encoded — the new image is
+/// runtime data — so a submit encodes the full `OP_UPDATE_BY_KEY` record and the pump patches the
+/// claimed `new_row_id` into it.
+#[derive(Debug, Clone)]
+pub struct CoveredUpdateRoute {
+    table: String,
+    table_arc: std::sync::Arc<str>,
+    catalog_seq: Index,
+    /// The pk's packed integer conflict-slot id (shared identity with the classic path).
+    pk_slot_id: u64,
+    /// The pk column's catalog position (the locate filter index).
+    pk_column_index: usize,
+    /// The pk column's name (needed to encode each submit's `OP_UPDATE_BY_KEY` record).
+    pk_column_name: String,
+    /// The table's column count — a submit provides every column positionally (full post-image).
+    column_count: usize,
+}
+
+impl CoveredUpdateRoute {
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+}
+
 impl Engine {
     /// Set the engine-wide DEFAULT commit mode (the pg server-default analog;
     /// per-statement overrides via
@@ -617,6 +646,185 @@ impl Engine {
             // WAL-FIRST: the delete's rows-affected (0 or 1) is resolved at APPLY (the locate
             // moved off the pump critical path); this cell carries it back to the settle. Init 0
             // = "no visible row" (a safe default a never-applied delete would report).
+            rows_affected: 0,
+            rows_affected_cell: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
+        })
+    }
+
+    /// U2: prepare a covered-UPDATE route for `table` — the by-PK full-row-replace twin of
+    /// [`Engine::prepare_covered_delete_route`] (same full eligibility, including the elision
+    /// re-entry arm), narrowed to v1's shape: the pk must be the table's ONLY unique i32 index.
+    /// A covered update supplies the FULL new row (all columns, catalog order, all INT4); the pk
+    /// is unchanged (the located row's key == the supplied pk), so the update replaces the
+    /// non-pk columns of the row with that pk. (A partial SET / pk change is out of v1 scope.)
+    pub fn prepare_covered_update_route(
+        &self,
+        table_name: &str,
+    ) -> Result<CoveredUpdateRoute, ExecuteError> {
+        let insert_route = self.prepare_covered_insert_route(table_name)?;
+        let route_err = |reason: &str| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "table \"{table_name}\" is not covered-UPDATE routable: {reason}"
+            )))
+        };
+        if insert_route.unique_i32_slots.len() != 1 {
+            return Err(route_err(
+                "v1 covers tables whose ONLY unique i32 index is the PK (ratified exclusion)",
+            ));
+        }
+        let (pk_slot_id, pk_column_index) = insert_route.unique_i32_slots[0];
+        let catalog = self.catalog_snapshot();
+        if catalog.commit_seq != insert_route.catalog_seq {
+            return Err(ExecuteError::Serialization(
+                "catalog moved during route preparation; retry".to_string(),
+            ));
+        }
+        let table = catalog
+            .relational_catalog
+            .get(table_name)
+            .ok_or_else(|| route_err("relation vanished during preparation"))?;
+        let pk_column_name = table
+            .columns
+            .get(pk_column_index)
+            .ok_or_else(|| route_err("pk column index out of range"))?
+            .name
+            .clone();
+        Ok(CoveredUpdateRoute {
+            table: insert_route.table,
+            table_arc: insert_route.table_arc,
+            catalog_seq: insert_route.catalog_seq,
+            pk_slot_id,
+            pk_column_index,
+            pk_column_name,
+            column_count: insert_route.column_count,
+        })
+    }
+
+    /// U2: submit a covered UPDATE (full-row replace by pk) with the engine-default commit mode.
+    /// `new_values` is the FULL new row (all columns, catalog order); the located pk is
+    /// `new_values[pk_column_index]`. `Ok(0)` and `Ok(1)` are both successful outcomes.
+    pub fn submit_covered_update_intent(
+        &self,
+        txn_id: u64,
+        route: &CoveredUpdateRoute,
+        new_values: &[i32],
+    ) -> Result<IntentTicket, ExecuteError> {
+        let mode = if self.intent_lanes.as_ref().is_some_and(|lanes| {
+            !lanes
+                .synchronous_commit_default
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }) {
+            SynchronousCommit::Off
+        } else {
+            SynchronousCommit::On
+        };
+        self.submit_covered_update_intent_with_commit(txn_id, route, new_values, mode)
+    }
+
+    /// U2: submit a covered UPDATE with an explicit commit mode. Lanes-mode only: there is no
+    /// classic fallback arm (the classic pipeline reports no rows-affected — a drifted or
+    /// non-lanes submit fails RETRYABLY instead of fabricating a count). Error-outcome acks
+    /// follow the same gates as insert/delete intents.
+    pub fn submit_covered_update_intent_with_commit(
+        &self,
+        txn_id: u64,
+        route: &CoveredUpdateRoute,
+        new_values: &[i32],
+        mode: SynchronousCommit,
+    ) -> Result<IntentTicket, ExecuteError> {
+        if self.repl_role() != Role::Leader {
+            return Err(ExecuteError::Engine(EngineError::NotLeader));
+        }
+        let Some(lanes) = &self.intent_lanes else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "covered-UPDATE intents require intent-lanes mode; use the classic path"
+                    .to_string(),
+            )));
+        };
+        if new_values.len() != route.column_count {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "covered-UPDATE intent expects {} params for table \"{}\", got {}",
+                route.column_count,
+                route.table,
+                new_values.len()
+            ))));
+        }
+        let read_snapshot = self.committed_seq();
+        std::mem::forget(self.register_active_snapshot(read_snapshot));
+        let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
+        match self.build_lane_update_intent(txn_id, route, new_values, read_snapshot) {
+            Some(mut intent) => {
+                intent.synchronous = mode == SynchronousCommit::On;
+                let outcome = std::sync::Arc::clone(&intent.outcome);
+                self.submit_lane_intent(lanes, intent);
+                Ok(IntentTicket {
+                    outcome: Some(outcome),
+                    snapshot_hold,
+                    resolved: None,
+                })
+            }
+            None => {
+                self.deregister_active_snapshot(read_snapshot);
+                Err(ExecuteError::Serialization(
+                    "covered-UPDATE route drifted (DDL since prepare); re-prepare the route"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Build the LEAN lane item for a covered UPDATE: the new post-image (all columns) rides
+    /// `values` (moved into the apply's new-version append), and the `OP_UPDATE_BY_KEY` record is
+    /// encoded here with a PLACEHOLDER `new_row_id` (0) — the pump patches the real claimed id at
+    /// `row_id_offset` (exactly like an INSERT's row id). The tombstone target + new-version
+    /// append are resolved at APPLY by the coalesced device visible-locate.
+    fn build_lane_update_intent(
+        &self,
+        txn_id: u64,
+        route: &CoveredUpdateRoute,
+        new_values: &[i32],
+        read_snapshot: Index,
+    ) -> Option<crate::engine_dml_concurrent::LaneIntent> {
+        let catalog = self.catalog_snapshot();
+        let prepared_catalog_seq = catalog.commit_seq;
+        let table = catalog.relational_catalog.get(&route.table)?;
+        let eligible = prepared_catalog_seq == route.catalog_seq
+            && self.binary_wal_records_enabled()
+            && table.columns.len() == route.column_count
+            && self.insert_unique_wave_batchable(&catalog, table);
+        if !eligible {
+            return None;
+        }
+        let pk = *new_values.get(route.pk_column_index)?;
+        let values: Vec<SqlValue> = new_values.iter().map(|&v| SqlValue::Int4(v)).collect();
+        // PLACEHOLDER new_row_id (0): the pump stamps the id it claims at wave formation into
+        // these 8 bytes at `row_id_offset`. `None` (name-width) declines to the retryable drift.
+        let record =
+            crate::wal_binary::encode_binary_update_by_key(&route.table, &route.pk_column_name, pk, 0, &values)?;
+        let row_id_offset =
+            crate::wal_binary::binary_update_new_row_id_offset(&route.table, &route.pk_column_name)
+                as u32;
+        debug_assert!(
+            (row_id_offset as usize) + 8 <= record.len(),
+            "new_row_id patch window must lie within the encoded update record"
+        );
+        Some(crate::engine_dml_concurrent::LaneIntent {
+            op: crate::engine_dml_concurrent::LaneOpKind::Update,
+            txn_id,
+            slot: (route.pk_slot_id, pk),
+            read_snapshot,
+            prepared_catalog_seq,
+            filter_idx: route.pk_column_index as u32,
+            row_id_offset,
+            table: std::sync::Arc::clone(&route.table_arc),
+            template: std::sync::Arc::from(record.as_slice()),
+            values,
+            outcome: crate::engine_dml_concurrent::new_pending_outcome(),
+            outstanding: None,
+            synchronous: true,
+            // WAL-FIRST: the update's rows-affected (0 or 1) is resolved at APPLY (the locate moved
+            // off the pump critical path); this cell carries it back to the settle. Init 0 = "no
+            // visible row" (a safe default a never-applied update would report).
             rows_affected: 0,
             rows_affected_cell: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
         })

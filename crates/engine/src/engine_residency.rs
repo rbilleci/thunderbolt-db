@@ -4635,6 +4635,69 @@ mod capacity_payload_tests {
         );
     }
 
+    /// F3/U4 (audit CRITICAL 1/2 regression): with the DUP-TOLERANT device index, an UPDATE whose
+    /// old+new versions land in the SAME shard (a recently-inserted-then-updated key) must NOT
+    /// break the single-key device locate. Before the write-locate kernel was made
+    /// advance-past-every-match, it emitted only the FIRST match per shard = the dead OLD twin, so:
+    /// (1) a point read `WHERE pk = k` returned EMPTY for a live updated key, and (2) an INSERT of k
+    /// bypassed uniqueness (saw only the dead twin -> "no dup"). Both must now resolve correctly
+    /// (device ON == host oracle). Sabotage: reverting the write-locate FOUND->advance flip fails
+    /// this (the point read goes empty / the reinsert is wrongly accepted).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn device_locate_same_shard_twin_point_read_and_reinsert() {
+        let run = |device: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(256); // a handful of rows stays in ONE open shard
+            e.set_device_write_locate_enabled(device);
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+                .unwrap();
+            e.execute_text(2, "INSERT INTO t (id, v) VALUES (1,10),(2,20),(3,30)")
+                .unwrap();
+            // UPDATE id=2: the new version appends into the SAME open shard as the old -> a
+            // same-shard twin (old at the lower row-index / earlier probe slot).
+            e.execute_text(3, "UPDATE t SET v = 999 WHERE id = 2").unwrap();
+            // (1) point read of the live updated key.
+            let point = e
+                .execute_relational_select_text("SELECT id, v FROM t WHERE id = 2")
+                .unwrap()
+                .rows
+                .into_boxed();
+            // (2) reinsert the SAME live key -> must be rejected as a duplicate (23505).
+            let reinsert = e
+                .execute_text(4, "INSERT INTO t (id, v) VALUES (2, 7)")
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            let hits = e.device_write_locate_hits();
+            (point, reinsert, hits)
+        };
+        let (on_point, on_reinsert, on_hits) = run(true);
+        let (off_point, off_reinsert, _off_hits) = run(false);
+        assert_eq!(on_point, off_point, "point read device == host oracle");
+        assert_eq!(
+            on_reinsert, off_reinsert,
+            "reinsert outcome device == host oracle"
+        );
+        // The live updated key resolves to its NEW value (not empty).
+        assert_eq!(
+            on_point.len(),
+            1,
+            "point read returns the live updated row (not empty): {on_point:?}"
+        );
+        assert_eq!(
+            on_point[0].get(1),
+            Some(&SqlValue::Int4(999)),
+            "point read sees the UPDATED value"
+        );
+        // Reinsert of a live key is a duplicate-PK violation on both arms.
+        assert!(
+            on_reinsert.is_err(),
+            "reinserting a live key must be rejected as a duplicate: {on_reinsert:?}"
+        );
+        assert!(on_hits > 0, "non-vacuity: the device locate fired");
+    }
+
     /// M1 design B — WAVE-TIME batched validation differential: an elided PK'd table runs the
     /// constraint+DML gauntlet with wave-batch ON (device_write_locate + wave_batch) vs the
     /// host-probe oracle (both off). Every outcome (incl 23505 text) + read must match — the
