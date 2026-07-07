@@ -115,6 +115,32 @@ impl CoveredInsertRoute {
     }
 }
 
+/// U1: a prepared covered-DELETE route — `DELETE FROM t WHERE <pk_col> = $1` on the covered
+/// int4 shape. v1 additionally requires the pk to be the table's ONLY unique i32 index
+/// (partial-coverage rules invite drift bugs — ratified review decision). Obtain via
+/// [`Engine::prepare_covered_delete_route`]; invalidated by any DDL. There is NO classic
+/// fallback arm: an eligibility-drifted submit returns a retryable error (the classic pipeline
+/// carries no rows-affected surface to report through — honest refusal over a fabricated count).
+#[derive(Debug, Clone)]
+pub struct CoveredDeleteRoute {
+    table: String,
+    table_arc: std::sync::Arc<str>,
+    catalog_seq: Index,
+    /// The pk's packed integer conflict-slot id (shared identity with the classic path).
+    pk_slot_id: u64,
+    /// The pk column's catalog position (the locate filter index).
+    pk_column_index: usize,
+    /// The pre-encoded W5b `OP_DELETE_BY_KEY` record MINUS the trailing 4 pk-value bytes —
+    /// a submit appends `pk.to_le_bytes()` and the record is complete (no wave-time patching).
+    record_prefix: Vec<u8>,
+}
+
+impl CoveredDeleteRoute {
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+}
+
 impl Engine {
     /// Set the engine-wide DEFAULT commit mode (the pg server-default analog;
     /// per-statement overrides via
@@ -322,6 +348,7 @@ impl Engine {
                     )
                 })?;
         Some(crate::engine_dml_concurrent::LaneIntent {
+            op: crate::engine_dml_concurrent::LaneOpKind::Insert,
             txn_id,
             slot: (slot_id, params[column_idx]),
             read_snapshot,
@@ -345,14 +372,11 @@ impl Engine {
         route: &CoveredInsertRoute,
         params: &[i32],
     ) -> Result<IntentTicket, ExecuteError> {
-        let mode = if self
-            .intent_lanes
-            .as_ref()
-            .is_some_and(|lanes| {
-                !lanes
-                    .synchronous_commit_default
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            }) {
+        let mode = if self.intent_lanes.as_ref().is_some_and(|lanes| {
+            !lanes
+                .synchronous_commit_default
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }) {
             SynchronousCommit::Off
         } else {
             SynchronousCommit::On
@@ -379,8 +403,7 @@ impl Engine {
             std::mem::forget(self.register_active_snapshot(read_snapshot));
             let snapshot_hold =
                 Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
-            if let Some(mut intent) = self.build_lane_intent(txn_id, route, params, read_snapshot)
-            {
+            if let Some(mut intent) = self.build_lane_intent(txn_id, route, params, read_snapshot) {
                 intent.synchronous = mode == SynchronousCommit::On;
                 let outcome = std::sync::Arc::clone(&intent.outcome);
                 // Single lane-ingress point: `submit_lane_intent` carries the
@@ -440,6 +463,160 @@ impl Engine {
                 })
             }
         }
+    }
+
+    /// U1: prepare a covered-DELETE route for `table` — the by-PK delete twin of
+    /// [`Engine::prepare_covered_insert_route`] (same full eligibility, including the elision
+    /// re-entry arm), narrowed to v1's shape: the pk must be the table's ONLY unique i32 index.
+    pub fn prepare_covered_delete_route(
+        &self,
+        table_name: &str,
+    ) -> Result<CoveredDeleteRoute, ExecuteError> {
+        let insert_route = self.prepare_covered_insert_route(table_name)?;
+        let route_err = |reason: &str| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "table \"{table_name}\" is not covered-DELETE routable: {reason}"
+            )))
+        };
+        if insert_route.unique_i32_slots.len() != 1 {
+            return Err(route_err(
+                "v1 covers tables whose ONLY unique i32 index is the PK (ratified exclusion)",
+            ));
+        }
+        let (pk_slot_id, pk_column_index) = insert_route.unique_i32_slots[0];
+        let catalog = self.catalog_snapshot();
+        if catalog.commit_seq != insert_route.catalog_seq {
+            return Err(ExecuteError::Serialization(
+                "catalog moved during route preparation; retry".to_string(),
+            ));
+        }
+        let table = catalog
+            .relational_catalog
+            .get(table_name)
+            .ok_or_else(|| route_err("relation vanished during preparation"))?;
+        let pk_column_name = table
+            .columns
+            .get(pk_column_index)
+            .ok_or_else(|| route_err("pk column index out of range"))?
+            .name
+            .clone();
+        let full = crate::wal_binary::encode_binary_delete_by_key(table_name, &pk_column_name, 0)
+            .ok_or_else(|| route_err("W5b record encoding declined (name width)"))?;
+        let record_prefix = full[..full.len() - 4].to_vec();
+        Ok(CoveredDeleteRoute {
+            table: insert_route.table,
+            table_arc: insert_route.table_arc,
+            catalog_seq: insert_route.catalog_seq,
+            pk_slot_id,
+            pk_column_index,
+            record_prefix,
+        })
+    }
+
+    /// U1: submit a covered DELETE (`DELETE FROM t WHERE pk = $1`) with the engine-default
+    /// commit mode. `Ok(0)` and `Ok(1)` are both successful outcomes (rows affected).
+    pub fn submit_covered_delete_intent(
+        &self,
+        txn_id: u64,
+        route: &CoveredDeleteRoute,
+        pk: i32,
+    ) -> Result<IntentTicket, ExecuteError> {
+        let mode = if self.intent_lanes.as_ref().is_some_and(|lanes| {
+            !lanes
+                .synchronous_commit_default
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }) {
+            SynchronousCommit::Off
+        } else {
+            SynchronousCommit::On
+        };
+        self.submit_covered_delete_intent_with_commit(txn_id, route, pk, mode)
+    }
+
+    /// U1: submit a covered DELETE with an explicit commit mode. Lanes-mode only: there is no
+    /// classic fallback arm (the classic pipeline reports no rows-affected — a drifted or
+    /// non-lanes submit fails RETRYABLY instead of fabricating a count). Error-outcome acks
+    /// follow the same gates as insert intents.
+    pub fn submit_covered_delete_intent_with_commit(
+        &self,
+        txn_id: u64,
+        route: &CoveredDeleteRoute,
+        pk: i32,
+        mode: SynchronousCommit,
+    ) -> Result<IntentTicket, ExecuteError> {
+        if self.repl_role() != Role::Leader {
+            return Err(ExecuteError::Engine(EngineError::NotLeader));
+        }
+        let Some(lanes) = &self.intent_lanes else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "covered-DELETE intents require intent-lanes mode; use the classic path"
+                    .to_string(),
+            )));
+        };
+        let read_snapshot = self.committed_seq();
+        std::mem::forget(self.register_active_snapshot(read_snapshot));
+        let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
+        match self.build_lane_delete_intent(txn_id, route, pk, read_snapshot) {
+            Some(mut intent) => {
+                intent.synchronous = mode == SynchronousCommit::On;
+                let outcome = std::sync::Arc::clone(&intent.outcome);
+                self.submit_lane_intent(lanes, intent);
+                Ok(IntentTicket {
+                    outcome: Some(outcome),
+                    snapshot_hold,
+                    resolved: None,
+                })
+            }
+            None => {
+                self.deregister_active_snapshot(read_snapshot);
+                Err(ExecuteError::Serialization(
+                    "covered-DELETE route drifted (DDL since prepare); re-prepare the route"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Build the LEAN lane item for a covered DELETE: no values, no row-id reservation — the
+    /// W5b record completes by appending the pk bytes to the route's pre-encoded prefix. The
+    /// tombstone target is resolved at wave formation by the coalesced device visible-locate.
+    fn build_lane_delete_intent(
+        &self,
+        txn_id: u64,
+        route: &CoveredDeleteRoute,
+        pk: i32,
+        read_snapshot: Index,
+    ) -> Option<crate::engine_dml_concurrent::LaneIntent> {
+        let catalog = self.catalog_snapshot();
+        let prepared_catalog_seq = catalog.commit_seq;
+        let table = catalog.relational_catalog.get(&route.table)?;
+        let eligible = prepared_catalog_seq == route.catalog_seq
+            && self.binary_wal_records_enabled()
+            && self.insert_unique_wave_batchable(&catalog, table);
+        if !eligible {
+            return None;
+        }
+        let mut record = Vec::with_capacity(route.record_prefix.len() + 4);
+        record.extend_from_slice(&route.record_prefix);
+        record.extend_from_slice(&pk.to_le_bytes());
+        Some(crate::engine_dml_concurrent::LaneIntent {
+            op: crate::engine_dml_concurrent::LaneOpKind::Delete,
+            txn_id,
+            slot: (route.pk_slot_id, pk),
+            read_snapshot,
+            prepared_catalog_seq,
+            filter_idx: route.pk_column_index as u32,
+            row_id_offset: 0,
+            table: std::sync::Arc::clone(&route.table_arc),
+            template: std::sync::Arc::from(record.as_slice()),
+            values: Vec::new(),
+            outcome: crate::engine_dml_concurrent::new_pending_outcome(),
+            outstanding: None,
+            synchronous: true,
+            // A delete that reaches the wave located exactly one live row (0-row deletes
+            // complete at the pre-claim filter and never carry this value).
+            rows_affected: 1,
+        })
     }
 
     /// E2.2(c) — poll a submitted intent. Returns `None` while in flight, `Some(result)` exactly

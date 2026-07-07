@@ -35,8 +35,7 @@ impl Engine {
         // keep the original byte-identical replay path.
         #[cfg(unix)]
         if !path.exists()
-            && (Self::intent_lane_files_exist(path)
-                || gpu_db_wal::fua_wal_segments_exist(path))
+            && (Self::intent_lane_files_exist(path) || gpu_db_wal::fua_wal_segments_exist(path))
         {
             return Self::open_durable_wal_segment(path);
         }
@@ -252,8 +251,7 @@ impl Engine {
             // ruling): the unfused sequence remains ONLY as the
             // ineligible-shape fallback (i64 sections / no live index /
             // in-pass decline), an eligibility dispatch — not configuration.
-            fused_apply_enabled: std::sync::atomic::AtomicBool::new(true
-            ),
+            fused_apply_enabled: std::sync::atomic::AtomicBool::new(true),
             device_write_locate_wave_batch_enabled: std::sync::atomic::AtomicBool::new(false),
             tombstone_churn_threshold_override: std::sync::atomic::AtomicU64::new(0),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.

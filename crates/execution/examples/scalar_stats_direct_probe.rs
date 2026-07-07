@@ -21,8 +21,14 @@ fn p50(mut v: Vec<u128>) -> u128 {
 }
 
 fn main() {
-    let rows: u64 = std::env::var("ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(8_388_608);
-    let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+    let rows: u64 = std::env::var("ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8_388_608);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
     let n = rows as usize;
 
     let Ok(runtime) = CudaDriverRuntime::probe() else {
@@ -44,8 +50,14 @@ fn main() {
     }
 
     let chunks = vec![
-        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-        CudaDeviceMemoryChunk { byte_offset: off_value, bytes: &value },
+        CudaDeviceMemoryChunk {
+            byte_offset: 0,
+            bytes: &header,
+        },
+        CudaDeviceMemoryChunk {
+            byte_offset: off_value,
+            bytes: &value,
+        },
     ];
     let resident = runtime
         .retain_device_memory_chunks(0, allocated, &chunks)
@@ -54,8 +66,9 @@ fn main() {
     // Distinct-count of the scrambled column (host): the odd-multiplier hash is a bijection on u32, so
     // every row is a distinct value => ~rows distinct.
     let distinct = {
-        let mut s: Vec<i32> =
-            (0..rows).map(|row| (row as u32).wrapping_mul(2_654_435_761) as i32).collect();
+        let mut s: Vec<i32> = (0..rows)
+            .map(|row| (row as u32).wrapping_mul(2_654_435_761) as i32)
+            .collect();
         s.sort_unstable();
         s.dedup();
         s.len()
@@ -63,8 +76,9 @@ fn main() {
 
     // Cross-check the direct kernel against an independent HOST oracle (count, sum, min, max) before
     // timing (byte-identity sanity).
-    let (d_count, d_sum, d_min, d_max) =
-        resident.scalar_stats_i32_from_payload(off_value, rows).expect("direct scalar stats");
+    let (d_count, d_sum, d_min, d_max) = resident
+        .scalar_stats_i32_from_payload(off_value, rows)
+        .expect("direct scalar stats");
     let (h_count, h_sum, h_min, h_max) = {
         let mut sum = 0_i64;
         let mut min = i32::MAX;
@@ -82,7 +96,9 @@ fn main() {
         (h_count, h_sum, h_min, h_max),
         "direct scalar stats must equal the host oracle"
     );
-    println!("# parity OK: count={d_count} sum={d_sum} min={d_min} max={d_max}; distinct={distinct}");
+    println!(
+        "# parity OK: count={d_count} sum={d_sum} min={d_min} max={d_max}; distinct={distinct}"
+    );
 
     let p50_us = |mut f: Box<dyn FnMut()>| -> f64 {
         for _ in 0..3 {
@@ -115,11 +131,15 @@ fn main() {
     println!("  {:<28} {:>10}  {:>12}", "path", "p50 us", "Melem/s");
     println!(
         "  {:<28} {:>9.0}us  {:>12.1}",
-        "direct scalar_stats", direct_us, mps(direct_us)
+        "direct scalar_stats",
+        direct_us,
+        mps(direct_us)
     );
     println!(
         "  {:<28} {:>9.0}us  {:>12.1}  (roofline ref)",
-        "direct sum (audited)", sum_us, mps(sum_us)
+        "direct sum (audited)",
+        sum_us,
+        mps(sum_us)
     );
     println!(
         "\n# direct scalar_stats is {:.0}% of the sum roofline at ~{distinct}-distinct.",

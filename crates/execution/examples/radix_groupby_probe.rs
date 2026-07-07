@@ -53,10 +53,19 @@ fn timed_us(iters: usize, mut run: impl FnMut() -> usize) -> (f64, usize) {
 }
 
 fn main() {
-    let rows: u64 = std::env::var("ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(8_388_608);
-    let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let rows: u64 = std::env::var("ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8_388_608);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
     // Two-level CUDA-event runs (kernel-only timing averages min of `runs` internally).
-    let kruns: u32 = std::env::var("KRUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let kruns: u32 = std::env::var("KRUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
     let n = rows as usize;
     let cards: Vec<u64> = vec![4_096, 65_536, 1 << 18, 1 << 20];
 
@@ -110,14 +119,26 @@ fn main() {
         .collect();
 
     let mut chunks = vec![
-        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-        CudaDeviceMemoryChunk { byte_offset: off_value, bytes: &value },
+        CudaDeviceMemoryChunk {
+            byte_offset: 0,
+            bytes: &header,
+        },
+        CudaDeviceMemoryChunk {
+            byte_offset: off_value,
+            bytes: &value,
+        },
     ];
     for (k, g) in g32_cols.iter().enumerate() {
-        chunks.push(CudaDeviceMemoryChunk { byte_offset: g32(k), bytes: g });
+        chunks.push(CudaDeviceMemoryChunk {
+            byte_offset: g32(k),
+            bytes: g,
+        });
     }
     for (k, g) in g64_cols.iter().enumerate() {
-        chunks.push(CudaDeviceMemoryChunk { byte_offset: g64(k), bytes: g });
+        chunks.push(CudaDeviceMemoryChunk {
+            byte_offset: g64(k),
+            bytes: g,
+        });
     }
     let resident = runtime
         .retain_device_memory_chunks(0, allocated, &chunks)
@@ -137,13 +158,19 @@ fn main() {
     // full-table scan: indices = 0..rows (no WHERE), as the executor passes for an unfiltered GROUP BY.
     let indices: Vec<u32> = (0..rows as u32).collect();
 
-    println!("# radix-partitioned GROUP BY potential probe. rows={rows}, iters={iters}, kruns={kruns}");
-    println!("# 8M i32 value column; group key = hash(row) %% C (high-entropy, exactly C distinct).");
+    println!(
+        "# radix-partitioned GROUP BY potential probe. rows={rows}, iters={iters}, kruns={kruns}"
+    );
+    println!(
+        "# 8M i32 value column; group key = hash(row) %% C (high-entropy, exactly C distinct)."
+    );
     println!("# TWO-LEVEL = gpu_db_group_by_i32_count_sum_twolevel (CUDA-event kernel-only ms) -- the LIVE");
     println!("#   per-group GROUP BY kernel the engine uses. NOTE: this path sizes its GLOBAL hash table to");
     println!("#   row_count*2 (=16M slots) -> it does NOT exhibit a shared-mem-overflow cliff; it is already");
     println!("#   a row-count-sized global hash. (The old `grouped_stats` GLOBAL open-addressing hash-agg");
-    println!("#   A/B arm -- the engine-dead 182-number path -- was removed with that kernel family.)");
+    println!(
+        "#   A/B arm -- the engine-dead 182-number path -- was removed with that kernel family.)"
+    );
     println!("# RADIX PIPELINE = radix-argsort(8M i64 keys) + gather(value by perm) + seg-reduce[PROXY].");
     println!("#   seg-reduce PROXY = scalar_stats 1-pass streaming scan (count+sum+min+max) over 8M i32.");
     println!("#   gather here ROUND-TRIPS the perm host->device + values device->host (~96MB PCIe) so it");
@@ -153,7 +180,15 @@ fn main() {
 
     println!(
         "  {:<10} {:>8} | {:>9} | {:>9} {:>9} {:>9} {:>9} | {:>9} | {:>10}",
-        "card", "groups", "2lvl ms", "radix ms", "  sort", "gather", "reduce", "integ ms", "2lvl/integ",
+        "card",
+        "groups",
+        "2lvl ms",
+        "radix ms",
+        "  sort",
+        "gather",
+        "reduce",
+        "integ ms",
+        "2lvl/integ",
     );
 
     for (k, &c) in cards.iter().enumerate() {
@@ -162,13 +197,26 @@ fn main() {
 
         // ---- TWO-LEVEL kernel (CUDA-event, kernel-only) ----
         let (twolevel_rows, twolevel_ms) = resident
-            .group_by_i32_count_sum_kernel_timed(goff32, off_value, &indices, true, kruns, grouped_agg_mask::ALL)
+            .group_by_i32_count_sum_kernel_timed(
+                goff32,
+                off_value,
+                &indices,
+                true,
+                kruns,
+                grouped_agg_mask::ALL,
+            )
             .expect("two-level kernel");
-        assert_eq!(twolevel_rows.len(), host_groups[k], "two-level group count mismatch @card {c}");
+        assert_eq!(
+            twolevel_rows.len(),
+            host_groups[k],
+            "two-level group count mismatch @card {c}"
+        );
 
         // ---- RADIX PIPELINE ----
         // (1) sort: the proven LSD-radix argsort (order_by_sort_i64 dispatches RADIX at n >= 10k).
-        let (sort_us, _) = timed_us(iters, || resident.order_by_sort_i64(ks, false).unwrap().len());
+        let (sort_us, _) = timed_us(iters, || {
+            resident.order_by_sort_i64(ks, false).unwrap().len()
+        });
         let perm = resident.order_by_sort_i64(ks, false).unwrap();
         assert_eq!(perm.len(), n, "perm length");
         // assert the sort actually grouped the keys: count runs in the sorted-key sequence == #groups.
@@ -181,18 +229,28 @@ fn main() {
                 prev = Some(key);
             }
         }
-        assert_eq!(runs_in_sorted, host_groups[k], "sorted-key run count != #groups @card {c}");
+        assert_eq!(
+            runs_in_sorted, host_groups[k],
+            "sorted-key run count != #groups @card {c}"
+        );
 
         // (2) gather value column by perm (GPU gather; perm uploaded host->device = conservative).
         let perm_u64: Vec<u64> = perm.iter().map(|&p| p as u64).collect();
-        let (gather_us, _) = timed_us(iters, || resident.project_i32_rows_from_payload(off_value, &perm_u64).unwrap().len());
+        let (gather_us, _) = timed_us(iters, || {
+            resident
+                .project_i32_rows_from_payload(off_value, &perm_u64)
+                .unwrap()
+                .len()
+        });
 
         // (3) segmented-reduce PROXY: a coalesced 1-pass count+sum+min+max streaming scan over the value
         // column. Same memory traffic a real reduce-by-key streams; the per-group boundary compares +
         // emit are register-cheap by comparison, so this LOWER-BOUNDs reduce cost (radix total = upper
         // bound on sort+gather + lower bound on reduce; reduce is the small term so the total is tight).
         let (reduce_us, _) = timed_us(iters, || {
-            let (cnt, _s, _mn, _mx) = resident.scalar_stats_i32_from_payload(off_value, rows).unwrap();
+            let (cnt, _s, _mn, _mx) = resident
+                .scalar_stats_i32_from_payload(off_value, rows)
+                .unwrap();
             cnt as usize
         });
 
@@ -217,8 +275,18 @@ fn main() {
 
     // Second sort data point: bitonic over the highest-card key set (a non-radix sort baseline).
     let top = cards.len() - 1;
-    let (bit_us, _) = timed_us(iters.min(5), || resident.bitonic_sort_i64(&keys_i64[top], false).unwrap().len());
-    let (rdx_us, _) = timed_us(iters, || resident.order_by_sort_i64(&keys_i64[top], false).unwrap().len());
+    let (bit_us, _) = timed_us(iters.min(5), || {
+        resident
+            .bitonic_sort_i64(&keys_i64[top], false)
+            .unwrap()
+            .len()
+    });
+    let (rdx_us, _) = timed_us(iters, || {
+        resident
+            .order_by_sort_i64(&keys_i64[top], false)
+            .unwrap()
+            .len()
+    });
     println!(
         "\n# 8M-key sort: radix {:.3} ms ({:.1} Melem/s)  vs  bitonic {:.3} ms ({:.1} Melem/s).",
         rdx_us / 1000.0,
@@ -226,7 +294,9 @@ fn main() {
         bit_us / 1000.0,
         rows as f64 / bit_us,
     );
-    println!("# integ ms = sort + 2x reduce-scan (fused on-device gather+reduce lower bound). The radix");
+    println!(
+        "# integ ms = sort + 2x reduce-scan (fused on-device gather+reduce lower bound). The radix"
+    );
     println!("#   pipeline is SORT-DOMINATED: sort is ~95%+ of integ, gather+reduce are sub-ms on-device.");
     println!("# 2lvl/integ > 1 => radix beats the two-level kernel at that cardinality (vs the integrated");
     println!("#   estimate; the measured 'radix ms' is inflated by host PCIe round-trips).");

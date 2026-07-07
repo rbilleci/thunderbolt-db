@@ -149,15 +149,14 @@ fn main() {
     let cu_stream_create: Symbol<CuStreamCreate> = sym(lib, &[b"cuStreamCreate\0"]);
     let cu_stream_synchronize: Symbol<Fn1Ptr> = sym(lib, &[b"cuStreamSynchronize\0"]);
     let cu_launch_kernel: Symbol<CuLaunchKernel> = sym(lib, &[b"cuLaunchKernel\0"]);
-    let cu_stream_begin_capture: Symbol<CuStreamBeginCapture> =
-        sym(lib, &[b"cuStreamBeginCapture_v2\0", b"cuStreamBeginCapture\0"]);
+    let cu_stream_begin_capture: Symbol<CuStreamBeginCapture> = sym(
+        lib,
+        &[b"cuStreamBeginCapture_v2\0", b"cuStreamBeginCapture\0"],
+    );
     let cu_stream_end_capture: Symbol<CuStreamEndCapture> = sym(lib, &[b"cuStreamEndCapture\0"]);
     let cu_graph_instantiate: Symbol<CuGraphInstantiate> = sym(
         lib,
-        &[
-            b"cuGraphInstantiateWithFlags\0",
-            b"cuGraphInstantiate_v2\0",
-        ],
+        &[b"cuGraphInstantiateWithFlags\0", b"cuGraphInstantiate_v2\0"],
     );
     let cu_graph_launch: Symbol<CuGraphLaunch> = sym(lib, &[b"cuGraphLaunch\0"]);
 
@@ -165,7 +164,10 @@ fn main() {
     let mut dev: i32 = 0;
     check(unsafe { cu_device_get(&mut dev, 0) }, "cuDeviceGet");
     let mut ctx: *mut c_void = std::ptr::null_mut();
-    check(unsafe { cu_ctx_retain(&mut ctx, dev) }, "cuDevicePrimaryCtxRetain");
+    check(
+        unsafe { cu_ctx_retain(&mut ctx, dev) },
+        "cuDevicePrimaryCtxRetain",
+    );
     check(unsafe { cu_ctx_set_current(ctx) }, "cuCtxSetCurrent");
 
     // Resident table: table[i] = i*7 (so a gather result is verifiable).
@@ -173,7 +175,10 @@ fn main() {
     let mask = table_size - 1;
     let table: Vec<i32> = (0..table_size as i32).map(|i| i.wrapping_mul(7)).collect();
     let mut table_dev: u64 = 0;
-    check(unsafe { cu_mem_alloc(&mut table_dev, table_size as usize * 4) }, "cuMemAlloc table");
+    check(
+        unsafe { cu_mem_alloc(&mut table_dev, table_size as usize * 4) },
+        "cuMemAlloc table",
+    );
     check(
         unsafe { cu_memcpy_htod(table_dev, table.as_ptr().cast(), table_size as usize * 4) },
         "HtoD table",
@@ -182,8 +187,14 @@ fn main() {
     let max_batch = 256usize;
     let mut needles_dev: u64 = 0;
     let mut out_dev: u64 = 0;
-    check(unsafe { cu_mem_alloc(&mut needles_dev, max_batch * 4) }, "cuMemAlloc needles");
-    check(unsafe { cu_mem_alloc(&mut out_dev, max_batch * 4) }, "cuMemAlloc out");
+    check(
+        unsafe { cu_mem_alloc(&mut needles_dev, max_batch * 4) },
+        "cuMemAlloc needles",
+    );
+    check(
+        unsafe { cu_mem_alloc(&mut out_dev, max_batch * 4) },
+        "cuMemAlloc out",
+    );
     // Pinned host staging (graph captures memcpy from/to these fixed addresses; we overwrite contents/read).
     let mut needles_host: *mut c_void = std::ptr::null_mut();
     let mut out_host: *mut c_void = std::ptr::null_mut();
@@ -209,7 +220,10 @@ fn main() {
         "cuModuleGetFunction",
     );
     let mut stream: *mut c_void = std::ptr::null_mut();
-    check(unsafe { cu_stream_create(&mut stream, 0) }, "cuStreamCreate");
+    check(
+        unsafe { cu_stream_create(&mut stream, 0) },
+        "cuStreamCreate",
+    );
 
     let needles_host_p = needles_host as *mut i32;
     let out_host_p = out_host as *mut i32;
@@ -226,14 +240,15 @@ fn main() {
             })
             .collect()
     };
-    let read_out = |batch: usize| -> Vec<i32> {
-        (0..batch).map(|k| unsafe { *out_host_p.add(k) }).collect()
-    };
+    let read_out =
+        |batch: usize| -> Vec<i32> { (0..batch).map(|k| unsafe { *out_host_p.add(k) }).collect() };
 
     let iters = 2000usize;
     let warmup = 50usize;
     println!("# R2.2c CUDA-graph vs direct-launch spike (gather op, same shape as lpb point read)");
-    println!("# DIRECT = HtoDAsync + launch + DtoHAsync + sync per batch;  GRAPH = cuGraphLaunch + sync");
+    println!(
+        "# DIRECT = HtoDAsync + launch + DtoHAsync + sync per batch;  GRAPH = cuGraphLaunch + sync"
+    );
     println!("# reference: wave single-flight p50 ~10us @batch1; lpb ~27us @batch1\n");
     println!(
         "  {:>6}  {:>14}  {:>14}  {:>12}  {:>16}",
@@ -267,7 +282,16 @@ fn main() {
                 );
                 check(
                     cu_launch_kernel(
-                        func, blocks, 1, 1, tpb, 1, 1, 0, stream, args.as_mut_ptr(),
+                        func,
+                        blocks,
+                        1,
+                        1,
+                        tpb,
+                        1,
+                        1,
+                        0,
+                        stream,
+                        args.as_mut_ptr(),
                         std::ptr::null_mut(),
                     ),
                     "launch",
@@ -285,7 +309,11 @@ fn main() {
         // correctness for the direct path
         set_needles(batch, 7);
         launch_direct(7);
-        assert_eq!(read_out(batch), expected(batch), "direct gather wrong (batch={batch})");
+        assert_eq!(
+            read_out(batch),
+            expected(batch),
+            "direct gather wrong (batch={batch})"
+        );
 
         let mut direct = Vec::with_capacity(iters);
         for r in 0..iters {
@@ -317,7 +345,16 @@ fn main() {
             );
             check(
                 cu_launch_kernel(
-                    func, blocks, 1, 1, tpb, 1, 1, 0, stream, args.as_mut_ptr(),
+                    func,
+                    blocks,
+                    1,
+                    1,
+                    tpb,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    args.as_mut_ptr(),
                     std::ptr::null_mut(),
                 ),
                 "cap launch",
@@ -341,7 +378,11 @@ fn main() {
         }
         set_needles(batch, 7);
         launch_graph(7);
-        assert_eq!(read_out(batch), expected(batch), "graph gather wrong (batch={batch})");
+        assert_eq!(
+            read_out(batch),
+            expected(batch),
+            "graph gather wrong (batch={batch})"
+        );
 
         let mut graph_t = Vec::with_capacity(iters);
         for r in 0..iters {

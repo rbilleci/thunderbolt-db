@@ -8395,6 +8395,20 @@ impl Engine {
         slots: &[u32],
         commit_seq: Index,
     ) -> bool {
+        let stamped: Vec<(u32, Index)> = slots.iter().map(|&slot| (slot, commit_seq)).collect();
+        self.tombstone_resident_shard_slots_stamped(table, shard_id, &stamped)
+    }
+
+    /// U1: the per-slot-stamp generalization of [`Self::tombstone_resident_shard_slots`] — a
+    /// merged lane apply batch spans commit seqs, so each tombstone carries its OWN stamp
+    /// (exactly like the append path's `InsertPerRow` birth stamps). Same on-demand region
+    /// allocation, same bounds/decline contract.
+    pub(crate) fn tombstone_resident_shard_slots_stamped(
+        &self,
+        table: &str,
+        shard_id: u32,
+        slots: &[(u32, Index)],
+    ) -> bool {
         if slots.is_empty() {
             return true;
         }
@@ -8412,7 +8426,7 @@ impl Engine {
             (shard.capacity, shard.row_count, shard.gpu_id)
         };
         // Bounds: every slot must be a live row of THIS shard (never headroom / out of range).
-        if slots.iter().any(|&slot| (slot as usize) >= row_count) {
+        if slots.iter().any(|&(slot, _)| (slot as usize) >= row_count) {
             return false;
         }
         // SV2: get-or-allocate the shard's ON-DEMAND `deleted_by` region (a separate `capacity`-sized u64
@@ -8463,10 +8477,10 @@ impl Engine {
         };
         let chunks: Vec<CudaOwnedDeviceMemoryChunk> = slots
             .iter()
-            .map(|&slot| CudaOwnedDeviceMemoryChunk {
+            .map(|&(slot, stamp)| CudaOwnedDeviceMemoryChunk {
                 // The region is JUST deleted_by (0-based): slot `s`'s stamp is at byte `s * 8`.
                 byte_offset: u64::from(slot) * width,
-                bytes: commit_seq.to_le_bytes().to_vec(),
+                bytes: stamp.to_le_bytes().to_vec(),
             })
             .collect();
         region.append_owned_chunks(chunks).is_ok()
@@ -9521,6 +9535,40 @@ impl Engine {
     /// `read_txn = C-1` cannot see. Returns Err when the gather declines — for an elided table
     /// that is a broken invariant (elision eligibility ⊆ gather eligibility), and failing LOUDLY
     /// beats a silently incomplete store.
+    /// U1: resolve elided rows' identities BY int4 KEY against the device gather at `read_txn`
+    /// — the rare lane-delete fallback's removal set (the tombstones' (shard, slot) targets are
+    /// exactly what a declined/stale device generation can no longer be trusted for; the KEY is
+    /// generation-independent). `keys` are `(column_index, value)`; a key with no visible match
+    /// at `read_txn` resolves to nothing (its delete was against a row this gather cannot see —
+    /// impossible for a wave-located 1-row target, but the resolve is total rather than lossy).
+    pub(crate) fn resolve_elided_row_ids_by_int4_key(
+        &self,
+        table: &RelationalTable,
+        read_txn: u64,
+        keys: &[(usize, i32)],
+    ) -> Result<std::collections::BTreeSet<u64>, EngineError> {
+        if keys.is_empty() {
+            return Ok(Default::default());
+        }
+        let gathered = self
+            .gather_resident_table_rows_from_device(table, read_txn)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "tombstone key-resolution gather declined for elided table \"{}\"",
+                    table.name
+                ))
+            })?;
+        let mut removals = std::collections::BTreeSet::new();
+        for (row_id, values) in &gathered {
+            for &(column, key) in keys {
+                if values.get(column) == Some(&SqlValue::Int4(key)) {
+                    removals.insert(*row_id);
+                }
+            }
+        }
+        Ok(removals)
+    }
+
     pub(crate) fn rehydrate_elided_table(
         &self,
         table: &RelationalTable,

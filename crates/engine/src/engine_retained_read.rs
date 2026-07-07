@@ -757,7 +757,7 @@ impl Engine {
     /// — where a physical miss is load-bearing ("no visible duplicate" / "0 matches"): a duplicate
     /// key FALSE-PASSES or an Eq-resolved UPDATE/DELETE loses its row. Repro + regression:
     /// `w0_concurrent_invalidation_must_not_leave_write_locate_trusting_stale_shards`.
-    fn shard_write_locate_cell_live(
+    pub(crate) fn shard_write_locate_cell_live(
         &self,
         table_name: &str,
         shard_id: u32,
@@ -1162,6 +1162,129 @@ impl Engine {
             .device_write_locate_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(result.count)
+    }
+
+    /// U1 (lane DELETE intents): the batched DEVICE VISIBLE-LOCATE — one coalesced launch
+    /// resolving every needle to its VISIBLE match count + first visible (shard_id, slot) at the
+    /// needle's OWN snapshot (visibility evaluated ON-DEVICE from the shards' created_by /
+    /// deleted_by regions; absent region = born-visible / all-live, matching the fills).
+    /// Declines (`None`) exactly like `wave_batch_locate_hit_counts_direct`: any invalid /
+    /// pressured / mismatched / stale-cell shard, or an index that can't be ensured — the caller
+    /// falls back per-needle or aborts retryably. `targets[i]` carries the probed shard's
+    /// identity handles for the APPLY-TIME liveness recheck (a VACUUM/re-admit between locate
+    /// and the coalesced tombstone apply rebuilds the shard and re-clusters slots — the apply
+    /// must decline on identity mismatch, never stamp a re-clustered slot).
+    pub(crate) fn wave_batch_visible_locate(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        needles: &[i32],
+        snapshots: &[u64],
+    ) -> Option<WaveVisibleLocate> {
+        if needles.is_empty() {
+            return Some(WaveVisibleLocate::default());
+        }
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
+        if table_shards.is_empty() {
+            return None;
+        }
+        let runtime_snapshot = self.router.runtime().snapshot();
+        let mut descs: Vec<VisibleLocateShard> = Vec::new();
+        // Parallel to `descs`: the probed shard's id + its MAIN device region (the W0 cell-
+        // liveness identity) — plus pins for the version regions the kernel dereferences.
+        let mut probed: Vec<(u32, Arc<CudaResidentDeviceMemory>)> = Vec::new();
+        let mut region_pins: Vec<Arc<CudaResidentDeviceMemory>> = Vec::new();
+        for shard in table_shards.iter() {
+            if shard.schema != table.schema || shard.table != table.name {
+                return None;
+            }
+            if !shard.is_valid(
+                runtime_snapshot
+                    .memory_pressured_gpu_ids
+                    .contains(&shard.gpu_id),
+            ) {
+                return None;
+            }
+            if shard.row_count == 0 {
+                continue;
+            }
+            let filter_offset = shard_i32_filter_offset(shard, table, filter_idx)?;
+            let device_memory = shard.device_memory.clone()?;
+            if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
+                return None;
+            }
+            let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
+                table,
+                &table.name,
+                shard.shard_id,
+                filter_idx,
+                &device_memory,
+                filter_offset,
+                shard.row_count,
+            )?;
+            let created_by_ptr = shard
+                .created_by_region
+                .as_ref()
+                .map(|region| {
+                    region_pins.push(Arc::clone(region));
+                    region.device_ptr()
+                })
+                .unwrap_or(0);
+            let deleted_by_ptr = shard
+                .deleted_by_region
+                .as_ref()
+                .map(|region| {
+                    region_pins.push(Arc::clone(region));
+                    region.device_ptr()
+                })
+                .unwrap_or(0);
+            descs.push(VisibleLocateShard {
+                index: device_index,
+                table_mask,
+                hash_shift,
+                created_by_ptr,
+                deleted_by_ptr,
+            });
+            probed.push((shard.shard_id, device_memory));
+        }
+        if descs.is_empty() {
+            // No probed shards: every needle has zero visible matches.
+            return Some(WaveVisibleLocate {
+                counts: vec![0u32; needles.len()],
+                shard_ids: vec![0u32; needles.len()],
+                slots: vec![0u32; needles.len()],
+                probed: Vec::new(),
+            });
+        }
+        let ctx = Arc::clone(&descs[0].index);
+        let result = ctx
+            .submit_multi_shard_i32_visible_locate(&descs, needles, snapshots)
+            .ok()?;
+        drop(region_pins); // kernel fenced by the blocking DtoH inside the submit
+        if result.count.len() != needles.len() {
+            return None;
+        }
+        self.read_state
+            .residency
+            .device_visible_locate_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Map probed-descriptor indexes back to real shard ids + identity handles.
+        let mut shard_ids = vec![0u32; needles.len()];
+        for (needle, (&count, &desc_idx)) in
+            result.count.iter().zip(result.shard_idx.iter()).enumerate()
+        {
+            if count >= 1 {
+                let (shard_id, _) = probed.get(desc_idx as usize)?;
+                shard_ids[needle] = *shard_id;
+            }
+        }
+        Some(WaveVisibleLocate {
+            counts: result.count,
+            shard_ids,
+            slots: result.slot,
+            probed,
+        })
     }
 
     /// M1 (charter-pure): the DEVICE write-locate — probe the per-shard DEVICE hash indexes in ONE
@@ -3032,6 +3155,21 @@ pub(crate) fn bloom_maybe_contains(
         }
     }
     true
+}
+
+/// U1: the batched visible-locate verdicts for one wave's delete needles. Parallel per-needle
+/// vectors (`counts[i]` visible matches at needle i's snapshot; `shard_ids[i]`/`slots[i]` = the
+/// first visible target, meaningful iff `counts[i] >= 1`) + `probed`, the (shard_id, MAIN device
+/// region) identity handles of every probed shard captured from the SAME `shards.load()`
+/// snapshot — the apply-time tombstone MUST recheck cell liveness against these exact regions
+/// (a VACUUM/re-admit between locate and apply re-clusters slots; stamping a stale slot would
+/// tombstone the wrong row).
+#[derive(Default)]
+pub(crate) struct WaveVisibleLocate {
+    pub(crate) counts: Vec<u32>,
+    pub(crate) shard_ids: Vec<u32>,
+    pub(crate) slots: Vec<u32>,
+    pub(crate) probed: Vec<(u32, Arc<CudaResidentDeviceMemory>)>,
 }
 
 /// Sub-slice 3b: a GENERATION-CONSISTENT cross-shard PK-index hit. Carries the resolved `(shard_id, slot)`

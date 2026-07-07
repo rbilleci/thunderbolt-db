@@ -79,11 +79,26 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
         0,
         allocated,
         &[
-            CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-            CudaDeviceMemoryChunk { byte_offset: off_a, bytes: &a },
-            CudaDeviceMemoryChunk { byte_offset: off_b, bytes: &b },
-            CudaDeviceMemoryChunk { byte_offset: off_c, bytes: &c },
-            CudaDeviceMemoryChunk { byte_offset: off_d, bytes: &d },
+            CudaDeviceMemoryChunk {
+                byte_offset: 0,
+                bytes: &header,
+            },
+            CudaDeviceMemoryChunk {
+                byte_offset: off_a,
+                bytes: &a,
+            },
+            CudaDeviceMemoryChunk {
+                byte_offset: off_b,
+                bytes: &b,
+            },
+            CudaDeviceMemoryChunk {
+                byte_offset: off_c,
+                bytes: &c,
+            },
+            CudaDeviceMemoryChunk {
+                byte_offset: off_d,
+                bytes: &d,
+            },
         ],
     ) {
         Ok(r) => r,
@@ -110,7 +125,10 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
         }
         let us = p50(s) as f64 / 1000.0;
         let gbps = gb / (us / 1e6);
-        println!("  {label:<40} {us:>9.0}us  {:>8.1} GB/s   (sink {sink})", gbps);
+        println!(
+            "  {label:<40} {us:>9.0}us  {:>8.1} GB/s   (sink {sink})",
+            gbps
+        );
         gbps
     };
 
@@ -124,23 +142,100 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
     );
     println!("\n# (1) RESIDENT-INPUT scans -- kernel-clean, wall ~= kernel (vs the sum_i32 read roofline) ---");
     let needles_miss: Vec<i32> = (0..8).map(|k| -((k as i32) + 1)).collect(); // negative -> never match A
-    // ROOFLINE = sum_i32: a pure 1-pass read+reduce over the same i32 column -> the HBM streaming peak.
-    let roof = bench("sum_i32 (ROOFLINE: pure 1-pass read+reduce)", g4, Box::new(|| resident.sum_i32_from_payload(off_a, rows).unwrap() as usize));
+                                                                              // ROOFLINE = sum_i32: a pure 1-pass read+reduce over the same i32 column -> the HBM streaming peak.
+    let roof = bench(
+        "sum_i32 (ROOFLINE: pure 1-pass read+reduce)",
+        g4,
+        Box::new(|| resident.sum_i32_from_payload(off_a, rows).unwrap() as usize),
+    );
     // equal_any is measured for comparison but is NOT the roofline: an 8-needle compare per element makes
     // it compute-bound (~2x slower than a pure read), so it is a data point, not the read ceiling.
     bench(
         "equal_any (8-needle scan -- NOT roofline; ~2x a read)",
         g4,
-        Box::new(|| resident.match_project_i32_equal_any_from_payload(off_a, &needles_miss, &[off_b], rows).unwrap().len()),
+        Box::new(|| {
+            resident
+                .match_project_i32_equal_any_from_payload(off_a, &needles_miss, &[off_b], rows)
+                .unwrap()
+                .len()
+        }),
     );
-    bench("count_i32_compare (1-pass)", g4, Box::new(|| resident.count_i32_compare_from_payload(off_a, rows, 1 << 19, CudaI32Comparison::Lt).unwrap() as usize));
-    bench("count_i32_between (1-pass)", g4, Box::new(|| resident.count_i32_between_from_payload(off_a, rows, 0, 1 << 19).unwrap() as usize));
-    bench("expr_i64_compare_scalar (8B, ~1% sel)", g8, Box::new(|| resident.expr_i64_compare_scalar_filter(off_c, 80_000_i64 * 2_654_435_761, false, 1, rows).unwrap().len()));
-    bench("expr_i128_compare_scalar (16B, ~1% sel)", g16, Box::new(|| resident.expr_i128_compare_scalar_filter(off_d, 80_000_i128 * 11, false, 1, rows).unwrap().len()));
-    let arith = vec![ExprStep::LoadColumn { byte_offset: off_a }, ExprStep::ScalarBinary { op: 0, scalar: 5, scalar_on_left: false }];
-    bench("arith_filter a+5<k (load+binop, 2-pass)", 2.0 * g4, Box::new(|| resident.run_expr_arith_filter(&arith, rows, 1, 1 << 19).unwrap().len()));
-    bench("compare_indices_ordered (2-pass, ~50% sel)", 2.0 * g4, Box::new(|| resident.compare_indices_ordered_from_payload(off_a, rows, 1 << 19, 1).unwrap().len()));
-    bench("project_compare ordered (2-pass, ~1% sel)", 2.0 * g4, Box::new(|| resident.project_i32_compare_from_payload(off_a, rows, 1 << 13, CudaI32Comparison::Lt).unwrap().len()));
+    bench(
+        "count_i32_compare (1-pass)",
+        g4,
+        Box::new(|| {
+            resident
+                .count_i32_compare_from_payload(off_a, rows, 1 << 19, CudaI32Comparison::Lt)
+                .unwrap() as usize
+        }),
+    );
+    bench(
+        "count_i32_between (1-pass)",
+        g4,
+        Box::new(|| {
+            resident
+                .count_i32_between_from_payload(off_a, rows, 0, 1 << 19)
+                .unwrap() as usize
+        }),
+    );
+    bench(
+        "expr_i64_compare_scalar (8B, ~1% sel)",
+        g8,
+        Box::new(|| {
+            resident
+                .expr_i64_compare_scalar_filter(off_c, 80_000_i64 * 2_654_435_761, false, 1, rows)
+                .unwrap()
+                .len()
+        }),
+    );
+    bench(
+        "expr_i128_compare_scalar (16B, ~1% sel)",
+        g16,
+        Box::new(|| {
+            resident
+                .expr_i128_compare_scalar_filter(off_d, 80_000_i128 * 11, false, 1, rows)
+                .unwrap()
+                .len()
+        }),
+    );
+    let arith = vec![
+        ExprStep::LoadColumn { byte_offset: off_a },
+        ExprStep::ScalarBinary {
+            op: 0,
+            scalar: 5,
+            scalar_on_left: false,
+        },
+    ];
+    bench(
+        "arith_filter a+5<k (load+binop, 2-pass)",
+        2.0 * g4,
+        Box::new(|| {
+            resident
+                .run_expr_arith_filter(&arith, rows, 1, 1 << 19)
+                .unwrap()
+                .len()
+        }),
+    );
+    bench(
+        "compare_indices_ordered (2-pass, ~50% sel)",
+        2.0 * g4,
+        Box::new(|| {
+            resident
+                .compare_indices_ordered_from_payload(off_a, rows, 1 << 19, 1)
+                .unwrap()
+                .len()
+        }),
+    );
+    bench(
+        "project_compare ordered (2-pass, ~1% sel)",
+        2.0 * g4,
+        Box::new(|| {
+            resident
+                .project_i32_compare_from_payload(off_a, rows, 1 << 13, CudaI32Comparison::Lt)
+                .unwrap()
+                .len()
+        }),
+    );
 
     println!("\n# (2) HOST-INPUT gather -- scattered, cache-line bound; wall INCLUDES a per-call index H2D ---");
     let idx: Vec<u64> = (0..rows).step_by(16).collect();
@@ -153,9 +248,24 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
         // (the event wraps only the kernel launch). So when the pooled stream is event-timed we can
         // isolate the kernel: clear, run, read the event back. Verified < wall (wall = H2D + kernel +
         // D2H + host alloc). If the pool is untimed (event = None) we fall back to the H2D-labeled wall.
-        bench(&format!("gather_i32 (project_i32_rows) ({} idx, +~{idx_h2d_mb:.0}MB idx H2D)", idx.len()), gidx_gb4, Box::new(|| resident.project_i32_rows_from_payload(off_b, i).unwrap().len()));
+        bench(
+            &format!(
+                "gather_i32 (project_i32_rows) ({} idx, +~{idx_h2d_mb:.0}MB idx H2D)",
+                idx.len()
+            ),
+            gidx_gb4,
+            Box::new(|| {
+                resident
+                    .project_i32_rows_from_payload(off_b, i)
+                    .unwrap()
+                    .len()
+            }),
+        );
         resident.clear_last_kernel_event_elapsed_us();
-        let n_gathered = resident.project_i32_rows_from_payload(off_b, i).unwrap().len();
+        let n_gathered = resident
+            .project_i32_rows_from_payload(off_b, i)
+            .unwrap()
+            .len();
         match resident.last_kernel_event_elapsed_us() {
             Some(ev_us) if ev_us > 0 => {
                 let kus = ev_us as f64;
@@ -164,23 +274,50 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
             }
             _ => println!("  {:<40}            (pooled stream untimed -- gather kernel not isolable; use the H2D-labeled wall above)", "  ^ gather_i32 KERNEL"),
         }
-        bench(&format!("gather_i64 (project_i64_rows) ({} idx, +~{idx_h2d_mb:.0}MB idx H2D)", idx.len()), gidx_gb8, Box::new(|| resident.project_i64_rows_from_payload(off_c, i).unwrap().len()));
+        bench(
+            &format!(
+                "gather_i64 (project_i64_rows) ({} idx, +~{idx_h2d_mb:.0}MB idx H2D)",
+                idx.len()
+            ),
+            gidx_gb8,
+            Box::new(|| {
+                resident
+                    .project_i64_rows_from_payload(off_c, i)
+                    .unwrap()
+                    .len()
+            }),
+        );
     }
 
     Some(roof)
 }
 
 fn main() {
-    let rows: u64 = std::env::var("ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(8_388_608);
+    let rows: u64 = std::env::var("ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8_388_608);
     // OUT-OF-L2 dataset: default 64M rows = 256MB/i32-col, ~2GB total resident. Chosen to clearly exceed
     // this card's L2 (queried + printed below). Configurable via ROWS_LARGE; if it can't be made resident
     // the OUT-OF-L2 pass is SKIPPED, not a panic.
-    let rows_large: u64 = std::env::var("ROWS_LARGE").ok().and_then(|v| v.parse().ok()).unwrap_or(67_108_864);
-    let sort_n: u64 = std::env::var("SORT_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1_048_576);
-    let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let rows_large: u64 = std::env::var("ROWS_LARGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(67_108_864);
+    let sort_n: u64 = std::env::var("SORT_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_048_576);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     // The OUT-OF-L2 pass allocates ~2GB + builds 64M-row host columns; cap its timed samples so the run
     // stays inside the timeout while STILL reporting p50 latency on every line. Configurable.
-    let iters_large: usize = std::env::var("ITERS_LARGE").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let iters_large: usize = std::env::var("ITERS_LARGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
 
     let Ok(runtime) = CudaDriverRuntime::probe() else {
         eprintln!("no local NVIDIA driver/GPU; skipping");
@@ -198,7 +335,9 @@ fn main() {
 
     println!("# read-kernel roofline (IN-L2 vs OUT-OF-L2 sweep).");
     println!("# card L2 cache  = {l2_bytes} bytes ({l2_mb:.0} MB)  [cudaDevAttrL2CacheSize, RTX PRO 6000 Blackwell]");
-    println!("# IN-L2 dataset  = {rows} rows = {in_l2_col_mb:.0}MB/i32-col  (FITS L2 -> cache-resident)");
+    println!(
+        "# IN-L2 dataset  = {rows} rows = {in_l2_col_mb:.0}MB/i32-col  (FITS L2 -> cache-resident)"
+    );
     println!(
         "# OUT-OF-L2 set  = {rows_large} rows = {out_l2_col_mb:.0}MB/i32-col  ({:.1}x L2 -> memory-bound)",
         out_l2_col_mb / l2_mb
@@ -207,23 +346,37 @@ fn main() {
     println!("\n  {:<40} {:>9}  {:>8}", "kernel", "p50", "rate");
 
     // (1a/2a) IN-L2 pass: 32MB/col, cache-resident. This is the cache-FLATTERED baseline.
-    println!("\n# ====================================================================================");
+    println!(
+        "\n# ===================================================================================="
+    );
     println!("# (1a) IN-L2 scans + (2a) IN-L2 gather  ({in_l2_col_mb:.0}MB/col, CACHE-RESIDENT)");
-    println!("# ====================================================================================");
+    println!(
+        "# ===================================================================================="
+    );
     let roof_in_l2 = run_scan_pass(&runtime, "(1a/2a) IN-L2", rows, iters);
 
     // (1b/2b) OUT-OF-L2 pass: 256MB/col, memory-bound. Same kernels, larger resident columns + a larger
     // gather index set (step_by(16) -> 4M indices at 64M rows). SKIPPED (not panic) on alloc failure.
-    println!("\n# ====================================================================================");
-    println!("# (1b) OUT-OF-L2 scans + (2b) OUT-OF-L2 gather  ({out_l2_col_mb:.0}MB/col, MEMORY-BOUND)");
-    println!("# ====================================================================================");
+    println!(
+        "\n# ===================================================================================="
+    );
+    println!(
+        "# (1b) OUT-OF-L2 scans + (2b) OUT-OF-L2 gather  ({out_l2_col_mb:.0}MB/col, MEMORY-BOUND)"
+    );
+    println!(
+        "# ===================================================================================="
+    );
     let roof_out_l2 = run_scan_pass(&runtime, "(1b/2b) OUT-OF-L2", rows_large, iters_large);
 
     // (3) ALGORITHMIC -- SINGLE pass, sized by SORT_N (NOT part of the IN-L2/OUT-OF-L2 row sweep). Runs on
     // its own small resident column so it is independent of the two scan datasets above.
-    println!("\n# ====================================================================================");
+    println!(
+        "\n# ===================================================================================="
+    );
     println!("# (3) ALGORITHMIC (sort / join / grouped) -- SINGLE pass, sort_n-sized (NOT in the L2 sweep)");
-    println!("# ====================================================================================");
+    println!(
+        "# ===================================================================================="
+    );
     let hash = |row: u64| -> u32 { ((row.wrapping_mul(2_654_435_761)) ^ (row << 13)) as u32 };
     let n = rows as usize;
     let off_a = 8u64;
@@ -247,11 +400,26 @@ fn main() {
             0,
             allocated,
             &[
-                CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-                CudaDeviceMemoryChunk { byte_offset: off_a, bytes: &a },
-                CudaDeviceMemoryChunk { byte_offset: off_b, bytes: &b },
-                CudaDeviceMemoryChunk { byte_offset: off_c, bytes: &c },
-                CudaDeviceMemoryChunk { byte_offset: off_d, bytes: &d },
+                CudaDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes: &header,
+                },
+                CudaDeviceMemoryChunk {
+                    byte_offset: off_a,
+                    bytes: &a,
+                },
+                CudaDeviceMemoryChunk {
+                    byte_offset: off_b,
+                    bytes: &b,
+                },
+                CudaDeviceMemoryChunk {
+                    byte_offset: off_c,
+                    bytes: &c,
+                },
+                CudaDeviceMemoryChunk {
+                    byte_offset: off_d,
+                    bytes: &d,
+                },
             ],
         )
         .expect("retain resident device memory (algorithmic pass)");
@@ -269,7 +437,10 @@ fn main() {
         }
         let us = p50(s) as f64 / 1000.0;
         // reports BOTH p50 latency (us) AND throughput (Melem/s).
-        println!("  {label:<40} {us:>9.0}us  {:>8.1} Melem/s (sink {sink})", elems as f64 / us);
+        println!(
+            "  {label:<40} {us:>9.0}us  {:>8.1} Melem/s (sink {sink})",
+            elems as f64 / us
+        );
     };
 
     println!("#     sort/join wall INCLUDES a per-call key H2D (multi-launch -> the CUDA event is only the");
@@ -279,18 +450,26 @@ fn main() {
     let join_h2d_mb = (sort_n as usize * 8 * 2) as f64 / 1e6; // build + probe key slices
     {
         let k = &keys;
-        throughput(&format!("bitonic_sort_i64 (+~{sort_h2d_mb:.0}MB key H2D)"), sort_n, Box::new(|| resident.bitonic_sort_i64(k, false).unwrap().len()));
+        throughput(
+            &format!("bitonic_sort_i64 (+~{sort_h2d_mb:.0}MB key H2D)"),
+            sort_n,
+            Box::new(|| resident.bitonic_sort_i64(k, false).unwrap().len()),
+        );
     }
     let build: Vec<i64> = (0..sort_n).map(|r| r as i64).collect();
-    let probe: Vec<i64> = (0..sort_n).map(|r| hash(r) as i64 % sort_n as i64).collect();
+    let probe: Vec<i64> = (0..sort_n)
+        .map(|r| hash(r) as i64 % sort_n as i64)
+        .collect();
     {
         let (bk, pk) = (&build, &probe);
-        throughput(&format!("hash_join_inner_i64 build+probe (+~{join_h2d_mb:.0}MB key H2D)"), sort_n, Box::new(|| {
-            match resident.hash_join_inner_i64(bk, pk, None, None) {
+        throughput(
+            &format!("hash_join_inner_i64 build+probe (+~{join_h2d_mb:.0}MB key H2D)"),
+            sort_n,
+            Box::new(|| match resident.hash_join_inner_i64(bk, pk, None, None) {
                 Ok(HashJoinOutcome::Pairs { probe_idxs, .. }) => probe_idxs.len(),
                 _ => 0,
-            }
-        }));
+            }),
+        );
     }
     // LIVE per-group GROUP BY (the two-level shared-mem kernel the engine uses), grouping by the
     // ~1M-distinct key column A and summing B over a full-table scan (indices = 0..rows, as the executor
@@ -306,20 +485,48 @@ fn main() {
         let gi = &gb_indices;
         // Honest KERNEL: CUDA-event timed, two-level kernel, 10 runs, full-compute mask.
         let (_rows, kernel_ms) = resident
-            .group_by_i32_count_sum_kernel_timed(off_a, off_b, gi, true, 10, gpu_db_execution::grouped_agg_mask::ALL)
+            .group_by_i32_count_sum_kernel_timed(
+                off_a,
+                off_b,
+                gi,
+                true,
+                10,
+                gpu_db_execution::grouped_agg_mask::ALL,
+            )
             .expect("group_by kernel_timed");
         let kernel_melem_s = rows as f64 / (kernel_ms as f64 * 1e3); // rows / (ms*1000 us) = rows/us = Melem/s
-        // reports BOTH p50 latency (the CUDA-event ms) AND throughput (Melem/s).
-        println!("  {:<40} {:>7.3}ms  {:>8.1} Melem/s (KERNEL only, CUDA-event)", "group_by_i32 KERNEL (~1M groups)", kernel_ms, kernel_melem_s);
+                                                                     // reports BOTH p50 latency (the CUDA-event ms) AND throughput (Melem/s).
+        println!(
+            "  {:<40} {:>7.3}ms  {:>8.1} Melem/s (KERNEL only, CUDA-event)",
+            "group_by_i32 KERNEL (~1M groups)", kernel_ms, kernel_melem_s
+        );
         // Full result path (index H2D + ~2*row_count table setup + host Vec build), labeled NON-kernel.
-        throughput("  ^ group_by_i32 from_payload (FULL PATH)", rows, Box::new(|| resident.group_by_i32_count_sum_from_payload(off_a, off_b, gi, gpu_db_execution::grouped_agg_mask::ALL).unwrap().len()));
+        throughput(
+            "  ^ group_by_i32 from_payload (FULL PATH)",
+            rows,
+            Box::new(|| {
+                resident
+                    .group_by_i32_count_sum_from_payload(
+                        off_a,
+                        off_b,
+                        gi,
+                        gpu_db_execution::grouped_agg_mask::ALL,
+                    )
+                    .unwrap()
+                    .len()
+            }),
+        );
         println!("  {:<40}            (+index H2D + ~2*row_count table setup + host Vec build -- see grouped_cardinality_probe)", "");
     }
 
     // Closing note: state BOTH roofline values + the cache effect explicitly.
-    println!("\n# ====================================================================================");
+    println!(
+        "\n# ===================================================================================="
+    );
     println!("# SUMMARY -- CACHE EFFECT (IN-L2 vs OUT-OF-L2)");
-    println!("# ====================================================================================");
+    println!(
+        "# ===================================================================================="
+    );
     match (roof_in_l2, roof_out_l2) {
         (Some(in_l2), Some(out_l2)) => {
             println!("# sum_i32 ROOFLINE  in-L2 ({in_l2_col_mb:.0}MB/col) = {in_l2:.0} GB/s  vs  out-of-L2 ({out_l2_col_mb:.0}MB/col) = {out_l2:.0} GB/s");

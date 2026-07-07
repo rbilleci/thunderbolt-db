@@ -23,8 +23,14 @@ fn p50(mut v: Vec<u128>) -> u128 {
 }
 
 fn main() {
-    let rows: u64 = std::env::var("ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(8_388_608);
-    let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+    let rows: u64 = std::env::var("ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8_388_608);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
     let n = rows as usize;
 
     let Ok(runtime) = CudaDriverRuntime::probe() else {
@@ -57,9 +63,18 @@ fn main() {
         unsafe { std::slice::from_raw_parts(bitmap.as_ptr().cast::<u8>(), bitmap.len() * 4) };
 
     let chunks = vec![
-        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-        CudaDeviceMemoryChunk { byte_offset: off_value, bytes: &value },
-        CudaDeviceMemoryChunk { byte_offset: off_bitmap, bytes: bitmap_bytes },
+        CudaDeviceMemoryChunk {
+            byte_offset: 0,
+            bytes: &header,
+        },
+        CudaDeviceMemoryChunk {
+            byte_offset: off_value,
+            bytes: &value,
+        },
+        CudaDeviceMemoryChunk {
+            byte_offset: off_bitmap,
+            bytes: bitmap_bytes,
+        },
     ];
     let resident = runtime
         .retain_device_memory_chunks(0, allocated, &chunks)
@@ -94,17 +109,32 @@ fn main() {
     };
 
     // ---- parity: filtered (no bitmap) direct == host oracle, before timing. ----
-    let direct_f =
-        resident.filtered_scalar_stats_i32_from_payload(off_value, rows, needle, cmp, None).unwrap();
-    assert_eq!(direct_f, host_oracle(true, false), "filtered direct == host oracle");
-    println!("# filtered parity OK (v < {needle}): count={} max={}", direct_f.0, direct_f.3);
+    let direct_f = resident
+        .filtered_scalar_stats_i32_from_payload(off_value, rows, needle, cmp, None)
+        .unwrap();
+    assert_eq!(
+        direct_f,
+        host_oracle(true, false),
+        "filtered direct == host oracle"
+    );
+    println!(
+        "# filtered parity OK (v < {needle}): count={} max={}",
+        direct_f.0, direct_f.3
+    );
 
     // ---- parity: nullable (unfiltered) direct == host oracle. ----
     let direct_nz = resident
         .nullable_scalar_stats_i32_from_payload(off_value, rows, Some(off_bitmap))
         .unwrap();
-    assert_eq!(direct_nz, host_oracle(false, true), "nullable direct == host oracle");
-    println!("# nullable parity OK: count={} (non-NULL) max={}", direct_nz.0, direct_nz.3);
+    assert_eq!(
+        direct_nz,
+        host_oracle(false, true),
+        "nullable direct == host oracle"
+    );
+    println!(
+        "# nullable parity OK: count={} (non-NULL) max={}",
+        direct_nz.0, direct_nz.3
+    );
 
     let p50_us = |mut f: Box<dyn FnMut()>| -> f64 {
         for _ in 0..3 {
@@ -122,13 +152,15 @@ fn main() {
     let direct_filtered_us = {
         let r = &resident;
         p50_us(Box::new(move || {
-            r.filtered_scalar_stats_i32_from_payload(off_value, rows, needle, cmp, None).unwrap();
+            r.filtered_scalar_stats_i32_from_payload(off_value, rows, needle, cmp, None)
+                .unwrap();
         }))
     };
     let direct_nullable_us = {
         let r = &resident;
         p50_us(Box::new(move || {
-            r.nullable_scalar_stats_i32_from_payload(off_value, rows, Some(off_bitmap)).unwrap();
+            r.nullable_scalar_stats_i32_from_payload(off_value, rows, Some(off_bitmap))
+                .unwrap();
         }))
     };
     let sum_us = {
@@ -141,9 +173,24 @@ fn main() {
     let mps = |us: f64| rows as f64 / us;
     println!("# rows={rows} (~{rows} distinct), iters={iters}, p50 latency");
     println!("  {:<34} {:>10}  {:>12}", "path", "p50 us", "Melem/s");
-    println!("  {:<34} {:>9.0}us  {:>12.1}", "filtered direct", direct_filtered_us, mps(direct_filtered_us));
-    println!("  {:<34} {:>9.0}us  {:>12.1}", "nullable direct", direct_nullable_us, mps(direct_nullable_us));
-    println!("  {:<34} {:>9.0}us  {:>12.1}  (roofline ref)", "direct sum (audited)", sum_us, mps(sum_us));
+    println!(
+        "  {:<34} {:>9.0}us  {:>12.1}",
+        "filtered direct",
+        direct_filtered_us,
+        mps(direct_filtered_us)
+    );
+    println!(
+        "  {:<34} {:>9.0}us  {:>12.1}",
+        "nullable direct",
+        direct_nullable_us,
+        mps(direct_nullable_us)
+    );
+    println!(
+        "  {:<34} {:>9.0}us  {:>12.1}  (roofline ref)",
+        "direct sum (audited)",
+        sum_us,
+        mps(sum_us)
+    );
     println!(
         "\n# filtered direct = {:.0}% of the sum roofline; nullable direct = {:.0}%.",
         100.0 * mps(direct_filtered_us) / mps(sum_us),

@@ -563,6 +563,13 @@ pub(crate) struct ResidencyReadState {
     /// M1: count of PK locates served by the DEVICE write-locate kernel (non-vacuity: proves the
     /// device path FIRED, not a silent fallback to the host probe / scan).
     pub(crate) device_write_locate_hits: std::sync::atomic::AtomicU64,
+    /// U1: count of coalesced VISIBLE-LOCATE launches (lane DELETE target resolution with
+    /// on-device MVCC visibility — the fired-counter for the delete-intent device path).
+    pub(crate) device_visible_locate_hits: std::sync::atomic::AtomicU64,
+    /// U1: count of lane DELETE tombstones stamped IN PLACE by the apply coalescer (the
+    /// fired-counter for the device tombstone path — a silent rehydrate fallback would pass
+    /// output equality while abandoning the in-place design).
+    pub(crate) lane_tombstone_applies: std::sync::atomic::AtomicU64,
     /// E2.5b-2 diagnostics: PK device-index REBUILDS (cache miss -> DtoH column
     /// read + host hash build + HtoD upload — the expensive path).
     pub(crate) lane_diag_rebuilds: std::sync::atomic::AtomicU64,

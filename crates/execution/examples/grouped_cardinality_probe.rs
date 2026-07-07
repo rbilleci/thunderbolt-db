@@ -18,8 +18,14 @@ fn p50(mut v: Vec<u128>) -> u128 {
 }
 
 fn main() {
-    let rows: u64 = std::env::var("ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(8_388_608);
-    let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+    let rows: u64 = std::env::var("ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8_388_608);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
     let n = rows as usize;
     let cards: Vec<u64> = vec![16, 256, 4_096, 65_536, 1 << 18, 1 << 20];
 
@@ -51,11 +57,20 @@ fn main() {
         .collect();
 
     let mut chunks = vec![
-        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-        CudaDeviceMemoryChunk { byte_offset: off_value, bytes: &value },
+        CudaDeviceMemoryChunk {
+            byte_offset: 0,
+            bytes: &header,
+        },
+        CudaDeviceMemoryChunk {
+            byte_offset: off_value,
+            bytes: &value,
+        },
     ];
     for (k, g) in group_cols.iter().enumerate() {
-        chunks.push(CudaDeviceMemoryChunk { byte_offset: group_off(k), bytes: g });
+        chunks.push(CudaDeviceMemoryChunk {
+            byte_offset: group_off(k),
+            bytes: g,
+        });
     }
     let resident = runtime
         .retain_device_memory_chunks(0, allocated, &chunks)

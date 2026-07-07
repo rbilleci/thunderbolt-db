@@ -273,11 +273,46 @@ pub(crate) struct ValidateSlot {
 /// the request — no `CommitWaveItem` re-walk on the apply path.
 pub(crate) struct ApplyRequest {
     pub(crate) table: String,
+    /// INSERT winners only (parallel with `row_ids`/`stamps`/`txn_ids`): the merged
+    /// open-shard append inputs. A delete-only wave ships these empty (U1).
     pub(crate) rows: Vec<Vec<crate::SqlValue>>,
     pub(crate) row_ids: Vec<u64>,
     pub(crate) stamps: Vec<u64>,
     pub(crate) txn_ids: Vec<u64>,
+    /// U1: DELETE winners — the tombstone pass's targets (resolved by the wave's
+    /// visible-locate, identity-pinned for the apply-time liveness recheck).
+    pub(crate) tombstones: Vec<LaneTombstone>,
+    /// The wave's WHOLE claimed seq block `[seq_first, seq_first + seq_len)` — the applied-cut
+    /// advance covers every claimed seq regardless of the insert/delete mix (U1: `stamps` is
+    /// insert-only and can no longer stand in for the block).
+    pub(crate) seq_first: u64,
+    pub(crate) seq_len: u64,
     pub(crate) slot: std::sync::Arc<ApplySlot>,
+}
+
+/// U1: one delete winner's resolved tombstone target, as located by the wave's coalesced
+/// device visible-locate.
+#[derive(Clone)]
+pub(crate) struct LaneTombstoneTarget {
+    pub(crate) shard_id: u32,
+    pub(crate) slot: u32,
+    /// The located shard's MAIN device region at locate time — the apply-time cell-liveness
+    /// identity (a VACUUM/re-admit between locate and apply re-clusters slots; the tombstone
+    /// pass must decline on identity mismatch, never stamp a re-clustered slot).
+    pub(crate) region: std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>,
+}
+
+/// U1: a tombstone work item inside an [`ApplyRequest`] — target + its commit seq (the
+/// `deleted_by` stamp value) + the by-key identity for the rare rehydrate fallback.
+pub(crate) struct LaneTombstone {
+    pub(crate) shard_id: u32,
+    pub(crate) slot: u32,
+    pub(crate) seq: u64,
+    pub(crate) region: std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>,
+    /// The pk column's catalog position (fallback key resolution).
+    pub(crate) filter_idx: u32,
+    /// The pk value (fallback key resolution).
+    pub(crate) pk: i32,
 }
 
 /// Apply completion: `done` flips after the merged append (or its fallback)

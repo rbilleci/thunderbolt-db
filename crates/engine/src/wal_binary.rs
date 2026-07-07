@@ -26,6 +26,12 @@ pub(crate) const WAL_BINARY_TAG: u8 = 0xFF;
 const WAL_BINARY_VERSION: u8 = 1;
 /// Op codes.
 const OP_INSERT: u8 = 1;
+/// U1 (W5b): a covered lane DELETE, logged BY KEY — replay re-resolves the key against the
+/// replayed state (deterministic: all ops on a key are lane-serialized in seq order, cross-key
+/// ops commute), so the record needs no resolved tuple/row ids. 0-row deletes never reach the
+/// WAL (the pump's pre-claim filter completes them without a seq), so a durable delete record
+/// re-resolving to 0 rows at replay is corruption-or-determinism-bug — the apply arm is LOUD.
+const OP_DELETE_BY_KEY: u8 = 2;
 
 /// The decoded form of a v1 binary INSERT record.
 pub(crate) struct BinaryInsertRecord {
@@ -33,6 +39,90 @@ pub(crate) struct BinaryInsertRecord {
     /// `(row_id, encoded_row)` — the row image in `encode_relational_row`'s cell encoding
     /// (the tuple store's canonical format; decoded against the catalog at apply time).
     pub(crate) rows: Vec<(u64, String)>,
+}
+
+/// The decoded form of a W5b by-key DELETE record (U1).
+pub(crate) struct BinaryDeleteByKeyRecord {
+    pub(crate) table: String,
+    /// The unique key column NAME (catalog identity survives replays; the covered route
+    /// guarantees it is the single unique i32 index column).
+    pub(crate) pk_column: String,
+    pub(crate) pk_value: i32,
+}
+
+/// A decoded binary WAL record of any op (the tag dispatch for apply/replay consumers).
+pub(crate) enum BinaryWalRecord {
+    Insert(BinaryInsertRecord),
+    DeleteByKey(BinaryDeleteByKeyRecord),
+}
+
+/// Encode a W5b by-key DELETE record. `None` on width-exceeding names (caller falls back to the
+/// SQL-text record, same contract as the insert encoder).
+pub(crate) fn encode_binary_delete_by_key(
+    table: &str,
+    pk_column: &str,
+    pk_value: i32,
+) -> Option<Vec<u8>> {
+    if table.len() > u16::MAX as usize || pk_column.len() > u16::MAX as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity(3 + 2 + table.len() + 2 + pk_column.len() + 4);
+    out.push(WAL_BINARY_TAG);
+    out.push(WAL_BINARY_VERSION);
+    out.push(OP_DELETE_BY_KEY);
+    out.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    out.extend_from_slice(table.as_bytes());
+    out.extend_from_slice(&(pk_column.len() as u16).to_le_bytes());
+    out.extend_from_slice(pk_column.as_bytes());
+    out.extend_from_slice(&pk_value.to_le_bytes());
+    Some(out)
+}
+
+/// Decode ANY binary record (op dispatch). Errors are LOUD (`Durability`) — a tagged record
+/// that fails to decode is corruption-or-version-skew, never silently skipped.
+pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, EngineError> {
+    let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
+    match payload.get(2) {
+        Some(&OP_INSERT) => decode_binary_insert(payload).map(BinaryWalRecord::Insert),
+        Some(&OP_DELETE_BY_KEY) => {
+            let mut at = 0usize;
+            let mut take = |n: usize| -> Result<&[u8], EngineError> {
+                let end = at.checked_add(n).ok_or_else(|| fail("length overflow"))?;
+                let slice = payload.get(at..end).ok_or_else(|| fail("truncated"))?;
+                at = end;
+                Ok(slice)
+            };
+            if take(1)?[0] != WAL_BINARY_TAG {
+                return Err(fail("missing tag"));
+            }
+            let version = take(1)?[0];
+            if version != WAL_BINARY_VERSION {
+                return Err(fail(&format!("unsupported version {version}")));
+            }
+            if take(1)?[0] != OP_DELETE_BY_KEY {
+                return Err(fail("op dispatch mismatch"));
+            }
+            let table_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+            let table = std::str::from_utf8(take(table_len)?)
+                .map_err(|_| fail("non-utf8 table name"))?
+                .to_string();
+            let column_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+            let pk_column = std::str::from_utf8(take(column_len)?)
+                .map_err(|_| fail("non-utf8 column name"))?
+                .to_string();
+            let pk_value = i32::from_le_bytes(take(4)?.try_into().expect("4 bytes"));
+            if at != payload.len() {
+                return Err(fail("trailing bytes"));
+            }
+            Ok(BinaryWalRecord::DeleteByKey(BinaryDeleteByKeyRecord {
+                table,
+                pk_column,
+                pk_value,
+            }))
+        }
+        Some(op) => Err(fail(&format!("unsupported op {op}"))),
+        None => Err(fail("truncated header")),
+    }
 }
 
 /// Encode a covered INSERT delta as a v1 binary record. `rows` are `(row_id, values)`.

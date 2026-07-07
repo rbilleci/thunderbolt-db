@@ -14,7 +14,7 @@ use gpu_db_execution::{
     CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory,
     CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, ExprStep, FilterOperator,
     LimitOperator, MockGpuRuntime, Operator, PlannedOp, ProjectOperator, ResidentElemType,
-    RouteDecision, ScanOperator, SortOperator, WriteLocateShard,
+    RouteDecision, ScanOperator, SortOperator, VisibleLocateShard, WriteLocateShard,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{

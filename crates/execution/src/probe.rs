@@ -33,7 +33,10 @@ impl Probe {
         #[cfg(feature = "probe-timing")]
         {
             let now = std::time::Instant::now();
-            Self { start: now, last: std::cell::Cell::new(now) }
+            Self {
+                start: now,
+                last: std::cell::Cell::new(now),
+            }
         }
         #[cfg(not(feature = "probe-timing"))]
         {
@@ -55,7 +58,10 @@ impl Probe {
         #[cfg(feature = "probe-timing")]
         {
             let now = std::time::Instant::now();
-            eprintln!("[probe] {_label} {}us", now.duration_since(self.last.get()).as_micros());
+            eprintln!(
+                "[probe] {_label} {}us",
+                now.duration_since(self.last.get()).as_micros()
+            );
             self.last.set(now);
         }
     }
@@ -66,7 +72,10 @@ impl Probe {
     pub fn scope(_label: &'static str) -> ProbeScope {
         #[cfg(feature = "probe-timing")]
         {
-            ProbeScope { start: std::time::Instant::now(), label: _label }
+            ProbeScope {
+                start: std::time::Instant::now(),
+                label: _label,
+            }
         }
         #[cfg(not(feature = "probe-timing"))]
         {
@@ -86,6 +95,10 @@ pub struct ProbeScope;
 #[cfg(feature = "probe-timing")]
 impl Drop for ProbeScope {
     fn drop(&mut self) {
-        eprintln!("[probe] {} {}us", self.label, self.start.elapsed().as_micros());
+        eprintln!(
+            "[probe] {} {}us",
+            self.label,
+            self.start.elapsed().as_micros()
+        );
     }
 }

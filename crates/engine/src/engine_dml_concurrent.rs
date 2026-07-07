@@ -219,11 +219,34 @@ impl CommitWaveDone {
     }
 }
 
+/// U1: the lane-op kind. INSERT is the E2 flagship; DELETE is the first Tier-1 mutation op —
+/// covered by-PK, target resolved by the coalesced device VISIBLE-LOCATE at wave formation
+/// (0-row deletes complete Ok(0) BEFORE any seq/WAL/row-id claim).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaneOpKind {
+    Insert,
+    Delete,
+}
+
+/// U1: one delete needle's wave-formation verdict from the coalesced device visible-locate.
+pub(crate) enum LaneDeleteVerdict {
+    /// No visible row at the item's snapshot: the delete completes `Ok(0)` PRE-CLAIM (no seq,
+    /// no WAL record, no apply work — SQL semantics; PG-consistent).
+    Zero,
+    /// Exactly one visible row — the tombstone target.
+    One(crate::engine_intent_lanes::LaneTombstoneTarget),
+    /// Locate declined / drifted / ambiguous: retryable serialization error.
+    Retry(String),
+}
+
 /// E2.5b-2 LEAN LANE ITEM: everything the lane pump needs, ~112B + the value
 /// row — vs the ~500B CommitWaveItem plus its AST/delta/text attachments. The
 /// pump's host passes were the measured final wall (~6.5ms/lane cycle of cold
 /// cache traffic at ~925-item waves); this struct is the fix.
 pub(crate) struct LaneIntent {
+    /// U1: which op this intent performs (Insert rides every existing path
+    /// unchanged; Delete adds the visible-locate + tombstone arms).
+    pub(crate) op: LaneOpKind,
     pub(crate) txn_id: u64,
     pub(crate) slot: crate::write_path::IntUniqueSlotKey,
     pub(crate) read_snapshot: Index,
@@ -2572,8 +2595,12 @@ impl Engine {
         // needles come straight from the intents' integer slots (no AST walk);
         // the locate goes through the cross-lane coalescer; count>0 hits get
         // the same authoritative visibility recheck as the classic path.
+        // U1: DELETE items resolve their tombstone targets in the same stage via
+        // the coalesced device VISIBLE-LOCATE (per-needle snapshots, visibility
+        // evaluated on-device) — the verdicts feed the pre-claim 0-row filter.
         let stat_start = Instant::now();
         let violations = self.lane_validate_unique(&batch);
+        let mut delete_verdicts = self.lane_locate_deletes(&batch);
         lanes.stat_validate_ns.fetch_add(
             stat_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
@@ -2590,6 +2617,10 @@ impl Engine {
         let mut winners: Vec<LaneIntent> = Vec::with_capacity(batch.len());
         let mut winner_slots: Vec<crate::write_path::IntUniqueSlotKey> =
             Vec::with_capacity(batch.len());
+        // U1: parallel to `winners` — the delete items' resolved tombstone targets
+        // (None for inserts).
+        let mut winner_targets: Vec<Option<crate::engine_intent_lanes::LaneTombstoneTarget>> =
+            Vec::with_capacity(batch.len());
         {
             let ledger = lanes.ledgers[lane]
                 .lock()
@@ -2603,6 +2634,31 @@ impl Engine {
                     ))));
                     continue;
                 }
+                // U1 DELETE verdicts precede the write-conflict checks: a 0-row delete
+                // performs NO write (SQL/SI semantics — a concurrently-inserted invisible
+                // row is not this statement's business), so it completes Ok(0) HERE,
+                // before any ledger record, seq claim, WAL record, or apply work.
+                let mut delete_target: Option<crate::engine_intent_lanes::LaneTombstoneTarget> =
+                    None;
+                if item.op == LaneOpKind::Delete {
+                    match delete_verdicts.remove(&position) {
+                        Some(LaneDeleteVerdict::Zero) => {
+                            item.set_outcome(Ok(0));
+                            continue;
+                        }
+                        Some(LaneDeleteVerdict::One(target)) => delete_target = Some(target),
+                        Some(LaneDeleteVerdict::Retry(message)) => {
+                            item.set_outcome(Err(ExecuteError::Serialization(message)));
+                            continue;
+                        }
+                        None => {
+                            item.set_outcome(Err(ExecuteError::Serialization(
+                                "delete locate verdict missing (internal); retry".to_string(),
+                            )));
+                            continue;
+                        }
+                    }
+                }
                 if ledger.conflicts_int_slot(item.slot, item.read_snapshot) {
                     let read_snapshot = item.read_snapshot;
                     item.set_outcome(Err(ExecuteError::Serialization(format!(
@@ -2612,12 +2668,13 @@ impl Engine {
                 }
                 if !wave_slots.insert(item.slot) {
                     item.set_outcome(Err(ExecuteError::Serialization(
-                        "intra-wave duplicate key: an earlier same-wave insert holds this unique slot"
+                        "intra-wave duplicate key: an earlier same-wave op holds this unique slot"
                             .to_string(),
                     )));
                     continue;
                 }
                 winner_slots.push(item.slot);
+                winner_targets.push(delete_target);
                 winners.push(item);
             }
         }
@@ -2647,9 +2704,20 @@ impl Engine {
             }
         };
 
-        // row-id block (atomic claim — safe under concurrent lanes) + W5a patches
+        // row-id block (atomic claim — safe under concurrent lanes) + W5a patches.
+        // U1: ONLY inserts consume row ids — the allocator must stay in exact lock-step with
+        // replay, which advances it per INSERT record row (`rows_consumed`); a delete claiming
+        // an id would skew every later replayed insert's identity.
         let patch_started = Instant::now();
-        let row_id_base = self.read_state.mvcc.claim_row_id_block(k);
+        let insert_count = winners
+            .iter()
+            .filter(|item| item.op == LaneOpKind::Insert)
+            .count() as u64;
+        let row_id_base = if insert_count > 0 {
+            self.read_state.mvcc.claim_row_id_block(insert_count)
+        } else {
+            0 // no insert in this wave; never read
+        };
         // FUSED patch+envelope pass: the frame payload is assembled in the same
         // loop that patches each record (bytes are cache-warm), replacing the
         // separate encode_record_into pass that was measured at ~1.4us/record
@@ -2658,14 +2726,33 @@ impl Engine {
         // Per-record end offsets: sub-frame publishing splits the payload on
         // record boundaries (see `intent_lane_subframes`).
         let mut record_ends: Vec<usize> = Vec::with_capacity(winners.len());
-        for (offset, item) in winners.iter().enumerate() {
-            let off = item.row_id_offset as usize;
-            let row_id = row_id_base + offset as u64;
-            let mut payload: std::sync::Arc<[u8]> = std::sync::Arc::from(&item.template[..]);
-            std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
-                [off..off + 8]
-                .copy_from_slice(&row_id.to_le_bytes());
-            gpu_db_wal::encode_wal_record_parts_into(&mut frame_payload, item.txn_id, &payload);
+        let mut insert_offset = 0u64;
+        for item in winners.iter() {
+            match item.op {
+                LaneOpKind::Insert => {
+                    let off = item.row_id_offset as usize;
+                    let row_id = row_id_base + insert_offset;
+                    insert_offset += 1;
+                    let mut payload: std::sync::Arc<[u8]> =
+                        std::sync::Arc::from(&item.template[..]);
+                    std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
+                        [off..off + 8]
+                        .copy_from_slice(&row_id.to_le_bytes());
+                    gpu_db_wal::encode_wal_record_parts_into(
+                        &mut frame_payload,
+                        item.txn_id,
+                        &payload,
+                    );
+                }
+                LaneOpKind::Delete => {
+                    // W5b by-key record: complete at build time, nothing to patch.
+                    gpu_db_wal::encode_wal_record_parts_into(
+                        &mut frame_payload,
+                        item.txn_id,
+                        &item.template[..],
+                    );
+                }
+            }
             record_ends.push(frame_payload.len());
         }
         lanes.stat_patch_ns.fetch_add(
@@ -2823,15 +2910,41 @@ impl Engine {
             let mut stamps = Vec::with_capacity(winners.len());
             let mut txn_ids = Vec::with_capacity(winners.len());
             let mut row_ids = Vec::with_capacity(winners.len());
+            let mut tombstones: Vec<crate::engine_intent_lanes::LaneTombstone> = Vec::new();
             let table_name = winners
                 .first()
                 .map(|item| item.table.to_string())
                 .unwrap_or_default();
+            // U1: split the wave — INSERT winners feed the merged append (rows/stamps/
+            // row_ids parallel, insert-dense); DELETE winners feed the tombstone pass.
+            // The request's seq range covers the WHOLE claimed block regardless of mix
+            // (the applied cut must advance over every claimed seq or acks hang).
+            let mut apply_insert_offset = 0u64;
             for (offset, item) in winners.iter_mut().enumerate() {
-                rows.push(std::mem::take(&mut item.values));
-                stamps.push(first_seq + offset as u64);
-                txn_ids.push(item.txn_id);
-                row_ids.push(row_id_base + offset as u64);
+                let seq = first_seq + offset as u64;
+                match item.op {
+                    LaneOpKind::Insert => {
+                        rows.push(std::mem::take(&mut item.values));
+                        stamps.push(seq);
+                        txn_ids.push(item.txn_id);
+                        row_ids.push(row_id_base + apply_insert_offset);
+                        apply_insert_offset += 1;
+                    }
+                    LaneOpKind::Delete => {
+                        let target = winner_targets
+                            .get(offset)
+                            .and_then(|target| target.clone())
+                            .expect("a delete winner carries its locate target");
+                        tombstones.push(crate::engine_intent_lanes::LaneTombstone {
+                            shard_id: target.shard_id,
+                            slot: target.slot,
+                            seq,
+                            region: target.region,
+                            filter_idx: item.filter_idx,
+                            pk: item.slot.1,
+                        });
+                    }
+                }
             }
             lanes
                 .apply_queue
@@ -2843,6 +2956,9 @@ impl Engine {
                     row_ids,
                     stamps,
                     txn_ids,
+                    tombstones,
+                    seq_first: first_seq,
+                    seq_len: k,
                     slot: std::sync::Arc::clone(&apply_slot),
                 });
         }
@@ -3174,7 +3290,7 @@ impl Engine {
                         .slot
                         .failed
                         .store(true, std::sync::atomic::Ordering::Release);
-                } else if let (Some(first), len) = (request.stamps.first(), request.stamps.len()) {
+                } else if request.seq_len > 0 {
                     // Advance the applied cut HERE, at apply completion — the
                     // cut is GLOBAL-gating (every lane's acks wait on it);
                     // deferring it to the owning pump measurably inflated
@@ -3182,13 +3298,16 @@ impl Engine {
                     // AUDIT (minor): `done` is stored BEFORE the cut advance
                     // so "cut covers the wave" always implies "its slot is
                     // done" — the settle-side debug_assert's precondition.
+                    // U1: the advance covers the request's WHOLE claimed seq
+                    // block (`stamps` is insert-only; a delete-bearing wave's
+                    // block is wider than its append set).
                     request
                         .slot
                         .done
                         .store(true, std::sync::atomic::Ordering::Release);
-                    let local = first - base;
-                    lanes.record_applied(local, local + len as u64);
-                    applied_rows += len as u64;
+                    let local = request.seq_first - base;
+                    lanes.record_applied(local, local + request.seq_len);
+                    applied_rows += request.stamps.len() as u64;
                     continue;
                 }
                 request
@@ -3236,6 +3355,11 @@ impl Engine {
                     position,
                     "catalog drift between intent build and lane wave (retry)".to_string(),
                 );
+                continue;
+            }
+            // U1: DELETE items resolve via `lane_locate_deletes` (visible-locate); the
+            // insert-dup validate has nothing to check for them.
+            if item.op == LaneOpKind::Delete {
                 continue;
             }
             let key = (&*item.table, item.filter_idx);
@@ -3333,6 +3457,114 @@ impl Engine {
         }
     }
 
+    /// U1: resolve every DELETE item's tombstone target via the coalesced device
+    /// VISIBLE-LOCATE — one launch per (table, filter) group, per-needle snapshots,
+    /// visibility on-device. Verdicts by batch position: `Zero` (no visible row —
+    /// the pre-claim 0-row filter), `One` (the target + its identity pin), `Retry`
+    /// (decline/drift/ambiguity — retryable). Insert items are not touched.
+    fn lane_locate_deletes(
+        &self,
+        batch: &[LaneIntent],
+    ) -> std::collections::BTreeMap<usize, LaneDeleteVerdict> {
+        let mut verdicts = std::collections::BTreeMap::new();
+        if !batch.iter().any(|item| item.op == LaneOpKind::Delete) {
+            return verdicts;
+        }
+        let catalog = self.catalog_snapshot();
+        let mut group_keys: Vec<(&str, u32)> = Vec::new();
+        let mut group_needles: Vec<Vec<i32>> = Vec::new();
+        let mut group_snapshots: Vec<Vec<u64>> = Vec::new();
+        let mut group_positions: Vec<Vec<usize>> = Vec::new();
+        for (position, item) in batch.iter().enumerate() {
+            if item.op != LaneOpKind::Delete {
+                continue;
+            }
+            if catalog.commit_seq != item.prepared_catalog_seq {
+                // The drift violation is already recorded by lane_validate_unique; the
+                // conflict pass consumes it first. Skip the needle.
+                continue;
+            }
+            let key = (&*item.table, item.filter_idx);
+            let group = match group_keys.iter().position(|k| *k == key) {
+                Some(index) => index,
+                None => {
+                    group_keys.push(key);
+                    group_needles.push(Vec::new());
+                    group_snapshots.push(Vec::new());
+                    group_positions.push(Vec::new());
+                    group_keys.len() - 1
+                }
+            };
+            group_needles[group].push(item.slot.1);
+            group_snapshots[group].push(item.read_snapshot);
+            group_positions[group].push(position);
+        }
+        for (group, &(table_name, filter_idx)) in group_keys.iter().enumerate() {
+            let Some(table) = catalog.relational_catalog.get(table_name) else {
+                for &position in &group_positions[group] {
+                    verdicts.insert(
+                        position,
+                        LaneDeleteVerdict::Retry("table dropped (retry)".to_string()),
+                    );
+                }
+                continue;
+            };
+            let locate = self.wave_batch_visible_locate(
+                table,
+                filter_idx as usize,
+                &group_needles[group],
+                &group_snapshots[group],
+            );
+            let Some(locate) = locate else {
+                for &position in &group_positions[group] {
+                    verdicts.insert(
+                        position,
+                        LaneDeleteVerdict::Retry(
+                            "resident visible-locate declined (invalidation window); retry"
+                                .to_string(),
+                        ),
+                    );
+                }
+                continue;
+            };
+            for (needle, &position) in group_positions[group].iter().enumerate() {
+                let verdict = match locate.counts.get(needle) {
+                    Some(0) => LaneDeleteVerdict::Zero,
+                    Some(1) => {
+                        let shard_id = locate.shard_ids[needle];
+                        match locate
+                            .probed
+                            .iter()
+                            .find(|(id, _)| *id == shard_id)
+                            .map(|(_, region)| std::sync::Arc::clone(region))
+                        {
+                            Some(region) => LaneDeleteVerdict::One(
+                                crate::engine_intent_lanes::LaneTombstoneTarget {
+                                    shard_id,
+                                    slot: locate.slots[needle],
+                                    region,
+                                },
+                            ),
+                            None => LaneDeleteVerdict::Retry(
+                                "probed shard vanished mid-locate; retry".to_string(),
+                            ),
+                        }
+                    }
+                    Some(_) => LaneDeleteVerdict::Retry(
+                        "ambiguous visible multiplicity for a unique key (uniqueness \
+                         invariant net); retry"
+                            .to_string(),
+                    ),
+                    None => LaneDeleteVerdict::Retry(
+                        "visible-locate verdict missing; retry".to_string(),
+                    ),
+                };
+                verdicts.insert(position, verdict);
+            }
+        }
+        verdicts
+    }
+
     /// APPLY LEADER body: merge every pending lane request per table and run
     /// ONE open-shard append pass (rows + per-row created_by stamps + row ids).
     /// The leader lock serializes appends, so the PK-index extension chain
@@ -3353,22 +3585,70 @@ impl Engine {
             let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(total);
             let mut row_ids: Vec<u64> = Vec::with_capacity(total);
             let mut stamps: Vec<Index> = Vec::with_capacity(total);
+            let mut tombstones: Vec<crate::engine_intent_lanes::LaneTombstone> = Vec::new();
             for &i in &requests {
                 // MOVE the row vectors (pointer moves) — the leader was cloning
                 // every merged row's SqlValues, ~1900 heap allocs per wave.
                 rows.append(&mut batch[i].rows);
                 row_ids.extend_from_slice(&batch[i].row_ids);
                 stamps.extend_from_slice(&batch[i].stamps);
+                tombstones.append(&mut batch[i].tombstones);
             }
-            let appended = self.auto_admit_on_commit_enabled()
-                && self.try_append_resident_int4_open_shard(
-                    table,
-                    &rows,
-                    crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
-                    Some(&row_ids),
-                );
+            // U1 TOMBSTONE PASS — runs BEFORE the append (a same-key reinsert appended in this
+            // very merged batch must not be visible to the tombstone's slot math; per-lane
+            // ordering already guarantees the delete's seq precedes any later reinsert).
+            // Grouped per (shard_id, locate-time region identity): the cell-liveness recheck
+            // gates each group — a VACUUM/re-admit between locate and apply re-clustered the
+            // slots, so a stale group DECLINES to the rehydrate fallback, never stamps.
+            let mut tombstones_ok = true;
+            if !tombstones.is_empty() {
+                let mut groups: BTreeMap<(u32, u64), Vec<usize>> = BTreeMap::new();
+                for (index, tombstone) in tombstones.iter().enumerate() {
+                    groups
+                        .entry((tombstone.shard_id, tombstone.region.device_ptr()))
+                        .or_default()
+                        .push(index);
+                }
+                for ((shard_id, _region_ptr), members) in &groups {
+                    let region = &tombstones[members[0]].region;
+                    let live = self.shard_write_locate_cell_live(table, *shard_id, region);
+                    let stamped = live
+                        && self.tombstone_resident_shard_slots_stamped(
+                            table,
+                            *shard_id,
+                            &members
+                                .iter()
+                                .map(|&index| (tombstones[index].slot, tombstones[index].seq))
+                                .collect::<Vec<_>>(),
+                        );
+                    if !stamped {
+                        tombstones_ok = false;
+                        break;
+                    }
+                }
+                if tombstones_ok {
+                    // VACUUM #5 churn signal: every stamped tombstone is a dead slot.
+                    self.add_tombstone_churn(table, tombstones.len() as u64);
+                    self.read_state.residency.lane_tombstone_applies.fetch_add(
+                        tombstones.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            }
+            let appended = tombstones_ok
+                && (rows.is_empty()
+                    || (self.auto_admit_on_commit_enabled()
+                        && self.try_append_resident_int4_open_shard(
+                            table,
+                            &rows,
+                            crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
+                            Some(&row_ids),
+                        )));
             if appended {
-                if self.host_install_elision_enabled() && !self.table_install_elided(table) {
+                if !rows.is_empty()
+                    && self.host_install_elision_enabled()
+                    && !self.table_install_elided(table)
+                {
                     let snapshot = self.catalog_snapshot();
                     if self.table_elision_eligible(&snapshot, table) {
                         self.set_table_install_elided(table, true);
@@ -3377,21 +3657,52 @@ impl Engine {
                 continue;
             }
             // Fallback (rare on the lanes path — intents gate on elided,
-            // auto-admit tables): rehydrate the merged batch as upserts and
-            // invalidate per txn, mirroring flush_wave_pending_appends.
+            // auto-admit tables): rehydrate the merged batch as upserts +
+            // key-resolved removals and invalidate per txn, mirroring
+            // flush_wave_pending_appends. U1: the seq window spans appends AND
+            // tombstones; removals are resolved BY KEY against the pre-batch
+            // gather (the tombstones' (shard, slot) targets are exactly what a
+            // declined/stale device state can no longer be trusted for).
             if self.table_install_elided(table) {
-                let first_seq = stamps.first().copied().unwrap_or_default();
-                let last_seq = stamps.last().copied().unwrap_or_default();
+                let first_seq = stamps
+                    .first()
+                    .copied()
+                    .into_iter()
+                    .chain(tombstones.first().map(|t| t.seq))
+                    .min()
+                    .unwrap_or_default();
+                let last_seq = stamps
+                    .last()
+                    .copied()
+                    .into_iter()
+                    .chain(tombstones.last().map(|t| t.seq))
+                    .max()
+                    .unwrap_or_default();
                 let upserts: BTreeMap<u64, Vec<SqlValue>> =
                     row_ids.iter().copied().zip(rows.iter().cloned()).collect();
                 let catalog_table = self
                     .relational_catalog_table(table)
                     .expect("an elided table is in the catalog");
+                let removals = self
+                    .resolve_elided_row_ids_by_int4_key(
+                        &catalog_table,
+                        first_seq.saturating_sub(1),
+                        &tombstones
+                            .iter()
+                            .map(|t| (t.filter_idx as usize, t.pk))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "commit-path invariant violation: tombstone key resolution for \
+                             the merged lane fallback on {table} failed: {err}"
+                        )
+                    });
                 self.rehydrate_elided_table(
                     &catalog_table,
                     first_seq.saturating_sub(1),
                     &upserts,
-                    &Default::default(),
+                    &removals,
                     last_seq,
                 )
                 .unwrap_or_else(|err| {

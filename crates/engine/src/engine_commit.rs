@@ -806,8 +806,12 @@ impl Engine {
             // exact scope (an undecodable tagged record falls back to the conservative global
             // invalidation, same as any unparseable payload).
             if is_binary_wal_record(&entry.payload) {
-                match decode_binary_insert(&entry.payload) {
-                    Ok(record) => {
+                match decode_binary_record(&entry.payload) {
+                    Ok(crate::wal_binary::BinaryWalRecord::Insert(record)) => {
+                        tables.insert(record.table);
+                        continue;
+                    }
+                    Ok(crate::wal_binary::BinaryWalRecord::DeleteByKey(record)) => {
                         tables.insert(record.table);
                         continue;
                     }
@@ -949,7 +953,42 @@ impl Engine {
         entry: &LogEntry,
         cat: &mut DdlCatalogState,
     ) -> Result<Option<AppliedRowMutation>, EngineError> {
-        let record = decode_binary_insert(&entry.payload)?;
+        let record = match decode_binary_record(&entry.payload)? {
+            crate::wal_binary::BinaryWalRecord::Insert(record) => record,
+            crate::wal_binary::BinaryWalRecord::DeleteByKey(record) => {
+                // U1 (W5b): replay a by-key DELETE through the EXACT text-arm apply path — a
+                // synthesized `Command::Delete` with the single pk-equality filter. Replay
+                // re-resolves the key against the replayed state; determinism holds because all
+                // ops on a key were lane-serialized in this same seq order live.
+                let delete = Delete {
+                    table: record.table.clone(),
+                    filter: Some(gpu_db_sql::SelectFilter {
+                        column: record.pk_column.clone(),
+                        op: gpu_db_sql::SelectFilterOp::Eq,
+                        value: SqlValue::Int4(record.pk_value),
+                    }),
+                    filters: Vec::new(),
+                    filter_groups: Vec::new(),
+                };
+                let applied = self.apply_delete(cat, delete, entry.index)?;
+                // LOUD 0-row net: a durable W5b delete record exists only because the live pump
+                // located exactly one visible row (0-row deletes never claim a seq / enter the
+                // WAL). Re-resolving to nothing here is corruption or a replay-determinism bug —
+                // never silently skipped.
+                let Some((table, rows, write_set)) = applied else {
+                    return Err(EngineError::Durability(format!(
+                        "W5b delete record for \"{}\" ({} = {}) re-resolved to 0 rows at replay \
+                         — the live commit located exactly one; refusing the inconsistent replay",
+                        record.table, record.pk_column, record.pk_value
+                    )));
+                };
+                return Ok(Some(AppliedRowMutation::Delete {
+                    table,
+                    rows,
+                    write_set,
+                }));
+            }
+        };
         let table = cat
             .relational_catalog
             .get(&record.table)
