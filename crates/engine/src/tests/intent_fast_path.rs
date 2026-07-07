@@ -689,3 +689,331 @@ fn gpu_async_commit_acks_early_and_recovers_clean_drain() {
         count.rows.row(0).first()
     );
 }
+
+/// U1: poll one covered-DELETE intent to completion, driving the pipeline. `Ok(n)` = rows
+/// affected (0 or 1 by the covered shape).
+fn commit_delete_via_submit(
+    engine: &Engine,
+    txn_ids: &AtomicU64,
+    route: &crate::CoveredDeleteRoute,
+    pk: i32,
+) -> Result<u64, ExecuteError> {
+    let mut ticket = engine
+        .submit_covered_delete_intent(txn_ids.fetch_add(1, Ordering::Relaxed), route, pk)?;
+    let mut spins = 0u64;
+    loop {
+        engine.drive_commit_wave();
+        if let Some(result) = engine.poll_intent(&mut ticket) {
+            return result;
+        }
+        spins += 1;
+        assert!(spins < 10_000_000, "delete intent never settled");
+    }
+}
+
+/// U1 END-TO-END: covered lane DELETE intents — 1-row and 0-row outcomes, dead-twin reinsert
+/// (the visibility-aware rebuild), same-key races (delete/delete and delete/insert in the
+/// un-settled window), rows-affected reporting, and the FIRED counters for the device
+/// visible-locate + in-place tombstone paths (non-vacuity: output parity alone cannot prove
+/// the device arms ran).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_lane_delete_intents_end_to_end() {
+    let path = test_wal_path("lane-delete-e2e");
+    let prior_durability = std::env::var("GPU_DB_WAL_DURABILITY").ok();
+    std::env::set_var("GPU_DB_WAL_DURABILITY", "fua");
+    let mut engine = Engine::with_durable_wal_segment(&path);
+    match &prior_durability {
+        Some(value) => std::env::set_var("GPU_DB_WAL_DURABILITY", value),
+        None => std::env::remove_var("GPU_DB_WAL_DURABILITY"),
+    }
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    // v1 exclusion probe target: a second unique i32 index makes the DELETE route refuse.
+    engine
+        .execute_text(2, "CREATE TABLE t2 (a INT PRIMARY KEY, b INT UNIQUE)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+
+    let txn_ids = AtomicU64::new(10);
+    engine
+        .execute_dml_concurrent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            "INSERT INTO t VALUES (1000000, 0)",
+        )
+        .unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("t")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return; // driverless box
+    }
+    let mut warmed = false;
+    for i in 0..10_000_i32 {
+        engine
+            .execute_dml_concurrent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
+            )
+            .unwrap();
+        if engine.table_install_elided("t") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "table never entered elision on a GPU box");
+
+    let insert_route = engine.prepare_covered_insert_route("t").unwrap();
+    let delete_route = engine.prepare_covered_delete_route("t").unwrap();
+    assert_eq!(delete_route.table(), "t");
+
+    let lanes_mode = crate::engine_intent_lanes::intent_lane_count() >= 2;
+    if !lanes_mode {
+        // Serial arm: delete intents are lanes-only — the refusal is loud, not a fallback.
+        let err = engine
+            .submit_covered_delete_intent(txn_ids.fetch_add(1, Ordering::Relaxed), &delete_route, 1)
+            .map(|_| ())
+            .expect_err("delete intents must refuse without lanes");
+        assert!(err.to_string().contains("intent-lanes"), "{err}");
+        return;
+    }
+
+    // Activate lanes + seed rows 0..200; every insert reports rows_affected == 1.
+    for id in 0..200_i32 {
+        let rows =
+            commit_intent_via_submit(&engine, &txn_ids, &insert_route, &[id, id + 7]).unwrap();
+        assert_eq!(rows, 1, "covered insert reports exactly one row");
+    }
+    let locates_before = engine
+        .read_state
+        .residency
+        .device_visible_locate_hits
+        .load(Ordering::Relaxed);
+    let tombstones_before = engine
+        .read_state
+        .residency
+        .lane_tombstone_applies
+        .load(Ordering::Relaxed);
+
+    // 1-row delete, then the SAME key again (dead twin -> 0 rows), then a never-existed key.
+    assert_eq!(
+        commit_delete_via_submit(&engine, &txn_ids, &delete_route, 50).unwrap(),
+        1,
+        "deleting a visible row affects exactly one row"
+    );
+    assert_eq!(
+        commit_delete_via_submit(&engine, &txn_ids, &delete_route, 50).unwrap(),
+        0,
+        "re-deleting a dead key affects zero rows (pre-claim filter)"
+    );
+    assert_eq!(
+        commit_delete_via_submit(&engine, &txn_ids, &delete_route, 987_654).unwrap(),
+        0,
+        "deleting a never-existing key affects zero rows"
+    );
+
+    // Visibility: id=50 is gone; total row count dropped by exactly one.
+    let rows = select_all_rows(&engine);
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.first() == Some(&SqlValue::Int4(50))),
+        "deleted key must not be visible"
+    );
+
+    // DEAD-TWIN REINSERT (the visibility-aware rebuild's reason to exist): reinserting the
+    // deleted key must succeed and be visible EXACTLY once — and later deletes still locate.
+    assert_eq!(
+        commit_intent_via_submit(&engine, &txn_ids, &insert_route, &[50, 999]).unwrap(),
+        1,
+        "reinserting a deleted key succeeds"
+    );
+    let rows = select_all_rows(&engine);
+    let fifty: Vec<_> = rows
+        .iter()
+        .filter(|row| row.first() == Some(&SqlValue::Int4(50)))
+        .collect();
+    assert_eq!(fifty.len(), 1, "reinserted key visible exactly once");
+    assert_eq!(fifty[0].get(1), Some(&SqlValue::Int4(999)), "new image wins");
+    assert_eq!(
+        commit_delete_via_submit(&engine, &txn_ids, &delete_route, 50).unwrap(),
+        1,
+        "the reinserted row is locatable + deletable (index survived the dead twin)"
+    );
+
+    // SAME-KEY RACES in the un-settled window: two deletes of one key — exactly one wins;
+    // the loser is 0-row or a retryable serialization error, never a second deletion.
+    let mut d1 = engine
+        .submit_covered_delete_intent(txn_ids.fetch_add(1, Ordering::Relaxed), &delete_route, 60)
+        .unwrap();
+    let mut d2 = engine
+        .submit_covered_delete_intent(txn_ids.fetch_add(1, Ordering::Relaxed), &delete_route, 60)
+        .unwrap();
+    let (mut r1, mut r2) = (None, None);
+    let mut spins = 0u64;
+    while r1.is_none() || r2.is_none() {
+        engine.drive_commit_wave();
+        if r1.is_none() {
+            r1 = engine.poll_intent(&mut d1);
+        }
+        if r2.is_none() {
+            r2 = engine.poll_intent(&mut d2);
+        }
+        spins += 1;
+        assert!(spins < 10_000_000, "racing deletes never settled");
+    }
+    let outcomes = [r1.unwrap(), r2.unwrap()];
+    let winners = outcomes
+        .iter()
+        .filter(|o| matches!(o, Ok(1)))
+        .count();
+    assert_eq!(winners, 1, "exactly one racing delete wins: {outcomes:?}");
+    assert!(
+        outcomes.iter().all(|o| match o {
+            Ok(0) | Ok(1) => true,
+            Err(err) => err.to_string().contains("conflict")
+                || err.to_string().contains("intra-wave"),
+            _ => false,
+        }),
+        "loser is 0-row or retryable: {outcomes:?}"
+    );
+
+    // v1 exclusion: a second unique i32 index refuses the DELETE route at prepare.
+    let err = engine.prepare_covered_delete_route("t2").unwrap_err();
+    assert!(
+        err.to_string().contains("ONLY unique i32 index")
+            || err.to_string().contains("not covered"),
+        "{err}"
+    );
+
+    // FIRED counters: the device visible-locate ran and tombstones were stamped in place
+    // (a silent fallback would pass every assertion above while abandoning the design).
+    assert!(
+        engine
+            .read_state
+            .residency
+            .device_visible_locate_hits
+            .load(Ordering::Relaxed)
+            > locates_before,
+        "the coalesced device visible-locate never fired"
+    );
+    assert!(
+        engine
+            .read_state
+            .residency
+            .lane_tombstone_applies
+            .load(Ordering::Relaxed)
+            >= tombstones_before + 3,
+        "in-place tombstone stamps never fired"
+    );
+}
+
+/// U1 RECOVERY: mixed insert/delete lane history replays to a row-identical store — the W5b
+/// by-key records re-resolve deterministically (winner insert replays before its delete;
+/// dead-twin reinsert lands as the visible image), and the reopened engine keeps serving.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_lane_delete_recovery_replays_row_identical() {
+    let path = test_wal_path("lane-delete-recovery");
+    let prior_durability = std::env::var("GPU_DB_WAL_DURABILITY").ok();
+    std::env::set_var("GPU_DB_WAL_DURABILITY", "fua");
+    let mut engine = Engine::with_durable_wal_segment(&path);
+    match &prior_durability {
+        Some(value) => std::env::set_var("GPU_DB_WAL_DURABILITY", value),
+        None => std::env::remove_var("GPU_DB_WAL_DURABILITY"),
+    }
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    let txn_ids = AtomicU64::new(10);
+    engine
+        .execute_dml_concurrent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            "INSERT INTO t VALUES (1000000, 0)",
+        )
+        .unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("t")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let mut warmed = false;
+    for i in 0..10_000_i32 {
+        engine
+            .execute_dml_concurrent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
+            )
+            .unwrap();
+        if engine.table_install_elided("t") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "table never entered elision on a GPU box");
+    if crate::engine_intent_lanes::intent_lane_count() < 2 {
+        return; // lanes-only surface
+    }
+
+    let insert_route = engine.prepare_covered_insert_route("t").unwrap();
+    let delete_route = engine.prepare_covered_delete_route("t").unwrap();
+    for id in 0..100_i32 {
+        assert_eq!(
+            commit_intent_via_submit(&engine, &txn_ids, &insert_route, &[id, id]).unwrap(),
+            1
+        );
+    }
+    // Delete the evens below 40; reinsert two of them with new images; delete a missing key
+    // (0-row: must leave NO record — replay parity proves it).
+    for id in (0..40_i32).step_by(2) {
+        assert_eq!(
+            commit_delete_via_submit(&engine, &txn_ids, &delete_route, id).unwrap(),
+            1
+        );
+    }
+    assert_eq!(
+        commit_delete_via_submit(&engine, &txn_ids, &delete_route, 555_555).unwrap(),
+        0
+    );
+    for id in [2_i32, 4] {
+        assert_eq!(
+            commit_intent_via_submit(&engine, &txn_ids, &insert_route, &[id, id + 5000]).unwrap(),
+            1
+        );
+    }
+    let mut before = select_all_rows(&engine);
+    before.sort();
+    drop(engine); // crash
+
+    let mut recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    let mut after = select_all_rows(&recovered);
+    after.sort();
+    assert_eq!(before, after, "replayed store must be row-identical");
+    // The recovered engine still deletes through the intent surface (route re-prepare
+    // exercises the elision re-entry arm on a recovered lanes engine).
+    let txn_ids = AtomicU64::new(1_000_000);
+    let delete_route = recovered.prepare_covered_delete_route("t").unwrap();
+    assert_eq!(
+        commit_delete_via_submit(&recovered, &txn_ids, &delete_route, 1).unwrap(),
+        1,
+        "post-recovery delete locates and tombstones"
+    );
+    assert_eq!(
+        commit_delete_via_submit(&recovered, &txn_ids, &delete_route, 1).unwrap(),
+        0,
+        "post-recovery dead key reports zero rows"
+    );
+}

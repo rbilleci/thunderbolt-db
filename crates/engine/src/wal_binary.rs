@@ -251,3 +251,32 @@ mod tests {
         assert!(decode_binary_insert(&skewed).is_err());
     }
 }
+
+#[cfg(test)]
+mod w5b_tests {
+    use super::*;
+
+    /// U1: the by-key DELETE record round-trips through the op-dispatch decoder, and a
+    /// truncated/trailing-bytes record fails LOUDLY (never a silent skip).
+    #[test]
+    fn w5b_delete_by_key_round_trips_and_fails_loud() {
+        let payload = encode_binary_delete_by_key("public_accounts", "id", -73).unwrap();
+        assert!(is_binary_wal_record(&payload));
+        match decode_binary_record(&payload).unwrap() {
+            BinaryWalRecord::DeleteByKey(record) => {
+                assert_eq!(record.table, "public_accounts");
+                assert_eq!(record.pk_column, "id");
+                assert_eq!(record.pk_value, -73);
+            }
+            BinaryWalRecord::Insert(_) => panic!("decoded the wrong op"),
+        }
+        assert!(decode_binary_record(&payload[..payload.len() - 1]).is_err());
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert!(decode_binary_record(&trailing).is_err());
+        // Unknown op byte is a loud version-skew error.
+        let mut skewed = payload;
+        skewed[2] = 99;
+        assert!(decode_binary_record(&skewed).is_err());
+    }
+}
