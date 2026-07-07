@@ -5,17 +5,17 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-07. **Base:** `main` @ `dc84e31d`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
+**Updated:** 2026-07-07. **Base:** `main` @ `aaaac1fe`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
 the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first), updates are
 SUSTAINABLE (F3/U4 version-aware device PK index — dup-tolerant, mixed bench 1.4M TPS / 3 rebuilds),
-and **R-ver (read version resolution, PART 1) MERGED** — a plain `SELECT <cols>`/`SELECT *` (no
-WHERE) over a versioned elided table now routes on-device (the SV3b/SV6 visibility conjunct) instead
-of dropping to the CPU-pinned path that rehydrated + de-elided. Three adversarial audits' CRITICALs
-(U2 replay lock-step; F3/U4 write-locate first-match) all fixed + sabotage-verified + regression-gated;
-R-ver two audits MERGE-SAFE. **NEXT: R-ver PART 2** — thread the visibility conjunct through the
-ORDER BY / GROUP BY / DISTINCT sharded sub-bridges (they still REFUSE versioned shards, engine_expr.rs
-~3093); + int8/date-bearing unfiltered scans still de-elide (int4-only routing). Then TYPE COVERAGE
-(#14) → CPU-engine deletion. See memory `u2-lane-update-design`.
+and **R-ver (read version resolution) COMPLETE — PART 1 + PART 2 MERGED**: reads over versioned
+elided tables no longer de-elide/refuse — plain `SELECT`/`SELECT *` route on-device (PART 1) and
+GROUP BY / DISTINCT / ORDER BY thread the SV3b/SV6 visibility conjunct through the sharded sub-bridges
+(PART 2). So MIXED OLTP (read+write on one hot table) is now fully GPU-native for the int4-PK shapes.
+Five adversarial audits across U2/F3/U4/R-ver all MERGE-SAFE; every CRITICAL (U2 replay lock-step;
+F3/U4 write-locate first-match) fixed + sabotage-verified + regression-gated. **NEXT: TYPE COVERAGE
+(#14)** → CPU-engine deletion (ADR-006, the charter's finish line). See memory `u2-lane-update-design`,
+`type-coverage-14`.
 
 ---
 
@@ -111,21 +111,23 @@ lanes loudly — the apply-before-append inversion must never silently serve pha
 index-decline documented as perf cost. Gates: MEGA suites 4/4 (default/lanes6/async arms), FULL GPU sweep
 371/371, engine 491/491 both arms.
 
-## >>> THE ONE NEXT ACTION: R-ver PART 2 — visibility through ORDER BY / GROUP BY / DISTINCT <<<
+## >>> THE ONE NEXT ACTION: TYPE COVERAGE (#14) — the CPU-engine-deletion gate <<<
 
-**R-ver PART 1 shipped (unfiltered projections route on-device; reads no longer de-elide for
-`SELECT <cols>`/`SELECT *`).** The map (memory `u2-lane-update-design`) found the observed plain-scan
-de-elide was an UNROUTABLE-SHAPE cliff, not versioning — the version-aware executor
-(`build_sharded_unified_exec_source` + `ResidentVisibility`, SV3b `deleted_by > read_txn_id` AND SV6
-`created_by <= read_txn_id`) already served projections; the unfiltered scan just wasn't classified.
-Fixed by classifying `int4_projection_all` (Columns + `SELECT *`) → the sharded/general executor.
-**PART 2 = the genuine version-specific gap:** ORDER BY / GROUP BY / DISTINCT over versioned sharded
-tables still hard-REFUSE (`engine_expr.rs` ~3093: "resident visibility filter (SV3b) is not yet wired
-through the DISTINCT / GROUP BY / ORDER BY sharded sub-bridges") — thread `ResidentVisibility`
-through `execute_resident_grouped_via_general` / distinct / ordered sub-bridges so their
-internally-rebuilt predicates AND-in `push_conjuncts` BEFORE group/sort/dedup (else hidden rows leak
-into keys). Bigger than PART 1 (per-bridge plumbing). Also open: int8/date-bearing tables' unfiltered
-scans still de-elide (PART 1 is int4-only). Then → TYPE COVERAGE (#14, the CPU-engine-deletion gate).
+**The mixed-OLTP hot path is now fully GPU-native for the common int4-PK shapes: sustained writes
+(F3/U4) AND reads (R-ver PART 1+2) over versioned tables no longer de-elide/refuse.** R-ver PART 2
+(MERGED) threaded `ResidentVisibility` through the GROUP BY / DISTINCT / ORDER BY sharded sub-bridges
+(the executor computes ONE survivor set `indices` = predicate AND visibility BEFORE group/sort/dedup,
+and every reshaping kernel reads only `indices` — so no per-kernel change; both refusals deleted).
+Gate `grouped_ordered_distinct_over_versioned_elided_hides_tombstones` + the flipped
+`sharded_predicate_null_3vl_on_versioned_shard`; opus audit MERGE-SAFE.
+
+**NEXT: TYPE COVERAGE (#14)** — the true CPU-engine-deletion gate (memory `type-coverage-14`). The
+covered/elided fast path is int4-PK only. Order by leverage: numeric/uuid (i128) + bool (bitmap) are
+incremental (reuse the per-type section machinery); **text LAST** (variable-length forces a new
+append/rollover design); then compound PKs (rejected at parse today). Each type moved onto the GPU
+path shrinks the CPU relational engine's surface until ADR-006 can DELETE it — the charter's finish
+line. Small read residue also open: int8/date-bearing tables' UNFILTERED scans still de-elide (R-ver
+is int4-only projection routing — extend the `int4_projection_all` classifier to int8/date).
 
 **U2 lane UPDATE + F3/U4 COMPLETE + MERGED (2026-07-07):** a covered UPDATE = tombstone-OLD +
 append-NEW at a FRESH new_row_id, both AT APPLY (WAL-first). F3/U4 = the version-aware dup-tolerant
