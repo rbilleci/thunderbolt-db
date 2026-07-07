@@ -88,6 +88,32 @@ fn select_all_rows(engine: &Engine) -> Vec<Vec<SqlValue>> {
     }
 }
 
+/// U1: unordered visibility read + host-side sort. Lane DELETEs version the shard
+/// (deleted_by region), and the ORDER BY / GROUP BY / DISTINCT paths REFUSE versioned
+/// sharded tables (the pre-existing SV3b/SV6 wiring gap — reachable now that deletes
+/// exist on lane tables; VACUUM's dense rebuild un-versions). The unordered scan carries
+/// the full mask-VM visibility filter, so it is the read surface for delete tests.
+fn select_rows_unordered_sorted(engine: &Engine) -> Vec<Vec<SqlValue>> {
+    let mut spins = 0u32;
+    loop {
+        engine.drive_commit_wave();
+        match engine.execute_relational_select_text("SELECT id, v FROM t") {
+            Ok(result) => {
+                let mut rows = result.rows.into_boxed();
+                rows.sort();
+                return rows;
+            }
+            Err(err) => {
+                spins += 1;
+                assert!(
+                    spins < 2_000_000,
+                    "unordered read-back never settled: {err}"
+                );
+            }
+        }
+    }
+}
+
 /// The full E2.1 arc on real hardware: warm a PK'd int4 table into elision,
 /// prepare the covered route, drive concurrent intents through the fast path
 /// (wave-batched device PK validation + device open-shard apply + W5a binary
@@ -698,8 +724,8 @@ fn commit_delete_via_submit(
     route: &crate::CoveredDeleteRoute,
     pk: i32,
 ) -> Result<u64, ExecuteError> {
-    let mut ticket = engine
-        .submit_covered_delete_intent(txn_ids.fetch_add(1, Ordering::Relaxed), route, pk)?;
+    let mut ticket =
+        engine.submit_covered_delete_intent(txn_ids.fetch_add(1, Ordering::Relaxed), route, pk)?;
     let mut spins = 0u64;
     loop {
         engine.drive_commit_wave();
@@ -807,6 +833,10 @@ fn gpu_lane_delete_intents_end_to_end() {
         1,
         "deleting a visible row affects exactly one row"
     );
+    assert!(
+        engine.table_install_elided("t"),
+        "an in-place lane tombstone must not de-elide the table (fallback fired?)"
+    );
     assert_eq!(
         commit_delete_via_submit(&engine, &txn_ids, &delete_route, 50).unwrap(),
         0,
@@ -817,15 +847,26 @@ fn gpu_lane_delete_intents_end_to_end() {
         0,
         "deleting a never-existing key affects zero rows"
     );
+    assert!(
+        engine.table_install_elided("t"),
+        "0-row deletes must not de-elide"
+    );
 
     // Visibility: id=50 is gone; total row count dropped by exactly one.
-    let rows = select_all_rows(&engine);
+    let rows = select_rows_unordered_sorted(&engine);
     assert!(
         !rows
             .iter()
             .any(|row| row.first() == Some(&SqlValue::Int4(50))),
         "deleted key must not be visible"
     );
+    // KNOWN CLIFF (U1 exit finding, open board): a SELECT over a delete-VERSIONED elided
+    // shard falls into the rehydrating host arm and DE-ELIDES the table (the plain-scan
+    // read path lacks the deleted_by visibility conjunct this shape needs). The covered
+    // routes' re-prepare carries the elision RE-ENTRY arm — the production contract until
+    // the read path is wired (Tier-3 mixed read+write gate work).
+    let insert_route = engine.prepare_covered_insert_route("t").unwrap();
+    let delete_route = engine.prepare_covered_delete_route("t").unwrap();
 
     // DEAD-TWIN REINSERT (the visibility-aware rebuild's reason to exist): reinserting the
     // deleted key must succeed and be visible EXACTLY once — and later deletes still locate.
@@ -834,13 +875,20 @@ fn gpu_lane_delete_intents_end_to_end() {
         1,
         "reinserting a deleted key succeeds"
     );
-    let rows = select_all_rows(&engine);
+    let rows = select_rows_unordered_sorted(&engine);
+    let insert_route = engine.prepare_covered_insert_route("t").unwrap();
+    let delete_route = engine.prepare_covered_delete_route("t").unwrap();
+    let _ = &insert_route;
     let fifty: Vec<_> = rows
         .iter()
         .filter(|row| row.first() == Some(&SqlValue::Int4(50)))
         .collect();
     assert_eq!(fifty.len(), 1, "reinserted key visible exactly once");
-    assert_eq!(fifty[0].get(1), Some(&SqlValue::Int4(999)), "new image wins");
+    assert_eq!(
+        fifty[0].get(1),
+        Some(&SqlValue::Int4(999)),
+        "new image wins"
+    );
     assert_eq!(
         commit_delete_via_submit(&engine, &txn_ids, &delete_route, 50).unwrap(),
         1,
@@ -869,16 +917,13 @@ fn gpu_lane_delete_intents_end_to_end() {
         assert!(spins < 10_000_000, "racing deletes never settled");
     }
     let outcomes = [r1.unwrap(), r2.unwrap()];
-    let winners = outcomes
-        .iter()
-        .filter(|o| matches!(o, Ok(1)))
-        .count();
+    let winners = outcomes.iter().filter(|o| matches!(o, Ok(1))).count();
     assert_eq!(winners, 1, "exactly one racing delete wins: {outcomes:?}");
     assert!(
         outcomes.iter().all(|o| match o {
             Ok(0) | Ok(1) => true,
-            Err(err) => err.to_string().contains("conflict")
-                || err.to_string().contains("intra-wave"),
+            Err(err) =>
+                err.to_string().contains("conflict") || err.to_string().contains("intra-wave"),
             _ => false,
         }),
         "loser is 0-row or retryable: {outcomes:?}"
@@ -994,13 +1039,17 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
             1
         );
     }
-    let mut before = select_all_rows(&engine);
-    before.sort();
+    let before = select_rows_unordered_sorted(&engine);
     drop(engine); // crash
 
     let mut recovered = Engine::open_durable_wal_segment(&path).unwrap();
-    let mut after = select_all_rows(&recovered);
-    after.sort();
+    recovered.set_auto_admit_on_commit(true);
+    recovered.set_host_install_elision_enabled(true);
+    recovered.set_binary_wal_records_enabled(true);
+    recovered.set_device_write_locate_enabled(true);
+    recovered.set_device_write_locate_wave_batch_enabled(true);
+    recovered.set_constrained_elision_enabled(true);
+    let after = select_rows_unordered_sorted(&recovered);
     assert_eq!(before, after, "replayed store must be row-identical");
     // The recovered engine still deletes through the intent surface (route re-prepare
     // exercises the elision re-entry arm on a recovered lanes engine).

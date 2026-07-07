@@ -962,12 +962,13 @@ impl Engine {
                 // ops on a key were lane-serialized in this same seq order live.
                 let delete = Delete {
                     table: record.table.clone(),
-                    filter: Some(gpu_db_sql::SelectFilter {
+                    filter: None,
+                    // The binder consumes `filters`/`filter_groups` (`filter` is legacy).
+                    filters: vec![gpu_db_sql::SelectFilter {
                         column: record.pk_column.clone(),
                         op: gpu_db_sql::SelectFilterOp::Eq,
                         value: SqlValue::Int4(record.pk_value),
-                    }),
-                    filters: Vec::new(),
+                    }],
                     filter_groups: Vec::new(),
                 };
                 let applied = self.apply_delete(cat, delete, entry.index)?;
