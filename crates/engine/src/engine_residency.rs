@@ -4698,6 +4698,78 @@ mod capacity_payload_tests {
         assert!(on_hits > 0, "non-vacuity: the device locate fired");
     }
 
+    /// R-ver (read version resolution): a plain unfiltered `SELECT <cols> FROM t` over a VERSIONED
+    /// ELIDED table must (1) stay ELIDED — no de-elide — and (2) hide the tombstoned row. Before
+    /// this slice the unfiltered projection had no resident-route shape, so it dropped to the
+    /// CPU-pinned host path which REHYDRATES + de-elides. Now it routes to the sharded unified
+    /// executor with the SV3b `deleted_by` conjunct threaded. Sabotage: removing the
+    /// `int4_projection_all` route classification de-elides (the read falls to the CPU seam).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn plain_scan_over_versioned_elided_table_stays_elided() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_host_install_elision_enabled(true);
+        e.set_constrained_elision_enabled(true);
+        e.set_device_write_locate_enabled(true);
+        e.set_device_write_locate_wave_batch_enabled(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        let mut seq = 2u64;
+        for chunk in 0..2_i64 {
+            let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                .map(|k| format!("({k},{})", k * 10))
+                .collect();
+            e.execute_text(seq, &format!("INSERT INTO t (id, v) VALUES {}", vals.join(",")))
+                .unwrap();
+            seq += 1;
+        }
+        if !e.table_install_elided("t") {
+            return; // driverless box / never elided -> nothing to prove
+        }
+        // DELETE a row -> the shard becomes VERSIONED (a deleted_by region). Stays elided (U1).
+        e.execute_text(seq, "DELETE FROM t WHERE id = 50").unwrap();
+        seq += 1;
+        assert!(
+            e.table_install_elided("t"),
+            "an in-place tombstone must not de-elide"
+        );
+        // THE GATE: a plain unfiltered scan must NOT de-elide, and must hide the tombstoned row.
+        let rows = e
+            .execute_relational_select_text("SELECT id, v FROM t")
+            .unwrap()
+            .rows
+            .into_boxed();
+        assert!(
+            e.table_install_elided("t"),
+            "a plain scan over a versioned elided table must NOT de-elide (route it on-device)"
+        );
+        assert!(
+            !rows.iter().any(|r| r.first() == Some(&SqlValue::Int4(50))),
+            "the tombstoned row must be hidden by the SV3b deleted_by conjunct"
+        );
+        assert_eq!(rows.len(), 199, "exactly one of the 200 rows is tombstoned");
+        // A second scan still does not de-elide (idempotent, not a one-shot).
+        let _ = e.execute_relational_select_text("SELECT id, v FROM t").unwrap();
+        assert!(e.table_install_elided("t"), "repeat scan stays elided");
+        // `SELECT *` (SelectProjection::All) over the all-int4 table ALSO stays elided + hides the
+        // tombstone (the classifier's All arm routes it on-device too).
+        let star = e
+            .execute_relational_select_text("SELECT * FROM t")
+            .unwrap()
+            .rows
+            .into_boxed();
+        assert!(
+            e.table_install_elided("t"),
+            "SELECT * over a versioned elided table must NOT de-elide"
+        );
+        assert_eq!(star.len(), 199, "SELECT * hides the tombstoned row too");
+        assert!(!star
+            .iter()
+            .any(|r| r.first() == Some(&SqlValue::Int4(50))));
+    }
+
     /// M1 design B — WAVE-TIME batched validation differential: an elided PK'd table runs the
     /// constraint+DML gauntlet with wave-batch ON (device_write_locate + wave_batch) vs the
     /// host-probe oracle (both off). Every outcome (incl 23505 text) + read must match — the
@@ -10670,6 +10742,7 @@ impl Engine {
                 | "int4_range_count"
                 | "int4_between_scalar_aggregate"
                 | "int4_projection"
+                | "int4_projection_all"
                 | "int4_composite_equality_multi_column_projection"
         ) {
             // THE FLIP audit F1: these filtered/range int4 shapes had NO sharded mapping, so the
@@ -10804,6 +10877,7 @@ impl Engine {
                 | "sharded_int4_filtered_scalar_aggregate"
                 | "sharded_int4_between_scalar_aggregate"
                 | "sharded_int4_projection"
+                | "sharded_int4_projection_all"
                 | "sharded_int4_composite_equality_multi_column_projection"
                 | "sharded_int4_equality_projection"
                 | "sharded_int4_equality_multi_column_projection"
@@ -10826,15 +10900,32 @@ impl Engine {
             return decision;
         }
         let mut required_int4_columns = BTreeSet::new();
-        if decision.query_shape == "sharded_int4_equality_multi_column_projection" {
-            let SelectProjection::Columns(columns) = &select.projection else {
-                decision.cache_state = "Absent".to_string();
-                decision.valid = false;
-                decision.reason = "sharded resident routing requires projected columns".to_string();
-                return decision;
-            };
-            for column in columns {
-                required_int4_columns.insert(column.clone());
+        // R-ver: the UNFILTERED projection (`sharded_int4_projection_all`) needs exactly its
+        // projected columns resident — no filter columns (there is no WHERE by shape definition).
+        // It shares the multi-column projection's extraction (the filter loops are no-ops here).
+        if decision.query_shape == "sharded_int4_equality_multi_column_projection"
+            || decision.query_shape == "sharded_int4_projection_all"
+        {
+            match &select.projection {
+                SelectProjection::Columns(columns) => {
+                    for column in columns {
+                        required_int4_columns.insert(column.clone());
+                    }
+                }
+                // R-ver: `SELECT * FROM t` needs EVERY column resident (the classifier already
+                // proved all columns are int4 for the `sharded_int4_projection_all` shape).
+                SelectProjection::All => {
+                    for column in &table.columns {
+                        required_int4_columns.insert(column.name.clone());
+                    }
+                }
+                _ => {
+                    decision.cache_state = "Absent".to_string();
+                    decision.valid = false;
+                    decision.reason =
+                        "sharded resident routing requires projected columns".to_string();
+                    return decision;
+                }
             }
             if let Some(filter) = &select.filter {
                 required_int4_columns.insert(filter.column.clone());

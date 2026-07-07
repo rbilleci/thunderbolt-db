@@ -161,6 +161,19 @@ pub(crate) fn resident_route_query_shape(
                 .selected_indexes
                 .iter()
                 .any(|idx| table.columns[*idx].ty == SqlType::Text);
+            // R-ver (read version resolution): an UNFILTERED projection (`SELECT <cols> FROM t`,
+            // no WHERE) has no resident-route shape today, so it drops to the CPU-pinned host path,
+            // which REHYDRATES + de-elides an ELIDED table (versioned OR not — the cliff is the
+            // unroutable shape, not versioning). The sharded unified executor already serves a plain
+            // projection (predicate = None) with the SV3b `deleted_by` visibility conjunct threaded,
+            // so classify the unfiltered int4 case and route it there (int4-only for now — an elided
+            // table carries no text columns; the general executor's text projection is out of scope).
+            if bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty() {
+                if selected_has_text {
+                    return None;
+                }
+                return Some("int4_projection_all".to_string());
+            }
             let filter_groups = if !bound.filter_groups.is_empty() {
                 bound.filter_groups.clone()
             } else if !bound.filters.is_empty() {
@@ -200,6 +213,21 @@ pub(crate) fn resident_route_query_shape(
                 && filter_groups.len() == 1
                 && filter_groups[0].len() == 1)
                 .then(|| "int4_projection".to_string())
+        }
+        SelectProjection::All => {
+            // R-ver: `SELECT * FROM t` (no WHERE) over an ALL-INT4 resident table routes on-device
+            // like the explicit-column unfiltered projection (order_by/group_by/offset/having are
+            // excluded by the guards above; distinct at the top). Any non-int4 column or a LIMIT
+            // keeps `SELECT *` on the CPU path (the general executor treats All == Columns of every
+            // column, so an all-int4 table projects every column with the SV3b visibility conjunct).
+            let unfiltered =
+                bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty();
+            let all_int4 = table
+                .columns
+                .iter()
+                .all(|column| matches!(column.ty, SqlType::Int4));
+            (unfiltered && all_int4 && select.limit.is_none())
+                .then(|| "int4_projection_all".to_string())
         }
         _ => None,
     }

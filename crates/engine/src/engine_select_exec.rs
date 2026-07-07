@@ -462,6 +462,11 @@ impl Engine {
             | "sharded_int4_filtered_scalar_aggregate"
             | "sharded_int4_between_scalar_aggregate"
             | "sharded_int4_projection"
+            // R-ver: the UNFILTERED int4 projection (SELECT <cols> FROM t, no WHERE). The general
+            // executor runs its plain-projection path with predicate = None and threads the SV3b
+            // `deleted_by` visibility conjunct for versioned shards — so this read stays on the
+            // resident route instead of falling to the CPU-pinned path (which rehydrates + de-elides).
+            | "sharded_int4_projection_all"
             | "sharded_int4_composite_equality_multi_column_projection"
             | "sharded_int4_equality_projection"
             | "sharded_int4_equality_multi_column_projection"
@@ -511,6 +516,11 @@ impl Engine {
             // the probe's phantom Int4(0)). Every FILTER is int4 (text only in the projection), so the int4-only
             // predicate builder suffices. Covers text + CTAS + view uniformly.
             "int4_projection"
+            // R-ver: the UNFILTERED int4 projection on a NON-sharded snapshot-resident table (the
+            // sharded twin is `sharded_int4_projection_all` above). The general executor's
+            // plain-projection path (predicate = None -> every row) serves it, so an unfiltered
+            // scan of a resident table stays on the resident route instead of the CPU-pinned path.
+            | "int4_projection_all"
             | "int4_equality_projection"
             | "int4_equality_multi_column_projection"
             | "int4_composite_equality_multi_column_projection"
