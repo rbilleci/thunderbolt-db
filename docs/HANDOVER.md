@@ -64,6 +64,13 @@ combined read+write gate has never been run (Tier 3 below).
 
 ---
 
+## MEGA-FUSE: EXECUTED, then REVERTED TO `feature/mega-fuse` (2026-07-07, flag-reckoning policy)
+
+Per the user's no-flag-proliferation ruling, the default-OFF mega-fuse arm was REMOVED from main and
+preserved (code + audit + A/B record) on the `feature/mega-fuse` branch: A/B losers do not live on main.
+It returns as a REPLACEMENT (not an alternative) once the cross-lane mega coalescer + WAL-first reorder
+flip its economics. The section below is the executed record.
+
 ## MEGA-FUSE: EXECUTED (2026-07-07) — mechanism proven, ships DEFAULT-OFF, launch economics documented
 
 The ratified next action ran end-to-end: recon → design → implementation → bug-find → fix → gates → A/B →

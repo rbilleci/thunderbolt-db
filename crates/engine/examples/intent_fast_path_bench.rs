@@ -434,10 +434,6 @@ fn run_arm(
                     publ as f64 / lw as f64 / 1e3,
                     apply as f64 / lw as f64 / 1e3,
                 );
-                let mega = engine.mega_fuse_hits();
-                if mega > 0 {
-                    eprintln!("    [mega-fuse: {mega} waves]");
-                }
                 if let Some((active, outstanding, resizes, resize_ns)) =
                     engine.intent_lane_adaptive_stats()
                 {
