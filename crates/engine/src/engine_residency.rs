@@ -7611,6 +7611,22 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// U1: coalesced device VISIBLE-LOCATE launches (lane DELETE target resolution).
+    pub fn device_visible_locate_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .device_visible_locate_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// U1: lane DELETE tombstones stamped IN PLACE by the apply coalescer.
+    pub fn lane_tombstone_applies(&self) -> u64 {
+        self.read_state
+            .residency
+            .lane_tombstone_applies
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// RETIREMENT A4e (audit B1) + TYPE-COVERAGE track 1: may `table` ENTER elision?
     /// Strictly-Int4, no checks, no outbound FKs, NO OTHER TABLE REFERENCES IT — and UNIQUE
     /// indexes (PK'd tables, the core-banking shape) allowed ONLY under

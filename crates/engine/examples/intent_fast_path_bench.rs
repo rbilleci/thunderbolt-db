@@ -34,6 +34,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 struct WriterSample {
     latencies_nanos: Vec<u64>,
     completions_millis: Vec<u64>,
+    /// U1 mixed workload: covered DELETEs this writer completed (0 for insert-only / non-driver).
+    deletes: u64,
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -147,12 +149,30 @@ fn run_arm(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let self_pump = !(arm == Arm::Driver && pumps > 0);
+    // U1 MIXED I/D WORKLOAD (Driver arm only, bench-only knob): GPU_DB_BENCH_MIX_DELETE=P
+    // makes ~P% of the driver's ops covered DELETEs of an OLDER, fully-committed live key
+    // (a trailing cursor lagging the insert cursor — every delete is a guaranteed 1-row hit,
+    // so this measures the pure delete cost + shard versioning under load, not 0-row churn).
+    // Clamped to <50 so the delete cursor can never overtake the insert cursor (starving
+    // targets). 0 (default) = the insert-only champion path, byte-identical.
+    let mix_delete: i64 = std::env::var("GPU_DB_BENCH_MIX_DELETE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+        .clamp(0, 49);
     let segment = wal_dir.join(format!("intent-{name}-c{writers}.wal"));
     remove_segment_files(&segment);
     let engine = build_engine(&segment)?;
     let txn_ids = Arc::new(AtomicU64::new(2));
     let warmed = warm_up_elision(&engine, &txn_ids)?;
     let route = Arc::new(engine.prepare_covered_insert_route("t")?);
+    // U1: the covered-DELETE route (prepared only when the mix is enabled — a driverless /
+    // non-elided warm-up would have already returned above).
+    let delete_route = if arm == Arm::Driver && mix_delete > 0 {
+        Some(Arc::new(engine.prepare_covered_delete_route("t")?))
+    } else {
+        None
+    };
     let engine = Arc::new(engine);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -184,6 +204,7 @@ fn run_arm(
         .map(|w| {
             let engine = Arc::clone(&engine);
             let route = Arc::clone(&route);
+            let delete_route = delete_route.clone();
             let stop = Arc::clone(&stop);
             let txn_ids = Arc::clone(&txn_ids);
             let barrier = Arc::clone(&barrier);
@@ -204,24 +225,57 @@ fn run_arm(
                     // E2.2(c): event-loop driver carrying `window` logical clients. Keep the window
                     // full of in-flight tickets, pump the wave, reap completions, record per-client
                     // end-to-end latency (submit -> durable+published poll), and refill.
-                    let mut inflight: Vec<Option<(gpu_db_engine::IntentTicket, Instant)>> =
+                    // U1: the third tuple field is the op kind (true = DELETE) for the mix report.
+                    let mut inflight: Vec<Option<(gpu_db_engine::IntentTicket, Instant, bool)>> =
                         (0..window).map(|_| None).collect();
+                    // U1 mixed workload: `d` (delete cursor) trails `i` (insert cursor) with a
+                    // settle lag so its target is always a fully-committed live key.
+                    let mut d = 0_i64;
+                    const DELETE_LAG: i64 = 4096;
+                    let mut deletes = 0_u64;
                     while !stop.load(Ordering::Relaxed) {
                         for slot in inflight.iter_mut() {
                             if slot.is_none() {
                                 let txn_id = txn_ids.fetch_add(1, Ordering::Relaxed);
-                                let id = (w as i64 * stride + i) as i32;
-                                i += 1;
+                                // Delete an older live key iff the mix quota is under target AND a
+                                // lagged committed target exists; else insert a fresh key.
+                                let want_delete = mix_delete > 0
+                                    && d + DELETE_LAG < i
+                                    && d * 100 < mix_delete * (i + d);
                                 let submitted = Instant::now();
-                                match engine.submit_covered_insert_intent_with_commit(
-                                    txn_id,
-                                    &route,
-                                    &[id, 1],
-                                    commit_mode,
-                                ) {
-                                    Ok(ticket) => *slot = Some((ticket, submitted)),
-                                    Err(err) => return Err(format!("driver {w} submit: {err}")),
-                                }
+                                let (ticket, is_delete) = if want_delete {
+                                    let key = (w as i64 * stride + d) as i32;
+                                    d += 1;
+                                    let route = delete_route
+                                        .as_ref()
+                                        .expect("delete route present when mix > 0");
+                                    match engine.submit_covered_delete_intent_with_commit(
+                                        txn_id,
+                                        route,
+                                        key,
+                                        commit_mode,
+                                    ) {
+                                        Ok(t) => (t, true),
+                                        Err(err) => {
+                                            return Err(format!("driver {w} delete submit: {err}"))
+                                        }
+                                    }
+                                } else {
+                                    let id = (w as i64 * stride + i) as i32;
+                                    i += 1;
+                                    match engine.submit_covered_insert_intent_with_commit(
+                                        txn_id,
+                                        &route,
+                                        &[id, 1],
+                                        commit_mode,
+                                    ) {
+                                        Ok(t) => (t, false),
+                                        Err(err) => {
+                                            return Err(format!("driver {w} submit: {err}"))
+                                        }
+                                    }
+                                };
+                                *slot = Some((ticket, submitted, is_delete));
                             }
                         }
                         // With dedicated pumps the drivers ONLY submit + poll (the pump threads
@@ -230,9 +284,14 @@ fn run_arm(
                             engine.drive_commit_wave();
                         }
                         for slot in inflight.iter_mut() {
-                            if let Some((ticket, submitted)) = slot {
+                            if let Some((ticket, submitted, is_delete)) = slot {
                                 if let Some(result) = engine.poll_intent(ticket) {
-                                    result.map_err(|err| format!("driver {w}: {err}"))?;
+                                    let rows =
+                                        result.map_err(|err| format!("driver {w}: {err}"))?;
+                                    if *is_delete {
+                                        deletes += 1;
+                                        debug_assert_eq!(rows, 1, "trailing-cursor delete misses");
+                                    }
                                     latencies_nanos.push(submitted.elapsed().as_nanos() as u64);
                                     completions_millis
                                         .push(run_started.elapsed().as_millis() as u64);
@@ -248,9 +307,14 @@ fn run_arm(
                     while pending > 0 {
                         engine.drive_commit_wave();
                         for slot in inflight.iter_mut() {
-                            if let Some((ticket, submitted)) = slot {
+                            if let Some((ticket, submitted, is_delete)) = slot {
                                 if let Some(result) = engine.poll_intent(ticket) {
-                                    result.map_err(|err| format!("driver {w} drain: {err}"))?;
+                                    let rows =
+                                        result.map_err(|err| format!("driver {w} drain: {err}"))?;
+                                    if *is_delete {
+                                        deletes += 1;
+                                        let _ = rows;
+                                    }
                                     latencies_nanos.push(submitted.elapsed().as_nanos() as u64);
                                     completions_millis
                                         .push(run_started.elapsed().as_millis() as u64);
@@ -263,6 +327,7 @@ fn run_arm(
                     return Ok(WriterSample {
                         latencies_nanos,
                         completions_millis,
+                        deletes,
                     });
                 }
                 while !stop.load(Ordering::Relaxed) {
@@ -287,6 +352,7 @@ fn run_arm(
                 Ok(WriterSample {
                     latencies_nanos,
                     completions_millis,
+                    deletes: 0,
                 })
             })
         })
@@ -407,6 +473,21 @@ fn run_arm(
         stats.flush_groups,
         stats.mean_group_size(),
     );
+
+    // U1 MIXED I/D report: the delete share + the device delete-path counters (non-vacuity —
+    // the visible-locate + in-place tombstone counts prove the device arms fired; pk-rebuilds
+    // shows the visibility-aware rebuild stays bounded under delete-versioning churn).
+    let total_deletes: u64 = samples.iter().map(|s| s.deletes).sum();
+    if total_deletes > 0 {
+        eprintln!(
+            "    [mix I/D: ops {total}  deletes {total_deletes} ({:.1}%)  \
+             visible-locates {}  tombstone-applies {}  pk-rebuilds {}]",
+            total_deletes as f64 * 100.0 / total.max(1) as f64,
+            engine.device_visible_locate_hits(),
+            engine.lane_tombstone_applies(),
+            engine.pk_index_rebuilds_diag(),
+        );
+    }
 
     // Attribution recon (stderr, opt-in phase timing).
     {
