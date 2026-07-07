@@ -334,6 +334,7 @@ impl Engine {
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
             outstanding: None,
             synchronous: true,
+            rows_affected: 1,
         })
     }
 
@@ -393,8 +394,11 @@ impl Engine {
                     resolved: None,
                 });
             }
-            // eligibility drift: classic inline fallback (rare)
-            let resolved = self.execute_dml_concurrent(txn_id, &route.synthesize_text(params));
+            // eligibility drift: classic inline fallback (rare). A covered INSERT is
+            // single-row by shape, so a successful classic run affected exactly 1 row.
+            let resolved = self
+                .execute_dml_concurrent(txn_id, &route.synthesize_text(params))
+                .map(|()| 1);
             self.deregister_active_snapshot(read_snapshot);
             return Ok(IntentTicket {
                 outcome: None,
@@ -426,8 +430,8 @@ impl Engine {
             }
             IntentBuild::Fallback(text) => {
                 // Rare drift: run the classic path inline, release the boundary, return a
-                // pre-resolved ticket (poll yields the result once).
-                let resolved = self.execute_dml_concurrent(txn_id, &text);
+                // pre-resolved ticket (poll yields the result once; single-row by shape).
+                let resolved = self.execute_dml_concurrent(txn_id, &text).map(|()| 1);
                 self.deregister_active_snapshot(read_snapshot);
                 Ok(IntentTicket {
                     outcome: None,
@@ -440,7 +444,8 @@ impl Engine {
 
     /// E2.2(c) — poll a submitted intent. Returns `None` while in flight, `Some(result)` exactly
     /// once on completion (releasing the read-snapshot GC boundary), and `None` thereafter.
-    pub fn poll_intent(&self, ticket: &mut IntentTicket) -> Option<Result<(), ExecuteError>> {
+    /// U1: `Ok(n)` carries ROWS AFFECTED (covered INSERT = 1; lane DELETE = 0 or 1).
+    pub fn poll_intent(&self, ticket: &mut IntentTicket) -> Option<Result<u64, ExecuteError>> {
         if let Some(resolved) = ticket.resolved.take() {
             return Some(resolved);
         }
@@ -579,7 +584,7 @@ pub struct IntentTicket {
         Index,
     )>,
     /// A pre-resolved result (the inline classic fallback arm), yielded on the first poll.
-    resolved: Option<Result<(), ExecuteError>>,
+    resolved: Option<Result<u64, ExecuteError>>,
 }
 
 impl IntentTicket {

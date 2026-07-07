@@ -67,7 +67,9 @@ type WavePendingAppends = BTreeMap<
     (
         Vec<Vec<SqlValue>>,
         Vec<u64>,
-        Vec<(usize, Index)>,
+        // (batch position, commit_seq, rows_affected) per buffered item (U1: the flush's
+        // committed entries carry the item's exact applied row count through to the ack).
+        Vec<(usize, Index, u64)>,
         Vec<Index>,
     ),
 >;
@@ -195,14 +197,18 @@ pub(crate) type CommitWaveOutcome = Arc<CommitWaveDone>;
 /// A wave item's completion slot: the payload behind a mutex, the `done` flag an ATOMIC so
 /// waiters can SPIN on completion (a few µs) instead of paying a futex sleep+wake round-trip
 /// per commit — the wakeup latency, not the mutex, dominated the first wave measurement.
+///
+/// U1: the Ok payload is ROWS AFFECTED (INSERT intents = 1; classic wave items = the applied
+/// delta's exact row count; 0-row lane DELETEs complete with Ok(0) at the pre-claim filter) —
+/// the engine's first rows-affected surface, introduced with the lane DELETE intents.
 #[derive(Default)]
 pub(crate) struct CommitWaveDone {
     done: std::sync::atomic::AtomicBool,
-    result: Mutex<Option<Result<(), ExecuteError>>>,
+    result: Mutex<Option<Result<u64, ExecuteError>>>,
 }
 
 impl CommitWaveDone {
-    pub(crate) fn take_if_done(&self) -> Option<Result<(), ExecuteError>> {
+    pub(crate) fn take_if_done(&self) -> Option<Result<u64, ExecuteError>> {
         if !self.done.load(AtomicOrdering::Acquire) {
             return None;
         }
@@ -235,10 +241,13 @@ pub(crate) struct LaneIntent {
     /// STRICT gate (durable AND applied); false acks at the APPLIED cut
     /// (async commit — bounded loss on power failure, consistency preserved).
     pub(crate) synchronous: bool,
+    /// U1: the rows-affected count a settled Ok reports (INSERT intents = 1;
+    /// DELETE intents that reach the wave located exactly one live row).
+    pub(crate) rows_affected: u64,
 }
 
 impl LaneIntent {
-    pub(crate) fn set_outcome(&self, result: Result<(), ExecuteError>) {
+    pub(crate) fn set_outcome(&self, result: Result<u64, ExecuteError>) {
         *self
             .outcome
             .result
@@ -262,7 +271,7 @@ pub(crate) fn new_pending_outcome() -> CommitWaveOutcome {
 }
 
 impl CommitWaveItem {
-    fn set_outcome(&self, result: Result<(), ExecuteError>) {
+    fn set_outcome(&self, result: Result<u64, ExecuteError>) {
         *self
             .outcome
             .result
@@ -321,9 +330,10 @@ impl Default for CommitWaveState {
 /// half of the wave.
 pub(crate) struct CommitWaveTail {
     batch: Vec<CommitWaveItem>,
-    /// `(batch position, commit_seq, appended)` for every item that reached the durable-commit
-    /// point, in wave order (aborted items' outcomes were already set in-section).
-    committed: Vec<(usize, Index, bool)>,
+    /// `(batch position, commit_seq, appended, rows_affected)` for every item that reached the
+    /// durable-commit point, in wave order (aborted items' outcomes were already set in-section).
+    /// `rows_affected` is the applied delta's exact row count — the Ok payload of the ack (U1).
+    committed: Vec<(usize, Index, bool, u64)>,
     last_seq: Index,
     last_position: usize,
     armed: bool,
@@ -696,10 +706,12 @@ impl Engine {
         let outcome = self.enqueue_commit_wave_item(item)?;
         // Blocking client: become the sequencer or spin/park on our own outcome, running the
         // pipeline's pending tails as a fallback claimer (the classic per-statement blocking arm).
+        // (U1: the classic blocking APIs keep their `()` signature — rows-affected surfaces via
+        // the intent path; the count is dropped here, not fabricated.)
         if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
-            return result;
+            return result.map(|_| ());
         }
-        self.await_commit_wave_outcome(&outcome)
+        self.await_commit_wave_outcome(&outcome).map(|_| ())
     }
 
     /// E2.2(c) — build a covered-INSERT wave item (the intent fast path's per-statement item),
@@ -754,9 +766,9 @@ impl Engine {
         }
         let outcome = self.enqueue_commit_wave_item(item)?;
         if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
-            return result;
+            return result.map(|_| ());
         }
-        self.await_commit_wave_outcome(&outcome)
+        self.await_commit_wave_outcome(&outcome).map(|_| ())
     }
 
     /// E2.2(c) — enqueue a built item WITHOUT blocking, returning its completion slot (the
@@ -844,7 +856,7 @@ impl Engine {
     fn pump_as_sequencer_if_idle(
         &self,
         own_outcome: &CommitWaveOutcome,
-    ) -> Option<Result<(), ExecuteError>> {
+    ) -> Option<Result<u64, ExecuteError>> {
         let promote = {
             let mut queue = self.lock_commit_wave_queue();
             if !queue.sequencer_active {
@@ -866,7 +878,7 @@ impl Engine {
     fn await_commit_wave_outcome(
         &self,
         own_outcome: &CommitWaveOutcome,
-    ) -> Result<(), ExecuteError> {
+    ) -> Result<u64, ExecuteError> {
         let outcome: &CommitWaveOutcome = own_outcome;
         loop {
             // Spin first: under load a wave completes within tens of µs, far cheaper to poll than
@@ -1338,7 +1350,7 @@ impl Engine {
         };
         let wall_clock = current_timestamp_micros();
         let mut wave_tail: Option<(Index, usize)> = None;
-        let mut committed: Vec<(usize, Index, bool)> = Vec::with_capacity(batch.len());
+        let mut committed: Vec<(usize, Index, bool, u64)> = Vec::with_capacity(batch.len());
         // Homogeneous fast-INSERT run accumulator (ADR-009's homogeneous-wave shape): consecutive
         // constraint-free INSERTs are installed together by ONE `with_table_mut` per table at run
         // flush. Their re-resolves never read table rows (constraint-free) and their row keys come
@@ -1355,15 +1367,16 @@ impl Engine {
         let flush_fast_run =
             |commit: &mut CommitState,
              fast_run: &mut Vec<(usize, Index, String, WriteDelta)>,
-             committed: &mut Vec<(usize, Index, bool)>| {
+             committed: &mut Vec<(usize, Index, bool, u64)>| {
                 if fast_run.is_empty() {
                     return;
                 }
                 let _ = commit; // the commit_mutex guard is held by the caller for the whole wave
                 let mut by_table: BTreeMap<String, Vec<(WriteDelta, Index)>> = BTreeMap::new();
-                let mut run_meta: Vec<(usize, Index, String)> = Vec::with_capacity(fast_run.len());
+                let mut run_meta: Vec<(usize, Index, String, u64)> =
+                    Vec::with_capacity(fast_run.len());
                 for (position, seq, table, delta) in fast_run.drain(..) {
-                    run_meta.push((position, seq, table.clone()));
+                    run_meta.push((position, seq, table.clone(), delta.rows_affected()));
                     by_table.entry(table).or_default().push((delta, seq));
                 }
                 for (table, deltas) in by_table {
@@ -1375,14 +1388,14 @@ impl Engine {
                             )
                         });
                 }
-                for (position, seq, _table) in run_meta {
+                for (position, seq, _table, rows) in run_meta {
                     commit.repl.mark_applied(seq);
                     self.invalidate_relational_residency_tables_concurrent(
                         &batch[position].residency_tables,
                         batch[position].txn_id,
                         seq,
                     );
-                    committed.push((position, seq, false));
+                    committed.push((position, seq, false, rows));
                 }
             };
         // A4e OPTIMIZATION: wave-BATCHED residency appends. The measured elision residual was
@@ -1399,7 +1412,7 @@ impl Engine {
         // E2.4a — the pending-append flush is a shared method (`flush_wave_pending_appends`) so the
         // serial and sharded sequencer paths keep ONE wave-batched open-shard append code path.
         let flush_appends =
-            |pending: &mut WavePendingAppends, committed: &mut Vec<(usize, Index, bool)>| {
+            |pending: &mut WavePendingAppends, committed: &mut Vec<(usize, Index, bool, u64)>| {
                 self.flush_wave_pending_appends(pending, committed, &batch);
             };
         // M1 design B: WAVE-TIME BATCHED PK-UNIQUE VALIDATION. Eligible INSERTs deferred their
@@ -1580,7 +1593,8 @@ impl Engine {
                 entry.3.push(commit_seq);
                 entry.0.push(values);
                 entry.1.push(row_id);
-                entry.2.push((position, commit_seq));
+                // Intent fast-lane items are single-row covered INSERTs by eligibility.
+                entry.2.push((position, commit_seq, 1));
                 wave_tail = Some((commit_seq, wal_position));
                 hp!(5);
                 continue;
@@ -1644,10 +1658,14 @@ impl Engine {
                         pending_appends.get(table_name)
                     {
                         if !rows.is_empty() {
-                            let first_seq =
-                                items_meta.first().map(|(_, seq)| *seq).unwrap_or_default();
-                            let last_seq =
-                                items_meta.last().map(|(_, seq)| *seq).unwrap_or_default();
+                            let first_seq = items_meta
+                                .first()
+                                .map(|(_, seq, _)| *seq)
+                                .unwrap_or_default();
+                            let last_seq = items_meta
+                                .last()
+                                .map(|(_, seq, _)| *seq)
+                                .unwrap_or_default();
                             let upserts: std::collections::BTreeMap<u64, Vec<SqlValue>> =
                                 row_ids.iter().copied().zip(rows.iter().cloned()).collect();
                             let catalog_table = self
@@ -1843,6 +1861,7 @@ impl Engine {
                     }
                     _ => None,
                 };
+            let item_rows = delta.rows_affected();
             self.apply_delta(delta, commit_seq, None)
                 .unwrap_or_else(|err| {
                     panic!(
@@ -1867,7 +1886,7 @@ impl Engine {
                         .extend(std::iter::repeat(commit_seq).take(rows.len()));
                     entry.0.extend(rows);
                     entry.1.extend(row_ids);
-                    entry.2.push((position, commit_seq));
+                    entry.2.push((position, commit_seq, item_rows));
                 }
                 _ => {
                     self.invalidate_relational_residency_tables_concurrent(
@@ -1875,7 +1894,7 @@ impl Engine {
                         item.txn_id,
                         commit_seq,
                     );
-                    committed.push((position, commit_seq, false));
+                    committed.push((position, commit_seq, false, item_rows));
                 }
             }
             hp!(6);
@@ -1913,7 +1932,7 @@ impl Engine {
         // committed items with auto_admit ON).
         let mut admit_tables: BTreeSet<String> = BTreeSet::new();
         if self.auto_admit_on_commit_enabled() {
-            for (position, _seq, appended) in &committed {
+            for (position, _seq, appended, _rows) in &committed {
                 if !appended {
                     admit_tables.extend(batch[*position].residency_tables.iter().cloned());
                 }
@@ -1940,7 +1959,7 @@ impl Engine {
     fn flush_wave_pending_appends(
         &self,
         pending: &mut WavePendingAppends,
-        committed: &mut Vec<(usize, Index, bool)>,
+        committed: &mut Vec<(usize, Index, bool, u64)>,
         batch: &[CommitWaveItem],
     ) {
         if pending.is_empty() {
@@ -1970,8 +1989,8 @@ impl Engine {
                 // gather at the batch's first seq - 1 (device state is complete through it:
                 // flushes happen in seq order).
                 if self.table_install_elided(&table) {
-                    let first_seq = items.first().map(|(_, seq)| *seq).unwrap_or_default();
-                    let last_seq = items.last().map(|(_, seq)| *seq).unwrap_or_default();
+                    let first_seq = items.first().map(|(_, seq, _)| *seq).unwrap_or_default();
+                    let last_seq = items.last().map(|(_, seq, _)| *seq).unwrap_or_default();
                     let upserts: std::collections::BTreeMap<u64, Vec<SqlValue>> =
                         row_ids.iter().copied().zip(rows.iter().cloned()).collect();
                     let catalog_table = self
@@ -1991,7 +2010,7 @@ impl Engine {
                         )
                     });
                 }
-                for (position, seq) in &items {
+                for (position, seq, _rows) in &items {
                     self.invalidate_relational_residency_tables_concurrent(
                         &batch[*position].residency_tables,
                         batch[*position].txn_id,
@@ -1999,8 +2018,8 @@ impl Engine {
                     );
                 }
             }
-            for (position, seq) in items {
-                committed.push((position, seq, appended));
+            for (position, seq, rows) in items {
+                committed.push((position, seq, appended, rows));
             }
         }
     }
@@ -2088,7 +2107,7 @@ impl Engine {
         // a propose_batch failure aborts the WHOLE wave — identical semantics to a first-item
         // propose failure, since the single-node leader either accepts all or is not leader.
         let mut wave_tail: Option<(Index, usize)> = None;
-        let mut committed: Vec<(usize, Index, bool)> = Vec::with_capacity(n);
+        let mut committed: Vec<(usize, Index, bool, u64)> = Vec::with_capacity(n);
         let mut pending_appends: WavePendingAppends = BTreeMap::new();
         let cut_started = hostphase.then(Instant::now);
         // Pass 1 — settle aborts, collect winners (position + payload parts) in wave order.
@@ -2159,7 +2178,8 @@ impl Engine {
                         entry.3.push(commit_seq);
                         entry.0.push(values);
                         entry.1.push(row_id_base + offset as u64);
-                        entry.2.push((position, commit_seq));
+                        // Sharded winners are single-row covered INSERTs by eligibility.
+                        entry.2.push((position, commit_seq, 1));
                     }
                     // Elided apply, batched: advance the row-id allocator + elision counter by the
                     // whole wave (host store skipped) and mark the block applied once.
@@ -2213,7 +2233,7 @@ impl Engine {
         // Post-publish auto_admit re-admissions stay a SEQUENCER duty (identical to serial).
         let mut admit_tables: BTreeSet<String> = BTreeSet::new();
         if self.auto_admit_on_commit_enabled() {
-            for (position, _seq, appended) in &committed {
+            for (position, _seq, appended, _rows) in &committed {
                 if !appended {
                     admit_tables.extend(batch[*position].residency_tables.iter().cloned());
                 }
@@ -2402,9 +2422,9 @@ impl Engine {
             return; // completion guard (clean=false) wedges idempotently + counts + notifies
         }
         self.publish_committed_seq(tail.last_seq);
-        for (position, _seq, _appended) in &tail.committed {
+        for (position, _seq, _appended, rows) in &tail.committed {
             self.metrics.inc_commit();
-            tail.batch[*position].set_outcome(Ok(()));
+            tail.batch[*position].set_outcome(Ok(*rows));
         }
         tail.armed = false;
         completion.clean = true;
@@ -3465,7 +3485,8 @@ impl Engine {
             if !entry.async_settled {
                 entry.async_settled = true;
                 for item in entry.async_winners.drain(..) {
-                    item.set_outcome(Ok(()));
+                    let rows = item.rows_affected;
+                    item.set_outcome(Ok(rows));
                 }
                 settled = true;
             }
@@ -3490,7 +3511,8 @@ impl Engine {
                 .stat_settled_waves
                 .fetch_add(1, AtomicOrdering::Relaxed);
             for item in entry.winners.into_iter().chain(entry.async_winners) {
-                item.set_outcome(Ok(()));
+                let rows = item.rows_affected;
+                item.set_outcome(Ok(rows));
             }
             settled = true;
         }

@@ -52,7 +52,7 @@ fn commit_intent_via_submit(
     txn_ids: &AtomicU64,
     route: &CoveredInsertRoute,
     params: &[i32],
-) -> Result<(), ExecuteError> {
+) -> Result<u64, ExecuteError> {
     let mut ticket = engine
         .submit_covered_insert_intent(txn_ids.fetch_add(1, Ordering::Relaxed), route, params)
         .expect("submit intent");
@@ -510,7 +510,8 @@ fn gpu_intent_sharded_wave_same_pk_single_winner() {
             .expect("submit dup"),
     );
 
-    let mut results: Vec<Option<Result<(), _>>> = (0..tickets.len()).map(|_| None).collect();
+    let mut results: Vec<Option<Result<u64, ExecuteError>>> =
+        (0..tickets.len()).map(|_| None).collect();
     let mut reaped = 0usize;
     let mut spins = 0u32;
     while reaped < tickets.len() {

@@ -211,6 +211,19 @@ pub(crate) struct WriteDelta {
     pub(crate) mutation: PreparedMutation,
 }
 
+impl WriteDelta {
+    /// U1 rows-affected surface: the exact row count this prepared mutation touches — the value
+    /// a committed item's `Ok(_)` outcome reports (INSERT = rows installed, UPDATE = versions
+    /// rewritten, DELETE = versions tombstoned).
+    pub(crate) fn rows_affected(&self) -> u64 {
+        match &self.mutation {
+            PreparedMutation::Insert { inserted_rows, .. } => inserted_rows.len() as u64,
+            PreparedMutation::Update { installs, .. } => installs.len() as u64,
+            PreparedMutation::Delete { tuple_ids, .. } => tuple_ids.len() as u64,
+        }
+    }
+}
+
 /// The recent-commits ledger: every committed write's `(table, row-key)` and unique-index slot →
 /// the highest `commit_seq` that wrote it (write-half MVCC, Stage 4, conflict-detection §3.3). The
 /// SI write-write check (first-committer-wins) is: a prepared txn with `read_snapshot = S` conflicts
