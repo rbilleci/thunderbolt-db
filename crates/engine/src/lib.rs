@@ -474,7 +474,7 @@ pub struct Engine {
     device_write_locate_enabled: std::sync::atomic::AtomicBool,
     /// E2.5c 2M+ push (b): FUSED merged-apply device pass (one staging HtoD + one launch for
     /// column scatter + created_by/row-id stamps + PK index insert). Default ON (measured
-    /// best-of-3 sustained 1.65M vs 1.41M unfused); opt out with `GPU_DB_FUSED_APPLY=0`,
+    /// best-of-3 sustained 1.65M vs 1.41M unfused); always on (the unfused arm is the ineligible-shape fallback),
     /// settable per engine.
     fused_apply_enabled: std::sync::atomic::AtomicBool,
     /// M1 design B (wave-time batched validation): eligible INSERTs' PK-unique check is DEFERRED

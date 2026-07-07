@@ -248,9 +248,11 @@ impl Engine {
             device_write_locate_enabled: std::sync::atomic::AtomicBool::new(false),
             // Default ON (measured: best-of-3 sustained 1.65M vs 1.41M unfused, p50 21.6ms
             // vs 26.3ms on the champion shape; full GPU parity incl. the reopen/checkpoint
-            // arcs). Opt out with GPU_DB_FUSED_APPLY=0.
-            fused_apply_enabled: std::sync::atomic::AtomicBool::new(
-                std::env::var("GPU_DB_FUSED_APPLY").as_deref() != Ok("0"),
+            // arcs). ALWAYS ON (flag folded per the no-flag-proliferation
+            // ruling): the unfused sequence remains ONLY as the
+            // ineligible-shape fallback (i64 sections / no live index /
+            // in-pass decline), an eligibility dispatch — not configuration.
+            fused_apply_enabled: std::sync::atomic::AtomicBool::new(true
             ),
             device_write_locate_wave_batch_enabled: std::sync::atomic::AtomicBool::new(false),
             tombstone_churn_threshold_override: std::sync::atomic::AtomicU64::new(0),
