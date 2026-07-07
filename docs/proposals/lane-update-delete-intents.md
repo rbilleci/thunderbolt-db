@@ -236,6 +236,14 @@ stands — correct over convenient.
   mixed-bench measurements.
 - **U5 — default flip** of the U/D intent path.
 
+**Flag discipline (per the no-flag-proliferation mandate, 2026-07-07):** the U/D path ships
+behind ONE flag whose WRITTEN EXPIRY is U5 — at the flip the flag and the refuse-U/D arm are
+DELETED in the same slice, not left as config. `GPU_DB_BENCH_MIX` is a bench knob, not product
+config. U4's mega arm carries no new flag: it extends `GPU_DB_MEGA_FUSE`, whose own
+expiry/deletion decision belongs to the mega economics follow-up — if that follow-up loses, the
+mega U/D op codes are never written; if it wins, the classic-vs-mega A/B verdict slice deletes
+the losing arm.
+
 Remaining **[DECIDE]**s: U4's VACUUM `max_created_by` unpin (§3.6); PK-update v2 (cross-lane
 two-phase vs quiesce-only — defer until a workload demands it); who implements U1
 (mega-fuse author offered; ownership is the user's call).
