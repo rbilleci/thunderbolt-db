@@ -5,9 +5,14 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-07. **Base:** `main` @ `6856ebcd`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
-lane DELETE intents COMPLETE + merged (WAL-first, fence-bound acks); lane UPDATE (U2) CHECKPOINTED on
-`feature/lane-update-intents` @ `9d85e1ca` (WAL layer done, resume via memory `u2-lane-update-design`).
+**Updated:** 2026-07-07. **Base:** `main` @ `d219a489`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
+the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first). **U2 lane
+UPDATE + F3/U4 (version-aware device PK index) MERGED** — updates now tombstone-OLD + append-NEW
+at a fresh new_row_id, and the dup-tolerant index means SUSTAINED updates no longer de-elide
+(mixed bench 1.4M TPS / 3 pk-rebuilds; was de-elide-every-update → panic). Two adversarial audits'
+CRITICALs (U2 replay lock-step assert; F3/U4 write-locate first-match) all fixed + sabotage-verified
++ regression-gated. **NEXT: the READ-path version resolution** (reads still de-elide versioned
+shards — the Tier-3 read twin of F3/U4). See memory `u2-lane-update-design`.
 
 ---
 
@@ -103,17 +108,30 @@ lanes loudly — the apply-before-append inversion must never silently serve pha
 index-decline documented as perf cost. Gates: MEGA suites 4/4 (default/lanes6/async arms), FULL GPU sweep
 371/371, engine 491/491 both arms.
 
-## >>> THE ONE NEXT ACTION: RESUME U2 (lane UPDATE intents) <<<
+## >>> THE ONE NEXT ACTION: READ-PATH VERSION RESOLUTION (the Tier-3 read twin of F3/U4) <<<
 
-**Branch `feature/lane-update-intents` @ `9d85e1ca` — the W5b `OP_UPDATE_BY_KEY` WAL layer is DONE
-+ committed + codec-tested; the replay arm is a LOUD STUB.** Resume via memory
-`u2-lane-update-design` (the full remaining plan). An UPDATE rides the merged WAL-first delete
-architecture: tombstone-OLD + append-NEW, both AT APPLY (off the pump critical path). Remaining:
-op model (`LaneOpKind::Update`), route + submit API, pump WAL-first (claim seq + new-version
-row_id, WAL the record, no pump-time locate), APPLY REORDER (locate old → tombstone → CONDITIONAL
-new-version append), the CORRECTNESS-CRITICAL replay arm (allocator lock-step incl. the 0-row
-case), rows-affected, gates + audit + merge. Known cost: UPDATE creates a dead twin (F3/U4 rebuild
-churn under readers).
+**F3/U4 made the WRITE path version-aware; READS are the remaining twin.** The read-path first-match
+dense probe DECLINES versioned shards (a shard with a `deleted_by` region) → host-fallback →
+DE-ELIDE, so any point/scan read after an update or delete de-elides the table (`select_rows_*`
+in the U2/U1 tests re-prepare the route to re-enter elision after every read — the workaround).
+The FIX is the read analog of what F3/U4 just did for writes: make the read probe resolve the
+snapshot-visible version among twins instead of declining — the same on-device visibility
+machinery (`gpu_db_resident_multi_shard_i32_visible_locate` walks the chain + evaluates
+created_by/deleted_by) the write path now rides. This closes the last hot-path "de-elide on read
+after write" cliff and makes MIXED OLTP (read+write on one hot table) fully GPU-native. Also
+reachable: ORDER BY / GROUP BY / DISTINCT refuse versioned sharded tables (SV3b/SV6 gap).
+
+**U2 lane UPDATE + F3/U4 COMPLETE + MERGED (2026-07-07):** a covered UPDATE = tombstone-OLD +
+append-NEW at a FRESH new_row_id, both AT APPLY (WAL-first). F3/U4 = the version-aware dup-tolerant
+device PK index (2 insert kernels + write-locate advance-past-match + `build_visible` dup_tolerant
+gated on `deleted_stamps.is_some()`) so SUSTAINED updates no longer de-elide (mixed bench 1.4M TPS
+/ 3 pk-rebuilds; was de-elide-every-update → panic). Two adversarial audits: U2 CRITICAL (replay
+lock-step assert assumed rowid-order==seq-order under concurrent lanes — FALSE, removed) + F3/U4
+CRITICALs 1/2 (write-locate first-match missed same-shard twins → point read empty + INSERT bypass
+— fixed) all FIXED + sabotage-verified + regression-gated (`device_locate_same_shard_twin_*`,
+`gpu_lane_update_sustained_stays_elided`, the high-water recovery gate). MEDIUM (elided_commit_delta
+old-row removal) closed via `old_row_ids`. Gates: FULL GPU sweep 377/377, engine CPU 493, clippy
+clean. Mixed I:U:D bench arm (`GPU_DB_BENCH_MIX_UPDATE`, bench-only). Memory `u2-lane-update-design`.
 
 **TIER-1 DELETE PATH COMPLETE + MERGED (2026-07-07):** lane DELETE intents (U1) shipped, then made
 WAL-FIRST — the delete locate + tombstone + rows-affected moved OFF the pump critical path to
