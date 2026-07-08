@@ -5,19 +5,25 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-07. **Base:** `main` @ `b16f791f`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
+**Updated:** 2026-07-08. **Base:** `main` @ `13d8d645`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
 the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first), updates are
 SUSTAINABLE (F3/U4 version-aware device PK index — dup-tolerant, mixed bench 1.4M TPS / 3 rebuilds),
 **R-ver (read version resolution) COMPLETE — PART 1 + PART 2 MERGED** (reads over versioned elided
-tables no longer de-elide/refuse — plain `SELECT`/`SELECT *` on-device + GROUP BY / DISTINCT / ORDER
-BY thread the SV3b/SV6 visibility conjunct through the sharded sub-bridges), so MIXED OLTP is fully
-GPU-native for the int4-PK shapes. **TYPE COVERAGE #14 — NUMERIC/UUID (b128) MERGED (`b16f791f`):**
-16-byte fixed-width value columns (NUMERIC via LE mantissa, UUID via raw bytes) now ride the elided
-device shard path — admit/append/rollover, the b128 recompaction gather into the unified exec source,
-plain-column ORDER BY routes to the GPU sort. Six adversarial audits across U2/F3/U4/R-ver/numeric all
-MERGE-SAFE; every CRITICAL fixed + sabotage-verified + regression-gated. **NEXT TYPE COVERAGE #14
-tracks:** bool (bitmap), text LAST (variable-length), compound PKs (don't parse today) → CPU-engine
-deletion (ADR-006, the charter's finish line). See memory `type-coverage-14`, `u2-lane-update-design`.
+tables no longer de-elide/refuse), so MIXED OLTP is fully GPU-native for the int4-PK shapes.
+**TYPE COVERAGE #14 per-type arc:** int4/date/int2 → int8/timestamp → **NUMERIC/UUID (b128) MERGED
+(`b16f791f`)** → **BOOL MERGED (`13d8d645`)**. Bool is BIT-PACKED (1 bit/row, the terminal columnar
+rep) via TWO new PTX kernels — `set_bool_bitmap_range` (incremental atomicOr append into pre-zeroed
+headroom; makes bool ELIDE, since elision needs a handled device append) + `gather_bool_bitmap_from_
+shard` (ALIGNMENT-FREE cross-shard bit repack, because shards seal at arbitrary non-32-aligned row
+counts so a byte-copy can't concatenate bitmaps). Rehydration gather now materializes bool (filtered/
+ORDER-BY-key shapes fall to CPU-pinned + rehydrate instead of hard-erroring). Seven adversarial audits
+across U2/F3/U4/R-ver/numeric/bool all MERGE-SAFE; every CRITICAL/HIGH fixed + sabotage-verified +
+regression-gated. **NEXT TYPE COVERAGE #14:** text LAST (variable-length — offset rebasing across
+shards), compound PKs (don't parse today) → CPU-engine deletion (ADR-006, the charter's finish line).
+**KNOWN GAP (pre-existing, shared numeric+bool):** `gather_resident_table_rows_from_device` still
+declines NUMERIC/UUID (b128 reassembly) on rehydration — a filtered numeric projection on an elided
+numeric table hard-errors; bool is fixed, numeric is a small b128-reassembly follow-up.
+See memory `type-coverage-14`, `u2-lane-update-design`.
 
 ---
 
