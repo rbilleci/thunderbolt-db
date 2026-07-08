@@ -358,10 +358,11 @@ pub(crate) fn i32_section_needle(ty: gpu_db_sql::SqlType, value: &SqlValue) -> O
 /// locate — only a rare, bounded extra recheck. Collision frequency is bounded per shard by the shard
 /// floor (a probe is already O(shards); the recheck adds a constant factor, not a new scalability class).
 ///
-/// The fold is ORDER-SENSITIVE (the key-column order is part of the tuple identity) and computed ONLY on
-/// the host (needles, the shard-gather rebuild, and the incremental append all fold in Rust), so there is
-/// no host/device fingerprint-divergence surface. `key == 0` is fine: the slot packs `(key<<32)|(row+1)`
-/// and `row+1 >= 1`, so a packed slot is never the empty-slot sentinel 0.
+/// The fold is ORDER-SENSITIVE (the key-column order is part of the tuple identity). It runs on the HOST
+/// for probe needles + the incremental append, and ON THE DEVICE for the index rebuild
+/// (`COMPOUND_FOLD_PTX` / `sql_value_key_words`, which is BYTE-IDENTICAL to this function — that
+/// host/device agreement is the load-bearing invariant a divergence would break). `key == 0` is fine: the
+/// slot packs `(key<<32)|(row+1)` and `row+1 >= 1`, so a packed slot is never the empty-slot sentinel 0.
 pub(crate) fn compound_key_fingerprint(vals: &[i32]) -> i32 {
     let mut h: u32 = 0x811C_9DC5; // FNV-1a offset basis
     for &v in vals {
@@ -399,19 +400,32 @@ pub(crate) fn index_key_column_positions(
         .collect()
 }
 
-/// COMPOUND KEYS: is EVERY key column of `index` an i32-SECTION type (Int4/Date/Int2)? This is the
-/// slice-1 support boundary — the fingerprint folds i32-section values only; a key column of any wider
-/// type keeps the compound key REJECTED at DDL and OFF the elision path (honest partial coverage, exactly
-/// as the single-column path began int4-only).
-pub(crate) fn index_all_key_columns_i32_section(
+/// COMPOUND KEYS: can `index` be validated by the DEVICE PK-index probe? The answer differs by arity,
+/// because the two paths store different things:
+///   - SINGLE-column key: the device index stores the RAW i32 key, so ONLY an i32-section key column
+///     (Int4/Date/Int2) is probeable (an i64 raw key does not fit — such a table must NOT elide).
+///   - COMPOUND key: every key column folds its i32-word decomposition into a 32-bit surrogate
+///     FINGERPRINT, so ANY foldable type (i32-section + i64-section today; b128/text are follow-ups) is
+///     probeable (see [`compound_key_type_supported`]).
+/// A key column of an unsupported type keeps the index OFF the elision path (honest partial coverage).
+pub(crate) fn index_all_key_columns_foldable(
     table: &RelationalTable,
     index: &RelationalIndex,
 ) -> bool {
-    index.key_columns.iter().all(|name| {
+    if index_is_compound(index) {
+        index.key_columns.iter().all(|name| {
+            table
+                .columns
+                .iter()
+                .find(|c| &c.name == name)
+                .is_some_and(|c| compound_key_type_supported(c.ty))
+        })
+    } else {
+        // Single-column: raw i32 key -> i32-section only (byte-identical to the pre-compound gate).
         table
             .columns
             .iter()
-            .find(|c| &c.name == name)
+            .find(|c| c.name == index.column)
             .is_some_and(|c| {
                 matches!(
                     c.ty,
@@ -420,7 +434,7 @@ pub(crate) fn index_all_key_columns_i32_section(
                         | gpu_db_sql::SqlType::Int2
                 )
             })
-    })
+    }
 }
 
 /// COMPOUND KEYS: the device-probe key id for `index` (see [`COMPOUND_KEY_ID_FLAG`]). `ordinal` is the
@@ -470,12 +484,49 @@ pub(crate) fn compound_index_row_fingerprint(
     index: &RelationalIndex,
     values: &[SqlValue],
 ) -> Option<i32> {
-    let mut scratch: Vec<i32> = Vec::with_capacity(index.key_columns.len());
+    let mut words: Vec<i32> = Vec::with_capacity(index.key_columns.len());
     for name in &index.key_columns {
         let pos = table.columns.iter().position(|c| &c.name == name)?;
-        scratch.push(i32_section_needle(table.columns[pos].ty, values.get(pos)?)?);
+        words.extend(sql_value_key_words(table.columns[pos].ty, values.get(pos)?)?);
     }
-    Some(compound_key_fingerprint(&scratch))
+    Some(compound_key_fingerprint(&words))
+}
+
+/// COMPOUND KEYS (wider types, TYPE-COVERAGE #14 Track 3): the ORDERED i32 WORDS of a key column's
+/// value, matching the on-device section's LITTLE-ENDIAN byte layout EXACTLY so the host fold (needle /
+/// append / SI slot) and the device fold (`gpu_db_compound_fold_fingerprints`, which reads the raw
+/// section words) agree byte-for-byte. Int4/Date -> `[v]`; Int2 -> `[widened v]`; Int8/Timestamp ->
+/// `[low32, high32]` (the i64 section stores `value.to_le_bytes()`, read as two LE i32 words). `None`
+/// for NULL or an unsupported key type -> the caller declines the device fast path (host validates).
+pub(crate) fn sql_value_key_words(ty: gpu_db_sql::SqlType, value: &SqlValue) -> Option<Vec<i32>> {
+    match (ty, value) {
+        (gpu_db_sql::SqlType::Int4, SqlValue::Int4(v)) => Some(vec![*v]),
+        (gpu_db_sql::SqlType::Date, SqlValue::Date(v)) => Some(vec![*v]),
+        (gpu_db_sql::SqlType::Int2, SqlValue::Int2(v)) => Some(vec![i32::from(*v)]),
+        (gpu_db_sql::SqlType::Int8, SqlValue::Int8(v))
+        | (gpu_db_sql::SqlType::Timestamp, SqlValue::Timestamp(v)) => {
+            let bits = *v as u64;
+            Some(vec![bits as u32 as i32, (bits >> 32) as u32 as i32])
+        }
+        _ => None,
+    }
+}
+
+/// COMPOUND KEYS (wider types): the number of i32 WORDS a key column of type `ty` occupies in its
+/// device section (Int4/Date/Int2 -> 1 word in the i32 section; Int8/Timestamp -> 2 words in the i64
+/// section). `None` for a type not yet supported as a compound key column (b128/text are follow-ups).
+/// A type is a valid compound key column IFF this returns `Some`.
+pub(crate) fn key_column_width_words(ty: gpu_db_sql::SqlType) -> Option<u32> {
+    match ty {
+        gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2 => Some(1),
+        gpu_db_sql::SqlType::Int8 | gpu_db_sql::SqlType::Timestamp => Some(2),
+        _ => None,
+    }
+}
+
+/// COMPOUND KEYS: `true` when `ty` is supported as a compound key column (see [`key_column_width_words`]).
+pub(crate) fn compound_key_type_supported(ty: gpu_db_sql::SqlType) -> bool {
+    key_column_width_words(ty).is_some()
 }
 
 /// COMPOUND KEYS: the SI-ledger integer conflict slot id for a compound unique index. The top bit is
@@ -8435,7 +8486,7 @@ impl Engine {
         let mut has_unique = false;
         for index in table.indexes.iter().filter(|index| index.unique) {
             has_unique = true;
-            if !index_all_key_columns_i32_section(table, index) {
+            if !index_all_key_columns_foldable(table, index) {
                 return false;
             }
         }
@@ -8529,7 +8580,7 @@ impl Engine {
             // (TYPE-COVERAGE #14 Track 3): EVERY key column must be i32-section — a compound
             // key over i32-section columns folds to a fingerprint surrogate that rides the
             // same i32 device index (`compound_key_fingerprint`).
-            !index.unique || index_all_key_columns_i32_section(table, index)
+            !index.unique || index_all_key_columns_foldable(table, index)
         }) && unique_ok
             && table.check_constraints.is_empty()
             && table.foreign_keys.is_empty()
@@ -9110,6 +9161,7 @@ impl Engine {
                     shard_device_memory.device_ptr(),
                     row_count,
                     &column_values,
+                    new_rows,
                 );
                 if let Some(started) = idx_started {
                     crate::engine_dml_concurrent::WAVE_DEVICE_STATS[2].fetch_add(

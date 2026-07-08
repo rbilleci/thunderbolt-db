@@ -539,20 +539,16 @@ impl Engine {
         table: &RelationalTable,
         group: &[(usize, SelectFilterOp, SqlValue)],
     ) -> Option<(usize, i32)> {
-        let mut eqs: Vec<(usize, i32)> = Vec::new();
+        // Every Eq predicate in the group, by column (first occurrence wins).
+        let mut eqs: Vec<(usize, &SqlValue)> = Vec::new();
         for (idx, op, value) in group {
-            if *op == SelectFilterOp::Eq {
-                if let Some(needle) = table
-                    .columns
-                    .get(*idx)
-                    .and_then(|column| crate::engine_residency::i32_section_needle(column.ty, value))
-                {
-                    if !eqs.iter().any(|(existing, _)| existing == idx) {
-                        eqs.push((*idx, needle));
-                    }
-                }
+            if *op == SelectFilterOp::Eq && !eqs.iter().any(|(existing, _)| existing == idx) {
+                eqs.push((*idx, value));
             }
         }
+        // Prefer a COMPOUND unique index whose EVERY key column is Eq-covered by a FOLDABLE value
+        // (i32/i64 sections). Fold each column's i32 WORDS (`sql_value_key_words`) in key-column order,
+        // byte-matching the device-built index.
         for (ord, index) in table
             .indexes
             .iter()
@@ -563,12 +559,19 @@ impl Engine {
             else {
                 continue;
             };
-            let mut words = Vec::with_capacity(positions.len());
+            let mut words: Vec<i32> = Vec::with_capacity(positions.len());
             if positions.iter().all(|p| {
                 match eqs.iter().find(|(idx, _)| idx == p) {
-                    Some((_, needle)) => {
-                        words.push(*needle);
-                        true
+                    Some((_, value)) => {
+                        match table.columns.get(*p).and_then(|column| {
+                            crate::engine_residency::sql_value_key_words(column.ty, value)
+                        }) {
+                            Some(column_words) => {
+                                words.extend(column_words);
+                                true
+                            }
+                            None => false,
+                        }
                     }
                     None => false,
                 }
@@ -577,7 +580,15 @@ impl Engine {
                 return Some((key_id, crate::engine_residency::compound_key_fingerprint(&words)));
             }
         }
-        eqs.first().copied()
+        // Single-column key fallback: the first i32-section Eq -> `(col_idx, raw i32 needle)` (a
+        // single-column key stores the raw i32; byte-identical to the prior behavior).
+        eqs.iter().find_map(|(idx, value)| {
+            table
+                .columns
+                .get(*idx)
+                .and_then(|column| crate::engine_residency::i32_section_needle(column.ty, value))
+                .map(|needle| (*idx, needle))
+        })
     }
 
     pub(crate) fn resolve_dml_matches_via_device(

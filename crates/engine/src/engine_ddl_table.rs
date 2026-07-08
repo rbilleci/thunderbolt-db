@@ -88,32 +88,28 @@ impl Engine {
         let name = create.table;
         let mut indexes = Vec::new();
         let mut checks = Vec::new();
-        // TYPE-COVERAGE #14 Track 3: compound PK/UNIQUE over i32-SECTION columns (Int4/Date/Int2) is
-        // device-native (folded to a surrogate fingerprint key — see `compound_key_fingerprint`).
-        // A compound key touching any WIDER type stays REJECTED (honest partial coverage: the
-        // fingerprint folds i32-section values only), so nothing silently-wrong ships.
-        let compound_key_i32_ok = |cols: &[String]| -> bool {
+        // TYPE-COVERAGE #14 Track 3: compound PK/UNIQUE over SUPPORTED key-column types (i32-section
+        // Int4/Date/Int2 + i64-section Int8/Timestamp) is device-native (each column's i32-word
+        // decomposition folds into a surrogate fingerprint — see `compound_key_fingerprint` /
+        // `sql_value_key_words`). A compound key touching any UNSUPPORTED type stays REJECTED (honest
+        // partial coverage; b128/text are follow-ups), so nothing silently-wrong ships.
+        let compound_key_ok = |cols: &[String]| -> bool {
             cols.iter().all(|name| {
                 columns.iter().find(|c| &c.name == name).is_some_and(|c| {
-                    matches!(
-                        c.ty,
-                        gpu_db_sql::SqlType::Int4
-                            | gpu_db_sql::SqlType::Date
-                            | gpu_db_sql::SqlType::Int2
-                    )
+                    crate::engine_residency::compound_key_type_supported(c.ty)
                 })
             })
         };
         if primary_key
             .as_ref()
-            .is_some_and(|pk| pk.columns.len() > 1 && !compound_key_i32_ok(&pk.columns))
+            .is_some_and(|pk| pk.columns.len() > 1 && !compound_key_ok(&pk.columns))
             || unique_constraints
                 .iter()
-                .any(|u| u.columns.len() > 1 && !compound_key_i32_ok(&u.columns))
+                .any(|u| u.columns.len() > 1 && !compound_key_ok(&u.columns))
         {
             return Err(EngineError::ApplyFailed(
                 "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                 (compound key columns must be int4, int2, or date)"
+                 (compound key columns must be int4, int2, date, int8, or timestamp)"
                     .to_string(),
             ));
         }
@@ -305,18 +301,13 @@ impl Engine {
             )));
         };
         if create.unique && column_idxs.len() > 1 {
-            let all_i32_section = column_idxs.iter().all(|&i| {
-                matches!(
-                    table.columns[i].ty,
-                    gpu_db_sql::SqlType::Int4
-                        | gpu_db_sql::SqlType::Date
-                        | gpu_db_sql::SqlType::Int2
-                )
+            let all_supported = column_idxs.iter().all(|&i| {
+                crate::engine_residency::compound_key_type_supported(table.columns[i].ty)
             });
-            if !all_i32_section {
+            if !all_supported {
                 return Err(EngineError::ApplyFailed(
                     "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                     (compound key columns must be int4, int2, or date)"
+                     (compound key columns must be int4, int2, date, int8, or timestamp)"
                         .to_string(),
                 ));
             }

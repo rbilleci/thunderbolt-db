@@ -4621,15 +4621,15 @@ fn insert_i32_unique_needle_at(
     Some((filter_idx, needle))
 }
 
-/// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): the coerced i32-section value of `index`'s key column
-/// `name` in this insert's single row — the shared per-column bind used by both the probe needle and
-/// the recheck tuple. `None` if the column is missing from the row or coerces to a non-i32-section
-/// value (e.g. NULL). Returns `(catalog_column_idx, coerced_value, i32_needle)`.
+/// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): the coerced value of `index`'s key column `name` in this
+/// insert's single row — the shared per-column bind used by both the probe needle (folded to words) and
+/// the recheck tuple. `None` if the column is missing from the row. Returns `(catalog_column_idx,
+/// coerced_value)`.
 fn insert_key_column_bind(
     insert: &Insert,
     table: &RelationalTable,
     name: &str,
-) -> Option<(usize, SqlValue, i32)> {
+) -> Option<(usize, SqlValue)> {
     let filter_idx = table.columns.iter().position(|c| c.name == *name)?;
     let column_ty = table.columns[filter_idx].ty;
     let row = insert.rows.first()?;
@@ -4639,13 +4639,13 @@ fn insert_key_column_bind(
         insert.columns.iter().position(|c| c == name)?
     };
     let coerced = coerce_filter_literal(row.get(source_pos)?.clone(), column_ty);
-    let needle = crate::engine_residency::i32_section_needle(column_ty, &coerced)?;
-    Some((filter_idx, coerced, needle))
+    Some((filter_idx, coerced))
 }
 
 /// COMPOUND KEYS: bind the DEVICE-PROBE `(key_id, needle)` for `index` against this insert's row.
-/// Single-column -> `(col_idx, raw i32)`; compound -> `(FLAG | ord, fingerprint)`. `None` if any key
-/// column can't bind (the caller falls to full host validation).
+/// Single-column -> `(col_idx, raw i32)`; compound -> `(FLAG | ord, fingerprint)` folded over every key
+/// column's i32 WORDS (`sql_value_key_words` — i64 keys contribute 2 words). `None` if any key column
+/// can't bind / is an unsupported key value (the caller falls to full host validation).
 fn insert_index_probe_needle(
     insert: &Insert,
     table: &RelationalTable,
@@ -4653,14 +4653,18 @@ fn insert_index_probe_needle(
     ord: usize,
 ) -> Option<(usize, i32)> {
     if crate::engine_residency::index_is_compound(index) {
-        let mut scratch: Vec<i32> = Vec::with_capacity(index.key_columns.len());
+        let mut words: Vec<i32> = Vec::with_capacity(index.key_columns.len());
         for name in &index.key_columns {
-            scratch.push(insert_key_column_bind(insert, table, name)?.2);
+            let (col_idx, value) = insert_key_column_bind(insert, table, name)?;
+            words.extend(crate::engine_residency::sql_value_key_words(
+                table.columns[col_idx].ty,
+                &value,
+            )?);
         }
         let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)?;
         Some((
             key_id,
-            crate::engine_residency::compound_key_fingerprint(&scratch),
+            crate::engine_residency::compound_key_fingerprint(&words),
         ))
     } else {
         insert_i32_unique_needle_at(insert, table, ord_first_column_idx(table, index)?)
@@ -4677,10 +4681,7 @@ fn insert_index_key_tuple(
     index
         .key_columns
         .iter()
-        .map(|name| {
-            let (col_idx, value, _) = insert_key_column_bind(insert, table, name)?;
-            Some((col_idx, value))
-        })
+        .map(|name| insert_key_column_bind(insert, table, name))
         .collect()
 }
 

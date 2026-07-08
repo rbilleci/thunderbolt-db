@@ -1654,6 +1654,132 @@ fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
     );
 }
 
+/// COMPOUND KEYS (wider types, Stage 2a): a compound PRIMARY KEY over i64 (Int8/Timestamp) columns — and
+/// a MIXED int4+int8 key — elides and enforces uniqueness ON THE DEVICE. Each key column folds its i32
+/// WORD decomposition into the surrogate fingerprint (i64 -> [low32, high32], matching the section's LE
+/// layout); the device fold kernel reads `widths[k]` words per column. Proves: elision, tuple uniqueness
+/// (dup -> 23505; distinct OK), the DEVICE fold matches the host needle even across the HIGH word (a
+/// value > 2^32 survives geometric rebuilds and its duplicate is caught), and DELETE by the i64 key stays
+/// device-native. Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE ct (a INT8, b INT8, v INT, PRIMARY KEY (a, b))")
+        .unwrap();
+    engine
+        .execute_text(2, "CREATE TABLE mt (a INT, b INT8, v INT, PRIMARY KEY (a, b))")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+
+    let txn_ids = AtomicU64::new(3);
+    macro_rules! sql {
+        ($s:expr) => {
+            engine.execute_dml_concurrent(txn_ids.fetch_add(1, Ordering::Relaxed), $s)
+        };
+    }
+    // Pre-elision sentinel whose first key column exceeds 2^32 (high word non-zero) — it survives the
+    // geometric device-fold rebuilds during warm-up, so a later duplicate probes it via the device fold.
+    sql!("INSERT INTO ct VALUES (5000000000, 1, 0)").unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("ct")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return; // self-guard: no usable GPU
+    }
+    let mut warmed = false;
+    for i in 0..10_000_i64 {
+        sql!(&format!(
+            "INSERT INTO ct VALUES ({}, {}, 0)",
+            6_000_000_000_i64 + i,
+            i
+        ))
+        .unwrap();
+        if engine.table_install_elided("ct") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "i64 compound-PK table never entered elision on a GPU box");
+
+    // Tuple uniqueness over i64 keys: distinct tuples commit; the exact tuple repeats -> 23505.
+    sql!("INSERT INTO ct VALUES (5000000000, 2, 10)").unwrap(); // same a, different b -> OK
+    let dup = sql!("INSERT INTO ct VALUES (5000000000, 1, 99)")
+        .unwrap_err()
+        .to_string();
+    // DEVICE-FOLD consistency across the HIGH word: (5000000000 = 0x1_2A05F200, high word = 1) sat in a
+    // device-folded rebuilt slot; the host-folded duplicate needle must match (a 1-word device fold would
+    // miss the high 32 bits -> no 23505).
+    assert!(
+        dup.contains("duplicate key value violates unique index"),
+        "duplicate i64 compound tuple must raise 23505 (2-word fold agreement), got: {dup}"
+    );
+    assert!(engine.table_install_elided("ct"));
+
+    // DELETE by the i64 compound key is CORRECT + tuple-exact. NOTE: the device RESOLVE folds the i64
+    // fingerprint (device resolve fires), but the SV4b in-place tombstone-locate is int4-scan-only
+    // (`resident_int4_row_predicate`), so an i64-KEYED table's DELETE currently de-elides to the host
+    // apply (correctness-preserved). Making it stay elided = a fingerprint-based tombstone-locate
+    // (Stage 2b). Assert correctness here, not elision-retention.
+    let resolve_before = engine.dml_device_resolve_hits();
+    sql!("DELETE FROM ct WHERE a = 5000000000 AND b = 1").unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > resolve_before,
+        "i64 compound DELETE must RESOLVE its target on the device"
+    );
+    let Command::Select(count) =
+        parse_command("SELECT COUNT(*) FROM ct WHERE a = 5000000000").unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine.execute_relational_select(&count).unwrap().rows,
+        vec![vec![SqlValue::Int8(1)]],
+        "exactly the (5000000000,2) row remains after deleting (5000000000,1)"
+    );
+
+    // MIXED int4+int8 compound key: elide + enforce uniqueness.
+    sql!("INSERT INTO mt VALUES (7, 8000000000, 0)").unwrap();
+    if engine
+        .populate_relational_residency_snapshot("mt")
+        .expect("populate mt")
+        .device_memory_proof
+        .is_some()
+    {
+        let mut mt_warmed = false;
+        for i in 0..10_000_i32 {
+            sql!(&format!(
+                "INSERT INTO mt VALUES ({}, {}, 0)",
+                100 + i,
+                9_000_000_000_i64 + i as i64
+            ))
+            .unwrap();
+            if engine.table_install_elided("mt") {
+                mt_warmed = true;
+                break;
+            }
+        }
+        assert!(mt_warmed, "mixed compound-PK table never entered elision");
+        sql!("INSERT INTO mt VALUES (7, 8000000001, 1)").unwrap(); // distinct b -> OK
+        let mdup = sql!("INSERT INTO mt VALUES (7, 8000000000, 2)")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mdup.contains("duplicate key value violates unique index"),
+            "duplicate mixed compound tuple must raise 23505, got: {mdup}"
+        );
+        assert!(engine.table_install_elided("mt"));
+    }
+}
+
 /// COMPOUND KEYS (operational cases): a DELETE / UPDATE BY a compound key resolves its target ON THE
 /// DEVICE (the SQL resolve builds the surrogate fingerprint from the key columns' Eq predicates and
 /// probes the compound index; the full `filter_groups` recheck restores tuple exactness), so the table

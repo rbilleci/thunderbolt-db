@@ -60,8 +60,17 @@ surrogate fingerprint from the key columns' Eq predicates and probes the compoun
 the table STAYS ELIDED instead of de-eliding (compound-keyed tables can't reach the visibility-blind
 covered lane — it needs a covered-INSERT route, which rejects compound — so the SQL resolve is the only
 path and it always rechecks). Point-reads already ran as device AND-scans (no de-elide). Focused audit
-CLEARED (exactness-under-collision airtight). **NEXT (Stage 2): wider compound key TYPES**
-(int8/timestamp/numeric/uuid/text + mixed) via each key column's i32-word decomposition folded on-device.
+CLEARED (exactness-under-collision airtight). **WIDER KEY TYPES (Stage 2a) — i64/MIXED DONE for
+INSERT-uniqueness + reads:** compound PK/UNIQUE over Int8/Timestamp columns (and MIXED int4+int8) now
+elides + validates uniqueness ON THE DEVICE — each key column folds its i32-WORD decomposition (i32 -> 1
+word; i64 -> 2 words [low32,high32] LE) into the fingerprint; the device fold kernel `COMPOUND_FOLD_PTX`
+takes per-column WIDTHS. Eligibility is arity-aware: SINGLE-column keys stay i32-section (raw i32 key),
+COMPOUND keys accept any foldable type (fingerprint). Focused audit CLEARED the host==device fold
+byte-for-byte. b128/text keys stay rejected. **DOCUMENTED LIMIT (per user sequencing): DELETE/UPDATE
+BY an i64 key de-elides at apply** — the SV4b tombstone-locate (`resident_int4_row_predicate`) is
+Int4-scan-only + `ResidentExpr` has no i64 literal; the device RESOLVE works, but the in-place tombstone
+declines -> host apply (correct, slower). **NEXT (Stage 2b): fingerprint-based tombstone-locate** so
+wider-type DELETE/UPDATE stay elided; THEN Stage 2c b128 (Numeric/Uuid, 4 words), Stage 2d text.
 LEDGERED: fused-apply-for-compound, 64-bit fingerprint. Also OPEN: text-COMPACTION follow-up
 (rollover-only = one shard/commit, O(all-shards)/read — scalability-ledger). See memory
 `type-coverage-14`, `scalability-ledger`, `charter-governance-ruling`.

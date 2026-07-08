@@ -12522,14 +12522,15 @@ DONE:
 }
 "#;
 
-// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3, charter close): fold a compound key's ORDERED i32-section
-// columns into the 32-bit surrogate FINGERPRINT entirely ON THE DEVICE, so the index rebuild never
+// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3, charter close + wider types): fold a compound key's ORDERED
+// key columns into the 32-bit surrogate FINGERPRINT entirely ON THE DEVICE, so the index rebuild never
 // reads the raw resident key columns back to the host to hash them (the host reads only the derived
 // fingerprint buffer, exactly as the single-column build reads its one key column). Byte-identical to
-// the host `compound_key_fingerprint` (FNV-1a: h=0x811C9DC5; per column h^=v; h*=0x01000193;
-// h=rotl(h,13)+0x9E3779B1) so the device-built index and the host-derived probe needle agree. One
-// thread per row; reads `base_ptr + offsets[k] + row*4` for each of `ncols` key columns (the offsets
-// are the shard's capacity-strided i32-section byte offsets). ASCII-only.
+// the host `compound_key_fingerprint`/`sql_value_key_words` (FNV-1a: h=0x811C9DC5; per WORD h^=w;
+// h*=0x01000193; h=rotl(h,13)+0x9E3779B1) so the device-built index and the host-derived probe needle
+// agree. Each key column contributes `widths[k]` consecutive i32 words (Int4/Date/Int2 -> 1; Int8/
+// Timestamp -> 2 = the i64 section's LE lo/hi), read column-major at `base + offsets[k] + row*widths[k]*4`
+// with `widths[k]` words folded in ascending (little-endian) order. One thread per row. ASCII-only.
 const COMPOUND_FOLD_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -12538,20 +12539,22 @@ const COMPOUND_FOLD_PTX: &[u8] = br#"
 .visible .entry gpu_db_compound_fold_fingerprints(
     .param .u64 base_ptr,
     .param .u64 offsets_ptr,
+    .param .u64 widths_ptr,
     .param .u32 ncols,
     .param .u32 row_count,
     .param .u64 out_ptr
 )
 {
-    .reg .pred %p<3>;
-    .reg .b32 %r<16>;
-    .reg .b64 %rd<16>;
+    .reg .pred %p<4>;
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<20>;
 
     ld.param.u64 %rd1, [base_ptr];
     ld.param.u64 %rd2, [offsets_ptr];
+    ld.param.u64 %rd3, [widths_ptr];
     ld.param.u32 %r1, [ncols];
     ld.param.u32 %r2, [row_count];
-    ld.param.u64 %rd3, [out_ptr];
+    ld.param.u64 %rd4, [out_ptr];
 
     mov.u32 %r3, %tid.x;
     mov.u32 %r4, %ctaid.x;
@@ -12560,10 +12563,8 @@ const COMPOUND_FOLD_PTX: &[u8] = br#"
     setp.ge.u32 %p1, %r6, %r2;
     @%p1 bra DONE;
 
-    mul.wide.u32 %rd4, %r6, 4;          // row * 4 (byte stride within a column)
-
     mov.u32 %r7, 2166136261;            // fp = 0x811C9DC5 (FNV offset basis)
-    mov.u32 %r8, 0;                     // k = 0
+    mov.u32 %r8, 0;                     // k = 0 (column index)
     setp.ge.u32 %p2, %r8, %r1;
     @%p2 bra STORE;                     // ncols == 0 -> empty fold (defensive)
 
@@ -12571,22 +12572,40 @@ FOLDLOOP:
     mul.wide.u32 %rd5, %r8, 8;          // k * 8 (offsets are u64)
     add.u64 %rd6, %rd2, %rd5;
     ld.global.u64 %rd7, [%rd6];         // off = offsets[k]
-    add.u64 %rd8, %rd1, %rd7;
-    add.u64 %rd9, %rd8, %rd4;           // addr = base + off + row*4
-    ld.global.s32 %r9, [%rd9];          // v = column value (i32)
-    xor.b32 %r7, %r7, %r9;              // fp ^= v
+    mul.wide.u32 %rd8, %r8, 4;          // k * 4 (widths are u32)
+    add.u64 %rd9, %rd3, %rd8;
+    ld.global.u32 %r9, [%rd9];          // w = widths[k] (words in this column)
+    mul.lo.u32 %r10, %r6, %r9;          // row * w (word index of this column's row-0-relative start)
+    mul.wide.u32 %rd10, %r10, 4;        // row * w * 4 (byte offset)
+    add.u64 %rd11, %rd1, %rd7;
+    add.u64 %rd12, %rd11, %rd10;        // col_base = base + off + row*w*4
+    mov.u32 %r11, 0;                    // j = 0 (word within column)
+    setp.ge.u32 %p3, %r11, %r9;
+    @%p3 bra NEXTCOL;                   // w == 0 -> no words (defensive)
+
+WORDLOOP:
+    mul.wide.u32 %rd13, %r11, 4;        // j * 4
+    add.u64 %rd14, %rd12, %rd13;        // addr = col_base + j*4
+    ld.global.s32 %r12, [%rd14];        // word value (i32)
+    xor.b32 %r7, %r7, %r12;             // fp ^= w
     mul.lo.u32 %r7, %r7, 16777619;      // fp *= 0x01000193 (FNV prime)
-    shl.b32 %r10, %r7, 13;              // rotl(fp, 13)
-    shr.b32 %r11, %r7, 19;
-    or.b32 %r7, %r10, %r11;
+    shl.b32 %r13, %r7, 13;              // rotl(fp, 13)
+    shr.b32 %r14, %r7, 19;
+    or.b32 %r7, %r13, %r14;
     add.u32 %r7, %r7, 2654435761;       // fp += 0x9E3779B1
+    add.u32 %r11, %r11, 1;
+    setp.lt.u32 %p3, %r11, %r9;
+    @%p3 bra WORDLOOP;
+
+NEXTCOL:
     add.u32 %r8, %r8, 1;
     setp.lt.u32 %p2, %r8, %r1;
     @%p2 bra FOLDLOOP;
 
 STORE:
-    add.u64 %rd11, %rd3, %rd4;          // out + row*4
-    st.global.u32 [%rd11], %r7;
+    mul.wide.u32 %rd15, %r6, 4;         // row * 4
+    add.u64 %rd16, %rd4, %rd15;         // out + row*4
+    st.global.u32 [%rd16], %r7;
 
 DONE:
     ret;
@@ -12914,17 +12933,20 @@ impl CudaResidentDeviceMemory {
         Ok(decline[0] != 0)
     }
 
-    /// COMPOUND KEYS (charter close): fold a compound key's `offsets` i32-section columns of the shard
-    /// buffer at `base_ptr` into per-row 32-bit fingerprints ON THE DEVICE (`COMPOUND_FOLD_PTX`),
-    /// returning the `row_count` fingerprints. This lets the PK-index rebuild derive the compound key
-    /// on the GPU instead of reading the raw resident key columns back to the host to hash them — the
-    /// host then reads only this derived fingerprint column, exactly as the single-column build reads
-    /// its one key column. Byte-identical to the host `compound_key_fingerprint`. Synchronous (the
-    /// blocking output DtoH on the null stream fences the launch).
+    /// COMPOUND KEYS (charter close + wider types): fold a compound key's columns of the shard buffer at
+    /// `base_ptr` into per-row 32-bit fingerprints ON THE DEVICE (`COMPOUND_FOLD_PTX`), returning the
+    /// `row_count` fingerprints. Each key column `k` contributes `widths[k]` consecutive i32 words at its
+    /// capacity-strided section `offsets[k]` (1 for i32-section, 2 for the i64 section). This lets the
+    /// PK-index rebuild derive the compound key on the GPU instead of reading the raw resident key columns
+    /// back to the host to hash them — the host then reads only this derived fingerprint column, exactly
+    /// as the single-column build reads its one key column. Byte-identical to the host
+    /// `compound_key_fingerprint` / `sql_value_key_words`. `offsets.len() == widths.len()`. Synchronous
+    /// (the blocking output DtoH on the null stream fences the launch).
     pub fn submit_compound_fold_fingerprints(
         &self,
         base_ptr: u64,
         offsets: &[u64],
+        widths: &[u32],
         row_count: usize,
     ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
         type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
@@ -12947,7 +12969,7 @@ impl CudaResidentDeviceMemory {
         if row_count == 0 {
             return Ok(Vec::new());
         }
-        if offsets.is_empty() || base_ptr == 0 {
+        if offsets.is_empty() || base_ptr == 0 || offsets.len() != widths.len() {
             return Err(CudaRuntimeProbeError::InvalidInputLength(offsets.len()));
         }
         let ncols = u32::try_from(offsets.len())
@@ -12957,6 +12979,10 @@ impl CudaResidentDeviceMemory {
         let offsets_bytes = offsets
             .len()
             .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let widths_bytes = widths
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let out_bytes = row_count
             .checked_mul(std::mem::size_of::<i32>())
@@ -12986,6 +13012,7 @@ impl CudaResidentDeviceMemory {
         };
 
         let offsets_guard = primary.lease_device_buffer_owned(offsets_bytes)?;
+        let widths_guard = primary.lease_device_buffer_owned(widths_bytes)?;
         let out_guard = primary.lease_device_buffer_owned(out_bytes)?;
 
         let mut ptx = Vec::with_capacity(COMPOUND_FOLD_PTX.len() + 1);
@@ -13000,15 +13027,20 @@ impl CudaResidentDeviceMemory {
                 offsets_bytes,
             )
         })?;
+        check_cuda(unsafe {
+            cu_memcpy_htod(widths_guard.ptr, widths.as_ptr().cast::<c_void>(), widths_bytes)
+        })?;
 
         let mut base_arg = base_ptr;
         let mut offsets_arg = offsets_guard.ptr;
+        let mut widths_arg = widths_guard.ptr;
         let mut ncols_arg = ncols;
         let mut rows_arg = row_count_u32;
         let mut out_arg = out_guard.ptr;
         let mut args = [
             (&mut base_arg as *mut u64).cast::<c_void>(),
             (&mut offsets_arg as *mut u64).cast::<c_void>(),
+            (&mut widths_arg as *mut u64).cast::<c_void>(),
             (&mut ncols_arg as *mut u32).cast::<c_void>(),
             (&mut rows_arg as *mut u32).cast::<c_void>(),
             (&mut out_arg as *mut u64).cast::<c_void>(),

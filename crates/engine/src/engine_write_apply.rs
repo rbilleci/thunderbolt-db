@@ -580,29 +580,25 @@ impl Engine {
                 // PREFLIGHT (before the WAL write — an apply-time reject would strand the command in the
                 // WAL to poison every replay). Single-column keys pass. Keep this in lock-step with the
                 // apply-layer guard in `apply_create_table`.
-                let ct_compound_i32_ok = |cols: &[String]| -> bool {
+                let ct_compound_ok = |cols: &[String]| -> bool {
                     cols.iter().all(|name| {
-                        create
-                            .columns
-                            .iter()
-                            .find(|c| &c.name == name)
-                            .is_some_and(|c| {
-                                matches!(c.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2)
-                            })
+                        create.columns.iter().find(|c| &c.name == name).is_some_and(|c| {
+                            crate::engine_residency::compound_key_type_supported(c.ty)
+                        })
                     })
                 };
                 if create
                     .primary_key
                     .as_ref()
-                    .is_some_and(|pk| pk.columns.len() > 1 && !ct_compound_i32_ok(&pk.columns))
+                    .is_some_and(|pk| pk.columns.len() > 1 && !ct_compound_ok(&pk.columns))
                     || create
                         .unique_constraints
                         .iter()
-                        .any(|u| u.columns.len() > 1 && !ct_compound_i32_ok(&u.columns))
+                        .any(|u| u.columns.len() > 1 && !ct_compound_ok(&u.columns))
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                         (compound key columns must be int4, int2, or date)"
+                         (compound key columns must be int4, int2, date, int8, or timestamp)"
                             .to_string(),
                     ));
                 }
@@ -677,16 +673,11 @@ impl Engine {
                     })
                     .collect::<Result<Vec<usize>, _>>()?;
                 if column_idxs.len() > 1
-                    && !column_idxs.iter().all(|&i| {
-                        matches!(
-                            table.columns[i].ty,
-                            SqlType::Int4 | SqlType::Date | SqlType::Int2
-                        )
-                    })
+                    && !column_idxs.iter().all(|&i| crate::engine_residency::compound_key_type_supported(table.columns[i].ty))
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                         (compound key columns must be int4, int2, or date)"
+                         (compound key columns must be int4, int2, date, int8, or timestamp)"
                             .to_string(),
                     ));
                 }
@@ -740,16 +731,11 @@ impl Engine {
                     })
                     .collect::<Result<Vec<usize>, _>>()?;
                 if column_idxs.len() > 1
-                    && !column_idxs.iter().all(|&i| {
-                        matches!(
-                            table.columns[i].ty,
-                            SqlType::Int4 | SqlType::Date | SqlType::Int2
-                        )
-                    })
+                    && !column_idxs.iter().all(|&i| crate::engine_residency::compound_key_type_supported(table.columns[i].ty))
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                         (compound key columns must be int4, int2, or date)"
+                         (compound key columns must be int4, int2, date, int8, or timestamp)"
                             .to_string(),
                     ));
                 }
@@ -810,16 +796,11 @@ impl Engine {
                     })
                     .collect::<Result<Vec<usize>, _>>()?;
                 if column_idxs.len() > 1
-                    && !column_idxs.iter().all(|&i| {
-                        matches!(
-                            table.columns[i].ty,
-                            SqlType::Int4 | SqlType::Date | SqlType::Int2
-                        )
-                    })
+                    && !column_idxs.iter().all(|&i| crate::engine_residency::compound_key_type_supported(table.columns[i].ty))
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                         (compound key columns must be int4, int2, or date)"
+                         (compound key columns must be int4, int2, date, int8, or timestamp)"
                             .to_string(),
                     ));
                 }

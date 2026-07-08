@@ -3616,6 +3616,74 @@ fn relational_catalog_replays_from_durable_wal_with_table_data() {
 }
 
 #[test]
+fn sql_value_key_words_matches_le_section_layout() {
+    use crate::engine_residency::{key_column_width_words, sql_value_key_words};
+    use gpu_db_sql::SqlType;
+    // i32-section types -> 1 word (the value).
+    assert_eq!(
+        sql_value_key_words(SqlType::Int4, &SqlValue::Int4(-5)),
+        Some(vec![-5])
+    );
+    assert_eq!(key_column_width_words(SqlType::Int4), Some(1));
+    // i64 types -> 2 words [low32, high32], matching the section's `value.to_le_bytes()` read as two
+    // LE i32 words (this ordering is load-bearing for host/device fold agreement).
+    let v: i64 = 5_000_000_000; // 0x1_2A05F200: low = 0x2A05F200, high = 0x1
+    let low = 0x2A05_F200_u32 as i32;
+    let high = 0x1_i32;
+    assert_eq!(
+        sql_value_key_words(SqlType::Int8, &SqlValue::Int8(v)),
+        Some(vec![low, high])
+    );
+    assert_eq!(key_column_width_words(SqlType::Int8), Some(2));
+    assert_eq!(key_column_width_words(SqlType::Timestamp), Some(2));
+    // Reassembling the two words little-endian recovers the i64 exactly.
+    let recon = (low as u32 as u64) | ((high as u32 as u64) << 32);
+    assert_eq!(recon as i64, v);
+    // Unsupported key types (b128/text) have no word width -> None.
+    assert_eq!(key_column_width_words(SqlType::Text), None);
+    assert_eq!(key_column_width_words(SqlType::Uuid), None);
+}
+
+#[test]
+fn compound_primary_key_over_i64_columns_enforces_tuple_uniqueness() {
+    // COMPOUND KEYS (wider types, Stage 2a): a compound PK over i64 (Int8/Timestamp) columns — and a
+    // MIXED int4+int8 key — is accepted and enforces TUPLE uniqueness (host validate path; the on-device
+    // path is proven by the GPU sweep). b128/text key columns stay rejected (follow-ups).
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE ct (a INT8, b INT8, v INT, PRIMARY KEY (a, b))")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO ct VALUES (5000000000, 1, 10)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO ct VALUES (5000000000, 2, 20)")
+        .unwrap(); // same a, different b -> OK
+    e.execute_text(4, "INSERT INTO ct VALUES (9000000000, 1, 30)")
+        .unwrap(); // different a, same b -> OK
+    let err = e
+        .execute_text(5, "INSERT INTO ct VALUES (5000000000, 1, 99)")
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("duplicate key value"),
+        "duplicate i64 compound tuple raises 23505, got {err:?}"
+    );
+
+    // MIXED int4 + int8 compound PK.
+    e.execute_text(6, "CREATE TABLE mt (a INT, b INT8, v INT, PRIMARY KEY (a, b))")
+        .unwrap();
+    e.execute_text(7, "INSERT INTO mt VALUES (1, 8000000000, 0)")
+        .unwrap();
+    e.execute_text(8, "INSERT INTO mt VALUES (1, 8000000001, 0)")
+        .unwrap(); // distinct b -> OK
+    assert!(e
+        .execute_text(9, "INSERT INTO mt VALUES (1, 8000000000, 5)")
+        .is_err());
+
+    // A compound key touching a b128/text type stays rejected (follow-up).
+    assert!(e
+        .execute_text(10, "CREATE TABLE nt (a INT, u UUID, PRIMARY KEY (a, u))")
+        .is_err());
+}
+
+#[test]
 fn compound_key_fingerprint_is_deterministic_and_order_sensitive() {
     use crate::engine_residency::compound_key_fingerprint as fp;
     // Deterministic: same tuple -> same fingerprint (host builder, needle, and append fold must agree).

@@ -899,6 +899,9 @@ impl Engine {
         device_ptr: u64,
         base_row_count: usize,
         column_values: &[Vec<i32>],
+        // COMPOUND KEYS (wider types): the appended rows' full SqlValues, so a compound index's tail
+        // fingerprint can fold WIDER key columns (i64) whose values are not in the i32 `column_values`.
+        new_rows: &[Vec<SqlValue>],
     ) {
         let appended = column_values.first().map_or(0, Vec::len);
         if appended == 0 {
@@ -926,24 +929,23 @@ impl Engine {
                 if !index.unique || !crate::engine_residency::index_is_compound(index) {
                     continue;
                 }
-                let Some(positions) =
-                    crate::engine_residency::index_key_column_positions(table, index)
-                else {
-                    continue;
-                };
-                if positions.iter().any(|&p| p >= column_values.len()) {
-                    continue;
-                }
-                let mut fp_tail: Vec<i32> = Vec::with_capacity(appended);
-                let mut scratch = vec![0_i32; positions.len()];
-                // `row` indexes every key column's appended tail in lock-step (a plain iterator
-                // can't zip a variable number of columns), so the range loop is the clear form.
-                #[allow(clippy::needless_range_loop)]
-                for row in 0..appended {
-                    for (k, &p) in positions.iter().enumerate() {
-                        scratch[k] = column_values[p][row];
+                // Fold each appended row's key TUPLE into its fingerprint from the full SqlValues
+                // (handles any supported key type, incl. i64). A row whose key can't fold (e.g. a NULL
+                // key column) makes the whole tail unfoldable -> skip this index's incremental extend;
+                // its cache entry stays at the old row_count and the next probe rebuilds it.
+                let mut fp_tail: Vec<i32> = Vec::with_capacity(new_rows.len());
+                let mut foldable = true;
+                for row in new_rows {
+                    match crate::engine_residency::compound_index_row_fingerprint(table, index, row) {
+                        Some(fp) => fp_tail.push(fp),
+                        None => {
+                            foldable = false;
+                            break;
+                        }
                     }
-                    fp_tail.push(crate::engine_residency::compound_key_fingerprint(&scratch));
+                }
+                if !foldable {
+                    continue;
                 }
                 let key_id = crate::engine_residency::COMPOUND_KEY_ID_FLAG | ord;
                 self.extend_shard_pk_device_index_entry(
@@ -1210,7 +1212,7 @@ impl Engine {
             // whole descriptor (int4/int8/text/null name vectors) per shard per wave for nothing.
             let offsets = positions
                 .iter()
-                .map(|&p| shard_i32_filter_offset(shard, table, p))
+                .map(|&p| shard_fixed_width_key_offset(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
@@ -1307,7 +1309,7 @@ impl Engine {
             }
             let offsets = positions
                 .iter()
-                .map(|&p| shard_i32_filter_offset(shard, table, p))
+                .map(|&p| shard_fixed_width_key_offset(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
@@ -1441,9 +1443,16 @@ impl Engine {
                 continue;
             }
             let descriptor = self.resident_snapshot_for_shard(shard, table);
+            // COMPOUND KEYS (wider types): dispatch each key column to its section's descriptor offset
+            // helper (i32-section vs i64 section), matching `shard_fixed_width_key_offset`.
             let offsets = positions
                 .iter()
-                .map(|&p| resident_device_int4_column_offset(&descriptor, table, p).ok())
+                .map(|&p| match table.columns.get(p).map(|c| c.ty) {
+                    Some(SqlType::Int8) | Some(SqlType::Timestamp) => {
+                        resident_device_int8_column_offset(&descriptor, table, p).ok()
+                    }
+                    _ => resident_device_int4_column_offset(&descriptor, table, p).ok(),
+                })
                 .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
@@ -2305,7 +2314,7 @@ impl Engine {
                 // key column past int4-ordinal 0.
                 let live_offsets = positions
                     .iter()
-                    .map(|&p| shard_i32_filter_offset(&live, table, p))
+                    .map(|&p| shard_fixed_width_key_offset(&live, table, p))
                     .collect::<Option<Vec<u64>>>()?;
                 // CAPACITY-SIZED INDEX: size the hash table once for the shard's
                 // full capacity (clamped to the builder's 2^30 slot limit via the
@@ -2349,8 +2358,14 @@ impl Engine {
             }
             keys
         } else {
+            // Per-column WORD widths (i32-section -> 1, i64 section -> 2), parallel to `build_offsets`
+            // in `positions` order; the device fold reads `widths[k]` words per column.
+            let widths = positions
+                .iter()
+                .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
+                .collect::<Option<Vec<u32>>>()?;
             let fps = build_memory
-                .submit_compound_fold_fingerprints(device_ptr, &build_offsets, row_count)
+                .submit_compound_fold_fingerprints(device_ptr, &build_offsets, &widths, row_count)
                 .ok()?;
             if fps.len() != row_count {
                 return None;
@@ -3328,6 +3343,49 @@ fn shard_i32_filter_offset(
         .checked_mul(int4_width)
         .and_then(|col_bytes| (int4_ordinal as u64).checked_mul(col_bytes))
         .and_then(|prefix| (std::mem::size_of::<u64>() as u64).checked_add(prefix))
+}
+
+/// COMPOUND KEYS (wider types): the capacity-strided byte offset of a FIXED-WIDTH key column in the
+/// shard buffer, dispatched by section — i32-section (Int4/Date/Int2) via `shard_i32_filter_offset`, or
+/// the i64 section (Int8/Timestamp): `header + int4_section_bytes + int8_ordinal * capacity * 8`
+/// (matching `resident_device_int8_column_offset`). Returns `None` for an unsupported/absent column.
+fn shard_fixed_width_key_offset(
+    shard: &RelationalResidentShard,
+    table: &RelationalTable,
+    col_idx: usize,
+) -> Option<u64> {
+    let column = table.columns.get(col_idx)?;
+    match column.ty {
+        SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
+            shard_i32_filter_offset(shard, table, col_idx)
+        }
+        SqlType::Int8 | SqlType::Timestamp => {
+            let int8_ordinal = table
+                .columns
+                .iter()
+                .take(col_idx)
+                .filter(|c| matches!(c.ty, SqlType::Int8 | SqlType::Timestamp))
+                .count();
+            if shard
+                .resident_device_int8_columns
+                .get(int8_ordinal)
+                .is_none_or(|name| name != &column.name)
+            {
+                return None;
+            }
+            let capacity = u64::try_from(shard.capacity).ok()?;
+            let int4_section_bytes = capacity
+                .checked_mul(std::mem::size_of::<i32>() as u64)?
+                .checked_mul(shard.resident_device_int4_columns.len() as u64)?;
+            let int8_prefix = capacity
+                .checked_mul(std::mem::size_of::<i64>() as u64)?
+                .checked_mul(int8_ordinal as u64)?;
+            (std::mem::size_of::<u64>() as u64)
+                .checked_add(int4_section_bytes)
+                .and_then(|after_i32| after_i32.checked_add(int8_prefix))
+        }
+        _ => None,
+    }
 }
 
 /// Cross-shard PK index (sub-slice 2): build a per-shard membership BLOOM over the int4 key column. `m` =
