@@ -4638,7 +4638,12 @@ fn insert_key_column_bind(
     } else {
         insert.columns.iter().position(|c| c == name)?
     };
-    let coerced = coerce_filter_literal(row.get(source_pos)?.clone(), column_ty);
+    // Coerce the raw literal to the column TYPE the way the INSERT apply does (Text -> Uuid via
+    // parse_uuid; Numeric rescaled to the column's scale) so the folded WORDS match the stored b128
+    // section bytes exactly — `coerce_filter_literal` leaves a uuid/numeric literal as Text/unscaled.
+    let coerced =
+        crate::rel_exec_helpers::coerce_insert_value(row.get(source_pos)?.clone(), column_ty, name)
+            .ok()?;
     Some((filter_idx, coerced))
 }
 

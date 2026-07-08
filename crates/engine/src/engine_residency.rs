@@ -495,8 +495,12 @@ pub(crate) fn compound_index_row_fingerprint(
 /// value, matching the on-device section's LITTLE-ENDIAN byte layout EXACTLY so the host fold (needle /
 /// append / SI slot) and the device fold (`gpu_db_compound_fold_fingerprints`, which reads the raw
 /// section words) agree byte-for-byte. Int4/Date -> `[v]`; Int2 -> `[widened v]`; Int8/Timestamp ->
-/// `[low32, high32]` (the i64 section stores `value.to_le_bytes()`, read as two LE i32 words). `None`
-/// for NULL or an unsupported key type -> the caller declines the device fast path (host validates).
+/// `[low32, high32]` (the i64 section stores `value.to_le_bytes()`, read as two LE i32 words); b128
+/// Numeric/Uuid -> 4 LE i32 words (the b128 section stores the i128 mantissa `to_le_bytes()` /
+/// the raw uuid bytes). `None` for NULL or an unsupported key type -> the caller declines the device
+/// fast path (host validates). NUMERIC scale: the section stores the mantissa RESCALED to the column's
+/// scale (values are rescaled on insert), and the needle/WHERE value is coerced to the same column type
+/// before folding, so the mantissa words agree; the full-tuple recheck is the exactness backstop.
 pub(crate) fn sql_value_key_words(ty: gpu_db_sql::SqlType, value: &SqlValue) -> Option<Vec<i32>> {
     match (ty, value) {
         (gpu_db_sql::SqlType::Int4, SqlValue::Int4(v)) => Some(vec![*v]),
@@ -507,18 +511,28 @@ pub(crate) fn sql_value_key_words(ty: gpu_db_sql::SqlType, value: &SqlValue) -> 
             let bits = *v as u64;
             Some(vec![bits as u32 as i32, (bits >> 32) as u32 as i32])
         }
+        (gpu_db_sql::SqlType::Numeric { .. }, SqlValue::Numeric(dec)) => {
+            let bits = dec.mantissa as u128;
+            Some((0..4).map(|i| (bits >> (32 * i)) as u32 as i32).collect())
+        }
+        (gpu_db_sql::SqlType::Uuid, SqlValue::Uuid(bytes)) => Some(
+            (0..4)
+                .map(|i| i32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]))
+                .collect(),
+        ),
         _ => None,
     }
 }
 
 /// COMPOUND KEYS (wider types): the number of i32 WORDS a key column of type `ty` occupies in its
 /// device section (Int4/Date/Int2 -> 1 word in the i32 section; Int8/Timestamp -> 2 words in the i64
-/// section). `None` for a type not yet supported as a compound key column (b128/text are follow-ups).
-/// A type is a valid compound key column IFF this returns `Some`.
+/// section; Numeric/Uuid -> 4 words in the b128 section). `None` for a type not yet supported as a
+/// compound key column (text is a follow-up). A type is a valid compound key column IFF this returns `Some`.
 pub(crate) fn key_column_width_words(ty: gpu_db_sql::SqlType) -> Option<u32> {
     match ty {
         gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2 => Some(1),
         gpu_db_sql::SqlType::Int8 | gpu_db_sql::SqlType::Timestamp => Some(2),
+        gpu_db_sql::SqlType::Numeric { .. } | gpu_db_sql::SqlType::Uuid => Some(4),
         _ => None,
     }
 }

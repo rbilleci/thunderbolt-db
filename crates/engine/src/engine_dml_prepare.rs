@@ -563,8 +563,18 @@ impl Engine {
             if positions.iter().all(|p| {
                 match eqs.iter().find(|(idx, _)| idx == p) {
                     Some((_, value)) => {
+                        // Coerce the WHERE literal to the column type (Text -> Uuid, Numeric ->
+                        // column scale) so the folded words match the stored b128 section bytes.
                         match table.columns.get(*p).and_then(|column| {
-                            crate::engine_residency::sql_value_key_words(column.ty, value)
+                            crate::rel_exec_helpers::coerce_insert_value(
+                                (*value).clone(),
+                                column.ty,
+                                &column.name,
+                            )
+                            .ok()
+                            .and_then(|v| {
+                                crate::engine_residency::sql_value_key_words(column.ty, &v)
+                            })
                         }) {
                             Some(column_words) => {
                                 words.extend(column_words);
@@ -752,9 +762,10 @@ impl Engine {
         if !hit.descriptor.resident_device_null_columns.is_empty() {
             return None; // raw i32 would read a stored NULL as 0 (the M3 decline discipline)
         }
-        // Audit A4 F1, lifted by TYPE-COVERAGE track 2 (stages 1 + iii): every FIXED-WIDTH
-        // section materializes with its CATALOG-derived variant — i32 via one u32/slot, i64 via
-        // two (the 4-mod-8 discipline). Non-fixed-width types still decline to the host fetch.
+        // Audit A4 F1, lifted by TYPE-COVERAGE track 2 (stages 1 + iii) + #14: every FIXED-WIDTH
+        // section materializes with its CATALOG-derived variant — i32 via one u32/slot, i64 via two
+        // (the 4-mod-8 discipline), b128 (Numeric/Uuid) via four. Non-fixed-width types (text) still
+        // decline to the host fetch.
         if table.columns.iter().any(|column| {
             !matches!(
                 column.ty,
@@ -763,6 +774,8 @@ impl Engine {
                     | crate::SqlType::Int2
                     | crate::SqlType::Int8
                     | crate::SqlType::Timestamp
+                    | crate::SqlType::Numeric { .. }
+                    | crate::SqlType::Uuid
             )
         }) {
             return None;
@@ -787,6 +800,34 @@ impl Engine {
         let mut row = Vec::with_capacity(table.columns.len());
         for idx in 0..table.columns.len() {
             match table.columns[idx].ty {
+                crate::SqlType::Numeric { .. } | crate::SqlType::Uuid => {
+                    // b128 (16-byte) section: 4 LE i32 words per slot, reassembled byte-identically to
+                    // the rehydration decode (`gather_resident_table_rows_from_device` B128 arm).
+                    let base = crate::relational_model::resident_device_numeric_column_offset(
+                        &hit.descriptor,
+                        table,
+                        idx,
+                    )
+                    .ok()?;
+                    let words = hit
+                        .device_memory
+                        .read_resident_i32_column(base + slot * 16, 4)
+                        .ok()?;
+                    if words.len() != 4 {
+                        return None;
+                    }
+                    let mut bytes = [0u8; 16];
+                    for (w, word) in words.iter().enumerate() {
+                        bytes[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                    row.push(match table.columns[idx].ty {
+                        crate::SqlType::Numeric { scale, .. } => SqlValue::Numeric(
+                            gpu_db_sql::Decimal128::new(i128::from_le_bytes(bytes), scale),
+                        ),
+                        crate::SqlType::Uuid => SqlValue::Uuid(bytes),
+                        _ => return None,
+                    });
+                }
                 crate::SqlType::Int8 | crate::SqlType::Timestamp => {
                     let base = crate::relational_model::resident_device_int8_column_offset(
                         &hit.descriptor,

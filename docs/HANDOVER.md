@@ -72,13 +72,20 @@ an i64 compound key now STAY ELIDED — a FINGERPRINT-based in-place tombstone-l
 for tables with an i64 key column: fold the row's key tuple -> fingerprint -> probe -> materialize each
 hit on-device + TUPLE-VERIFY the key columns (so a collision can't tombstone the wrong slot) -> exact-1 ->
 tombstone. UPDATE reuses it (tombstone-old). All-i32 tables keep the proven int4-predicate path. Focused
-audit CLEARED (collision-safe, already-dead/SI-fix visibility sound, exact-1 sound). **NEXT: Stage 2c
-b128** (Numeric/Uuid = 4 words, reuses the widths kernel + word production; recheck falls to host for
-b128-value tables), **Stage 2d text** (variable-length blob hashing). LEDGER GAPS surfaced by the audit:
-(a) a compound table with a NULL key column OR a b128/text VALUE column de-elides on EVERY DELETE/UPDATE
-(fingerprint/materialize declines); (b) reads over a VERSIONED wider-type elided table de-elide (R-ver is
-int4-only). LEDGERED: fused-apply-for-compound, 64-bit fingerprint, text-COMPACTION. See memory
-`type-coverage-14`, `scalability-ledger`, `charter-governance-ruling`.
+audit CLEARED (collision-safe, already-dead/SI-fix visibility sound, exact-1 sound). **b128 (Stage 2c) —
+Numeric/Uuid INSERT-uniqueness + reads DONE:** a compound key over Numeric/Uuid columns folds 4 words
+(16 LE bytes) via the widths kernel + `sql_value_key_words`; `materialize_resident_row_via_hit` now
+reassembles b128 (i128 mantissa / raw uuid) so the recheck is device-native. LOAD-BEARING FIX: the needle
+bind now uses `coerce_insert_value` (Text -> Uuid via parse_uuid; Numeric rescaled to the column scale) —
+a uuid literal parses as Text and MUST coerce to bytes / a numeric to the column scale so host==device
+fold agrees (audit scrutinized the numeric-scale invariant hardest — SOLID: stored value + needle share
+the one rescale path, plus scale-independent Decimal128 recheck). Audit CLEARED. **NEXT: Stage 2d text**
+(variable-length blob hashing). GAPS: (a) DELETE/UPDATE BY a b128 key needs the WHERE-LITERAL coercion
+(a `WHERE u='uuid-str'` predicate stays Text -> 0-row/safe, not a wrong-row delete — a follow-up); (b) a
+compound table with a NULL key column OR a text VALUE column de-elides on DELETE/UPDATE; (c) reads over a
+VERSIONED wider-type elided table de-elide (R-ver is int4-only). LEDGERED: fused-apply-for-compound,
+64-bit fingerprint, text-COMPACTION. See memory `type-coverage-14`, `scalability-ledger`,
+`charter-governance-ruling`.
 
 ---
 

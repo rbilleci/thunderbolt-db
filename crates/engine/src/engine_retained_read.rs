@@ -1451,6 +1451,9 @@ impl Engine {
                     Some(SqlType::Int8) | Some(SqlType::Timestamp) => {
                         resident_device_int8_column_offset(&descriptor, table, p).ok()
                     }
+                    Some(SqlType::Numeric { .. }) | Some(SqlType::Uuid) => {
+                        resident_device_numeric_column_offset(&descriptor, table, p).ok()
+                    }
                     _ => resident_device_int4_column_offset(&descriptor, table, p).ok(),
                 })
                 .collect::<Option<Vec<u64>>>()?;
@@ -3383,6 +3386,37 @@ fn shard_fixed_width_key_offset(
             (std::mem::size_of::<u64>() as u64)
                 .checked_add(int4_section_bytes)
                 .and_then(|after_i32| after_i32.checked_add(int8_prefix))
+        }
+        SqlType::Numeric { .. } | SqlType::Uuid => {
+            // b128 section: header + int4_section + int8_section + numeric_ordinal * capacity * 16
+            // (matching `resident_device_numeric_column_offset`).
+            let numeric_ordinal = table
+                .columns
+                .iter()
+                .take(col_idx)
+                .filter(|c| matches!(c.ty, SqlType::Numeric { .. } | SqlType::Uuid))
+                .count();
+            if shard
+                .resident_device_numeric_columns
+                .get(numeric_ordinal)
+                .is_none_or(|name| name != &column.name)
+            {
+                return None;
+            }
+            let capacity = u64::try_from(shard.capacity).ok()?;
+            let int4_section_bytes = capacity
+                .checked_mul(std::mem::size_of::<i32>() as u64)?
+                .checked_mul(shard.resident_device_int4_columns.len() as u64)?;
+            let int8_section_bytes = capacity
+                .checked_mul(std::mem::size_of::<i64>() as u64)?
+                .checked_mul(shard.resident_device_int8_columns.len() as u64)?;
+            let numeric_prefix = capacity
+                .checked_mul(std::mem::size_of::<i128>() as u64)?
+                .checked_mul(numeric_ordinal as u64)?;
+            (std::mem::size_of::<u64>() as u64)
+                .checked_add(int4_section_bytes)
+                .and_then(|after_i32| after_i32.checked_add(int8_section_bytes))
+                .and_then(|after_i64| after_i64.checked_add(numeric_prefix))
         }
         _ => None,
     }

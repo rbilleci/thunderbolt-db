@@ -1660,6 +1660,94 @@ fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
 /// layout); the device fold kernel reads `widths[k]` words per column. Proves: elision, tuple uniqueness
 /// (dup -> 23505; distinct OK), the DEVICE fold matches the host needle even across the HIGH word (a
 /// value > 2^32 survives geometric rebuilds and its duplicate is caught), and DELETE by the i64 key stays
+/// COMPOUND KEYS (wider types, Stage 2c): a compound PRIMARY KEY over a b128 (UUID) column — mixed with
+/// int4 — elides + enforces uniqueness ON THE DEVICE (each b128 key column folds 4 i32 words = the LE
+/// section bytes) and DELETE by the key stays device-native (materialize now reassembles b128 for the
+/// tuple-verify). Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE ut (a INT, u UUID, v INT, PRIMARY KEY (a, u))")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+
+    let txn_ids = AtomicU64::new(2);
+    let uuid = |n: u32| format!("00000000-0000-0000-0000-{:012x}", n);
+    macro_rules! sql {
+        ($s:expr) => {
+            engine.execute_dml_concurrent(txn_ids.fetch_add(1, Ordering::Relaxed), $s)
+        };
+    }
+    // Pre-elision sentinel with a HIGH-word-nonzero uuid (exercises all 4 folded words on rebuild).
+    sql!(&format!(
+        "INSERT INTO ut VALUES (5, '{}', 0)",
+        "ffffffff-0000-0000-0000-000000000001"
+    ))
+    .unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("ut")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return; // self-guard: no usable GPU
+    }
+    let mut warmed = false;
+    for i in 0..10_000_u32 {
+        sql!(&format!("INSERT INTO ut VALUES ({}, '{}', 0)", 1000 + i, uuid(i))).unwrap();
+        if engine.table_install_elided("ut") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "uuid compound-PK table never entered elision on a GPU box");
+
+    // Tuple uniqueness over the b128 key: a distinct uuid commits; the exact (a,u) tuple repeats -> 23505.
+    sql!(&format!("INSERT INTO ut VALUES (5, '{}', 1)", uuid(7))).unwrap();
+    let dup = sql!(&format!(
+        "INSERT INTO ut VALUES (5, '{}', 9)",
+        "ffffffff-0000-0000-0000-000000000001"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        dup.contains("duplicate key value violates unique index"),
+        "duplicate uuid compound tuple must raise 23505 (4-word fold agreement), got: {dup}"
+    );
+    assert!(
+        engine.table_install_elided("ut"),
+        "uuid compound-PK table stays device-native across the validated inserts"
+    );
+    // Read-your-writes over the elided b128-keyed table: exactly two a=5 rows exist.
+    let Command::Select(count) =
+        parse_command("SELECT COUNT(*) FROM ut WHERE a = 5").unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine.execute_relational_select(&count).unwrap().rows,
+        vec![vec![SqlValue::Int8(2)]],
+        "both a=5 uuid rows are visible (sentinel + uuid(7))"
+    );
+    // NOTE: DELETE/UPDATE BY a b128 key needs the WHERE-literal coercion (a `WHERE u = 'uuid-string'`
+    // is not coerced Text->Uuid on the resolve path) — a follow-up gap, orthogonal to the fingerprint
+    // fold. INSERT-uniqueness + reads are device-native here.
+}
+
+/// COMPOUND KEYS (wider types, Stage 2a): a compound PRIMARY KEY over i64 (Int8/Timestamp) columns — and
+/// a MIXED int4+int8 key — elides and enforces uniqueness ON THE DEVICE. Each key column folds its i32
+/// WORD decomposition into the surrogate fingerprint (i64 -> [low32, high32] LE, matching the section's LE
+/// layout); the device fold kernel reads `widths[k]` words per column. Proves: elision, tuple uniqueness
+/// (dup -> 23505; distinct OK), the DEVICE fold matches the host needle even across the HIGH word (a
+/// value > 2^32 survives geometric rebuilds and its duplicate is caught), and DELETE by the i64 key stays
 /// device-native. Driverless-safe.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]

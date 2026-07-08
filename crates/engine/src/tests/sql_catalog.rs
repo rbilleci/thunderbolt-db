@@ -3639,9 +3639,28 @@ fn sql_value_key_words_matches_le_section_layout() {
     // Reassembling the two words little-endian recovers the i64 exactly.
     let recon = (low as u32 as u64) | ((high as u32 as u64) << 32);
     assert_eq!(recon as i64, v);
-    // Unsupported key types (b128/text) have no word width -> None.
+    // b128 (Numeric/Uuid) -> 4 words (16 LE bytes = 4 LE i32). Uuid folds its raw bytes; Numeric folds
+    // its i128 mantissa (both matching the b128 section's LE byte layout).
+    assert_eq!(key_column_width_words(SqlType::Uuid), Some(4));
+    assert_eq!(
+        key_column_width_words(SqlType::Numeric {
+            precision: 20,
+            scale: 4
+        }),
+        Some(4)
+    );
+    let uuid_bytes: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    assert_eq!(
+        sql_value_key_words(SqlType::Uuid, &SqlValue::Uuid(uuid_bytes)),
+        Some(vec![
+            i32::from_le_bytes([1, 2, 3, 4]),
+            i32::from_le_bytes([5, 6, 7, 8]),
+            i32::from_le_bytes([9, 10, 11, 12]),
+            i32::from_le_bytes([13, 14, 15, 16]),
+        ])
+    );
+    // Text (variable-length) is still not a supported compound key column.
     assert_eq!(key_column_width_words(SqlType::Text), None);
-    assert_eq!(key_column_width_words(SqlType::Uuid), None);
 }
 
 #[test]
@@ -3677,9 +3696,41 @@ fn compound_primary_key_over_i64_columns_enforces_tuple_uniqueness() {
         .execute_text(9, "INSERT INTO mt VALUES (1, 8000000000, 5)")
         .is_err());
 
-    // A compound key touching a b128/text type stays rejected (follow-up).
+    // COMPOUND KEYS (wider types, Stage 2c): b128 (Uuid / Numeric) key columns are now ACCEPTED and
+    // enforce tuple uniqueness.
+    e.execute_text(10, "CREATE TABLE ut (a INT, u UUID, v INT, PRIMARY KEY (a, u))")
+        .unwrap();
+    e.execute_text(
+        11,
+        "INSERT INTO ut VALUES (1, '00000000-0000-0000-0000-000000000001', 0)",
+    )
+    .unwrap();
+    e.execute_text(
+        12,
+        "INSERT INTO ut VALUES (1, '00000000-0000-0000-0000-000000000002', 0)",
+    )
+    .unwrap(); // distinct uuid -> OK
     assert!(e
-        .execute_text(10, "CREATE TABLE nt (a INT, u UUID, PRIMARY KEY (a, u))")
+        .execute_text(
+            13,
+            "INSERT INTO ut VALUES (1, '00000000-0000-0000-0000-000000000001', 9)"
+        )
+        .is_err()); // duplicate (a, u) tuple -> 23505
+
+    e.execute_text(
+        14,
+        "CREATE TABLE nt (a INT, n NUMERIC(20,4), v INT, PRIMARY KEY (a, n))",
+    )
+    .unwrap();
+    e.execute_text(15, "INSERT INTO nt VALUES (1, 1.5, 0)").unwrap();
+    e.execute_text(16, "INSERT INTO nt VALUES (1, 2.5, 0)").unwrap(); // distinct -> OK
+    assert!(e
+        .execute_text(17, "INSERT INTO nt VALUES (1, 1.5, 9)")
+        .is_err()); // duplicate (a, n) tuple -> 23505
+
+    // A compound key touching TEXT (variable-length) stays rejected (Stage 2d follow-up).
+    assert!(e
+        .execute_text(18, "CREATE TABLE tt (a INT, s TEXT, PRIMARY KEY (a, s))")
         .is_err());
 }
 
