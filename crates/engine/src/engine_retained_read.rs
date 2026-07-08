@@ -1264,10 +1264,14 @@ impl Engine {
     pub(crate) fn wave_batch_visible_locate(
         &self,
         table: &RelationalTable,
-        // COMPOUND KEYS: the probe key id. DELETE/UPDATE target resolution passes single-column key
-        // ids only (compound-keyed DELETE/UPDATE via the fingerprint index is a follow-up — the
-        // consuming apply does not yet tuple-verify a located slot, so a fingerprint collision must
-        // not reach it); `probe_key_id_positions` therefore resolves `[key_id]` here in practice.
+        // COMPOUND KEYS: the probe key id. This visibility-blind LANE tombstone/update path consumes
+        // the located `(shard, slot)` WITHOUT re-verifying the row's key, so a fingerprint collision
+        // must never reach it — its callers pass single-column key ids ONLY. That is structurally
+        // guaranteed: a compound-keyed table cannot take the covered-DELETE/UPDATE lane (it needs a
+        // covered-INSERT route, which rejects compound). Compound DELETE/UPDATE ARE implemented — via
+        // the SQL resolve path (`resolve_dml_matches_via_device` -> `dml_device_probe_key`), which
+        // probes the fingerprint index and then re-verifies the FULL tuple with the `filter_groups`
+        // recheck. So `probe_key_id_positions` resolves `[key_id]` here in practice.
         key_id: usize,
         needles: &[i32],
         snapshots: &[u64],

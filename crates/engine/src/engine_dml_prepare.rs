@@ -527,6 +527,59 @@ impl Engine {
     /// shards); every hit must carry a STAMPED identity (sentinel/absent region = unknown lineage).
     /// The locate is PHYSICAL (a tombstoned row still hits): the keyed fetch at `visibility` is the
     /// authoritative filter — a host-invisible row resolves to no match, exactly as the scan would.
+    /// COMPOUND KEYS (operational cases): pick the device PK-index probe key for a DELETE/UPDATE
+    /// resolve over one Eq-predicate `group`. Preference: a COMPOUND unique index whose EVERY key
+    /// column is Eq-covered in the group by an i32-section value -> `(FLAG | ordinal, fingerprint)`
+    /// (folded in key-column order, byte-matching the device-built index); else the FIRST i32-section
+    /// Eq -> `(col_idx, needle)` (the single-column key, byte-identical to the prior behavior). `None`
+    /// when no i32-section Eq exists. The caller's full `filter_groups` recheck restores exactness, so
+    /// a compound fingerprint collision here can never delete/update the wrong row.
+    fn dml_device_probe_key(
+        &self,
+        table: &RelationalTable,
+        group: &[(usize, SelectFilterOp, SqlValue)],
+    ) -> Option<(usize, i32)> {
+        let mut eqs: Vec<(usize, i32)> = Vec::new();
+        for (idx, op, value) in group {
+            if *op == SelectFilterOp::Eq {
+                if let Some(needle) = table
+                    .columns
+                    .get(*idx)
+                    .and_then(|column| crate::engine_residency::i32_section_needle(column.ty, value))
+                {
+                    if !eqs.iter().any(|(existing, _)| existing == idx) {
+                        eqs.push((*idx, needle));
+                    }
+                }
+            }
+        }
+        for (ord, index) in table
+            .indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| index.unique && crate::engine_residency::index_is_compound(index))
+        {
+            let Some(positions) = crate::engine_residency::index_key_column_positions(table, index)
+            else {
+                continue;
+            };
+            let mut words = Vec::with_capacity(positions.len());
+            if positions.iter().all(|p| {
+                match eqs.iter().find(|(idx, _)| idx == p) {
+                    Some((_, needle)) => {
+                        words.push(*needle);
+                        true
+                    }
+                    None => false,
+                }
+            }) {
+                let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)?;
+                return Some((key_id, crate::engine_residency::compound_key_fingerprint(&words)));
+            }
+        }
+        eqs.first().copied()
+    }
+
     pub(crate) fn resolve_dml_matches_via_device(
         &self,
         table: &RelationalTable,
@@ -558,30 +611,20 @@ impl Engine {
             rehydrate_if_elided(self)?;
             return Ok(None);
         }
-        // Single-needle shape: one group, one Eq on an Int4 column (the locate probes one key).
+        // Single-GROUP shape: one AND-group of Eq predicates (the locate probes one key). A
+        // single-column key drives on its one i32-section Eq; a COMPOUND key drives on the surrogate
+        // FINGERPRINT of its key columns when they are ALL Eq-covered in the group (device-native
+        // compound DELETE/UPDATE — no de-elide). Exactness for both rides the `filter_groups` recheck
+        // below.
         let [group] = filter_groups else {
             rehydrate_if_elided(self)?;
             return Ok(None);
         };
-        let mut eq: Option<(usize, i32)> = None;
-        for (idx, op, value) in group {
-            if *op == SelectFilterOp::Eq {
-                // TYPE-COVERAGE track 2: any i32-section-typed Eq (Int4/Date/Int2, variant
-                // agreeing with the column) can drive the locate.
-                if let Some(needle) = table.columns.get(*idx).and_then(|column| {
-                    crate::engine_residency::i32_section_needle(column.ty, value)
-                }) {
-                    eq = Some((*idx, needle));
-                    break;
-                }
-            }
-        }
-        let Some((filter_idx, needle)) = eq else {
+        let Some((key_id, needle)) = self.dml_device_probe_key(table, group) else {
             rehydrate_if_elided(self)?;
             return Ok(None);
         };
-        let Some(hits) =
-            self.locate_resident_pk_via_shard_index_detailed(table, filter_idx, needle)
+        let Some(hits) = self.locate_resident_pk_via_shard_index_detailed(table, key_id, needle)
         else {
             rehydrate_if_elided(self)?;
             return Ok(None); // locate declined (dup / oversize / invalid / not resident)

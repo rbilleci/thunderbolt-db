@@ -52,10 +52,19 @@ restored the lanes-mode LIVE-shard offset recompute in `ensure_shard_pk_device_i
 disproved+documented (ordinal-based cache key is safe because every index-shape DDL triggers a GLOBAL
 residency invalidation that purges the PK-index cache); the device fold kernel CLEARED (byte-identical to
 the host fold, sabotage-verified via a device-fold-consistency dup test).
-LEDGERED FOLLOW-UPS: fused-apply-for-compound, wider compound key types (i64/b128/text tuple hashing),
 64-bit fingerprint. **This was the last charter-advancing step before CPU-engine deletion (ADR-006).**
-Also OPEN: text-COMPACTION follow-up (rollover-only = one shard/commit, O(all-shards)/read —
-scalability-ledger). See memory `type-coverage-14`, `scalability-ledger`, `charter-governance-ruling`.
+**OPERATIONAL CASES (Stage 1) DEVICE-NATIVE:** a DELETE / UPDATE `WHERE a=? AND b=?` by a compound key
+now resolves ON THE DEVICE — `resolve_dml_matches_via_device` -> `dml_device_probe_key` folds the
+surrogate fingerprint from the key columns' Eq predicates and probes the compound index; the full
+`filter_groups` recheck restores tuple exactness (a collision can never delete/update the wrong row), so
+the table STAYS ELIDED instead of de-eliding (compound-keyed tables can't reach the visibility-blind
+covered lane — it needs a covered-INSERT route, which rejects compound — so the SQL resolve is the only
+path and it always rechecks). Point-reads already ran as device AND-scans (no de-elide). Focused audit
+CLEARED (exactness-under-collision airtight). **NEXT (Stage 2): wider compound key TYPES**
+(int8/timestamp/numeric/uuid/text + mixed) via each key column's i32-word decomposition folded on-device.
+LEDGERED: fused-apply-for-compound, 64-bit fingerprint. Also OPEN: text-COMPACTION follow-up
+(rollover-only = one shard/commit, O(all-shards)/read — scalability-ledger). See memory
+`type-coverage-14`, `scalability-ledger`, `charter-governance-ruling`.
 
 ---
 

@@ -1654,6 +1654,99 @@ fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
     );
 }
 
+/// COMPOUND KEYS (operational cases): a DELETE / UPDATE BY a compound key resolves its target ON THE
+/// DEVICE (the SQL resolve builds the surrogate fingerprint from the key columns' Eq predicates and
+/// probes the compound index; the full `filter_groups` recheck restores tuple exactness), so the table
+/// STAYS ELIDED instead of de-eliding to a host rehydrate. This proves: the device resolve FIRES (the
+/// `dml_device_resolve_hits` counter advances), the table stays elided across the DELETE + UPDATE, and
+/// the ops are TUPLE-EXACT (deleting `(a,b1)` leaves `(a,b2)` — not first-column-only). Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_compound_delete_update_by_key_stays_device_native() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE ct (a INT, b INT, v INT, PRIMARY KEY (a, b))")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+
+    let txn_ids = AtomicU64::new(2);
+    macro_rules! sql {
+        ($s:expr) => {
+            engine.execute_dml_concurrent(txn_ids.fetch_add(1, Ordering::Relaxed), $s)
+        };
+    }
+    sql!("INSERT INTO ct VALUES (1000000, 0, 0)").unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("ct")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return; // self-guard: no usable GPU
+    }
+    let mut warmed = false;
+    for i in 0..10_000_i32 {
+        sql!(&format!("INSERT INTO ct VALUES ({}, {}, 0)", 2_000_000 + i, i)).unwrap();
+        if engine.table_install_elided("ct") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "compound-PK table never entered elision on a GPU box");
+    // Two rows sharing the first key column a=5 but differing in b.
+    sql!("INSERT INTO ct VALUES (5, 1, 100)").unwrap();
+    sql!("INSERT INTO ct VALUES (5, 2, 200)").unwrap();
+    assert!(engine.table_install_elided("ct"));
+
+    // DELETE by the FULL compound key -> device resolve; the table must STAY ELIDED (not rehydrate).
+    let resolve_before = engine.dml_device_resolve_hits();
+    sql!("DELETE FROM ct WHERE a = 5 AND b = 1").unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > resolve_before,
+        "compound DELETE must resolve its target ON THE DEVICE (counter advanced)"
+    );
+    assert!(
+        engine.table_install_elided("ct"),
+        "compound DELETE must not de-elide the table"
+    );
+
+    // TUPLE EXACTNESS: (5,1) is gone; (5,2) survives (a DELETE keyed on the tuple, not column a).
+    let count_a5 = |engine: &Engine| -> i64 {
+        let Command::Select(sel) =
+            parse_command("SELECT COUNT(*) FROM ct WHERE a = 5").unwrap()
+        else {
+            unreachable!()
+        };
+        match engine.execute_relational_select(&sel).unwrap().rows[0][0] {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("unexpected count value {other:?}"),
+        }
+    };
+    assert_eq!(count_a5(&engine), 1, "exactly one a=5 row remains after deleting (5,1)");
+
+    // UPDATE by the full compound key -> device resolve; stays elided; hits the right tuple.
+    sql!("UPDATE ct SET v = 999 WHERE a = 5 AND b = 2").unwrap();
+    assert!(
+        engine.table_install_elided("ct"),
+        "compound UPDATE must not de-elide the table"
+    );
+    let Command::Select(sel) =
+        parse_command("SELECT v FROM ct WHERE a = 5 AND b = 2").unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine.execute_relational_select(&sel).unwrap().rows,
+        vec![vec![SqlValue::Int4(999)]],
+        "compound UPDATE must set v=999 on exactly the (5,2) tuple"
+    );
+}
+
 /// COMPOUND KEYS (audit regression): a compound index's per-shard device-index cache is keyed by
 /// `FLAG | ordinal`. Dropping an EARLIER constraint shifts the ordinals of the following indexes, so
 /// a SURVIVING cache entry could alias the shifted index (its probe would read an index built from
