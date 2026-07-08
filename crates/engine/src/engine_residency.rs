@@ -5002,6 +5002,83 @@ mod capacity_payload_tests {
         );
     }
 
+    /// TYPE-COVERAGE #14: the DEVICE->HOST rehydration gather materializes NUMERIC + UUID (both the
+    /// 16-byte b128 section) AND BIGINT (the i64 section) — so a read shape the on-device routes cannot
+    /// serve (here a FILTERED projection of the value column) falls to the CPU-pinned path and
+    /// rehydrates device->host correctly instead of hard-erroring ("device-authoritative invariant
+    /// broken"). Differential vs the CPU host oracle over the filtered read, one case per type.
+    /// Sabotage: declining any of these types in `gather_resident_table_rows_from_device` re-errors.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn b128_and_bigint_filtered_rehydration_reads_from_device() {
+        // (value-column DDL type, per-id value SQL). `id` is the INT PK; `val` is the rehydrated column.
+        let cases: [(&str, fn(i64) -> String); 6] = [
+            ("NUMERIC(20,4)", |k| format!("{k}.{:04}", (k * 7) % 10000)),
+            // A NEGATIVE mantissa (i128 high bit): exercises from_le_bytes sign-correctness.
+            ("NUMERIC(20,4)", |k| format!("-{k}.{:04}", (k * 7) % 10000)),
+            // scale 0 + negative: the mantissa IS the integer, no fractional digits.
+            ("NUMERIC(12,0)", |k| format!("{}", k * 7 - 500)),
+            ("UUID", |k| {
+                format!("'{:08x}-0000-0000-0000-000000000000'", k as u32)
+            }),
+            ("BIGINT", |k| format!("{}", k * 1_000_000_007)),
+            // A NEGATIVE bigint (i64 sign bit) through the two-halves reassembly.
+            ("BIGINT", |k| format!("{}", -k * 1_000_000_007 - 1)),
+        ];
+        for (ty, val_fn) in cases {
+            let run = |device: bool| -> (bool, Vec<Vec<SqlValue>>) {
+                let e = Engine::new_local();
+                e.set_auto_admit_on_commit(device);
+                e.set_host_install_elision_enabled(device);
+                e.set_constrained_elision_enabled(device);
+                e.set_device_write_locate_enabled(device);
+                e.set_device_write_locate_wave_batch_enabled(device);
+                e.set_shard_size_target(64); // multi-shard -> the gather spans shards
+                e.execute_text(1, &format!("CREATE TABLE t (id INT PRIMARY KEY, val {ty})"))
+                    .unwrap();
+                let mut seq = 2u64;
+                for chunk in 0..2_i64 {
+                    let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                        .map(|k| format!("({k}, {})", val_fn(k)))
+                        .collect();
+                    e.execute_text(
+                        seq,
+                        &format!("INSERT INTO t (id, val) VALUES {}", vals.join(",")),
+                    )
+                    .unwrap();
+                    seq += 1;
+                }
+                let elided = e.table_install_elided("t");
+                // A FILTERED projection of the value column is NOT a served on-device shape -> CPU-pinned
+                // path -> (elided) rehydrate device->host FIRST. id=3 lands in shard 0.
+                let rows = e
+                    .execute_relational_select_text("SELECT id, val FROM t WHERE id = 3")
+                    .unwrap()
+                    .rows
+                    .into_boxed();
+                (elided, rows)
+            };
+            let (on_elided, on_rows) = run(true);
+            let (_off_elided, off_rows) = run(false);
+            if on_rows.is_empty() {
+                return; // driverless box
+            }
+            assert!(
+                on_elided,
+                "{ty}: the table must be device-authoritative (elided)"
+            );
+            assert_eq!(
+                on_rows.len(),
+                1,
+                "{ty}: the filtered read returns exactly id=3"
+            );
+            assert_eq!(
+                on_rows, off_rows,
+                "{ty}: elided filtered read (rehydrated device->host) == CPU host oracle"
+            );
+        }
+    }
+
     /// R-ver PART 2: GROUP BY / DISTINCT / ORDER BY over a VERSIONED elided sharded table must
     /// HIDE tombstoned rows (they used to hard-REFUSE — "SV3b not wired through the reshaping
     /// sub-bridges" — because those bridges dropped `visibility`). Now the visibility is threaded
@@ -10271,11 +10348,12 @@ impl Engine {
     ) -> Option<Vec<(u64, Vec<SqlValue>)>> {
         // TYPE-COVERAGE track 2 (stage iii): every FIXED-WIDTH-section type gathers with its
         // catalog-derived variant (i32 via one u32/slot; i64 via two — the 4-mod-8 discipline).
-        // TYPE-COVERAGE #14 (bool): bool also gathers here (1 bit/row from the bitmap section) — this
-        // is the DEVICE->HOST rehydration a read shape the on-device routes can't serve falls back to
-        // (a filtered bool projection, an ORDER BY on a bool key). Without it an elided bool table would
-        // hard-error on those shapes. (Numeric/Uuid remain a pre-existing gap — declined here — pending
-        // their own b128 reassembly slice.)
+        // TYPE-COVERAGE #14 (bool/numeric/uuid): these also gather here — this is the DEVICE->HOST
+        // rehydration a read shape the on-device routes can't serve falls back to (a filtered bool/
+        // numeric projection, an ORDER BY on a bool key). Without it an elided table with such a column
+        // would hard-error on those shapes. Bool = 1 bit/row bitmap; Numeric/Uuid = the 16-byte b128
+        // section (numeric = i128 mantissa LE at the catalog scale; uuid = the raw 16 bytes). TEXT
+        // (variable-length) is the remaining declined type.
         if table.columns.iter().any(|column| {
             !matches!(
                 column.ty,
@@ -10285,6 +10363,8 @@ impl Engine {
                     | gpu_db_sql::SqlType::Int8
                     | gpu_db_sql::SqlType::Timestamp
                     | gpu_db_sql::SqlType::Bool
+                    | gpu_db_sql::SqlType::Numeric { .. }
+                    | gpu_db_sql::SqlType::Uuid
             )
         }) {
             return None;
@@ -10337,6 +10417,10 @@ impl Engine {
                 // TYPE-COVERAGE #14 (bool): the raw bitmap words (ceil(rows/32) u32, read as i32); bit
                 // `slot` = word[slot/32] >> (slot%32) & 1.
                 Bool(Vec<i32>),
+                // TYPE-COVERAGE #14 (numeric/uuid): the b128 section as FOUR i32 words/slot (16 LE
+                // bytes/row). Reassembled to i128 per row: numeric = the mantissa (at the catalog
+                // scale); uuid = the raw 16 bytes.
+                B128(Vec<i32>),
             }
             let mut columns: Vec<GatheredColumn> = Vec::with_capacity(table.columns.len());
             for idx in 0..table.columns.len() {
@@ -10366,6 +10450,20 @@ impl Engine {
                         columns.push(GatheredColumn::Bool(
                             device_memory
                                 .read_resident_i32_column(base, rows.div_ceil(32))
+                                .ok()?,
+                        ));
+                    }
+                    gpu_db_sql::SqlType::Numeric { .. } | gpu_db_sql::SqlType::Uuid => {
+                        let base = crate::relational_model::resident_device_numeric_column_offset(
+                            &descriptor,
+                            table,
+                            idx,
+                        )
+                        .ok()?;
+                        // FOUR i32 words per row (16 bytes), read as the live prefix.
+                        columns.push(GatheredColumn::B128(
+                            device_memory
+                                .read_resident_i32_column(base, rows * 4)
                                 .ok()?,
                         ));
                     }
@@ -10410,6 +10508,27 @@ impl Engine {
                         GatheredColumn::Bool(words) => {
                             let bit = (words[slot / 32] as u32 >> (slot % 32)) & 1;
                             Some(SqlValue::Bool(bit == 1))
+                        }
+                        GatheredColumn::B128(words) => {
+                            // Reassemble the 16 LE bytes (4 u32 words) for this slot.
+                            let mut bytes = [0u8; 16];
+                            for w in 0..4 {
+                                bytes[w * 4..w * 4 + 4]
+                                    .copy_from_slice(&words[slot * 4 + w].to_le_bytes());
+                            }
+                            match catalog_column.ty {
+                                gpu_db_sql::SqlType::Numeric { scale, .. } => {
+                                    // numeric = i128 mantissa LE, at the column's declared scale
+                                    // (byte-identical to the on-device projection's Decimal128::new).
+                                    Some(SqlValue::Numeric(gpu_db_sql::Decimal128::new(
+                                        i128::from_le_bytes(bytes),
+                                        scale,
+                                    )))
+                                }
+                                // uuid = the raw 16 bytes (storage wrote them verbatim).
+                                gpu_db_sql::SqlType::Uuid => Some(SqlValue::Uuid(bytes)),
+                                _ => None,
+                            }
                         }
                     })
                     .collect::<Option<Vec<SqlValue>>>()?;
