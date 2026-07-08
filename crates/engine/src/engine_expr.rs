@@ -2991,6 +2991,86 @@ impl Engine {
                 allocated_bytes = allocated_bytes.saturating_add(col_region_bytes);
             }
         }
+        // TYPE-COVERAGE #14 (text): recompact each TEXT column into the unified buffer. Text can't
+        // byte-concatenate directly across shards: each shard's offsets are RELATIVE to its own bytes
+        // blob. So the unified layout is, per column, an 8-aligned offsets section (total+1 i64) then the
+        // concatenated bytes blob; the blobs byte-copy at a running blob_base (RecompactSegment) and a
+        // per-element REBASE kernel adds each shard's blob_base to its offsets. Executor reads via the text
+        // offset helper (offsets_byte_offset + bytes_byte_offset), same layout as the single buffer.
+        let mut unified_text_columns: Vec<crate::relational_model::ResidentDeviceTextColumnLayout> =
+            Vec::new();
+        // (dst_offsets_byte_offset, dst_base_row, blob_base, src_ptr, src_offsets_byte_offset, count).
+        let mut text_rebase_ops: Vec<(u64, u32, u64, u64, u64, u32)> = Vec::new();
+        {
+            let text_names: Vec<String> = shards[0]
+                .resident_device_text_columns
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            for name in &text_names {
+                while !allocated_bytes.is_multiple_of(8) {
+                    allocated_bytes += 1;
+                }
+                let offsets_byte_offset = allocated_bytes;
+                let offsets_bytes = (total_row_count as u64 + 1) * 8;
+                allocated_bytes = allocated_bytes.saturating_add(offsets_bytes);
+                let bytes_byte_offset = allocated_bytes;
+                // Every offset entry IS written by the rebase (the shard ranges tile [0..total]); the
+                // fill is a defensive pre-zero (a skipped/empty shard leaves no garbage gap).
+                fills.push(gpu_db_execution::RecompactFill {
+                    byte_offset: offsets_byte_offset,
+                    len: offsets_bytes,
+                    fill_byte: 0,
+                });
+                let mut rows_before = 0_u64;
+                let mut blob_base = 0_u64;
+                for (shard, (device_ptr, row_count, _capacity)) in
+                    shards.iter().zip(shard_ptrs.iter())
+                {
+                    let row_count = *row_count as u64;
+                    let Some(layout) = shard
+                        .resident_device_text_columns
+                        .iter()
+                        .find(|t| &t.name == name)
+                    else {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "sharded text recompaction: shard {} lacks text column \"{name}\"",
+                            shard.shard_id
+                        ))));
+                    };
+                    if row_count > 0 {
+                        if layout.bytes_len > 0 {
+                            segments.push(gpu_db_execution::RecompactSegment {
+                                src_device_ptr: *device_ptr,
+                                src_byte_offset: layout.bytes_byte_offset,
+                                dst_byte_offset: bytes_byte_offset + blob_base,
+                                byte_len: layout.bytes_len,
+                            });
+                        }
+                        // Rebase this shard's (row_count+1) offsets into [rows_before .. +row_count].
+                        text_rebase_ops.push((
+                            offsets_byte_offset,
+                            rows_before as u32,
+                            blob_base,
+                            *device_ptr,
+                            layout.offsets_byte_offset,
+                            (row_count + 1) as u32,
+                        ));
+                    }
+                    rows_before = rows_before.saturating_add(row_count);
+                    blob_base = blob_base.saturating_add(layout.bytes_len);
+                }
+                allocated_bytes = allocated_bytes.saturating_add(blob_base);
+                unified_text_columns.push(
+                    crate::relational_model::ResidentDeviceTextColumnLayout {
+                        name: name.clone(),
+                        offsets_byte_offset,
+                        bytes_byte_offset,
+                        bytes_len: blob_base,
+                    },
+                );
+            }
+        }
         let header = (total_row_count as u64).to_le_bytes();
 
         // Recompact ON-DEVICE into one unified buffer, then build the whole-table descriptor + injected
@@ -3015,6 +3095,19 @@ impl Engine {
                     )))
                 })?;
         }
+        // TYPE-COVERAGE #14 (text): rebase each shard's offsets into the unified offsets section (DtoD,
+        // after the blob byte-copies above). A failure declines the whole sharded read.
+        for (dst_off, dst_base, blob_base, src_ptr, src_off, count) in &text_rebase_ops {
+            unified_mem
+                .rebase_text_offsets_from_shard(
+                    *dst_off, *dst_base, *blob_base, *src_ptr, *src_off, *count,
+                )
+                .map_err(|err| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "sharded text offset rebase kernel failed: {err}"
+                    )))
+                })?;
+        }
         let proof = unified_mem.metadata().clone();
         let snapshot = self.resident_snapshot_for_unified(
             table,
@@ -3026,6 +3119,7 @@ impl Engine {
             int8_columns,
             numeric_columns,
             unified_bool_columns,
+            unified_text_columns,
             unified_null_columns,
         );
         Ok(ShardedUnifiedExecSource {

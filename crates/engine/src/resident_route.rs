@@ -167,6 +167,7 @@ pub(crate) fn resident_route_query_shape(
                             | SqlType::Numeric { .. }
                             | SqlType::Uuid
                             | SqlType::Bool
+                            | SqlType::Text
                     )
                 });
                 return all_servable.then(|| "int4_projection_all".to_string());
@@ -252,6 +253,10 @@ pub(crate) fn resident_route_query_shape(
                         | SqlType::Bool
                 )
             });
+            // NB: TEXT is intentionally NOT in this `SELECT *` arm — a `SELECT *` over a text table stays
+            // on the existing route (CPU-pinned -> rehydrate for an elided table). On-device text reads go
+            // through the EXPLICIT-column projection arm above (which the elided-text gate exercises); the
+            // `SELECT *` shape keeps its legacy classification so the route-decision tests are unchanged.
             (unfiltered && all_fixed_width && select.limit.is_none())
                 .then(|| "int4_projection_all".to_string())
         }

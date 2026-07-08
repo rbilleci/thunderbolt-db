@@ -1061,6 +1061,34 @@ impl CudaResidentDeviceMemory {
         Ok(out)
     }
 
+    /// TYPE-COVERAGE #14 (text): read `len` RAW bytes from this buffer at `byte_offset` (a text column's
+    /// bytes blob), for the device->host rehydration gather. Bounds-checked against `allocated_bytes`.
+    pub fn read_resident_bytes(
+        &self,
+        byte_offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, CudaRuntimeProbeError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = byte_offset
+            .checked_add(len as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if end > self.metadata.allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(len));
+        }
+        self.primary.set_current()?;
+        let mut out = vec![0_u8; len];
+        check_cuda(unsafe {
+            (self.primary.cu_memcpy_dtoh)(
+                out.as_mut_ptr().cast::<c_void>(),
+                self.device_ptr + byte_offset,
+                len,
+            )
+        })?;
+        Ok(out)
+    }
+
     /// Slice 1a (GPU-native writes): append `chunks` IN PLACE into this allocation's headroom — one
     /// `cuMemcpyHtoD` to `device_ptr + byte_offset` per chunk, with NO reallocation and NO
     /// device-to-device recompaction, so an OPEN shard grows without re-uploading the rows it already
@@ -12354,6 +12382,65 @@ DONE:
 }
 "#;
 
+// TYPE-COVERAGE #14 (text): rebase ONE source shard's text offsets into the unified buffer's offsets
+// section. A shard's offsets are RELATIVE to its own bytes blob (start 0); the unified buffer concatenates
+// blobs, so each shard's offsets must have that shard's running `blob_base` added. Thread `i` reads source
+// offset `i` (u64) and writes `src_off + blob_base` to unified offset `dst_base_row + i`. `count` =
+// row_count+1 (the offsets are one-longer than the rows). DtoD, no HtoD; the unified offsets section is
+// fully written across shards (contiguous, boundaries overlap with the identical value).
+const TEXT_OFFSET_REBASE_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_text_offset_rebase(
+    .param .u64 dst_ptr,
+    .param .u64 dst_offsets_byte_offset,
+    .param .u32 dst_base_row,
+    .param .u64 blob_base,
+    .param .u64 src_ptr,
+    .param .u64 src_offsets_byte_offset,
+    .param .u32 count
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [dst_ptr];
+    ld.param.u64 %rd2, [dst_offsets_byte_offset];
+    ld.param.u32 %r1, [dst_base_row];
+    ld.param.u64 %rd3, [blob_base];
+    ld.param.u64 %rd4, [src_ptr];
+    ld.param.u64 %rd5, [src_offsets_byte_offset];
+    ld.param.u32 %r2, [count];
+
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.u32 %r6, %r4, %r5, %r3;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra DONE;
+
+    // src_off = *(u64*)(src_ptr + src_offsets_byte_offset + i*8)
+    mul.wide.u32 %rd6, %r6, 8;
+    add.u64 %rd7, %rd4, %rd5;
+    add.u64 %rd7, %rd7, %rd6;
+    ld.global.u64 %rd8, [%rd7];
+    // dst_val = src_off + blob_base
+    add.u64 %rd9, %rd8, %rd3;
+    // dst_idx = dst_base_row + i ; addr = dst_ptr + dst_offsets_byte_offset + dst_idx*8
+    add.u32 %r7, %r1, %r6;
+    mul.wide.u32 %rd10, %r7, 8;
+    add.u64 %rd11, %rd1, %rd2;
+    add.u64 %rd11, %rd11, %rd10;
+    st.global.u64 [%rd11], %rd9;
+
+DONE:
+    ret;
+}
+"#;
+
 const INDEX_INSERT_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -13057,6 +13144,99 @@ impl CudaResidentDeviceMemory {
             (&mut dst_ptr_arg as *mut u64).cast::<c_void>(),
             (&mut dst_off_arg as *mut u64).cast::<c_void>(),
             (&mut dst_base_arg as *mut u32).cast::<c_void>(),
+            (&mut src_ptr_arg as *mut u64).cast::<c_void>(),
+            (&mut src_off_arg as *mut u64).cast::<c_void>(),
+            (&mut count_arg as *mut u32).cast::<c_void>(),
+        ];
+        let threads_per_block: u32 = 128;
+        let blocks = count.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        check_cuda(unsafe { cu_ctx_synchronize() })?;
+        Ok(())
+    }
+
+    /// TYPE-COVERAGE #14 (text): rebase ONE source shard's `count` (= row_count+1) text offsets into THIS
+    /// (unified) buffer's offsets section at `dst_offsets_byte_offset`, placing the shard's offset `i` at
+    /// unified offset `dst_base_row + i` with `blob_base` added (the shard's running byte position in the
+    /// concatenated unified blob). Device->device (no HtoD). Synchronous (ctx-sync).
+    pub fn rebase_text_offsets_from_shard(
+        &self,
+        dst_offsets_byte_offset: u64,
+        dst_base_row: u32,
+        blob_base: u64,
+        src_device_ptr: u64,
+        src_offsets_byte_offset: u64,
+        count: u32,
+    ) -> Result<(), CudaRuntimeProbeError> {
+        type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        if count == 0 {
+            return Ok(());
+        }
+        if self.device_ptr() == 0 || src_device_ptr == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_ctx_synchronize = unsafe {
+            primary
+                .lib()
+                .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let mut ptx = Vec::with_capacity(TEXT_OFFSET_REBASE_PTX.len() + 1);
+        ptx.extend_from_slice(TEXT_OFFSET_REBASE_PTX);
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_resident_text_offset_rebase", &ptx)?;
+
+        let mut dst_ptr_arg = self.device_ptr();
+        let mut dst_off_arg = dst_offsets_byte_offset;
+        let mut dst_base_arg = dst_base_row;
+        let mut blob_base_arg = blob_base;
+        let mut src_ptr_arg = src_device_ptr;
+        let mut src_off_arg = src_offsets_byte_offset;
+        let mut count_arg = count;
+        let mut args = [
+            (&mut dst_ptr_arg as *mut u64).cast::<c_void>(),
+            (&mut dst_off_arg as *mut u64).cast::<c_void>(),
+            (&mut dst_base_arg as *mut u32).cast::<c_void>(),
+            (&mut blob_base_arg as *mut u64).cast::<c_void>(),
             (&mut src_ptr_arg as *mut u64).cast::<c_void>(),
             (&mut src_off_arg as *mut u64).cast::<c_void>(),
             (&mut count_arg as *mut u32).cast::<c_void>(),

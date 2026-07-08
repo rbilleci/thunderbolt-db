@@ -2044,12 +2044,19 @@ fn relational_catalog_drops_table_and_replays_from_wal() {
         .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("people").unwrap();
     assert!(snapshot.is_valid());
-    assert!(e.relational_residency_snapshot("people").is_some());
+    // TYPE-COVERAGE #14 (text): a PK'd text table is SHARD-resident (device-authoritative), not
+    // single-buffer, so check either representation.
+    assert!(
+        e.relational_residency_snapshot("people").is_some() || e.resident_shard_count("people") > 0
+    );
     e.execute_text(10, "DROP TABLE public.people").unwrap();
 
     assert!(e.relational_catalog_table("people").is_none());
     assert!(e.relational_catalog_table("teams").is_some());
-    assert!(e.relational_residency_snapshot("people").is_none());
+    assert!(
+        e.relational_residency_snapshot("people").is_none()
+            && e.resident_shard_count("people") == 0
+    );
     assert!(!e.read_state.residency.device_memory.contains_key("people"));
     assert_eq!(e.relational_table_comment("people"), None);
     assert_eq!(e.relational_column_comment("people", 2), None);
@@ -2285,9 +2292,12 @@ fn relational_catalog_truncates_table_and_replays_from_wal() {
             .as_deref(),
         Some("identity")
     );
+    // TYPE-COVERAGE #14 (text): a PK'd text table is SHARD-resident, so there is no single-buffer
+    // snapshot to invalidate — the empty ORDER BY select above already proved TRUNCATE serves no stale
+    // rows. Accept either an invalidated single-buffer snapshot (legacy) or the shard representation.
     assert!(e
         .relational_residency_snapshot("people")
-        .is_some_and(|snapshot| !snapshot.is_valid()));
+        .map_or(true, |snapshot| !snapshot.is_valid()));
 
     e.execute_text(11, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
         .unwrap();

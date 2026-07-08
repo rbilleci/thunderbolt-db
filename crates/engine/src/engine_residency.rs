@@ -4823,6 +4823,96 @@ mod capacity_payload_tests {
         assert!(!star.iter().any(|r| r.first() == Some(&SqlValue::Int4(50))));
     }
 
+    /// TYPE-COVERAGE #14 (text): a TEXT value column is device-authoritative (elided), ROLLS OVER to
+    /// multiple DENSE shards (rollover-only — variable-length has no headroom), and READS correctly via
+    /// the cross-shard gather (each shard's bytes blob byte-copies at a running blob_base; a per-element
+    /// offset-rebase kernel adds that blob_base to the shard's offsets). VARIED-LENGTH strings incl EMPTY
+    /// exercise the offset math across shard + blob boundaries. Differential vs the CPU host oracle.
+    /// Sabotage: dropping the rebase (or the blob segment) diverges the differential.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn text_column_elides_appends_and_reads_multishard() {
+        let run = |device: bool| -> (bool, usize, Vec<Vec<SqlValue>>) {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(device);
+            e.set_host_install_elision_enabled(device);
+            e.set_constrained_elision_enabled(device);
+            e.set_device_write_locate_enabled(device);
+            e.set_device_write_locate_wave_batch_enabled(device);
+            e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the text gather
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+                .unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                // s = a varied-length string; k % 7 == 0 -> a GENUINELY EMPTY string (a zero-length blob
+                // span, incl. the FIRST row k=0 and spans landing at shard boundaries) — exercises the
+                // offset math where consecutive offsets are equal.
+                let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| {
+                        if k % 7 == 0 {
+                            format!("({k}, '')")
+                        } else {
+                            format!("({k}, 'v{k}-{}')", "x".repeat((k % 7) as usize))
+                        }
+                    })
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, s) VALUES {}", vals.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            let elided = e.table_install_elided("t");
+            let shard_count = e.resident_shard_count("t");
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, s FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            // A FILTERED text projection is NOT a served on-device shape -> CPU-pinned path -> (elided)
+            // rehydrate device->host FIRST (the text arm of gather_resident_table_rows_from_device).
+            // id=3 -> "v3-xxx" (3 % 7 == 3 -> 3 'x'). Without the text rehydration arm this hard-errors.
+            let filtered = e
+                .execute_relational_select_text("SELECT id, s FROM t WHERE id = 3")
+                .unwrap()
+                .rows
+                .into_boxed();
+            assert_eq!(filtered.len(), 1, "filtered text read returns exactly id=3");
+            assert!(
+                matches!(filtered[0].get(1), Some(SqlValue::Text(t)) if t == "v3-xxx"),
+                "the rehydrated text value is exact, got {:?}",
+                filtered[0].get(1)
+            );
+            (elided, shard_count, rows)
+        };
+        let (on_elided, on_shards, on_rows) = run(true);
+        let (_off_elided, _off_shards, off_rows) = run(false);
+        if on_rows.is_empty() {
+            return; // driverless box
+        }
+        assert!(
+            on_elided,
+            "a TEXT-bearing table must be device-authoritative (elided)"
+        );
+        assert!(
+            on_shards >= 2,
+            "the table must roll over to MULTIPLE dense shards (exercise the text gather), saw {on_shards}"
+        );
+        assert_eq!(
+            on_rows, off_rows,
+            "elided multi-shard text read == CPU host oracle (blob concat + offset rebase are correct)"
+        );
+        // A non-empty string materializes with its exact bytes.
+        assert!(
+            on_rows
+                .iter()
+                .any(|r| matches!(r.get(1), Some(SqlValue::Text(t)) if t.contains('x'))),
+            "a varied-length string materializes with its bytes"
+        );
+    }
+
     /// TYPE-COVERAGE #14 (numeric): a NUMERIC value column rides the device-authoritative / elided
     /// fast path — the table ELIDES, INSERTs append device-authoritatively into the b128 (16-byte)
     /// section, the table rolls over to MULTIPLE shards, and reads over the numeric column match the
@@ -7388,6 +7478,36 @@ impl Engine {
                         | SqlType::Bool
                 )
             });
+        // TYPE-COVERAGE #14 (text): a table with a TEXT column (+ any other elision-compatible types)
+        // shard-admits as a DENSE shard (capacity == row_count — text has no capacity-strided headroom).
+        // It is not `fixed_width_sections` (variable-length), so it takes the dense capacity path below
+        // and the rollover-only append (each commit seals a fresh dense text shard). Reads span the
+        // shards via the blob-concat + offset-rebase gather.
+        let text_sectioned = !purely_int4
+            && !fixed_width_sections
+            && self.shard_int8_section_enabled()
+            && row_count > 0
+            && row_count < (1usize << 29)
+            && !column_types.is_empty()
+            && column_types.iter().any(|ty| matches!(ty, SqlType::Text))
+            // Text SHARD-admission is for the elided WRITE path (device-authoritative INSERTs), which
+            // needs the PK write-locate. A text table with NO primary key stays SINGLE-BUFFER (the
+            // legacy resident read path — text prefix LIKE, probes, routes — is unchanged for it).
+            && catalog_table.indexes.iter().any(|index| index.unique)
+            && column_types.iter().all(|ty| {
+                matches!(
+                    ty,
+                    SqlType::Int4
+                        | SqlType::Date
+                        | SqlType::Int2
+                        | SqlType::Int8
+                        | SqlType::Timestamp
+                        | SqlType::Numeric { .. }
+                        | SqlType::Uuid
+                        | SqlType::Bool
+                        | SqlType::Text
+                )
+            });
         // A PURELY-int4 table is laid down with capacity HEADROOM (~2x rows, power-of-two) so committed
         // INSERTs append in place (1b-ii). S-d2: the sharded read is now capacity-aware (the recompaction
         // gather + `resident_snapshot_for_shard` stride by `shard.capacity`), so the OPEN shard gets the
@@ -7516,7 +7636,7 @@ impl Engine {
         // until shards carry every section (type-coverage ledger item).
         if self.shard_residency_enabled()
             && device_memory.is_some()
-            && (purely_int4 || fixed_width_sections)
+            && (purely_int4 || fixed_width_sections || text_sectioned)
         {
             // Audit (S-d1) fix: this re-admit makes the SHARD representation authoritative — clear any prior
             // single-buffer cell for the table so a runtime flag flip (OFF->ON) cannot leave a stale
@@ -7579,18 +7699,20 @@ impl Engine {
                 // "large admit is one dense shard") must reach the append fn's ROLLOVER branch —
                 // the in-place branch checks headroom itself. Gating headroom here made every
                 // bulk-admitted lineage decline appends outright -> O(table) re-admit per commit.
-                // TYPE-COVERAGE #14: appendable = every column rides a section the chunk encoder /
-                // append ops maintain in place — i32 / i64 / b128 (fixed-width chunks) OR a bool bitmap
-                // (the device atomicOr set-range op) — with NO text / NULL sections. The b128 and bool
-                // counts join the i32+i64 count so a numeric- or bool-bearing open shard appends in
-                // place instead of O(table) re-admitting per commit.
-                int4_appendable: snapshot.resident_device_text_columns.is_empty()
-                    && snapshot.resident_device_null_columns.is_empty()
+                // TYPE-COVERAGE #14: `int4_appendable` = "participates in the append/rollover machinery"
+                // (NOT necessarily in-place). Fixed-width (i32/i64/b128) + bool append IN PLACE into
+                // headroom; TEXT tables are admitted DENSE (capacity == row_count) so they never fit
+                // in place -> every commit ROLLS OVER a fresh dense text shard (the rollover-only model).
+                // NULL-bearing shards stay non-appendable (single dense shard). The text count joins the
+                // others so a text table qualifies and reaches the rollover branch instead of the
+                // O(table) re-admit (which, being unhandled, would never let the table elide).
+                int4_appendable: snapshot.resident_device_null_columns.is_empty()
                     && snapshot.column_count
                         == snapshot.resident_device_int4_columns.len()
                             + snapshot.resident_device_int8_columns.len()
                             + snapshot.resident_device_numeric_columns.len()
-                            + snapshot.resident_device_bool_columns.len(),
+                            + snapshot.resident_device_bool_columns.len()
+                            + snapshot.resident_device_text_columns.len(),
                 // S-d3: the zone map (min/max per int4 column) for shard pruning.
                 resident_device_int4_column_stats: snapshot
                     .resident_device_int4_column_stats
@@ -8246,6 +8368,12 @@ impl Engine {
                     // a single dense shard until slice 2 adds the incremental bitmap append. Bool is a
                     // value column only — the unique-index gate below keeps keys on the i32 section.
                     | gpu_db_sql::SqlType::Bool
+                    // TYPE-COVERAGE #14 (text): TEXT value columns are device-authoritative (an
+                    // 8-aligned offsets section + a bytes blob). Variable-length can't use capacity
+                    // headroom, so a text-bearing open shard NEVER appends in place -> it ROLLS OVER
+                    // (each commit seals a fresh DENSE text shard the payload builder emits); reads span
+                    // the shards via the blob-concat + offset-rebase gather. Text stays a value column.
+                    | gpu_db_sql::SqlType::Text
             )
         }) && table.indexes.iter().all(|index| {
             // The A2/A3 device locate probes i32-SECTION keys only: a unique index on an
@@ -8575,6 +8703,7 @@ impl Engine {
             shard_int8_names,
             shard_numeric_names,
             shard_bool_layouts,
+            shard_text_layouts,
             gpu_id,
             schema,
             max_shard_id,
@@ -8598,6 +8727,7 @@ impl Engine {
                 open.resident_device_int8_columns.clone(),
                 open.resident_device_numeric_columns.clone(),
                 open.resident_device_bool_columns.clone(),
+                open.resident_device_text_columns.clone(),
                 open.gpu_id,
                 open.schema.clone(),
                 table_shards.iter().map(|s| s.shard_id).max().unwrap_or(0),
@@ -8630,17 +8760,22 @@ impl Engine {
             + shard_int8_names.len()
             + shard_numeric_names.len()
             + shard_bool_layouts.len()
+            + shard_text_layouts.len()
             != column_count
         {
             return false;
         }
+        // TYPE-COVERAGE #14 (text): a text-bearing shard is DENSE (no headroom) -> it never appends in
+        // place; force the ROLLOVER branch (the in-place path's chunk encoder rejects text anyway).
+        let has_text = !shard_text_layouts.is_empty();
         let num_i32_cols = shard_int4_names.len();
         let num_i64_cols = shard_int8_names.len();
         let num_numeric_cols = shard_numeric_names.len();
         let num_bool_cols = shard_bool_layouts.len();
 
-        // FITS the open shard's headroom -> append IN PLACE (1b-ii on the shard path).
-        if row_count.checked_add(k).is_some_and(|end| end <= capacity) {
+        // FITS the open shard's headroom -> append IN PLACE (1b-ii on the shard path). Text never
+        // qualifies (dense: row_count == capacity), but gate explicitly so the intent is clear.
+        if !has_text && row_count.checked_add(k).is_some_and(|end| end <= capacity) {
             let Some(shard_device_memory) = self
                 .read_state
                 .residency
@@ -8874,21 +9009,31 @@ impl Engine {
         // S-d2c ROLLOVER: the open shard is full -> SEAL it (leave it in place, immutable) and build + install
         // a NEW open shard holding the k rows (capacity = the target, so it grows to the target before the
         // next rollover). O(rows appended), NOT the O(table) re-admit -> this is what removes the 536M cap.
-        let new_capacity = self
-            .shard_size_target()
-            .max(k.saturating_mul(2).next_power_of_two());
-        let (device_payload, bool_layouts, int4_stats) =
+        // TYPE-COVERAGE #14 (text): a text column has NO capacity-strided headroom (the builder rejects
+        // capacity > row_count for text), so a text-bearing rollover shard is DENSE (capacity == k) — it
+        // never appends in place; the NEXT commit rolls another dense shard. Fixed-width/bool rollovers
+        // keep the growth headroom.
+        let has_text = column_types.iter().any(|ty| matches!(ty, SqlType::Text));
+        let new_capacity = if has_text {
+            k
+        } else {
+            self.shard_size_target()
+                .max(k.saturating_mul(2).next_power_of_two())
+        };
+        let (device_payload, text_layouts, bool_layouts, int4_stats) =
             match build_relational_device_payload_with_capacity(
                 &column_names,
                 &column_types,
                 new_rows,
                 new_capacity,
             ) {
-                // NULL-free (the caller rejects NULLs) -> text/null outputs are empty; keep the columnar
-                // payload + the int4 zone-map stats (min/max over the k rows) for pruning (S-d3). TYPE-
-                // COVERAGE #14 (bool): the bool bitmap layouts (offsets into THIS payload) DO carry — a
-                // rolled shard can hold bool value columns even though it holds no NULLs.
-                Ok((payload, _text, bool_cols, stats, _b128, _null)) => (payload, bool_cols, stats),
+                // NULL-free (the caller rejects NULLs) -> null output is empty; keep the columnar payload +
+                // the int4 zone-map stats (min/max over the k rows) for pruning (S-d3). TYPE-COVERAGE #14:
+                // the bool bitmap AND text (offsets+blob) layouts (offsets into THIS payload) DO carry — a
+                // rolled shard can hold bool/text value columns even though it holds no NULLs.
+                Ok((payload, text_cols, bool_cols, stats, _b128, _null)) => {
+                    (payload, text_cols, bool_cols, stats)
+                }
                 Err(_) => return false,
             };
         // SV1/SV2: the rolled shard carries NO version metadata in its payload — `created_by` is gone and
@@ -8947,7 +9092,12 @@ impl Engine {
                 + k * (num_i32_cols * std::mem::size_of::<i32>()
                     + num_i64_cols * std::mem::size_of::<i64>()
                     + num_numeric_cols * 16)
-                + bool_layouts.len() * k.div_ceil(32) * 4) as u64,
+                + bool_layouts.len() * k.div_ceil(32) * 4
+                // TYPE-COVERAGE #14 (text): the offsets section ((k+1)*8) + the bytes blob per column.
+                + text_layouts
+                    .iter()
+                    .map(|t| (k + 1) * 8 + t.bytes_len as usize)
+                    .sum::<usize>()) as u64,
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
             resident_device_int4_columns: shard_int4_names.clone(),
@@ -8956,7 +9106,8 @@ impl Engine {
             resident_device_numeric_columns: shard_numeric_names.clone(),
             // TYPE-COVERAGE #14 (bool): the bool bitmaps ride the rollover payload (offsets from the builder).
             resident_device_bool_columns: bool_layouts,
-            resident_device_text_columns: Vec::new(),
+            // TYPE-COVERAGE #14 (text): the DENSE text (offsets+blob) layouts ride the rollover payload.
+            resident_device_text_columns: text_layouts,
             // Rollover shards are fixed-width (i32/i64/b128) + NULL-free by precondition (NULLs rejected).
             resident_device_null_columns: Vec::new(),
             gpu_id,
@@ -10352,8 +10503,8 @@ impl Engine {
         // rehydration a read shape the on-device routes can't serve falls back to (a filtered bool/
         // numeric projection, an ORDER BY on a bool key). Without it an elided table with such a column
         // would hard-error on those shapes. Bool = 1 bit/row bitmap; Numeric/Uuid = the 16-byte b128
-        // section (numeric = i128 mantissa LE at the catalog scale; uuid = the raw 16 bytes). TEXT
-        // (variable-length) is the remaining declined type.
+        // section (numeric = i128 mantissa LE at the catalog scale; uuid = the raw 16 bytes); Text = the
+        // offsets section + bytes blob. Every elision-eligible type now rehydrates (nothing declined by type).
         if table.columns.iter().any(|column| {
             !matches!(
                 column.ty,
@@ -10365,6 +10516,7 @@ impl Engine {
                     | gpu_db_sql::SqlType::Bool
                     | gpu_db_sql::SqlType::Numeric { .. }
                     | gpu_db_sql::SqlType::Uuid
+                    | gpu_db_sql::SqlType::Text
             )
         }) {
             return None;
@@ -10421,6 +10573,9 @@ impl Engine {
                 // bytes/row). Reassembled to i128 per row: numeric = the mantissa (at the catalog
                 // scale); uuid = the raw 16 bytes.
                 B128(Vec<i32>),
+                // TYPE-COVERAGE #14 (text): the offsets (row+1 u64) + the bytes blob; row `slot` =
+                // blob[offsets[slot]..offsets[slot+1]].
+                Text(Vec<u64>, Vec<u8>),
             }
             let mut columns: Vec<GatheredColumn> = Vec::with_capacity(table.columns.len());
             for idx in 0..table.columns.len() {
@@ -10466,6 +10621,25 @@ impl Engine {
                                 .read_resident_i32_column(base, rows * 4)
                                 .ok()?,
                         ));
+                    }
+                    gpu_db_sql::SqlType::Text => {
+                        let layout = crate::relational_model::resident_device_text_column_layout(
+                            &descriptor,
+                            table,
+                            idx,
+                        )
+                        .ok()?;
+                        // The offsets section is (rows+1) u64; the blob is `bytes_len` raw bytes.
+                        let offsets = device_memory
+                            .read_resident_u64_column(layout.offsets_byte_offset, rows + 1)
+                            .ok()?;
+                        let blob = device_memory
+                            .read_resident_bytes(
+                                layout.bytes_byte_offset,
+                                layout.bytes_len as usize,
+                            )
+                            .ok()?;
+                        columns.push(GatheredColumn::Text(offsets, blob));
                     }
                     _ => {
                         let base = crate::relational_model::resident_device_int4_column_offset(
@@ -10529,6 +10703,14 @@ impl Engine {
                                 gpu_db_sql::SqlType::Uuid => Some(SqlValue::Uuid(bytes)),
                                 _ => None,
                             }
+                        }
+                        GatheredColumn::Text(offsets, blob) => {
+                            // row `slot` = blob[offsets[slot]..offsets[slot+1]] as UTF-8.
+                            let start = offsets[slot] as usize;
+                            let end = offsets[slot + 1] as usize;
+                            blob.get(start..end)
+                                .and_then(|b| std::str::from_utf8(b).ok())
+                                .map(|s| SqlValue::Text(s.to_string()))
                         }
                     })
                     .collect::<Option<Vec<SqlValue>>>()?;
@@ -10622,6 +10804,9 @@ impl Engine {
         // (offsets ABSOLUTE in that buffer). One entry per bool column (bool is dense — present on every
         // shard). Empty for a bool-free table -> byte-identical to the pre-bool read.
         bool_columns: Vec<ResidentDeviceBoolColumnLayout>,
+        // TYPE-COVERAGE #14 (text): the per-column text (offsets+blob) layouts recompacted into the unified
+        // buffer (offsets ABSOLUTE). One entry per text column (text is dense — present on every shard).
+        text_columns: Vec<ResidentDeviceTextColumnLayout>,
         // M3-for-shards: the per-column NULL bitmaps recompacted into the unified buffer (offsets ABSOLUTE
         // in that buffer). Empty when no surviving shard carries a NULL — byte-identical to the pre-M3 read.
         null_columns: Vec<ResidentDeviceNullBitmapLayout>,
@@ -10641,7 +10826,7 @@ impl Engine {
             resident_device_int8_columns: int8_columns,
             resident_device_numeric_columns: numeric_columns,
             resident_device_bool_columns: bool_columns,
-            resident_device_text_columns: Vec::new(),
+            resident_device_text_columns: text_columns,
             resident_device_null_columns: null_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
@@ -11739,6 +11924,10 @@ impl Engine {
                             .resident_device_bool_columns
                             .iter()
                             .any(|b| &b.name == column)
+                        && !shard
+                            .resident_device_text_columns
+                            .iter()
+                            .any(|t| &t.name == column)
                 })
             {
                 decision.cache_state = "Absent".to_string();

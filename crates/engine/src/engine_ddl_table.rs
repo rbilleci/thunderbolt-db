@@ -1262,6 +1262,17 @@ impl Engine {
                 .residency
                 .with_snapshots_mut(|snapshots| snapshots.remove(name));
             self.read_state.residency.device_memory.remove(name);
+            // TYPE-COVERAGE #14 (text/shards): a SHARD-resident table (any elided table — int4/numeric/
+            // bool/text) must also drop its SHARDS + shard device memory, else a re-created table of the
+            // same name would bind stale shards (wrong results) and the buffers would leak. (Single-buffer
+            // tables have no shards, so this is a no-op for them.)
+            self.read_state
+                .residency
+                .with_shards_mut(|shards| shards.remove(name));
+            self.read_state
+                .residency
+                .shard_device_memory
+                .remove_table(name);
             // SV4 prereq #1 (lifecycle): ERASE the dropped table's on-demand `deleted_by` region cells
             // (the commit's `invalidate_table` only publishes `None`, freeing the device buffer but leaving
             // a dangling per-shard key). A DROPped table is gone for good, so fully remove its keys to avoid
