@@ -5,8 +5,8 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-08. **Base:** `main` @ `ce84a677` (branch `feature/compound-uniqueness-device` =
-device-native compound uniqueness, awaiting merge). **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
+**Updated:** 2026-07-08. **Base:** `main` @ `fe9af98d` (device-native compound uniqueness MERGED).
+**ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
 the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first), updates are
 SUSTAINABLE (F3/U4 version-aware device PK index — dup-tolerant, mixed bench 1.4M TPS / 3 rebuilds),
 **R-ver (read version resolution) COMPLETE — PART 1 + PART 2 MERGED** (reads over versioned elided
@@ -30,8 +30,8 @@ byte-concats blobs + a NEW PTX kernel (`gpu_db_resident_text_offset_rebase`) tha
 offsets by its running blob_base (offsets are blob-relative, can't byte-concat). Text shard-admission is
 PK-GATED so legacy non-PK text tables stay single-buffer (blast-radius containment); surfaced + fixed a
 real DROP shard-leak. Eight adversarial audits (…/numeric/bool/rehydration/text) all MERGE-SAFE.
-**COMPOUND KEYS (Track 3) — DEVICE-NATIVE UNIQUENESS IMPLEMENTED (branch
-`feature/compound-uniqueness-device`, awaiting merge; foundation `3e3f520d`):** a compound `PRIMARY KEY` /
+**COMPOUND KEYS (Track 3) — DEVICE-NATIVE UNIQUENESS MERGED (`fe9af98d`; foundation
+`3e3f520d`):** a compound `PRIMARY KEY` /
 `UNIQUE` over i32-SECTION columns (Int4/Date/Int2) now ELIDES and validates uniqueness ON THE DEVICE — the
 six DDL rejections are lifted for that subset (wider-typed compound stays honestly rejected, all pre-WAL).
 THE ARCHITECTURE (best DELIVERED perf, CHARTER-PURE): the ordered key-column values fold into a 32-bit
