@@ -5,7 +5,7 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-08. **Base:** `main` @ `bcc8eed0`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
+**Updated:** 2026-07-08. **Base:** `main` @ `3e3f520d`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
 the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first), updates are
 SUSTAINABLE (F3/U4 version-aware device PK index — dup-tolerant, mixed bench 1.4M TPS / 3 rebuilds),
 **R-ver (read version resolution) COMPLETE — PART 1 + PART 2 MERGED** (reads over versioned elided
@@ -29,10 +29,15 @@ byte-concats blobs + a NEW PTX kernel (`gpu_db_resident_text_offset_rebase`) tha
 offsets by its running blob_base (offsets are blob-relative, can't byte-concat). Text shard-admission is
 PK-GATED so legacy non-PK text tables stay single-buffer (blast-radius containment); surfaced + fixed a
 real DROP shard-leak. Eight adversarial audits (…/numeric/bool/rehydration/text) all MERGE-SAFE.
-**NEXT: compound PKs** (don't parse today — `sql/lib.rs` single-column destructure; a parser/AST/catalog
-project) = the last gate before CPU-engine deletion (ADR-006, the charter's finish line). Also OPEN: a
-text-COMPACTION follow-up (rollover-only = one shard/commit, O(all-shards)/read — scalability-ledger).
-See memory `type-coverage-14`, `scalability-ledger`, `u2-lane-update-design`.
+**COMPOUND KEYS (Track 3) — FOUNDATION MERGED (`3e3f520d`):** the parser + AST + catalog now REPRESENT a
+multi-column key (`PRIMARY KEY (a,b)` parses; `RelationalIndex.key_columns`), but compound keys are
+REJECTED in PREFLIGHT (pre-WAL — an apply-time reject POISONS replay; found+fixed) until device-native
+uniqueness lands. Charter-aligned choice (per scope discussion): build compound uniqueness on the DEVICE
+from day one, NOT the host value_index slated for deletion (no churn). **NEXT: device-native compound
+uniqueness** — a compound-key write-locate probe (hash the key tuple / multi-column probe) so compound-PK
+tables ELIDE + the rejection lifts = the last charter-advancing step to CPU-engine deletion (ADR-006).
+Also OPEN: text-COMPACTION follow-up (rollover-only = one shard/commit, O(all-shards)/read —
+scalability-ledger #27). See memory `type-coverage-14`, `scalability-ledger`, `charter-governance-ruling`.
 
 ---
 
