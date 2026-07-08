@@ -5,7 +5,7 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-08. **Base:** `main` @ `819efbf7`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
+**Updated:** 2026-07-08. **Base:** `main` @ `bcc8eed0`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
 the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first), updates are
 SUSTAINABLE (F3/U4 version-aware device PK index — dup-tolerant, mixed bench 1.4M TPS / 3 rebuilds),
 **R-ver (read version resolution) COMPLETE — PART 1 + PART 2 MERGED** (reads over versioned elided
@@ -21,10 +21,18 @@ across U2/F3/U4/R-ver/numeric/bool all MERGE-SAFE; every CRITICAL/HIGH fixed + s
 regression-gated. **REHYDRATION CLOSED (`819efbf7`):** `gather_resident_table_rows_from_device` (the
 device→host rebuild for read shapes the on-device routes can't serve — filtered value-column
 projections, ORDER-BY-on-bool-key) now materializes NUMERIC/UUID (b128 reassembly) + BIGINT (verified),
-so those shapes rehydrate instead of hard-erroring; TEXT is the only remaining rehydration-declined
-type. **NEXT TYPE COVERAGE #14:** text LAST (variable-length — offset rebasing across shards + its own
-rehydration arm), compound PKs (don't parse today) → CPU-engine deletion (ADR-006, the charter's
-finish line). See memory `type-coverage-14`, `u2-lane-update-design`.
+so those shapes rehydrate instead of hard-erroring. **TEXT MERGED (`bcc8eed0`) — TYPE COVERAGE #14
+PER-TYPE ARC COMPLETE: every scalar type (int2/4/8, date, timestamp, numeric, uuid, bool, text) is now
+device-authoritative across write + on-device read + rehydration.** Text is ROLLOVER-ONLY (variable-
+length has no headroom → each commit seals a dense text shard); the crux was a cross-shard gather that
+byte-concats blobs + a NEW PTX kernel (`gpu_db_resident_text_offset_rebase`) that rebases each shard's
+offsets by its running blob_base (offsets are blob-relative, can't byte-concat). Text shard-admission is
+PK-GATED so legacy non-PK text tables stay single-buffer (blast-radius containment); surfaced + fixed a
+real DROP shard-leak. Eight adversarial audits (…/numeric/bool/rehydration/text) all MERGE-SAFE.
+**NEXT: compound PKs** (don't parse today — `sql/lib.rs` single-column destructure; a parser/AST/catalog
+project) = the last gate before CPU-engine deletion (ADR-006, the charter's finish line). Also OPEN: a
+text-COMPACTION follow-up (rollover-only = one shard/commit, O(all-shards)/read — scalability-ledger).
+See memory `type-coverage-14`, `scalability-ledger`, `u2-lane-update-design`.
 
 ---
 
