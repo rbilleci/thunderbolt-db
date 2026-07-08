@@ -66,13 +66,18 @@ elides + validates uniqueness ON THE DEVICE — each key column folds its i32-WO
 word; i64 -> 2 words [low32,high32] LE) into the fingerprint; the device fold kernel `COMPOUND_FOLD_PTX`
 takes per-column WIDTHS. Eligibility is arity-aware: SINGLE-column keys stay i32-section (raw i32 key),
 COMPOUND keys accept any foldable type (fingerprint). Focused audit CLEARED the host==device fold
-byte-for-byte. b128/text keys stay rejected. **DOCUMENTED LIMIT (per user sequencing): DELETE/UPDATE
-BY an i64 key de-elides at apply** — the SV4b tombstone-locate (`resident_int4_row_predicate`) is
-Int4-scan-only + `ResidentExpr` has no i64 literal; the device RESOLVE works, but the in-place tombstone
-declines -> host apply (correct, slower). **NEXT (Stage 2b): fingerprint-based tombstone-locate** so
-wider-type DELETE/UPDATE stay elided; THEN Stage 2c b128 (Numeric/Uuid, 4 words), Stage 2d text.
-LEDGERED: fused-apply-for-compound, 64-bit fingerprint. Also OPEN: text-COMPACTION follow-up
-(rollover-only = one shard/commit, O(all-shards)/read — scalability-ledger). See memory
+byte-for-byte. b128/text keys stay rejected. **OPERATIONAL FOR i64 (Stage 2b) DONE:** DELETE/UPDATE BY
+an i64 compound key now STAY ELIDED — a FINGERPRINT-based in-place tombstone-locate
+(`try_tombstone_resident_delete_via_fingerprint`) replaces the Int4-scan `resident_int4_row_predicate`
+for tables with an i64 key column: fold the row's key tuple -> fingerprint -> probe -> materialize each
+hit on-device + TUPLE-VERIFY the key columns (so a collision can't tombstone the wrong slot) -> exact-1 ->
+tombstone. UPDATE reuses it (tombstone-old). All-i32 tables keep the proven int4-predicate path. Focused
+audit CLEARED (collision-safe, already-dead/SI-fix visibility sound, exact-1 sound). **NEXT: Stage 2c
+b128** (Numeric/Uuid = 4 words, reuses the widths kernel + word production; recheck falls to host for
+b128-value tables), **Stage 2d text** (variable-length blob hashing). LEDGER GAPS surfaced by the audit:
+(a) a compound table with a NULL key column OR a b128/text VALUE column de-elides on EVERY DELETE/UPDATE
+(fingerprint/materialize declines); (b) reads over a VERSIONED wider-type elided table de-elide (R-ver is
+int4-only). LEDGERED: fused-apply-for-compound, 64-bit fingerprint, text-COMPACTION. See memory
 `type-coverage-14`, `scalability-ledger`, `charter-governance-ruling`.
 
 ---

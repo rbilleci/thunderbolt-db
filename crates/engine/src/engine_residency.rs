@@ -401,13 +401,12 @@ pub(crate) fn index_key_column_positions(
 }
 
 /// COMPOUND KEYS: can `index` be validated by the DEVICE PK-index probe? The answer differs by arity,
-/// because the two paths store different things:
-///   - SINGLE-column key: the device index stores the RAW i32 key, so ONLY an i32-section key column
-///     (Int4/Date/Int2) is probeable (an i64 raw key does not fit — such a table must NOT elide).
-///   - COMPOUND key: every key column folds its i32-word decomposition into a 32-bit surrogate
-///     FINGERPRINT, so ANY foldable type (i32-section + i64-section today; b128/text are follow-ups) is
-///     probeable (see [`compound_key_type_supported`]).
-/// A key column of an unsupported type keeps the index OFF the elision path (honest partial coverage).
+/// because the two paths store different things. A SINGLE-column key: the device index stores the RAW i32
+/// key, so ONLY an i32-section key column (Int4/Date/Int2) is probeable (an i64 raw key does not fit — such
+/// a table must NOT elide). A COMPOUND key: every key column folds its i32-word decomposition into a 32-bit
+/// surrogate FINGERPRINT, so ANY foldable type (i32-section + i64-section today; b128/text are follow-ups)
+/// is probeable (see [`compound_key_type_supported`]). A key column of an unsupported type keeps the index
+/// OFF the elision path (honest partial coverage).
 pub(crate) fn index_all_key_columns_foldable(
     table: &RelationalTable,
     index: &RelationalIndex,

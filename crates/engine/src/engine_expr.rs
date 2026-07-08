@@ -2337,6 +2337,83 @@ impl Engine {
         Some(total)
     }
 
+    /// COMPOUND KEYS (wider types, Stage 2b): locate + tombstone the deleted `row`'s resident slot via the
+    /// compound FINGERPRINT index, for tables the int4-column predicate can't uniquely locate (an i64 key
+    /// column is not in the predicate). Folds the row's key tuple to its fingerprint, probes the compound
+    /// index, and — because the probe is fingerprint-based (a collision could point at a DIFFERENT tuple) —
+    /// TUPLE-VERIFIES each hit by materializing the slot on-device and comparing the full key columns. Only
+    /// the verified, snapshot-LIVE slot is tombstoned. Returns `Some(1)` on the unique match, else `None`
+    /// (ambiguous / device decline / can't-materialize) -> the caller re-admits (always correct). `ord` is
+    /// `index`'s position in `table.indexes`.
+    fn try_tombstone_resident_delete_via_fingerprint(
+        &self,
+        table: &RelationalTable,
+        index: &crate::relational_model::RelationalIndex,
+        ord: usize,
+        row: &[SqlValue],
+        commit_seq: Index,
+    ) -> Option<usize> {
+        let fingerprint = crate::engine_residency::compound_index_row_fingerprint(table, index, row)?;
+        let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)?;
+        let key_positions = crate::engine_residency::index_key_column_positions(table, index)?;
+        let hits = self.locate_resident_pk_via_shard_index_detailed(table, key_id, fingerprint)?;
+        // TUPLE-VERIFY every fingerprint hit: materialize the slot at the commit boundary (created_by <=
+        // seq && deleted_by > seq = snapshot-live, so an already-tombstoned slot yields None and is
+        // dropped — the SI-fix already-dead discipline), then confirm the full key tuple matches. A device
+        // decline (materialize None) re-admits.
+        let mut matched: Vec<(u32, u32)> = Vec::new();
+        for hit in &hits {
+            let materialized = self.materialize_resident_row_via_hit(table, hit, commit_seq);
+            let mrow = match materialized {
+                Some(Some(mrow)) => mrow,
+                Some(None) => continue, // not snapshot-live (already dead / future): not our slot
+                None => return None,    // can't materialize (device err / wider value column) -> re-admit
+            };
+            if key_positions
+                .iter()
+                .all(|&p| mrow.get(p) == row.get(p))
+            {
+                matched.push((hit.shard_id, hit.slot));
+            }
+        }
+        // EXACT-1: a unique key identifies exactly one live slot. Anything else (0 = the resolved row
+        // moved/vanished; >1 = a fingerprint collision that both tuple-matched, impossible for a unique
+        // key but guarded) declines to the re-admit.
+        if matched.len() != 1 {
+            return None;
+        }
+        let (shard_id, slot) = matched[0];
+        if !self.tombstone_resident_shard_slots(&table.name, shard_id, &[slot], commit_seq) {
+            return None;
+        }
+        Some(1)
+    }
+
+    /// COMPOUND KEYS (wider types): the first compound unique index whose slot the int4-column predicate
+    /// CANNOT uniquely locate — i.e. it has a key column outside the i32 section (an i64 key). Such a
+    /// table's DELETE/UPDATE must locate via the fingerprint index (`try_tombstone_resident_delete_via_
+    /// fingerprint`); an all-i32-section table keeps the proven int4-predicate locate. Returns `(ord, index)`.
+    fn compound_index_needing_fingerprint_locate(
+        table: &RelationalTable,
+    ) -> Option<(usize, &crate::relational_model::RelationalIndex)> {
+        table.indexes.iter().enumerate().find(|(_, index)| {
+            index.unique
+                && crate::engine_residency::index_is_compound(index)
+                && index.key_columns.iter().any(|name| {
+                    table
+                        .columns
+                        .iter()
+                        .find(|c| &c.name == name)
+                        .is_some_and(|c| {
+                            !matches!(
+                                c.ty,
+                                SqlType::Int4 | SqlType::Date | SqlType::Int2
+                            )
+                        })
+                })
+        })
+    }
+
     /// SV4b (commit path): for a single-entry DELETE commit, LOCATE + tombstone the deleted rows' resident
     /// slots IN PLACE instead of the O(table) invalidate + re-admit. Builds an int4-equality predicate that
     /// matches the deleted row's resident int4 columns and stamps the located slots. Returns `true` (the
@@ -2368,9 +2445,24 @@ impl Engine {
         let Some(table) = cat.relational_catalog.get(table_name) else {
             return false;
         };
+        // COMPOUND KEYS (wider types): a compound key with an i64 column can't be located by the
+        // int4-column predicate -> use the fingerprint index + tuple-verify. All-i32-section tables keep
+        // the proven int4-predicate locate.
+        let fp_index = Self::compound_index_needing_fingerprint_locate(table);
         for row in deleted_rows {
             if row.len() != table.columns.len() {
                 return false;
+            }
+            if let Some((ord, index)) = fp_index {
+                if !matches!(
+                    self.try_tombstone_resident_delete_via_fingerprint(
+                        table, index, ord, row, commit_seq
+                    ),
+                    Some(1)
+                ) {
+                    return false;
+                }
+                continue;
             }
             let Some(predicate) = Self::resident_int4_row_predicate(table, row) else {
                 return false;

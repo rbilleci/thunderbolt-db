@@ -1679,6 +1679,8 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
     engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
 
     let txn_ids = AtomicU64::new(3);
     macro_rules! sql {
@@ -1724,17 +1726,30 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
     );
     assert!(engine.table_install_elided("ct"));
 
-    // DELETE by the i64 compound key is CORRECT + tuple-exact. NOTE: the device RESOLVE folds the i64
-    // fingerprint (device resolve fires), but the SV4b in-place tombstone-locate is int4-scan-only
-    // (`resident_int4_row_predicate`), so an i64-KEYED table's DELETE currently de-elides to the host
-    // apply (correctness-preserved). Making it stay elided = a fingerprint-based tombstone-locate
-    // (Stage 2b). Assert correctness here, not elision-retention.
+    // DELETE + UPDATE by the i64 compound key stay DEVICE-NATIVE (Stage 2b: the SV4b in-place
+    // tombstone-locate folds the i64 fingerprint + tuple-verifies the slot, so no int4-predicate
+    // de-elide). Run BOTH write ops FIRST and assert elision-retention immediately: a verifying SELECT
+    // on a VERSIONED wider-type table de-elides it (a read-path limitation — R-ver is int4-only —
+    // orthogonal to these WRITE ops), so correctness is checked AFTER the elision asserts.
+    sql!("INSERT INTO ct VALUES (5000000000, 3, 30)").unwrap();
     let resolve_before = engine.dml_device_resolve_hits();
     sql!("DELETE FROM ct WHERE a = 5000000000 AND b = 1").unwrap();
     assert!(
         engine.dml_device_resolve_hits() > resolve_before,
         "i64 compound DELETE must RESOLVE its target on the device"
     );
+    assert!(
+        engine.table_install_elided("ct"),
+        "i64 compound DELETE must stay device-native (fingerprint tombstone-locate), not de-elide"
+    );
+    sql!("UPDATE ct SET v = 777 WHERE a = 5000000000 AND b = 2").unwrap();
+    assert!(
+        engine.table_install_elided("ct"),
+        "i64 compound UPDATE must stay device-native (fingerprint tombstone-locate), not de-elide"
+    );
+
+    // Correctness (may de-elide the versioned table — checked AFTER the elision-retention asserts):
+    // deleted only (5000000000,1) [b=2 and b=3 remain]; the UPDATE set v=777 on exactly (5000000000,2).
     let Command::Select(count) =
         parse_command("SELECT COUNT(*) FROM ct WHERE a = 5000000000").unwrap()
     else {
@@ -1742,8 +1757,18 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
     };
     assert_eq!(
         engine.execute_relational_select(&count).unwrap().rows,
-        vec![vec![SqlValue::Int8(1)]],
-        "exactly the (5000000000,2) row remains after deleting (5000000000,1)"
+        vec![vec![SqlValue::Int8(2)]],
+        "deleted only (5000000000,1); b=2 and b=3 remain"
+    );
+    let Command::Select(sel) =
+        parse_command("SELECT v FROM ct WHERE a = 5000000000 AND b = 2").unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine.execute_relational_select(&sel).unwrap().rows,
+        vec![vec![SqlValue::Int4(777)]],
+        "i64 compound UPDATE sets v=777 on exactly the (5000000000,2) tuple"
     );
 
     // MIXED int4+int8 compound key: elide + enforce uniqueness.
