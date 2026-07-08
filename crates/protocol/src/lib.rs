@@ -7065,6 +7065,7 @@ mod tests {
                 primary_key: Some(PrimaryKey {
                     name: None,
                     column: "id".to_string(),
+                    columns: vec!["id".to_string()],
                 }),
                 unique_constraints: Vec::new(),
                 check_constraints: Vec::new(),
@@ -7097,10 +7098,12 @@ default: None,
                     UniqueConstraint {
                         name: None,
                         column: "name".to_string(),
+                        columns: vec!["name".to_string()],
                     },
                     UniqueConstraint {
                         name: Some("unique_people_id_key".to_string()),
                         column: "id".to_string(),
+                        columns: vec!["id".to_string()],
                     },
                 ],
                 check_constraints: Vec::new(),
@@ -7165,6 +7168,7 @@ default: None,
                 table: "keyed_people".to_string(),
                 name: "keyed_people_pkey".to_string(),
                 column: "id".to_string(),
+                columns: vec!["id".to_string()],
             })
         );
         assert_eq!(
@@ -7173,6 +7177,7 @@ default: None,
                 table: "keyed_people".to_string(),
                 name: "keyed_people_name_key".to_string(),
                 column: "name".to_string(),
+                columns: vec!["name".to_string()],
             })
         );
         assert_eq!(
@@ -7529,6 +7534,7 @@ default: None,
                 primary_key: Some(PrimaryKey {
                     name: None,
                     column: "id".to_string(),
+                    columns: vec!["id".to_string()],
                 }),
                 unique_constraints: Vec::new(),
                 check_constraints: Vec::new(),
@@ -8351,6 +8357,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 name: "people_name_idx".to_string(),
                 table: "people".to_string(),
                 column: "name".to_string(),
+                columns: vec!["name".to_string()],
                 unique: false,
             })
         );
@@ -8361,6 +8368,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 name: "people_name_idx".to_string(),
                 table: "people".to_string(),
                 column: "name".to_string(),
+                columns: vec!["name".to_string()],
                 unique: false,
             })
         );
@@ -8373,6 +8381,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 name: "people_name_idx".to_string(),
                 table: "people".to_string(),
                 column: "name".to_string(),
+                columns: vec!["name".to_string()],
                 unique: true,
             })
         );

@@ -155,26 +155,38 @@ pub struct CreateTable {
 pub struct AddPrimaryKey {
     pub table: String,
     pub name: String,
+    /// The FIRST key column (== `columns[0]`); kept for single-column call sites.
     pub column: String,
+    /// The ordered key columns (>= 1). A COMPOUND key has len > 1.
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrimaryKey {
     pub name: Option<String>,
+    /// The FIRST key column (== `columns[0]`); kept for single-column call sites.
     pub column: String,
+    /// The ordered key columns (>= 1). A COMPOUND primary key has len > 1.
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniqueConstraint {
     pub name: Option<String>,
+    /// The FIRST key column (== `columns[0]`); kept for single-column call sites.
     pub column: String,
+    /// The ordered key columns (>= 1). A COMPOUND unique constraint has len > 1.
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddUniqueConstraint {
     pub table: String,
     pub name: String,
+    /// The FIRST key column (== `columns[0]`); kept for single-column call sites.
     pub column: String,
+    /// The ordered key columns (>= 1). A COMPOUND unique constraint has len > 1.
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,7 +257,10 @@ pub struct DropConstraint {
 pub struct CreateIndex {
     pub name: String,
     pub table: String,
+    /// The FIRST key column (== `columns[0]`); kept for single-column call sites.
     pub column: String,
+    /// The ordered key columns (>= 1). A COMPOUND index/constraint has len > 1.
+    pub columns: Vec<String>,
     pub unique: bool,
 }
 
@@ -3007,11 +3022,12 @@ fn parse_add_primary_key(input: &str) -> Result<AddPrimaryKey, ParseError> {
         .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "KEY"))
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
-    let column = parse_single_constraint_column(rest)?;
+    let columns = parse_constraint_columns(rest)?;
     Ok(AddPrimaryKey {
         table,
         name,
-        column,
+        column: columns[0].clone(),
+        columns,
     })
 }
 
@@ -3020,11 +3036,12 @@ fn parse_add_unique_constraint(input: &str) -> Result<AddUniqueConstraint, Parse
     let rest = strip_keyword_prefix_case_insensitive(rest, "UNIQUE")
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
-    let column = parse_single_constraint_column(rest)?;
+    let columns = parse_constraint_columns(rest)?;
     Ok(AddUniqueConstraint {
         table,
         name,
-        column,
+        column: columns[0].clone(),
+        columns,
     })
 }
 
@@ -3508,17 +3525,23 @@ fn parse_check_constraint_filter(rest: &str) -> Result<SelectFilter, ParseError>
     Ok(filter)
 }
 
-fn parse_single_constraint_column(rest: &str) -> Result<String, ParseError> {
+/// Parse a constraint column LIST `(a, b, ...)` — the compound-key form of
+/// [`parse_single_constraint_column`]. Returns the ordered, normalized key columns (>= 1). A
+/// COMPOUND PRIMARY KEY / UNIQUE constraint is `PRIMARY KEY (a, b)`; a single-column one is the
+/// `[a]` special case (so callers get a uniform `Vec`). Rejects an empty list / trailing tokens.
+fn parse_constraint_columns(rest: &str) -> Result<Vec<String>, ParseError> {
     let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
     let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
     if close <= open || !rest[close + 1..].trim().is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
-    let columns = split_csv(&rest[open + 1..close])?;
-    let [column] = columns.as_slice() else {
+    let raw = split_csv(&rest[open + 1..close])?;
+    if raw.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
-    };
-    normalize_identifier(column.trim())
+    }
+    raw.iter()
+        .map(|column| normalize_identifier(column.trim()))
+        .collect()
 }
 
 fn parse_create_schema(input: &str) -> Result<CreateSchema, ParseError> {
@@ -3611,18 +3634,21 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
                     .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "KEY"))
                     .ok_or(ParseError::InvalidRelationalSql)?
                     .trim_start();
-                let column = parse_single_constraint_column(rest)?;
+                let columns = parse_constraint_columns(rest)?;
                 if primary_key.is_some() {
                     return Err(ParseError::InvalidRelationalSql);
                 }
                 primary_key = Some(PrimaryKey {
                     name: Some(name),
-                    column,
+                    column: columns[0].clone(),
+                    columns,
                 });
             } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "UNIQUE") {
+                let columns = parse_constraint_columns(rest.trim_start())?;
                 unique_constraints.push(UniqueConstraint {
                     name: Some(name),
-                    column: parse_single_constraint_column(rest.trim_start())?,
+                    column: columns[0].clone(),
+                    columns,
                 });
             } else if strip_keyword_prefix_case_insensitive(rest, "CHECK").is_some() {
                 check_constraints.push(CheckConstraint {
@@ -3638,28 +3664,23 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             let rest = strip_keyword_prefix_case_insensitive(rest.trim_start(), "KEY")
                 .ok_or(ParseError::InvalidRelationalSql)?
                 .trim_start();
-            let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
-            let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
-            if close <= open || !rest[close + 1..].trim().is_empty() {
-                return Err(ParseError::InvalidRelationalSql);
-            }
-            let key_columns = split_csv(&rest[open + 1..close])?;
-            let [column] = key_columns.as_slice() else {
-                return Err(ParseError::InvalidRelationalSql);
-            };
+            let columns = parse_constraint_columns(rest)?;
             if primary_key.is_some() {
                 return Err(ParseError::InvalidRelationalSql);
             }
             primary_key = Some(PrimaryKey {
                 name: None,
-                column: normalize_identifier(column.trim())?,
+                column: columns[0].clone(),
+                columns,
             });
             continue;
         }
         if let Some(rest) = strip_keyword_prefix_case_insensitive(trimmed, "UNIQUE") {
+            let columns = parse_constraint_columns(rest.trim_start())?;
             unique_constraints.push(UniqueConstraint {
                 name: None,
-                column: parse_single_constraint_column(rest.trim_start())?,
+                column: columns[0].clone(),
+                columns,
             });
             continue;
         }
@@ -3739,12 +3760,14 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             primary_key = Some(PrimaryKey {
                 name: None,
                 column: name.clone(),
+                columns: vec![name.clone()],
             });
         }
         if column_unique {
             unique_constraints.push(UniqueConstraint {
                 name: None,
                 column: name.clone(),
+                columns: vec![name.clone()],
             });
         }
         columns.push(ColumnDef {
@@ -4019,15 +4042,19 @@ fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
             table_target
         };
     let table = normalize_relation_identifier(table_target)?;
-    let columns = split_csv(&target[open + 1..close])?;
-    let [column] = columns.as_slice() else {
+    // The literal `CREATE INDEX ... (cols)` text form stays SINGLE-column for now (compound secondary
+    // indexes are out of scope); a multi-column list is a clean parse error. The compound-PK path builds
+    // `CreateIndex` internally (apply_add_primary_key) and carries `columns` there.
+    let raw = split_csv(&target[open + 1..close])?;
+    let [column] = raw.as_slice() else {
         return Err(ParseError::InvalidRelationalSql);
     };
     let column = normalize_identifier(column.trim())?;
     Ok(CreateIndex {
         name,
         table,
-        column,
+        column: column.clone(),
+        columns: vec![column],
         unique,
     })
 }
@@ -6022,9 +6049,7 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
         | SqlValue::Text(_)
         | SqlValue::Date(_)
         | SqlValue::Timestamp(_)
-        | SqlValue::Uuid(_) => {
-            Err(ParseError::InvalidRelationalSql)
-        }
+        | SqlValue::Uuid(_) => Err(ParseError::InvalidRelationalSql),
     }
 }
 
@@ -6040,9 +6065,7 @@ fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
         | SqlValue::Text(_)
         | SqlValue::Date(_)
         | SqlValue::Timestamp(_)
-        | SqlValue::Uuid(_) => {
-            Err(ParseError::InvalidRelationalSql)
-        }
+        | SqlValue::Uuid(_) => Err(ParseError::InvalidRelationalSql),
     }
 }
 

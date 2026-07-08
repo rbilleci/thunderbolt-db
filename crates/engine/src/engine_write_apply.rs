@@ -574,6 +574,24 @@ impl Engine {
                 }
             }
             Command::CreateTable(create) => {
+                // TYPE-COVERAGE #14 Track 3: the parser + catalog REPRESENT a compound key (columns
+                // list), but uniqueness ENFORCEMENT is not wired yet, so a COMPOUND PRIMARY KEY / UNIQUE
+                // is rejected in PREFLIGHT (before the WAL write — an apply-time reject would leave the
+                // rejected command in the WAL to poison every subsequent replay). Single-column keys pass.
+                if create
+                    .primary_key
+                    .as_ref()
+                    .is_some_and(|pk| pk.columns.len() > 1)
+                    || create
+                        .unique_constraints
+                        .iter()
+                        .any(|u| u.columns.len() > 1)
+                {
+                    return Err(EngineError::ApplyFailed(
+                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported"
+                            .to_string(),
+                    ));
+                }
                 if !cat.relational_public_schema_exists {
                     return Err(EngineError::ApplyFailed(format!(
                         "schema \"{}\" does not exist",
@@ -607,6 +625,13 @@ impl Engine {
                 }
             }
             Command::CreateIndex(create) if create.unique => {
+                // TYPE-COVERAGE #14 Track 3: compound UNIQUE index rejected in preflight (see CreateTable).
+                if create.columns.len() > 1 {
+                    return Err(EngineError::ApplyFailed(
+                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported"
+                            .to_string(),
+                    ));
+                }
                 if cat
                     .relational_catalog
                     .values()
@@ -646,6 +671,13 @@ impl Engine {
                 Self::validate_unique_values(&rows, column_idx, &create.name)?;
             }
             Command::AddPrimaryKey(add) => {
+                // TYPE-COVERAGE #14 Track 3: compound ADD PRIMARY KEY rejected in preflight (see CreateTable).
+                if add.columns.len() > 1 {
+                    return Err(EngineError::ApplyFailed(
+                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported"
+                            .to_string(),
+                    ));
+                }
                 if cat
                     .relational_catalog
                     .values()
@@ -701,6 +733,13 @@ impl Engine {
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
             }
             Command::AddUniqueConstraint(add) => {
+                // TYPE-COVERAGE #14 Track 3: compound ADD UNIQUE rejected in preflight (see CreateTable).
+                if add.columns.len() > 1 {
+                    return Err(EngineError::ApplyFailed(
+                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported"
+                            .to_string(),
+                    ));
+                }
                 if cat
                     .relational_catalog
                     .values()

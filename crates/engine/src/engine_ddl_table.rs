@@ -88,12 +88,23 @@ impl Engine {
         let name = create.table;
         let mut indexes = Vec::new();
         let mut checks = Vec::new();
+        // TYPE-COVERAGE #14 Track 3: compound PK/UNIQUE parses + rides the catalog, but uniqueness
+        // enforcement isn't wired yet (see apply_create_index_with_constraint_flags) — REJECT it here
+        // for the inline CREATE TABLE form so nothing silently-wrong ships. Single-column keys are fine.
+        if primary_key.as_ref().is_some_and(|pk| pk.columns.len() > 1)
+            || unique_constraints.iter().any(|u| u.columns.len() > 1)
+        {
+            return Err(EngineError::ApplyFailed(
+                "compound PRIMARY KEY / UNIQUE constraints are not yet supported".to_string(),
+            ));
+        }
         if let Some(primary_key) = primary_key {
             let constraint_name = primary_key.name.unwrap_or_else(|| format!("{}_pkey", name));
             indexes.push(RelationalIndex {
                 name: constraint_name,
                 table: name.clone(),
                 column: primary_key.column,
+                key_columns: primary_key.columns,
                 unique: true,
                 primary_key: true,
                 unique_constraint: false,
@@ -113,6 +124,7 @@ impl Engine {
                 name: constraint_name,
                 table: name.clone(),
                 column: unique.column,
+                key_columns: unique.columns,
                 unique: true,
                 primary_key: false,
                 unique_constraint: true,
@@ -210,6 +222,7 @@ impl Engine {
             name: add.name,
             table: add.table,
             column: add.column,
+            columns: add.columns,
             unique: true,
         };
         self.apply_create_index_with_constraint_flags(cat, create, true, false)
@@ -230,6 +243,17 @@ impl Engine {
         primary_key: bool,
         unique_constraint: bool,
     ) -> Result<(), EngineError> {
+        // TYPE-COVERAGE #14 Track 3 (compound keys): the parser + catalog now represent a COMPOUND key
+        // (`create.columns.len() > 1`), but UNIQUENESS enforcement for it is not wired yet — the host
+        // validators are single-column (first-column-only would be WRONG), and the device write-locate
+        // probes one key column. So a COMPOUND unique/PK constraint is REJECTED here (honest, never
+        // silently-wrong) until the device-native compound-locate lands. A non-unique compound index
+        // (no uniqueness semantics) is allowed through. Single-column keys are unaffected.
+        if create.unique && create.columns.len() > 1 {
+            return Err(EngineError::ApplyFailed(
+                "compound PRIMARY KEY / UNIQUE constraints are not yet supported".to_string(),
+            ));
+        }
         if cat
             .relational_catalog
             .values()
@@ -288,6 +312,7 @@ impl Engine {
                 name: create.name,
                 table: create.table,
                 column: create.column,
+                key_columns: create.columns,
                 unique: create.unique,
                 primary_key,
                 unique_constraint,
@@ -304,6 +329,7 @@ impl Engine {
             name: add.name,
             table: add.table,
             column: add.column,
+            columns: add.columns,
             unique: true,
         };
         self.apply_create_index_with_constraint_flags(cat, create, false, true)

@@ -1198,6 +1198,7 @@ fn relational_catalog_records_create_index_and_replays_from_wal() {
             name: "people_name_idx".to_string(),
             table: "people".to_string(),
             column: "name".to_string(),
+            key_columns: vec!["name".to_string()],
             unique: false,
             primary_key: false,
             unique_constraint: false,
@@ -1214,6 +1215,7 @@ fn relational_catalog_records_create_index_and_replays_from_wal() {
             name: "people_name_idx".to_string(),
             table: "people".to_string(),
             column: "name".to_string(),
+            key_columns: vec!["name".to_string()],
             unique: false,
             primary_key: false,
             unique_constraint: false,
@@ -1264,6 +1266,7 @@ fn relational_unique_index_rejects_duplicate_create_insert_update_and_replays_fr
             name: "people_name_uidx".to_string(),
             table: "people".to_string(),
             column: "name".to_string(),
+            key_columns: vec!["name".to_string()],
             unique: true,
             primary_key: false,
             unique_constraint: false,
@@ -1356,6 +1359,7 @@ fn relational_unique_constraints_reject_duplicates_and_replay_from_wal() {
                 name: "people_name_key".to_string(),
                 table: "people".to_string(),
                 column: "name".to_string(),
+                key_columns: vec!["name".to_string()],
                 unique: true,
                 primary_key: false,
                 unique_constraint: true,
@@ -1364,6 +1368,7 @@ fn relational_unique_constraints_reject_duplicates_and_replay_from_wal() {
                 name: "people_id_key".to_string(),
                 table: "people".to_string(),
                 column: "id".to_string(),
+                key_columns: vec!["id".to_string()],
                 unique: true,
                 primary_key: false,
                 unique_constraint: true,
@@ -1627,6 +1632,7 @@ fn relational_primary_key_rejects_duplicates_and_replays_from_wal() {
             name: "people_pkey".to_string(),
             table: "people".to_string(),
             column: "id".to_string(),
+            key_columns: vec!["id".to_string()],
             unique: true,
             primary_key: true,
             unique_constraint: false,
@@ -1794,6 +1800,7 @@ fn relational_catalog_drops_index_and_replays_from_wal() {
             name: "people_pkey".to_string(),
             table: "people".to_string(),
             column: "id".to_string(),
+            key_columns: vec!["id".to_string()],
             unique: true,
             primary_key: true,
             unique_constraint: false,
@@ -1850,6 +1857,7 @@ fn relational_catalog_renames_index_and_replays_from_wal() {
             name: "people_lookup_idx".to_string(),
             table: "people".to_string(),
             column: "name".to_string(),
+            key_columns: vec!["name".to_string()],
             unique: false,
             primary_key: false,
             unique_constraint: false,
@@ -3605,4 +3613,74 @@ fn relational_catalog_replays_from_durable_wal_with_table_data() {
             matched_keys: 2,
         }
     );
+}
+
+#[test]
+fn compound_primary_key_parses_but_is_rejected_until_device_support() {
+    // TYPE-COVERAGE #14 Track 3 (compound keys): the PARSER + catalog now REPRESENT a compound key
+    // (columns list), the foundation for device-native compound uniqueness. But uniqueness ENFORCEMENT
+    // isn't wired yet, so a compound PRIMARY KEY / UNIQUE is REJECTED at DDL (honest, never
+    // silently-wrong). Single-column keys are unaffected.
+
+    // (1) The parser accepts the compound form and captures BOTH key columns (not just the first).
+    let Command::CreateTable(create) =
+        parse_command("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))").unwrap()
+    else {
+        panic!("expected CREATE TABLE");
+    };
+    let pk = create.primary_key.expect("primary key parsed");
+    assert_eq!(pk.columns, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(pk.column, "a"); // the first key column (single-column back-compat)
+
+    // (2) DDL REJECTS the compound key cleanly (not silently-wrong first-column-only uniqueness).
+    let e = Engine::new_local();
+    let err = e
+        .execute_text(1, "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))")
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("compound"),
+        "compound PK is rejected with a clear message, got {err:?}"
+    );
+    // A compound UNIQUE constraint is likewise rejected.
+    assert!(e
+        .execute_text(2, "CREATE TABLE u (a INT, b INT, UNIQUE (a, b))")
+        .is_err());
+    // Every OTHER compound unique/PK entry point is rejected in PREFLIGHT too (before the WAL — so no
+    // rejected command poisons replay; the `e2` engine stays usable after each rejection).
+    let e2 = Engine::new_local();
+    e2.execute_text(1, "CREATE TABLE k (a INT, b INT)").unwrap();
+    assert!(e2
+        .execute_text(
+            2,
+            "ALTER TABLE ONLY public.k ADD CONSTRAINT k_pkey PRIMARY KEY (a, b)"
+        )
+        .is_err());
+    assert!(e2
+        .execute_text(
+            3,
+            "ALTER TABLE ONLY public.k ADD CONSTRAINT k_ab_key UNIQUE (a, b)"
+        )
+        .is_err());
+    assert!(e2
+        .execute_text(4, "CREATE UNIQUE INDEX k_ab_idx ON k (a, b)")
+        .is_err());
+    // Not poisoned: a single-column constraint on the same table still applies after the rejections.
+    e2.execute_text(
+        5,
+        "ALTER TABLE ONLY public.k ADD CONSTRAINT k_pkey PRIMARY KEY (a)",
+    )
+    .unwrap();
+
+    // (3) A single-column PRIMARY KEY still works end-to-end (no regression).
+    e.execute_text(3, "CREATE TABLE s (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO s (id, v) VALUES (1, 10), (2, 20)")
+        .unwrap();
+    // The PK is enforced (duplicate id rejected).
+    assert!(e
+        .execute_text(5, "INSERT INTO s (id, v) VALUES (1, 99)")
+        .is_err());
+    let table = e.relational_catalog_table("s").unwrap();
+    let pk = table.indexes.iter().find(|i| i.primary_key).unwrap();
+    assert_eq!(pk.key_columns, vec!["id".to_string()]);
 }

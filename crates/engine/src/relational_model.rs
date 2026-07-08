@@ -36,7 +36,13 @@ pub struct RelationalColumn {
 pub struct RelationalIndex {
     pub name: String,
     pub table: String,
+    /// The FIRST key column (== `key_columns[0]`). Kept for the many single-column call sites
+    /// (device locate, single-key resolve, pg_catalog single-key introspection).
     pub column: String,
+    /// COMPOUND-KEY (TYPE COVERAGE #14 Track 3): the ORDERED key columns. `[column]` for a
+    /// single-column index; `[a, b, ...]` for a compound PRIMARY KEY / UNIQUE. Compound-aware code
+    /// (uniqueness validation, pg_catalog `indkey`, device compound-locate) reads this.
+    pub key_columns: Vec<String>,
     pub unique: bool,
     pub primary_key: bool,
     pub unique_constraint: bool,
