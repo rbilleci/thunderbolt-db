@@ -89,6 +89,41 @@ impl WriteSet {
     /// writes share the integer conflict map with the intent fast path.
     pub(crate) fn add_unique_slots(&mut self, table: &RelationalTable, values: &[SqlValue]) {
         for index in table.indexes.iter().filter(|index| index.unique) {
+            // COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): a compound unique index contributes ONE
+            // conflict slot per row keyed by the whole ordered tuple — a string slot (the
+            // index-name-qualified tuple, for the classic conflict map) and, when every key column
+            // is an i32-section value, the integer fingerprint slot the intent fast path also emits
+            // (so cross-path conflicts stay exact). Same-tuple concurrent writers share the
+            // fingerprint -> a real conflict is never missed; a fingerprint collision between two
+            // DISTINCT tuples only over-conflicts (safe, retryable).
+            if crate::engine_residency::index_is_compound(index) {
+                let Some(positions) =
+                    crate::engine_residency::index_key_column_positions(table, index)
+                else {
+                    continue;
+                };
+                // Join the per-column index strings with a control-char separator so distinct tuples
+                // can never concatenate to the same key (`(a="1|2", b="3")` vs `(a="1", b="2|3")`).
+                let tuple_value: String = positions
+                    .iter()
+                    .map(|&i| relational_index_value(&values[i]))
+                    .collect::<Vec<_>>()
+                    .join("\u{1}");
+                self.unique_slots.push(UniqueIndexSlotKey {
+                    table: table.name.clone(),
+                    column: index.name.clone(),
+                    value: tuple_value,
+                });
+                if let Some(fp) =
+                    crate::engine_residency::compound_index_row_fingerprint(table, index, values)
+                {
+                    self.unique_slots_i32.push((
+                        crate::engine_residency::compound_unique_slot_id(table, index),
+                        fp,
+                    ));
+                }
+                continue;
+            }
             let Some(column_idx) = table
                 .columns
                 .iter()

@@ -343,6 +343,157 @@ pub(crate) fn i32_section_needle(ty: gpu_db_sql::SqlType, value: &SqlValue) -> O
     }
 }
 
+/// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): the device i32 PK index stores/probes a single 32-bit
+/// key per row. A compound `PRIMARY KEY (a, b, ...)` (or compound `UNIQUE`) over i32-SECTION columns
+/// (Int4/Date/Int2) is served by folding the ordered key-column values into ONE 32-bit SURROGATE key —
+/// the fingerprint below — which then rides the EXACT single-column index machinery (host builder,
+/// device insert/write-locate/visible-locate kernels, coalescer, geometric rebuild) unchanged: to the
+/// device the fingerprint is just an opaque 32-bit key.
+///
+/// EXACTNESS is not a property of the fingerprint (distinct tuples CAN collide on 32 bits): it is
+/// restored by the authoritative recheck. The device write-locate probe is already NON-authoritative —
+/// any `count > 0` triggers `visible_row_with_value`, which materializes the candidate row on-device and
+/// compares. For a compound key that recheck compares the FULL key TUPLE (see
+/// `tuple_matches_key_columns`), so a fingerprint collision can never produce a false 23505 or a wrong
+/// locate — only a rare, bounded extra recheck. Collision frequency is bounded per shard by the shard
+/// floor (a probe is already O(shards); the recheck adds a constant factor, not a new scalability class).
+///
+/// The fold is ORDER-SENSITIVE (the key-column order is part of the tuple identity) and computed ONLY on
+/// the host (needles, the shard-gather rebuild, and the incremental append all fold in Rust), so there is
+/// no host/device fingerprint-divergence surface. `key == 0` is fine: the slot packs `(key<<32)|(row+1)`
+/// and `row+1 >= 1`, so a packed slot is never the empty-slot sentinel 0.
+pub(crate) fn compound_key_fingerprint(vals: &[i32]) -> i32 {
+    let mut h: u32 = 0x811C_9DC5; // FNV-1a offset basis
+    for &v in vals {
+        h ^= v as u32;
+        h = h.wrapping_mul(0x0100_0193); // FNV prime
+        h = h.rotate_left(13).wrapping_add(0x9E37_79B1); // extra avalanche + Fibonacci constant
+    }
+    h as i32
+}
+
+/// COMPOUND KEYS: the device-probe "key id" that identifies WHICH unique index a probe/gather targets.
+/// A single-column index keeps its catalog COLUMN INDEX verbatim (byte-compatible with every existing
+/// cache entry and offset computation). A COMPOUND index encodes `FLAG | ordinal` where `ordinal` is the
+/// index's position in `table.indexes` — a small, per-index-UNIQUE, collision-free discriminator (a
+/// probabilistic hash of the column set could alias two compound indexes and silently serve the wrong
+/// index buffer = a MISSED-duplicate correctness bug, so the ordinal is used, not a hash). The flag bit
+/// (the top usize bit) can never collide with a real column index (`< usize::MAX >> 1`).
+pub(crate) const COMPOUND_KEY_ID_FLAG: usize = 1_usize << (usize::BITS - 1);
+
+/// COMPOUND KEYS: `true` when `index` spans more than one key column.
+pub(crate) fn index_is_compound(index: &RelationalIndex) -> bool {
+    index.key_columns.len() > 1
+}
+
+/// COMPOUND KEYS: resolve `index.key_columns` (ordered) to their catalog column positions. `None` if any
+/// named key column is absent from the table (a malformed catalog — the caller declines the fast path).
+pub(crate) fn index_key_column_positions(
+    table: &RelationalTable,
+    index: &RelationalIndex,
+) -> Option<Vec<usize>> {
+    index
+        .key_columns
+        .iter()
+        .map(|name| table.columns.iter().position(|c| &c.name == name))
+        .collect()
+}
+
+/// COMPOUND KEYS: is EVERY key column of `index` an i32-SECTION type (Int4/Date/Int2)? This is the
+/// slice-1 support boundary — the fingerprint folds i32-section values only; a key column of any wider
+/// type keeps the compound key REJECTED at DDL and OFF the elision path (honest partial coverage, exactly
+/// as the single-column path began int4-only).
+pub(crate) fn index_all_key_columns_i32_section(
+    table: &RelationalTable,
+    index: &RelationalIndex,
+) -> bool {
+    index.key_columns.iter().all(|name| {
+        table
+            .columns
+            .iter()
+            .find(|c| &c.name == name)
+            .is_some_and(|c| {
+                matches!(
+                    c.ty,
+                    gpu_db_sql::SqlType::Int4
+                        | gpu_db_sql::SqlType::Date
+                        | gpu_db_sql::SqlType::Int2
+                )
+            })
+    })
+}
+
+/// COMPOUND KEYS: the device-probe key id for `index` (see [`COMPOUND_KEY_ID_FLAG`]). `ordinal` is the
+/// index's position in `table.indexes`. Single-column -> the key column's catalog index; compound ->
+/// `FLAG | ordinal`. Returns `None` if the single key column can't be resolved.
+///
+/// CACHE SAFETY (audit): the ordinal is also the discriminator for the per-shard PK device-index
+/// cache `(table, shard_id, key_id)`, and DROP CONSTRAINT / DROP INDEX SHIFT ordinals. This is sound
+/// because EVERY index-shape DDL (CREATE/DROP INDEX, ADD/DROP PRIMARY KEY / UNIQUE) is an "other DDL"
+/// in `residency_invalidation_scope` -> the conservative GLOBAL `invalidate_relational_residency`,
+/// which runs `invalidate_relational_residency_table` for every resident table and thereby
+/// `purge_shard_pk_index_for_table` (engine_commit.rs). So no cache entry survives an ordinal shift;
+/// the next probe rebuilds against the current ordinals. Regression:
+/// `gpu_compound_drop_constraint_shifts_ordinal_without_aliasing_the_device_index`.
+pub(crate) fn index_probe_key_id(
+    table: &RelationalTable,
+    index: &RelationalIndex,
+    ordinal: usize,
+) -> Option<usize> {
+    if index_is_compound(index) {
+        Some(COMPOUND_KEY_ID_FLAG | ordinal)
+    } else {
+        table.columns.iter().position(|c| c.name == index.column)
+    }
+}
+
+/// COMPOUND KEYS: decode a device-probe `key_id` (see [`index_probe_key_id`]) back to the ordered
+/// catalog positions of its key column(s). A single-column key id IS the column index (`[key_id]`); a
+/// compound key id (`COMPOUND_KEY_ID_FLAG | ordinal`) resolves `table.indexes[ordinal].key_columns`.
+/// `None` if the ordinal / a named key column is out of range (a torn catalog -> the caller declines).
+pub(crate) fn probe_key_id_positions(table: &RelationalTable, key_id: usize) -> Option<Vec<usize>> {
+    if key_id & COMPOUND_KEY_ID_FLAG != 0 {
+        let ordinal = key_id & !COMPOUND_KEY_ID_FLAG;
+        index_key_column_positions(table, table.indexes.get(ordinal)?)
+    } else {
+        Some(vec![key_id])
+    }
+}
+
+/// COMPOUND KEYS: fold a ROW's key-column values (catalog order in `values`) into the surrogate
+/// fingerprint needle. `None` if any key column is absent or not an i32-SECTION value (the caller then
+/// declines the device fast path and falls to the host validate ladder). NULL is not an i32-section
+/// value, so a row with a NULL key column returns `None` — its uniqueness rides the host path (which is
+/// where PK-NOT-NULL / NULL-tuple semantics live anyway).
+pub(crate) fn compound_index_row_fingerprint(
+    table: &RelationalTable,
+    index: &RelationalIndex,
+    values: &[SqlValue],
+) -> Option<i32> {
+    let mut scratch: Vec<i32> = Vec::with_capacity(index.key_columns.len());
+    for name in &index.key_columns {
+        let pos = table.columns.iter().position(|c| &c.name == name)?;
+        scratch.push(i32_section_needle(table.columns[pos].ty, values.get(pos)?)?);
+    }
+    Some(compound_key_fingerprint(&scratch))
+}
+
+/// COMPOUND KEYS: the SI-ledger integer conflict slot id for a compound unique index. The top bit is
+/// SET so it can never alias a single-column slot's `(oid << 32) | column_id` on the same table (real
+/// column ids are small positive u32s). The low 31 bits fold the ordered key-column ids for per-index
+/// stability; a fold collision between two compound indexes only OVER-conflicts (a safe, retryable
+/// false abort), never MISSES a real conflict (same tuple -> same fingerprint -> same (slot,value) key).
+pub(crate) fn compound_unique_slot_id(table: &RelationalTable, index: &RelationalIndex) -> u64 {
+    let mut fold: u32 = 0x811C_9DC5;
+    for name in &index.key_columns {
+        if let Some(col) = table.columns.iter().find(|c| &c.name == name) {
+            fold ^= col.id;
+            fold = fold.wrapping_mul(0x0100_0193);
+        }
+    }
+    crate::write_path::pack_unique_slot_id(table.oid, 0x8000_0000 | (fold & 0x7FFF_FFFF))
+}
+
 /// The uniform memset byte whose repetition is the `deleted_by` LIVE sentinel `0x7F7F_7F7F_7F7F_7F7F` — a
 /// large POSITIVE signed i64 (the device visibility compare `deleted_by > read_txn_id` is a signed s64
 /// kernel; `u64::MAX` would be -1 signed and a live row would wrongly fail the compare) that exceeds every
@@ -8278,17 +8429,13 @@ impl Engine {
         }) {
             return false;
         }
-        // At least one unique index, and EVERY unique index is on a strictly-i32 column.
+        // At least one unique index, and EVERY unique index's key column(s) are strictly-i32-section.
+        // COMPOUND KEYS: a compound key over i32-section columns folds to a fingerprint surrogate and
+        // rides the same batched device write-locate.
         let mut has_unique = false;
         for index in table.indexes.iter().filter(|index| index.unique) {
             has_unique = true;
-            let Some(column) = table.columns.iter().find(|c| c.name == index.column) else {
-                return false;
-            };
-            if !matches!(
-                column.ty,
-                gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2
-            ) {
+            if !index_all_key_columns_i32_section(table, index) {
                 return false;
             }
         }
@@ -8378,20 +8525,11 @@ impl Engine {
         }) && table.indexes.iter().all(|index| {
             // The A2/A3 device locate probes i32-SECTION keys only: a unique index on an
             // i64 column could not be validated device-side, so such a table must not
-            // elide (its probes would decline -> rehydrate thrash at best).
-            !index.unique
-                || table
-                    .columns
-                    .iter()
-                    .find(|column| column.name == index.column)
-                    .is_some_and(|column| {
-                        matches!(
-                            column.ty,
-                            gpu_db_sql::SqlType::Int4
-                                | gpu_db_sql::SqlType::Date
-                                | gpu_db_sql::SqlType::Int2
-                        )
-                    })
+            // elide (its probes would decline -> rehydrate thrash at best). COMPOUND KEYS
+            // (TYPE-COVERAGE #14 Track 3): EVERY key column must be i32-section — a compound
+            // key over i32-section columns folds to a fingerprint surrogate that rides the
+            // same i32 device index (`compound_key_fingerprint`).
+            !index.unique || index_all_key_columns_i32_section(table, index)
         }) && unique_ok
             && table.check_constraints.is_empty()
             && table.foreign_keys.is_empty()

@@ -1187,13 +1187,13 @@ impl Engine {
         struct TableCtx<'c> {
             name: &'c str,
             table: &'c RelationalTable,
-            // (filter_idx, unique-index ordinal) for each strictly-i32 unique index; empty = not
-            // eligible (its inserts take the full-validate fallback / were validated off-lock).
-            unique_cols: Vec<(usize, usize)>,
+            // COMPOUND KEYS: the ORDINALS (into `table.indexes`) of the unique indexes to validate —
+            // each keyed on i32-section column(s). Empty = not eligible (full-validate fallback).
+            unique_indexes: Vec<usize>,
         }
         let mut tables: Vec<TableCtx> = Vec::new();
-        // group key = (distinct-table index, filter_idx) -> (needles, positions).
-        let mut group_keys: Vec<(usize, usize)> = Vec::new();
+        // group key = (distinct-table index, probe key_id, index ordinal) -> (needles, positions).
+        let mut group_keys: Vec<(usize, usize, usize)> = Vec::new();
         let mut group_needles: Vec<Vec<i32>> = Vec::new();
         let mut group_positions: Vec<Vec<usize>> = Vec::new();
         let mut full_validate: Vec<usize> = Vec::new();
@@ -1213,19 +1213,13 @@ impl Engine {
                         continue;
                     };
                     let eligible = self.insert_unique_wave_batchable(&catalog, table);
-                    let unique_cols = if eligible {
+                    let unique_indexes: Vec<usize> = if eligible {
                         table
                             .indexes
                             .iter()
                             .enumerate()
                             .filter(|(_, index)| index.unique)
-                            .filter_map(|(ord, index)| {
-                                table
-                                    .columns
-                                    .iter()
-                                    .position(|c| c.name == index.column)
-                                    .map(|fi| (fi, ord))
-                            })
+                            .map(|(ord, _)| ord)
                             .collect()
                     } else {
                         Vec::new()
@@ -1233,7 +1227,7 @@ impl Engine {
                     tables.push(TableCtx {
                         name: &insert.table,
                         table,
-                        unique_cols,
+                        unique_indexes,
                     });
                     tables.len() - 1
                 }
@@ -1244,21 +1238,23 @@ impl Engine {
                 full_validate.push(pos);
                 continue;
             }
-            if tables[tctx_idx].unique_cols.is_empty() {
+            if tables[tctx_idx].unique_indexes.is_empty() {
                 continue; // not eligible -> off-lock validated it
             }
-            // Eligible + gen-matched -> it was deferred. Bind each unique needle (no alloc).
+            // Eligible + gen-matched -> it was deferred. Bind each unique index's probe needle
+            // (single-column raw key, or the compound tuple fingerprint).
             let table = tables[tctx_idx].table;
             let mut bound_all = true;
-            let cols = tables[tctx_idx].unique_cols.clone();
-            for (filter_idx, _ord) in &cols {
-                let Some((_, needle)) = insert_i32_unique_needle_at(insert, table, *filter_idx)
+            let ords = tables[tctx_idx].unique_indexes.clone();
+            for ord in &ords {
+                let index = &table.indexes[*ord];
+                let Some((key_id, needle)) = insert_index_probe_needle(insert, table, index, *ord)
                 else {
                     bound_all = false;
                     break;
                 };
-                // Find/create the (tctx_idx, filter_idx) group.
-                let gk = (tctx_idx, *filter_idx);
+                // Find/create the (tctx_idx, key_id, ord) group.
+                let gk = (tctx_idx, key_id, *ord);
                 let gi = match group_keys.iter().position(|k| *k == gk) {
                     Some(i) => i,
                     None => {
@@ -1276,10 +1272,12 @@ impl Engine {
             }
         }
         // Batched device locate per group; count==0 passes, count>0 authoritative-checks.
-        for (gi, &(tctx_idx, filter_idx)) in group_keys.iter().enumerate() {
+        for (gi, &(tctx_idx, key_id, ord)) in group_keys.iter().enumerate() {
             let table = tables[tctx_idx].table;
+            let index = &table.indexes[ord];
+            let compound = crate::engine_residency::index_is_compound(index);
             let locate_started = wave_device_phase_timing_enabled().then(Instant::now);
-            let locate = self.wave_batch_locate_hit_counts(table, filter_idx, &group_needles[gi]);
+            let locate = self.wave_batch_locate_hit_counts(table, key_id, &group_needles[gi]);
             if let Some(started) = locate_started {
                 WAVE_DEVICE_STATS[0]
                     .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -1292,33 +1290,47 @@ impl Engine {
                         .zip(counts.iter())
                     {
                         if count == 0 {
-                            continue; // the common case: no physical slot holds the key
+                            continue; // the common case: no physical slot holds the key/fingerprint
                         }
-                        // Rare: >0 hits -> authoritative visibility+value check.
+                        // Rare: >0 hits -> authoritative visibility+value check. For a COMPOUND key
+                        // the recheck compares the FULL key tuple (a fingerprint hit alone is not a
+                        // duplicate), restoring exactness to the surrogate probe.
                         let visibility = crate::StorageVisibility {
                             read_txn_id: batch[pos].read_snapshot,
                         };
-                        if self
-                            .visible_row_with_value(
+                        let is_dup = if compound {
+                            let Command::Insert(insert) = &batch[pos].cmd else {
+                                continue;
+                            };
+                            match insert_index_key_tuple(insert, table, index) {
+                                Some(tuple) => self
+                                    .visible_row_with_tuple(
+                                        table,
+                                        visibility,
+                                        key_id,
+                                        Some(needle),
+                                        &tuple,
+                                        None,
+                                    )
+                                    .unwrap_or(false),
+                                None => {
+                                    // Unbindable tuple (e.g. NULL key column) -> full host validate.
+                                    full_validate.push(pos);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            self.visible_row_with_value(
                                 table,
                                 visibility,
-                                filter_idx,
+                                key_id,
                                 &SqlValue::Int4(needle),
                                 None,
                             )
                             .unwrap_or(false)
-                        {
-                            // Look up the index name ONLY now (rare) for the byte-identical 23505.
-                            let index_name = table
-                                .indexes
-                                .iter()
-                                .find(|idx| {
-                                    idx.unique
-                                        && table.columns.iter().position(|c| c.name == idx.column)
-                                            == Some(filter_idx)
-                                })
-                                .map(|idx| idx.name.as_str())
-                                .unwrap_or("");
+                        };
+                        if is_dup {
+                            let index_name = index.name.as_str();
                             violations.entry(pos).or_insert_with(|| {
                                 format!(
                                     "duplicate key value violates unique index \"{index_name}\""
@@ -3557,8 +3569,8 @@ impl Engine {
             // new versions (only the 1-row updates append). Sets each update's rows-affected cell
             // (0 or 1). Runs only if the insert append succeeded (a failed append rehydrates the
             // whole batch anyway); a decline routes to the rehydrate fallback (by-key resolution).
-            let updates_ok = updates.is_empty()
-                || (appended && self.apply_lane_updates_device(table, &updates));
+            let updates_ok =
+                updates.is_empty() || (appended && self.apply_lane_updates_device(table, &updates));
             if appended && deletes_ok && updates_ok {
                 continue;
             }
@@ -4607,4 +4619,72 @@ fn insert_i32_unique_needle_at(
     let coerced = coerce_filter_literal(raw, column_ty);
     let needle = crate::engine_residency::i32_section_needle(column_ty, &coerced)?;
     Some((filter_idx, needle))
+}
+
+/// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): the coerced i32-section value of `index`'s key column
+/// `name` in this insert's single row — the shared per-column bind used by both the probe needle and
+/// the recheck tuple. `None` if the column is missing from the row or coerces to a non-i32-section
+/// value (e.g. NULL). Returns `(catalog_column_idx, coerced_value, i32_needle)`.
+fn insert_key_column_bind(
+    insert: &Insert,
+    table: &RelationalTable,
+    name: &str,
+) -> Option<(usize, SqlValue, i32)> {
+    let filter_idx = table.columns.iter().position(|c| c.name == *name)?;
+    let column_ty = table.columns[filter_idx].ty;
+    let row = insert.rows.first()?;
+    let source_pos = if insert.columns.is_empty() {
+        filter_idx
+    } else {
+        insert.columns.iter().position(|c| c == name)?
+    };
+    let coerced = coerce_filter_literal(row.get(source_pos)?.clone(), column_ty);
+    let needle = crate::engine_residency::i32_section_needle(column_ty, &coerced)?;
+    Some((filter_idx, coerced, needle))
+}
+
+/// COMPOUND KEYS: bind the DEVICE-PROBE `(key_id, needle)` for `index` against this insert's row.
+/// Single-column -> `(col_idx, raw i32)`; compound -> `(FLAG | ord, fingerprint)`. `None` if any key
+/// column can't bind (the caller falls to full host validation).
+fn insert_index_probe_needle(
+    insert: &Insert,
+    table: &RelationalTable,
+    index: &RelationalIndex,
+    ord: usize,
+) -> Option<(usize, i32)> {
+    if crate::engine_residency::index_is_compound(index) {
+        let mut scratch: Vec<i32> = Vec::with_capacity(index.key_columns.len());
+        for name in &index.key_columns {
+            scratch.push(insert_key_column_bind(insert, table, name)?.2);
+        }
+        let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)?;
+        Some((
+            key_id,
+            crate::engine_residency::compound_key_fingerprint(&scratch),
+        ))
+    } else {
+        insert_i32_unique_needle_at(insert, table, ord_first_column_idx(table, index)?)
+    }
+}
+
+/// COMPOUND KEYS: the key TUPLE `(catalog_column_idx, coerced_value)` for `index`'s recheck. `None`
+/// if any key column can't bind (parallel to `insert_index_probe_needle`).
+fn insert_index_key_tuple(
+    insert: &Insert,
+    table: &RelationalTable,
+    index: &RelationalIndex,
+) -> Option<Vec<(usize, SqlValue)>> {
+    index
+        .key_columns
+        .iter()
+        .map(|name| {
+            let (col_idx, value, _) = insert_key_column_bind(insert, table, name)?;
+            Some((col_idx, value))
+        })
+        .collect()
+}
+
+/// The catalog index of a single-column index's key column (`index.column`).
+fn ord_first_column_idx(table: &RelationalTable, index: &RelationalIndex) -> Option<usize> {
+    table.columns.iter().position(|c| c.name == index.column)
 }

@@ -1206,8 +1206,16 @@ fn gpu_lane_update_intents_end_to_end() {
         .iter()
         .filter(|row| row.first() == Some(&SqlValue::Int4(50)))
         .collect();
-    assert_eq!(fifty.len(), 1, "the updated key is visible EXACTLY once (old twin hidden)");
-    assert_eq!(fifty[0].get(1), Some(&SqlValue::Int4(9999)), "new image wins");
+    assert_eq!(
+        fifty.len(),
+        1,
+        "the updated key is visible EXACTLY once (old twin hidden)"
+    );
+    assert_eq!(
+        fifty[0].get(1),
+        Some(&SqlValue::Int4(9999)),
+        "new image wins"
+    );
     let rows_before_zero = rows.len();
 
     // 0-ROW UPDATE (missing key): the CONDITIONAL append must fire NOTHING.
@@ -1239,8 +1247,16 @@ fn gpu_lane_update_intents_end_to_end() {
         .iter()
         .filter(|row| row.first() == Some(&SqlValue::Int4(50)))
         .collect();
-    assert_eq!(fifty.len(), 1, "chained update leaves the key visible exactly once");
-    assert_eq!(fifty[0].get(1), Some(&SqlValue::Int4(8888)), "latest image wins");
+    assert_eq!(
+        fifty.len(),
+        1,
+        "chained update leaves the key visible exactly once"
+    );
+    assert_eq!(
+        fifty[0].get(1),
+        Some(&SqlValue::Int4(8888)),
+        "latest image wins"
+    );
 
     // UPDATE-THEN-DELETE: update key 60, then delete it — the delete must locate the NEW version
     // through the pk index that the update's dead-twin append dropped then a locate rebuilt.
@@ -1523,4 +1539,197 @@ fn gpu_lane_update_sustained_stays_elided() {
         rebuilds < 30,
         "pk-index rebuilds must stay bounded under sustained updates, saw {rebuilds}"
     );
+}
+
+/// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): a compound PRIMARY KEY over i32-section columns is
+/// DEVICE-NATIVE — the table elides, and the wave-batched device write-locate validates uniqueness
+/// on the surrogate FINGERPRINT while the authoritative recheck compares the FULL tuple. This proves
+/// the DEVICE path FIRES (the `device_write_locate_hits` counter advances — not a silent host
+/// fallback) AND that uniqueness is exact (a repeated tuple is 23505; a tuple differing in ONE key
+/// column is a distinct row). Compound keys take the CLASSIC covered path (`execute_dml_concurrent`),
+/// not the fused intent lane. Self-guards on a driverless box.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE ct (a INT, b INT, v INT, PRIMARY KEY (a, b))",
+        )
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+
+    let txn_ids = AtomicU64::new(2);
+    macro_rules! insert {
+        ($sql:expr) => {
+            engine.execute_dml_concurrent(txn_ids.fetch_add(1, Ordering::Relaxed), $sql)
+        };
+    }
+    insert!("INSERT INTO ct VALUES (1000000, 0, 0)").unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("ct")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return; // self-guard: no usable GPU on this box
+    }
+
+    // Warm into elision on the classic covered wave path (distinct tuples: unique `a` per row).
+    let mut warmed = false;
+    for i in 0..10_000_i32 {
+        insert!(&format!(
+            "INSERT INTO ct VALUES ({}, {}, 0)",
+            2_000_000 + i,
+            i
+        ))
+        .unwrap();
+        if engine.table_install_elided("ct") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(
+        warmed,
+        "compound-PK table never entered elision on a GPU box"
+    );
+
+    // The DEVICE write-locate must actually fire for the compound key (non-vacuity).
+    let hits_before = engine.device_write_locate_hits();
+    // A brand-new distinct tuple commits.
+    insert!("INSERT INTO ct VALUES (5000000, 1, 10)").unwrap();
+    // The EXACT tuple again -> 23505 (device fingerprint hit, tuple recheck confirms).
+    let dup = insert!("INSERT INTO ct VALUES (5000000, 1, 99)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        dup.contains("duplicate key value violates unique index"),
+        "duplicate compound tuple must raise 23505, got: {dup}"
+    );
+    // Same first key column, DIFFERENT second -> a DISTINCT tuple, must commit (not first-col-only).
+    insert!("INSERT INTO ct VALUES (5000000, 2, 11)").unwrap();
+    // Same second key column, DIFFERENT first -> also distinct, must commit.
+    insert!("INSERT INTO ct VALUES (7000000, 1, 12)").unwrap();
+
+    assert!(
+        engine.device_write_locate_hits() > hits_before,
+        "the compound-key wave validation must run on the DEVICE (write-locate counter advanced)"
+    );
+    // Uniqueness never de-elided the table (sustained device path).
+    assert!(
+        engine.table_install_elided("ct"),
+        "compound-PK table must stay elided across the validated inserts"
+    );
+
+    // CHARTER (device-fold consistency): the compound index REBUILD folds the fingerprint ON THE
+    // DEVICE (submit_compound_fold_fingerprints), while the probe needle is HOST-folded
+    // (compound_key_fingerprint) -- they MUST byte-match. The (1000000, 0) tuple was inserted before
+    // elision and has survived every geometric device-fold rebuild during warm-up, so it sits in the
+    // index at a DEVICE-folded slot; a duplicate of it (host-folded needle) raising 23505 proves the
+    // two folds agree (a constant/order divergence would miss -> no 23505 -> this assert fails).
+    let dup_rebuilt = insert!("INSERT INTO ct VALUES (1000000, 0, 55)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        dup_rebuilt.contains("duplicate key value violates unique index"),
+        "device-folded index fingerprint must match the host needle fold, got: {dup_rebuilt}"
+    );
+
+    // Read-your-writes over the elided compound table: exactly the committed distinct tuples exist.
+    let Command::Select(count) =
+        parse_command("SELECT COUNT(*) FROM ct WHERE a = 5000000").unwrap()
+    else {
+        unreachable!()
+    };
+    let rows = engine.execute_relational_select(&count).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Int8(2)]],
+        "exactly two visible rows share a=5000000 (b=1 and b=2)"
+    );
+}
+
+/// COMPOUND KEYS (audit regression): a compound index's per-shard device-index cache is keyed by
+/// `FLAG | ordinal`. Dropping an EARLIER constraint shifts the ordinals of the following indexes, so
+/// a SURVIVING cache entry could alias the shifted index (its probe would read an index built from
+/// the WRONG key columns -> a missed duplicate / silent UNIQUE violation). This is closed because any
+/// index-shape DDL is an "other DDL" in `residency_invalidation_scope` -> the GLOBAL residency
+/// invalidation, which purges the PK device-index cache (`purge_shard_pk_index_for_table`) for every
+/// table (see `index_probe_key_id`'s CACHE SAFETY note). This test drops the PK so the surviving
+/// `(c,d)` UNIQUE shifts from ordinal 1 to 0 and proves it still raises 23505 on a duplicate `(c,d)`
+/// tuple — i.e. the ordinal-shift invariant holds end-to-end. Self-guards on a driverless box.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_compound_drop_constraint_shifts_ordinal_without_aliasing_the_device_index() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE ct (a INT, b INT, c INT, d INT, \
+             CONSTRAINT ct_pk PRIMARY KEY (a, b), CONSTRAINT ct_cd UNIQUE (c, d))",
+        )
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+
+    let txn_ids = AtomicU64::new(2);
+    macro_rules! insert {
+        ($sql:expr) => {
+            engine.execute_dml_concurrent(txn_ids.fetch_add(1, Ordering::Relaxed), $sql)
+        };
+    }
+    insert!("INSERT INTO ct VALUES (1000000, 0, 1000000, 0)").unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("ct")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return; // self-guard: no usable GPU
+    }
+    // Warm into elision; both compound indexes build their device caches during the wave probes.
+    let mut warmed = false;
+    for i in 0..10_000_i32 {
+        insert!(&format!(
+            "INSERT INTO ct VALUES ({}, {}, {}, {})",
+            2_000_000 + i,
+            i,
+            3_000_000 + i,
+            i
+        ))
+        .unwrap();
+        if engine.table_install_elided("ct") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "compound table never entered elision on a GPU box");
+    // A sentinel row establishes the (c,d) = (100, 200) tuple.
+    insert!("INSERT INTO ct VALUES (5, 5, 100, 200)").unwrap();
+
+    // Drop the PRIMARY KEY (ordinal 0) -> the surviving `ct_cd` UNIQUE (c,d) shifts to ordinal 0.
+    engine
+        .execute_text(90_000, "ALTER TABLE ONLY public.ct DROP CONSTRAINT ct_pk")
+        .unwrap();
+
+    // The (c,d) uniqueness MUST still be enforced through its device index after the shift: a
+    // DISTINCT (a,b) but DUPLICATE (c,d) tuple raises 23505. On the buggy (un-purged) build the
+    // (c,d) probe aliased the stale (a,b) index at ordinal 0, missed the duplicate, and committed.
+    let dup = insert!("INSERT INTO ct VALUES (6, 6, 100, 200)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        dup.contains("duplicate key value violates unique index"),
+        "surviving compound UNIQUE must catch the duplicate after the ordinal shift, got: {dup}"
+    );
+    // And a genuinely new (c,d) tuple still commits (the index is live, not wedged-declining).
+    insert!("INSERT INTO ct VALUES (7, 7, 101, 201)").unwrap();
 }

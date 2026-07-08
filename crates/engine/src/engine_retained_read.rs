@@ -785,15 +785,25 @@ impl Engine {
     pub(crate) fn locate_resident_pk_via_shard_index_detailed(
         &self,
         table: &RelationalTable,
-        filter_idx: usize,
+        // COMPOUND KEYS: the probe key id (single-column column-index, or `FLAG | ordinal`); `key`
+        // is the raw key or the compound fingerprint.
+        key_id: usize,
         key: i32,
     ) -> Option<Vec<ShardPkHit>> {
         // M1 (charter ruling 2026-07-03): the DEVICE write-locate replaces the host PK-hash probe.
         // Same Vec<ShardPkHit> output (region-Arc capture unchanged) -> a drop-in the consumers
         // never see. The host-probe path below is the flag-off oracle until M3 deletes it.
         if self.device_write_locate_enabled() {
-            return self.locate_resident_pk_via_device(table, filter_idx, key);
+            return self.locate_resident_pk_via_device(table, key_id, key);
         }
+        // COMPOUND KEYS: the host-oracle probe below is single-column (`probe_shard_pk_index_cached`
+        // keys on one filter column); a compound key can't ride it, so decline -> the recheck falls
+        // to the host rehydrate+scan ladder (correct, just not device-accelerated when the device
+        // write-locate is disabled).
+        if key_id & crate::engine_residency::COMPOUND_KEY_ID_FLAG != 0 {
+            return None;
+        }
+        let filter_idx = key_id;
         let shards = self.read_state.residency.shards.load();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
@@ -895,8 +905,71 @@ impl Engine {
             return;
         }
         let new_count = base_row_count + appended;
+        // Single-column keys: the cache is keyed by the catalog COLUMN INDEX, and the appended tail
+        // is that column's values verbatim (`column_values[col_idx]`).
         for (col_idx, tail) in column_values.iter().enumerate() {
-            let key = (table_name.to_string(), shard_id, col_idx);
+            self.extend_shard_pk_device_index_entry(
+                (table_name.to_string(), shard_id, col_idx),
+                device_ptr,
+                base_row_count,
+                new_count,
+                tail,
+            );
+        }
+        // COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): each compound unique index's cache entry is keyed
+        // by `FLAG | ordinal`, and its appended tail is the per-row FINGERPRINT folded from the key
+        // columns' appended values. Only compound indexes need this second pass (single-column keys
+        // rode the loop above); resolved from the catalog (rare relative to the append itself).
+        let catalog = self.catalog_snapshot();
+        if let Some(table) = catalog.relational_catalog.get(table_name) {
+            for (ord, index) in table.indexes.iter().enumerate() {
+                if !index.unique || !crate::engine_residency::index_is_compound(index) {
+                    continue;
+                }
+                let Some(positions) =
+                    crate::engine_residency::index_key_column_positions(table, index)
+                else {
+                    continue;
+                };
+                if positions.iter().any(|&p| p >= column_values.len()) {
+                    continue;
+                }
+                let mut fp_tail: Vec<i32> = Vec::with_capacity(appended);
+                let mut scratch = vec![0_i32; positions.len()];
+                // `row` indexes every key column's appended tail in lock-step (a plain iterator
+                // can't zip a variable number of columns), so the range loop is the clear form.
+                #[allow(clippy::needless_range_loop)]
+                for row in 0..appended {
+                    for (k, &p) in positions.iter().enumerate() {
+                        scratch[k] = column_values[p][row];
+                    }
+                    fp_tail.push(crate::engine_residency::compound_key_fingerprint(&scratch));
+                }
+                let key_id = crate::engine_residency::COMPOUND_KEY_ID_FLAG | ord;
+                self.extend_shard_pk_device_index_entry(
+                    (table_name.to_string(), shard_id, key_id),
+                    device_ptr,
+                    base_row_count,
+                    new_count,
+                    &fp_tail,
+                );
+            }
+        }
+    }
+
+    /// M1 (ledger #24): maintain ONE cached device PK-index entry over an append — insert the k
+    /// appended keys/fingerprints (`tail`) via the `index_insert` kernel. Shared by the single-column
+    /// and compound passes of `extend_shard_pk_device_index_on_append` (`tail` is a column's raw
+    /// values or the folded compound fingerprints; the device index treats both as opaque keys).
+    fn extend_shard_pk_device_index_entry(
+        &self,
+        key: (String, u32, usize),
+        device_ptr: u64,
+        base_row_count: usize,
+        new_count: usize,
+        tail: &[i32],
+    ) {
+        {
             // Snapshot the entry basis under the lock (index Arc is cheap-cloned for the launch).
             let (index, table_mask, hash_shift) = {
                 let cache = self
@@ -906,13 +979,13 @@ impl Engine {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let Some(entry) = cache.get(&key) else {
-                    continue; // not built on the device -> nothing to maintain
+                    return; // not built on the device -> nothing to maintain
                 };
                 if entry.resident_device_ptr != device_ptr || entry.row_count != base_row_count {
-                    continue; // re-admit / a prober advanced it -> the prober path converges it
+                    return; // re-admit / a prober advanced it -> the prober path converges it
                 }
                 let Some(index) = entry.device_index.clone() else {
-                    continue; // DECLINED is monotone under appends
+                    return; // DECLINED is monotone under appends
                 };
                 (index, entry.table_mask, entry.hash_shift)
             };
@@ -925,10 +998,10 @@ impl Engine {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(&key);
-                continue;
+                return;
             }
             let Ok(base_row_u32) = u32::try_from(base_row_count) else {
-                continue;
+                return;
             };
             // The kernel mutates the device index buffer IN PLACE (atom.cas). A launch failure ->
             // drop the entry (rebuild next probe); never a wrong index.
@@ -942,12 +1015,12 @@ impl Engine {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let Some(entry) = cache.get_mut(&key) else {
-                        continue;
+                        return;
                     };
                     // Re-validate the basis (a racing rebuild could have replaced it).
                     if entry.resident_device_ptr != device_ptr || entry.row_count != base_row_count
                     {
-                        continue;
+                        return;
                     }
                     if dup {
                         // F3/U4: the insert kernel now PLACES version twins, so `dup` no longer
@@ -985,7 +1058,7 @@ impl Engine {
     pub(crate) fn wave_batch_locate_hit_counts(
         &self,
         table: &RelationalTable,
-        filter_idx: usize,
+        key_id: usize,
         needles: &[i32],
     ) -> Option<Vec<u32>> {
         // E2.5b-2 device-stage aggregation (v1): under lanes, funnel locate
@@ -993,9 +1066,9 @@ impl Engine {
         // every lane's concurrently-pending wave (fixed-per-launch device cost
         // was the measured scaling bound past 4 lanes).
         if self.intent_lanes.is_some() {
-            return self.wave_batch_locate_coalesced(table, filter_idx, needles);
+            return self.wave_batch_locate_coalesced(table, key_id, needles);
         }
-        self.wave_batch_locate_hit_counts_direct(table, filter_idx, needles)
+        self.wave_batch_locate_hit_counts_direct(table, key_id, needles)
     }
 
     /// The cross-lane coalescing front of the device locate (see
@@ -1005,7 +1078,7 @@ impl Engine {
     fn wave_batch_locate_coalesced(
         &self,
         table: &RelationalTable,
-        filter_idx: usize,
+        key_id: usize,
         needles: &[i32],
     ) -> Option<Vec<u32>> {
         use std::sync::atomic::Ordering as AOrd;
@@ -1023,7 +1096,7 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(crate::engine_intent_lanes::ValidateRequest {
                 table: table.name.clone(),
-                filter_idx,
+                key_id,
                 needles: needles.to_vec(),
                 slot: std::sync::Arc::clone(&slot),
             });
@@ -1050,7 +1123,7 @@ impl Engine {
                 let mut matched = Vec::new();
                 let mut rest = Vec::with_capacity(queue.len());
                 for request in queue.drain(..) {
-                    if request.table == table.name && request.filter_idx == filter_idx {
+                    if request.table == table.name && request.key_id == key_id {
                         matched.push(request);
                     } else {
                         rest.push(request);
@@ -1073,7 +1146,7 @@ impl Engine {
             lanes
                 .stat_coalesced_requests
                 .fetch_add(batch.len() as u64, AOrd::Relaxed);
-            let counts = self.wave_batch_locate_hit_counts_direct(table, filter_idx, &all_needles);
+            let counts = self.wave_batch_locate_hit_counts_direct(table, key_id, &all_needles);
             let mut offset = 0usize;
             for request in batch {
                 let take = request.needles.len();
@@ -1098,9 +1171,13 @@ impl Engine {
     pub(crate) fn wave_batch_locate_hit_counts_direct(
         &self,
         table: &RelationalTable,
-        filter_idx: usize,
+        // COMPOUND KEYS: the probe key id (single-column column-index, or `FLAG | ordinal`). The
+        // `needles` are the raw i32 keys for a single-column key, or the host-computed compound
+        // fingerprints — the device index treats both as opaque 32-bit keys.
+        key_id: usize,
         needles: &[i32],
     ) -> Option<Vec<u32>> {
+        let positions = crate::engine_residency::probe_key_id_positions(table, key_id)?;
         // COUNT-ONLY (max_hits=0): the kernel emits per-needle counts only (0 = no dup, else
         // u32::MAX), skipping the shard/slot buffers + 2 DtoH reads this fn never consumes.
         const MAX_HITS: u32 = 0;
@@ -1131,7 +1208,10 @@ impl Engine {
             // PERF (this runs SERIALLY on the sequencer, per wave): compute the i32 filter offset
             // DIRECTLY from the shard's own fields — `resident_snapshot_for_shard` would clone the
             // whole descriptor (int4/int8/text/null name vectors) per shard per wave for nothing.
-            let filter_offset = shard_i32_filter_offset(shard, table, filter_idx)?;
+            let offsets = positions
+                .iter()
+                .map(|&p| shard_i32_filter_offset(shard, table, p))
+                .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
             // concurrent invalidations); a stale shard declines the whole wave-batch probe.
@@ -1142,9 +1222,10 @@ impl Engine {
                 table,
                 &table.name,
                 shard.shard_id,
-                filter_idx,
+                key_id,
+                &positions,
                 &device_memory,
-                filter_offset,
+                &offsets,
                 shard.row_count,
             )?;
             descs.push(WriteLocateShard {
@@ -1183,13 +1264,18 @@ impl Engine {
     pub(crate) fn wave_batch_visible_locate(
         &self,
         table: &RelationalTable,
-        filter_idx: usize,
+        // COMPOUND KEYS: the probe key id. DELETE/UPDATE target resolution passes single-column key
+        // ids only (compound-keyed DELETE/UPDATE via the fingerprint index is a follow-up — the
+        // consuming apply does not yet tuple-verify a located slot, so a fingerprint collision must
+        // not reach it); `probe_key_id_positions` therefore resolves `[key_id]` here in practice.
+        key_id: usize,
         needles: &[i32],
         snapshots: &[u64],
     ) -> Option<WaveVisibleLocate> {
         if needles.is_empty() {
             return Some(WaveVisibleLocate::default());
         }
+        let positions = crate::engine_residency::probe_key_id_positions(table, key_id)?;
         let shards = self.read_state.residency.shards.load();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
@@ -1215,7 +1301,10 @@ impl Engine {
             if shard.row_count == 0 {
                 continue;
             }
-            let filter_offset = shard_i32_filter_offset(shard, table, filter_idx)?;
+            let offsets = positions
+                .iter()
+                .map(|&p| shard_i32_filter_offset(shard, table, p))
+                .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
@@ -1224,9 +1313,10 @@ impl Engine {
                 table,
                 &table.name,
                 shard.shard_id,
-                filter_idx,
+                key_id,
+                &positions,
                 &device_memory,
-                filter_offset,
+                &offsets,
                 shard.row_count,
             )?;
             let created_by_ptr = shard
@@ -1304,10 +1394,15 @@ impl Engine {
     fn locate_resident_pk_via_device(
         &self,
         table: &RelationalTable,
-        filter_idx: usize,
+        // COMPOUND KEYS: the probe key id; `key` is the raw i32 key (single-column) or the compound
+        // fingerprint. The returned hits are still (shard, slot) — the CALLER (the authoritative
+        // recheck) materializes each and compares the FULL tuple, so a fingerprint collision is
+        // filtered there.
+        key_id: usize,
         key: i32,
     ) -> Option<Vec<ShardPkHit>> {
         const MAX_HITS: u32 = 4;
+        let positions = crate::engine_residency::probe_key_id_positions(table, key_id)?;
         let shards = self.read_state.residency.shards.load();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
@@ -1342,8 +1437,10 @@ impl Engine {
                 continue;
             }
             let descriptor = self.resident_snapshot_for_shard(shard, table);
-            let filter_offset =
-                resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
+            let offsets = positions
+                .iter()
+                .map(|&p| resident_device_int4_column_offset(&descriptor, table, p).ok())
+                .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
             // concurrent invalidations); a stale shard declines the device locate to the ladder.
@@ -1357,9 +1454,10 @@ impl Engine {
                 table,
                 &table.name,
                 shard.shard_id,
-                filter_idx,
+                key_id,
+                &positions,
                 &device_memory,
-                filter_offset,
+                &offsets,
                 shard.row_count,
             )?;
             descs.push(WriteLocateShard {
@@ -2104,13 +2202,25 @@ impl Engine {
         table: &RelationalTable,
         table_name: &str,
         shard_id: u32,
-        col_idx: usize,
+        // COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): `key_id` identifies WHICH unique index this index
+        // serves — a single-column key's catalog COLUMN INDEX (byte-compatible with every prior cache
+        // entry), or `COMPOUND_KEY_ID_FLAG | ordinal` for a compound key. `positions` are the ordered
+        // catalog indices of the key column(s); `offsets` are those columns' capacity-strided
+        // i32-section byte offsets, caller-computed. NON-lanes builds from the caller's shard, so the
+        // caller offsets are exact. UNDER LANES the rebuild reads the LIVE shard whose capacity a
+        // concurrent re-admit may have GROWN since the caller's snapshot — so offsets are RECOMPUTED
+        // from the live shard here (a capacity-strided offset for any key column past int4-ordinal 0
+        // would otherwise mis-address the buffer -> garbage fingerprints -> a missed duplicate). One
+        // offset = single column (raw keys); >1 = compound (the per-row values FOLD into the surrogate
+        // fingerprint the index stores as an opaque key).
+        key_id: usize,
+        positions: &[usize],
         device_memory: &Arc<CudaResidentDeviceMemory>,
-        filter_offset: u64,
+        offsets: &[u64],
         row_count: usize,
     ) -> Option<(Arc<CudaResidentDeviceMemory>, u32, u32)> {
         let device_ptr = device_memory.device_ptr();
-        let cache_key = (table_name.to_string(), shard_id, col_idx);
+        let cache_key = (table_name.to_string(), shard_id, key_id);
         // Fast path: a valid cached device index -> return it (or None if it declined at build).
         {
             let cache = self
@@ -2158,7 +2268,7 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             })
         };
-        let (build_memory, build_offset, build_row_count, build_capacity_rows) =
+        let (build_memory, build_offsets, build_row_count, build_capacity_rows) =
             if self.intent_lanes.is_some() {
                 // Re-check under the guard: another prober may have rebuilt already.
                 {
@@ -2184,17 +2294,31 @@ impl Engine {
                     .find(|shard| shard.shard_id == shard_id)?
                     .clone();
                 let live_memory = live.device_memory.clone()?;
-                let live_offset = shard_i32_filter_offset(&live, table, col_idx)?;
                 let live_rows = live.row_count;
+                // AUDIT FIX (compound): recompute the key-column offsets from the LIVE shard — a
+                // concurrent re-admit may have grown its capacity since the caller's snapshot, and
+                // the offsets are capacity-strided, so the caller's offsets could mis-address every
+                // key column past int4-ordinal 0.
+                let live_offsets = positions
+                    .iter()
+                    .map(|&p| shard_i32_filter_offset(&live, table, p))
+                    .collect::<Option<Vec<u64>>>()?;
                 // CAPACITY-SIZED INDEX: size the hash table once for the shard's
                 // full capacity (clamped to the builder's 2^30 slot limit via the
                 // sizing_rows argument), so capacity-exhaustion rebuilds are
                 // impossible for the shard's lifetime — only ptr changes
                 // (re-admission) rebuild, and the floor above makes those rare.
                 let capacity_rows = live.capacity as u64;
-                (live_memory, live_offset, live_rows, capacity_rows)
+                (live_memory, live_offsets, live_rows, capacity_rows)
             } else {
-                (Arc::clone(device_memory), filter_offset, row_count, 0_u64)
+                // NON-lanes: the build reads the CALLER's `device_memory` (same generation the caller
+                // computed `offsets` against, no concurrent re-admit), so the caller offsets are exact.
+                (
+                    Arc::clone(device_memory),
+                    offsets.to_vec(),
+                    row_count,
+                    0_u64,
+                )
             };
         let device_ptr = build_memory.device_ptr();
         self.read_state
@@ -2206,12 +2330,29 @@ impl Engine {
         if row_count == 0 || row_count_u64 >= u32::MAX as u64 {
             return None;
         }
-        let keys = build_memory
-            .read_resident_i32_column(build_offset, row_count)
-            .ok()?;
-        if keys.len() != row_count {
-            return None;
-        }
+        // COMPOUND KEYS: obtain the per-row keys the index stores. A single-column key reads its one
+        // resident column verbatim (raw keys), byte-identical to the prior path. A COMPOUND key folds
+        // its columns into the surrogate fingerprint ON THE DEVICE (`submit_compound_fold_fingerprints`,
+        // byte-matching the host `compound_key_fingerprint`) — the raw key columns are NEVER read back
+        // to the host to be hashed (the charter close); the host reads only the derived fingerprint
+        // column, exactly as the single-column build reads its one key column.
+        let keys: Vec<i32> = if build_offsets.len() == 1 {
+            let keys = build_memory
+                .read_resident_i32_column(build_offsets[0], row_count)
+                .ok()?;
+            if keys.len() != row_count {
+                return None;
+            }
+            keys
+        } else {
+            let fps = build_memory
+                .submit_compound_fold_fingerprints(device_ptr, &build_offsets, row_count)
+                .ok()?;
+            if fps.len() != row_count {
+                return None;
+            }
+            fps
+        };
         // U1 (visibility-aware rebuild): read the shard's deleted_by stamps (absent region =
         // all-live) and skip rows dead at or below the GC boundary — see
         // `build_int4_pk_hash_table_host_visible`. Boundary = the oldest registered snapshot
@@ -2388,8 +2529,9 @@ impl Engine {
                 &table.name,
                 shard.shard_id,
                 filter_idx,
+                std::slice::from_ref(&filter_idx),
                 &device_memory,
-                filter_offset,
+                &[filter_offset],
                 shard.row_count,
             )?;
             let mut projection_offsets: Vec<u64> = Vec::with_capacity(ncols);
@@ -3453,7 +3595,11 @@ mod cross_shard_pk_index_tests {
             probe = (probe + 1) & mask;
         }
         found.sort_unstable();
-        assert_eq!(found, vec![1, 3], "both twins (packed row+1 = 1 and 3) are indexed");
+        assert_eq!(
+            found,
+            vec![1, 3],
+            "both twins (packed row+1 = 1 and 3) are indexed"
+        );
     }
 
     /// The per-shard bloom (sub-slice 2) has NO FALSE NEGATIVES (every built key -> maybe_contains true --

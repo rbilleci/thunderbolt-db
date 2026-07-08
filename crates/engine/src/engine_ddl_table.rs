@@ -88,14 +88,33 @@ impl Engine {
         let name = create.table;
         let mut indexes = Vec::new();
         let mut checks = Vec::new();
-        // TYPE-COVERAGE #14 Track 3: compound PK/UNIQUE parses + rides the catalog, but uniqueness
-        // enforcement isn't wired yet (see apply_create_index_with_constraint_flags) — REJECT it here
-        // for the inline CREATE TABLE form so nothing silently-wrong ships. Single-column keys are fine.
-        if primary_key.as_ref().is_some_and(|pk| pk.columns.len() > 1)
-            || unique_constraints.iter().any(|u| u.columns.len() > 1)
+        // TYPE-COVERAGE #14 Track 3: compound PK/UNIQUE over i32-SECTION columns (Int4/Date/Int2) is
+        // device-native (folded to a surrogate fingerprint key — see `compound_key_fingerprint`).
+        // A compound key touching any WIDER type stays REJECTED (honest partial coverage: the
+        // fingerprint folds i32-section values only), so nothing silently-wrong ships.
+        let compound_key_i32_ok = |cols: &[String]| -> bool {
+            cols.iter().all(|name| {
+                columns.iter().find(|c| &c.name == name).is_some_and(|c| {
+                    matches!(
+                        c.ty,
+                        gpu_db_sql::SqlType::Int4
+                            | gpu_db_sql::SqlType::Date
+                            | gpu_db_sql::SqlType::Int2
+                    )
+                })
+            })
+        };
+        if primary_key
+            .as_ref()
+            .is_some_and(|pk| pk.columns.len() > 1 && !compound_key_i32_ok(&pk.columns))
+            || unique_constraints
+                .iter()
+                .any(|u| u.columns.len() > 1 && !compound_key_i32_ok(&u.columns))
         {
             return Err(EngineError::ApplyFailed(
-                "compound PRIMARY KEY / UNIQUE constraints are not yet supported".to_string(),
+                "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
+                 (compound key columns must be int4, int2, or date)"
+                    .to_string(),
             ));
         }
         if let Some(primary_key) = primary_key {
@@ -243,17 +262,6 @@ impl Engine {
         primary_key: bool,
         unique_constraint: bool,
     ) -> Result<(), EngineError> {
-        // TYPE-COVERAGE #14 Track 3 (compound keys): the parser + catalog now represent a COMPOUND key
-        // (`create.columns.len() > 1`), but UNIQUENESS enforcement for it is not wired yet — the host
-        // validators are single-column (first-column-only would be WRONG), and the device write-locate
-        // probes one key column. So a COMPOUND unique/PK constraint is REJECTED here (honest, never
-        // silently-wrong) until the device-native compound-locate lands. A non-unique compound index
-        // (no uniqueness semantics) is allowed through. Single-column keys are unaffected.
-        if create.unique && create.columns.len() > 1 {
-            return Err(EngineError::ApplyFailed(
-                "compound PRIMARY KEY / UNIQUE constraints are not yet supported".to_string(),
-            ));
-        }
         if cat
             .relational_catalog
             .values()
@@ -275,34 +283,63 @@ impl Engine {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", create.table))
             })?
             .clone();
-        let Some(column_idx) = table
+        // COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): resolve EVERY key column (single-column keys
+        // resolve `[column_idx]`). A compound UNIQUE/PK over i32-SECTION columns (Int4/Date/Int2) is
+        // device-native (folded to a fingerprint surrogate); a compound key touching any wider type
+        // stays REJECTED (honest partial coverage). `create.columns` is the ordered key-column list
+        // the parser/catalog populate (== `[create.column]` for a single-column key).
+        let Some(column_idxs) = create
             .columns
             .iter()
-            .position(|column| column.name == create.column)
+            .map(|name| table.columns.iter().position(|column| &column.name == name))
+            .collect::<Option<Vec<usize>>>()
         else {
+            let missing = create
+                .columns
+                .iter()
+                .find(|name| !table.columns.iter().any(|column| &column.name == *name))
+                .cloned()
+                .unwrap_or_else(|| create.column.clone());
             return Err(EngineError::ApplyFailed(format!(
-                "column \"{}\" does not exist",
-                create.column
+                "column \"{missing}\" does not exist"
             )));
         };
+        if create.unique && column_idxs.len() > 1 {
+            let all_i32_section = column_idxs.iter().all(|&i| {
+                matches!(
+                    table.columns[i].ty,
+                    gpu_db_sql::SqlType::Int4
+                        | gpu_db_sql::SqlType::Date
+                        | gpu_db_sql::SqlType::Int2
+                )
+            });
+            if !all_i32_section {
+                return Err(EngineError::ApplyFailed(
+                    "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
+                     (compound key columns must be int4, int2, or date)"
+                        .to_string(),
+                ));
+            }
+        }
         if create.unique {
             let visibility = StorageVisibility {
                 read_txn_id: self.committed_seq() as TxnId,
             };
             let rows = self.visible_relational_rows(&table, visibility)?;
-            // PG: ADD PRIMARY KEY over existing data requires the column non-null (23502) — the
+            // PG: ADD PRIMARY KEY over existing data requires EVERY key column non-null (23502) — the
             // creation-time half of the PK NOT NULL invariant the DML validators rely on.
-            if primary_key
-                && rows
+            if primary_key {
+                if let Some(&null_col) = column_idxs
                     .iter()
-                    .any(|row| matches!(row[column_idx], SqlValue::Null))
-            {
-                return Err(EngineError::ApplyFailed(format!(
-                    "column \"{}\" of relation \"{}\" contains null values",
-                    create.column, create.table
-                )));
+                    .find(|&&i| rows.iter().any(|row| matches!(row[i], SqlValue::Null)))
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "column \"{}\" of relation \"{}\" contains null values",
+                        table.columns[null_col].name, create.table
+                    )));
+                }
             }
-            Self::validate_unique_values(&rows, column_idx, &create.name)?;
+            Self::validate_unique_values_tuple(&rows, &column_idxs, &create.name)?;
         }
         cat.relational_catalog
             .get_mut(&create.table)
@@ -619,14 +656,18 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn validate_unique_values(
+    /// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): a duplicate is a repeated ORDERED TUPLE of the key
+    /// columns (`column_idxs.len() == 1` reproduces the single-column unique check exactly).
+    /// STRUCTURAL equality (NULL == NULL, via `BTreeSet`), matching the scan validators' semantics.
+    pub(crate) fn validate_unique_values_tuple(
         rows: &[Vec<SqlValue>],
-        column_idx: usize,
+        column_idxs: &[usize],
         index_name: &str,
     ) -> Result<(), EngineError> {
-        let mut seen = BTreeSet::new();
+        let mut seen: BTreeSet<Vec<SqlValue>> = BTreeSet::new();
         for row in rows {
-            if !seen.insert(row[column_idx].clone()) {
+            let key: Vec<SqlValue> = column_idxs.iter().map(|&i| row[i].clone()).collect();
+            if !seen.insert(key) {
                 return Err(EngineError::ApplyFailed(format!(
                     "duplicate key value violates unique index \"{}\"",
                     index_name
@@ -641,14 +682,14 @@ impl Engine {
         rows: &[Vec<SqlValue>],
     ) -> Result<(), EngineError> {
         for index in table.indexes.iter().filter(|index| index.unique) {
-            let Some(column_idx) = table
-                .columns
-                .iter()
-                .position(|column| column.name == index.column)
+            // COMPOUND KEYS: validate the ORDERED TUPLE of every key column (single-column keys
+            // resolve `[column_idx]` — byte-identical to the prior behavior).
+            let Some(column_idxs) =
+                crate::engine_residency::index_key_column_positions(table, index)
             else {
                 continue;
             };
-            Self::validate_unique_values(rows, column_idx, &index.name)?;
+            Self::validate_unique_values_tuple(rows, &column_idxs, &index.name)?;
         }
         Ok(())
     }
@@ -844,8 +885,12 @@ impl Engine {
                 "foreign key column type does not match referenced column type".to_string(),
             ));
         }
+        // COMPOUND KEYS: a single-column FK matches only a SINGLE-COLUMN unique/primary key — the
+        // first column of a compound key is NOT independently unique, so it must not satisfy the FK.
         let has_referenced_unique_key = referenced_table.indexes.iter().any(|index| {
-            index.column == add.referenced_column && (index.primary_key || index.unique_constraint)
+            index.key_columns.len() == 1
+                && index.column == add.referenced_column
+                && (index.primary_key || index.unique_constraint)
         });
         if !has_referenced_unique_key {
             return Err(EngineError::ApplyFailed(format!(

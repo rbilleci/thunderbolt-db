@@ -12522,6 +12522,77 @@ DONE:
 }
 "#;
 
+// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3, charter close): fold a compound key's ORDERED i32-section
+// columns into the 32-bit surrogate FINGERPRINT entirely ON THE DEVICE, so the index rebuild never
+// reads the raw resident key columns back to the host to hash them (the host reads only the derived
+// fingerprint buffer, exactly as the single-column build reads its one key column). Byte-identical to
+// the host `compound_key_fingerprint` (FNV-1a: h=0x811C9DC5; per column h^=v; h*=0x01000193;
+// h=rotl(h,13)+0x9E3779B1) so the device-built index and the host-derived probe needle agree. One
+// thread per row; reads `base_ptr + offsets[k] + row*4` for each of `ncols` key columns (the offsets
+// are the shard's capacity-strided i32-section byte offsets). ASCII-only.
+const COMPOUND_FOLD_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_compound_fold_fingerprints(
+    .param .u64 base_ptr,
+    .param .u64 offsets_ptr,
+    .param .u32 ncols,
+    .param .u32 row_count,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [base_ptr];
+    ld.param.u64 %rd2, [offsets_ptr];
+    ld.param.u32 %r1, [ncols];
+    ld.param.u32 %r2, [row_count];
+    ld.param.u64 %rd3, [out_ptr];
+
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.u32 %r6, %r4, %r5, %r3;      // row = global thread id
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra DONE;
+
+    mul.wide.u32 %rd4, %r6, 4;          // row * 4 (byte stride within a column)
+
+    mov.u32 %r7, 2166136261;            // fp = 0x811C9DC5 (FNV offset basis)
+    mov.u32 %r8, 0;                     // k = 0
+    setp.ge.u32 %p2, %r8, %r1;
+    @%p2 bra STORE;                     // ncols == 0 -> empty fold (defensive)
+
+FOLDLOOP:
+    mul.wide.u32 %rd5, %r8, 8;          // k * 8 (offsets are u64)
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.u64 %rd7, [%rd6];         // off = offsets[k]
+    add.u64 %rd8, %rd1, %rd7;
+    add.u64 %rd9, %rd8, %rd4;           // addr = base + off + row*4
+    ld.global.s32 %r9, [%rd9];          // v = column value (i32)
+    xor.b32 %r7, %r7, %r9;              // fp ^= v
+    mul.lo.u32 %r7, %r7, 16777619;      // fp *= 0x01000193 (FNV prime)
+    shl.b32 %r10, %r7, 13;              // rotl(fp, 13)
+    shr.b32 %r11, %r7, 19;
+    or.b32 %r7, %r10, %r11;
+    add.u32 %r7, %r7, 2654435761;       // fp += 0x9E3779B1
+    add.u32 %r8, %r8, 1;
+    setp.lt.u32 %p2, %r8, %r1;
+    @%p2 bra FOLDLOOP;
+
+STORE:
+    add.u64 %rd11, %rd3, %rd4;          // out + row*4
+    st.global.u32 [%rd11], %r7;
+
+DONE:
+    ret;
+}
+"#;
+
 /// One fused merged-apply pass (see [`FUSED_APPLY_PTX`]): everything the kernel needs, staged
 /// into one buffer by [`CudaResidentDeviceMemory::submit_i32_fused_apply`].
 pub struct FusedApplyRequest<'a> {
@@ -12841,6 +12912,131 @@ impl CudaResidentDeviceMemory {
             )
         })?;
         Ok(decline[0] != 0)
+    }
+
+    /// COMPOUND KEYS (charter close): fold a compound key's `offsets` i32-section columns of the shard
+    /// buffer at `base_ptr` into per-row 32-bit fingerprints ON THE DEVICE (`COMPOUND_FOLD_PTX`),
+    /// returning the `row_count` fingerprints. This lets the PK-index rebuild derive the compound key
+    /// on the GPU instead of reading the raw resident key columns back to the host to hash them — the
+    /// host then reads only this derived fingerprint column, exactly as the single-column build reads
+    /// its one key column. Byte-identical to the host `compound_key_fingerprint`. Synchronous (the
+    /// blocking output DtoH on the null stream fences the launch).
+    pub fn submit_compound_fold_fingerprints(
+        &self,
+        base_ptr: u64,
+        offsets: &[u64],
+        row_count: usize,
+    ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        if row_count == 0 {
+            return Ok(Vec::new());
+        }
+        if offsets.is_empty() || base_ptr == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(offsets.len()));
+        }
+        let ncols = u32::try_from(offsets.len())
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(offsets.len()))?;
+        let row_count_u32 = u32::try_from(row_count)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(row_count))?;
+        let offsets_bytes = offsets
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let out_bytes = row_count
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_memcpy_htod = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_memcpy_dtoh = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let offsets_guard = primary.lease_device_buffer_owned(offsets_bytes)?;
+        let out_guard = primary.lease_device_buffer_owned(out_bytes)?;
+
+        let mut ptx = Vec::with_capacity(COMPOUND_FOLD_PTX.len() + 1);
+        ptx.extend_from_slice(COMPOUND_FOLD_PTX);
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_compound_fold_fingerprints", &ptx)?;
+
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                offsets_guard.ptr,
+                offsets.as_ptr().cast::<c_void>(),
+                offsets_bytes,
+            )
+        })?;
+
+        let mut base_arg = base_ptr;
+        let mut offsets_arg = offsets_guard.ptr;
+        let mut ncols_arg = ncols;
+        let mut rows_arg = row_count_u32;
+        let mut out_arg = out_guard.ptr;
+        let mut args = [
+            (&mut base_arg as *mut u64).cast::<c_void>(),
+            (&mut offsets_arg as *mut u64).cast::<c_void>(),
+            (&mut ncols_arg as *mut u32).cast::<c_void>(),
+            (&mut rows_arg as *mut u32).cast::<c_void>(),
+            (&mut out_arg as *mut u64).cast::<c_void>(),
+        ];
+        let threads_per_block: u32 = 128;
+        let blocks = row_count_u32.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        // The blocking output DtoH on the null stream fences the kernel (same discipline as
+        // `submit_i32_index_insert`'s decline read); out_bytes > 0 here, so it always transfers.
+        let mut out = vec![0_i32; row_count];
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(out.as_mut_ptr().cast::<c_void>(), out_guard.ptr, out_bytes)
+        })?;
+        Ok(out)
     }
 
     /// U1 perf lever B: SCATTER `values[t]` into `deleted_by[slots[t]]` in ONE launch (a single

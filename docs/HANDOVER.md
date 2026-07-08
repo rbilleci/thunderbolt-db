@@ -5,7 +5,8 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-08. **Base:** `main` @ `3e3f520d`. **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
+**Updated:** 2026-07-08. **Base:** `main` @ `ce84a677` (branch `feature/compound-uniqueness-device` =
+device-native compound uniqueness, awaiting merge). **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
 the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first), updates are
 SUSTAINABLE (F3/U4 version-aware device PK index — dup-tolerant, mixed bench 1.4M TPS / 3 rebuilds),
 **R-ver (read version resolution) COMPLETE — PART 1 + PART 2 MERGED** (reads over versioned elided
@@ -29,15 +30,32 @@ byte-concats blobs + a NEW PTX kernel (`gpu_db_resident_text_offset_rebase`) tha
 offsets by its running blob_base (offsets are blob-relative, can't byte-concat). Text shard-admission is
 PK-GATED so legacy non-PK text tables stay single-buffer (blast-radius containment); surfaced + fixed a
 real DROP shard-leak. Eight adversarial audits (…/numeric/bool/rehydration/text) all MERGE-SAFE.
-**COMPOUND KEYS (Track 3) — FOUNDATION MERGED (`3e3f520d`):** the parser + AST + catalog now REPRESENT a
-multi-column key (`PRIMARY KEY (a,b)` parses; `RelationalIndex.key_columns`), but compound keys are
-REJECTED in PREFLIGHT (pre-WAL — an apply-time reject POISONS replay; found+fixed) until device-native
-uniqueness lands. Charter-aligned choice (per scope discussion): build compound uniqueness on the DEVICE
-from day one, NOT the host value_index slated for deletion (no churn). **NEXT: device-native compound
-uniqueness** — a compound-key write-locate probe (hash the key tuple / multi-column probe) so compound-PK
-tables ELIDE + the rejection lifts = the last charter-advancing step to CPU-engine deletion (ADR-006).
+**COMPOUND KEYS (Track 3) — DEVICE-NATIVE UNIQUENESS IMPLEMENTED (branch
+`feature/compound-uniqueness-device`, awaiting merge; foundation `3e3f520d`):** a compound `PRIMARY KEY` /
+`UNIQUE` over i32-SECTION columns (Int4/Date/Int2) now ELIDES and validates uniqueness ON THE DEVICE — the
+six DDL rejections are lifted for that subset (wider-typed compound stays honestly rejected, all pre-WAL).
+THE ARCHITECTURE (best DELIVERED perf, CHARTER-PURE): the ordered key-column values fold into a 32-bit
+SURROGATE FINGERPRINT (`compound_key_fingerprint`) that rides the ENTIRE existing single-column i32 device
+index (build/insert/write-locate/visible-locate/coalescer/geometric-rebuild), inheriting every banked
+optimization. CHARTER: the index REBUILD folds ON THE DEVICE (one new PTX kernel
+`gpu_db_compound_fold_fingerprints` / `submit_compound_fold_fingerprints`, BYTE-IDENTICAL to the host
+`compound_key_fingerprint`) so the raw resident key columns are NEVER read back to the host to be hashed —
+the host reads only the derived fingerprint column, at charter parity with the single-column build; the
+needle + incremental-append folds run on host-HELD values (the INSERT's own literals / the wave's rows =
+control-plane, same posture as the single-column needle). EXACTNESS is free + device-native: the
+write-locate probe is already non-authoritative (count>0 → recheck), so for a compound key the recheck
+materializes the candidate row and compares the FULL TUPLE (`visible_row_with_tuple`), so a fingerprint
+collision can never false-23505 or mis-locate. Compound tables take the CLASSIC covered path (the fused
+INTENT lane rejects them — still device-native). Gates: engine 495/0, FULL GPU sweep 385/0, clippy
+baseline. TWO adversarial opus audits (broad + a focused kernel audit): ONE real fix adopted (HIGH —
+restored the lanes-mode LIVE-shard offset recompute in `ensure_shard_pk_device_index`) + ONE FALSE POSITIVE
+disproved+documented (ordinal-based cache key is safe because every index-shape DDL triggers a GLOBAL
+residency invalidation that purges the PK-index cache); the device fold kernel CLEARED (byte-identical to
+the host fold, sabotage-verified via a device-fold-consistency dup test).
+LEDGERED FOLLOW-UPS: fused-apply-for-compound, wider compound key types (i64/b128/text tuple hashing),
+64-bit fingerprint. **This was the last charter-advancing step before CPU-engine deletion (ADR-006).**
 Also OPEN: text-COMPACTION follow-up (rollover-only = one shard/commit, O(all-shards)/read —
-scalability-ledger #27). See memory `type-coverage-14`, `scalability-ledger`, `charter-governance-ruling`.
+scalability-ledger). See memory `type-coverage-14`, `scalability-ledger`, `charter-governance-ruling`.
 
 ---
 

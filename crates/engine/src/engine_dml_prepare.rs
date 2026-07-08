@@ -947,6 +947,152 @@ impl Engine {
         Ok(false)
     }
 
+    /// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): the tuple generalization of
+    /// [`Self::visible_row_with_value`] — does a VISIBLE row carry the full key TUPLE `key_cols`
+    /// (each `(catalog_column_idx, expected_value)`)? This is the AUTHORITATIVE recheck that restores
+    /// exactness to the fingerprint device probe: the device write-locate returns `count > 0` for a
+    /// fingerprint MATCH (which may be a distinct tuple that collided), and this materializes the
+    /// candidate row(s) and compares every key column, so a collision is filtered here. `fingerprint`
+    /// is the surrogate needle and `key_id` the compound probe id (see `index_probe_key_id`).
+    /// Device-first (materialize on-device + tuple compare), rehydrate + host-scan on decline.
+    pub(crate) fn visible_row_with_tuple(
+        &self,
+        table: &RelationalTable,
+        visibility: StorageVisibility,
+        key_id: usize,
+        // `None` = the tuple has a non-i32-section key value (e.g. NULL), so the device fingerprint
+        // probe can't run — go straight to the host scan (which applies the structural NULL == NULL
+        // semantics the scan validators use).
+        fingerprint: Option<i32>,
+        key_cols: &[(usize, SqlValue)],
+        exclude_keys: Option<&BTreeSet<String>>,
+    ) -> Result<bool, EngineError> {
+        if let Some(fingerprint) = fingerprint {
+            if let Some(answer) = self.device_visible_row_with_tuple(
+                table,
+                visibility,
+                key_id,
+                fingerprint,
+                key_cols,
+                exclude_keys,
+            ) {
+                return Ok(answer);
+            }
+        }
+        // Device decline: rehydrate an elided table BEFORE the host scan (a stale value index would
+        // answer from missing/old rows = a constraint hole) — same SI-fix discipline as
+        // `visible_row_with_value`.
+        let mut probe_visibility = visibility;
+        if self.table_install_elided(&table.name) {
+            self.rehydrate_elided_serialized(&table.name)?;
+            probe_visibility.read_txn_id = probe_visibility.read_txn_id.max(self.committed_seq());
+        }
+        let fresh = self.read_state.mvcc.table_rows(&table.name);
+        Self::any_visible_row_with_tuple(table, &fresh, probe_visibility, key_cols, exclude_keys)
+    }
+
+    /// COMPOUND KEYS: the DEVICE arm of [`Self::visible_row_with_tuple`] — probe the fingerprint
+    /// index, materialize each hit on-device, and confirm the FULL key tuple. `None` on any device
+    /// decline (the caller rehydrates + host-scans). Mirrors `device_visible_row_with_value`.
+    fn device_visible_row_with_tuple(
+        &self,
+        table: &RelationalTable,
+        visibility: StorageVisibility,
+        key_id: usize,
+        fingerprint: i32,
+        key_cols: &[(usize, SqlValue)],
+        exclude_keys: Option<&BTreeSet<String>>,
+    ) -> Option<bool> {
+        if !self.dml_device_validate_enabled() {
+            return None;
+        }
+        let hits = self.locate_resident_pk_via_shard_index_detailed(table, key_id, fingerprint)?;
+        let mut answer = false;
+        for hit in &hits {
+            let region = hit.row_id.as_ref()?;
+            let halves = region
+                .read_resident_i32_column(u64::from(hit.slot) * 8, 2)
+                .ok()?;
+            let (lo, hi) = (*halves.first()?, *halves.get(1)?);
+            let row_id = (lo as u32 as u64) | ((hi as u32 as u64) << 32);
+            if row_id == u64::MAX {
+                return None; // unstamped slot: identity unknown -> host ladder
+            }
+            let key = relational_row_key(&table.name, row_id);
+            if exclude_keys.is_some_and(|excluded| excluded.contains(&key)) {
+                continue;
+            }
+            let row = if self.table_install_elided(&table.name) {
+                match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
+                    Some(Some(row)) => row,
+                    Some(None) => continue,
+                    None => return None,
+                }
+            } else {
+                let table_rows = self.read_state.mvcc.table_rows(&table.name);
+                let fetched = table_rows
+                    .store()
+                    .tuple_fetch_by_key(&key, visibility)
+                    .ok()?;
+                let Some(tuple) = fetched else {
+                    continue;
+                };
+                decode_relational_row(&tuple.value, &table.columns).ok()?
+            };
+            // Full-tuple exactness: EVERY key column must match (a fingerprint hit alone is not a dup).
+            if key_cols.iter().all(|(ci, v)| row.get(*ci) == Some(v)) {
+                answer = true;
+                break;
+            }
+        }
+        self.read_state
+            .residency
+            .dml_device_validate_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(answer)
+    }
+
+    /// COMPOUND KEYS: the HOST arm of [`Self::visible_row_with_tuple`] — candidates from the FIRST
+    /// key column's value index (a superset), each fetched at `visibility` and full-tuple compared.
+    /// Structural equality (NULL == NULL), matching `any_visible_row_with_value`.
+    pub(crate) fn any_visible_row_with_tuple(
+        table: &RelationalTable,
+        table_rows: &crate::resident_storage::TableRowsView,
+        visibility: StorageVisibility,
+        key_cols: &[(usize, SqlValue)],
+        exclude_keys: Option<&BTreeSet<String>>,
+    ) -> Result<bool, EngineError> {
+        let Some((first_idx, first_val)) = key_cols.first() else {
+            return Ok(false);
+        };
+        let mut keys = table_rows.index_keys(
+            &table.columns[*first_idx].name,
+            &relational_index_value(first_val),
+        );
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            if exclude_keys.is_some_and(|excluded| excluded.contains(&key)) {
+                continue;
+            }
+            let fetched = table_rows
+                .store()
+                .tuple_fetch_by_key(&key, visibility)
+                .map_err(|err: gpu_db_storage::StorageError| {
+                    EngineError::ApplyFailed(err.to_string())
+                })?;
+            let Some(tuple) = fetched else {
+                continue;
+            };
+            let row = decode_relational_row(&tuple.value, &table.columns)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            if key_cols.iter().all(|(ci, v)| row.get(*ci) == Some(v)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// PHASE C slice 1b: INDEX-DRIVEN constraint validation for an index-resolved DELETE/UPDATE —
     /// semantically identical to the scan validators (`validate_unique_indexes_for_rows` /
     /// `validate_check_constraints_for_rows` / `validate_foreign_keys_with_table_rows`) RESTRICTED
@@ -981,25 +1127,49 @@ impl Engine {
         Self::validate_primary_key_not_null(table, new_images.iter().map(Vec::as_slice))?;
         // 1. UNIQUE: in-batch duplicates among the new images (the scan validator's BTreeSet pass,
         //    NULLs collide) + each new value vs the UNTOUCHED visible rows via the index.
-        for index in table.indexes.iter().filter(|index| index.unique) {
-            let Some(column_idx) = table
-                .columns
-                .iter()
-                .position(|column| column.name == index.column)
+        for (ord, index) in table.indexes.iter().enumerate().filter(|(_, i)| i.unique) {
+            // COMPOUND KEYS: validate the ORDERED key TUPLE (single-column keys resolve `[column_idx]`,
+            // byte-identical to the prior path). In-batch tuple dedup + each new tuple vs the untouched
+            // visible rows via the fingerprint index (device) / host tuple scan.
+            let Some(positions) = crate::engine_residency::index_key_column_positions(table, index)
             else {
                 continue;
             };
-            let mut seen = BTreeSet::new();
+            let compound = crate::engine_residency::index_is_compound(index);
+            let key_id = if compound {
+                crate::engine_residency::COMPOUND_KEY_ID_FLAG | ord
+            } else {
+                positions[0]
+            };
+            let mut seen: BTreeSet<Vec<SqlValue>> = BTreeSet::new();
             for row in new_images {
-                if !seen.insert(row[column_idx].clone())
-                    || self.visible_row_with_value(
-                        table,
-                        visibility,
-                        column_idx,
-                        &row[column_idx],
-                        Some(touched_keys),
-                    )?
-                {
+                let tuple_key: Vec<SqlValue> = positions.iter().map(|&i| row[i].clone()).collect();
+                let conflict = !seen.insert(tuple_key) || {
+                    if compound {
+                        let key_cols: Vec<(usize, SqlValue)> =
+                            positions.iter().map(|&i| (i, row[i].clone())).collect();
+                        let fingerprint = crate::engine_residency::compound_index_row_fingerprint(
+                            table, index, row,
+                        );
+                        self.visible_row_with_tuple(
+                            table,
+                            visibility,
+                            key_id,
+                            fingerprint,
+                            &key_cols,
+                            Some(touched_keys),
+                        )?
+                    } else {
+                        self.visible_row_with_value(
+                            table,
+                            visibility,
+                            key_id,
+                            &row[positions[0]],
+                            Some(touched_keys),
+                        )?
+                    }
+                };
+                if conflict {
                     return Err(EngineError::ApplyFailed(format!(
                         "duplicate key value violates unique index \"{}\"",
                         index.name

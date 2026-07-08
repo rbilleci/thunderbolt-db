@@ -256,7 +256,10 @@ pub(crate) struct IntentLaneState {
 /// One lane's pending locate request (see `IntentLaneState::validate_queue`).
 pub(crate) struct ValidateRequest {
     pub(crate) table: String,
-    pub(crate) filter_idx: usize,
+    /// COMPOUND KEYS: the device-probe key id — a single-column column-index or `FLAG | ordinal`
+    /// (see `index_probe_key_id`). Requests coalesce per (table, key_id); the needles are the raw
+    /// keys or the compound fingerprints for that index.
+    pub(crate) key_id: usize,
     pub(crate) needles: Vec<i32>,
     pub(crate) slot: std::sync::Arc<ValidateSlot>,
 }

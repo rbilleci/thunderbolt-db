@@ -487,6 +487,12 @@ impl Engine {
             if index.column == rename.old_name {
                 index.column = rename.new_name.clone();
             }
+            // COMPOUND KEYS: rename the column everywhere it appears in a compound key too.
+            for key_column in &mut index.key_columns {
+                if *key_column == rename.old_name {
+                    *key_column = rename.new_name.clone();
+                }
+            }
         }
         for constraint in &mut table_ref.check_constraints {
             if constraint.column == rename.old_name {
@@ -565,7 +571,9 @@ impl Engine {
         if table
             .indexes
             .iter()
-            .any(|index| index.column == drop_column.column)
+            // COMPOUND KEYS: a column that participates in ANY key column of a compound index also
+            // blocks the drop (not just the single-column `index.column`).
+            .any(|index| index.key_columns.contains(&drop_column.column))
             || table
                 .check_constraints
                 .iter()

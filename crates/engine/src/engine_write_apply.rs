@@ -574,21 +574,35 @@ impl Engine {
                 }
             }
             Command::CreateTable(create) => {
-                // TYPE-COVERAGE #14 Track 3: the parser + catalog REPRESENT a compound key (columns
-                // list), but uniqueness ENFORCEMENT is not wired yet, so a COMPOUND PRIMARY KEY / UNIQUE
-                // is rejected in PREFLIGHT (before the WAL write — an apply-time reject would leave the
-                // rejected command in the WAL to poison every subsequent replay). Single-column keys pass.
+                // TYPE-COVERAGE #14 Track 3: compound PK/UNIQUE over i32-SECTION columns
+                // (Int4/Date/Int2) is device-native (folded to a fingerprint surrogate — see
+                // `compound_key_fingerprint`); a compound key touching any WIDER type stays REJECTED in
+                // PREFLIGHT (before the WAL write — an apply-time reject would strand the command in the
+                // WAL to poison every replay). Single-column keys pass. Keep this in lock-step with the
+                // apply-layer guard in `apply_create_table`.
+                let ct_compound_i32_ok = |cols: &[String]| -> bool {
+                    cols.iter().all(|name| {
+                        create
+                            .columns
+                            .iter()
+                            .find(|c| &c.name == name)
+                            .is_some_and(|c| {
+                                matches!(c.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2)
+                            })
+                    })
+                };
                 if create
                     .primary_key
                     .as_ref()
-                    .is_some_and(|pk| pk.columns.len() > 1)
+                    .is_some_and(|pk| pk.columns.len() > 1 && !ct_compound_i32_ok(&pk.columns))
                     || create
                         .unique_constraints
                         .iter()
-                        .any(|u| u.columns.len() > 1)
+                        .any(|u| u.columns.len() > 1 && !ct_compound_i32_ok(&u.columns))
                 {
                     return Err(EngineError::ApplyFailed(
-                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported"
+                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
+                         (compound key columns must be int4, int2, or date)"
                             .to_string(),
                     ));
                 }
@@ -625,13 +639,6 @@ impl Engine {
                 }
             }
             Command::CreateIndex(create) if create.unique => {
-                // TYPE-COVERAGE #14 Track 3: compound UNIQUE index rejected in preflight (see CreateTable).
-                if create.columns.len() > 1 {
-                    return Err(EngineError::ApplyFailed(
-                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported"
-                            .to_string(),
-                    ));
-                }
                 if cat
                     .relational_catalog
                     .values()
@@ -652,32 +659,46 @@ impl Engine {
                         create.table
                     ))
                 })?;
-                let column_idx = table
+                // COMPOUND KEYS: resolve EVERY key column; a compound UNIQUE over i32-section columns
+                // is device-native, any wider type stays rejected in preflight (lock-step with apply).
+                let column_idxs = create
                     .columns
                     .iter()
-                    .position(|column| column.name == create.column)
-                    .ok_or_else(|| {
-                        EngineError::ApplyFailed(format!(
-                            "column \"{}\" does not exist",
-                            create.column
-                        ))
-                    })?;
+                    .map(|name| {
+                        table
+                            .columns
+                            .iter()
+                            .position(|column| &column.name == name)
+                            .ok_or_else(|| {
+                                EngineError::ApplyFailed(format!(
+                                    "column \"{name}\" does not exist"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<usize>, _>>()?;
+                if column_idxs.len() > 1
+                    && !column_idxs.iter().all(|&i| {
+                        matches!(
+                            table.columns[i].ty,
+                            SqlType::Int4 | SqlType::Date | SqlType::Int2
+                        )
+                    })
+                {
+                    return Err(EngineError::ApplyFailed(
+                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
+                         (compound key columns must be int4, int2, or date)"
+                            .to_string(),
+                    ));
+                }
                 let rows = self.visible_relational_rows(
                     table,
                     StorageVisibility {
                         read_txn_id: self.committed_seq() as TxnId,
                     },
                 )?;
-                Self::validate_unique_values(&rows, column_idx, &create.name)?;
+                Self::validate_unique_values_tuple(&rows, &column_idxs, &create.name)?;
             }
             Command::AddPrimaryKey(add) => {
-                // TYPE-COVERAGE #14 Track 3: compound ADD PRIMARY KEY rejected in preflight (see CreateTable).
-                if add.columns.len() > 1 {
-                    return Err(EngineError::ApplyFailed(
-                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported"
-                            .to_string(),
-                    ));
-                }
                 if cat
                     .relational_catalog
                     .values()
@@ -701,45 +722,59 @@ impl Engine {
                         add.table
                     )));
                 }
-                let column_idx = table
+                // COMPOUND KEYS: resolve EVERY key column; compound PK over i32-section columns is
+                // device-native, any wider type stays rejected in preflight (lock-step with apply).
+                let column_idxs = add
                     .columns
                     .iter()
-                    .position(|column| column.name == add.column)
-                    .ok_or_else(|| {
-                        EngineError::ApplyFailed(format!(
-                            "column \"{}\" does not exist",
-                            add.column
-                        ))
-                    })?;
+                    .map(|name| {
+                        table
+                            .columns
+                            .iter()
+                            .position(|column| &column.name == name)
+                            .ok_or_else(|| {
+                                EngineError::ApplyFailed(format!(
+                                    "column \"{name}\" does not exist"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<usize>, _>>()?;
+                if column_idxs.len() > 1
+                    && !column_idxs.iter().all(|&i| {
+                        matches!(
+                            table.columns[i].ty,
+                            SqlType::Int4 | SqlType::Date | SqlType::Int2
+                        )
+                    })
+                {
+                    return Err(EngineError::ApplyFailed(
+                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
+                         (compound key columns must be int4, int2, or date)"
+                            .to_string(),
+                    ));
+                }
                 let rows = self.visible_relational_rows(
                     table,
                     StorageVisibility {
                         read_txn_id: self.committed_seq() as TxnId,
                     },
                 )?;
-                // PG: ADD PRIMARY KEY over existing data requires the column non-null (23502) —
+                // PG: ADD PRIMARY KEY over existing data requires EVERY key column non-null (23502) —
                 // checked in PREFLIGHT (a failure inside apply would strand the entry in the commit
                 // pipeline), byte-identical to the apply-layer guard in
                 // `apply_create_index_with_constraint_flags`.
-                if rows
+                if let Some(&null_col) = column_idxs
                     .iter()
-                    .any(|row| matches!(row[column_idx], SqlValue::Null))
+                    .find(|&&i| rows.iter().any(|row| matches!(row[i], SqlValue::Null)))
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "column \"{}\" of relation \"{}\" contains null values",
-                        add.column, add.table
+                        table.columns[null_col].name, add.table
                     )));
                 }
-                Self::validate_unique_values(&rows, column_idx, &add.name)?;
+                Self::validate_unique_values_tuple(&rows, &column_idxs, &add.name)?;
             }
             Command::AddUniqueConstraint(add) => {
-                // TYPE-COVERAGE #14 Track 3: compound ADD UNIQUE rejected in preflight (see CreateTable).
-                if add.columns.len() > 1 {
-                    return Err(EngineError::ApplyFailed(
-                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported"
-                            .to_string(),
-                    ));
-                }
                 if cat
                     .relational_catalog
                     .values()
@@ -757,23 +792,44 @@ impl Engine {
                 let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
                 })?;
-                let column_idx = table
+                // COMPOUND KEYS: resolve EVERY key column; compound UNIQUE over i32-section columns is
+                // device-native, any wider type stays rejected in preflight (lock-step with apply).
+                let column_idxs = add
                     .columns
                     .iter()
-                    .position(|column| column.name == add.column)
-                    .ok_or_else(|| {
-                        EngineError::ApplyFailed(format!(
-                            "column \"{}\" does not exist",
-                            add.column
-                        ))
-                    })?;
+                    .map(|name| {
+                        table
+                            .columns
+                            .iter()
+                            .position(|column| &column.name == name)
+                            .ok_or_else(|| {
+                                EngineError::ApplyFailed(format!(
+                                    "column \"{name}\" does not exist"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<usize>, _>>()?;
+                if column_idxs.len() > 1
+                    && !column_idxs.iter().all(|&i| {
+                        matches!(
+                            table.columns[i].ty,
+                            SqlType::Int4 | SqlType::Date | SqlType::Int2
+                        )
+                    })
+                {
+                    return Err(EngineError::ApplyFailed(
+                        "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
+                         (compound key columns must be int4, int2, or date)"
+                            .to_string(),
+                    ));
+                }
                 let rows = self.visible_relational_rows(
                     table,
                     StorageVisibility {
                         read_txn_id: self.committed_seq() as TxnId,
                     },
                 )?;
-                Self::validate_unique_values(&rows, column_idx, &add.name)?;
+                Self::validate_unique_values_tuple(&rows, &column_idxs, &add.name)?;
             }
             Command::AddCheckConstraint(add) => self.preflight_add_check_constraint(add)?,
             Command::AddForeignKey(add) => self.preflight_add_foreign_key(add, txn_id)?,
@@ -1213,7 +1269,8 @@ impl Engine {
                 if table
                     .indexes
                     .iter()
-                    .any(|index| index.column == drop.column)
+                    // COMPOUND KEYS: block the drop when the column is ANY key column of a compound index.
+                    .any(|index| index.key_columns.contains(&drop.column))
                     || table
                         .check_constraints
                         .iter()

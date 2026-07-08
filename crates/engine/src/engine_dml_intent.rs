@@ -260,6 +260,20 @@ impl Engine {
                 ));
             }
         }
+        // COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): the intent fast path's fused-apply derives the
+        // PK slot from ONE column; a compound key can't ride it (uniqueness folds a multi-column
+        // fingerprint). Compound-keyed tables take the CLASSIC covered path instead — still
+        // device-native (`wave_batch_validate_unique` is compound-aware), just not the single-launch
+        // fused lane. (Fused-apply for compound = a ledgered follow-up.)
+        if table
+            .indexes
+            .iter()
+            .any(|index| index.unique && crate::engine_residency::index_is_compound(index))
+        {
+            return Err(route_err(
+                "compound unique/primary keys are served by the classic covered path",
+            ));
+        }
         // E2.2(a): precompute the integer conflict slots — one per unique index, keyed by the
         // stable (table_oid, column_id) identity + the row's i32 value at wave time. Every column
         // is INT4 here, so every unique index qualifies for the allocation-free integer slot.
@@ -799,8 +813,13 @@ impl Engine {
         let values: Vec<SqlValue> = new_values.iter().map(|&v| SqlValue::Int4(v)).collect();
         // PLACEHOLDER new_row_id (0): the pump stamps the id it claims at wave formation into
         // these 8 bytes at `row_id_offset`. `None` (name-width) declines to the retryable drift.
-        let record =
-            crate::wal_binary::encode_binary_update_by_key(&route.table, &route.pk_column_name, pk, 0, &values)?;
+        let record = crate::wal_binary::encode_binary_update_by_key(
+            &route.table,
+            &route.pk_column_name,
+            pk,
+            0,
+            &values,
+        )?;
         let row_id_offset =
             crate::wal_binary::binary_update_new_row_id_offset(&route.table, &route.pk_column_name)
                 as u32;
@@ -885,6 +904,11 @@ impl Engine {
             && self.binary_wal_records_enabled()
             && table.is_some_and(|table| {
                 table.columns.len() == route.column_count
+                    // COMPOUND KEYS: a table that became compound-keyed (DDL) drops off the fused
+                    // intent path to the classic covered path (see prepare_covered_insert_route).
+                    && !table.indexes.iter().any(|index| {
+                        index.unique && crate::engine_residency::index_is_compound(index)
+                    })
                     && self.insert_unique_wave_batchable(&catalog, table)
             });
         if !eligible {

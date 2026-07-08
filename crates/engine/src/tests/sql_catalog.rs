@@ -3616,13 +3616,31 @@ fn relational_catalog_replays_from_durable_wal_with_table_data() {
 }
 
 #[test]
-fn compound_primary_key_parses_but_is_rejected_until_device_support() {
-    // TYPE-COVERAGE #14 Track 3 (compound keys): the PARSER + catalog now REPRESENT a compound key
-    // (columns list), the foundation for device-native compound uniqueness. But uniqueness ENFORCEMENT
-    // isn't wired yet, so a compound PRIMARY KEY / UNIQUE is REJECTED at DDL (honest, never
-    // silently-wrong). Single-column keys are unaffected.
+fn compound_key_fingerprint_is_deterministic_and_order_sensitive() {
+    use crate::engine_residency::compound_key_fingerprint as fp;
+    // Deterministic: same tuple -> same fingerprint (host builder, needle, and append fold must agree).
+    assert_eq!(fp(&[1, 2, 3]), fp(&[1, 2, 3]));
+    // Order-sensitive: the key-column ORDER is part of the tuple identity.
+    assert_ne!(fp(&[1, 2]), fp(&[2, 1]));
+    // Distinct tuples differing in ONE column produce (near-always) distinct fingerprints; the
+    // authoritative recheck restores exactness regardless, but a good mix keeps rechecks rare.
+    assert_ne!(fp(&[1, 2]), fp(&[1, 3]));
+    assert_ne!(fp(&[1, 2]), fp(&[5, 2]));
+    // A single-element tuple is still folded (NOT the raw key) — compound keys never reuse the
+    // single-column raw-key path, so there is no aliasing between the two representations.
+    assert_ne!(fp(&[7]), 7);
+}
 
-    // (1) The parser accepts the compound form and captures BOTH key columns (not just the first).
+#[test]
+fn compound_primary_key_over_i32_section_columns_enforces_tuple_uniqueness() {
+    // TYPE-COVERAGE #14 Track 3 (compound keys): a compound PRIMARY KEY / UNIQUE over i32-SECTION
+    // columns (Int4/Date/Int2) is now DEVICE-NATIVE — the ordered key tuple folds to a surrogate
+    // fingerprint that rides the i32 index; the count>0 recheck compares the FULL tuple, so
+    // uniqueness is exact. This test drives the HOST validate path (`Engine::new_local`, no GPU);
+    // the on-device path is proven by the GPU sweep. A compound key touching any WIDER type stays
+    // rejected (honest partial coverage).
+
+    // (1) The parser captures BOTH key columns (not just the first).
     let Command::CreateTable(create) =
         parse_command("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))").unwrap()
     else {
@@ -3632,53 +3650,85 @@ fn compound_primary_key_parses_but_is_rejected_until_device_support() {
     assert_eq!(pk.columns, vec!["a".to_string(), "b".to_string()]);
     assert_eq!(pk.column, "a"); // the first key column (single-column back-compat)
 
-    // (2) DDL REJECTS the compound key cleanly (not silently-wrong first-column-only uniqueness).
+    // (2) A compound PK over i32-section columns is ACCEPTED and the catalog records both columns.
     let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))")
+        .unwrap();
+    let table = e.relational_catalog_table("t").unwrap();
+    let idx = table.indexes.iter().find(|i| i.primary_key).unwrap();
+    assert_eq!(idx.key_columns, vec!["a".to_string(), "b".to_string()]);
+
+    // (3) TUPLE uniqueness — not first-column-only, not second-column-only.
+    e.execute_text(2, "INSERT INTO t (a, b) VALUES (1, 2)")
+        .unwrap();
+    // Same first column, different second -> DISTINCT tuple, allowed.
+    e.execute_text(3, "INSERT INTO t (a, b) VALUES (1, 3)")
+        .unwrap();
+    // Same second column, different first -> DISTINCT tuple, allowed.
+    e.execute_text(4, "INSERT INTO t (a, b) VALUES (5, 2)")
+        .unwrap();
+    // ORDER matters: (2,1) is a distinct tuple from (1,2), allowed (order-sensitive fingerprint).
+    e.execute_text(5, "INSERT INTO t (a, b) VALUES (2, 1)")
+        .unwrap();
+    // Exact tuple repeat -> 23505.
     let err = e
-        .execute_text(1, "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))")
+        .execute_text(6, "INSERT INTO t (a, b) VALUES (1, 2)")
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("duplicate key value"),
+        "duplicate compound tuple raises 23505, got {err:?}"
+    );
+
+    // (4) A compound key touching a WIDER type (TEXT here) stays rejected — cleanly, in preflight.
+    let err = e
+        .execute_text(7, "CREATE TABLE w (a INT, s TEXT, PRIMARY KEY (a, s))")
         .unwrap_err();
     assert!(
         format!("{err:?}").contains("compound"),
-        "compound PK is rejected with a clear message, got {err:?}"
+        "wider-typed compound PK is rejected, got {err:?}"
     );
-    // A compound UNIQUE constraint is likewise rejected.
-    assert!(e
-        .execute_text(2, "CREATE TABLE u (a INT, b INT, UNIQUE (a, b))")
-        .is_err());
-    // Every OTHER compound unique/PK entry point is rejected in PREFLIGHT too (before the WAL — so no
-    // rejected command poisons replay; the `e2` engine stays usable after each rejection).
+
+    // (5) The other compound entry points also work for i32-section keys (ADD PK / ADD UNIQUE /
+    // CREATE UNIQUE INDEX) — and each is preflight-checked, so a rejection never poisons the engine.
     let e2 = Engine::new_local();
-    e2.execute_text(1, "CREATE TABLE k (a INT, b INT)").unwrap();
-    assert!(e2
-        .execute_text(
-            2,
-            "ALTER TABLE ONLY public.k ADD CONSTRAINT k_pkey PRIMARY KEY (a, b)"
-        )
-        .is_err());
-    assert!(e2
-        .execute_text(
-            3,
-            "ALTER TABLE ONLY public.k ADD CONSTRAINT k_ab_key UNIQUE (a, b)"
-        )
-        .is_err());
-    assert!(e2
-        .execute_text(4, "CREATE UNIQUE INDEX k_ab_idx ON k (a, b)")
-        .is_err());
-    // Not poisoned: a single-column constraint on the same table still applies after the rejections.
+    e2.execute_text(1, "CREATE TABLE k (a INT, b INT, c INT)")
+        .unwrap();
     e2.execute_text(
-        5,
-        "ALTER TABLE ONLY public.k ADD CONSTRAINT k_pkey PRIMARY KEY (a)",
+        2,
+        "ALTER TABLE ONLY public.k ADD CONSTRAINT k_pkey PRIMARY KEY (a, b)",
     )
     .unwrap();
+    e2.execute_text(
+        3,
+        "ALTER TABLE ONLY public.k ADD CONSTRAINT k_bc_key UNIQUE (b, c)",
+    )
+    .unwrap();
+    e2.execute_text(4, "INSERT INTO k (a, b, c) VALUES (1, 2, 3)")
+        .unwrap();
+    // Violates the (a,b) PK.
+    assert!(e2
+        .execute_text(5, "INSERT INTO k (a, b, c) VALUES (1, 2, 9)")
+        .is_err());
+    // Violates the (b,c) UNIQUE index (distinct (a,b)).
+    assert!(e2
+        .execute_text(6, "INSERT INTO k (a, b, c) VALUES (7, 2, 3)")
+        .is_err());
+    // Distinct on both compound keys -> allowed.
+    e2.execute_text(7, "INSERT INTO k (a, b, c) VALUES (7, 8, 9)")
+        .unwrap();
 
-    // (3) A single-column PRIMARY KEY still works end-to-end (no regression).
-    e.execute_text(3, "CREATE TABLE s (id INT PRIMARY KEY, v INT)")
+    // (6) DDL integrity: a column that participates in a compound key cannot be dropped.
+    assert!(e2
+        .execute_text(8, "ALTER TABLE ONLY public.k DROP COLUMN b")
+        .is_err());
+
+    // (7) A single-column PRIMARY KEY still works end-to-end (no regression).
+    e.execute_text(8, "CREATE TABLE s (id INT PRIMARY KEY, v INT)")
         .unwrap();
-    e.execute_text(4, "INSERT INTO s (id, v) VALUES (1, 10), (2, 20)")
+    e.execute_text(9, "INSERT INTO s (id, v) VALUES (1, 10), (2, 20)")
         .unwrap();
-    // The PK is enforced (duplicate id rejected).
     assert!(e
-        .execute_text(5, "INSERT INTO s (id, v) VALUES (1, 99)")
+        .execute_text(10, "INSERT INTO s (id, v) VALUES (1, 99)")
         .is_err());
     let table = e.relational_catalog_table("s").unwrap();
     let pk = table.indexes.iter().find(|i| i.primary_key).unwrap();
