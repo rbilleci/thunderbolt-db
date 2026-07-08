@@ -12226,6 +12226,134 @@ DONE:
 }
 "#;
 
+// TYPE-COVERAGE #14 (bool): set the value bits of `count` appended rows into a resident bool column's
+// 1-bit/row bitmap section (LE u32 words, LSB-first). Thread t owns appended row `base_row + t`; it reads
+// its value byte (0/1) and, iff 1, atomic-ORs the bit into word `(base_row+t)>>5`. FALSE rows write
+// nothing — the open shard's bitmap headroom is pre-zeroed at admission, and prior appends only set (never
+// clear) bits, so ORing new true-bits is correct without reading the boundary word (no host mirror, no
+// readback). atom.or handles the case where several appended rows land in the SAME 32-bit word.
+const BOOL_BITMAP_SET_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_bool_bitmap_set_range(
+    .param .u64 region_ptr,
+    .param .u64 bitmap_byte_offset,
+    .param .u32 base_row,
+    .param .u32 count,
+    .param .u64 values_ptr
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<13>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [region_ptr];
+    ld.param.u64 %rd2, [bitmap_byte_offset];
+    ld.param.u32 %r1, [base_row];
+    ld.param.u32 %r2, [count];
+    ld.param.u64 %rd3, [values_ptr];
+
+    // t = ctaid.x * ntid.x + tid.x
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.u32 %r6, %r4, %r5, %r3;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra DONE;
+
+    // val = values[t]  (u8, zero-extended); false -> leave bit 0
+    cvt.u64.u32 %rd4, %r6;
+    add.u64 %rd5, %rd3, %rd4;
+    ld.global.u8 %r7, [%rd5];
+    setp.eq.u32 %p2, %r7, 0;
+    @%p2 bra DONE;
+
+    // row = base_row + t ; word = row >> 5 ; bit = row & 31 ; mask = 1 << bit
+    add.u32 %r8, %r1, %r6;
+    shr.u32 %r9, %r8, 5;
+    and.b32 %r10, %r8, 31;
+    mov.u32 %r11, 1;
+    shl.b32 %r11, %r11, %r10;
+
+    // addr = region_ptr + bitmap_byte_offset + word*4
+    mul.wide.u32 %rd6, %r9, 4;
+    add.u64 %rd7, %rd1, %rd2;
+    add.u64 %rd7, %rd7, %rd6;
+    atom.global.or.b32 %r12, [%rd7], %r11;
+
+DONE:
+    ret;
+}
+"#;
+
+// TYPE-COVERAGE #14 (bool): recompact ONE shard's bool bitmap into the unified buffer's bool bitmap at an
+// ARBITRARY (not necessarily 32-row-aligned) destination base. Thread `l` owns the shard's local row `l`;
+// it reads source bit `l` and, iff set, atomic-ORs destination bit `dst_base_row + l`. A byte-copy cannot
+// do this when `dst_base_row % 32 != 0` (shards seal at arbitrary row counts), so this per-bit gather is
+// the alignment-free repack. The unified region is pre-zeroed (RecompactFill 0x00) so only set bits are
+// written; atom.or handles rows from different shards that land in the SAME destination word.
+const BOOL_BITMAP_GATHER_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_bool_bitmap_gather_shard(
+    .param .u64 dst_ptr,
+    .param .u64 dst_bitmap_offset,
+    .param .u32 dst_base_row,
+    .param .u64 src_ptr,
+    .param .u64 src_bitmap_offset,
+    .param .u32 count
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<12>;
+
+    ld.param.u64 %rd1, [dst_ptr];
+    ld.param.u64 %rd2, [dst_bitmap_offset];
+    ld.param.u32 %r1, [dst_base_row];
+    ld.param.u64 %rd3, [src_ptr];
+    ld.param.u64 %rd4, [src_bitmap_offset];
+    ld.param.u32 %r2, [count];
+
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.u32 %r6, %r4, %r5, %r3;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra DONE;
+
+    // src bit l: word = src[src_off + (l>>5)*4]; bit = (word >> (l&31)) & 1
+    shr.u32 %r7, %r6, 5;
+    and.b32 %r8, %r6, 31;
+    mul.wide.u32 %rd5, %r7, 4;
+    add.u64 %rd6, %rd3, %rd4;
+    add.u64 %rd6, %rd6, %rd5;
+    ld.global.u32 %r9, [%rd6];
+    shr.u32 %r10, %r9, %r8;
+    and.b32 %r10, %r10, 1;
+    setp.eq.u32 %p2, %r10, 0;
+    @%p2 bra DONE;
+
+    // dst bit (dst_base_row + l): word = (base+l)>>5 ; bit = (base+l)&31 ; mask = 1<<bit
+    add.u32 %r11, %r1, %r6;
+    shr.u32 %r12, %r11, 5;
+    and.b32 %r13, %r11, 31;
+    mov.u32 %r14, 1;
+    shl.b32 %r14, %r14, %r13;
+    mul.wide.u32 %rd7, %r12, 4;
+    add.u64 %rd8, %rd1, %rd2;
+    add.u64 %rd8, %rd8, %rd7;
+    atom.global.or.b32 %r15, [%rd8], %r14;
+
+DONE:
+    ret;
+}
+"#;
+
 const INDEX_INSERT_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -12749,6 +12877,208 @@ impl CudaResidentDeviceMemory {
         check_cuda(unsafe { cu_ctx_synchronize() })?;
         drop(slots_guard);
         drop(values_guard);
+        Ok(())
+    }
+
+    /// TYPE-COVERAGE #14 (bool): set the value bits of `values.len()` appended rows into THIS shard
+    /// buffer's bool column bitmap at `bitmap_byte_offset` (the column's section start within the buffer),
+    /// starting at local row `base_row`. `values[i]` is 0/1 for appended row `base_row + i`. The kernel
+    /// atomic-ORs only the TRUE bits (the headroom is pre-zeroed, so false rows and untouched prior bits
+    /// stay correct) — the bool analog of `scatter_u64_slots`. Synchronous (ctx-sync) so the bits are
+    /// device-visible before the caller bumps `row_count` / publishes.
+    pub fn set_bool_bitmap_range(
+        &self,
+        bitmap_byte_offset: u64,
+        base_row: u32,
+        values: &[u8],
+    ) -> Result<(), CudaRuntimeProbeError> {
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        if values.is_empty() {
+            return Ok(());
+        }
+        if self.device_ptr() == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let count = u32::try_from(values.len())
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(values.len()))?;
+        let values_bytes = std::mem::size_of_val(values);
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_memcpy_htod = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_ctx_synchronize = unsafe {
+            primary
+                .lib()
+                .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let values_guard = primary.lease_device_buffer_owned(values_bytes)?;
+
+        let mut ptx = Vec::with_capacity(BOOL_BITMAP_SET_PTX.len() + 1);
+        ptx.extend_from_slice(BOOL_BITMAP_SET_PTX);
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_resident_bool_bitmap_set_range", &ptx)?;
+
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                values_guard.ptr,
+                values.as_ptr().cast::<c_void>(),
+                values_bytes,
+            )
+        })?;
+
+        let mut region_arg = self.device_ptr();
+        let mut offset_arg = bitmap_byte_offset;
+        let mut base_row_arg = base_row;
+        let mut count_arg = count;
+        let mut values_arg = values_guard.ptr;
+        let mut args = [
+            (&mut region_arg as *mut u64).cast::<c_void>(),
+            (&mut offset_arg as *mut u64).cast::<c_void>(),
+            (&mut base_row_arg as *mut u32).cast::<c_void>(),
+            (&mut count_arg as *mut u32).cast::<c_void>(),
+            (&mut values_arg as *mut u64).cast::<c_void>(),
+        ];
+        let threads_per_block: u32 = 128;
+        let blocks = count.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        check_cuda(unsafe { cu_ctx_synchronize() })?;
+        drop(values_guard);
+        Ok(())
+    }
+
+    /// TYPE-COVERAGE #14 (bool): gather ONE source shard's bool bitmap (`count` local rows at
+    /// `src_bitmap_offset` in `src_device_ptr`) into THIS (unified) buffer's bool bitmap at
+    /// `dst_bitmap_offset`, placing the shard's row `l` at unified row `dst_base_row + l`. Device->device
+    /// (no HtoD): the kernel atomic-ORs each set source bit into the pre-zeroed unified region, so it works
+    /// at ANY `dst_base_row` (shards seal at arbitrary, non-32-aligned row counts). Synchronous (ctx-sync).
+    pub fn gather_bool_bitmap_from_shard(
+        &self,
+        dst_bitmap_offset: u64,
+        dst_base_row: u32,
+        src_device_ptr: u64,
+        src_bitmap_offset: u64,
+        count: u32,
+    ) -> Result<(), CudaRuntimeProbeError> {
+        type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        if count == 0 {
+            return Ok(());
+        }
+        if self.device_ptr() == 0 || src_device_ptr == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_ctx_synchronize = unsafe {
+            primary
+                .lib()
+                .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let mut ptx = Vec::with_capacity(BOOL_BITMAP_GATHER_PTX.len() + 1);
+        ptx.extend_from_slice(BOOL_BITMAP_GATHER_PTX);
+        ptx.push(0);
+        let function =
+            primary.cached_function(c"gpu_db_resident_bool_bitmap_gather_shard", &ptx)?;
+
+        let mut dst_ptr_arg = self.device_ptr();
+        let mut dst_off_arg = dst_bitmap_offset;
+        let mut dst_base_arg = dst_base_row;
+        let mut src_ptr_arg = src_device_ptr;
+        let mut src_off_arg = src_bitmap_offset;
+        let mut count_arg = count;
+        let mut args = [
+            (&mut dst_ptr_arg as *mut u64).cast::<c_void>(),
+            (&mut dst_off_arg as *mut u64).cast::<c_void>(),
+            (&mut dst_base_arg as *mut u32).cast::<c_void>(),
+            (&mut src_ptr_arg as *mut u64).cast::<c_void>(),
+            (&mut src_off_arg as *mut u64).cast::<c_void>(),
+            (&mut count_arg as *mut u32).cast::<c_void>(),
+        ];
+        let threads_per_block: u32 = 128;
+        let blocks = count.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        check_cuda(unsafe { cu_ctx_synchronize() })?;
         Ok(())
     }
 

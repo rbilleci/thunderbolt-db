@@ -442,10 +442,14 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
                 // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) 16-byte section.
                 | SqlType::Numeric { .. }
                 | SqlType::Uuid
+                // TYPE-COVERAGE #14 (bool): the 1-bit/row bitmap — emits NO chunk here (the caller's
+                // device atomicOr set-range op writes its bits); the encoder just skips the column.
+                | SqlType::Bool
         )
     }) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "open-shard append supports fixed-width (i32/i64/b128) sections only".to_string(),
+            "open-shard append supports fixed-width (i32/i64/b128) + bool-bitmap sections only"
+                .to_string(),
         )));
     }
     // Row-arity guard: a malformed (short/long) row must return the fallback Err, never panic on the
@@ -548,7 +552,11 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
                 chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
                 numeric_ordinal += 1;
             }
-            _ => unreachable!("the section guard above rejects non-fixed-width columns"),
+            // TYPE-COVERAGE #14 (bool): the bitmap is NOT a capacity-strided fixed-width chunk — its
+            // bits are set by the caller's device atomicOr op (`set_bool_bitmap_range`) into the
+            // pre-zeroed headroom. Emit no chunk and touch no fixed-width ordinal.
+            SqlType::Bool => {}
+            _ => unreachable!("the section guard above rejects non-fixed-width/bool columns"),
         }
     }
     chunks.push(CudaOwnedDeviceMemoryChunk {
@@ -4885,6 +4893,115 @@ mod capacity_payload_tests {
         );
     }
 
+    /// TYPE-COVERAGE #14 (bool): a BOOLEAN value column is device-authoritative (elided), APPENDS in
+    /// place (the device atomicOr bitmap set-range op writes each appended row's bit into the pre-zeroed
+    /// headroom), ROLLS OVER to multiple shards, and READS correctly via the cross-shard bitmap gather
+    /// (32-row-aligned byte-copy of each shard's live words). The differential vs the CPU host oracle
+    /// proves every bit lands right across shard + word boundaries (200 rows, shard_size 64 => ~4 shards,
+    /// so a word-crossing true/false spread must survive both the append op and the recompaction). Both
+    /// truth values materialize as SqlValue::Bool. Sabotage: dropping the bool gather segment (or the
+    /// atomicOr op) diverges the differential; a non-32-aligned shard makes the gather DECLINE, not lie.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn bool_column_elides_appends_and_reads_multishard() {
+        let run = |device: bool| -> (bool, usize, Vec<Vec<SqlValue>>) {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(device);
+            e.set_host_install_elision_enabled(device);
+            e.set_constrained_elision_enabled(device);
+            e.set_device_write_locate_enabled(device);
+            e.set_device_write_locate_wave_batch_enabled(device);
+            e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the bitmap gather
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, flag BOOLEAN)")
+                .unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                // flag = (id % 3 == 0): a word-crossing true/false spread so a wrong bitmap offset, a
+                // mis-packed word, or a mis-aligned cross-shard copy is visible in the differential.
+                let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k}, {})", if k % 3 == 0 { "true" } else { "false" }))
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, flag) VALUES {}", vals.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            let elided = e.table_install_elided("t");
+            let shard_count = e.resident_shard_count("t");
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, flag FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            // An ORDER BY over a bool-bearing elided table must ALSO route on-device (the bool column
+            // is carried through the sort's unified source, not sent to the CPU pinned path where it
+            // would rehydrate-decline). Same rows, so the sorted-by-debug comparison folds it in.
+            let ordered = e
+                .execute_relational_select_text("SELECT id, flag FROM t ORDER BY id")
+                .unwrap()
+                .rows
+                .into_boxed();
+            assert_eq!(
+                ordered.len(),
+                rows.len(),
+                "ORDER BY over the bool table serves the same row set on-device"
+            );
+            // A FILTERED bool projection is NOT a served on-device shape -> it falls to the CPU-pinned
+            // path, which for an ELIDED table rehydrates device->host FIRST. Without bool in the
+            // rehydration gather this hard-errors ("device-authoritative invariant broken"); with it,
+            // the row reads correctly. Row id=3 is true (3 % 3 == 0), id=5 is false.
+            let filtered = e
+                .execute_relational_select_text("SELECT id, flag FROM t WHERE id = 3")
+                .unwrap()
+                .rows
+                .into_boxed();
+            assert_eq!(
+                filtered.len(),
+                1,
+                "a filtered bool projection rehydrates + reads (no device-authoritative hard-error)"
+            );
+            assert!(
+                matches!(filtered[0].get(1), Some(SqlValue::Bool(true))),
+                "the rehydrated bool value is correct (id=3 -> true), got {:?}",
+                filtered[0].get(1)
+            );
+            (elided, shard_count, rows)
+        };
+        let (on_elided, on_shards, on_rows) = run(true);
+        let (_off_elided, _off_shards, off_rows) = run(false);
+        if on_rows.is_empty() {
+            return; // driverless box
+        }
+        assert!(
+            on_elided,
+            "a BOOLEAN-bearing table must be device-authoritative (elided)"
+        );
+        assert!(
+            on_shards >= 2,
+            "the table must roll over to MULTIPLE shards (exercise the bitmap gather), saw {on_shards}"
+        );
+        assert_eq!(
+            on_rows, off_rows,
+            "elided multi-shard bool read == CPU host oracle (the 1-bit/row gather is correct)"
+        );
+        // Both truth values must materialize as real SqlValue::Bool (not dropped / all-zeroed).
+        assert!(
+            on_rows
+                .iter()
+                .any(|r| matches!(r.get(1), Some(SqlValue::Bool(true)))),
+            "at least one TRUE flag materializes"
+        );
+        assert!(
+            on_rows
+                .iter()
+                .any(|r| matches!(r.get(1), Some(SqlValue::Bool(false)))),
+            "at least one FALSE flag materializes"
+        );
+    }
+
     /// R-ver PART 2: GROUP BY / DISTINCT / ORDER BY over a VERSIONED elided sharded table must
     /// HIDE tombstoned rows (they used to hard-REFUSE — "SV3b not wired through the reshaping
     /// sub-bridges" — because those bridges dropped `visibility`). Now the visibility is threaded
@@ -7189,6 +7306,9 @@ impl Engine {
                         // after the i64 sections; Numeric + Uuid share it (same fixed width).
                         | SqlType::Numeric { .. }
                         | SqlType::Uuid
+                        // TYPE-COVERAGE #14 (bool): the 1-bit/row bitmap section rides the payload
+                        // after the b128 sections; the incremental append sets its bits on-device.
+                        | SqlType::Bool
                 )
             });
         // A PURELY-int4 table is laid down with capacity HEADROOM (~2x rows, power-of-two) so committed
@@ -7382,17 +7502,18 @@ impl Engine {
                 // "large admit is one dense shard") must reach the append fn's ROLLOVER branch —
                 // the in-place branch checks headroom itself. Gating headroom here made every
                 // bulk-admitted lineage decline appends outright -> O(table) re-admit per commit.
-                // TYPE-COVERAGE #14 (numeric): appendable = every column rides a FIXED-WIDTH section
-                // (i32 / i64 / b128) — no bool / text / NULL sections. The b128 (Numeric/Uuid) count
-                // joins the i32+i64 count so a numeric-bearing open shard appends in place instead of
-                // O(table) re-admitting per commit (the chunk encoder writes its 16-byte arm).
-                int4_appendable: snapshot.resident_device_bool_columns.is_empty()
-                    && snapshot.resident_device_text_columns.is_empty()
+                // TYPE-COVERAGE #14: appendable = every column rides a section the chunk encoder /
+                // append ops maintain in place — i32 / i64 / b128 (fixed-width chunks) OR a bool bitmap
+                // (the device atomicOr set-range op) — with NO text / NULL sections. The b128 and bool
+                // counts join the i32+i64 count so a numeric- or bool-bearing open shard appends in
+                // place instead of O(table) re-admitting per commit.
+                int4_appendable: snapshot.resident_device_text_columns.is_empty()
                     && snapshot.resident_device_null_columns.is_empty()
                     && snapshot.column_count
                         == snapshot.resident_device_int4_columns.len()
                             + snapshot.resident_device_int8_columns.len()
-                            + snapshot.resident_device_numeric_columns.len(),
+                            + snapshot.resident_device_numeric_columns.len()
+                            + snapshot.resident_device_bool_columns.len(),
                 // S-d3: the zone map (min/max per int4 column) for shard pruning.
                 resident_device_int4_column_stats: snapshot
                     .resident_device_int4_column_stats
@@ -7405,6 +7526,9 @@ impl Engine {
                 resident_device_int8_columns: snapshot.resident_device_int8_columns.clone(),
                 // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) section rides the same payload.
                 resident_device_numeric_columns: snapshot.resident_device_numeric_columns.clone(),
+                // TYPE-COVERAGE #14 (bool): the bool bitmaps ride the same single-buffer payload;
+                // offsets are relative to it (which this shard's device buffer is), so they carry directly.
+                resident_device_bool_columns: snapshot.resident_device_bool_columns.clone(),
                 resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
                 // M3-for-shards: carry the payload's per-column NULL validity bitmaps so the sharded scan's
                 // recompaction can rebuild them into the unified buffer (this re-admit path is the ONLY
@@ -8038,6 +8162,13 @@ impl Engine {
                     // a value column, not a PK/unique key.)
                     | gpu_db_sql::SqlType::Numeric { .. }
                     | gpu_db_sql::SqlType::Uuid
+                    // TYPE-COVERAGE #14 (bool slice 1): bool VALUE columns are device-authoritative
+                    // (the payload builder emits a 1-bit/row bitmap; the general executor reads it).
+                    // NON-appendable for now (like int8 stage i): a bool-bearing open shard declines
+                    // in-place append and RE-ADMITS (rebuild rebuilds the bitmap), so bool tables stay
+                    // a single dense shard until slice 2 adds the incremental bitmap append. Bool is a
+                    // value column only — the unique-index gate below keeps keys on the i32 section.
+                    | gpu_db_sql::SqlType::Bool
             )
         }) && table.indexes.iter().all(|index| {
             // The A2/A3 device locate probes i32-SECTION keys only: a unique index on an
@@ -8366,6 +8497,7 @@ impl Engine {
             shard_int4_names,
             shard_int8_names,
             shard_numeric_names,
+            shard_bool_layouts,
             gpu_id,
             schema,
             max_shard_id,
@@ -8388,6 +8520,7 @@ impl Engine {
                 open.resident_device_int4_columns.clone(),
                 open.resident_device_int8_columns.clone(),
                 open.resident_device_numeric_columns.clone(),
+                open.resident_device_bool_columns.clone(),
                 open.gpu_id,
                 open.schema.clone(),
                 table_shards.iter().map(|s| s.shard_id).max().unwrap_or(0),
@@ -8416,7 +8549,10 @@ impl Engine {
             .map(|column| column.ty)
             .collect();
         let column_count = column_types.len();
-        if shard_int4_names.len() + shard_int8_names.len() + shard_numeric_names.len()
+        if shard_int4_names.len()
+            + shard_int8_names.len()
+            + shard_numeric_names.len()
+            + shard_bool_layouts.len()
             != column_count
         {
             return false;
@@ -8424,6 +8560,7 @@ impl Engine {
         let num_i32_cols = shard_int4_names.len();
         let num_i64_cols = shard_int8_names.len();
         let num_numeric_cols = shard_numeric_names.len();
+        let num_bool_cols = shard_bool_layouts.len();
 
         // FITS the open shard's headroom -> append IN PLACE (1b-ii on the shard path).
         if row_count.checked_add(k).is_some_and(|end| end <= capacity) {
@@ -8463,7 +8600,10 @@ impl Engine {
             // (replacing the ~8 driver calls of the unfused chain below). Int4-only shards
             // (the covered-INSERT shape); ineligible falls through to the unfused sequence,
             // byte-identical to before the flag.
-            let fused = if self.fused_apply_enabled() && num_i64_cols == 0 && num_numeric_cols == 0
+            let fused = if self.fused_apply_enabled()
+                && num_i64_cols == 0
+                && num_numeric_cols == 0
+                && num_bool_cols == 0
             {
                 let append_started =
                     crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
@@ -8522,6 +8662,32 @@ impl Engine {
                     // Partial/failed append leaves bytes only in invisible headroom beyond row_count;
                     // returning false makes the caller invalidate + re-admit, discarding them.
                     return false;
+                }
+                // TYPE-COVERAGE #14 (bool): the chunk encoder emits NO bytes for bool columns (a bitmap
+                // is not a capacity-strided fixed-width chunk), so set the k appended rows' value bits
+                // here via the device atomicOr op — writing into the pre-zeroed bitmap headroom at the
+                // shard's LOCAL row_count. Same before-the-`row_count`-bump ordering as the version
+                // stamps: the slots are still invisible headroom, so a torn (bits written, count not
+                // bumped) state is unreadable, and a failure -> false -> re-admit (rebuild is truthful).
+                for layout in &shard_bool_layouts {
+                    let Some(col_idx) = column_names.iter().position(|n| n == &layout.name) else {
+                        return false; // shard/catalog bool label mismatch -> decline to the oracle
+                    };
+                    let values: Vec<u8> = new_rows
+                        .iter()
+                        .map(|row| match row[col_idx] {
+                            SqlValue::Bool(true) => 1u8,
+                            // false / NULL leave the bit 0 (NULL-free by the appendable guard anyway;
+                            // the validity bitmap, absent here, would decide a real NULL).
+                            _ => 0u8,
+                        })
+                        .collect();
+                    if shard_device_memory
+                        .set_bool_bitmap_range(layout.bitmap_byte_offset, row_count as u32, &values)
+                        .is_err()
+                    {
+                        return false;
+                    }
                 }
                 // SV6 ORDER (load-bearing): stamp created_by BEFORE the `row_count` bump below publishes the
                 // appended slots. The slots are still invisible headroom here, so a torn state (values + stamps
@@ -8634,17 +8800,20 @@ impl Engine {
         let new_capacity = self
             .shard_size_target()
             .max(k.saturating_mul(2).next_power_of_two());
-        let (device_payload, int4_stats) = match build_relational_device_payload_with_capacity(
-            &column_names,
-            &column_types,
-            new_rows,
-            new_capacity,
-        ) {
-            // Pure int4 + NULL-free (the caller rejects NULLs) -> text/bool/b128/null outputs are empty; keep
-            // the columnar payload + the int4 zone-map stats (min/max over the k rows) for pruning (S-d3).
-            Ok((payload, _text, _bool, stats, _b128, _null)) => (payload, stats),
-            Err(_) => return false,
-        };
+        let (device_payload, bool_layouts, int4_stats) =
+            match build_relational_device_payload_with_capacity(
+                &column_names,
+                &column_types,
+                new_rows,
+                new_capacity,
+            ) {
+                // NULL-free (the caller rejects NULLs) -> text/null outputs are empty; keep the columnar
+                // payload + the int4 zone-map stats (min/max over the k rows) for pruning (S-d3). TYPE-
+                // COVERAGE #14 (bool): the bool bitmap layouts (offsets into THIS payload) DO carry — a
+                // rolled shard can hold bool value columns even though it holds no NULLs.
+                Ok((payload, _text, bool_cols, stats, _b128, _null)) => (payload, bool_cols, stats),
+                Err(_) => return false,
+            };
         // SV1/SV2: the rolled shard carries NO version metadata in its payload — `created_by` is gone and
         // `deleted_by` is on-demand (allocated in `shard_deleted_by_memory` on the shard's first delete).
         let Some(new_device_memory) = self
@@ -8697,16 +8866,19 @@ impl Engine {
             // Audit NOTE adopted: count i64 columns at 8 bytes + b128 (Numeric/Uuid) columns at
             // 16 bytes (was a telemetry undercount vs the admit path; allocated_bytes was always
             // correct).
-            resident_bytes: (8 + k
-                * (num_i32_cols * std::mem::size_of::<i32>()
+            resident_bytes: (8
+                + k * (num_i32_cols * std::mem::size_of::<i32>()
                     + num_i64_cols * std::mem::size_of::<i64>()
-                    + num_numeric_cols * 16)) as u64,
+                    + num_numeric_cols * 16)
+                + bool_layouts.len() * k.div_ceil(32) * 4) as u64,
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
             resident_device_int4_columns: shard_int4_names.clone(),
             resident_device_int8_columns: shard_int8_names.clone(),
             // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) section rides the rollover payload.
             resident_device_numeric_columns: shard_numeric_names.clone(),
+            // TYPE-COVERAGE #14 (bool): the bool bitmaps ride the rollover payload (offsets from the builder).
+            resident_device_bool_columns: bool_layouts,
             resident_device_text_columns: Vec::new(),
             // Rollover shards are fixed-width (i32/i64/b128) + NULL-free by precondition (NULLs rejected).
             resident_device_null_columns: Vec::new(),
@@ -9708,6 +9880,7 @@ impl Engine {
                 resident_device_int4_columns: shard.resident_device_int4_columns,
                 resident_device_int8_columns: Vec::new(), // benchmark chunks are int4-only
                 resident_device_numeric_columns: Vec::new(),
+                resident_device_bool_columns: Vec::new(),
                 resident_device_text_columns: shard.resident_device_text_columns,
                 // Benchmark installs carry no NULL metadata (dense, read-only, NULL-free chunks).
                 resident_device_null_columns: Vec::new(),
@@ -10098,6 +10271,11 @@ impl Engine {
     ) -> Option<Vec<(u64, Vec<SqlValue>)>> {
         // TYPE-COVERAGE track 2 (stage iii): every FIXED-WIDTH-section type gathers with its
         // catalog-derived variant (i32 via one u32/slot; i64 via two — the 4-mod-8 discipline).
+        // TYPE-COVERAGE #14 (bool): bool also gathers here (1 bit/row from the bitmap section) — this
+        // is the DEVICE->HOST rehydration a read shape the on-device routes can't serve falls back to
+        // (a filtered bool projection, an ORDER BY on a bool key). Without it an elided bool table would
+        // hard-error on those shapes. (Numeric/Uuid remain a pre-existing gap — declined here — pending
+        // their own b128 reassembly slice.)
         if table.columns.iter().any(|column| {
             !matches!(
                 column.ty,
@@ -10106,6 +10284,7 @@ impl Engine {
                     | gpu_db_sql::SqlType::Int2
                     | gpu_db_sql::SqlType::Int8
                     | gpu_db_sql::SqlType::Timestamp
+                    | gpu_db_sql::SqlType::Bool
             )
         }) {
             return None;
@@ -10155,6 +10334,9 @@ impl Engine {
             enum GatheredColumn {
                 I32(Vec<i32>),
                 I64(Vec<i32>),
+                // TYPE-COVERAGE #14 (bool): the raw bitmap words (ceil(rows/32) u32, read as i32); bit
+                // `slot` = word[slot/32] >> (slot%32) & 1.
+                Bool(Vec<i32>),
             }
             let mut columns: Vec<GatheredColumn> = Vec::with_capacity(table.columns.len());
             for idx in 0..table.columns.len() {
@@ -10169,6 +10351,21 @@ impl Engine {
                         columns.push(GatheredColumn::I64(
                             device_memory
                                 .read_resident_i32_column(base, rows * 2)
+                                .ok()?,
+                        ));
+                    }
+                    gpu_db_sql::SqlType::Bool => {
+                        let base = crate::relational_model::resident_device_bool_column_offset(
+                            &descriptor,
+                            table,
+                            idx,
+                        )
+                        .ok()?;
+                        // ceil(rows/32) words cover the live prefix (the shard bitmap is
+                        // capacity-strided; the words past `rows` map to headroom -> unread).
+                        columns.push(GatheredColumn::Bool(
+                            device_memory
+                                .read_resident_i32_column(base, rows.div_ceil(32))
                                 .ok()?,
                         ));
                     }
@@ -10209,6 +10406,10 @@ impl Engine {
                             let lo = halves[slot * 2] as u32 as u64;
                             let hi = halves[slot * 2 + 1] as u32 as u64;
                             sql_value_from_i64_section(catalog_column.ty, (lo | (hi << 32)) as i64)
+                        }
+                        GatheredColumn::Bool(words) => {
+                            let bit = (words[slot / 32] as u32 >> (slot % 32)) & 1;
+                            Some(SqlValue::Bool(bit == 1))
                         }
                     })
                     .collect::<Option<Vec<SqlValue>>>()?;
@@ -10254,7 +10455,9 @@ impl Engine {
             // TYPE-COVERAGE #14 (numeric): the shard's b128 (Numeric/Uuid) section labels ride the
             // descriptor (layout == single-buffer, so the shared 16-byte offset helper addresses it).
             resident_device_numeric_columns: shard.resident_device_numeric_columns.clone(),
-            resident_device_bool_columns: Vec::new(),
+            // TYPE-COVERAGE #14 (bool): the shard's per-column bool bitmaps (offsets relative to the
+            // shard's buffer, which this descriptor addresses) so the executor reads bool on-device.
+            resident_device_bool_columns: shard.resident_device_bool_columns.clone(),
             resident_device_text_columns: shard.resident_device_text_columns.clone(),
             // M3-for-shards: carry the shard's own per-column NULL bitmaps (offsets are relative to the
             // shard's buffer, which this descriptor addresses). Empty for the NULL-free majority.
@@ -10296,6 +10499,10 @@ impl Engine {
         // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) columns recompacted into the unified
         // buffer (after every i32 + i64 section, total_row_count-strided at 16 bytes). Empty pre-slice.
         numeric_columns: Vec<String>,
+        // TYPE-COVERAGE #14 (bool): the per-column bool bitmaps recompacted into the unified buffer
+        // (offsets ABSOLUTE in that buffer). One entry per bool column (bool is dense — present on every
+        // shard). Empty for a bool-free table -> byte-identical to the pre-bool read.
+        bool_columns: Vec<ResidentDeviceBoolColumnLayout>,
         // M3-for-shards: the per-column NULL bitmaps recompacted into the unified buffer (offsets ABSOLUTE
         // in that buffer). Empty when no surviving shard carries a NULL — byte-identical to the pre-M3 read.
         null_columns: Vec<ResidentDeviceNullBitmapLayout>,
@@ -10314,7 +10521,7 @@ impl Engine {
             resident_device_int4_column_stats: Vec::new(),
             resident_device_int8_columns: int8_columns,
             resident_device_numeric_columns: numeric_columns,
-            resident_device_bool_columns: Vec::new(),
+            resident_device_bool_columns: bool_columns,
             resident_device_text_columns: Vec::new(),
             resident_device_null_columns: null_columns,
             valid_through_index: self.committed_seq(),
@@ -11400,15 +11607,19 @@ impl Engine {
             if shard.device_memory.is_none() {
                 has_all_device_memory = false;
             }
-            // TYPE-COVERAGE #14 (numeric): a required column must sit in SOME fixed-width device
-            // section — int4 / int8 / b128 (Numeric/Uuid). (Filter columns are still int4 by shape
-            // definition; only the projected columns can be i64/b128, which the general executor +
-            // the recompaction gather serve.) Text/bool required columns are never classified here.
+            // TYPE-COVERAGE #14: a required column must sit in SOME device section the general
+            // executor + recompaction gather serve — int4 / int8 / b128 (Numeric/Uuid) / bool bitmap.
+            // (Filter columns are still int4 by shape definition; only PROJECTED columns can be
+            // i64/b128/bool.) Text required columns are never classified here.
             if !required_int4_columns.is_empty()
                 && required_int4_columns.iter().any(|column| {
                     !shard.resident_device_int4_columns.contains(column)
                         && !shard.resident_device_int8_columns.contains(column)
                         && !shard.resident_device_numeric_columns.contains(column)
+                        && !shard
+                            .resident_device_bool_columns
+                            .iter()
+                            .any(|b| &b.name == column)
                 })
             {
                 decision.cache_state = "Absent".to_string();

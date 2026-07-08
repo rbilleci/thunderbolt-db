@@ -758,6 +758,13 @@ pub(crate) struct RelationalResidentShard {
     /// i64 section, capacity-strided (16 bytes/row), so the shared offset helpers address them.
     /// Empty on int4/int8-only lineages. Mirrors `resident_device_int8_columns` at double width.
     pub(crate) resident_device_numeric_columns: Vec<String>,
+    /// TYPE-COVERAGE #14 (bool slice): per-column BOOL bitmaps carried in THIS shard's device payload
+    /// (1 bit/row, LE u32 words, LSB-first, bit i = row i; 1 = true, 0 = false). In catalog order, one
+    /// entry per bool column, laid out AFTER every i32/i64/b128 section, `ceil(capacity/32)` words each.
+    /// Unlike NULL bitmaps (sparse — only null-bearing columns), a bool column ALWAYS carries one. The
+    /// unified recompaction byte-copies these into the unified buffer (same 32-row-aligned cross-shard
+    /// path as the NULL bitmaps); the open shard maintains its bits incrementally on append.
+    pub(crate) resident_device_bool_columns: Vec<ResidentDeviceBoolColumnLayout>,
     pub(crate) resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     /// M3-for-shards: per-column NULL validity bitmaps carried in THIS shard's device payload (1 = valid,
     /// 0 = NULL), in catalog order, one entry per column that contains a NULL. The sharded scan's unified
@@ -821,6 +828,7 @@ impl PartialEq for RelationalResidentShard {
             && self.resident_device_int4_columns == other.resident_device_int4_columns
             && self.resident_device_int8_columns == other.resident_device_int8_columns
             && self.resident_device_numeric_columns == other.resident_device_numeric_columns
+            && self.resident_device_bool_columns == other.resident_device_bool_columns
             && self.resident_device_text_columns == other.resident_device_text_columns
             && self.resident_device_null_columns == other.resident_device_null_columns
             && self.gpu_id == other.gpu_id

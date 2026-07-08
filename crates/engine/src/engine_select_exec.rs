@@ -114,6 +114,10 @@ impl Engine {
                             // route to the GPU sort as well -- a plain-column ORDER BY over a
                             // numeric/uuid table no longer falls through to the CPU pinned
                             // path (the sharded b128 ORDER BY differential).
+                            // TYPE-COVERAGE #14 (bool): the bool bitmap section is gathered into the
+                            // unified source too, so a bool column no longer forces an ORDER BY over
+                            // a bool-bearing elided table onto the CPU pinned path (which would
+                            // rehydrate-decline). Bool is carried/projected here, not a sort key.
                             matches!(
                                 c.ty,
                                 SqlType::Int4
@@ -123,6 +127,7 @@ impl Engine {
                                     | SqlType::Timestamp
                                     | SqlType::Numeric { .. }
                                     | SqlType::Uuid
+                                    | SqlType::Bool
                             )
                         }) && self
                             .read_state

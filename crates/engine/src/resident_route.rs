@@ -166,6 +166,7 @@ pub(crate) fn resident_route_query_shape(
                             | SqlType::Int2
                             | SqlType::Numeric { .. }
                             | SqlType::Uuid
+                            | SqlType::Bool
                     )
                 });
                 return all_servable.then(|| "int4_projection_all".to_string());
@@ -248,6 +249,7 @@ pub(crate) fn resident_route_query_shape(
                         | SqlType::Int2
                         | SqlType::Numeric { .. }
                         | SqlType::Uuid
+                        | SqlType::Bool
                 )
             });
             (unfiltered && all_fixed_width && select.limit.is_none())

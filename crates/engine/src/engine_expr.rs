@@ -2927,6 +2927,70 @@ impl Engine {
                 allocated_bytes = allocated_bytes.saturating_add(col_region_bytes);
             }
         }
+        // TYPE-COVERAGE #14 (bool): recompact each bool column's 1-bit/row bitmap into the unified buffer.
+        // Unlike the NULL bitmaps (sparse) or the fixed-width sections (byte-copyable at any boundary), a
+        // bool bitmap CANNOT be byte-concatenated across shards: shards seal at ARBITRARY row counts (the
+        // first dense admit seals at exactly its row count, e.g. 100), so a shard's `rows_before` is
+        // generally not 32-row aligned and its bits would land in the wrong destination word. So the region
+        // is only PRE-ZEROED here (RecompactFill 0x00); after the DtoD recompaction each shard's bits are
+        // repacked into place by a per-bit gather KERNEL (`gather_bool_bitmap_from_shard`) that reads source
+        // bit `l` and atomic-ORs destination bit `rows_before + l` — alignment-free. The executor reads the
+        // region by ABSOLUTE offset (`resident_device_bool_column_offset`), like the NULL bitmaps.
+        let mut unified_bool_columns: Vec<crate::relational_model::ResidentDeviceBoolColumnLayout> =
+            Vec::new();
+        // (dst_bitmap_offset, dst_base_row, src_device_ptr, src_bitmap_offset, count) per (column, shard).
+        let mut bool_gather_ops: Vec<(u64, u32, u64, u64, u32)> = Vec::new();
+        {
+            let words_per_col = (total_row_count as u64).div_ceil(32);
+            let col_region_bytes = words_per_col * 4;
+            let bool_names: Vec<String> = shards[0]
+                .resident_device_bool_columns
+                .iter()
+                .map(|b| b.name.clone())
+                .collect();
+            for name in &bool_names {
+                let col_offset = allocated_bytes;
+                fills.push(gpu_db_execution::RecompactFill {
+                    byte_offset: col_offset,
+                    len: col_region_bytes,
+                    fill_byte: 0x00,
+                });
+                let mut rows_before = 0_u64;
+                for (shard, (device_ptr, row_count, _capacity)) in
+                    shards.iter().zip(shard_ptrs.iter())
+                {
+                    let row_count = *row_count as u64;
+                    let Some(layout) = shard
+                        .resident_device_bool_columns
+                        .iter()
+                        .find(|b| &b.name == name)
+                    else {
+                        // A shard missing a bool column its siblings carry => layout skew => decline.
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "sharded bool recompaction: shard {} lacks bool column \"{name}\"",
+                            shard.shard_id
+                        ))));
+                    };
+                    if row_count > 0 {
+                        bool_gather_ops.push((
+                            col_offset,
+                            rows_before as u32,
+                            *device_ptr,
+                            layout.bitmap_byte_offset,
+                            row_count as u32,
+                        ));
+                    }
+                    rows_before = rows_before.saturating_add(row_count);
+                }
+                unified_bool_columns.push(
+                    crate::relational_model::ResidentDeviceBoolColumnLayout {
+                        name: name.clone(),
+                        bitmap_byte_offset: col_offset,
+                    },
+                );
+                allocated_bytes = allocated_bytes.saturating_add(col_region_bytes);
+            }
+        }
         let header = (total_row_count as u64).to_le_bytes();
 
         // Recompact ON-DEVICE into one unified buffer, then build the whole-table descriptor + injected
@@ -2939,6 +3003,18 @@ impl Engine {
                     "sharded resident recompaction into a unified device buffer failed: {err}"
                 )))
             })?;
+        // TYPE-COVERAGE #14 (bool): repack each shard's bool bits into the pre-zeroed unified regions with
+        // the alignment-free per-bit gather kernel (DtoD, no HtoD). Runs after the DtoD recompaction so the
+        // unified buffer + shard buffers are both live; a failure declines the whole sharded read.
+        for (dst_off, dst_base, src_ptr, src_off, count) in &bool_gather_ops {
+            unified_mem
+                .gather_bool_bitmap_from_shard(*dst_off, *dst_base, *src_ptr, *src_off, *count)
+                .map_err(|err| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "sharded bool bitmap gather kernel failed: {err}"
+                    )))
+                })?;
+        }
         let proof = unified_mem.metadata().clone();
         let snapshot = self.resident_snapshot_for_unified(
             table,
@@ -2949,6 +3025,7 @@ impl Engine {
             int4_columns,
             int8_columns,
             numeric_columns,
+            unified_bool_columns,
             unified_null_columns,
         );
         Ok(ShardedUnifiedExecSource {
