@@ -1671,15 +1671,19 @@ pub(crate) fn bind_delete_filter_groups(
                 .into_iter()
                 .map(|filter| {
                     let idx = relational_column_index(table, &filter.column)?;
-                    // Coerce across the integer/numeric tower for parity with SELECT; a
-                    // value with no implicit cast to the column type still errors loudly.
-                    let value = coerce_filter_literal(filter.value, table.columns[idx].ty);
-                    if !sql_value_matches_type(&value, table.columns[idx].ty) {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "invalid value for column \"{}\"",
-                            filter.column
-                        ))));
+                    let ty = table.columns[idx].ty;
+                    // Coerce across the integer/numeric tower for parity with SELECT.
+                    let value = coerce_filter_literal(filter.value.clone(), ty);
+                    if sql_value_matches_type(&value, ty) {
+                        return Ok((idx, filter.op, value));
                     }
+                    // COMPOUND KEYS (wider types): a TEXT literal against a Uuid/Date/Timestamp column
+                    // (or a numeric needing rescale) needs the INSERT-side coercion (Text -> Uuid via
+                    // parse_uuid, etc.) so the WHERE value MATCHES the stored typed value (else the
+                    // predicate recheck compares Text vs Uuid -> 0 rows). A value with no cast still
+                    // errors loudly.
+                    let value = coerce_insert_value(filter.value, ty, &filter.column)
+                        .map_err(ExecuteError::Engine)?;
                     Ok((idx, filter.op, value))
                 })
                 .collect()

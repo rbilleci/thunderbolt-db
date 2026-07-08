@@ -79,13 +79,19 @@ reassembles b128 (i128 mantissa / raw uuid) so the recheck is device-native. LOA
 bind now uses `coerce_insert_value` (Text -> Uuid via parse_uuid; Numeric rescaled to the column scale) —
 a uuid literal parses as Text and MUST coerce to bytes / a numeric to the column scale so host==device
 fold agrees (audit scrutinized the numeric-scale invariant hardest — SOLID: stored value + needle share
-the one rescale path, plus scale-independent Decimal128 recheck). Audit CLEARED. **NEXT: Stage 2d text**
-(variable-length blob hashing). GAPS: (a) DELETE/UPDATE BY a b128 key needs the WHERE-LITERAL coercion
-(a `WHERE u='uuid-str'` predicate stays Text -> 0-row/safe, not a wrong-row delete — a follow-up); (b) a
-compound table with a NULL key column OR a text VALUE column de-elides on DELETE/UPDATE; (c) reads over a
-VERSIONED wider-type elided table de-elide (R-ver is int4-only). LEDGERED: fused-apply-for-compound,
-64-bit fingerprint, text-COMPACTION. See memory `type-coverage-14`, `scalability-ledger`,
-`charter-governance-ruling`.
+the one rescale path, plus scale-independent Decimal128 recheck). Audit CLEARED. **b128 DELETE/UPDATE BY
+KEY now DEVICE-NATIVE too:** the WHERE-literal coercion gap is CLOSED — `bind_delete_filter_groups` falls
+back to `coerce_insert_value` (Text -> Uuid via parse_uuid; Text -> Timestamp) when `coerce_filter_literal`
+leaves a type-mismatch, so `WHERE u='uuid-str'` matches the stored Uuid (also fixes uuid/timestamp WHERE
+DELETEs generally). Audit CLEARED (fallback fires ONLY where the old code hard-errored -> no regression;
+only Text->Uuid/Timestamp newly succeed). So the FIXED-WIDTH compound key types (int + numeric/uuid) are
+now FULLY operational (INSERT-uniqueness + reads + DELETE/UPDATE). **NEXT: Stage 2d text** (variable-length
+blob hashing — the device fold needs a text branch reading offsets+blob; existing GPU text-hash machinery
+at execution/lib.rs:1514/1565 is the reuse candidate; text tables are ROLLOVER-only = many dense shards).
+GAPS: (b) a compound table with a NULL key column OR a text VALUE column de-elides on DELETE/UPDATE; (c)
+reads over a VERSIONED wider-type elided table de-elide (R-ver is int4-only). LEDGERED:
+fused-apply-for-compound, 64-bit fingerprint, text-COMPACTION. See memory `type-coverage-14`,
+`scalability-ledger`, `charter-governance-ruling`.
 
 ---
 

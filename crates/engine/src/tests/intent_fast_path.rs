@@ -1722,11 +1722,27 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
         dup.contains("duplicate key value violates unique index"),
         "duplicate uuid compound tuple must raise 23505 (4-word fold agreement), got: {dup}"
     );
+    assert!(engine.table_install_elided("ut"));
+    engine.set_resident_delete_tombstone_enabled(true);
+
+    // DELETE by the b128 (uuid) compound key stays DEVICE-NATIVE: the WHERE uuid literal is coerced
+    // Text->Uuid (`bind_delete_filter_groups`), the fingerprint probe locates the slot, and materialize
+    // reassembles the uuid for the tuple-verify. Assert elision-retention BEFORE any verifying read.
+    let resolve_before = engine.dml_device_resolve_hits();
+    sql!(&format!(
+        "DELETE FROM ut WHERE a = 5 AND u = '{}'",
+        "ffffffff-0000-0000-0000-000000000001"
+    ))
+    .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > resolve_before,
+        "uuid compound DELETE must RESOLVE on the device"
+    );
     assert!(
         engine.table_install_elided("ut"),
-        "uuid compound-PK table stays device-native across the validated inserts"
+        "uuid compound DELETE must stay device-native, not de-elide"
     );
-    // Read-your-writes over the elided b128-keyed table: exactly two a=5 rows exist.
+    // Correctness (may de-elide the versioned table): exactly the (5, uuid(7)) row remains for a=5.
     let Command::Select(count) =
         parse_command("SELECT COUNT(*) FROM ut WHERE a = 5").unwrap()
     else {
@@ -1734,12 +1750,9 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
     };
     assert_eq!(
         engine.execute_relational_select(&count).unwrap().rows,
-        vec![vec![SqlValue::Int8(2)]],
-        "both a=5 uuid rows are visible (sentinel + uuid(7))"
+        vec![vec![SqlValue::Int8(1)]],
+        "deleted the (5, ffff...0001) row; (5, ...0007) remains"
     );
-    // NOTE: DELETE/UPDATE BY a b128 key needs the WHERE-literal coercion (a `WHERE u = 'uuid-string'`
-    // is not coerced Text->Uuid on the resolve path) — a follow-up gap, orthogonal to the fingerprint
-    // fold. INSERT-uniqueness + reads are device-native here.
 }
 
 /// COMPOUND KEYS (wider types, Stage 2a): a compound PRIMARY KEY over i64 (Int8/Timestamp) columns — and
