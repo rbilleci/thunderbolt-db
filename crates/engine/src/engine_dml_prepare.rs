@@ -12,10 +12,10 @@ pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
 
 /// CPU-ENGINE RETIREMENT (ADR-006): lower a DELETE/UPDATE's `filter_groups` (OR of AND-groups) into an
 /// `ResidentExpr` DNF (`Column(catalog_idx) <op> literal`, AND within a group, OR across groups) for the
-/// device predicate scan-locate. Supports INT4-section columns (`Int4` literals, lowered via the I32 VM)
-/// and INT8-section columns (`Int8` literals, lowered via the I64 VM with a `CompareScalarI64` / widened
-/// scalar — ADR-006 wider-type range DML). ANY other leaf (a wider type — numeric/text/timestamp — a NULL,
-/// a LIKE-prefix, or an empty group) returns `None` so the caller declines to the host rehydrate. `Column`
+/// device predicate scan-locate. Supports INT4/INT8/TIMESTAMP (I32/I64 VM), NUMERIC (I128 VM), and TEXT
+/// EQUALITY (`= 'lit'` only, via the device byte-wise text kernel — text has no device ordering, so text
+/// `<`/`>`/LIKE decline). ANY other leaf (a NULL, a LIKE-prefix, a text inequality, or an empty group)
+/// returns `None` so the caller declines to the host rehydrate. `Column`
 /// carries the FULL-CATALOG index, which `lower_resident_predicate` translates to the shard's section
 /// offset (int4 or int8 by the column's catalog type — a program is mono-typed, so all leaves in a group
 /// must share the element width; a mixed int4/int8 predicate hard-errors on lowering and declines).
@@ -42,6 +42,15 @@ fn dml_filter_groups_to_device_predicate(
                 (Some(SqlType::Timestamp), SqlValue::Timestamp(v)) => ResidentExpr::Int8Literal(*v),
                 (Some(SqlType::Numeric { .. }), SqlValue::Numeric(d)) => {
                     ResidentExpr::NumericLiteral(*d)
+                }
+                // TEXT EQUALITY (ADR-006, charter-pure): `text_col = 'lit'` lowers to a `TextLiteral`
+                // that `lower_resident_predicate`'s `try_lower_text_predicate` evaluates via the
+                // DEVICE byte-wise text-equality kernel — the located slots then materialize their
+                // text on-device (`materialize_resident_row_via_hit` text arm) for the recheck. Text
+                // is only ORDERED-comparable lexicographically, which the device kernel does not do,
+                // so ONLY `=` lowers here; `<`/`>`/LIKE decline. No new kernel — reuses the read path.
+                (Some(SqlType::Text), SqlValue::Text(s)) if matches!(op, SelectFilterOp::Eq) => {
+                    ResidentExpr::TextLiteral(s.clone())
                 }
                 _ => return None,
             };

@@ -2509,6 +2509,111 @@ fn gpu_numeric_range_dml_resolves_on_device() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure text coverage): a TEXT-EQUALITY DELETE/UPDATE on an
+/// ELIDED table resolves ON THE DEVICE — the DML predicate builder now emits `Column(text) = TextLiteral`,
+/// which `lower_resident_predicate` evaluates via the existing DEVICE byte-wise text-equality kernel
+/// (`try_lower_text_predicate`); the located slots materialize their text on-device
+/// (`materialize_resident_row_via_hit` text arm) for the recheck. NO host store, NO new kernel — reuses
+/// the read path. Stays elided; touches exactly the matching rows. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_text_predicate_dml_resolves_on_device() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    let mut txn = 2u64;
+    engine
+        .execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 'alice')")
+        .unwrap();
+    txn += 1;
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    for (id, name) in [(2i64, "bob"), (3, "carol"), (4, "bob")] {
+        engine
+            .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES ({id}, '{name}')"))
+            .unwrap();
+        txn += 1;
+    }
+    assert!(engine.table_install_elided("t"), "the text table must elide first");
+
+    let ids = |engine: &Engine| -> Vec<i64> {
+        let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
+            unreachable!()
+        };
+        let mut out: Vec<i64> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n as i64,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(ids(&engine), vec![1, 2, 3, 4]);
+
+    // TEXT-EQ DELETE (name = 'bob' -> ids 2, 4) ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(txn, "DELETE FROM t WHERE name = 'bob'")
+        .unwrap();
+    txn += 1;
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a text-equality DELETE must RESOLVE on the device"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a text-equality DELETE must NOT de-elide"
+    );
+    assert_eq!(ids(&engine), vec![1, 3], "exactly the two 'bob' rows (2,4) deleted");
+
+    // TEXT-EQ UPDATE (name = 'carol' -> id 3) ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(txn, "UPDATE t SET name = 'CAROL' WHERE name = 'carol'")
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a text-equality UPDATE must RESOLVE on the device"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a text-equality UPDATE must NOT de-elide"
+    );
+    let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE name = 'CAROL'").unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine
+            .execute_relational_select(&cnt)
+            .unwrap()
+            .rows
+            .iter()
+            .next()
+            .and_then(|r| r.first()),
+        Some(&SqlValue::Int8(1)),
+        "id 3's name is now 'CAROL' (text UPDATE applied on-device)"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, multi-statement elision): a MULTI-ENTRY commit BATCH of INSERTs
 /// (the group-commit batcher grouping GpuBatched inserts under load — the SQL-text write path) now
 /// KEEPS the table ELIDED via ONE incremental device append per table, instead of de-eliding the
