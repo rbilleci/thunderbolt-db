@@ -5,7 +5,10 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `28fe8df8` (CPU-ENGINE RETIREMENT — TWELVE merged wins: MULTI-BOUND
+**Updated:** 2026-07-09. **Base:** `main` @ `396977e8` (CPU-ENGINE RETIREMENT — THIRTEEN merged wins: NULLABLE-COLUMN
+DELETE/UPDATE resolves ON-DEVICE (`materialize_resident_row_via_hit` reads per-column validity bitmaps → SqlValue::Null
+instead of declining wholesale on any null-bearing shard; NULL predicate operands double-excluded by locate+recheck
+3VL; unblocks the common nullable-table case; CHARTER-PURE) `396977e8`; MULTI-BOUND
 TIMESTAMP range DELETE/UPDATE resolves ON-DEVICE (`ts>=X AND ts<=Y` lowers on the i64 buffer VM — timestamp is i64
 micros in the int8 section; `resident_device_int_column_offset`+`try_lower_timestamp_predicate` AND/OR path, LOCAL
 i64-section gate so nullable-ts 3VL reads stay on their peephole; CHARTER-PURE) `28fe8df8`; UUID + BOOL
