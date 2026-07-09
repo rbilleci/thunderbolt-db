@@ -2995,6 +2995,86 @@ fn gpu_bool_predicate_dml_resolves_on_device() {
     assert_eq!(gpu_ids_of_t(&engine), vec![2, 4], "exactly the two flag=true rows deleted");
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a UUID ORDERING (`>`) DELETE on an ELIDED table
+/// resolves ON THE DEVICE — uuid is byte-comparable (PG's uuid order == the device compare kernel's
+/// cmp code == the recheck `compare_sql_values`), so the DML builder now lowers `<`/`>`/`<=`/`>=` (not
+/// just `=`). GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_uuid_inequality_dml_resolves_on_device() {
+    let u = |n: u8| format!("'00000000-0000-0000-0000-0000000000{n:02}'");
+    // id=5 differs in the FIRST (most-significant) byte — a high-byte-dominant value that is byte-wise
+    // GREATER than <02> even though its trailing bytes are all zero. This adversarially exercises the
+    // MSB-first byte ordering (not just a last-byte difference).
+    let high_byte = "'01000000-0000-0000-0000-000000000000'";
+    let Some(engine) = gpu_elided_pk_table_with_column(
+        "u UUID",
+        &[(1, &u(1)), (2, &u(2)), (3, &u(3)), (4, &u(4)), (5, high_byte)],
+    ) else {
+        return;
+    };
+    // DELETE WHERE u > <02> -> ids 3, 4 (last byte) AND 5 (first byte 01 > 00) ON THE DEVICE, ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(9, "DELETE FROM t WHERE u > '00000000-0000-0000-0000-000000000002'")
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a uuid ordering DELETE must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("t"), "a uuid ordering DELETE must NOT de-elide");
+    assert_eq!(
+        gpu_ids_of_t(&engine),
+        vec![1, 2],
+        "ids 3,4 (last byte) AND 5 (high byte 01>00) deleted; MSB-first byte order"
+    );
+}
+
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): `col IN (...)` DELETE — parsed as an OR of `=` groups
+/// — resolves ON THE DEVICE for int4 and text via the OR mask VM (text needles), reusing the equality
+/// coverage. Confirms the IN shape composes from the per-type `=` arms. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_in_list_dml_resolves_on_device() {
+    // int4 IN.
+    {
+        let Some(engine) =
+            gpu_elided_pk_table_with_column("v INT", &[(1, "10"), (2, "20"), (3, "30"), (4, "40")])
+        else {
+            return;
+        };
+        let before = engine.dml_device_resolve_hits();
+        engine
+            .execute_dml_concurrent(9, "DELETE FROM t WHERE id IN (2, 4)")
+            .unwrap();
+        assert!(
+            engine.dml_device_resolve_hits() > before,
+            "an int4 IN DELETE must RESOLVE on the device"
+        );
+        assert!(engine.table_install_elided("t"), "int4 IN DELETE must NOT de-elide");
+        assert_eq!(gpu_ids_of_t(&engine), vec![1, 3], "ids 2,4 deleted");
+    }
+    // text IN.
+    {
+        let Some(engine) = gpu_elided_pk_table_with_column(
+            "name TEXT",
+            &[(1, "'a'"), (2, "'b'"), (3, "'c'"), (4, "'d'")],
+        ) else {
+            return;
+        };
+        let before = engine.dml_device_resolve_hits();
+        engine
+            .execute_dml_concurrent(9, "DELETE FROM t WHERE name IN ('a', 'c')")
+            .unwrap();
+        assert!(
+            engine.dml_device_resolve_hits() > before,
+            "a text IN DELETE must RESOLVE on the device"
+        );
+        assert!(engine.table_install_elided("t"), "text IN DELETE must NOT de-elide");
+        assert_eq!(gpu_ids_of_t(&engine), vec![2, 4], "the 'a' and 'c' rows deleted");
+    }
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, multi-statement elision): a MULTI-ENTRY commit BATCH of INSERTs
 /// (the group-commit batcher grouping GpuBatched inserts under load — the SQL-text write path) now
 /// KEEPS the table ELIDED via ONE incremental device append per table, instead of de-eliding the

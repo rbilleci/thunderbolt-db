@@ -67,7 +67,19 @@ fn dml_filter_groups_to_device_predicate(
                 // bytes), bool via `try_lower_bool_predicate` (the 1-bit bitmap → mask). The recheck
                 // compares uuid/bool exactly (`compare_sql_values`). `=` only. The WHERE literal is
                 // coerced to the column type at bind (Text→Uuid), so a still-Text value declines here.
-                (Some(SqlType::Uuid), SqlValue::Uuid(bytes)) if matches!(op, SelectFilterOp::Eq) => {
+                // UUID supports ORDERING too (byte-wise, PG's uuid order == the device kernel's cmp
+                // code == the recheck `compare_sql_values`), so `=`/`<`/`<=`/`>`/`>=` all lower;
+                // LikePrefix already declined at the text-only guard above.
+                (Some(SqlType::Uuid), SqlValue::Uuid(bytes))
+                    if matches!(
+                        op,
+                        SelectFilterOp::Eq
+                            | SelectFilterOp::Lt
+                            | SelectFilterOp::Lte
+                            | SelectFilterOp::Gt
+                            | SelectFilterOp::Gte
+                    ) =>
+                {
                     ResidentExpr::TextLiteral(gpu_db_sql::uuid::format_uuid(bytes))
                 }
                 (Some(SqlType::Bool), SqlValue::Bool(v)) if matches!(op, SelectFilterOp::Eq) => {
