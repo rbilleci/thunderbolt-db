@@ -33,12 +33,16 @@ fn dml_filter_groups_to_device_predicate(
         for (idx, op, value) in group {
             // The value leaf by the column's section: Int4 -> Int4Literal (I32 VM); Int8 / Timestamp ->
             // Int8Literal (I64 VM — a timestamp is i64 microseconds in the same i64 section, lowered by the
-            // timestamp peephole which now accepts a raw-micros Int8Literal). Any other column type / value
-            // declines to the host.
+            // timestamp peephole which accepts a raw-micros Int8Literal); Numeric -> NumericLiteral (I128 VM
+            // via the numeric peephole, which rescales to the column scale and handles AND/OR). Any other
+            // column type / value declines to the host.
             let value_leaf = match (table.columns.get(*idx).map(|c| c.ty), value) {
                 (Some(SqlType::Int4), SqlValue::Int4(v)) => ResidentExpr::Int4Literal(*v),
                 (Some(SqlType::Int8), SqlValue::Int8(v)) => ResidentExpr::Int8Literal(*v),
                 (Some(SqlType::Timestamp), SqlValue::Timestamp(v)) => ResidentExpr::Int8Literal(*v),
+                (Some(SqlType::Numeric { .. }), SqlValue::Numeric(d)) => {
+                    ResidentExpr::NumericLiteral(*d)
+                }
                 _ => return None,
             };
             let bop = match op {

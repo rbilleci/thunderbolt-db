@@ -2416,6 +2416,99 @@ fn gpu_timestamp_range_delete_resolves_on_device() {
     assert_eq!(ids(&engine), vec![4, 5, 6], "ids 1,2,3 (Jan-Mar) purged exactly");
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, wider-type range DML): a NUMERIC range DELETE/UPDATE on an ELIDED table
+/// resolves ON THE DEVICE — the DML predicate builder emits `Column(num) <op> NumericLiteral(dec)`, lowered
+/// by the numeric peephole via the i128 compare kernel (rescaled to the column scale), which ALSO handles
+/// AND/OR — so a MULTI-BOUND range (`amt >= a AND amt <= b`) resolves on-device too. Stays elided; touches
+/// the exact rows. Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_numeric_range_dml_resolves_on_device() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, amt NUMERIC(12,2))")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    // ids 1..=6 at amt = id * 50.00 -> 50, 100, 150, 200, 250, 300.
+    let mut txn = 2u64;
+    engine
+        .execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 50.00)")
+        .unwrap();
+    txn += 1;
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // self-guard: no usable GPU
+    }
+    for id in 2..=6i64 {
+        engine
+            .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES ({id}, {}.00)", id * 50))
+            .unwrap();
+        txn += 1;
+    }
+    assert!(engine.table_install_elided("t"), "table must elide first");
+
+    let ids = |engine: &Engine| -> Vec<i64> {
+        let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
+            unreachable!()
+        };
+        let mut out: Vec<i64> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n as i64,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>());
+
+    // Single-bound numeric range DELETE (amt > 250.00 -> id 6) ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(txn, "DELETE FROM t WHERE amt > 250.00")
+        .unwrap();
+    txn += 1;
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "numeric range DELETE must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("t"), "numeric range DELETE must NOT de-elide");
+    assert_eq!(ids(&engine), (1..=5).collect::<Vec<_>>(), "id 6 (amt=300) deleted exactly");
+
+    // MULTI-BOUND numeric range UPDATE (100 <= amt <= 200 -> ids 2,3,4) — the AND path — ON THE DEVICE.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(txn, "UPDATE t SET amt = 0.00 WHERE amt >= 100.00 AND amt <= 200.00")
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "multi-bound numeric range UPDATE must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("t"), "numeric range UPDATE must NOT de-elide");
+    assert_eq!(ids(&engine), (1..=5).collect::<Vec<_>>(), "UPDATE changed no id set");
+    let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE amt = 0.00").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine.execute_relational_select(&cnt).unwrap().rows.iter().next().and_then(|r| r.first()),
+        Some(&SqlValue::Int8(3)),
+        "exactly ids 2,3,4 (amt 100,150,200) now have amt=0"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, audit BLOCKER fix): the `handled=true`-on-empty change lets a data
 /// no-op report HANDLED, but `handled` ALSO drives elision-ENTER — which must be gated on a non-empty
 /// applied set (only a real append/tombstone confirms the device residency). Otherwise a zero-row op on a
