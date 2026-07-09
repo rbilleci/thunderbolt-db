@@ -5,7 +5,10 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `396977e8` (CPU-ENGINE RETIREMENT — THIRTEEN merged wins: NULLABLE-COLUMN
+**Updated:** 2026-07-09. **Base:** `main` @ `556e3c0b` (CPU-ENGINE RETIREMENT — FOURTEEN merged wins: LIKE-PREFIX
+DELETE/UPDATE resolves ON-DEVICE (`text_col LIKE 'p%'` lowers to `Column Like TextLiteral(escaped-p%)` → existing
+device text-LIKE kernel `expr_text_like_scalar_filter`; recheck `starts_with`; parser guarantees device==recheck;
+CHARTER-PURE) `556e3c0b`; NULLABLE-COLUMN
 DELETE/UPDATE resolves ON-DEVICE (`materialize_resident_row_via_hit` reads per-column validity bitmaps → SqlValue::Null
 instead of declining wholesale on any null-bearing shard; NULL predicate operands double-excluded by locate+recheck
 3VL; unblocks the common nullable-table case; CHARTER-PURE) `396977e8`; MULTI-BOUND
