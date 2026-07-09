@@ -2249,6 +2249,100 @@ fn gpu_range_dml_resolves_on_device_without_deelide() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, wider-type range DML): an INT8 range DELETE/UPDATE on an ELIDED table
+/// resolves ON THE DEVICE via `try_resolve_dml_via_predicate_scan` — the WHERE lowers to an int8
+/// `ResidentExpr` (`Column(int8) <op> Int8Literal`, the new VM literal) evaluated at I64 width by
+/// `CompareScalarI64`, so a LARGE i64 bound (> i32::MAX, e.g. a bigint/timestamp-scale value) that cannot
+/// fit an Int4Literal resolves on-device instead of de-eliding. Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_int8_range_dml_resolves_on_device() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    // b = id * 2_000_000_000 -> ids 3..=8 have b > i32::MAX (2.1e9), so the bound cannot be an Int4Literal.
+    let big = 2_000_000_000i64;
+    let mut txn = 2u64;
+    engine.execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES (1, {})", big)).unwrap();
+    txn += 1;
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // self-guard: no usable GPU
+    }
+    for id in 2..=8i64 {
+        engine
+            .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES ({id}, {})", id * big))
+            .unwrap();
+        txn += 1;
+    }
+    assert!(engine.table_install_elided("t"), "table must elide first");
+
+    let ids = |engine: &Engine| -> Vec<i64> {
+        let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
+            unreachable!()
+        };
+        let mut out: Vec<i64> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n as i64,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(ids(&engine), (1..=8).collect::<Vec<_>>());
+
+    // A LARGE-bound int8 range DELETE (b > 6e9 -> ids 4..=8) resolves ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(txn, &format!("DELETE FROM t WHERE b > {}", 6 * big))
+        .unwrap();
+    txn += 1;
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "int8 range DELETE with a >i32 bound must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("t"), "int8 range DELETE must NOT de-elide");
+    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>(), "ids 7,8 (b=14e9,16e9) deleted exactly");
+
+    // A LARGE-bound int8 range UPDATE (b <= 4e9 = 2*big -> ids 1,2; 4e9 > i32::MAX) resolves ON THE
+    // DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(txn, &format!("UPDATE t SET b = 0 WHERE b <= {}", 2 * big))
+        .unwrap();
+    txn += 1;
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "int8 range UPDATE with a >i32 bound must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("t"), "int8 range UPDATE must NOT de-elide");
+    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>(), "UPDATE changed no id set");
+    let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE b = 0").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine.execute_relational_select(&cnt).unwrap().rows.iter().next().and_then(|r| r.first()),
+        Some(&SqlValue::Int8(2)),
+        "exactly ids 1,2 (b=2e9,4e9) now have b=0"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, audit BLOCKER fix): the `handled=true`-on-empty change lets a data
 /// no-op report HANDLED, but `handled` ALSO drives elision-ENTER — which must be gated on a non-empty
 /// applied set (only a real append/tombstone confirms the device residency). Otherwise a zero-row op on a

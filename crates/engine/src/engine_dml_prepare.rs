@@ -11,13 +11,15 @@ use super::*;
 pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
 
 /// CPU-ENGINE RETIREMENT (ADR-006): lower a DELETE/UPDATE's `filter_groups` (OR of AND-groups) into an
-/// int4 `ResidentExpr` DNF (`Column(catalog_idx) <op> Int4Literal`, AND within a group, OR across groups)
-/// for the device predicate scan-locate. Restricted to INT4-section columns + Int4 literals (the type
-/// coverage the device predicate VM + the point resolve already guarantee); ANY other leaf (a wider type,
-/// a NULL, a LIKE-prefix, or an empty group) returns `None` so the caller declines to the host rehydrate.
-/// `Column` carries the FULL-CATALOG index, which `lower_resident_predicate` translates to the shard's
-/// int4-section offset (the same convention as `resident_int4_row_predicate`).
-fn dml_filter_groups_to_int4_predicate(
+/// `ResidentExpr` DNF (`Column(catalog_idx) <op> literal`, AND within a group, OR across groups) for the
+/// device predicate scan-locate. Supports INT4-section columns (`Int4` literals, lowered via the I32 VM)
+/// and INT8-section columns (`Int8` literals, lowered via the I64 VM with a `CompareScalarI64` / widened
+/// scalar — ADR-006 wider-type range DML). ANY other leaf (a wider type — numeric/text/timestamp — a NULL,
+/// a LIKE-prefix, or an empty group) returns `None` so the caller declines to the host rehydrate. `Column`
+/// carries the FULL-CATALOG index, which `lower_resident_predicate` translates to the shard's section
+/// offset (int4 or int8 by the column's catalog type — a program is mono-typed, so all leaves in a group
+/// must share the element width; a mixed int4/int8 predicate hard-errors on lowering and declines).
+fn dml_filter_groups_to_device_predicate(
     table: &RelationalTable,
     filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
 ) -> Option<crate::engine_expr::ResidentExpr> {
@@ -29,11 +31,12 @@ fn dml_filter_groups_to_int4_predicate(
     for group in filter_groups {
         let mut conj: Option<ResidentExpr> = None;
         for (idx, op, value) in group {
-            if table.columns.get(*idx).map(|c| c.ty) != Some(SqlType::Int4) {
-                return None;
-            }
-            let SqlValue::Int4(lit) = value else {
-                return None;
+            // The value leaf by the column's section: Int4 -> Int4Literal (I32 VM); Int8 -> Int8Literal
+            // (I64 VM). Any other column type / value declines to the host.
+            let value_leaf = match (table.columns.get(*idx).map(|c| c.ty), value) {
+                (Some(SqlType::Int4), SqlValue::Int4(v)) => ResidentExpr::Int4Literal(*v),
+                (Some(SqlType::Int8), SqlValue::Int8(v)) => ResidentExpr::Int8Literal(*v),
+                _ => return None,
             };
             let bop = match op {
                 SelectFilterOp::Eq => ResidentBinaryOp::Eq,
@@ -46,7 +49,7 @@ fn dml_filter_groups_to_int4_predicate(
             let leaf = ResidentExpr::Binary {
                 op: bop,
                 lhs: Box::new(ResidentExpr::Column(*idx)),
-                rhs: Box::new(ResidentExpr::Int4Literal(*lit)),
+                rhs: Box::new(value_leaf),
             };
             conj = Some(match conj {
                 None => leaf,
@@ -829,7 +832,7 @@ impl Engine {
         visibility: StorageVisibility,
     ) -> Result<Option<Vec<DmlResolvedMatch>>, EngineError> {
         // Lower the WHERE to an int4 ResidentExpr DNF; a non-int4 / unsupported leaf declines to the host.
-        let Some(predicate) = dml_filter_groups_to_int4_predicate(table, filter_groups) else {
+        let Some(predicate) = dml_filter_groups_to_device_predicate(table, filter_groups) else {
             return Ok(None);
         };
         // Evaluate the predicate ON-DEVICE per shard -> matching slots WITH each slot's generation-consistent

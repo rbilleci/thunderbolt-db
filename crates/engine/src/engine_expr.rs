@@ -49,6 +49,11 @@ pub(crate) enum ResidentBinaryOp {
 pub(crate) enum ResidentExpr {
     Column(usize),
     Int4Literal(i32),
+    /// A full-width i64 literal — the comparison value for an `int8`/`timestamp` column whose literal may
+    /// exceed `i32` (a timestamp, a large bigint). Lowers to a `CompareScalarI64` VM step at `I64` element
+    /// width (an `Int4Literal` against an int8 column widens instead, so this is only needed for literals
+    /// outside the i32 range, but the DML predicate builder emits it for every int8 leaf for uniformity).
+    Int8Literal(i64),
     /// A numeric (DECIMAL) literal as its [`Decimal128`] (mantissa + scale). Compared by rescaling to
     /// the target column's scale at lowering time (the type matrix, doc 19). An integer literal
     /// compared to a numeric column arrives as `Int4Literal` and is coerced to numeric on that path.
@@ -878,6 +883,7 @@ fn expr_mentions_int8(expr: &ResidentExpr, table: &RelationalTable) -> bool {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int8)
         }
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
@@ -898,6 +904,7 @@ fn expr_mentions_int4_column(expr: &ResidentExpr, table: &RelationalTable) -> bo
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int4)
         }
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
@@ -934,6 +941,7 @@ fn expr_mentions_numeric(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         ),
         ResidentExpr::NumericLiteral(_) => true,
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
         ResidentExpr::IsNull { .. } => false,
@@ -972,6 +980,7 @@ fn expr_mentions_text(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         }
         ResidentExpr::TextLiteral(_) => true,
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
         ResidentExpr::IsNull { .. } => false,
@@ -1019,6 +1028,7 @@ fn expr_mentions_date(expr: &ResidentExpr, table: &RelationalTable) -> bool {
             expr_mentions_date(lhs, table) || expr_mentions_date(rhs, table)
         }
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
@@ -1067,6 +1077,7 @@ fn expr_mentions_timestamp(expr: &ResidentExpr, table: &RelationalTable) -> bool
             expr_mentions_timestamp(lhs, table) || expr_mentions_timestamp(rhs, table)
         }
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
@@ -1115,6 +1126,7 @@ fn expr_mentions_uuid(expr: &ResidentExpr, table: &RelationalTable) -> bool {
             expr_mentions_uuid(lhs, table) || expr_mentions_uuid(rhs, table)
         }
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
@@ -1159,6 +1171,7 @@ fn expr_mentions_int2(expr: &ResidentExpr, table: &RelationalTable) -> bool {
             expr_mentions_int2(lhs, table) || expr_mentions_int2(rhs, table)
         }
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
@@ -1294,11 +1307,13 @@ fn numeric_arith_scale(expr: &ResidentExpr, table: &RelationalTable) -> Result<u
         }),
         ResidentExpr::NumericLiteral(decimal) => Ok(decimal.canonical().scale),
         ResidentExpr::Int4Literal(_) => Ok(0),
-        ResidentExpr::TextLiteral(_) | ResidentExpr::BoolLiteral(_) => {
-            Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "a text/bool literal is not a numeric arithmetic operand".to_string(),
-            )))
-        }
+        // An `Int8Literal` is only produced for an int8 COMPARISON leaf (`int8col <op> Int8Literal`), never
+        // as a numeric-arithmetic operand — a clean error rather than a silent mis-scale.
+        ResidentExpr::Int8Literal(_)
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "an int8/text/bool literal is not a numeric arithmetic operand".to_string(),
+        ))),
         // IS NULL is a predicate leaf, never an arithmetic operand (the parser never produces it here).
         ResidentExpr::IsNull { .. } => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "IS NULL is not a numeric arithmetic operand".to_string(),
@@ -1448,6 +1463,7 @@ fn compile_numeric_arith(
             }
         }
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -1611,6 +1627,7 @@ fn compile_arith_program(
             }
         }
         ResidentExpr::Int4Literal(_)
+        | ResidentExpr::Int8Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -1848,6 +1865,28 @@ fn compile_predicate_program(
         (ResidentExpr::Int4Literal(scalar), value) if !is_int4_literal(value) => {
             compile_arith_program(value, table, snapshot, program)?;
             program.push(ExprStep::CompareScalar {
+                cmp,
+                scalar: *scalar,
+                scalar_on_left: true,
+            });
+            push_leaf_validity_and(&[value], table, snapshot, program)
+        }
+        // ADR-006 (wider-type range DML): a full-width i64 literal against an int8/timestamp column ->
+        // `CompareScalarI64` (the whole program runs at `I64` element width, so `LoadColumn` reads 8 bytes
+        // and this compares the s64 scalar). `value` is the int8 column (or arith subtree); a literal-vs-
+        // literal falls to `compile_arith_program`'s bare-literal error, exactly like the Int4Literal arms.
+        (value, ResidentExpr::Int8Literal(scalar)) if !is_int4_literal(value) => {
+            compile_arith_program(value, table, snapshot, program)?;
+            program.push(ExprStep::CompareScalarI64 {
+                cmp,
+                scalar: *scalar,
+                scalar_on_left: false,
+            });
+            push_leaf_validity_and(&[value], table, snapshot, program)
+        }
+        (ResidentExpr::Int8Literal(scalar), value) if !is_int4_literal(value) => {
+            compile_arith_program(value, table, snapshot, program)?;
+            program.push(ExprStep::CompareScalarI64 {
                 cmp,
                 scalar: *scalar,
                 scalar_on_left: true,
