@@ -520,19 +520,37 @@ pub(crate) fn sql_value_key_words(ty: gpu_db_sql::SqlType, value: &SqlValue) -> 
                 .map(|i| i32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]))
                 .collect(),
         ),
+        // TEXT (variable-length): no fixed section width, so the column folds to ONE word = the FNV-1a
+        // hash of its UTF-8 bytes (`fnv1a_bytes`), which the device fold kernel computes over the resident
+        // text blob byte-for-byte identically. A 32-bit collision is separated by the full-tuple recheck.
+        (gpu_db_sql::SqlType::Text, SqlValue::Text(s)) => Some(vec![fnv1a_bytes(s.as_bytes())]),
         _ => None,
     }
 }
 
-/// COMPOUND KEYS (wider types): the number of i32 WORDS a key column of type `ty` occupies in its
-/// device section (Int4/Date/Int2 -> 1 word in the i32 section; Int8/Timestamp -> 2 words in the i64
-/// section; Numeric/Uuid -> 4 words in the b128 section). `None` for a type not yet supported as a
-/// compound key column (text is a follow-up). A type is a valid compound key column IFF this returns `Some`.
+/// COMPOUND KEYS (text): the FNV-1a hash of a byte string, BYTE-IDENTICAL to the device fold kernel's
+/// text branch (`h = 0x811C9DC5; per byte h ^= b; h *= 0x01000193`). A text key column folds to this
+/// single word; the outer `compound_key_fingerprint` then mixes it with the other columns' words.
+pub(crate) fn fnv1a_bytes(bytes: &[u8]) -> i32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for &b in bytes {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h as i32
+}
+
+/// COMPOUND KEYS (wider types): the device fold kernel's per-column WIDTH — the number of fixed-width i32
+/// WORDS (Int4/Date/Int2 -> 1 in the i32 section; Int8/Timestamp -> 2 in the i64 section; Numeric/Uuid ->
+/// 4 in the b128 section), or the TEXT SENTINEL 0 (Text -> variable-length: the kernel's width==0 branch
+/// reads the row's offsets+blob and hashes them instead of reading fixed words). `None` for a type not
+/// supported as a compound key column. A type is a valid compound key column IFF this returns `Some`.
 pub(crate) fn key_column_width_words(ty: gpu_db_sql::SqlType) -> Option<u32> {
     match ty {
         gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2 => Some(1),
         gpu_db_sql::SqlType::Int8 | gpu_db_sql::SqlType::Timestamp => Some(2),
         gpu_db_sql::SqlType::Numeric { .. } | gpu_db_sql::SqlType::Uuid => Some(4),
+        gpu_db_sql::SqlType::Text => Some(0), // text sentinel (variable-length, hashed on-device)
         _ => None,
     }
 }

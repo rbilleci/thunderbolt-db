@@ -1755,6 +1755,103 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
     );
 }
 
+/// COMPOUND KEYS (wider types, Stage 2d): a compound PRIMARY KEY over a TEXT column — mixed with int4 —
+/// elides and enforces uniqueness ON THE DEVICE. A text key column is variable-length, so it folds to ONE
+/// word = the FNV-1a hash of its UTF-8 bytes; the device fold kernel's TEXT branch (`widths[k] == 0`) reads
+/// the row's `[start,end)` blob span from the shard's text section and hashes it BYTE-IDENTICALLY to the
+/// host `fnv1a_bytes` (so the device index rebuild and the host probe needle agree). A fingerprint collision
+/// can only OVER-report a hit, which the full-tuple recheck — now materializing the resident text on-device
+/// (`materialize_resident_row_via_hit` Text arm) — separates. Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_compound_text_key_elides_and_validates_on_device() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE tt (a INT, s TEXT, v INT, PRIMARY KEY (a, s))")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+
+    let txn_ids = AtomicU64::new(2);
+    macro_rules! sql {
+        ($s:expr) => {
+            engine.execute_dml_concurrent(txn_ids.fetch_add(1, Ordering::Relaxed), $s)
+        };
+    }
+    // Pre-elision sentinel: a distinctive text key that must survive the device fold on rebuild.
+    sql!("INSERT INTO tt VALUES (5, 'alpha-KEY', 0)").unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("tt")
+        .expect("populate residency");
+    if snapshot.device_memory_proof.is_none() {
+        return; // self-guard: no usable GPU
+    }
+    let mut warmed = false;
+    for i in 0..10_000_u32 {
+        sql!(&format!("INSERT INTO tt VALUES ({}, 'k{}', 0)", 1000 + i, i)).unwrap();
+        if engine.table_install_elided("tt") {
+            warmed = true;
+            break;
+        }
+    }
+    assert!(warmed, "text compound-PK table never entered elision on a GPU box");
+
+    // The DEVICE write-locate must actually fire for the text compound key (non-vacuity).
+    let hits_before = engine.device_write_locate_hits();
+    // A brand-new distinct tuple commits.
+    sql!("INSERT INTO tt VALUES (5, 'beta', 10)").unwrap();
+    // The EXACT (a, s) tuple again -> 23505 (device fingerprint hit, on-device text tuple recheck confirms).
+    let dup = sql!("INSERT INTO tt VALUES (5, 'beta', 99)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        dup.contains("duplicate key value violates unique index"),
+        "duplicate text compound tuple must raise 23505 (text-hash fold agreement), got: {dup}"
+    );
+    // Re-insert the PRE-ELISION sentinel tuple -> 23505: proves the DEVICE rebuild fold of the resident
+    // text blob byte-matches the HOST probe needle's `fnv1a_bytes`.
+    let dup_sentinel = sql!("INSERT INTO tt VALUES (5, 'alpha-KEY', 7)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        dup_sentinel.contains("duplicate key value violates unique index"),
+        "re-inserting the pre-elision text tuple must raise 23505 (device rebuild == host needle), got: {dup_sentinel}"
+    );
+    // Same first key column, DIFFERENT text -> a DISTINCT tuple, must commit (not first-col-only).
+    sql!("INSERT INTO tt VALUES (5, 'gamma', 11)").unwrap();
+    // Same text, DIFFERENT first column -> also distinct, must commit.
+    sql!("INSERT INTO tt VALUES (9, 'beta', 12)").unwrap();
+
+    assert!(
+        engine.device_write_locate_hits() > hits_before,
+        "the text compound-key wave validation must run on the DEVICE (write-locate counter advanced)"
+    );
+    // Uniqueness never de-elided the table (sustained device path).
+    assert!(
+        engine.table_install_elided("tt"),
+        "text compound-PK table must stay elided across the validated inserts"
+    );
+
+    // Read-your-writes over the elided text-compound table: the distinct tuples for a=5 are exactly
+    // {alpha-KEY, beta, gamma} (3 rows).
+    let Command::Select(count) =
+        parse_command("SELECT COUNT(*) FROM tt WHERE a = 5").unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine.execute_relational_select(&count).unwrap().rows,
+        vec![vec![SqlValue::Int8(3)]],
+        "a=5 holds exactly the 3 distinct text tuples"
+    );
+}
+
 /// COMPOUND KEYS (wider types, Stage 2a): a compound PRIMARY KEY over i64 (Int8/Timestamp) columns — and
 /// a MIXED int4+int8 key — elides and enforces uniqueness ON THE DEVICE. Each key column folds its i32
 /// WORD decomposition into the surrogate fingerprint (i64 -> [low32, high32] LE, matching the section's LE

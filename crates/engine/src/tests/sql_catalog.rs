@@ -3659,8 +3659,9 @@ fn sql_value_key_words_matches_le_section_layout() {
             i32::from_le_bytes([13, 14, 15, 16]),
         ])
     );
-    // Text (variable-length) is still not a supported compound key column.
-    assert_eq!(key_column_width_words(SqlType::Text), None);
+    // Text (variable-length, Stage 2d) is a supported compound key column via the TEXT SENTINEL width 0
+    // (the device fold reads the row's blob span and hashes it, rather than reading fixed words).
+    assert_eq!(key_column_width_words(SqlType::Text), Some(0));
 }
 
 #[test]
@@ -3728,10 +3729,17 @@ fn compound_primary_key_over_i64_columns_enforces_tuple_uniqueness() {
         .execute_text(17, "INSERT INTO nt VALUES (1, 1.5, 9)")
         .is_err()); // duplicate (a, n) tuple -> 23505
 
-    // A compound key touching TEXT (variable-length) stays rejected (Stage 2d follow-up).
+    // COMPOUND KEYS (wider types, Stage 2d): a TEXT (variable-length) key column is now ACCEPTED and
+    // enforces tuple uniqueness (each text column folds to one word = the FNV-1a hash of its bytes).
+    e.execute_text(18, "CREATE TABLE tt (a INT, s TEXT, v INT, PRIMARY KEY (a, s))")
+        .unwrap();
+    e.execute_text(19, "INSERT INTO tt VALUES (1, 'alpha', 0)")
+        .unwrap();
+    e.execute_text(20, "INSERT INTO tt VALUES (1, 'beta', 0)")
+        .unwrap(); // distinct text -> OK
     assert!(e
-        .execute_text(18, "CREATE TABLE tt (a INT, s TEXT, PRIMARY KEY (a, s))")
-        .is_err());
+        .execute_text(21, "INSERT INTO tt VALUES (1, 'alpha', 9)")
+        .is_err()); // duplicate (a, s) tuple -> 23505
 }
 
 #[test]
@@ -3798,13 +3806,14 @@ fn compound_primary_key_over_i32_section_columns_enforces_tuple_uniqueness() {
         "duplicate compound tuple raises 23505, got {err:?}"
     );
 
-    // (4) A compound key touching a WIDER type (TEXT here) stays rejected — cleanly, in preflight.
+    // (4) A compound key touching a NON-FOLDABLE type (BOOL — no i32-word decomposition) stays
+    // rejected — cleanly, in preflight. (i32/i64/b128/text are all supported now; bool is not.)
     let err = e
-        .execute_text(7, "CREATE TABLE w (a INT, s TEXT, PRIMARY KEY (a, s))")
+        .execute_text(7, "CREATE TABLE w (a INT, f BOOL, PRIMARY KEY (a, f))")
         .unwrap_err();
     assert!(
         format!("{err:?}").contains("compound"),
-        "wider-typed compound PK is rejected, got {err:?}"
+        "non-foldable-typed compound PK is rejected, got {err:?}"
     );
 
     // (5) The other compound entry points also work for i32-section keys (ADD PK / ADD UNIQUE /

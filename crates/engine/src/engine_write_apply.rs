@@ -598,7 +598,7 @@ impl Engine {
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                         (compound key columns must be int4, int2, date, int8, or timestamp)"
+                         (compound key columns must be int4, int2, date, int8, timestamp, numeric, uuid, or text)"
                             .to_string(),
                     ));
                 }
@@ -677,7 +677,7 @@ impl Engine {
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                         (compound key columns must be int4, int2, date, int8, or timestamp)"
+                         (compound key columns must be int4, int2, date, int8, timestamp, numeric, uuid, or text)"
                             .to_string(),
                     ));
                 }
@@ -735,7 +735,7 @@ impl Engine {
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                         (compound key columns must be int4, int2, date, int8, or timestamp)"
+                         (compound key columns must be int4, int2, date, int8, timestamp, numeric, uuid, or text)"
                             .to_string(),
                     ));
                 }
@@ -800,7 +800,7 @@ impl Engine {
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
-                         (compound key columns must be int4, int2, date, int8, or timestamp)"
+                         (compound key columns must be int4, int2, date, int8, timestamp, numeric, uuid, or text)"
                             .to_string(),
                     ));
                 }

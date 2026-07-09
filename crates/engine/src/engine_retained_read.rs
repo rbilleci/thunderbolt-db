@@ -1214,6 +1214,10 @@ impl Engine {
                 .iter()
                 .map(|&p| shard_fixed_width_key_offset(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
+            let blob_offsets = positions
+                .iter()
+                .map(|&p| shard_key_column_blob_offset(shard, table, p))
+                .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
             // concurrent invalidations); a stale shard declines the whole wave-batch probe.
@@ -1228,6 +1232,7 @@ impl Engine {
                 &positions,
                 &device_memory,
                 &offsets,
+                &blob_offsets,
                 shard.row_count,
             )?;
             descs.push(WriteLocateShard {
@@ -1311,6 +1316,10 @@ impl Engine {
                 .iter()
                 .map(|&p| shard_fixed_width_key_offset(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
+            let blob_offsets = positions
+                .iter()
+                .map(|&p| shard_key_column_blob_offset(shard, table, p))
+                .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
@@ -1323,6 +1332,7 @@ impl Engine {
                 &positions,
                 &device_memory,
                 &offsets,
+                &blob_offsets,
                 shard.row_count,
             )?;
             let created_by_ptr = shard
@@ -1444,7 +1454,8 @@ impl Engine {
             }
             let descriptor = self.resident_snapshot_for_shard(shard, table);
             // COMPOUND KEYS (wider types): dispatch each key column to its section's descriptor offset
-            // helper (i32-section vs i64 section), matching `shard_fixed_width_key_offset`.
+            // helper (i32-section vs i64 section vs b128 vs text-offsets), matching
+            // `shard_fixed_width_key_offset`. A TEXT key column contributes its OFFSETS-array byte offset.
             let offsets = positions
                 .iter()
                 .map(|&p| match table.columns.get(p).map(|c| c.ty) {
@@ -1454,7 +1465,20 @@ impl Engine {
                     Some(SqlType::Numeric { .. }) | Some(SqlType::Uuid) => {
                         resident_device_numeric_column_offset(&descriptor, table, p).ok()
                     }
+                    Some(SqlType::Text) => resident_device_text_column_layout(&descriptor, table, p)
+                        .ok()
+                        .map(|layout| layout.offsets_byte_offset),
                     _ => resident_device_int4_column_offset(&descriptor, table, p).ok(),
+                })
+                .collect::<Option<Vec<u64>>>()?;
+            // COMPOUND KEYS (text): the parallel blob byte offsets (nonzero only for a text column).
+            let blob_offsets = positions
+                .iter()
+                .map(|&p| match table.columns.get(p).map(|c| c.ty) {
+                    Some(SqlType::Text) => resident_device_text_column_layout(&descriptor, table, p)
+                        .ok()
+                        .map(|layout| layout.bytes_byte_offset),
+                    _ => Some(0),
                 })
                 .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
@@ -1474,6 +1498,7 @@ impl Engine {
                 &positions,
                 &device_memory,
                 &offsets,
+                &blob_offsets,
                 shard.row_count,
             )?;
             descs.push(WriteLocateShard {
@@ -2233,6 +2258,9 @@ impl Engine {
         positions: &[usize],
         device_memory: &Arc<CudaResidentDeviceMemory>,
         offsets: &[u64],
+        // COMPOUND KEYS (text): the per-key-column BLOB byte offsets, parallel to `offsets` — nonzero only
+        // for a TEXT column (its blob), 0 for fixed-width columns. Recomputed from the live shard under lanes.
+        blob_offsets: &[u64],
         row_count: usize,
     ) -> Option<(Arc<CudaResidentDeviceMemory>, u32, u32)> {
         let device_ptr = device_memory.device_ptr();
@@ -2284,7 +2312,7 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             })
         };
-        let (build_memory, build_offsets, build_row_count, build_capacity_rows) =
+        let (build_memory, build_offsets, build_blob_offsets, build_row_count, build_capacity_rows) =
             if self.intent_lanes.is_some() {
                 // Re-check under the guard: another prober may have rebuilt already.
                 {
@@ -2319,19 +2347,32 @@ impl Engine {
                     .iter()
                     .map(|&p| shard_fixed_width_key_offset(&live, table, p))
                     .collect::<Option<Vec<u64>>>()?;
+                // COMPOUND KEYS (text): the blob byte offsets are ALSO capacity/layout-dependent, so
+                // recompute them from the live shard alongside the fixed-width offsets.
+                let live_blob_offsets = positions
+                    .iter()
+                    .map(|&p| shard_key_column_blob_offset(&live, table, p))
+                    .collect::<Option<Vec<u64>>>()?;
                 // CAPACITY-SIZED INDEX: size the hash table once for the shard's
                 // full capacity (clamped to the builder's 2^30 slot limit via the
                 // sizing_rows argument), so capacity-exhaustion rebuilds are
                 // impossible for the shard's lifetime — only ptr changes
                 // (re-admission) rebuild, and the floor above makes those rare.
                 let capacity_rows = live.capacity as u64;
-                (live_memory, live_offsets, live_rows, capacity_rows)
+                (
+                    live_memory,
+                    live_offsets,
+                    live_blob_offsets,
+                    live_rows,
+                    capacity_rows,
+                )
             } else {
                 // NON-lanes: the build reads the CALLER's `device_memory` (same generation the caller
                 // computed `offsets` against, no concurrent re-admit), so the caller offsets are exact.
                 (
                     Arc::clone(device_memory),
                     offsets.to_vec(),
+                    blob_offsets.to_vec(),
                     row_count,
                     0_u64,
                 )
@@ -2368,7 +2409,13 @@ impl Engine {
                 .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
                 .collect::<Option<Vec<u32>>>()?;
             let fps = build_memory
-                .submit_compound_fold_fingerprints(device_ptr, &build_offsets, &widths, row_count)
+                .submit_compound_fold_fingerprints(
+                    device_ptr,
+                    &build_offsets,
+                    &widths,
+                    &build_blob_offsets,
+                    row_count,
+                )
                 .ok()?;
             if fps.len() != row_count {
                 return None;
@@ -2554,6 +2601,7 @@ impl Engine {
                 std::slice::from_ref(&filter_idx),
                 &device_memory,
                 &[filter_offset],
+                &[0], // single-column key -> blob offsets unused (fixed-width fold path)
                 shard.row_count,
             )?;
             let mut projection_offsets: Vec<u64> = Vec::with_capacity(ncols);
@@ -3418,7 +3466,36 @@ fn shard_fixed_width_key_offset(
                 .and_then(|after_i32| after_i32.checked_add(int8_section_bytes))
                 .and_then(|after_i64| after_i64.checked_add(numeric_prefix))
         }
+        SqlType::Text => {
+            // TEXT key column: the fold reads the column's OFFSETS array (self-describing absolute byte
+            // offset in the shard buffer). The BLOB is addressed separately via `shard_key_column_blob_offset`.
+            shard
+                .resident_device_text_columns
+                .iter()
+                .find(|layout| layout.name == column.name)
+                .map(|layout| layout.offsets_byte_offset)
+        }
         _ => None,
+    }
+}
+
+/// COMPOUND KEYS (text): the BLOB byte offset of a TEXT key column in the shard buffer (the device fold
+/// kernel's `blob_offsets[k]`, consulted only for the text sentinel `widths[k] == 0`). Returns `0` for a
+/// fixed-width column (the kernel ignores it there), so callers build a `blob_offsets` array parallel to
+/// the fixed-width `offsets` array uniformly across key column types.
+fn shard_key_column_blob_offset(
+    shard: &RelationalResidentShard,
+    table: &RelationalTable,
+    col_idx: usize,
+) -> Option<u64> {
+    let column = table.columns.get(col_idx)?;
+    match column.ty {
+        SqlType::Text => shard
+            .resident_device_text_columns
+            .iter()
+            .find(|layout| layout.name == column.name)
+            .map(|layout| layout.bytes_byte_offset),
+        _ => Some(0),
     }
 }
 

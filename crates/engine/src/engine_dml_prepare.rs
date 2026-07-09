@@ -764,8 +764,9 @@ impl Engine {
         }
         // Audit A4 F1, lifted by TYPE-COVERAGE track 2 (stages 1 + iii) + #14: every FIXED-WIDTH
         // section materializes with its CATALOG-derived variant — i32 via one u32/slot, i64 via two
-        // (the 4-mod-8 discipline), b128 (Numeric/Uuid) via four. Non-fixed-width types (text) still
-        // decline to the host fetch.
+        // (the 4-mod-8 discipline), b128 (Numeric/Uuid) via four. TEXT (variable-length) materializes
+        // this slot's blob span from the shard's text section (offsets+blob) — the compound-text-key
+        // recheck reads the resident key on-device instead of de-eliding to the host fetch.
         if table.columns.iter().any(|column| {
             !matches!(
                 column.ty,
@@ -776,6 +777,7 @@ impl Engine {
                     | crate::SqlType::Timestamp
                     | crate::SqlType::Numeric { .. }
                     | crate::SqlType::Uuid
+                    | crate::SqlType::Text
             )
         }) {
             return None;
@@ -845,6 +847,35 @@ impl Engine {
                         table.columns[idx].ty,
                         (lo | (hi << 32)) as i64,
                     )?);
+                }
+                crate::SqlType::Text => {
+                    // TEXT section: read THIS slot's [start,end) offsets (2 consecutive u64) then the
+                    // blob span, byte-identical to the rehydration decode
+                    // (`gather_resident_table_rows_from_device` Text arm), but for one slot only.
+                    let layout = crate::relational_model::resident_device_text_column_layout(
+                        &hit.descriptor,
+                        table,
+                        idx,
+                    )
+                    .ok()?;
+                    let bounds = hit
+                        .device_memory
+                        .read_resident_u64_column(layout.offsets_byte_offset + slot * 8, 2)
+                        .ok()?;
+                    let start = *bounds.first()?;
+                    let end = *bounds.get(1)?;
+                    if end < start {
+                        return None;
+                    }
+                    let bytes = hit
+                        .device_memory
+                        .read_resident_bytes(
+                            layout.bytes_byte_offset + start,
+                            (end - start) as usize,
+                        )
+                        .ok()?;
+                    let text = std::str::from_utf8(&bytes).ok()?.to_string();
+                    row.push(SqlValue::Text(text));
                 }
                 _ => {
                     let base = crate::relational_model::resident_device_int4_column_offset(

@@ -12530,7 +12530,15 @@ DONE:
 // h*=0x01000193; h=rotl(h,13)+0x9E3779B1) so the device-built index and the host-derived probe needle
 // agree. Each key column contributes `widths[k]` consecutive i32 words (Int4/Date/Int2 -> 1; Int8/
 // Timestamp -> 2 = the i64 section's LE lo/hi), read column-major at `base + offsets[k] + row*widths[k]*4`
-// with `widths[k]` words folded in ascending (little-endian) order. One thread per row. ASCII-only.
+// with `widths[k]` words folded in ascending (little-endian) order. One thread per row. The text branch's
+// byte loop hashes raw bytes (`ld.global.u8` zero-extends), so it is byte-exact for all UTF-8, not just ASCII.
+//
+// TEXT key columns are variable-length (no fixed section width), so `widths[k] == 0` is the TEXT SENTINEL:
+// the kernel then treats `offsets[k]` as the byte offset of that column's OFFSETS array (n+1 i64 entries)
+// and `blob_offsets[k]` as the byte offset of its blob, reads the row's [start,end) byte span, folds ONE
+// word = the FNV-1a hash of those bytes (h=0x811C9DC5; per BYTE h^=b; h*=0x01000193 — byte-identical to the
+// host `fnv1a_bytes`), then applies the same outer per-word mix. `blob_offsets` is ignored for fixed-width
+// columns (pass 0). One thread per row.
 const COMPOUND_FOLD_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -12540,18 +12548,20 @@ const COMPOUND_FOLD_PTX: &[u8] = br#"
     .param .u64 base_ptr,
     .param .u64 offsets_ptr,
     .param .u64 widths_ptr,
+    .param .u64 blob_offsets_ptr,
     .param .u32 ncols,
     .param .u32 row_count,
     .param .u64 out_ptr
 )
 {
-    .reg .pred %p<4>;
-    .reg .b32 %r<20>;
-    .reg .b64 %rd<20>;
+    .reg .pred %p<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<40>;
 
     ld.param.u64 %rd1, [base_ptr];
     ld.param.u64 %rd2, [offsets_ptr];
     ld.param.u64 %rd3, [widths_ptr];
+    ld.param.u64 %rd20, [blob_offsets_ptr];
     ld.param.u32 %r1, [ncols];
     ld.param.u32 %r2, [row_count];
     ld.param.u64 %rd4, [out_ptr];
@@ -12574,14 +12584,14 @@ FOLDLOOP:
     ld.global.u64 %rd7, [%rd6];         // off = offsets[k]
     mul.wide.u32 %rd8, %r8, 4;          // k * 4 (widths are u32)
     add.u64 %rd9, %rd3, %rd8;
-    ld.global.u32 %r9, [%rd9];          // w = widths[k] (words in this column)
+    ld.global.u32 %r9, [%rd9];          // w = widths[k] (words in this column; 0 = TEXT sentinel)
+    setp.eq.u32 %p4, %r9, 0;
+    @%p4 bra TEXTCOL;                   // w == 0 -> variable-length text column
     mul.lo.u32 %r10, %r6, %r9;          // row * w (word index of this column's row-0-relative start)
     mul.wide.u32 %rd10, %r10, 4;        // row * w * 4 (byte offset)
     add.u64 %rd11, %rd1, %rd7;
     add.u64 %rd12, %rd11, %rd10;        // col_base = base + off + row*w*4
     mov.u32 %r11, 0;                    // j = 0 (word within column)
-    setp.ge.u32 %p3, %r11, %r9;
-    @%p3 bra NEXTCOL;                   // w == 0 -> no words (defensive)
 
 WORDLOOP:
     mul.wide.u32 %rd13, %r11, 4;        // j * 4
@@ -12596,6 +12606,38 @@ WORDLOOP:
     add.u32 %r11, %r11, 1;
     setp.lt.u32 %p3, %r11, %r9;
     @%p3 bra WORDLOOP;
+    bra NEXTCOL;
+
+TEXTCOL:
+    // offsets array for this column starts at base + off; entries are i64, one per row + 1.
+    add.u64 %rd21, %rd1, %rd7;          // off_arr = base + off
+    mul.wide.u32 %rd22, %r6, 8;         // row * 8
+    add.u64 %rd23, %rd21, %rd22;        // &offsets[row]
+    ld.global.u64 %rd24, [%rd23];       // start = offsets[row]
+    ld.global.u64 %rd25, [%rd23+8];     // end   = offsets[row+1]
+    // blob base = base + blob_offsets[k]
+    add.u64 %rd26, %rd20, %rd5;         // &blob_offsets[k] (rd5 = k*8 from above)
+    ld.global.u64 %rd27, [%rd26];       // blob_off = blob_offsets[k]
+    add.u64 %rd28, %rd1, %rd27;         // blob_base = base + blob_off
+    mov.u32 %r15, 2166136261;           // h_text = 0x811C9DC5 (inner byte FNV)
+    mov.u64 %rd29, %rd24;               // i = start
+BYTELOOP:
+    setp.ge.u64 %p5, %rd29, %rd25;      // i >= end ?
+    @%p5 bra BYTEDONE;
+    add.u64 %rd30, %rd28, %rd29;        // &blob[i]
+    ld.global.u8 %r16, [%rd30];         // byte
+    xor.b32 %r15, %r15, %r16;           // h_text ^= b
+    mul.lo.u32 %r15, %r15, 16777619;    // h_text *= 0x01000193
+    add.u64 %rd29, %rd29, 1;
+    bra BYTELOOP;
+BYTEDONE:
+    // fold the single text word h_text into fp with the outer per-word mix.
+    xor.b32 %r7, %r7, %r15;
+    mul.lo.u32 %r7, %r7, 16777619;
+    shl.b32 %r13, %r7, 13;
+    shr.b32 %r14, %r7, 19;
+    or.b32 %r7, %r13, %r14;
+    add.u32 %r7, %r7, 2654435761;
 
 NEXTCOL:
     add.u32 %r8, %r8, 1;
@@ -12940,13 +12982,17 @@ impl CudaResidentDeviceMemory {
     /// PK-index rebuild derive the compound key on the GPU instead of reading the raw resident key columns
     /// back to the host to hash them — the host then reads only this derived fingerprint column, exactly
     /// as the single-column build reads its one key column. Byte-identical to the host
-    /// `compound_key_fingerprint` / `sql_value_key_words`. `offsets.len() == widths.len()`. Synchronous
-    /// (the blocking output DtoH on the null stream fences the launch).
+    /// `compound_key_fingerprint` / `sql_value_key_words`. `offsets.len() == widths.len() ==
+    /// blob_offsets.len()`. A TEXT key column sets `widths[k] == 0` (the sentinel); `offsets[k]` is then
+    /// the byte offset of its OFFSETS array and `blob_offsets[k]` the byte offset of its blob (ignored,
+    /// pass 0, for fixed-width columns). Synchronous (the blocking output DtoH on the null stream fences
+    /// the launch).
     pub fn submit_compound_fold_fingerprints(
         &self,
         base_ptr: u64,
         offsets: &[u64],
         widths: &[u32],
+        blob_offsets: &[u64],
         row_count: usize,
     ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
         type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
@@ -12969,7 +13015,11 @@ impl CudaResidentDeviceMemory {
         if row_count == 0 {
             return Ok(Vec::new());
         }
-        if offsets.is_empty() || base_ptr == 0 || offsets.len() != widths.len() {
+        if offsets.is_empty()
+            || base_ptr == 0
+            || offsets.len() != widths.len()
+            || offsets.len() != blob_offsets.len()
+        {
             return Err(CudaRuntimeProbeError::InvalidInputLength(offsets.len()));
         }
         let ncols = u32::try_from(offsets.len())
@@ -12983,6 +13033,10 @@ impl CudaResidentDeviceMemory {
         let widths_bytes = widths
             .len()
             .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let blob_offsets_bytes = blob_offsets
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let out_bytes = row_count
             .checked_mul(std::mem::size_of::<i32>())
@@ -13013,6 +13067,7 @@ impl CudaResidentDeviceMemory {
 
         let offsets_guard = primary.lease_device_buffer_owned(offsets_bytes)?;
         let widths_guard = primary.lease_device_buffer_owned(widths_bytes)?;
+        let blob_offsets_guard = primary.lease_device_buffer_owned(blob_offsets_bytes)?;
         let out_guard = primary.lease_device_buffer_owned(out_bytes)?;
 
         let mut ptx = Vec::with_capacity(COMPOUND_FOLD_PTX.len() + 1);
@@ -13030,10 +13085,18 @@ impl CudaResidentDeviceMemory {
         check_cuda(unsafe {
             cu_memcpy_htod(widths_guard.ptr, widths.as_ptr().cast::<c_void>(), widths_bytes)
         })?;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                blob_offsets_guard.ptr,
+                blob_offsets.as_ptr().cast::<c_void>(),
+                blob_offsets_bytes,
+            )
+        })?;
 
         let mut base_arg = base_ptr;
         let mut offsets_arg = offsets_guard.ptr;
         let mut widths_arg = widths_guard.ptr;
+        let mut blob_offsets_arg = blob_offsets_guard.ptr;
         let mut ncols_arg = ncols;
         let mut rows_arg = row_count_u32;
         let mut out_arg = out_guard.ptr;
@@ -13041,6 +13104,7 @@ impl CudaResidentDeviceMemory {
             (&mut base_arg as *mut u64).cast::<c_void>(),
             (&mut offsets_arg as *mut u64).cast::<c_void>(),
             (&mut widths_arg as *mut u64).cast::<c_void>(),
+            (&mut blob_offsets_arg as *mut u64).cast::<c_void>(),
             (&mut ncols_arg as *mut u32).cast::<c_void>(),
             (&mut rows_arg as *mut u32).cast::<c_void>(),
             (&mut out_arg as *mut u64).cast::<c_void>(),
