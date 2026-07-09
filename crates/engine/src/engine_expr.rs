@@ -8904,6 +8904,56 @@ impl Engine {
                 .map(Some)
                 .map_err(map_err);
         }
+        // textcol <lt/le/gt/ge> 'literal' (ADR-006): LEXICOGRAPHIC unsigned byte compare on-device
+        // (memcmp of the common prefix; shorter sorts first) — byte-identical to the host
+        // `compare_sql_values` Text order (Rust `str::cmp`) that the DML recheck uses, so device ==
+        // recheck. A column-on-RIGHT (`'lit' < col`) flips `scalar_on_left`; a nullable text column
+        // AND's its validity mask (a NULL operand is UNKNOWN ⇒ excluded).
+        if matches!(
+            compare,
+            ResidentBinaryOp::Lt
+                | ResidentBinaryOp::Le
+                | ResidentBinaryOp::Gt
+                | ResidentBinaryOp::Ge
+        ) {
+            let (col, needle, scalar_on_left) =
+                match (text_column_index(lhs, table), text_column_index(rhs, table)) {
+                    (Some(col), None) if text_literal_value(rhs).is_some() => {
+                        (col, text_literal_value(rhs).expect("checked"), false)
+                    }
+                    (None, Some(col)) if text_literal_value(lhs).is_some() => {
+                        (col, text_literal_value(lhs).expect("checked"), true)
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "text column-vs-column comparison is a follow-on".to_string(),
+                        )));
+                    }
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "text comparison must be a column against a literal".to_string(),
+                        )));
+                    }
+                };
+            let cmp = predicate_compare_code(compare)
+                .expect("lt/le/gt/ge have compare codes");
+            let layout = resident_device_text_column_layout(snapshot, table, col)?;
+            let validity: Vec<u64> = resident_device_null_column_offset(snapshot, table, col)?
+                .into_iter()
+                .collect();
+            return device_memory
+                .expr_text_compare_scalar_filter(
+                    layout.offsets_byte_offset,
+                    layout.bytes_byte_offset,
+                    needle.as_bytes(),
+                    scalar_on_left,
+                    cmp,
+                    row_count,
+                    &validity,
+                )
+                .map(Some)
+                .map_err(map_err);
+        }
         let negate = match compare {
             ResidentBinaryOp::Eq => false,
             ResidentBinaryOp::Ne => true,
@@ -8911,10 +8961,9 @@ impl Engine {
             | ResidentBinaryOp::Le
             | ResidentBinaryOp::Gt
             | ResidentBinaryOp::Ge => {
+                // Handled by the inequality block above; unreachable here.
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "text inequalities need collation sort keys (a follow-on); only = and <> run \
-                     on the GPU"
-                        .to_string(),
+                    "text inequality reached the eq/ne arm unexpectedly".to_string(),
                 )));
             }
             // AND/OR returned early (above) -> the mask VM. Any other op here is unsupported.

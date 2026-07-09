@@ -3075,6 +3075,71 @@ fn gpu_in_list_dml_resolves_on_device() {
     }
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure — NEW device kernel): text INEQUALITY
+/// (`name < 'x'` / `>` / `<=` / `>=`) DELETE/UPDATE on an ELIDED table resolves ON THE DEVICE via the
+/// new lexicographic byte-compare kernel `gpu_db_resident_text_compare_scalar_to_mask` (unsigned memcmp
+/// of the common prefix; the shorter string sorts first) — BYTE-IDENTICAL to the host
+/// `compare_sql_values` Text order (`str::cmp`) the recheck uses. Adversarial: exercises byte-order
+/// (uppercase `B`=0x42 < lowercase `b`=0x62), prefix (first byte decides `ab` vs `b`), and the length
+/// tiebreak (`ab` > `a`, common prefix equal → longer sorts after). GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_text_inequality_dml_resolves_on_device() {
+    // Byte values: 'a'=0x61, 'b'=0x62, 'c'=0x63, 'ab'=61 62, 'B'=0x42 (< lowercase).
+    let seed: &[(i64, &str)] = &[(1, "'a'"), (2, "'b'"), (3, "'c'"), (4, "'ab'"), (5, "'B'")];
+
+    // name < 'b': 'a'(<), 'ab'(first byte 'a'<'b'), 'B'(0x42<0x62) -> delete 1,4,5; keep 'b','c'.
+    {
+        let Some(engine) = gpu_elided_pk_table_with_column("name TEXT", seed) else {
+            return;
+        };
+        let before = engine.dml_device_resolve_hits();
+        engine
+            .execute_dml_concurrent(9, "DELETE FROM t WHERE name < 'b'")
+            .unwrap();
+        assert!(
+            engine.dml_device_resolve_hits() > before,
+            "a text inequality DELETE must RESOLVE on the device"
+        );
+        assert!(engine.table_install_elided("t"), "text `<` must NOT de-elide");
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![2, 3],
+            "a, ab, B deleted (byte-order 'B'<'b' + prefix 'ab'<'b'); 'b','c' kept"
+        );
+    }
+    // name > 'a': 'b','c' (>), 'ab' (common prefix 'a' equal, longer -> 'ab' > 'a'); 'B'=0x42 < 'a'=0x61.
+    {
+        let Some(engine) = gpu_elided_pk_table_with_column("name TEXT", seed) else {
+            return;
+        };
+        engine
+            .execute_dml_concurrent(9, "DELETE FROM t WHERE name > 'a'")
+            .unwrap();
+        assert!(engine.table_install_elided("t"), "text `>` must NOT de-elide");
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![1, 5],
+            "b, c, ab deleted (LENGTH TIEBREAK: 'ab' > 'a'); 'a','B' kept"
+        );
+    }
+    // name >= 'b' (inclusive): only 'b','c' -> delete 2,3; keep 'a','ab','B'.
+    {
+        let Some(engine) = gpu_elided_pk_table_with_column("name TEXT", seed) else {
+            return;
+        };
+        engine
+            .execute_dml_concurrent(9, "DELETE FROM t WHERE name >= 'b'")
+            .unwrap();
+        assert!(engine.table_install_elided("t"), "text `>=` must NOT de-elide");
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![1, 4, 5],
+            "only 'b','c' deleted (>= inclusive); 'a','ab','B' kept"
+        );
+    }
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, multi-statement elision): a MULTI-ENTRY commit BATCH of INSERTs
 /// (the group-commit batcher grouping GpuBatched inserts under load — the SQL-text write path) now
 /// KEEPS the table ELIDED via ONE incremental device append per table, instead of de-eliding the

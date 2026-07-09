@@ -2184,12 +2184,22 @@ fn gpu_execute_resident_expr_select_sql_runs_text_equality() {
         .expect("name = 'zzz' on GPU");
     assert!(none.rows.is_empty(), "name = 'zzz' matches nothing");
 
-    // REJECTIONS -- hard errors, never wrong rows (LIKE is now supported; see the text_like test):
-    assert!(
-        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE name < 'bob'")
-            .is_err(),
-        "text inequality => collation-sort-key follow-on"
+    // Text INEQUALITY now runs on-device (ADR-006: the lexicographic byte-compare kernel). `name < 'bob'`
+    // = the three 'alice' rows (a < b byte-wise) -> labels 0,2,5, matching the host `str::cmp` order.
+    let lt = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE name < 'bob'")
+        .expect("name < 'bob' on GPU");
+    assert_eq!(
+        lt.rows,
+        vec![
+            vec![SqlValue::Int4(0)],
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(5)]
+        ],
+        "name < 'bob' => the 'alice' rows 0,2,5 (byte-wise lexicographic)"
     );
+
+    // REJECTIONS -- hard errors, never wrong rows:
     assert!(
         e.execute_resident_expr_select_sql("SELECT label FROM t WHERE name = label")
             .is_err(),

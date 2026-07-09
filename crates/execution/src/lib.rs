@@ -2197,6 +2197,35 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// Surviving row indices of `text[i] <cmp> needle` over a resident TEXT column (the type matrix,
+    /// doc 19): LEXICOGRAPHIC unsigned byte compare (memcmp of the common prefix; the shorter string
+    /// sorts first), matching the host `compare_sql_values` Text order (Rust `str::cmp`). `cmp`:
+    /// 0=eq/1=lt/2=le/3=gt/4=ge/5=ne; `scalar_on_left` reverses the operand order. `validity_offsets`
+    /// (M3 — doc 21) holds the text column's validity bitmap offset when nullable (a NULL operand is
+    /// UNKNOWN ⇒ excluded); empty ⇒ byte-identical to the no-NULL path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expr_text_compare_scalar_filter(
+        &self,
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        needle: &[u8],
+        scalar_on_left: bool,
+        comparison: u32,
+        row_count: u64,
+        validity_offsets: &[u64],
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_text_compare_scalar_filter(
+            self,
+            offsets_byte_offset,
+            bytes_byte_offset,
+            needle,
+            scalar_on_left,
+            comparison,
+            row_count,
+            validity_offsets,
+        )
+    }
+
     /// Surviving row indices of `text[i] LIKE pattern` over a resident TEXT column (the type matrix,
     /// doc 19). `tokens` is the pattern compiled to the kernel ABI -- one u32 per token,
     /// `(op << 8) | literal_byte`, op 0 = literal byte, 1 = any-one (`_`), 2 = any-run (`%`), with `\`
@@ -6810,6 +6839,121 @@ fn launch_cuda_resident_text_eq_scalar_filter(
         }
     })?;
     compact_mask_i32_to_indices(resident, mask.ptr, n)
+}
+
+/// Evaluate `text[i] <cmp> needle` over a resident TEXT column to surviving row indices (the type
+/// matrix, doc 19): copy the needle bytes H2D, run `gpu_db_resident_text_compare_scalar_to_mask`
+/// (LEXICOGRAPHIC unsigned byte compare, shorter-sorts-first — matches the host `compare_sql_values`
+/// Text order), AND any nullable-column validity mask, then compact. `cmp`: 0=eq/1=lt/2=le/3=gt/4=ge/
+/// 5=ne; `scalar_on_left` reverses the operand order. `validity_offsets` holds the text column's
+/// validity bitmap offset when nullable (empty otherwise; a NULL operand is excluded — UNKNOWN).
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_resident_text_compare_scalar_filter(
+    resident: &CudaResidentDeviceMemory,
+    offsets_byte_offset: u64,
+    bytes_byte_offset: u64,
+    needle: &[u8],
+    scalar_on_left: bool,
+    comparison: u32,
+    n: u64,
+    validity_offsets: &[u64],
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mask_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let compare_fn =
+        primary.cached_function(c"gpu_db_resident_text_compare_scalar_to_mask", &ptx)?;
+
+    let needle_lease = primary.lease_device_buffer(needle.len().max(1))?;
+    let mask = primary.lease_device_buffer(mask_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = offsets_byte_offset;
+    let mut a2 = bytes_byte_offset;
+    let mut a3 = needle_lease.ptr;
+    let mut a4 = needle.len() as u64;
+    let mut a5 = u32::from(scalar_on_left);
+    let mut a6 = comparison;
+    let mut a7 = n;
+    let mut a8 = mask.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+        (&mut a5 as *mut u32).cast::<c_void>(),
+        (&mut a6 as *mut u32).cast::<c_void>(),
+        (&mut a7 as *mut u64).cast::<c_void>(),
+        (&mut a8 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        if !needle.is_empty() {
+            let rc = unsafe {
+                htod_async(
+                    needle_lease.ptr,
+                    needle.as_ptr().cast::<c_void>(),
+                    needle.len(),
+                    stream,
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+        }
+        unsafe {
+            cu_launch_kernel(
+                compare_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+    compact_mask_with_validity(resident, mask.ptr, validity_offsets, n)
 }
 
 /// Evaluate `uuid[i] <cmp> needle` over a resident UUID column (16 raw bytes/row) to surviving row

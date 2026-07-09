@@ -52,13 +52,22 @@ fn dml_filter_groups_to_device_predicate(
                 (Some(SqlType::Numeric { .. }), SqlValue::Numeric(d)) => {
                     ResidentExpr::NumericLiteral(*d)
                 }
-                // TEXT EQUALITY (ADR-006, charter-pure): `text_col = 'lit'` lowers to a `TextLiteral`
-                // that `lower_resident_predicate`'s `try_lower_text_predicate` evaluates via the
-                // DEVICE byte-wise text-equality kernel — the located slots then materialize their
-                // text on-device (`materialize_resident_row_via_hit` text arm) for the recheck. Text
-                // is only ORDERED-comparable lexicographically, which the device kernel does not do,
-                // so ONLY `=` lowers here; `<`/`>`/LIKE decline. No new kernel — reuses the read path.
-                (Some(SqlType::Text), SqlValue::Text(s)) if matches!(op, SelectFilterOp::Eq) => {
+                // TEXT `=` and `<`/`<=`/`>`/`>=` (ADR-006, charter-pure): lowers to a `TextLiteral` that
+                // `try_lower_text_predicate` evaluates on-device — equality via the byte-eq kernel,
+                // ordering via the lexicographic byte-compare kernel (memcmp, shorter sorts first,
+                // BYTE-IDENTICAL to the host `compare_sql_values` Text order the recheck uses). The
+                // located slots materialize their text on-device for the recheck. `LIKE 'p%'` is a
+                // separate arm below; no other text op lowers.
+                (Some(SqlType::Text), SqlValue::Text(s))
+                    if matches!(
+                        op,
+                        SelectFilterOp::Eq
+                            | SelectFilterOp::Lt
+                            | SelectFilterOp::Lte
+                            | SelectFilterOp::Gt
+                            | SelectFilterOp::Gte
+                    ) =>
+                {
                     ResidentExpr::TextLiteral(s.clone())
                 }
                 // UUID / BOOL EQUALITY (ADR-006, charter-pure): reuse the DEVICE equality kernels the

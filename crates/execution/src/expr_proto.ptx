@@ -3081,6 +3081,169 @@ done_teq:
     ret;
 }
 
+// out_mask[i] = (text[i] <cmp> needle) ? 1 : 0  over a resident TEXT column (the type matrix, doc 19).
+// LEXICOGRAPHIC UNSIGNED byte compare: memcmp over min(len,nlen) bytes; if the common prefix is equal
+// the SHORTER string sorts first (ord = sign(len - nlen)). This is exactly the host compare_sql_values
+// Text order (Rust `str::cmp`, byte-wise) + the text bitonic-sort kernel, so device == recheck. cmp:
+// 0=eq, 1=lt, 2=le, 3=gt, 4=ge, 5=ne. scalar_on_left negates the sign (literal <cmp> column). Offsets
+// read as 2x 4-byte loads (the section can land 4-mod-8 aligned; an 8-byte load faults 716); bytes via
+// ld.global.u8 (always aligned).
+.visible .entry gpu_db_resident_text_compare_scalar_to_mask(
+    .param .u64 resident_ptr,
+    .param .u64 offsets_byte_offset,
+    .param .u64 bytes_byte_offset,
+    .param .u64 needle_ptr,
+    .param .u64 needle_len,
+    .param .u32 scalar_on_left,
+    .param .u32 comparison,
+    .param .u64 n,
+    .param .u64 out_mask_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %ceq;
+    .reg .pred %clt;
+    .reg .pred %cle;
+    .reg .pred %cgt;
+    .reg .pred %cge;
+    .reg .pred %cne;
+    .reg .pred %req;
+    .reg .pred %rlt;
+    .reg .pred %rle;
+    .reg .pred %rgt;
+    .reg .pred %rge;
+    .reg .pred %rne;
+    .reg .pred %tmp;
+    .reg .pred %match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %onleft;
+    .reg .u32 %cmp;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .s32 %ord;
+    .reg .b32 %mask;
+    .reg .u64 %off_base;
+    .reg .u64 %bytes_base;
+    .reg .u64 %needle;
+    .reg .u64 %nlen;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o8;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %len;
+    .reg .u64 %minlen;
+    .reg .u64 %j;
+    .reg .u64 %rowbytes;
+    .reg .u64 %a_addr;
+    .reg .u64 %b_addr;
+
+    ld.param.u64 %off_base, [resident_ptr];
+    ld.param.u64 %addr, [offsets_byte_offset];
+    add.u64 %off_base, %off_base, %addr;
+    ld.param.u64 %bytes_base, [resident_ptr];
+    ld.param.u64 %addr, [bytes_byte_offset];
+    add.u64 %bytes_base, %bytes_base, %addr;
+    ld.param.u64 %needle, [needle_ptr];
+    ld.param.u64 %nlen, [needle_len];
+    ld.param.u32 %onleft, [scalar_on_left];
+    ld.param.u32 %cmp, [comparison];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_mask_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_tcmp:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_tcmp;
+    mul.lo.u64 %o8, %i, 8;
+    add.u64 %addr, %off_base, %o8;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %start, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %end, {%w0, %w1};
+    sub.u64 %len, %end, %start;
+    add.u64 %rowbytes, %bytes_base, %start;
+    min.u64 %minlen, %len, %nlen;
+    mov.s32 %ord, 0;
+    mov.u64 %j, 0;
+tcmp_byte:
+    setp.ge.u64 %p, %j, %minlen;
+    @%p bra tcmp_len;
+    add.u64 %a_addr, %rowbytes, %j;
+    ld.global.u8 %abyte, [%a_addr];
+    add.u64 %b_addr, %needle, %j;
+    ld.global.u8 %bbyte, [%b_addr];
+    setp.eq.u32 %p, %abyte, %bbyte;
+    @%p bra tcmp_byte_next;
+    mov.s32 %ord, 1;
+    setp.lt.u32 %p, %abyte, %bbyte;
+    @%p mov.s32 %ord, -1;
+    bra tcmp_after;
+tcmp_byte_next:
+    add.u64 %j, %j, 1;
+    bra tcmp_byte;
+tcmp_len:
+    // Common prefix equal -> the shorter string sorts first (ord = sign(len - nlen); 0 if equal).
+    setp.lt.u64 %p, %len, %nlen;
+    @%p mov.s32 %ord, -1;
+    setp.gt.u64 %p, %len, %nlen;
+    @%p mov.s32 %ord, 1;
+tcmp_after:
+    setp.ne.u32 %p, %onleft, 0;
+    @%p neg.s32 %ord, %ord;
+    setp.eq.u32 %ceq, %cmp, 0;
+    setp.eq.u32 %clt, %cmp, 1;
+    setp.eq.u32 %cle, %cmp, 2;
+    setp.eq.u32 %cgt, %cmp, 3;
+    setp.eq.u32 %cge, %cmp, 4;
+    setp.eq.u32 %cne, %cmp, 5;
+    setp.eq.s32 %req, %ord, 0;
+    setp.lt.s32 %rlt, %ord, 0;
+    setp.le.s32 %rle, %ord, 0;
+    setp.gt.s32 %rgt, %ord, 0;
+    setp.ge.s32 %rge, %ord, 0;
+    setp.ne.s32 %rne, %ord, 0;
+    mov.pred %match, 0;
+    and.pred %tmp, %ceq, %req;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %clt, %rlt;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cle, %rle;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cgt, %rgt;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cge, %rge;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cne, %rne;
+    or.pred %match, %match, %tmp;
+    selp.b32 %mask, 1, 0, %match;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %out, %o4;
+    st.global.b32 [%addr], %mask;
+    add.u64 %i, %i, %stride;
+    bra loop_tcmp;
+done_tcmp:
+    ret;
+}
+
 // out_mask[i] = (text[i] LIKE pattern) ? 1 : 0  over a resident TEXT column (the type matrix, doc 19).
 // `pattern` is a device u32 TOKEN array (ntok tokens) compiled on the host (escapes resolved): each
 // token = (op<<8)|literal_byte, op 0=literal byte, 1=any-one (`_`), 2=any-run (`%`). Iterative
