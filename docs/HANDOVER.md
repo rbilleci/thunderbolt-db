@@ -5,7 +5,11 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `2170dee1` (CPU-ENGINE RETIREMENT — FIFTEEN merged wins: UUID INEQUALITIES
+**Updated:** 2026-07-09. **Base:** `main` @ `7e06610e` (CPU-ENGINE RETIREMENT — SIXTEEN merged wins: TEXT INEQUALITIES
+`<`/`>`/`<=`/`>=` resolve ON-DEVICE for BOTH DML + reads via a NEW hand-written PTX kernel
+`gpu_db_resident_text_compare_scalar_to_mask` (lexicographic unsigned byte compare, shorter-sorts-first,
+byte-identical to `str::cmp` == the recheck; opus-audited instruction-by-instruction; scalar_on_left + nullable
+validity) `7e06610e`; UUID INEQUALITIES
 `<`/`>`/`<=`/`>=` DELETE/UPDATE resolve ON-DEVICE (uuid is byte-comparable — device kernel==recheck==PG MSB-first
 byte-wise; builder Eq→all-comparisons) + `col IN (...)` confirmed on-device for int4/text (OR-of-Eq via mask VM, free
 from the equality wins) `2170dee1`; LIKE-PREFIX
