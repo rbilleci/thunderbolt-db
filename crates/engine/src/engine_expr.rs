@@ -1095,6 +1095,10 @@ fn timestamp_literal_micros(expr: &ResidentExpr) -> Result<i64, ExecuteError> {
                 )))
             })
         }
+        // ADR-006 (wider-type range DML): the DML predicate builder supplies an already-bound timestamp as
+        // its raw i64 microseconds via `Int8Literal` (there is no host string to re-parse), so accept it
+        // directly — the same i64 micros the text path produces after `parse_timestamp`.
+        ResidentExpr::Int8Literal(micros) => Ok(*micros),
         _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "a timestamp column compares only to a timestamp literal or another timestamp column"
                 .to_string(),
