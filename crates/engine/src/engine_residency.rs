@@ -6571,21 +6571,33 @@ mod capacity_payload_tests {
             "the Date-typing path must be exercised (locate answered)"
         );
 
-        // NULL-bearing shard: the materializer must DECLINE, never alias NULL as 0.
+        // NULL-bearing shard (ADR-006 nullable-column DML): the materializer no longer DECLINES —
+        // it reads the per-column validity bitmap and reconstructs the row WITH `SqlValue::Null`
+        // (never aliasing a stored NULL as 0). Row id=1 has v=NULL.
         e.execute_text(400, "CREATE TABLE n (id INT, v INT)")
             .unwrap();
         e.execute_text(401, "INSERT INTO n (id, v) VALUES (1, NULL), (2, 20)")
             .unwrap();
         let n_table = e.relational_catalog_table("n").unwrap();
+        let mut null_materialization_checked = false;
         if let Some(hits) = e.locate_resident_pk_via_shard_index_detailed(&n_table, 0, 1) {
             for hit in &hits {
-                assert_eq!(
-                    e.materialize_resident_row_via_hit(&n_table, hit, e.committed_seq()),
-                    None,
-                    "a null-bearing shard must DECLINE the raw-i32 materialization"
-                );
+                if let Some(Some(device_row)) =
+                    e.materialize_resident_row_via_hit(&n_table, hit, e.committed_seq())
+                {
+                    assert_eq!(
+                        device_row,
+                        vec![SqlValue::Int4(1), SqlValue::Null],
+                        "null-aware materialization: id=1 reads v as SqlValue::Null (not 0)"
+                    );
+                    null_materialization_checked = true;
+                }
             }
         }
+        assert!(
+            null_materialization_checked,
+            "the NULL-aware materialization path must be exercised (was a blanket decline)"
+        );
     }
 
     /// RETIREMENT A3 — the VALIDATOR-LADDER differential: constraint outcomes (success AND the

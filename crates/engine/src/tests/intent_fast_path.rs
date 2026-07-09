@@ -2498,6 +2498,106 @@ fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
     assert_eq!(ids(&engine), vec![1, 5, 6], "ids 2,3,4 (Feb-Apr) purged exactly");
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a DELETE/UPDATE on a table with NULL-BEARING columns
+/// resolves ON THE DEVICE — `materialize_resident_row_via_hit` no longer declines wholesale on a
+/// null-bearing shard; it reads each column's validity bitmap per-slot (0 bit -> SqlValue::Null) so the
+/// recheck sees the real row (with NULLs). A matched row whose VALUE column is NULL is handled: the
+/// device locate excluded NULL predicate operands (3VL), and the recheck re-applies 3VL. No host store.
+/// GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nullable_column_dml_resolves_on_device() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, notes TEXT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    // id=1 'a', id=2 NULL, id=3 'c', id=4 NULL — a nullable value column that actually holds NULLs.
+    engine
+        .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 'a')")
+        .unwrap();
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    engine
+        .execute_dml_concurrent(3, "INSERT INTO t (id, notes) VALUES (2, NULL)")
+        .unwrap();
+    engine
+        .execute_dml_concurrent(4, "INSERT INTO t VALUES (3, 'c')")
+        .unwrap();
+    engine
+        .execute_dml_concurrent(5, "INSERT INTO t (id, notes) VALUES (4, NULL)")
+        .unwrap();
+    assert!(
+        engine.table_install_elided("t"),
+        "a nullable-column table must elide (NULL coverage)"
+    );
+
+    let ids = |engine: &Engine| -> Vec<i64> {
+        let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
+            unreachable!()
+        };
+        let mut out: Vec<i64> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n as i64,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(ids(&engine), vec![1, 2, 3, 4]);
+
+    // RANGE DELETE (id 2..=3) — matches a NULL-notes row (id=2) — resolves ON THE DEVICE via the
+    // predicate scan + null-aware materialize, and STAYS ELIDED (pre-fix this de-elided: materialize
+    // declined on the null-bearing shard).
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(6, "DELETE FROM t WHERE id >= 2 AND id <= 3")
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a DELETE on a null-bearing table must RESOLVE on the device (materialize is null-aware)"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a DELETE on a null-bearing table must NOT de-elide"
+    );
+    assert_eq!(ids(&engine), vec![1, 4], "ids 2 (NULL) and 3 deleted exactly");
+
+    // The surviving NULL row (id=4) is intact + reads back as NULL.
+    let Command::Select(sel) =
+        parse_command("SELECT notes FROM t WHERE id = 4").unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine
+            .execute_relational_select(&sel)
+            .unwrap()
+            .rows
+            .iter()
+            .next()
+            .and_then(|r| r.first()),
+        Some(&SqlValue::Null),
+        "id=4's notes is still NULL after the on-device DELETE"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, wider-type range DML): a NUMERIC range DELETE/UPDATE on an ELIDED table
 /// resolves ON THE DEVICE — the DML predicate builder emits `Column(num) <op> NumericLiteral(dec)`, lowered
 /// by the numeric peephole via the i128 compare kernel (rescaled to the column scale), which ALSO handles

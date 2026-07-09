@@ -941,9 +941,12 @@ impl Engine {
         hit: &crate::engine_retained_read::ShardPkHit,
         read_txn_id: u64,
     ) -> Option<Option<Vec<SqlValue>>> {
-        if !hit.descriptor.resident_device_null_columns.is_empty() {
-            return None; // raw i32 would read a stored NULL as 0 (the M3 decline discipline)
-        }
+        // ADR-006 (nullable-column DML): a NULL-bearing shard no longer declines wholesale — each
+        // column's validity bitmap is read per-slot below (a 0 bit ⇒ SqlValue::Null), so a
+        // DELETE/UPDATE whose PREDICATE is device-resolvable resolves on-device even when the table
+        // has nullable columns (the located rows already excluded NULL predicate operands via the
+        // device 3VL validity-AND; the recheck's `select_filter_matches` re-applies 3VL). Was: a
+        // blanket decline because a raw i32 read would alias a stored NULL as 0.
         // Audit A4 F1, lifted by TYPE-COVERAGE track 2 (stages 1 + iii) + #14: every FIXED-WIDTH
         // section materializes with its CATALOG-derived variant — i32 via one u32/slot, i64 via two
         // (the 4-mod-8 discipline), b128 (Numeric/Uuid) via four. TEXT (variable-length) materializes
@@ -984,6 +987,24 @@ impl Engine {
         }
         let mut row = Vec::with_capacity(table.columns.len());
         for idx in 0..table.columns.len() {
+            // ADR-006 (nullable-column DML): if this column has a validity bitmap and the slot's bit
+            // is 0, the value is NULL (byte-identical to the gather Bool-bitmap addressing: word
+            // `slot/32`, bit `slot%32`, LSB-first; 1 = present, 0 = NULL). Read ONE word for the slot.
+            if let Some(layout) = hit
+                .descriptor
+                .resident_device_null_columns
+                .iter()
+                .find(|layout| layout.name == table.columns[idx].name)
+            {
+                let word = hit
+                    .device_memory
+                    .read_resident_i32_column(layout.bitmap_byte_offset + (slot / 32) * 4, 1)
+                    .ok()?;
+                if (*word.first()? as u32 >> (slot % 32)) & 1 == 0 {
+                    row.push(SqlValue::Null);
+                    continue;
+                }
+            }
             match table.columns[idx].ty {
                 crate::SqlType::Numeric { .. } | crate::SqlType::Uuid => {
                     // b128 (16-byte) section: 4 LE i32 words per slot, reassembled byte-identically to
