@@ -1129,9 +1129,13 @@ pub(crate) fn resident_device_int_column_offset(
         Some(SqlType::Int4 | SqlType::Int2) => {
             resident_device_int4_column_offset(snapshot, table, column_idx)
         }
-        Some(SqlType::Int8) => resident_device_int8_column_offset(snapshot, table, column_idx),
+        // A timestamp is i64 microseconds stored in the SAME i64 section as int8 (ADR-006 multi-bound
+        // timestamp DML): the i64 VM reads it byte-identically, so it resolves to the int8 offset.
+        Some(SqlType::Int8 | SqlType::Timestamp) => {
+            resident_device_int8_column_offset(snapshot, table, column_idx)
+        }
         _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident device-memory column is neither int2/int4 nor int8".to_string(),
+            "resident device-memory column is neither int2/int4 nor int8/timestamp".to_string(),
         ))),
     }
 }

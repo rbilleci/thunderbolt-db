@@ -2416,6 +2416,88 @@ fn gpu_timestamp_range_delete_resolves_on_device() {
     assert_eq!(ids(&engine), vec![4, 5, 6], "ids 1,2,3 (Jan-Mar) purged exactly");
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a MULTI-BOUND timestamp range DELETE/UPDATE
+/// (`ts >= X AND ts <= Y`) on an ELIDED table resolves ON THE DEVICE. A timestamp is i64 micros in the
+/// i64 section, so the AND now lowers on the i64 buffer VM (the SAME path int8 AND/OR uses) — the DML
+/// builder emits `And(Column(ts) >= Int8Literal, Column(ts) <= Int8Literal)`, `resident_device_int_
+/// column_offset` resolves the timestamp column to the i64 section, and `compile_predicate_program`
+/// emits `CompareScalarI64` per bound. No host store, no new kernel. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    // ids 1..=6 at ts = 2020-01..06-01.
+    let mut txn = 2u64;
+    engine
+        .execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, '2020-01-01 00:00:00')")
+        .unwrap();
+    txn += 1;
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    for (id, month) in (2..=6i64).zip(2..=6) {
+        engine
+            .execute_dml_concurrent(
+                txn,
+                &format!("INSERT INTO t VALUES ({id}, '2020-0{month}-01 00:00:00')"),
+            )
+            .unwrap();
+        txn += 1;
+    }
+    assert!(engine.table_install_elided("t"), "table must elide first");
+
+    let ids = |engine: &Engine| -> Vec<i64> {
+        let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
+            unreachable!()
+        };
+        let mut out: Vec<i64> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n as i64,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>());
+
+    // MULTI-BOUND range DELETE (2020-02-01 <= ts <= 2020-04-01 -> ids 2,3,4) — the AND path — ON DEVICE.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(
+            txn,
+            "DELETE FROM t WHERE ts >= '2020-02-01 00:00:00' AND ts <= '2020-04-01 00:00:00'",
+        )
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a multi-bound timestamp range DELETE must RESOLVE on the device"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a multi-bound timestamp range DELETE must NOT de-elide"
+    );
+    assert_eq!(ids(&engine), vec![1, 5, 6], "ids 2,3,4 (Feb-Apr) purged exactly");
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, wider-type range DML): a NUMERIC range DELETE/UPDATE on an ELIDED table
 /// resolves ON THE DEVICE — the DML predicate builder emits `Column(num) <op> NumericLiteral(dec)`, lowered
 /// by the numeric peephole via the i128 compare kernel (rescaled to the column scale), which ALSO handles

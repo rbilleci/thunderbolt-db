@@ -1774,6 +1774,11 @@ fn predicate_vm_elem_type(
     {
         Some(ResidentElemType::I64)
     } else {
+        // NB: Timestamp is deliberately NOT folded into the I64 case here — the NULLABLE-column read
+        // branch keys off this helper and must keep routing a nullable timestamp to its dedicated 3VL
+        // temporal peephole (whose literal is a parsed micros, not an Int8Literal the generic VM emits).
+        // The non-null timestamp AND/OR path checks i64-section columns LOCALLY (see
+        // `try_lower_timestamp_predicate`) so it does not disturb that routing.
         None
     }
 }
@@ -8334,8 +8339,10 @@ impl Engine {
     /// non-timestamp predicate. Timestamp `AND`/`OR` / arithmetic, and a timestamp compared to a
     /// non-timestamp value, are hard errors -- never a silent mis-answer.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn try_lower_timestamp_predicate(
         &self,
+        predicate: &ResidentExpr,
         compare: ResidentBinaryOp,
         lhs: &ResidentExpr,
         rhs: &ResidentExpr,
@@ -8347,15 +8354,44 @@ impl Engine {
         if !(expr_mentions_timestamp(lhs, table) || expr_mentions_timestamp(rhs, table)) {
             return Ok(None);
         }
-        let Some(cmp) = predicate_compare_code(compare) else {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "the general GPU executor supports only simple timestamp comparisons (timestamp \
-                 AND/OR and arithmetic are follow-ons)"
-                    .to_string(),
-            )));
-        };
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        let Some(cmp) = predicate_compare_code(compare) else {
+            // AND/OR (ADR-006 multi-bound timestamp DML): a timestamp is i64 micros in the i64
+            // section, so a TIMESTAMP-ONLY (i64-section) AND/OR lowers via the i64 buffer VM — the
+            // SAME path int8 AND/OR uses (`compile_predicate_program` emits `CompareScalarI64` for
+            // each `Int8Literal` bound the DML builder produced; `resident_device_int_column_offset`
+            // resolves the timestamp column to the i64 section). Gate LOCALLY on every column being an
+            // i64 section (Int8/Timestamp) — NOT via `predicate_vm_elem_type`, which the nullable-read
+            // branch keys off (folding Timestamp in there would divert nullable-timestamp 3VL reads).
+            // A MIXED timestamp/other-type predicate fails this check → clean error, never a silent
+            // mis-answer at one element width. (`compile_predicate_program` itself errors cleanly if a
+            // bound is not an `Int8Literal` — e.g. a `TextLiteral` from a non-DML build — so it can
+            // never mis-read a text needle against the i64 column.)
+            let mut cols = Vec::new();
+            collect_expr_columns(predicate, &mut cols);
+            let all_i64_section = !cols.is_empty()
+                && cols.iter().all(|&col| {
+                    matches!(
+                        table.columns.get(col).map(|column| column.ty),
+                        Some(SqlType::Int8 | SqlType::Timestamp)
+                    )
+                });
+            if all_i64_section {
+                let mut program = Vec::new();
+                let mut needles: Vec<Vec<u8>> = Vec::new();
+                compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
+                return device_memory
+                    .run_expr_predicate_filter(&program, row_count, ResidentElemType::I64)
+                    .map(Some)
+                    .map_err(map_err);
+            }
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports timestamp AND/OR only over a timestamp-only \
+                 (i64) predicate; a mixed-type timestamp AND/OR and arithmetic are follow-ons"
+                    .to_string(),
+            )));
         };
         match (
             timestamp_column_index(lhs, table),
@@ -9403,6 +9439,7 @@ impl Engine {
         // the int8 compare kernels). BEFORE the text path (the literal is a string). None for a
         // non-timestamp predicate; errors on timestamp AND/OR / arithmetic / mixed.
         if let Some(indices) = self.try_lower_timestamp_predicate(
+            predicate,
             *compare,
             lhs,
             rhs,
