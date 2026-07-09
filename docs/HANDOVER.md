@@ -5,7 +5,10 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `be6bd91f` (CPU-ENGINE RETIREMENT — TEN merged wins: TEXT-EQUALITY
+**Updated:** 2026-07-09. **Base:** `main` @ `ba02918b` (CPU-ENGINE RETIREMENT — ELEVEN merged wins: UUID + BOOL
+EQUALITY DELETE/UPDATE resolve ON-DEVICE (builder arms → existing `try_lower_uuid_predicate` (b128 byte compare) /
+`try_lower_bool_predicate` (bitmap→mask); + a bool materialize bitmap arm; CHARTER-PURE, no host store, no new
+kernel; `=` only) `ba02918b`; TEXT-EQUALITY
 DELETE/UPDATE resolves ON-DEVICE (`text_col='lit'` lowers to `TextLiteral` → existing device byte-exact text kernel
 `try_lower_text_predicate` + device text materialize + recheck; CHARTER-PURE, no host store, no new kernel; `=` only,
 text has no device ordering) `be6bd91f`; MULTI-STATEMENT
