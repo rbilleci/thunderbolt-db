@@ -8776,23 +8776,11 @@ impl Engine {
             row_ids.is_none_or(|ids| ids.len() == new_rows.len()),
             "row_ids must parallel new_rows"
         );
-        // Audit DO-NOT-SHIP fix: a NULL in an appended row would need a validity bitmap, but the open
-        // shard this path appends into is bitmap-free by construction (the eligibility check below
-        // requires `resident_device_null_columns.is_empty()`) and this append writes a NULL int4 as a
-        // placeholder 0 WITHOUT creating/maintaining a bitmap. The device aggregate / DISTINCT / GROUP BY
-        // routes derive NULL-ness solely from the bitmap, so an appended NULL would read as a phantom 0
-        // (wrong results vs the re-admit baseline). Decline -> the caller re-admits, which BUILDS the
-        // correct bitmap; thereafter the table has a null column so this path always declines it. (Bitmap
-        // maintenance on append is a later slice.)
-        if new_rows
-            .iter()
-            .any(|row| row.iter().any(|v| matches!(v, SqlValue::Null)))
-        {
-            return false;
-        }
         // S-d2b: a SHARD-resident table (the segmented layout, default-OFF flag) appends to its OPEN shard's
         // headroom instead of the single buffer. (Admission publishes a table to shards XOR snapshots, so
-        // the two paths never overlap for one table.)
+        // the two paths never overlap for one table.) ADR-006 (NULL coverage): the shard path now handles a
+        // NULL in an appended row by rolling a DENSE shard whose validity bitmaps the payload builder
+        // constructs (like TEXT), so a NULL insert STAYS ELIDED instead of de-eliding via re-admit.
         if self
             .read_state
             .residency
@@ -8802,6 +8790,19 @@ impl Engine {
             .is_some_and(|shards| !shards.is_empty())
         {
             return self.try_append_to_resident_open_shard(table, new_rows, created_by, row_ids);
+        }
+        // SINGLE-BUFFER path only: a NULL in an appended row would need a validity bitmap, but the single
+        // buffer this path appends into is bitmap-free by construction (the `purely_int4` eligibility below
+        // requires `resident_device_null_columns.is_empty()`) and this append writes a NULL int4 as a
+        // placeholder 0 WITHOUT a bitmap. The device aggregate / DISTINCT / GROUP BY routes derive NULL-ness
+        // solely from the bitmap, so an appended NULL would read as a phantom 0. Decline -> the caller
+        // re-admits, which BUILDS the correct bitmap. (The SHARD path above now maintains bitmaps on the
+        // rollover, so it no longer declines here; only the single-buffer kill-switch layout does.)
+        if new_rows
+            .iter()
+            .any(|row| row.iter().any(|v| matches!(v, SqlValue::Null)))
+        {
+            return false;
         }
         // SV6 defensive: an UPDATE-appended NEW VERSION must be stamped + hidden from older readers,
         // and the single unified buffer carries no per-row version regions — decline and let the
@@ -8923,6 +8924,12 @@ impl Engine {
             .memory_pressured_gpu_ids
             .clone();
         let k = new_rows.len();
+        // ADR-006 (NULL coverage): does this appended BATCH carry any NULL? A null-bearing batch cannot
+        // append in place (the in-place chunk encoder has no validity-bitmap channel); it rolls a DENSE
+        // shard whose bitmaps the payload builder constructs — exactly like a text column.
+        let batch_has_null = new_rows
+            .iter()
+            .any(|row| row.iter().any(|v| matches!(v, SqlValue::Null)));
         // Read the OPEN (last) shard's state once.
         let (
             shard_id,
@@ -8934,6 +8941,7 @@ impl Engine {
             shard_numeric_names,
             shard_bool_layouts,
             shard_text_layouts,
+            shard_null_layouts,
             gpu_id,
             schema,
             max_shard_id,
@@ -8958,6 +8966,7 @@ impl Engine {
                 open.resident_device_numeric_columns.clone(),
                 open.resident_device_bool_columns.clone(),
                 open.resident_device_text_columns.clone(),
+                open.resident_device_null_columns.clone(),
                 open.gpu_id,
                 open.schema.clone(),
                 table_shards.iter().map(|s| s.shard_id).max().unwrap_or(0),
@@ -8998,14 +9007,23 @@ impl Engine {
         // TYPE-COVERAGE #14 (text): a text-bearing shard is DENSE (no headroom) -> it never appends in
         // place; force the ROLLOVER branch (the in-place path's chunk encoder rejects text anyway).
         let has_text = !shard_text_layouts.is_empty();
+        // ADR-006 (NULL coverage): a NULL-bearing shard is likewise DENSE (rolled with validity bitmaps), so
+        // it never appends in place; and a null-carrying BATCH must roll a fresh bitmap-bearing dense shard
+        // (the in-place chunk encoder has no validity-bitmap channel — it would write a NULL as a phantom 0).
+        let has_null_shard = !shard_null_layouts.is_empty();
         let num_i32_cols = shard_int4_names.len();
         let num_i64_cols = shard_int8_names.len();
         let num_numeric_cols = shard_numeric_names.len();
         let num_bool_cols = shard_bool_layouts.len();
 
-        // FITS the open shard's headroom -> append IN PLACE (1b-ii on the shard path). Text never
-        // qualifies (dense: row_count == capacity), but gate explicitly so the intent is clear.
-        if !has_text && row_count.checked_add(k).is_some_and(|end| end <= capacity) {
+        // FITS the open shard's headroom -> append IN PLACE (1b-ii on the shard path). Text / null-bearing
+        // shards never qualify (dense: row_count == capacity), and a null-carrying batch is excluded so it
+        // takes the bitmap-building rollover; gate explicitly so the intent is clear.
+        if !has_text
+            && !has_null_shard
+            && !batch_has_null
+            && row_count.checked_add(k).is_some_and(|end| end <= capacity)
+        {
             let Some(shard_device_memory) = self
                 .read_state
                 .residency
@@ -9245,25 +9263,29 @@ impl Engine {
         // never appends in place; the NEXT commit rolls another dense shard. Fixed-width/bool rollovers
         // keep the growth headroom.
         let has_text = column_types.iter().any(|ty| matches!(ty, SqlType::Text));
-        let new_capacity = if has_text {
+        // ADR-006 (NULL coverage): a null-carrying batch rolls a DENSE shard (capacity == k, like text) so
+        // the validity bitmaps are exact for the live rows and the shard never appends in place afterward
+        // (which would need in-place bitmap maintenance). A fixed-width null-FREE batch keeps growth headroom.
+        let new_capacity = if has_text || batch_has_null {
             k
         } else {
             self.shard_size_target()
                 .max(k.saturating_mul(2).next_power_of_two())
         };
-        let (device_payload, text_layouts, bool_layouts, int4_stats) =
+        let (device_payload, text_layouts, bool_layouts, int4_stats, null_layouts) =
             match build_relational_device_payload_with_capacity(
                 &column_names,
                 &column_types,
                 new_rows,
                 new_capacity,
             ) {
-                // NULL-free (the caller rejects NULLs) -> null output is empty; keep the columnar payload +
-                // the int4 zone-map stats (min/max over the k rows) for pruning (S-d3). TYPE-COVERAGE #14:
-                // the bool bitmap AND text (offsets+blob) layouts (offsets into THIS payload) DO carry — a
-                // rolled shard can hold bool/text value columns even though it holds no NULLs.
-                Ok((payload, text_cols, bool_cols, stats, _b128, _null)) => {
-                    (payload, text_cols, bool_cols, stats)
+                // Keep the columnar payload + the int4 zone-map stats (min/max over the k rows) for pruning
+                // (S-d3). TYPE-COVERAGE #14: the bool bitmap AND text (offsets+blob) layouts (offsets into
+                // THIS payload) carry. ADR-006 (NULL coverage): the VALIDITY BITMAP layouts (`null_cols`,
+                // offsets into THIS payload) now ALSO carry, so a null-carrying rollover STAYS ELIDED with
+                // correct NULL-ness (was discarded, forcing a de-elide via re-admit). Null-free batch -> empty.
+                Ok((payload, text_cols, bool_cols, stats, _b128, null_cols)) => {
+                    (payload, text_cols, bool_cols, stats, null_cols)
                 }
                 Err(_) => return false,
             };
@@ -9324,6 +9346,8 @@ impl Engine {
                     + num_i64_cols * std::mem::size_of::<i64>()
                     + num_numeric_cols * 16)
                 + bool_layouts.len() * k.div_ceil(32) * 4
+                // ADR-006 (NULL coverage): each validity bitmap is ceil(k/32) u32 words.
+                + null_layouts.len() * k.div_ceil(32) * 4
                 // TYPE-COVERAGE #14 (text): the offsets section ((k+1)*8) + the bytes blob per column.
                 + text_layouts
                     .iter()
@@ -9339,8 +9363,10 @@ impl Engine {
             resident_device_bool_columns: bool_layouts,
             // TYPE-COVERAGE #14 (text): the DENSE text (offsets+blob) layouts ride the rollover payload.
             resident_device_text_columns: text_layouts,
-            // Rollover shards are fixed-width (i32/i64/b128) + NULL-free by precondition (NULLs rejected).
-            resident_device_null_columns: Vec::new(),
+            // ADR-006 (NULL coverage): the validity-bitmap layouts (offsets into THIS payload) ride the
+            // rollover, so a null-carrying rolled shard reads NULL-correctly on-device + rehydrate. Empty
+            // for a null-free batch (the common case) -> byte-identical to before.
+            resident_device_null_columns: null_layouts,
             gpu_id,
             schema,
             table: table.to_string(),
@@ -10769,9 +10795,6 @@ impl Engine {
             if !shard.is_valid(memory_pressure_active) {
                 return None;
             }
-            if !shard.resident_device_null_columns.is_empty() {
-                return None;
-            }
             if shard.row_count == 0 {
                 continue;
             }
@@ -10782,6 +10805,29 @@ impl Engine {
             let device_memory = shard.device_memory.clone()?;
             let row_id_region = shard.row_id_region.clone()?;
             let rows = shard.row_count;
+            // ADR-006 (NULL coverage): per CATALOG column, the shard's validity bitmap words (ceil(rows/32)
+            // u32, read as i32; bit `slot` = 1 => valid, 0 => NULL) if the column carries one, else `None`
+            // (no NULLs => all-valid). A sparse map: only null-bearing columns have a layout. This lets the
+            // gather (the rehydrate source) materialize a null-bearing shard instead of declining +
+            // hard-erroring, so a null-carrying elided table's rehydrate is CORRECT (was: unrecoverable).
+            let null_bitmaps: Vec<Option<Vec<i32>>> = {
+                let mut per_col = Vec::with_capacity(table.columns.len());
+                for column in &table.columns {
+                    match shard
+                        .resident_device_null_columns
+                        .iter()
+                        .find(|layout| layout.name == column.name)
+                    {
+                        Some(layout) => per_col.push(Some(
+                            device_memory
+                                .read_resident_i32_column(layout.bitmap_byte_offset, rows.div_ceil(32))
+                                .ok()?,
+                        )),
+                        None => per_col.push(None),
+                    }
+                }
+                per_col
+            };
             // Bulk DtoH: identities (2 i32 halves LE per slot), then each column's live prefix.
             let id_halves = row_id_region.read_resident_i32_column(0, rows * 2).ok()?;
             let deleted = match &shard.deleted_by_region {
@@ -10901,7 +10947,18 @@ impl Engine {
                 let row: Vec<SqlValue> = columns
                     .iter()
                     .zip(table.columns.iter())
-                    .map(|(column, catalog_column)| match column {
+                    .enumerate()
+                    .map(|(col_idx, (column, catalog_column))| {
+                        // ADR-006 (NULL coverage): a column with a validity bitmap whose bit for this slot is
+                        // 0 is NULL — short-circuit the decode (the raw section holds a don't-care placeholder
+                        // 0 / empty, exactly what the payload builder wrote). Columns without a bitmap are
+                        // all-valid. Mirrors the on-device M3 read path's NULL semantics.
+                        if let Some(words) = &null_bitmaps[col_idx] {
+                            if (words[slot / 32] as u32 >> (slot % 32)) & 1 == 0 {
+                                return Some(SqlValue::Null);
+                            }
+                        }
+                        match column {
                         GatheredColumn::I32(vals) => {
                             sql_value_from_i32_section(catalog_column.ty, vals[slot])
                         }
@@ -10942,6 +10999,7 @@ impl Engine {
                             blob.get(start..end)
                                 .and_then(|b| std::str::from_utf8(b).ok())
                                 .map(|s| SqlValue::Text(s.to_string()))
+                        }
                         }
                     })
                     .collect::<Option<Vec<SqlValue>>>()?;

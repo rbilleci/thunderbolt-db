@@ -3042,18 +3042,21 @@ impl Engine {
                 None
             };
 
-        // M3-for-shards: recompact each column's NULL VALIDITY BITMAP into the unified buffer (mirrors the
-        // deleted_by region: FILL all-valid, then DtoD-copy each null-bearing shard's bitmap). A column gets a
+        // M3-for-shards: recompact each column's NULL VALIDITY BITMAP into the unified buffer. A column gets a
         // unified bitmap iff SOME surviving shard carries one; the region is 1 bit/row (u32 words, LSB-first,
         // 1 = valid / 0 = NULL), placed 4-aligned after the int4 (+ version) sections. The executor reads it
         // by ABSOLUTE offset (`resident_device_null_column_offset`) and materializes `SqlValue::Null` for a
-        // 0 bit, so the sharded scan stops reading a NULL-stored-0 placeholder as `0`. A null-bearing shard's
-        // live-row prefix MUST start on a 32-row (word) boundary to byte-copy; multi-shard tables are NULL-FREE
-        // by construction (the rollover admit rejects NULLs -> a null-bearing table is a SINGLE shard with
-        // rows_before == 0), so this always holds -- a misaligned null-bearing shard errors rather than
-        // mis-copy bits (never a wrong result). No null-bearing shard -> zero extra bytes, byte-identical read.
+        // 0 bit, so the sharded scan stops reading a NULL-stored-0 placeholder as `0`. ADR-006 (NULL coverage):
+        // a null-bearing table is now MULTI-shard (a NULL insert rolls a dense shard), so the region is
+        // PRE-FILLED 0xFF (all valid) and each null-bearing shard's bits are repacked with the ALIGNMENT-FREE
+        // per-bit gather kernel (`gather_null_bitmap_from_shard`, which CLEARS only NULL bits) — the same
+        // strategy as the bool bitmaps, since a shard's `rows_before` is generally not 32-row aligned and a
+        // byte-copy would land its bits in the wrong destination word. No null-bearing shard -> zero extra
+        // bytes, byte-identical read.
         let mut unified_null_columns: Vec<crate::relational_model::ResidentDeviceNullBitmapLayout> =
             Vec::new();
+        // (dst_bitmap_offset, dst_base_row, src_device_ptr, src_bitmap_offset, count) per (column, shard).
+        let mut null_gather_ops: Vec<(u64, u32, u64, u64, u32)> = Vec::new();
         {
             // Union of null-bearing column names across surviving shards, in catalog order (deterministic).
             let null_col_names: Vec<String> = table
@@ -3088,21 +3091,18 @@ impl Engine {
                         .iter()
                         .find(|n| &n.name == name)
                     {
-                        if !rows_before.is_multiple_of(32) {
-                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                "sharded NULL recompaction: shard live prefix ({rows_before} rows) is not \
-                                 32-row aligned for column \"{name}\" (unreachable: multi-shard is NULL-free)"
-                            ))));
+                        // Alignment-free per-bit repack (like bool): the kernel places source local row `l`
+                        // at unified row `rows_before + l`, clearing only NULL bits — no 32-row-alignment
+                        // requirement on `rows_before`, so a null-bearing shard at any offset is correct.
+                        if row_count > 0 {
+                            null_gather_ops.push((
+                                col_offset,
+                                rows_before as u32,
+                                *device_ptr,
+                                layout.bitmap_byte_offset,
+                                row_count as u32,
+                            ));
                         }
-                        // The shard bitmap is capacity-strided; its first ceil(row_count/32) words hold the
-                        // live bits (trailing bits map to rows past the table end -> don't-care).
-                        let shard_words = row_count.div_ceil(32);
-                        segments.push(gpu_db_execution::RecompactSegment {
-                            src_device_ptr: *device_ptr,
-                            src_byte_offset: layout.bitmap_byte_offset,
-                            dst_byte_offset: col_offset + (rows_before / 32) * 4,
-                            byte_len: shard_words * 4,
-                        });
                     }
                     rows_before = rows_before.saturating_add(row_count);
                 }
@@ -3283,6 +3283,17 @@ impl Engine {
                     )))
                 })?;
         }
+        // ADR-006 (NULL coverage): repack each null-bearing shard's validity bits into the pre-filled-0xFF
+        // unified regions with the alignment-free per-bit gather kernel (DtoD). A failure declines the read.
+        for (dst_off, dst_base, src_ptr, src_off, count) in &null_gather_ops {
+            unified_mem
+                .gather_null_bitmap_from_shard(*dst_off, *dst_base, *src_ptr, *src_off, *count)
+                .map_err(|err| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "sharded null bitmap gather kernel failed: {err}"
+                    )))
+                })?;
+        }
         // TYPE-COVERAGE #14 (text): rebase each shard's offsets into the unified offsets section (DtoD,
         // after the blob byte-copies above). A failure declines the whole sharded read.
         for (dst_off, dst_base, blob_base, src_ptr, src_off, count) in &text_rebase_ops {
@@ -3359,8 +3370,9 @@ impl Engine {
         // scalability-ledger #4/#8) — locate finds the exact shard even when [min,max] can't exclude any.
         // M3-for-shards: the point-index route gathers RAW i32 slots (no validity bitmap), so it would read a
         // NULL-stored-0 as 0 while the scan below is now NULL-aware -> SKIP it for a null-bearing table so the
-        // NULL-aware scan serves it (null-bearing => single-shard, so this never costs the many-shard win).
-        // The `..._null_blind_matches_scan` differential is the tripwire that this decline keeps route == scan.
+        // NULL-aware scan serves it. (ADR-006: a null-bearing table can now be MULTI-shard — a NULL insert
+        // rolls a dense shard — so this may forgo the many-shard point-index win for such tables; correctness
+        // first.) The `..._null_blind_matches_scan` differential is the tripwire that this decline keeps route == scan.
         // (The null check runs on its own lightweight shards load; the route re-validates internally against
         // its own generation-consistent capture, and the unified gather below is NULL-aware regardless.)
         if let Some((filter_idx, needle)) = point_lookup_eq {

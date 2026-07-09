@@ -2057,6 +2057,98 @@ fn gpu_zero_match_dml_keeps_table_elided() {
     assert_eq!(count(&engine), 5, "the matching DELETE removed exactly one row");
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, NULL coverage): an INSERT carrying a NULL used to DE-ELIDE the table
+/// (the in-place append has no validity-bitmap channel, so it declined -> re-admit). Now a null-carrying
+/// batch rolls a DENSE shard whose validity bitmaps the payload builder constructs (like TEXT), so the
+/// table STAYS ELIDED and reads NULL-correctly on-device. And the rehydrate GATHER
+/// (`gather_resident_table_rows_from_device`) now materializes a null-bearing shard (reads the bitmap ->
+/// SqlValue::Null) instead of declining + hard-erroring — so a DML that must rehydrate a null-bearing
+/// elided table de-elides SAFELY (correct), never crashes. Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+
+    let mut txn = 2u64;
+    engine.execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 10)").unwrap();
+    txn += 1;
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // self-guard: no usable GPU
+    }
+    for id in 2..=6i64 {
+        engine
+            .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES ({id}, {})", id * 10))
+            .unwrap();
+        txn += 1;
+    }
+    assert!(engine.table_install_elided("t"), "table must elide first");
+
+    // INSERT a NULL value: must STAY ELIDED (was: de-elide).
+    engine.execute_dml_concurrent(txn, "INSERT INTO t VALUES (7, NULL)").unwrap();
+    txn += 1;
+    assert!(
+        engine.table_install_elided("t"),
+        "a NULL insert must NOT de-elide the table (the rollover builds the validity bitmap)"
+    );
+
+    // Read the NULL back ON-DEVICE (the row set stayed elided). Use the text entry so `IS NULL` (which the
+    // strict hand-rolled parser rejects) routes through the general executor.
+    let read = |engine: &Engine, sql: &str| -> Vec<Vec<SqlValue>> {
+        let mut rows: Vec<Vec<SqlValue>> = engine
+            .execute_relational_select_text(sql)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.to_vec())
+            .collect();
+        rows.sort_by_key(|r| format!("{r:?}"));
+        rows
+    };
+    assert_eq!(
+        read(&engine, "SELECT id, v FROM t WHERE id = 7"),
+        vec![vec![SqlValue::Int4(7), SqlValue::Null]],
+        "the NULL reads back as NULL, not a phantom 0"
+    );
+    assert_eq!(
+        read(&engine, "SELECT COUNT(*) FROM t"),
+        vec![vec![SqlValue::Int8(7)]],
+        "all 7 rows present (6 + the null row)"
+    );
+    // 3VL: IS NULL finds exactly the null row; a value filter excludes it.
+    assert_eq!(
+        read(&engine, "SELECT id FROM t WHERE v IS NULL"),
+        vec![vec![SqlValue::Int4(7)]],
+        "IS NULL finds exactly the null row"
+    );
+    assert!(engine.table_install_elided("t"), "reads must not de-elide the null-bearing table");
+
+    // A DML that must REHYDRATE the null-bearing table (materialize declines a null shard) de-elides
+    // SAFELY now that the gather materializes nulls — no "device-authoritative invariant broken" crash.
+    engine.execute_dml_concurrent(txn, "DELETE FROM t WHERE id = 5").unwrap();
+    assert_eq!(
+        read(&engine, "SELECT COUNT(*) FROM t"),
+        vec![vec![SqlValue::Int8(6)]],
+        "the DELETE removed exactly one row (no crash on the null-bearing rehydrate)"
+    );
+    assert_eq!(
+        read(&engine, "SELECT id, v FROM t WHERE id = 7"),
+        vec![vec![SqlValue::Int4(7), SqlValue::Null]],
+        "the null row survives the rehydrate with its NULL intact"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006): a RANGE / non-point DELETE / UPDATE on an ELIDED table now resolves on
 /// the DEVICE via the predicate scan-locate (`try_resolve_dml_via_predicate_scan` -> the WHERE lowered to a
 /// ResidentExpr, evaluated per shard by `lower_resident_predicate`, each matching slot materialized with

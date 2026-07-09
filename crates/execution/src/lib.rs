@@ -12382,6 +12382,74 @@ DONE:
 }
 "#;
 
+// ADR-006 (NULL coverage): recompact ONE shard's VALIDITY bitmap into the unified buffer at an ARBITRARY
+// (not necessarily 32-row-aligned) destination base — the alignment-free twin of the bool gather. Validity
+// semantics are INVERTED vs bool: 1 = valid, 0 = NULL, and a row/shard WITHOUT a bitmap is all-valid. So the
+// unified region is PRE-FILLED 0xFF (all valid) and this kernel only acts on NULL rows: thread `l` reads
+// source bit `l`, and iff it is 0 (NULL) atomic-AND-CLEARS destination bit `dst_base_row + l`. Valid bits
+// leave the pre-filled 1 untouched; atom.and handles rows from different shards sharing a destination word.
+const NULL_BITMAP_GATHER_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_null_bitmap_gather_shard(
+    .param .u64 dst_ptr,
+    .param .u64 dst_bitmap_offset,
+    .param .u32 dst_base_row,
+    .param .u64 src_ptr,
+    .param .u64 src_bitmap_offset,
+    .param .u32 count
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<12>;
+
+    ld.param.u64 %rd1, [dst_ptr];
+    ld.param.u64 %rd2, [dst_bitmap_offset];
+    ld.param.u32 %r1, [dst_base_row];
+    ld.param.u64 %rd3, [src_ptr];
+    ld.param.u64 %rd4, [src_bitmap_offset];
+    ld.param.u32 %r2, [count];
+
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.u32 %r6, %r4, %r5, %r3;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra DONE;
+
+    // src bit l: word = src[src_off + (l>>5)*4]; bit = (word >> (l&31)) & 1
+    shr.u32 %r7, %r6, 5;
+    and.b32 %r8, %r6, 31;
+    mul.wide.u32 %rd5, %r7, 4;
+    add.u64 %rd6, %rd3, %rd4;
+    add.u64 %rd6, %rd6, %rd5;
+    ld.global.u32 %r9, [%rd6];
+    shr.u32 %r10, %r9, %r8;
+    and.b32 %r10, %r10, 1;
+    // valid (bit==1) -> leave the pre-filled 0xFF; only a NULL (bit==0) clears the dst bit.
+    setp.ne.u32 %p2, %r10, 0;
+    @%p2 bra DONE;
+
+    // dst bit (dst_base_row + l): word = (base+l)>>5 ; bit = (base+l)&31 ; clear mask = ~(1<<bit)
+    add.u32 %r11, %r1, %r6;
+    shr.u32 %r12, %r11, 5;
+    and.b32 %r13, %r11, 31;
+    mov.u32 %r14, 1;
+    shl.b32 %r14, %r14, %r13;
+    not.b32 %r14, %r14;
+    mul.wide.u32 %rd7, %r12, 4;
+    add.u64 %rd8, %rd1, %rd2;
+    add.u64 %rd8, %rd8, %rd7;
+    atom.global.and.b32 %r15, [%rd8], %r14;
+
+DONE:
+    ret;
+}
+"#;
+
 // TYPE-COVERAGE #14 (text): rebase ONE source shard's text offsets into the unified buffer's offsets
 // section. A shard's offsets are RELATIVE to its own bytes blob (start 0); the unified buffer concatenates
 // blobs, so each shard's offsets must have that shard's running `blob_base` added. Thread `i` reads source
@@ -13425,6 +13493,98 @@ impl CudaResidentDeviceMemory {
         ptx.push(0);
         let function =
             primary.cached_function(c"gpu_db_resident_bool_bitmap_gather_shard", &ptx)?;
+
+        let mut dst_ptr_arg = self.device_ptr();
+        let mut dst_off_arg = dst_bitmap_offset;
+        let mut dst_base_arg = dst_base_row;
+        let mut src_ptr_arg = src_device_ptr;
+        let mut src_off_arg = src_bitmap_offset;
+        let mut count_arg = count;
+        let mut args = [
+            (&mut dst_ptr_arg as *mut u64).cast::<c_void>(),
+            (&mut dst_off_arg as *mut u64).cast::<c_void>(),
+            (&mut dst_base_arg as *mut u32).cast::<c_void>(),
+            (&mut src_ptr_arg as *mut u64).cast::<c_void>(),
+            (&mut src_off_arg as *mut u64).cast::<c_void>(),
+            (&mut count_arg as *mut u32).cast::<c_void>(),
+        ];
+        let threads_per_block: u32 = 128;
+        let blocks = count.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        check_cuda(unsafe { cu_ctx_synchronize() })?;
+        Ok(())
+    }
+
+    /// ADR-006 (NULL coverage): gather ONE source shard's VALIDITY bitmap (`count` local rows at
+    /// `src_bitmap_offset` in `src_device_ptr`) into THIS (unified) buffer's validity bitmap at
+    /// `dst_bitmap_offset`, placing the shard's row `l` at unified row `dst_base_row + l`. The unified region
+    /// is PRE-FILLED 0xFF (all valid); the kernel atomic-AND-CLEARS each NULL source bit — the alignment-free
+    /// twin of `gather_bool_bitmap_from_shard`, working at ANY `dst_base_row`. Synchronous (ctx-sync).
+    pub fn gather_null_bitmap_from_shard(
+        &self,
+        dst_bitmap_offset: u64,
+        dst_base_row: u32,
+        src_device_ptr: u64,
+        src_bitmap_offset: u64,
+        count: u32,
+    ) -> Result<(), CudaRuntimeProbeError> {
+        type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        if count == 0 {
+            return Ok(());
+        }
+        if self.device_ptr() == 0 || src_device_ptr == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_ctx_synchronize = unsafe {
+            primary
+                .lib()
+                .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let mut ptx = Vec::with_capacity(NULL_BITMAP_GATHER_PTX.len() + 1);
+        ptx.extend_from_slice(NULL_BITMAP_GATHER_PTX);
+        ptx.push(0);
+        let function =
+            primary.cached_function(c"gpu_db_resident_null_bitmap_gather_shard", &ptx)?;
 
         let mut dst_ptr_arg = self.device_ptr();
         let mut dst_off_arg = dst_bitmap_offset;
