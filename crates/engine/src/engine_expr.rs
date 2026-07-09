@@ -2273,6 +2273,89 @@ impl Engine {
         Some(out)
     }
 
+    /// CPU-ENGINE RETIREMENT (ADR-006): the GENERATION-CONSISTENT twin of [`Self::locate_resident_delete_slots`]
+    /// for the elided-DML predicate RESOLVE (prepare_delete / prepare_update, which run OFF the commit lock).
+    /// For every resident slot matching `predicate`, returns a [`ShardPkHit`] whose device buffer + all three
+    /// version regions (`deleted_by` / `created_by` / `row_id`) + descriptor are CAPTURED FROM THE SAME
+    /// `shards.load()` snapshot the slot was computed against, gated by the W0 `shard_write_locate_cell_live`
+    /// liveness check. This closes the concurrent TOCTOU the slot-only variant would expose to a lock-free
+    /// caller: a reordering re-admit (VACUUM / SV3a recompaction) between two independent `shards.load()`s
+    /// could otherwise apply one generation's slots to another generation's compacted buffer = a wrong row.
+    /// Mirrors `locate_resident_pk_via_shard_index_detailed`'s single-snapshot discipline. `None` = decline
+    /// (the caller rehydrates): not shard-resident, a shard invalid / memory-pressured / catalog-mismatched /
+    /// superseded (W0) / missing its device memory, or a predicate that could not lower on a shard.
+    pub(crate) fn locate_resident_delete_slots_detailed(
+        &self,
+        table: &RelationalTable,
+        predicate: &ResidentExpr,
+    ) -> Option<Vec<crate::engine_retained_read::ShardPkHit>> {
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
+        if table_shards.is_empty() {
+            return None;
+        }
+        let mut constraints: Vec<(usize, i32)> = Vec::new();
+        mandatory_int4_equalities(predicate, &mut constraints);
+        let column_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+        let runtime_snapshot = self.router.runtime().snapshot();
+        let mut out: Vec<crate::engine_retained_read::ShardPkHit> = Vec::new();
+        for shard in table_shards.iter() {
+            // S-d3 zone-map prune (same soundness as the slot-only variant: prune ONLY a stat-carrying shard
+            // that provably excludes every mandatory needle; a no-stat shard is always kept).
+            if !constraints.is_empty()
+                && constraints.iter().any(|(col, needle)| {
+                    shard_zone_map_excludes(
+                        &column_names,
+                        &shard.resident_device_int4_column_stats,
+                        *col,
+                        *needle,
+                    )
+                })
+            {
+                continue;
+            }
+            if shard.schema != table.schema || shard.table != table.name {
+                return None;
+            }
+            let memory_pressure_active = runtime_snapshot
+                .memory_pressured_gpu_ids
+                .contains(&shard.gpu_id);
+            if !shard.is_valid(memory_pressure_active) {
+                return None;
+            }
+            let device_memory = shard.device_memory.clone()?;
+            // W0: the descriptor flags don't see concurrent invalidations — require the authoritative cell to
+            // still publish THIS buffer, else decline (the located slot would address a superseded generation).
+            if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
+                return None;
+            }
+            let descriptor = self.resident_snapshot_for_shard(shard, table);
+            let slots = self
+                .lower_resident_predicate(
+                    predicate,
+                    table,
+                    &descriptor,
+                    &device_memory,
+                    shard.row_count as u64,
+                    None,
+                )
+                .ok()?;
+            // Every hit captures the SAME generation's buffer + regions + descriptor as its slot.
+            for slot in slots {
+                out.push(crate::engine_retained_read::ShardPkHit {
+                    shard_id: shard.shard_id,
+                    slot,
+                    descriptor: descriptor.clone(),
+                    device_memory: device_memory.clone(),
+                    deleted_by: shard.deleted_by_region.clone(),
+                    created_by: shard.created_by_region.clone(),
+                    row_id: shard.row_id_region.clone(),
+                });
+            }
+        }
+        Some(out)
+    }
+
     /// SV4 (GPU-native DELETE): LOCATE the resident slots matching `predicate` + stamp `deleted_by =
     /// commit_seq` on them IN PLACE (O(rows touched)), instead of the O(table) invalidate + re-admit. Returns
     /// `Some(n)` = n slots tombstoned (n may be 0: the predicate matched no resident row -- still a success,

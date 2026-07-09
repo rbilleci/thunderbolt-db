@@ -10,6 +10,66 @@ use super::*;
 /// the seq_scan produced. `None` from the resolver = index-ineligible -> the caller scans.
 pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
 
+/// CPU-ENGINE RETIREMENT (ADR-006): lower a DELETE/UPDATE's `filter_groups` (OR of AND-groups) into an
+/// int4 `ResidentExpr` DNF (`Column(catalog_idx) <op> Int4Literal`, AND within a group, OR across groups)
+/// for the device predicate scan-locate. Restricted to INT4-section columns + Int4 literals (the type
+/// coverage the device predicate VM + the point resolve already guarantee); ANY other leaf (a wider type,
+/// a NULL, a LIKE-prefix, or an empty group) returns `None` so the caller declines to the host rehydrate.
+/// `Column` carries the FULL-CATALOG index, which `lower_resident_predicate` translates to the shard's
+/// int4-section offset (the same convention as `resident_int4_row_predicate`).
+fn dml_filter_groups_to_int4_predicate(
+    table: &RelationalTable,
+    filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+) -> Option<crate::engine_expr::ResidentExpr> {
+    use crate::engine_expr::{ResidentBinaryOp, ResidentExpr};
+    if filter_groups.is_empty() || filter_groups.iter().any(Vec::is_empty) {
+        return None;
+    }
+    let mut dnf: Option<ResidentExpr> = None;
+    for group in filter_groups {
+        let mut conj: Option<ResidentExpr> = None;
+        for (idx, op, value) in group {
+            if table.columns.get(*idx).map(|c| c.ty) != Some(SqlType::Int4) {
+                return None;
+            }
+            let SqlValue::Int4(lit) = value else {
+                return None;
+            };
+            let bop = match op {
+                SelectFilterOp::Eq => ResidentBinaryOp::Eq,
+                SelectFilterOp::Lt => ResidentBinaryOp::Lt,
+                SelectFilterOp::Lte => ResidentBinaryOp::Le,
+                SelectFilterOp::Gt => ResidentBinaryOp::Gt,
+                SelectFilterOp::Gte => ResidentBinaryOp::Ge,
+                SelectFilterOp::LikePrefix => return None,
+            };
+            let leaf = ResidentExpr::Binary {
+                op: bop,
+                lhs: Box::new(ResidentExpr::Column(*idx)),
+                rhs: Box::new(ResidentExpr::Int4Literal(*lit)),
+            };
+            conj = Some(match conj {
+                None => leaf,
+                Some(prev) => ResidentExpr::Binary {
+                    op: ResidentBinaryOp::And,
+                    lhs: Box::new(prev),
+                    rhs: Box::new(leaf),
+                },
+            });
+        }
+        let c = conj?;
+        dnf = Some(match dnf {
+            None => c,
+            Some(prev) => ResidentExpr::Binary {
+                op: ResidentBinaryOp::Or,
+                lhs: Box::new(prev),
+                rhs: Box::new(c),
+            },
+        });
+    }
+    dnf
+}
+
 /// Ledger #18: how much constraint validation `prepare_insert` runs. `Full` everywhere EXCEPT
 /// the wave sequencer's under-lock RE-RESOLVE, where unique/CHECK re-validation of an FK-FREE
 /// table is PROVABLY REDUNDANT — the coverage argument, verified against the sequencer:
@@ -637,11 +697,29 @@ impl Engine {
         // FINGERPRINT of its key columns when they are ALL Eq-covered in the group (device-native
         // compound DELETE/UPDATE — no de-elide). Exactness for both rides the `filter_groups` recheck
         // below.
+        // NON-POINT predicate (an OR of groups): the point-key probe serves only a single Eq group. On an
+        // ELIDED table, resolve it via the DEVICE PREDICATE SCAN-LOCATE before rehydrating (ADR-006).
         let [group] = filter_groups else {
+            if elided {
+                if let Some(matches) =
+                    self.try_resolve_dml_via_predicate_scan(table, filter_groups, visibility)?
+                {
+                    return Ok(Some(matches));
+                }
+            }
             rehydrate_if_elided(self)?;
             return Ok(None);
         };
+        // A range / inequality / multi-filter group is not an Eq point key: `dml_device_probe_key` declines.
+        // On an ELIDED table, resolve it via the device predicate scan-locate before rehydrating (ADR-006).
         let Some((key_id, needle)) = self.dml_device_probe_key(table, group) else {
+            if elided {
+                if let Some(matches) =
+                    self.try_resolve_dml_via_predicate_scan(table, filter_groups, visibility)?
+                {
+                    return Ok(Some(matches));
+                }
+            }
             rehydrate_if_elided(self)?;
             return Ok(None);
         };
@@ -724,6 +802,79 @@ impl Engine {
         // SV5 gate 2 matches for 1 slot -> commit fell back to invalidate+re-admit (caught by the
         // SV6 concurrent hammer). Version slots of one logical row are ONE match.
         matches.dedup_by_key(|(tuple_id, _, _)| *tuple_id);
+        self.read_state
+            .residency
+            .dml_device_resolve_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(matches))
+    }
+
+    /// CPU-ENGINE RETIREMENT (ADR-006): resolve a DELETE/UPDATE's matches on an ELIDED table for a
+    /// NON-POINT predicate (a range like `id > 5`, an inequality, a multi-filter AND-group, or an OR of
+    /// groups) via the DEVICE PREDICATE SCAN-LOCATE, instead of REHYDRATING (de-eliding). The point-key
+    /// fingerprint probe (`dml_device_probe_key`) only serves an Eq point lookup, so every other WHERE used
+    /// to fall to the host — which on an elided table means a full O(table) rehydrate (and, when it matched
+    /// rows, an immediate re-elide: pure churn). This lowers the WHERE to an int4 `ResidentExpr` and
+    /// evaluates it ON-DEVICE per shard (`locate_resident_delete_slots` -> `lower_resident_predicate`);
+    /// each matching LOCAL slot is materialized from the device with SV3b/SV6 visibility applied
+    /// (`materialize_resident_row_via_hit`, so tombstoned / too-new versions never match) and the full
+    /// `filter_groups` is rechecked, so the result equals the host scan. Returns `Ok(Some(matches))` when
+    /// the device resolved it (the table STAYS ELIDED); `Ok(None)` to DECLINE (the caller rehydrates) on a
+    /// non-int4 / unsupported predicate leaf, a locate that could not run, an identity-unknown lineage, or a
+    /// device-read failure. Mirrors the point-probe loop above (same materialize + recheck + row_id dedup).
+    fn try_resolve_dml_via_predicate_scan(
+        &self,
+        table: &RelationalTable,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        visibility: StorageVisibility,
+    ) -> Result<Option<Vec<DmlResolvedMatch>>, EngineError> {
+        // Lower the WHERE to an int4 ResidentExpr DNF; a non-int4 / unsupported leaf declines to the host.
+        let Some(predicate) = dml_filter_groups_to_int4_predicate(table, filter_groups) else {
+            return Ok(None);
+        };
+        // Evaluate the predicate ON-DEVICE per shard -> matching slots WITH each slot's generation-consistent
+        // buffer + version regions + descriptor captured from ONE `shards.load()` (the W0-guarded detailed
+        // locate), so slot + buffer + regions never straddle a concurrent re-admit (prepare runs off-lock).
+        // The slots are visibility-BLIND physical positions; the materialize step applies SV3b/SV6 visibility.
+        let Some(hits) = self.locate_resident_delete_slots_detailed(table, &predicate) else {
+            return Ok(None);
+        };
+        let mut matches: Vec<DmlResolvedMatch> = Vec::new();
+        for hit in &hits {
+            // The host key derives from the row-identity region at the LOCAL slot (mirror the point path).
+            let Some(region) = &hit.row_id else {
+                return Ok(None); // identity-unknown lineage -> host path (A2 discipline)
+            };
+            let Ok(halves) = region.read_resident_i32_column(u64::from(hit.slot) * 8, 2) else {
+                return Ok(None);
+            };
+            let (Some(lo), Some(hi)) = (halves.first(), halves.get(1)) else {
+                return Ok(None);
+            };
+            let row_id = (*lo as u32 as u64) | ((*hi as u32 as u64) << 32);
+            if row_id == u64::MAX {
+                return Ok(None); // unstamped slot: identity unknown -> host path
+            }
+            match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
+                Some(Some(row)) => {
+                    // Full-WHERE recheck (exactness): the device predicate + the host recheck agree, but the
+                    // recheck is the authoritative net (same as the point path's).
+                    if filter_groups.iter().any(|filters| {
+                        filters
+                            .iter()
+                            .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
+                    }) {
+                        matches.push((row_id, relational_row_key(&table.name, row_id), row));
+                    }
+                }
+                Some(None) => continue, // not visible at this snapshot (tombstoned / too-new version)
+                None => return Ok(None), // materialize declined -> host path
+            }
+        }
+        // A logical row can hit in multiple shards (an SV5 update-append: tombstoned old slot + live new
+        // slot), same row_id -> one match (parity with the point path's dedup).
+        matches.sort_by_key(|(row_id, _, _)| *row_id);
+        matches.dedup_by_key(|(row_id, _, _)| *row_id);
         self.read_state
             .residency
             .dml_device_resolve_hits

@@ -2057,6 +2057,106 @@ fn gpu_zero_match_dml_keeps_table_elided() {
     assert_eq!(count(&engine), 5, "the matching DELETE removed exactly one row");
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006): a RANGE / non-point DELETE / UPDATE on an ELIDED table now resolves on
+/// the DEVICE via the predicate scan-locate (`try_resolve_dml_via_predicate_scan` -> the WHERE lowered to a
+/// ResidentExpr, evaluated per shard by `lower_resident_predicate`, each matching slot materialized with
+/// SV3b/SV6 visibility + the full WHERE rechecked) instead of REHYDRATING (de-eliding) in the prepare
+/// phase. A zero-match range stays elided (no churn); a matching range deletes/updates the exact rows and
+/// STAYS ELIDED, with the device resolve counter advancing (non-vacuity). Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_range_dml_resolves_on_device_without_deelide() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    let mut txn = 2u64;
+    engine.execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 10)").unwrap();
+    txn += 1;
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // self-guard: no usable GPU
+    }
+    for id in 2..=8i64 {
+        engine
+            .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES ({id}, {})", id * 10))
+            .unwrap();
+        txn += 1;
+    }
+    assert!(engine.table_install_elided("t"), "table must elide first");
+
+    let ids = |engine: &Engine| -> Vec<i64> {
+        let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
+            unreachable!()
+        };
+        let mut out: Vec<i64> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n as i64,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(ids(&engine), (1..=8).collect::<Vec<_>>());
+
+    // Zero-match RANGE DELETE -> device resolve, no rows, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine.execute_dml_concurrent(txn, "DELETE FROM t WHERE id > 100000").unwrap();
+    txn += 1;
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "zero-match range DELETE must RESOLVE on the device (counter advances)"
+    );
+    assert!(engine.table_install_elided("t"), "zero-match range DELETE must NOT de-elide");
+    assert_eq!(ids(&engine), (1..=8).collect::<Vec<_>>(), "no rows deleted");
+
+    // Matching RANGE DELETE (id > 6) -> deletes ids 7,8 ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine.execute_dml_concurrent(txn, "DELETE FROM t WHERE id > 6").unwrap();
+    txn += 1;
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "matching range DELETE must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("t"), "matching range DELETE must NOT de-elide");
+    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>(), "ids 7,8 deleted exactly");
+
+    // Matching RANGE UPDATE (id <= 2 SET v=0) -> updates ids 1,2 ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine.execute_dml_concurrent(txn, "UPDATE t SET v = 0 WHERE id <= 2").unwrap();
+    txn += 1;
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "matching range UPDATE must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("t"), "matching range UPDATE must NOT de-elide");
+    // The update kept the row set (still ids 1..=6) and set v=0 for ids 1,2.
+    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>(), "UPDATE changed no id set");
+    let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE v = 0").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine.execute_relational_select(&cnt).unwrap().rows.iter().next().and_then(|r| r.first()),
+        Some(&SqlValue::Int8(2)),
+        "exactly ids 1,2 now have v=0"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, audit BLOCKER fix): the `handled=true`-on-empty change lets a data
 /// no-op report HANDLED, but `handled` ALSO drives elision-ENTER — which must be gated on a non-empty
 /// applied set (only a real append/tombstone confirms the device residency). Otherwise a zero-row op on a
