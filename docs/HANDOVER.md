@@ -5,7 +5,10 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `556e3c0b` (CPU-ENGINE RETIREMENT — FOURTEEN merged wins: LIKE-PREFIX
+**Updated:** 2026-07-09. **Base:** `main` @ `2170dee1` (CPU-ENGINE RETIREMENT — FIFTEEN merged wins: UUID INEQUALITIES
+`<`/`>`/`<=`/`>=` DELETE/UPDATE resolve ON-DEVICE (uuid is byte-comparable — device kernel==recheck==PG MSB-first
+byte-wise; builder Eq→all-comparisons) + `col IN (...)` confirmed on-device for int4/text (OR-of-Eq via mask VM, free
+from the equality wins) `2170dee1`; LIKE-PREFIX
 DELETE/UPDATE resolves ON-DEVICE (`text_col LIKE 'p%'` lowers to `Column Like TextLiteral(escaped-p%)` → existing
 device text-LIKE kernel `expr_text_like_scalar_filter`; recheck `starts_with`; parser guarantees device==recheck;
 CHARTER-PURE) `556e3c0b`; NULLABLE-COLUMN
