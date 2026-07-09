@@ -5,9 +5,10 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `86a3ff6f` (CPU-ENGINE RETIREMENT: range/non-point DELETE/UPDATE now
-resolve ON-DEVICE instead of de-eliding — MERGED; declined resident reads → general GPU executor `ebd04717`; point
-zero-match DML stays elided `6f7cad76`; TEXT compound-key uniqueness `df136262`; foundation `fe9af98d`).
+**Updated:** 2026-07-09. **Base:** `main` @ `bb2a2c03` (CPU-ENGINE RETIREMENT — FIVE merged wins: NULL coverage
+(nullable columns stay elided, new alignment-free `NULL_BITMAP_GATHER_PTX` kernel) `bb2a2c03`; range/non-point
+DELETE/UPDATE resolve on-device `86a3ff6f`; point zero-match DML stays elided `6f7cad76`; declined resident reads →
+general GPU executor `ebd04717`; TEXT compound-key uniqueness `df136262`; foundation `fe9af98d`).
 
 **>>> ACTIVE: CPU-ENGINE DELETION (ADR-006) — closing the de-elide/host-fallback triggers <<<** Recon mapped the
 deletion target (`finalize_relational_select` + `rel_exec_helpers.rs` host operators + `CpuMvccExecutionBackend`)
