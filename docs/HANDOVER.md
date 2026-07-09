@@ -5,7 +5,10 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `bd55680a` (CPU-ENGINE RETIREMENT — EIGHT merged wins: NUMERIC range DML (single+multi-bound) `bd55680a`; TIMESTAMP range DML `2fb42ab3`; INT8 range DML
+**Updated:** 2026-07-09. **Base:** `main` @ `db29b8a8` (CPU-ENGINE RETIREMENT — NINE merged wins: MULTI-STATEMENT
+INSERT-batch elision (a group-commit batch keeps its insert-only elided tables ELIDED via one incremental device
+append per table, `InsertPerRow` stamps; was: `to_apply.len()>1` de-elided the whole scope every batched write)
+`db29b8a8`; NUMERIC range DML (single+multi-bound) `bd55680a`; TIMESTAMP range DML `2fb42ab3`; INT8 range DML
 (new `Int8Literal`→`CompareScalarI64`, >i32 bounds on-device) `9e62b882`; NULL coverage (nullable columns stay
 elided, alignment-free `NULL_BITMAP_GATHER_PTX` kernel) `bb2a2c03`; range/non-point DELETE/UPDATE resolve on-device
 `86a3ff6f`; point zero-match DML stays elided `6f7cad76`; declined resident reads → general GPU executor `ebd04717`;
@@ -26,10 +29,16 @@ elided (`6f7cad76` — return HANDLED on an empty applied set + gate elision-ENT
 non-point DELETE/UPDATE resolve ON-DEVICE (`86a3ff6f` — `try_resolve_dml_via_predicate_scan` lowers the WHERE to a
 ResidentExpr + `locate_resident_delete_slots_detailed` single-snapshot+W0 + materialize/visibility/recheck; kills
 O(table) de-elide churn for all int4 range DML). Debugging lesson: a backtrace at `rehydrate_elided_table` is the
-definitive de-elide root-cause tool. REMAINING de-elide/host triggers: WIDER-TYPE range DML (int4-only predicate
-builder — int8/numeric/text range predicates still decline); NULL-bearing shard breaks
-`gather_resident_table_rows_from_device` → `rehydrate_elided_table` HARD-ERRORS (correctness hazard);
-multi-statement/multi-table commits force de-elide (`engine_commit.rs:355`); CHECK/FK block elision. ARCHITECTURAL
+definitive de-elide root-cause tool. **MULTI-STATEMENT batch de-elide PARTIALLY CLOSED (`db29b8a8`):** a
+group-commit batch (`commit_mutation_batch` → `apply_and_publish_committed_inner`, `to_apply.len()>1`) used to
+de-elide EVERY touched elided table up front (the banked per-type elision wins silently reverted under the batcher —
+the SQL-text write path; tests survived only because they issue one statement at a time). Now a batch's insert-only
+elided tables STAY ELIDED via one incremental `try_append` per table (`InsertPerRow` birth stamps, decline →
+rehydrate-with-delta; maintained tables excluded from invalidate+auto-admit). Opus audit SOUND. Root cause: PK/unique
+tables take the immediate single-entry commit (never batch) — only CONSTRAINT-FREE int4 tables batch, and they elide.
+REMAINING de-elide/host triggers: multi-entry batches with a DELETE/UPDATE (or non-DML) still de-elide (insert-only
+this slice); WIDER-TYPE range DML (int8/numeric/timestamp now on-device; text range still declines); NULL-bearing
+shard `gather_resident_table_rows_from_device` edge (mostly closed by `bb2a2c03`); CHECK/FK block elision. ARCHITECTURAL
 GATES (a program, per ADR-012, user chose "shrink achievable surface"): non-resident/over-VRAM tables need the STRATA
 STREAMING EXECUTOR (the documented terminal gate); views/matviews; JOINs beyond the 2-table `=` chain; window
 functions (absent from the grammar). See memory `type-coverage-14`, `scalability-ledger`.
