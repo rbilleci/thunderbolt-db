@@ -2614,6 +2614,130 @@ fn gpu_text_predicate_dml_resolves_on_device() {
     );
 }
 
+/// Shared harness: an elided int4-PK table with one extra typed column, seeded 1-per-commit and admitted.
+/// Returns `None` (self-guard) with no usable GPU. `col_ddl` is the extra column (e.g. "u UUID").
+#[cfg(test)]
+fn gpu_elided_pk_table_with_column(col_ddl: &str, seed: &[(i64, &str)]) -> Option<Engine> {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, &format!("CREATE TABLE t (id INT PRIMARY KEY, {col_ddl})"))
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    let mut txn = 2u64;
+    if let Some((id, v)) = seed.first() {
+        engine
+            .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES ({id}, {v})"))
+            .unwrap();
+        txn += 1;
+    }
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return None; // no usable GPU
+    }
+    for (id, v) in seed.iter().skip(1) {
+        engine
+            .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES ({id}, {v})"))
+            .unwrap();
+        txn += 1;
+    }
+    assert!(engine.table_install_elided("t"), "the table must elide first");
+    Some(engine)
+}
+
+#[cfg(test)]
+fn gpu_ids_of_t(engine: &Engine) -> Vec<i64> {
+    let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
+        unreachable!()
+    };
+    let mut out: Vec<i64> = engine
+        .execute_relational_select(&s)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match r.first() {
+            Some(SqlValue::Int4(n)) => *n as i64,
+            other => panic!("unexpected id: {other:?}"),
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a UUID-EQUALITY DELETE on an ELIDED table resolves ON
+/// THE DEVICE — the DML builder lowers `u = 'uuid'` to a `TextLiteral` the existing device
+/// `try_lower_uuid_predicate` (byte-wise b128 compare) evaluates; the hit materializes its uuid on-device
+/// (b128 arm) for the recheck. No host store, no new kernel. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_uuid_predicate_dml_resolves_on_device() {
+    let a = "'00000000-0000-0000-0000-000000000001'";
+    let b = "'00000000-0000-0000-0000-000000000002'";
+    let Some(engine) =
+        gpu_elided_pk_table_with_column("u UUID", &[(1, a), (2, b), (3, a), (4, b)])
+    else {
+        return;
+    };
+    assert_eq!(gpu_ids_of_t(&engine), vec![1, 2, 3, 4]);
+
+    // DELETE WHERE u = <a> -> ids 1, 3, ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(
+            9,
+            "DELETE FROM t WHERE u = '00000000-0000-0000-0000-000000000001'",
+        )
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a uuid-equality DELETE must RESOLVE on the device"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a uuid-equality DELETE must NOT de-elide"
+    );
+    assert_eq!(gpu_ids_of_t(&engine), vec![2, 4], "exactly the two <a>-uuid rows deleted");
+}
+
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a BOOL-EQUALITY DELETE on an ELIDED table resolves ON
+/// THE DEVICE — the DML builder lowers `flag = true` to a `BoolLiteral` the existing device
+/// `try_lower_bool_predicate` (1-bit bitmap → mask) evaluates; the hit materializes its bool on-device
+/// (new bitmap arm) for the recheck. No host store, no new kernel. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_bool_predicate_dml_resolves_on_device() {
+    let Some(engine) = gpu_elided_pk_table_with_column(
+        "flag BOOL",
+        &[(1, "true"), (2, "false"), (3, "true"), (4, "false")],
+    ) else {
+        return;
+    };
+    assert_eq!(gpu_ids_of_t(&engine), vec![1, 2, 3, 4]);
+
+    // DELETE WHERE flag = true -> ids 1, 3, ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(9, "DELETE FROM t WHERE flag = true")
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a bool-equality DELETE must RESOLVE on the device"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a bool-equality DELETE must NOT de-elide"
+    );
+    assert_eq!(gpu_ids_of_t(&engine), vec![2, 4], "exactly the two flag=true rows deleted");
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, multi-statement elision): a MULTI-ENTRY commit BATCH of INSERTs
 /// (the group-commit batcher grouping GpuBatched inserts under load — the SQL-text write path) now
 /// KEEPS the table ELIDED via ONE incremental device append per table, instead of de-eliding the

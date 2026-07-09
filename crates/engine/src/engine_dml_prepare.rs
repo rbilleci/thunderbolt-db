@@ -52,6 +52,18 @@ fn dml_filter_groups_to_device_predicate(
                 (Some(SqlType::Text), SqlValue::Text(s)) if matches!(op, SelectFilterOp::Eq) => {
                     ResidentExpr::TextLiteral(s.clone())
                 }
+                // UUID / BOOL EQUALITY (ADR-006, charter-pure): reuse the DEVICE equality kernels the
+                // read path already has — uuid via `try_lower_uuid_predicate` (byte-wise b128 compare;
+                // the needle is the canonical uuid string a `TextLiteral` parses back to the same 16
+                // bytes), bool via `try_lower_bool_predicate` (the 1-bit bitmap → mask). The recheck
+                // compares uuid/bool exactly (`compare_sql_values`). `=` only. The WHERE literal is
+                // coerced to the column type at bind (Text→Uuid), so a still-Text value declines here.
+                (Some(SqlType::Uuid), SqlValue::Uuid(bytes)) if matches!(op, SelectFilterOp::Eq) => {
+                    ResidentExpr::TextLiteral(gpu_db_sql::uuid::format_uuid(bytes))
+                }
+                (Some(SqlType::Bool), SqlValue::Bool(v)) if matches!(op, SelectFilterOp::Eq) => {
+                    ResidentExpr::BoolLiteral(*v)
+                }
                 _ => return None,
             };
             let bop = match op {
@@ -948,6 +960,7 @@ impl Engine {
                     | crate::SqlType::Numeric { .. }
                     | crate::SqlType::Uuid
                     | crate::SqlType::Text
+                    | crate::SqlType::Bool
             )
         }) {
             return None;
@@ -1046,6 +1059,23 @@ impl Engine {
                         .ok()?;
                     let text = std::str::from_utf8(&bytes).ok()?.to_string();
                     row.push(SqlValue::Text(text));
+                }
+                crate::SqlType::Bool => {
+                    // BOOL section: a 1-bit-per-row bitmap (LSB-first u32 words). Read the u32 word
+                    // holding THIS slot and extract its bit, byte-identical to the rehydration decode
+                    // (`gather_resident_table_rows_from_device` Bool arm), for one slot only.
+                    let base = crate::relational_model::resident_device_bool_column_offset(
+                        &hit.descriptor,
+                        table,
+                        idx,
+                    )
+                    .ok()?;
+                    let word = hit
+                        .device_memory
+                        .read_resident_i32_column(base + (slot / 32) * 4, 1)
+                        .ok()?;
+                    let bit = (*word.first()? as u32 >> (slot % 32)) & 1;
+                    row.push(SqlValue::Bool(bit == 1));
                 }
                 _ => {
                     let base = crate::relational_model::resident_device_int4_column_offset(
