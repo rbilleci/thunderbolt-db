@@ -2509,6 +2509,93 @@ fn gpu_numeric_range_dml_resolves_on_device() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, multi-statement elision): a MULTI-ENTRY commit BATCH of INSERTs
+/// (the group-commit batcher grouping GpuBatched inserts under load — the SQL-text write path) now
+/// KEEPS the table ELIDED via ONE incremental device append per table, instead of de-eliding the
+/// whole batch scope to the CPU host store (`to_apply.len() > 1` used to rehydrate every touched
+/// elided table). Drives the real path: `commit_mutation_batch` -> `apply_and_publish_committed_inner`
+/// with `to_apply.len() == 3`. A CONSTRAINT-FREE int4 table is elision-eligible AND its INSERTs group
+/// (a unique-index table takes the immediate single-entry commit and never batches). All rows land +
+/// read back on-device, the table stays elided, and every entry took the elided host-install skip
+/// (host_install_elisions += 3 in the one batch). GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_multi_entry_insert_batch_stays_elided() {
+    let mut engine = Engine::new_local();
+    engine.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+
+    let payload = |sql: &str| -> std::sync::Arc<[u8]> { std::sync::Arc::from(sql.as_bytes()) };
+    let commit_batch = |engine: &Engine, items: &[(u64, std::sync::Arc<[u8]>)]| {
+        engine
+            .commit_mutation_batch(items)
+            .map_err(|failure| failure.error)
+            .expect("group commit");
+    };
+
+    // Seed row 1 as a batch of ONE (single-entry path), then admit residency — self-guard on no GPU.
+    commit_batch(&engine, &[(2, payload("INSERT INTO t VALUES (1, 10)"))]);
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    // Two more single-entry commits drive the (now-resident) table into elision — ENTER needs a
+    // handled incremental append.
+    commit_batch(&engine, &[(3, payload("INSERT INTO t VALUES (2, 20)"))]);
+    commit_batch(&engine, &[(4, payload("INSERT INTO t VALUES (3, 30)"))]);
+    assert!(
+        engine.table_install_elided("t"),
+        "the table must be elided before the multi-entry batch"
+    );
+
+    let ids = |engine: &Engine| -> Vec<i64> {
+        let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
+            unreachable!()
+        };
+        let mut out: Vec<i64> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n as i64,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(ids(&engine), (1..=3).collect::<Vec<_>>());
+
+    // THE MULTI-ENTRY BATCH: three INSERTs group-committed as ONE commit (`to_apply.len() == 3`).
+    // Before ADR-006 multi-statement elision, the `to_apply.len() > 1` guard de-elided the scope.
+    let elisions_before = engine.host_install_elisions();
+    commit_batch(
+        &engine,
+        &[
+            (10, payload("INSERT INTO t VALUES (4, 40)")),
+            (11, payload("INSERT INTO t VALUES (5, 50)")),
+            (12, payload("INSERT INTO t VALUES (6, 60)")),
+        ],
+    );
+
+    assert!(
+        engine.table_install_elided("t"),
+        "a multi-entry INSERT batch must NOT de-elide — it stays device-authoritative"
+    );
+    assert_eq!(
+        engine.host_install_elisions() - elisions_before,
+        3,
+        "all three batched INSERTs took the elided host-install skip (multi-entry stayed elided)"
+    );
+    assert_eq!(
+        ids(&engine),
+        (1..=6).collect::<Vec<_>>(),
+        "every batched row landed on-device and reads back exactly"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, audit BLOCKER fix): the `handled=true`-on-empty change lets a data
 /// no-op report HANDLED, but `handled` ALSO drives elision-ENTER — which must be gated on a non-empty
 /// applied set (only a real append/tombstone confirms the device residency). Otherwise a zero-row op on a

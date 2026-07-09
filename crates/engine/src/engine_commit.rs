@@ -272,10 +272,23 @@ impl Engine {
         // table from its STALE store (elided-era rows lost). Rehydrate every elided table in the
         // batch's scope FIRST (under this commit lock; state through committed_seq is fully on
         // device) — the tables de-elide, the applies install normally, the re-admit is truthful.
+        // ADR-006 (multi-statement elision): EXCEPT the insert-only-touched elided tables — a
+        // multi-entry batch (the group-commit batcher grouping GpuBatched INSERTs under load) now
+        // KEEPS those ELIDED via a single incremental device append per table below (parity with the
+        // single-entry incremental path), instead of de-eliding to the CPU host store. A table
+        // touched by a DELETE/UPDATE, or every table in a batch carrying non-DML, still de-elides.
+        let keep_elided: BTreeSet<String> = if to_apply.len() > 1
+            && self.auto_admit_on_commit_enabled()
+            && self.host_install_elision_enabled()
+        {
+            self.batch_insert_only_elided_tables(&to_apply)
+        } else {
+            BTreeSet::new()
+        };
         if to_apply.len() > 1 && self.host_install_elision_enabled() {
             if let Some(scope) = Self::residency_invalidation_scope(&to_apply) {
                 for table_name in &scope {
-                    if self.table_install_elided(table_name) {
+                    if self.table_install_elided(table_name) && !keep_elided.contains(table_name) {
                         let Some(table) = self.relational_catalog_table(table_name) else {
                             continue;
                         };
@@ -295,11 +308,23 @@ impl Engine {
         // Hold the catalog latch across the WHOLE apply loop AND the catalog publish (PART B), so a
         // DDL's working-map mutation + the published-snapshot push are atomic w.r.t. another DDL. Lock
         // order is fixed: commit_mutex (held by the caller) FIRST, then this latch.
-        let handled = {
+        // ADR-006 (multi-statement elision): a keep-elided table's INSERTs accumulate here across ALL
+        // entries of the batch — `rows` in seq-scan order, `row_ids` their host identities, `seqs`
+        // each row's birth commit index (entries span multiple indices, so the append stamps PER ROW
+        // via `AppendCreatedBy::InsertPerRow`, exactly like the concurrent wave flush). One incremental
+        // device append per table after the loop keeps it elided.
+        #[derive(Default)]
+        struct InsertAccum {
+            rows: Vec<Vec<SqlValue>>,
+            row_ids: Vec<u64>,
+            seqs: Vec<Index>,
+        }
+        let (handled, maintained) = {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
             let mut applied: Option<AppliedRowMutation> = None;
             let mut recorded_write_set = false;
+            let mut insert_batch: BTreeMap<String, InsertAccum> = BTreeMap::new();
             for e in &to_apply {
                 commit.sm.apply(e)?;
                 if let Some(m) = self.apply_mvcc_entry(e, cat)? {
@@ -312,6 +337,20 @@ impl Engine {
                     // in production routing.
                     commit.ledger.record(m.write_set(), e.index);
                     recorded_write_set = true;
+                    if let AppliedRowMutation::Insert {
+                        table,
+                        rows,
+                        row_ids,
+                        ..
+                    } = &m
+                    {
+                        if keep_elided.contains(table) {
+                            let acc = insert_batch.entry(table.clone()).or_default();
+                            acc.rows.extend(rows.iter().cloned());
+                            acc.row_ids.extend(row_ids.iter().copied());
+                            acc.seqs.extend(std::iter::repeat_n(e.index, rows.len()));
+                        }
+                    }
                     applied = Some(m);
                 }
                 commit.repl.mark_applied(e.index);
@@ -434,7 +473,16 @@ impl Engine {
                     if self.table_elision_eligible(&snapshot, table_name) {
                         self.set_table_install_elided(table_name, true);
                     }
-                } else if !handled && self.table_install_elided(table_name) {
+                } else if !handled
+                    && self.table_install_elided(table_name)
+                    && !keep_elided.contains(table_name)
+                {
+                    // ADR-006 (multi-statement elision): a keep-elided table is maintained by the
+                    // multi-entry INSERT append below (on the FULL batch), NOT rehydrated/de-elided
+                    // here on just the last entry's delta. `keep_elided` is empty for the single-entry
+                    // and imprecise-scope cases, so this is inert there (behavior preserved); and the
+                    // ENTER arm above needs `handled`, which is false for a multi-entry commit, so a
+                    // keep-elided table never enters via the single-`applied` hook either.
                     let (upserts, removals) = Self::elided_commit_delta(applied_ref);
                     if let Some(table) = cat.relational_catalog.get(table_name) {
                         self.rehydrate_elided_table(
@@ -442,6 +490,49 @@ impl Engine {
                             publish_index.saturating_sub(1),
                             &upserts,
                             &removals,
+                            publish_index,
+                        )?;
+                    }
+                }
+            }
+            // ADR-006 (multi-statement elision): drain the accumulated INSERTs for the keep-elided
+            // tables. ONE incremental device append per table (all the batch's rows, PER-ROW birth
+            // stamps like the concurrent wave flush) keeps the table ELIDED + current. A decline (no
+            // headroom on a single-buffer table, a NULL, a device error) de-elides that ONE table via
+            // a rehydrate carrying the batch's rows as the delta: the append is ATOMIC per call, so on
+            // decline NONE of these rows reached the device and the gather @ C-1 is the pre-commit
+            // state; the de-elided table then falls into the invalidate+re-admit set below. `handled`
+            // is false for a multi-entry commit, so the single-entry lifecycle above skipped these.
+            let mut maintained: BTreeSet<String> = BTreeSet::new();
+            for (table_name, acc) in insert_batch {
+                if acc.rows.is_empty() {
+                    continue;
+                }
+                debug_assert!(
+                    self.table_install_elided(&table_name),
+                    "keep_elided tables stay elided through the apply loop (commit_mutex held)"
+                );
+                let appended = self.try_append_resident_int4_open_shard(
+                    &table_name,
+                    &acc.rows,
+                    crate::engine_residency::AppendCreatedBy::InsertPerRow(&acc.seqs),
+                    Some(&acc.row_ids),
+                );
+                if appended {
+                    maintained.insert(table_name);
+                } else if self.table_install_elided(&table_name) {
+                    let upserts: BTreeMap<u64, Vec<SqlValue>> = acc
+                        .row_ids
+                        .iter()
+                        .copied()
+                        .zip(acc.rows.iter().cloned())
+                        .collect();
+                    if let Some(table) = cat.relational_catalog.get(&table_name) {
+                        self.rehydrate_elided_table(
+                            table,
+                            publish_index.saturating_sub(1),
+                            &upserts,
+                            &Default::default(),
                             publish_index,
                         )?;
                     }
@@ -475,11 +566,19 @@ impl Engine {
                 }
             }
             if !handled {
-                self.invalidate_relational_residency_for_commit(&to_apply, txn_id, publish_index);
+                // ADR-006: SKIP the tables kept elided in place by the multi-entry INSERT append —
+                // invalidating them would re-admit from the (deliberately stale) host store.
+                // `maintained` is empty for the single-entry path (behavior preserved).
+                self.invalidate_relational_residency_for_commit_except(
+                    &to_apply,
+                    &maintained,
+                    txn_id,
+                    publish_index,
+                );
             }
             let prune_below = self.catalog_prune_boundary(publish_index);
             self.publish_catalog_snapshot(cat, publish_index, prune_below);
-            handled
+            (handled, maintained)
         };
         self.publish_committed_seq(publish_index);
         // STRATA S-B: best-effort GPU-residency admission for the committed mutation's tables (flag-gated,
@@ -487,7 +586,10 @@ impl Engine {
         // Skipped when we maintained residency in place above — that table is already resident + current.
         if self.auto_admit_on_commit_enabled() && !handled {
             if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
-                self.auto_admit_resident_tables(&tables);
+                // A maintained table stays elided + current — re-admitting would rebuild it from the
+                // stale host store (de-eliding it). `maintained` is empty for the single-entry path.
+                let admit: BTreeSet<String> = tables.difference(&maintained).cloned().collect();
+                self.auto_admit_resident_tables(&admit);
             }
         }
         Ok(())
@@ -891,6 +993,86 @@ impl Engine {
             }
             None => self.invalidate_relational_residency(txn_id, index),
         }
+    }
+
+    /// Like [`Engine::invalidate_relational_residency_for_commit`] but SKIPS any table in
+    /// `maintained` — the multi-entry INSERT batch kept those ELIDED + current via an in-place device
+    /// append, so they must NOT be invalidated (the re-admit would rebuild them from the deliberately
+    /// stale host store). If the scope is imprecise (`None`) NO table was maintained
+    /// (`batch_insert_only_elided_tables` returns empty there), so the conservative global
+    /// invalidation still runs.
+    fn invalidate_relational_residency_for_commit_except(
+        &self,
+        entries: &[LogEntry],
+        maintained: &BTreeSet<String>,
+        txn_id: TxnId,
+        index: Index,
+    ) {
+        match Self::residency_invalidation_scope(entries) {
+            Some(tables) => {
+                for table in &tables {
+                    if maintained.contains(table) {
+                        continue;
+                    }
+                    self.invalidate_relational_residency_table(table, txn_id, index);
+                }
+            }
+            None => self.invalidate_relational_residency(txn_id, index),
+        }
+    }
+
+    /// ADR-006 (multi-statement elision): the subset of `entries`' tables that a MULTI-ENTRY commit
+    /// can keep ELIDED by an incremental device append instead of de-eliding the whole scope — a
+    /// table touched ONLY by INSERTs in this batch AND already host-install-elided. A table touched by
+    /// any DELETE/UPDATE (device tombstone/version maintenance for a batch is a later slice), and
+    /// EVERY table when the batch contains anything but Insert/Update/Delete (DDL/truncate/other — the
+    /// scope turns imprecise, matching [`Engine::residency_invalidation_scope`] returning `None`), is
+    /// excluded and takes the conservative up-front de-elide. Insert-only is the dominant batched
+    /// shape: the batcher groups INSERTs under load, each of which alone would stay elided via the
+    /// single-entry incremental path — this restores that under batching.
+    fn batch_insert_only_elided_tables(&self, entries: &[LogEntry]) -> BTreeSet<String> {
+        let mut has_insert: BTreeSet<String> = BTreeSet::new();
+        let mut has_other: BTreeSet<String> = BTreeSet::new();
+        for entry in entries {
+            if is_binary_wal_record(&entry.payload) {
+                match decode_binary_record(&entry.payload) {
+                    Ok(crate::wal_binary::BinaryWalRecord::Insert(record)) => {
+                        has_insert.insert(record.table);
+                    }
+                    Ok(crate::wal_binary::BinaryWalRecord::DeleteByKey(record)) => {
+                        has_other.insert(record.table);
+                    }
+                    Ok(crate::wal_binary::BinaryWalRecord::UpdateByKey(record)) => {
+                        has_other.insert(record.table);
+                    }
+                    Err(_) => return BTreeSet::new(),
+                }
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(&entry.payload) else {
+                return BTreeSet::new();
+            };
+            let Ok(command) = parse_command(text) else {
+                return BTreeSet::new();
+            };
+            match command {
+                Command::Insert(insert) => {
+                    has_insert.insert(insert.table);
+                }
+                Command::Update(update) => {
+                    has_other.insert(update.table);
+                }
+                Command::Delete(delete) => {
+                    has_other.insert(delete.table);
+                }
+                // Any DDL / truncate / other command makes the scope imprecise — stay conservative.
+                _ => return BTreeSet::new(),
+            }
+        }
+        has_insert
+            .into_iter()
+            .filter(|table| !has_other.contains(table) && self.table_install_elided(table))
+            .collect()
     }
 
     pub(crate) fn invalidate_relational_residency_for_memory_pressure(&self, gpu_id: u16) {
