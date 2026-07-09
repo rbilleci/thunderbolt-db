@@ -5,7 +5,7 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-08. **Base:** `main` @ `fe9af98d` (device-native compound uniqueness MERGED).
+**Updated:** 2026-07-09. **Base:** `main` @ `df136262` (device-native TEXT compound-key uniqueness MERGED; foundation `fe9af98d`).
 **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
 the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first), updates are
 SUSTAINABLE (F3/U4 version-aware device PK index — dup-tolerant, mixed bench 1.4M TPS / 3 rebuilds),
@@ -85,12 +85,24 @@ back to `coerce_insert_value` (Text -> Uuid via parse_uuid; Text -> Timestamp) w
 leaves a type-mismatch, so `WHERE u='uuid-str'` matches the stored Uuid (also fixes uuid/timestamp WHERE
 DELETEs generally). Audit CLEARED (fallback fires ONLY where the old code hard-errored -> no regression;
 only Text->Uuid/Timestamp newly succeed). So the FIXED-WIDTH compound key types (int + numeric/uuid) are
-now FULLY operational (INSERT-uniqueness + reads + DELETE/UPDATE). **NEXT: Stage 2d text** (variable-length
-blob hashing — the device fold needs a text branch reading offsets+blob; existing GPU text-hash machinery
-at execution/lib.rs:1514/1565 is the reuse candidate; text tables are ROLLOVER-only = many dense shards).
-GAPS: (b) a compound table with a NULL key column OR a text VALUE column de-elides on DELETE/UPDATE; (c)
-reads over a VERSIONED wider-type elided table de-elide (R-ver is int4-only). LEDGERED:
-fused-apply-for-compound, 64-bit fingerprint, text-COMPACTION. See memory `type-coverage-14`,
+now FULLY operational (INSERT-uniqueness + reads + DELETE/UPDATE). **TEXT (Stage 2d) — INSERT-uniqueness +
+reads DONE (`df136262`):** a compound key over a TEXT column now ELIDES + validates uniqueness ON THE
+DEVICE. A text column is variable-length, so it folds to ONE word = the FNV-1a hash of its UTF-8 bytes; the
+device fold kernel `COMPOUND_FOLD_PTX` gains a TEXT SENTINEL branch (`widths[k]==0`) that reads the row's
+`[start,end)` blob span (offsets array + blob, via a new `blob_offsets` kernel param) and hashes the bytes
+BYTE-IDENTICALLY to the host `fnv1a_bytes` — so the device rebuild == the host probe needle. The byte loop
+is UTF-8-exact (zero-extended `ld.global.u8`), not ASCII-only. `materialize_resident_row_via_hit` now
+decodes a resident TEXT slot on-device (single-slot offsets+blob read) so the full-tuple recheck compares
+the actual strings (a collision can't false-23505). `compound_key_type_supported`/`key_column_width_words`
+accept Text (sentinel width 0); single-column keys stay i32-section (arity-aware); non-foldable types
+(bool/float) stay rejected. Independent adversarial opus audit (PTX register liveness, host==device
+byte-exactness, offset addressing, lanes recompute, recheck collision-separation, NULL text, multi-text
+ordering) -> MERGE-SAFE, no defects. **So the ENTIRE compound-key type matrix (int2/4/8, date, timestamp,
+numeric, uuid, text) is now device-native for INSERT-uniqueness + reads.**
+GAPS: text/b128 DELETE/UPDATE BY KEY over a compound table with a text VALUE column or a NULL key column
+de-elides (text-KEY DELETE/UPDATE not yet exercised — INSERT-scoped this slice); (c) reads over a VERSIONED
+wider-type elided table de-elide (R-ver is int4-only). LEDGERED: fused-apply-for-compound, 64-bit
+fingerprint, text-COMPACTION (rollover-only shard proliferation). See memory `type-coverage-14`,
 `scalability-ledger`, `charter-governance-ruling`.
 
 ---
