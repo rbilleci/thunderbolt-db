@@ -5,7 +5,7 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `2fb42ab3` (CPU-ENGINE RETIREMENT — SEVEN merged wins: TIMESTAMP range DML (single-comparison purge) `2fb42ab3`; INT8 range DML
+**Updated:** 2026-07-09. **Base:** `main` @ `bd55680a` (CPU-ENGINE RETIREMENT — EIGHT merged wins: NUMERIC range DML (single+multi-bound) `bd55680a`; TIMESTAMP range DML `2fb42ab3`; INT8 range DML
 (new `Int8Literal`→`CompareScalarI64`, >i32 bounds on-device) `9e62b882`; NULL coverage (nullable columns stay
 elided, alignment-free `NULL_BITMAP_GATHER_PTX` kernel) `bb2a2c03`; range/non-point DELETE/UPDATE resolve on-device
 `86a3ff6f`; point zero-match DML stays elided `6f7cad76`; declined resident reads → general GPU executor `ebd04717`;
