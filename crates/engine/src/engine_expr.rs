@@ -2440,7 +2440,15 @@ impl Engine {
         // (they are pre-publish; the re-admit rebuilds all-live and releases the regions — the
         // same partial-failure argument SV5 documented for tombstone-without-append).
         if deleted_rows.is_empty() {
-            return false;
+            // ADR-006: a ZERO-ROW DELETE (WHERE matched nothing) is a data NO-OP — nothing to tombstone,
+            // the elided table is byte-unchanged. Report it HANDLED (`true`) so the commit path keeps the
+            // table ELIDED instead of treating the no-op as unhandled and REHYDRATING (de-eliding) it — a
+            // pure de-elide trigger on the common `DELETE ... WHERE <no match>` OLTP shape (confirmed via
+            // backtrace: apply_and_publish_committed_inner's `!handled && elided -> rehydrate` arm).
+            // `deleted_rows` is the APPLIED removed set (resolved at apply), so empty == genuinely zero
+            // matches, never a resolution failure. Elision-ENTER is separately gated on a non-empty applied
+            // set in the caller, so this no-op never drives a table INTO elision.
+            return true;
         }
         let Some(table) = cat.relational_catalog.get(table_name) else {
             return false;
@@ -2550,12 +2558,17 @@ impl Engine {
         commit_seq: Index,
         row_ids: Option<&[u64]>,
     ) -> bool {
+        // ADR-006: a ZERO-ROW UPDATE (WHERE matched nothing) is a data NO-OP — `old_rows`/`new_rows` are
+        // both empty (parallel), nothing to tombstone or append, the elided table is byte-unchanged.
+        // Report it HANDLED (`true`) so the commit path keeps the table ELIDED instead of REHYDRATING it
+        // (the `DELETE/UPDATE ... WHERE <no match>` de-elide trigger). Elision-ENTER is separately gated on
+        // a non-empty applied set in the caller, so this no-op never drives a table INTO elision.
+        if old_rows.is_empty() {
+            return new_rows.is_empty();
+        }
         // RETIREMENT A4b: MULTI-ROW — old/new/row_ids must be parallel and identity-complete;
         // ALL tombstones land before ANY append (the locate must run on the pre-append buffer).
-        if old_rows.is_empty()
-            || old_rows.len() != new_rows.len()
-            || !row_ids.is_some_and(|ids| ids.len() == new_rows.len())
-        {
+        if old_rows.len() != new_rows.len() || row_ids.is_none_or(|ids| ids.len() != new_rows.len()) {
             return false;
         }
         // 1. Tombstone every OLD version's slot (locates run on the buffer BEFORE the appends).

@@ -1986,6 +1986,129 @@ fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
     }
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006): a ZERO-MATCH DELETE / UPDATE (a `WHERE` that matches nothing) is a
+/// data NO-OP and must NOT de-elide the table. Confirmed by backtrace that the trigger is the commit
+/// path's `apply_and_publish_committed_inner` `!handled && elided -> rehydrate_elided_table` arm:
+/// `try_tombstone_resident_delete_commit` / `try_update_resident_commit` returned `false` on an empty
+/// applied set, which the commit path treated as "unhandled" and REHYDRATED (de-elided) the table — a pure
+/// de-elide trigger on the common `DELETE/UPDATE ... WHERE <no match>` OLTP shape. The zero-match commit
+/// now reports HANDLED, the table STAYS ELIDED, and the data is byte-unchanged. Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_zero_match_dml_keeps_table_elided() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8, s TEXT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    let mut txn = 2u64;
+    engine
+        .execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 100, 'v1')")
+        .unwrap();
+    txn += 1;
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // self-guard: no usable GPU
+    }
+    for id in 2..=6i64 {
+        engine
+            .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES ({id}, {}, 'v{id}')", id * 100))
+            .unwrap();
+        txn += 1;
+    }
+    assert!(engine.table_install_elided("t"), "table must elide first");
+
+    let count = |engine: &Engine| -> i64 {
+        let Command::Select(s) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+            unreachable!()
+        };
+        match engine.execute_relational_select(&s).unwrap().rows.iter().next().and_then(|r| r.first()) {
+            Some(SqlValue::Int8(n)) => *n,
+            other => panic!("unexpected COUNT: {other:?}"),
+        }
+    };
+    assert_eq!(count(&engine), 6, "6 rows committed");
+
+    // Zero-match POINT DELETE / UPDATE (WHERE pk = <absent>) -> data no-op, must STAY ELIDED. (A RANGE
+    // zero-match de-elides in the PREPARE phase via a separate trigger — the non-point device resolve —
+    // handled in a follow-up slice; this slice closes the point-lookup no-match trigger in the commit path.)
+    for stmt in [
+        "DELETE FROM t WHERE id = 99999",
+        "UPDATE t SET b = 0 WHERE id = 99999",
+    ] {
+        engine.execute_dml_concurrent(txn, stmt).unwrap();
+        txn += 1;
+        assert!(engine.table_install_elided("t"), "zero-match {stmt:?} must NOT de-elide");
+        assert_eq!(count(&engine), 6, "zero-match {stmt:?} changed no rows");
+    }
+
+    // Sanity: a MATCHING DELETE still works + stays elided (the fix didn't break the real path).
+    engine.execute_dml_concurrent(txn, "DELETE FROM t WHERE id = 3").unwrap();
+    assert!(engine.table_install_elided("t"), "a matching DELETE stays elided");
+    assert_eq!(count(&engine), 5, "the matching DELETE removed exactly one row");
+}
+
+/// CPU-ENGINE RETIREMENT (ADR-006, audit BLOCKER fix): the `handled=true`-on-empty change lets a data
+/// no-op report HANDLED, but `handled` ALSO drives elision-ENTER — which must be gated on a non-empty
+/// applied set (only a real append/tombstone confirms the device residency). Otherwise a zero-row op on a
+/// NON-elided / non-resident table would ENTER elision and a later op would hard-error
+/// "device-authoritative invariant broken". This exercises the SERIALIZED commit path (`execute_text`,
+/// where elision-ENTER lives) with an EMPTY eligible never-resident table (per the auditor's reproducer):
+/// the zero-row DELETE produces `Some(rows=[])` -> `try_tombstone` empty-return `true` -> handled; without
+/// the `applied_changed_rows` guard it would ENTER elision on a table with no device backing. Driverless.
+#[test]
+fn zero_row_dml_must_not_enter_elision_on_nonelided_table() {
+    let engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine.set_host_install_elision_enabled(true);
+    engine.set_auto_admit_on_commit(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    // EMPTY, eligible, NON-elided, no device residency. MUST use execute_text (serialized) — the ENTER
+    // block lives there; apply_delete => Some(rows=[]) => try_tombstone empty-return => handled=true.
+    engine
+        .execute_text(2, "DELETE FROM t WHERE id > 100000")
+        .unwrap();
+    assert!(
+        !engine.table_install_elided("t"),
+        "a zero-row DELETE on a non-elided/non-resident table must NOT enter elision"
+    );
+    engine
+        .execute_text(3, "UPDATE t SET v = 0 WHERE id > 100000")
+        .unwrap();
+    assert!(
+        !engine.table_install_elided("t"),
+        "a zero-row UPDATE on a non-elided/non-resident table must NOT enter elision"
+    );
+
+    // A subsequent real INSERT still commits + reads back (without the guard the table would be elided with
+    // no device backing, and this path would hit the rehydrate "invariant broken" hard error).
+    engine.execute_text(4, "INSERT INTO t VALUES (1, 10)").unwrap();
+    engine.execute_text(5, "INSERT INTO t VALUES (2, 20)").unwrap();
+    let Command::Select(s) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine.execute_relational_select(&s).unwrap().rows.iter().next().and_then(|r| r.first()),
+        Some(&SqlValue::Int8(2)),
+        "both inserts visible (no lost rows / no hard error)"
+    );
+}
+
 /// COMPOUND KEYS (wider types, Stage 2a): a compound PRIMARY KEY over i64 (Int8/Timestamp) columns — and
 /// a MIXED int4+int8 key — elides and enforces uniqueness ON THE DEVICE. Each key column folds its i32
 /// WORD decomposition into the surrogate fingerprint (i64 -> [low32, high32] LE, matching the section's LE

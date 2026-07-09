@@ -409,7 +409,22 @@ impl Engine {
                     | AppliedRowMutation::Delete { table, .. }
                     | AppliedRowMutation::Update { table, .. } => table.as_str(),
                 };
+                // ADR-006: a ZERO-ROW DELETE/UPDATE now reports HANDLED (`true`) so it does NOT de-elide an
+                // already-elided table (the no-op is byte-unchanged). But `handled` ALSO drives elision-
+                // ENTER below, and ENTER requires the device residency to be CONFIRMED CURRENT — which only
+                // a NON-EMPTY append/tombstone establishes (they return `false` when the table is not
+                // device-resident; `table_elision_eligible` is catalog-only and checks no residency). A
+                // zero-row op touches the device not at all, so it must NEVER drive ENTER (that would elide a
+                // possibly-non-resident table -> a later rehydrate hard-errors "device-authoritative
+                // invariant broken"). Gate ENTER on the applied set being non-empty; the no-op leaves the
+                // elision state unchanged (neither enters nor exits).
+                let applied_changed_rows = match applied_ref {
+                    AppliedRowMutation::Insert { rows, .. } => !rows.is_empty(),
+                    AppliedRowMutation::Delete { rows, .. } => !rows.is_empty(),
+                    AppliedRowMutation::Update { old_rows, .. } => !old_rows.is_empty(),
+                };
                 if handled
+                    && applied_changed_rows
                     && self.host_install_elision_enabled()
                     && !self.table_install_elided(table_name)
                 {
