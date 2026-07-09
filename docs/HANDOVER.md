@@ -5,7 +5,10 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `ba02918b` (CPU-ENGINE RETIREMENT — ELEVEN merged wins: UUID + BOOL
+**Updated:** 2026-07-09. **Base:** `main` @ `28fe8df8` (CPU-ENGINE RETIREMENT — TWELVE merged wins: MULTI-BOUND
+TIMESTAMP range DELETE/UPDATE resolves ON-DEVICE (`ts>=X AND ts<=Y` lowers on the i64 buffer VM — timestamp is i64
+micros in the int8 section; `resident_device_int_column_offset`+`try_lower_timestamp_predicate` AND/OR path, LOCAL
+i64-section gate so nullable-ts 3VL reads stay on their peephole; CHARTER-PURE) `28fe8df8`; UUID + BOOL
 EQUALITY DELETE/UPDATE resolve ON-DEVICE (builder arms → existing `try_lower_uuid_predicate` (b128 byte compare) /
 `try_lower_bool_predicate` (bitmap→mask); + a bool materialize bitmap arm; CHARTER-PURE, no host store, no new
 kernel; `=` only) `ba02918b`; TEXT-EQUALITY
