@@ -617,6 +617,11 @@ pub(crate) struct ResidencyReadState {
     /// (unique/FK validators). Both answers count — FALSE (no visible row carries the value) is the
     /// load-bearing one. `Relaxed` monotonic counter.
     pub(crate) dml_device_validate_hits: std::sync::atomic::AtomicU64,
+    /// CPU-ENGINE RETIREMENT (ADR-006): count of relational SELECTs that the SPECIALIZED resident route
+    /// DECLINED but the GENERAL GPU Expr executor then served on-device (instead of de-eliding to the CPU
+    /// pinned path). The non-vacuity signal that a wider-type / non-enumerated read shape stayed on the
+    /// GPU — output equality with the CPU oracle can't prove WHICH engine ran. `Relaxed` monotonic counter.
+    pub(crate) general_read_fallback_hits: std::sync::atomic::AtomicU64,
     /// RETIREMENT A4e: tables whose commits ELIDE the host tuple-store + value-index install
     /// (device-authoritative). Entered after first admission when eligible under the default-OFF
     /// flag; LEFT (sticky de-elision) via rehydration when any resolve/gather declines. COW set —

@@ -8342,6 +8342,16 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// CPU-ENGINE RETIREMENT (ADR-006): count of SELECTs the specialized route declined but the GENERAL
+    /// GPU Expr executor served on-device (instead of de-eliding to the CPU pinned path). Non-vacuity
+    /// signal for the read fallback — proves a wider-type/non-enumerated shape stayed on the GPU.
+    pub fn general_read_fallback_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .general_read_fallback_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// PHASE C slice 1: enable/disable the VALUE-INDEX resolve for DELETE/UPDATE prepare (default
     /// ON). OFF = the O(table) seq_scan (the oracle path) — the A/B lever the differentials use.
     pub fn set_dml_value_index_resolve_enabled(&self, on: bool) {

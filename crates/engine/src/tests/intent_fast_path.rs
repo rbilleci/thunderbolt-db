@@ -1852,6 +1852,140 @@ fn gpu_compound_text_key_elides_and_validates_on_device() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006): the DECLINED-shape general-executor read fallback. A wider-type
+/// (int8 / numeric / text) SELECT shape the SPECIALIZED resident route does NOT recognize — a scalar
+/// aggregate, a filtered projection, DISTINCT, GROUP BY, single-key ORDER BY, `SELECT *` over a text
+/// table — used to DE-ELIDE the table and run on the CPU relational engine. It now routes to the GENERAL
+/// GPU Expr executor instead: the read stays ON THE DEVICE (`general_read_fallback_hits` advances) and the
+/// table STAYS ELIDED (no rehydrate), while the result matches the expected (spec) answer. Driverless-safe.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8, g INT8, s TEXT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+
+    let mut txn = 2u64;
+    // A fixed, KNOWN dataset (id 1..=12; b=id*10; g=id%3; s="v{id}"). Insert the first row, then guard on
+    // a usable GPU, then insert the rest — the table elides during ingest and holds the full 12 rows.
+    engine
+        .execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 10, 1, 'v1')")
+        .unwrap();
+    txn += 1;
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // self-guard: no usable GPU
+    }
+    for id in 2..=12i64 {
+        engine
+            .execute_dml_concurrent(
+                txn,
+                &format!("INSERT INTO t VALUES ({id}, {}, {}, 'v{id}')", id * 10, id % 3),
+            )
+            .unwrap();
+        txn += 1;
+    }
+    assert!(
+        engine.table_install_elided("t"),
+        "the wider-type PK'd table must elide before the read fallback is exercised"
+    );
+
+    // Each shape: (SQL, expected rows). Set-valued shapes are compared order-insensitively.
+    let sorted = |mut rows: Vec<Vec<SqlValue>>| {
+        rows.sort_by_key(|r| format!("{r:?}"));
+        rows
+    };
+    let run = |engine: &Engine, shape: &str| -> (bool, bool, Vec<Vec<SqlValue>>) {
+        let before = engine.general_read_fallback_hits();
+        let Command::Select(select) = parse_command(shape).unwrap() else {
+            unreachable!()
+        };
+        let res = engine.execute_relational_select(&select).unwrap();
+        let fired = engine.general_read_fallback_hits() > before;
+        let elided_after = engine.table_install_elided("t");
+        (fired, elided_after, res.rows.iter().map(|r| r.to_vec()).collect())
+    };
+
+    // int8 scalar aggregate: SUM(bigint) -> numeric (PG spec); sum(10..120 step 10) = 780.
+    let cases: Vec<(&str, Vec<Vec<SqlValue>>)> = vec![
+        (
+            "SELECT SUM(b) FROM t",
+            vec![vec![SqlValue::Numeric(gpu_db_sql::Decimal128::new(780, 0))]],
+        ),
+        // int8-filtered projection: b = 50 -> id 5.
+        ("SELECT id FROM t WHERE b = 50", vec![vec![SqlValue::Int4(5)]]),
+        // DISTINCT over an int8 column -> {0,1,2}.
+        (
+            "SELECT DISTINCT g FROM t",
+            vec![
+                vec![SqlValue::Int8(0)],
+                vec![SqlValue::Int8(1)],
+                vec![SqlValue::Int8(2)],
+            ],
+        ),
+        // GROUP BY an int8 column -> each residue class has 4 members.
+        (
+            "SELECT g, COUNT(*) FROM t GROUP BY g",
+            vec![
+                vec![SqlValue::Int8(0), SqlValue::Int8(4)],
+                vec![SqlValue::Int8(1), SqlValue::Int8(4)],
+                vec![SqlValue::Int8(2), SqlValue::Int8(4)],
+            ],
+        ),
+        // single-key ORDER BY on an int8 column + LIMIT -> the 3 smallest b (ids 1,2,3).
+        (
+            "SELECT id FROM t ORDER BY b LIMIT 3",
+            vec![
+                vec![SqlValue::Int4(1)],
+                vec![SqlValue::Int4(2)],
+                vec![SqlValue::Int4(3)],
+            ],
+        ),
+        // SELECT * over a TEXT-bearing table (the resident route excludes text from SELECT *).
+        (
+            "SELECT * FROM t WHERE id = 7",
+            vec![vec![
+                SqlValue::Int4(7),
+                SqlValue::Int8(70),
+                SqlValue::Int8(1),
+                SqlValue::Text("v7".to_string()),
+            ]],
+        ),
+        // EMPTY-filtered scalar aggregate: SUM over zero rows is NULL (PG spec), served on-device
+        // WITHOUT de-eliding (the general executor's empty-set guard returns NULL, not a hard error).
+        (
+            "SELECT SUM(b) FROM t WHERE b = 999999",
+            vec![vec![SqlValue::Null]],
+        ),
+    ];
+
+    for (shape, expected) in cases {
+        let (fired, elided_after, rows) = run(&engine, shape);
+        assert!(
+            fired,
+            "shape {shape:?} must be served by the GENERAL GPU executor (fallback counter must advance), \
+             not de-elided to the CPU engine"
+        );
+        assert!(
+            elided_after,
+            "shape {shape:?} must keep the table ELIDED (the on-device read must not rehydrate)"
+        );
+        assert_eq!(
+            sorted(rows),
+            sorted(expected),
+            "shape {shape:?} result must match the spec answer"
+        );
+    }
+}
+
 /// COMPOUND KEYS (wider types, Stage 2a): a compound PRIMARY KEY over i64 (Int8/Timestamp) columns — and
 /// a MIXED int4+int8 key — elides and enforces uniqueness ON THE DEVICE. Each key column folds its i32
 /// WORD decomposition into the surrogate fingerprint (i64 -> [low32, high32] LE, matching the section's LE

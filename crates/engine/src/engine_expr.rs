@@ -3684,6 +3684,29 @@ impl Engine {
         Ok(result)
     }
 
+    /// CPU-ENGINE RETIREMENT (ADR-006): the `&Select`->general-executor DISPATCH for the DECLINED-shape
+    /// read fallback (`execute_relational_select_instrumented`, when the specialized resident route did
+    /// not recognize the shape). Routes by shape to the correct `src: None` sub-bridge — a `SELECT
+    /// DISTINCT col` to the DISTINCT bridge (which synthesizes `GROUP BY col` and dedups on-device;
+    /// `with_binding` does NOT dedup a bare distinct projection itself), and everything else (GROUP BY /
+    /// single-key ORDER BY / plain projection / scalar aggregate) to the grouped bridge, whose non-grouped
+    /// path runs the plain projection / aggregate. `src: None` lets `with_binding` resolve the payload —
+    /// the whole-table buffer OR the TYPE-COMPLETE unified shard source (THE FLIP), so wider-type
+    /// (int8 / numeric / uuid / bool / text) shapes run on-device, unlike the int4-only
+    /// `execute_resident_sharded_via_general`. Mirrors that method's shape dispatch (distinct-first, then
+    /// grouped for GROUP BY / ORDER BY). Errors (never mis-answers) on a shape it cannot express; the
+    /// caller then serves it from the CPU pinned path.
+    pub(crate) fn execute_resident_select_via_general(
+        &self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        if select.distinct {
+            self.execute_resident_distinct_via_general(select, None, None)
+        } else {
+            self.execute_resident_grouped_via_general(select, None, None)
+        }
+    }
+
     /// Benchmark helper (tests only): run GROUP BY on a resident table with the SINGLE-LEVEL or
     /// TWO-LEVEL kernel selected explicitly, over a full-table scan. Returns the result rows so the
     /// caller can confirm both kernels agree; the caller times repeated calls. Not on the query path.

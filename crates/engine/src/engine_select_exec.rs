@@ -279,7 +279,54 @@ impl Engine {
                 Err(err) => return Err(err),
             }
         }
+        // CPU-ENGINE RETIREMENT (ADR-006): the SPECIALIZED resident route declined this shape (a
+        // wider-type filtered projection / aggregate / GROUP BY / DISTINCT / ORDER BY / OFFSET the
+        // enumerated matcher does not recognize). Before de-eliding to the CPU pinned path (which
+        // REHYDRATES the elided table + runs the host relational engine — the very engine ADR-006
+        // deletes), route it to the GENERAL GPU Expr executor: `execute_resident_grouped_via_general`
+        // binds the `&Select`, rebuilds the WHERE as a `ResidentExpr`, and runs projection / aggregate /
+        // GROUP BY / DISTINCT / ORDER BY / LIMIT / OFFSET ON THE DEVICE for every retained type, over the
+        // whole-table buffer or the unified shard source (versioned-aware). It is GATED on residency: the
+        // general path has NO CPU fallback and hard-errors on a non-resident table, so a table with no
+        // snapshot/shards must skip it and take the CPU pinned path (which serves non-resident tables).
+        // The general executor ERRORS (never mis-answers) on a shape it cannot express, so on ANY error we
+        // fall to the CPU pinned path, which serves it — honest partial coverage that only ever ADDS
+        // on-device reach, never a wrong result. `general_read_fallback_hits` proves the on-device path
+        // fired (a silent de-elide would pass output equality while abandoning the elision).
+        if self.table_is_gpu_resident(&select.table) {
+            on_pinned();
+            match self.execute_resident_select_via_general(select) {
+                Ok(result) => {
+                    self.read_state
+                        .residency
+                        .general_read_fallback_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(result);
+                }
+                // Residency invalidated mid-statement, OR a shape the general executor cannot express:
+                // serve it from the CPU pinned path (de-eliding an elided table if needed). The hook
+                // already fired above, so this uses the no-op-hook entry.
+                Err(_) => return self.execute_relational_select_cpu_pinned(select),
+            }
+        }
         self.execute_relational_select_cpu_pinned_instrumented(select, on_pinned)
+    }
+
+    /// CPU-ENGINE RETIREMENT (ADR-006): is `table` GPU-resident right now — i.e. does it have a published
+    /// single-buffer residency snapshot OR at least one live shard? The general Expr executor has no CPU
+    /// fallback and hard-errors on a non-resident table, so the declined-route fallback gates on this
+    /// (mirrors the `execute_relational_select_text` residency gate). A racing invalidation between this
+    /// check and the executor's own load surfaces as an `is_residency_invalidated` error, which the
+    /// fallback already routes to the CPU pinned path.
+    fn table_is_gpu_resident(&self, table: &str) -> bool {
+        self.relational_residency_snapshot(table).is_some()
+            || self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get(table)
+                .is_some_and(|shards| !shards.is_empty())
     }
 
     /// The CPU pinned-read path for a relational SELECT (write-half MVCC, Stage 4): bind, pin ONE
