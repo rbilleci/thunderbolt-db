@@ -31,6 +31,15 @@ fn dml_filter_groups_to_device_predicate(
     for group in filter_groups {
         let mut conj: Option<ResidentExpr> = None;
         for (idx, op, value) in group {
+            // LIKE-prefix is a TEXT-ONLY op (audit hardening): a non-text column with a `LikePrefix`
+            // whose literal coerced to that type (e.g. `ts LIKE '2020-...%'` → Timestamp) must NOT
+            // ride an unguarded numeric/timestamp value_leaf arm — decline cleanly here rather than
+            // emit a `Column Like <non-text-literal>` that only errors deeper in lowering.
+            if matches!(op, SelectFilterOp::LikePrefix)
+                && table.columns.get(*idx).map(|c| c.ty) != Some(SqlType::Text)
+            {
+                return None;
+            }
             // The value leaf by the column's section: Int4 -> Int4Literal (I32 VM); Int8 / Timestamp ->
             // Int8Literal (I64 VM — a timestamp is i64 microseconds in the same i64 section, lowered by the
             // timestamp peephole which accepts a raw-micros Int8Literal); Numeric -> NumericLiteral (I128 VM
@@ -64,6 +73,16 @@ fn dml_filter_groups_to_device_predicate(
                 (Some(SqlType::Bool), SqlValue::Bool(v)) if matches!(op, SelectFilterOp::Eq) => {
                     ResidentExpr::BoolLiteral(*v)
                 }
+                // TEXT `LIKE 'prefix%'` (ADR-006, charter-pure): reuse the DEVICE text-LIKE kernel the
+                // read path already has (`try_lower_text_predicate`'s `expr_text_like_scalar_filter`).
+                // A `LikePrefix` bound carries the BARE literal prefix; reconstruct the faithful escaped
+                // `LIKE '<prefix>%'` pattern (byte-identical to the read path's `map_predicate_node`), so
+                // the device match == the recheck's `left.starts_with(prefix)`. Text columns only.
+                (Some(SqlType::Text), SqlValue::Text(s))
+                    if matches!(op, SelectFilterOp::LikePrefix) =>
+                {
+                    ResidentExpr::TextLiteral(crate::engine_expr::like_pattern_for_literal_prefix(s))
+                }
                 _ => return None,
             };
             let bop = match op {
@@ -72,7 +91,9 @@ fn dml_filter_groups_to_device_predicate(
                 SelectFilterOp::Lte => ResidentBinaryOp::Le,
                 SelectFilterOp::Gt => ResidentBinaryOp::Gt,
                 SelectFilterOp::Gte => ResidentBinaryOp::Ge,
-                SelectFilterOp::LikePrefix => return None,
+                // Only reached for a text column (the value_leaf `LikePrefix` arm above; every other
+                // type's `LikePrefix` already declined at value_leaf) → the device text-LIKE op.
+                SelectFilterOp::LikePrefix => ResidentBinaryOp::Like,
             };
             let leaf = ResidentExpr::Binary {
                 op: bop,

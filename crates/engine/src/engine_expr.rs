@@ -264,7 +264,7 @@ fn grouped_projection_to_aggregates(projection: &SelectProjection) -> Option<Sel
 /// escapes). To match the legacy probe's literal-byte prefix match EXACTLY, escape every LIKE-special byte
 /// in the prefix (`%`, `_`, `\`) and append a `%`: the resulting `LIKE '<escaped>%'` means "starts with the
 /// literal prefix" — `compile_like_pattern` then yields the same byte-prefix semantics the probe had.
-fn like_pattern_for_literal_prefix(prefix: &str) -> String {
+pub(crate) fn like_pattern_for_literal_prefix(prefix: &str) -> String {
     let mut pattern = Vec::with_capacity(prefix.len() + 1);
     for &byte in prefix.as_bytes() {
         if matches!(byte, b'%' | b'_' | b'\\') {

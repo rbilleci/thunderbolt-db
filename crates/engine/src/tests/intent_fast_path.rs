@@ -2796,6 +2796,81 @@ fn gpu_text_predicate_dml_resolves_on_device() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a `LIKE 'prefix%'` DELETE on an ELIDED table resolves
+/// ON THE DEVICE — the DML builder lowers `name LIKE 'bo%'` to `Column(name) Like TextLiteral('bo%')`
+/// (the escaped pattern, byte-identical to the read path), which `try_lower_text_predicate` evaluates via
+/// the existing DEVICE text-LIKE kernel `expr_text_like_scalar_filter`; the recheck re-applies
+/// `starts_with`. Matches EVERY row with the prefix ('bob' AND 'bobby'), none without. No host store,
+/// no new kernel. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_like_prefix_dml_resolves_on_device() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+
+    engine
+        .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 'alice')")
+        .unwrap();
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    for (id, name) in [(2i64, "bob"), (3, "bobby"), (4, "carol")] {
+        engine
+            .execute_dml_concurrent(id as u64 + 1, &format!("INSERT INTO t VALUES ({id}, '{name}')"))
+            .unwrap();
+    }
+    assert!(engine.table_install_elided("t"), "the text table must elide first");
+
+    let ids = |engine: &Engine| -> Vec<i64> {
+        let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
+            unreachable!()
+        };
+        let mut out: Vec<i64> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n as i64,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(ids(&engine), vec![1, 2, 3, 4]);
+
+    // LIKE-prefix DELETE (name LIKE 'bo%' -> 'bob' AND 'bobby' = ids 2,3) ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(9, "DELETE FROM t WHERE name LIKE 'bo%'")
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a LIKE-prefix DELETE must RESOLVE on the device"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a LIKE-prefix DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        vec![1, 4],
+        "exactly the 'bo'-prefixed rows (bob, bobby) deleted; alice/carol kept"
+    );
+}
+
 /// Shared harness: an elided int4-PK table with one extra typed column, seeded 1-per-commit and admitted.
 /// Returns `None` (self-guard) with no usable GPU. `col_ddl` is the extra column (e.g. "u UUID").
 #[cfg(test)]
