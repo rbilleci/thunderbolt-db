@@ -5,7 +5,25 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `df136262` (device-native TEXT compound-key uniqueness MERGED; foundation `fe9af98d`).
+**Updated:** 2026-07-09. **Base:** `main` @ `ebd04717` (CPU-ENGINE RETIREMENT: DECLINED resident reads now route to
+the GENERAL GPU executor instead of de-eliding — MERGED; TEXT compound-key uniqueness `df136262`; foundation `fe9af98d`).
+
+**>>> ACTIVE: CPU-ENGINE DELETION (ADR-006) — closing the de-elide/host-fallback triggers <<<** Recon mapped the
+deletion target (`finalize_relational_select` + `rel_exec_helpers.rs` host operators + `CpuMvccExecutionBackend`)
+and the trigger taxonomy. FIRST LEVER SHIPPED (`ebd04717`): when the SPECIALIZED resident-route classifier declines a
+SELECT shape on a GPU-RESIDENT table, `execute_relational_select_instrumented` now routes it to the GENERAL GPU Expr
+executor (`execute_resident_select_via_general`: DISTINCT→distinct bridge, else grouped bridge, src=None so
+`with_binding` resolves the whole-table or TYPE-COMPLETE unified shard source) instead of de-eliding to the CPU pinned
+path. Wider-type filtered projections / scalar aggregates / DISTINCT / GROUP BY / single-key ORDER BY / `SELECT *`
+over text / OFFSET / empty-aggregate (→NULL) all now stay ON THE DEVICE + ELIDED (`general_read_fallback_hits` proves
+it). The general executor ERRORS (never mis-answers) on a shape it can't express → falls to CPU (honest partial
+coverage). Opus audit MERGE-SAFE (7 angles; visibility rests on the single-buffer↔shard exclusivity invariant).
+REMAINING de-elide/host triggers (recon): DML-side WHERE eval (`engine_dml_prepare.rs`) still host; NULL-bearing shard
+breaks `gather_resident_table_rows_from_device` → `rehydrate_elided_table` HARD-ERRORS (correctness hazard);
+multi-statement/multi-table commits force de-elide (`engine_commit.rs:355`); CHECK/FK block elision. ARCHITECTURAL
+GATES (a program, per ADR-012, user chose "shrink achievable surface"): non-resident/over-VRAM tables need the STRATA
+STREAMING EXECUTOR (the documented terminal gate); views/matviews; JOINs beyond the 2-table `=` chain; window
+functions (absent from the grammar). See memory `type-coverage-14`, `scalability-ledger`.
 **ACTIVE lane:** TIER-1 TYPE/OP COVERAGE —
 the covered lane write TRIAD is COMPLETE (INSERT + DELETE + UPDATE, all WAL-first), updates are
 SUSTAINABLE (F3/U4 version-aware device PK index — dup-tolerant, mixed bench 1.4M TPS / 3 rebuilds),
