@@ -5,8 +5,9 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `ebd04717` (CPU-ENGINE RETIREMENT: DECLINED resident reads now route to
-the GENERAL GPU executor instead of de-eliding — MERGED; TEXT compound-key uniqueness `df136262`; foundation `fe9af98d`).
+**Updated:** 2026-07-09. **Base:** `main` @ `86a3ff6f` (CPU-ENGINE RETIREMENT: range/non-point DELETE/UPDATE now
+resolve ON-DEVICE instead of de-eliding — MERGED; declined resident reads → general GPU executor `ebd04717`; point
+zero-match DML stays elided `6f7cad76`; TEXT compound-key uniqueness `df136262`; foundation `fe9af98d`).
 
 **>>> ACTIVE: CPU-ENGINE DELETION (ADR-006) — closing the de-elide/host-fallback triggers <<<** Recon mapped the
 deletion target (`finalize_relational_select` + `rel_exec_helpers.rs` host operators + `CpuMvccExecutionBackend`)
@@ -18,8 +19,14 @@ path. Wider-type filtered projections / scalar aggregates / DISTINCT / GROUP BY 
 over text / OFFSET / empty-aggregate (→NULL) all now stay ON THE DEVICE + ELIDED (`general_read_fallback_hits` proves
 it). The general executor ERRORS (never mis-answers) on a shape it can't express → falls to CPU (honest partial
 coverage). Opus audit MERGE-SAFE (7 angles; visibility rests on the single-buffer↔shard exclusivity invariant).
-REMAINING de-elide/host triggers (recon): DML-side WHERE eval (`engine_dml_prepare.rs`) still host; NULL-bearing shard
-breaks `gather_resident_table_rows_from_device` → `rehydrate_elided_table` HARD-ERRORS (correctness hazard);
+FOUR MERGED WINS so far: declined resident READS → general GPU executor (`ebd04717`); POINT zero-match DML stays
+elided (`6f7cad76` — return HANDLED on an empty applied set + gate elision-ENTER on `applied_changed_rows`); RANGE/
+non-point DELETE/UPDATE resolve ON-DEVICE (`86a3ff6f` — `try_resolve_dml_via_predicate_scan` lowers the WHERE to a
+ResidentExpr + `locate_resident_delete_slots_detailed` single-snapshot+W0 + materialize/visibility/recheck; kills
+O(table) de-elide churn for all int4 range DML). Debugging lesson: a backtrace at `rehydrate_elided_table` is the
+definitive de-elide root-cause tool. REMAINING de-elide/host triggers: WIDER-TYPE range DML (int4-only predicate
+builder — int8/numeric/text range predicates still decline); NULL-bearing shard breaks
+`gather_resident_table_rows_from_device` → `rehydrate_elided_table` HARD-ERRORS (correctness hazard);
 multi-statement/multi-table commits force de-elide (`engine_commit.rs:355`); CHECK/FK block elision. ARCHITECTURAL
 GATES (a program, per ADR-012, user chose "shrink achievable surface"): non-resident/over-VRAM tables need the STRATA
 STREAMING EXECUTOR (the documented terminal gate); views/matviews; JOINs beyond the 2-table `=` chain; window
