@@ -5,7 +5,10 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `db29b8a8` (CPU-ENGINE RETIREMENT — NINE merged wins: MULTI-STATEMENT
+**Updated:** 2026-07-09. **Base:** `main` @ `be6bd91f` (CPU-ENGINE RETIREMENT — TEN merged wins: TEXT-EQUALITY
+DELETE/UPDATE resolves ON-DEVICE (`text_col='lit'` lowers to `TextLiteral` → existing device byte-exact text kernel
+`try_lower_text_predicate` + device text materialize + recheck; CHARTER-PURE, no host store, no new kernel; `=` only,
+text has no device ordering) `be6bd91f`; MULTI-STATEMENT
 INSERT-batch elision (a group-commit batch keeps its insert-only elided tables ELIDED via one incremental device
 append per table, `InsertPerRow` stamps; was: `to_apply.len()>1` de-elided the whole scope every batched write)
 `db29b8a8`; NUMERIC range DML (single+multi-bound) `bd55680a`; TIMESTAMP range DML `2fb42ab3`; INT8 range DML
@@ -13,6 +16,14 @@ append per table, `InsertPerRow` stamps; was: `to_apply.len()>1` de-elided the w
 elided, alignment-free `NULL_BITMAP_GATHER_PTX` kernel) `bb2a2c03`; range/non-point DELETE/UPDATE resolve on-device
 `86a3ff6f`; point zero-match DML stays elided `6f7cad76`; declined resident reads → general GPU executor `ebd04717`;
 TEXT compound-key uniqueness `df136262`; foundation `fe9af98d`).
+
+**⛔ CHARTER RULING (user, EMPHATIC 2026-07-09): do NOT touch / repair / make-faithful / invest in the HOST STORE.**
+The de-elide → `rehydrate_elided_table` → CPU tuple store is INTERIM debt to DELETE, not to improve. The only
+charter-pure way to keep DML elided is to make the **DEVICE resolve the WHERE** so it never de-elides (MOVE WORK TO
+THE GPU). A DELETE/UPDATE multi-entry-batch elision attempt that made the host-store de-elide reconcile faithful
+(per-row `created_by`, gather-boundary seam) was REVERTED as charter-violating; the branch `feature/multi-entry-du-elision`
+holds the dead approach. When a de-elide is unavoidable (device can't serve a shape), let it de-elide as-is — never
+polish a path slated for deletion. See CHARTER.md, memory `stay-gpu-native-charter`.
 
 **>>> ACTIVE: CPU-ENGINE DELETION (ADR-006) — closing the de-elide/host-fallback triggers <<<** Recon mapped the
 deletion target (`finalize_relational_select` + `rel_exec_helpers.rs` host operators + `CpuMvccExecutionBackend`)
