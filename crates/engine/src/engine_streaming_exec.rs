@@ -236,6 +236,11 @@ enum StreamShape {
         normalized: SelectProjection,
         distinct_key_only: bool,
     },
+    /// S-E.4: a single-key `ORDER BY` projection. `top_n` = the `[OFFSET,OFFSET+LIMIT)` window bound
+    /// (`Some` = a top-N stream: each chunk's device-sorted local top-(skip+take) is its only possible
+    /// contribution to the global window; `None` = unbounded — the whole survivor set must fit the
+    /// budget for the final device sort, else defer).
+    Ordered { top_n: Option<usize> },
 }
 
 /// Classify a SELECT as a streamable shape, or `None` for the non-foldable classes (ORDER BY — S-E.4;
@@ -246,8 +251,37 @@ enum StreamShape {
 /// early-exit + scan-order windowing is a valid instance); GROUP BY / DISTINCT fold TWO-LEVEL (per-chunk
 /// device partials -> concat -> one final device merge pass).
 fn streaming_shape(select: &Select) -> Option<StreamShape> {
-    if !select.order_by.is_empty() || !select.having_groups.is_empty() {
+    if !select.having_groups.is_empty() {
         return None;
+    }
+    // S-E.4 ORDER BY: a single-key ordered `All`/`Columns` projection streams — the sort key must ride
+    // the partials (be among the projected columns) so the FINAL device sort can re-order them. Ordered
+    // DISTINCT / grouped / multi-key stay declined (multi-key is hard-rejected upstream anyway).
+    if !select.order_by.is_empty() {
+        if select.distinct || select.group_by.is_some() || select.order_by.len() != 1 {
+            return None;
+        }
+        let key = &select.order_by[0].column;
+        // An ORDER BY EXPRESSION parses to the empty-string sentinel column (the expression rides a
+        // separate order_by_exprs vector this path never receives) — decline it up front instead of
+        // burning chunk uploads before the executor's "column does not exist" defer (audit LOW; the
+        // grouped bridge guards the same sentinel).
+        if key.is_empty() {
+            return None;
+        }
+        let key_projected = match &select.projection {
+            SelectProjection::All => true,
+            SelectProjection::Columns(columns) => columns.contains(key),
+            _ => return None,
+        };
+        if !key_projected {
+            return None;
+        }
+        // The window bound: OFFSET-without-LIMIT has no top-N bound -> treat as unbounded.
+        let top_n = select
+            .limit
+            .map(|limit| select.offset.unwrap_or(0).saturating_add(limit));
+        return Some(StreamShape::Ordered { top_n });
     }
     // S-E.3 DISTINCT: single-column `SELECT DISTINCT col` == `SELECT col, COUNT(*) GROUP BY col` with
     // the count dropped (the distinct bridge's own synthesis) — so it rides the grouped fold.
@@ -388,6 +422,16 @@ impl Engine {
                 &bound,
                 predicate.as_ref(),
                 copin_s,
+                gpu_id,
+                budget,
+            ),
+            StreamShape::Ordered { top_n } => self.run_streaming_ordered_fold(
+                select,
+                &table,
+                &bound,
+                predicate.as_ref(),
+                copin_s,
+                top_n,
                 gpu_id,
                 budget,
             ),
@@ -1048,6 +1092,340 @@ impl Engine {
                 partials_bytes.saturating_add(chunk_row_device_bytes(&row, partial_types));
             partials_acc.push(row);
         }
+        ChunkOutcome::Ok
+    }
+
+    /// STRATA S-E.4 — the ORDER BY fold. THE SORT IS ALWAYS ON THE DEVICE (the charter forbids a host
+    /// k-way merge): TOP-N (`ORDER BY k LIMIT n [OFFSET m]`) runs each chunk's projection through the
+    /// device sort + device window — a chunk's local top-(m+n) is its ONLY possible contribution to the
+    /// global window — concats the runs (control plane), COMPACTS the accumulator by device re-sort +
+    /// re-window whenever it outgrows the chunk target, and finishes with ONE device sort + the REAL
+    /// window over the synthesized runs relation. UNBOUNDED ORDER BY skips the per-chunk sort (plain
+    /// device filter/project per chunk — a final re-sort makes chunk runs pointless) and defers honestly
+    /// mid-scan if the survivor set outgrows the budget (its final device sort could not fit).
+    #[allow(clippy::too_many_arguments)]
+    fn run_streaming_ordered_fold(
+        &self,
+        select: &Select,
+        table: &RelationalTable,
+        bound: &BoundRelationalSelect,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+        top_n: Option<usize>,
+        gpu_id: u16,
+        budget: u64,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let chunk_target_bytes = (budget / 2).max(1);
+        let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
+        // The per-chunk select: top-N keeps the ORDER BY + a device LIMIT of the window bound (the run
+        // truncation); unbounded strips the ORDER BY (plain filter/project — sorted once at the end).
+        let mut chunk_select = select.clone();
+        chunk_select.offset = None;
+        match top_n {
+            Some(bound_n) => chunk_select.limit = Some(bound_n),
+            None => {
+                chunk_select.order_by = Vec::new();
+                chunk_select.limit = None;
+            }
+        }
+        let Ok(chunk_bound) = bind_relational_select(table, &chunk_select) else {
+            return self.execute_relational_select_cpu_pinned(select);
+        };
+
+        // The synthesized RUNS relation: the projected columns by name/type (the classifier guarantees
+        // the sort key is among them), consumed by the FINAL device sort + window pass.
+        let runs_column_refs: Vec<(&str, SqlType)> = bound
+            .selected_columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty))
+            .collect();
+        let partial_types: Vec<SqlType> = runs_column_refs.iter().map(|(_, ty)| *ty).collect();
+        let runs_table = catalog_relation_table(&table.schema, "__stream_runs", &runs_column_refs);
+        let final_select = Select {
+            table: runs_table.name.clone(),
+            distinct: false,
+            projection: SelectProjection::Columns(
+                runs_column_refs
+                    .iter()
+                    .map(|(name, _)| (*name).to_string())
+                    .collect(),
+            ),
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: select.order_by.clone(),
+            limit: select.limit,
+            offset: select.offset,
+        };
+        let Ok(final_bound) = bind_relational_select(&runs_table, &final_select) else {
+            return self.execute_relational_select_cpu_pinned(select);
+        };
+        // The COMPACTION select: same device sort but windowed to the top-N bound only (OFFSET stays 0 —
+        // the real window slices once, at the end).
+        let compact_select = Select {
+            limit: top_n,
+            offset: None,
+            ..final_select.clone()
+        };
+        let Ok(compact_bound) = bind_relational_select(&runs_table, &compact_select) else {
+            return self.execute_relational_select_cpu_pinned(select);
+        };
+
+        let mut runs_acc: Vec<Vec<SqlValue>> = Vec::new();
+        let mut runs_bytes: u64 = 0;
+        let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
+        let mut chunk_bytes: u64 = 0;
+        let mut chunks_run: u64 = 0;
+
+        let prefix = relational_key_prefix(&select.table);
+        let visibility = StorageVisibility {
+            read_txn_id: copin_s,
+        };
+        {
+            let table_rows = self.read_state.mvcc.table_rows(&select.table);
+            let mut cursor = table_rows.store().seq_scan_open(visibility)?;
+            while let Some(tuple) = cursor.next() {
+                if !tuple.key.starts_with(&prefix) {
+                    continue;
+                }
+                let decoded = decode_relational_row(&tuple.value, &table.columns)?;
+                chunk_bytes =
+                    chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+                chunk_rows.push(decoded);
+                if chunk_bytes >= chunk_target_bytes {
+                    match self.ordered_streaming_chunk(
+                        &chunk_select,
+                        table,
+                        &chunk_bound,
+                        predicate,
+                        copin_s,
+                        &chunk_rows,
+                        &partial_types,
+                        &mut runs_acc,
+                        &mut runs_bytes,
+                    ) {
+                        ChunkOutcome::Ok => {}
+                        ChunkOutcome::Defer => {
+                            return self.execute_relational_select_cpu_pinned(select)
+                        }
+                        ChunkOutcome::Hard(err) => return Err(err),
+                    }
+                    chunks_run += 1;
+                    chunk_rows.clear();
+                    chunk_bytes = 0;
+                    if runs_bytes >= chunk_target_bytes {
+                        match top_n {
+                            // TOP-N compaction: device re-sort + truncate to the window bound.
+                            Some(_) => {
+                                match self.sort_streaming_runs(
+                                    &compact_select,
+                                    &runs_table,
+                                    &compact_bound,
+                                    copin_s,
+                                    &partial_types,
+                                    &mut runs_acc,
+                                    &mut runs_bytes,
+                                    budget,
+                                ) {
+                                    ChunkOutcome::Ok => {}
+                                    ChunkOutcome::Defer => {
+                                        return self
+                                            .execute_relational_select_cpu_pinned(select)
+                                    }
+                                    ChunkOutcome::Hard(err) => return Err(err),
+                                }
+                                // A window bound too large to compact under the budget cannot final-
+                                // sort either: defer (mirrors the grouped over-cardinality defer).
+                                if runs_bytes > budget {
+                                    return self.execute_relational_select_cpu_pinned(select);
+                                }
+                            }
+                            // UNBOUNDED: the survivor set itself outgrew the budget — its final
+                            // device sort cannot fit. Defer honestly (the CPU path serves it).
+                            None => {
+                                if runs_bytes > budget {
+                                    return self.execute_relational_select_cpu_pinned(select);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !chunk_rows.is_empty() {
+            match self.ordered_streaming_chunk(
+                &chunk_select,
+                table,
+                &chunk_bound,
+                predicate,
+                copin_s,
+                &chunk_rows,
+                &partial_types,
+                &mut runs_acc,
+                &mut runs_bytes,
+            ) {
+                ChunkOutcome::Ok => {}
+                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
+                ChunkOutcome::Hard(err) => return Err(err),
+            }
+            chunks_run += 1;
+        }
+
+        // FINAL: one device sort + the REAL [OFFSET, OFFSET+LIMIT) window over the accumulated runs.
+        // An empty accumulator (empty table / all filtered) is the empty ordered result.
+        if !runs_acc.is_empty() {
+            match self.sort_streaming_runs(
+                &final_select,
+                &runs_table,
+                &final_bound,
+                copin_s,
+                &partial_types,
+                &mut runs_acc,
+                &mut runs_bytes,
+                budget,
+            ) {
+                ChunkOutcome::Ok => {}
+                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
+                ChunkOutcome::Hard(err) => return Err(err),
+            }
+        }
+        let rows_out = std::mem::take(&mut runs_acc);
+
+        self.read_state
+            .residency
+            .streaming_fold_hits
+            .fetch_add(1, Ordering::Relaxed);
+        self.read_state
+            .residency
+            .streaming_fold_chunks
+            .fetch_add(chunks_run, Ordering::Relaxed);
+
+        Ok(RelationalSelectResult {
+            columns: Arc::new(bound.selected_columns.clone()),
+            rows: rows_out.into(),
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            fallback_reason: None,
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
+        })
+    }
+
+    /// One ordered-fold chunk: upload, run the per-chunk select on the device (top-N = sort + window to
+    /// the bound; unbounded = plain filter/project), and CONCAT the resulting run into the accumulator.
+    #[allow(clippy::too_many_arguments)]
+    fn ordered_streaming_chunk(
+        &self,
+        chunk_select: &Select,
+        table: &RelationalTable,
+        chunk_bound: &BoundRelationalSelect,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+        chunk_rows: &[Vec<SqlValue>],
+        partial_types: &[SqlType],
+        runs_acc: &mut Vec<Vec<SqlValue>>,
+        runs_bytes: &mut u64,
+    ) -> ChunkOutcome {
+        let (descriptor, device_memory) =
+            match self.build_transient_relation_residency(table, chunk_rows) {
+                Ok(pair) => pair,
+                Err(_) => return ChunkOutcome::Defer,
+            };
+        self.read_state
+            .residency
+            .streaming_fold_peak_chunk_bytes
+            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
+        let src = ResidentExecSource {
+            descriptor: Arc::new(descriptor),
+            device_memory: Arc::new(device_memory),
+            row_count: chunk_rows.len() as u64,
+        };
+        let order_by_exprs: Vec<Option<ResidentExpr>> = vec![None; chunk_select.order_by.len()];
+        let order_by_nulls_first: Vec<Option<bool>> = vec![None; chunk_select.order_by.len()];
+        let result = match self.execute_resident_expr_select_with_binding(
+            chunk_select,
+            table,
+            Some(&src),
+            chunk_bound.clone(),
+            copin_s,
+            predicate,
+            None,
+            &order_by_exprs,
+            &order_by_nulls_first,
+            None,
+            &[],
+        ) {
+            Ok(result) => result,
+            Err(err) if is_overflow_error(&err) => return ChunkOutcome::Hard(err),
+            Err(_) => return ChunkOutcome::Defer,
+        };
+        for row in result.rows.into_boxed() {
+            *runs_bytes = runs_bytes.saturating_add(chunk_row_device_bytes(&row, partial_types));
+            runs_acc.push(row);
+        }
+        ChunkOutcome::Ok
+    }
+
+    /// Device-sort (+ window) the accumulated runs as a transient synthesized relation, replacing the
+    /// accumulator with the sorted/windowed rows. Serves BOTH the top-N compaction and the final pass.
+    /// BUDGET GATE (the S-E.3 lesson): defer WITHOUT uploading when the accumulator exceeds the budget.
+    #[allow(clippy::too_many_arguments)]
+    fn sort_streaming_runs(
+        &self,
+        sort_select: &Select,
+        runs_table: &RelationalTable,
+        sort_bound: &BoundRelationalSelect,
+        copin_s: Index,
+        partial_types: &[SqlType],
+        runs_acc: &mut Vec<Vec<SqlValue>>,
+        runs_bytes: &mut u64,
+        budget: u64,
+    ) -> ChunkOutcome {
+        if *runs_bytes > budget {
+            return ChunkOutcome::Defer;
+        }
+        let (descriptor, device_memory) =
+            match self.build_transient_relation_residency(runs_table, runs_acc) {
+                Ok(pair) => pair,
+                Err(_) => return ChunkOutcome::Defer,
+            };
+        self.read_state
+            .residency
+            .streaming_fold_peak_chunk_bytes
+            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
+        let src = ResidentExecSource {
+            descriptor: Arc::new(descriptor),
+            device_memory: Arc::new(device_memory),
+            row_count: runs_acc.len() as u64,
+        };
+        let order_by_exprs: Vec<Option<ResidentExpr>> = vec![None; sort_select.order_by.len()];
+        let order_by_nulls_first: Vec<Option<bool>> = vec![None; sort_select.order_by.len()];
+        let result = match self.execute_resident_expr_select_with_binding(
+            sort_select,
+            runs_table,
+            Some(&src),
+            sort_bound.clone(),
+            copin_s,
+            None,
+            None,
+            &order_by_exprs,
+            &order_by_nulls_first,
+            None,
+            &[],
+        ) {
+            Ok(result) => result,
+            Err(err) if is_overflow_error(&err) => return ChunkOutcome::Hard(err),
+            Err(_) => return ChunkOutcome::Defer,
+        };
+        let mut sorted: Vec<Vec<SqlValue>> = Vec::new();
+        let mut sorted_bytes: u64 = 0;
+        for row in result.rows.into_boxed() {
+            sorted_bytes = sorted_bytes.saturating_add(chunk_row_device_bytes(&row, partial_types));
+            sorted.push(row);
+        }
+        *runs_acc = sorted;
+        *runs_bytes = sorted_bytes;
         ChunkOutcome::Ok
     }
 
