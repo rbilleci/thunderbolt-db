@@ -5,7 +5,9 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `6fba4ecb` (CPU-ENGINE RETIREMENT — TWENTY-THREE merged wins:
+**Updated:** 2026-07-10. **Base:** `main` @ `337454c7` (CPU-ENGINE RETIREMENT — TWENTY-FOUR merged wins:
+CHECK-on-NULL PG 3VL fix (NULL SATISFIES a CHECK — both engine evaluators guarded; legacy gpu-db-server emulator
+divergence noted-not-patched per the charter ruling) `337454c7`;
 CHECK-CONSTRAINED TABLES ELIDE (the first constraint class lifted — CHECK is row-local; ADD CHECK's existing-row
 scan is elision-safe-by-construction; wave/lanes still route CHECK to the full off-lock prepare; FK stays blocked
 both directions) + the audit-HIGH preflight stale-scan bypass FIXED (a mid-preflight rehydrate left the UPDATE
