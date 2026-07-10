@@ -130,7 +130,19 @@ fn dml_filter_groups_to_device_predicate(
                 {
                     ResidentExpr::TextLiteral(gpu_db_sql::uuid::format_uuid(bytes))
                 }
-                (Some(SqlType::Bool), SqlValue::Bool(v)) if matches!(op, SelectFilterOp::Eq) => {
+                // Bool supports ORDERING too (ADR-006 bool inequalities: PG `false < true`; the
+                // bool leaves constant-fold `<`/`<=`/`>`/`>=` to equality masks or constants, and
+                // the recheck's `compare_sql_values` Bool arm is `bool::cmp` — identical order).
+                (Some(SqlType::Bool), SqlValue::Bool(v))
+                    if matches!(
+                        op,
+                        SelectFilterOp::Eq
+                            | SelectFilterOp::Lt
+                            | SelectFilterOp::Lte
+                            | SelectFilterOp::Gt
+                            | SelectFilterOp::Gte
+                    ) =>
+                {
                     ResidentExpr::BoolLiteral(*v)
                 }
                 // TEXT `LIKE 'prefix%'` (ADR-006, charter-pure): reuse the DEVICE text-LIKE kernel the

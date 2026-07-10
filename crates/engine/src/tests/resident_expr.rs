@@ -652,6 +652,78 @@ fn gpu_resident_expr_mixed_width_where_3vl() {
         "non-null mixed int8+text AND: id 1 only (2 fails the range, 3 fails the eq)"
     );
     assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    // BOOL INEQUALITIES over the NULLABLE-table VM path (ADR-006: PG `false < true`; each shape
+    // constant-folds — `f < true` ⇔ `f = false`; `f <= true` ⇔ constant-TRUE-for-KNOWN). tmw has
+    // f=[true,true,false,true,true] and NULL big rows but NON-null f — pin the fold shapes here,
+    // then the 3VL trap on a nullable-bool table below.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tmw WHERE f < true AND big >= 0")
+        .expect("bool inequality inside AND runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(6)]],
+        "f < true ⇔ f = false -> ids 3,6 (NULL-big rows excluded by the int8 leaf's 3VL)"
+    );
+    // NULLABLE-BOOL 3VL trap: `nb <= true` folds to a CONSTANT-TRUE mask that never reads the
+    // value bitmap — ONLY the validity AND can exclude the NULL row (UNKNOWN, PG 3VL).
+    e.execute_text(5, "CREATE TABLE tbn (id INT, nb BOOL)").unwrap();
+    e.execute_text(6, "INSERT INTO tbn (id,nb) VALUES (1,true),(2,NULL),(3,false)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tbn").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE nb <= true AND id > 0")
+        .expect("nullable-bool <= true runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)]],
+        "nb <= true is TRUE for known bools only — the NULL row must be excluded by validity"
+    );
+    // The empty-set fold: `nb > true` matches nothing (not even NULL).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE nb > true AND id > 0")
+        .expect("nullable-bool > true runs on the GPU");
+    assert_eq!(r.rows, Vec::<Vec<SqlValue>>::new(), "nb > true is constant FALSE");
+    // Literal-on-left flips the op: `true > nb` ⇔ `nb < true` ⇔ `nb = false`.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE true > nb AND id > 0")
+        .expect("literal-on-left bool inequality runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(3)]],
+        "true > nb ⇔ nb = false -> id 3 (NULL excluded)"
+    );
+    // Audit polarity-gap pins: the Ge const-true shape, and the remaining two mask shapes.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE nb >= false AND id > 0")
+        .expect("nb >= false runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)]],
+        "nb >= false is TRUE for known bools only (the Ge const-true fold; NULL excluded)"
+    );
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE nb <= false AND id > 0")
+        .expect("nb <= false runs on the GPU");
+    assert_eq!(r.rows, vec![vec![SqlValue::Int4(3)]], "nb <= false ⇔ nb = false");
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE nb >= true AND id > 0")
+        .expect("nb >= true runs on the GPU");
+    assert_eq!(r.rows, vec![vec![SqlValue::Int4(1)]], "nb >= true ⇔ nb = true");
+    // The PEEPHOLE const-true ALL-indices arm (non-null single comparison, no AND): tmw's `f` is
+    // a NON-null bool (the nullable-branch gate keys on the REFERENCED columns only), so this is
+    // the direct pin of try_lower_bool_predicate's (0..n) return.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tmw WHERE f <= true")
+        .expect("non-null bare f <= true runs on the GPU (peephole const-true)");
+    assert_eq!(
+        r.rows,
+        (1..=6).map(|i| vec![SqlValue::Int4(i)]).collect::<Vec<_>>(),
+        "f <= true over a NON-null bool = every row (the peephole all-indices arm)"
+    );
+
     // NON-NULL mixed int8+int2 (the audit's MEDIUM: this shape used to SLIP PAST the mixed
     // block — int2 was unchecked — into the I64 compile, where the 4-byte int2 slot was read at
     // an 8-byte stride = silent wrong rows). Now it routes to I32 like the rest: id 1 only

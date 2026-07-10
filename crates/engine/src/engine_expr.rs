@@ -2339,12 +2339,12 @@ fn compile_bool_leaf(
 ) -> Result<(), ExecuteError> {
     let is_bool_col =
         |idx: usize| table.columns.get(idx).map(|column| column.ty) == Some(SqlType::Bool);
-    let (col, literal) = match (lhs, rhs) {
+    let (col, literal, column_on_left) = match (lhs, rhs) {
         (ResidentExpr::Column(col), ResidentExpr::BoolLiteral(b)) if is_bool_col(*col) => {
-            (*col, *b)
+            (*col, *b, true)
         }
         (ResidentExpr::BoolLiteral(b), ResidentExpr::Column(col)) if is_bool_col(*col) => {
-            (*col, *b)
+            (*col, *b, false)
         }
         _ => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -2352,23 +2352,64 @@ fn compile_bool_leaf(
             )));
         }
     };
-    let negate = match op {
-        ResidentBinaryOp::Eq => !literal,
-        ResidentBinaryOp::Ne => literal,
+    // ADR-006 (bool inequalities): PG orders `false < true`, so every `<`/`<=`/`>`/`>=` against a
+    // TWO-VALUED literal CONSTANT-FOLDS to an equality mask or a constant — no new kernel:
+    //   col <  true  ⇔ col = false        col <  false ⇔ FALSE (nothing sorts below false)
+    //   col <= false ⇔ col = false        col <= true  ⇔ TRUE-for-KNOWN (3VL: NULL is UNKNOWN)
+    //   col >  false ⇔ col = true         col >  true  ⇔ FALSE
+    //   col >= true  ⇔ col = true         col >= false ⇔ TRUE-for-KNOWN
+    // A literal-on-left comparison is the column-on-left one with the op FLIPPED (`true > col` ⇔
+    // `col < true`). The host recheck (`compare_sql_values` Bool = `bool::cmp`) orders identically.
+    let effective = if column_on_left {
+        op
+    } else {
+        match op {
+            ResidentBinaryOp::Lt => ResidentBinaryOp::Gt,
+            ResidentBinaryOp::Le => ResidentBinaryOp::Ge,
+            ResidentBinaryOp::Gt => ResidentBinaryOp::Lt,
+            ResidentBinaryOp::Ge => ResidentBinaryOp::Le,
+            other => other,
+        }
+    };
+    // `Some(needle)` selects rows where col == needle (a BoolMask); `None` is a constant verdict.
+    let (needle, const_true_for_known) = match effective {
+        ResidentBinaryOp::Eq => (Some(literal), false),
+        ResidentBinaryOp::Ne => (Some(!literal), false),
+        ResidentBinaryOp::Lt if literal => (Some(false), false),
+        ResidentBinaryOp::Le if !literal => (Some(false), false),
+        ResidentBinaryOp::Gt if !literal => (Some(true), false),
+        ResidentBinaryOp::Ge if literal => (Some(true), false),
+        // col < false / col > true: no bool sorts there — constant FALSE (NULL rows are UNKNOWN
+        // ⇒ excluded too, so no validity needed).
+        ResidentBinaryOp::Lt | ResidentBinaryOp::Gt => (None, false),
+        // col <= true / col >= false: TRUE for every KNOWN bool — constant TRUE masked by
+        // validity (a NULL operand is UNKNOWN ⇒ excluded; the 3VL net below is load-bearing).
+        ResidentBinaryOp::Le | ResidentBinaryOp::Ge => (None, true),
         _ => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "the general GPU executor supports only = / <> against a bool literal".to_string(),
+                "the general GPU executor supports only comparisons against a bool literal"
+                    .to_string(),
             )));
         }
+    };
+    let Some(needle) = needle else {
+        program.push(ExprStep::ConstMask {
+            value: const_true_for_known,
+        });
+        if const_true_for_known {
+            // 3VL: without this AND, a NULL row would ride the constant-TRUE mask.
+            return push_column_validity_and(col, table, snapshot, program);
+        }
+        return Ok(());
     };
     let offset = resident_device_bool_column_offset(snapshot, table, col)?;
     program.push(ExprStep::BoolMask {
         bitmap_byte_offset: offset,
-        negate,
+        negate: !needle,
     });
-    // 3VL: a NULL bool operand makes `=`/`<>` UNKNOWN ⇒ not selected. The value-bitmap bit of a NULL row
-    // is the 0 placeholder, so `= false` / `<> true` would otherwise wrongly select it; AND with the
-    // validity mask excludes it.
+    // 3VL: a NULL bool operand makes the comparison UNKNOWN ⇒ not selected. The value-bitmap bit
+    // of a NULL row is the 0 placeholder, so `= false` / `<> true` / `< true` would otherwise
+    // wrongly select it; AND with the validity mask excludes it.
     push_column_validity_and(col, table, snapshot, program)
 }
 
@@ -9596,30 +9637,61 @@ impl Engine {
     ) -> Result<Option<Vec<u32>>, ExecuteError> {
         let is_bool_col =
             |idx: usize| table.columns.get(idx).map(|column| column.ty) == Some(SqlType::Bool);
-        let (col, literal) = match (lhs, rhs) {
+        let (col, literal, column_on_left) = match (lhs, rhs) {
             (ResidentExpr::Column(col), ResidentExpr::BoolLiteral(b)) if is_bool_col(*col) => {
-                (*col, *b)
+                (*col, *b, true)
             }
             (ResidentExpr::BoolLiteral(b), ResidentExpr::Column(col)) if is_bool_col(*col) => {
-                (*col, *b)
+                (*col, *b, false)
             }
             _ => return Ok(None),
         };
-        // `flag = true` -> set bits (negate=false); `flag = false` -> clear bits (negate=true).
-        // `<>` is the complement.
-        let negate = match compare {
-            ResidentBinaryOp::Eq => !literal,
-            ResidentBinaryOp::Ne => literal,
+        // ADR-006 (bool inequalities): the same constant-fold as `compile_bool_leaf` — PG orders
+        // `false < true`, so `<`/`<=`/`>`/`>=` against a two-valued literal reduces to an
+        // equality mask or a constant verdict. This peephole serves NON-NULL columns only (a
+        // nullable-bool predicate routes through the VM block above), so constant-TRUE is ALL
+        // rows — there is no UNKNOWN to exclude.
+        let effective = if column_on_left {
+            compare
+        } else {
+            match compare {
+                ResidentBinaryOp::Lt => ResidentBinaryOp::Gt,
+                ResidentBinaryOp::Le => ResidentBinaryOp::Ge,
+                ResidentBinaryOp::Gt => ResidentBinaryOp::Lt,
+                ResidentBinaryOp::Ge => ResidentBinaryOp::Le,
+                other => other,
+            }
+        };
+        let needle = match effective {
+            ResidentBinaryOp::Eq => literal,
+            ResidentBinaryOp::Ne => !literal,
+            ResidentBinaryOp::Lt if literal => false,
+            ResidentBinaryOp::Le if !literal => false,
+            ResidentBinaryOp::Gt if !literal => true,
+            ResidentBinaryOp::Ge if literal => true,
+            ResidentBinaryOp::Lt | ResidentBinaryOp::Gt => {
+                return Ok(Some(Vec::new())); // col < false / col > true: nothing qualifies
+            }
+            ResidentBinaryOp::Le | ResidentBinaryOp::Ge => {
+                // col <= true / col >= false over a NON-NULL column: every row qualifies.
+                let n = u32::try_from(row_count).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "bool predicate row count exceeds u32".to_string(),
+                    ))
+                })?;
+                return Ok(Some((0..n).collect()));
+            }
             _ => {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "the general GPU executor supports only = / <> against a bool literal"
+                    "the general GPU executor supports only comparisons against a bool literal"
                         .to_string(),
                 )));
             }
         };
+        // `col == true` -> set bits (negate=false); `col == false` -> clear bits (negate=true).
         let offset = resident_device_bool_column_offset(snapshot, table, col)?;
         device_memory
-            .expr_bool_to_mask_filter(offset, negate, row_count)
+            .expr_bool_to_mask_filter(offset, !needle, row_count)
             .map(Some)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
     }

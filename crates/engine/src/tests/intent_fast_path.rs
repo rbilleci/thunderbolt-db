@@ -3946,6 +3946,20 @@ fn gpu_mixed_width_dml_resolves_on_device() {
     );
     assert!(engine.table_install_elided("m"), "the versioned-shard DELETE must NOT de-elide");
     assert_eq!(ids(&engine), vec![1, 3], "id 5 deleted; 1 ('keep') and 3 (big=100) survive");
+
+    // BOOL INEQUALITY DML (ADR-006: `flag < true` ⇔ `flag = false` — the bool leaves constant-
+    // fold PG's false<true ordering; the DML builder now lowers bool comparisons, not just Eq).
+    // Survivors: 1 (flag true), 3 (flag false). The DELETE removes exactly id 3, on-device.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(txn + 1, "DELETE FROM m WHERE flag < true")
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a bool-inequality DELETE must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("m"), "a bool-inequality DELETE must NOT de-elide");
+    assert_eq!(ids(&engine), vec![1], "flag < true deleted exactly the flag=false row (3)");
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, audit HIGH regression pin): a MID-PREFLIGHT REHYDRATE must not
