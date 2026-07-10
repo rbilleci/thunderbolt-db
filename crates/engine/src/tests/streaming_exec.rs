@@ -862,7 +862,7 @@ fn streaming_reduction_absent_without_budget_uses_host_path() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_streaming_ab_probe() {
+fn gpu_streaming_cold_tier_replay_probe() {
     let mut e = Engine::new_local();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
@@ -896,6 +896,84 @@ fn gpu_streaming_ab_probe() {
         let t2 = t.elapsed().as_micros();
         assert_eq!(c.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(100_000)]]);
         assert_eq!(s.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(4_999_950_000i64)]]);
-        eprintln!("ABPROBE run={run} count_us={t1} sum_us={t2}");
+        eprintln!("COLDPROBE run={run} count_us={t1} sum_us={t2}");
+        assert!(e.streaming_cold_hits() >= 1, "cold tier served the repeat reads");
     }
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_cold_tier_invalidates_on_write() {
+    // S-E.6 THE correctness gate: the cold tier serves BYTE-REPLAYS of a prior build, so a WRITE must
+    // invalidate it (the tuple-store generation Arc changes on every COW publish) — a stale hit would
+    // serve pre-write data to post-write readers. Build -> hit -> INSERT -> fresh result -> hit again
+    // -> DELETE -> fresh result.
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE big (a INT)").unwrap();
+    const N: i32 = 1500;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i})"));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO big (a) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+
+    // Build (scan + capture), then a hit (byte replay), identical results.
+    let count = |e: &Engine| {
+        e.execute_relational_select(&select("SELECT COUNT(*) FROM big"))
+            .unwrap()
+            .rows
+            .clone()
+            .into_boxed()
+    };
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
+    let builds_after_first = e.streaming_cold_builds();
+    assert!(builds_after_first >= 1, "the first streaming read installs the cold tier");
+    let hits_before = e.streaming_cold_hits();
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
+    assert!(
+        e.streaming_cold_hits() > hits_before,
+        "the repeat read must SERVE FROM the cold tier"
+    );
+    // A different fold shape hits the SAME cache (chunks are fold-agnostic).
+    let sum = e
+        .execute_relational_select(&select("SELECT SUM(a) FROM big"))
+        .unwrap();
+    let expected_sum: i64 = (0..i64::from(N)).sum();
+    assert_eq!(sum.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(expected_sum)]]);
+
+    // INSERT -> the generation Arc changes -> MISS -> fresh scan sees N+1 (a stale hit would say N).
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)").unwrap();
+    assert_eq!(
+        count(&e),
+        vec![vec![SqlValue::Int8(i64::from(N) + 1)]],
+        "a write must invalidate the cold tier (stale replay would return the OLD count)"
+    );
+    assert!(
+        e.streaming_cold_builds() > builds_after_first,
+        "the post-write read must REBUILD (not hit)"
+    );
+    // The rebuilt cache serves hits again...
+    let hits_before = e.streaming_cold_hits();
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N) + 1)]]);
+    assert!(e.streaming_cold_hits() > hits_before, "rebuilt cache hits again");
+    // ...and a DELETE invalidates again.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM big WHERE a = 100000").unwrap();
+    assert_eq!(
+        count(&e),
+        vec![vec![SqlValue::Int8(i64::from(N))]],
+        "a DELETE must invalidate the cold tier"
+    );
 }

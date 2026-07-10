@@ -635,6 +635,20 @@ pub(crate) struct ResidencyReadState {
     /// residency of the fold). The out-of-core proof: this stays <= the configured budget even when the
     /// whole table's bytes dwarf it. `fetch_max`, monotonic across the process.
     pub(crate) streaming_fold_peak_chunk_bytes: std::sync::atomic::AtomicU64,
+    /// STRATA S-E.6: the streaming COLD TIER — per-table DEVICE-FORMAT chunk payloads cached in host
+    /// RAM after a fold's first (MVCC-scan) build, replayed byte-for-byte on later streaming reads
+    /// (no per-row decode, no payload assembly — the measured ~68% host wall). Validity = the pinned
+    /// tuple-store generation-payload Arc (pointer equality; any write COW-publishes a fresh Arc ->
+    /// miss -> rebuild) + the chunk target. COW map: readers `load()` wait-free; the (rare) install
+    /// and cap-eviction publishers serialize on `streaming_cold_lock`.
+    pub(crate) streaming_cold_chunks:
+        ArcSwap<BTreeMap<String, std::sync::Arc<crate::engine_streaming_exec::ColdTableChunks>>>,
+    /// Serializes `streaming_cold_chunks` publishers (install / cap eviction).
+    pub(crate) streaming_cold_lock: Mutex<()>,
+    /// STRATA S-E.6: streaming reads served from the cold tier (byte-replay, no MVCC decode).
+    pub(crate) streaming_cold_hits: std::sync::atomic::AtomicU64,
+    /// STRATA S-E.6: cold-tier builds installed (a fold's scan captured its chunks for reuse).
+    pub(crate) streaming_cold_builds: std::sync::atomic::AtomicU64,
     /// RETIREMENT A4e: tables whose commits ELIDE the host tuple-store + value-index install
     /// (device-authoritative). Entered after first admission when eligible under the default-OFF
     /// flag; LEFT (sticky de-elision) via rehydration when any resolve/gather declines. COW set —

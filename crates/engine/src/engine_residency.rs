@@ -10039,6 +10039,9 @@ impl Engine {
         (
             RelationalResidencySnapshot,
             gpu_db_execution::PendingCudaResidentDeviceCopy,
+            // The built device payload BYTES, handed back so the streaming cold tier (S-E.6) can
+            // cache them for byte-replay (the upload staged them into pinned memory already).
+            Vec<u8>,
         ),
         ExecuteError,
     > {
@@ -10106,7 +10109,7 @@ impl Engine {
             evicted_tables_on_admission: Vec::new(),
             device_memory_proof: Some(pending.metadata().clone()),
         };
-        Ok((snapshot, pending))
+        Ok((snapshot, pending, device_payload))
     }
 
     pub fn install_benchmark_relational_residency_chunks(

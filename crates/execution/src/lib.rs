@@ -732,7 +732,11 @@ impl Drop for PooledStreamOwned {
 /// stream from a pinned staging buffer; the allocation must not be read (no kernel launched
 /// against it) until [`Self::wait`] returns. Dropping an un-waited handle still synchronizes the
 /// stream (best-effort) before releasing the pinned buffer — the staging bytes are never handed
-/// back to the pool while the DMA could still be reading them.
+/// back to the pool while the DMA could still be reading them. NOTE the field DROP ORDER also
+/// carries safety: `memory` drops first, and classic `cuMemFree` implicitly device-syncs, draining
+/// the in-flight HtoD before the transport releases the pinned bytes — if the allocation path ever
+/// migrates to stream-ordered `cuMemFreeAsync`, the transport sync becomes the ONLY fence and this
+/// ordering must be revisited (audit F5).
 pub struct PendingCudaResidentDeviceCopy {
     memory: Option<CudaResidentDeviceMemory>,
     in_flight: Option<PendingCopyTransport>,

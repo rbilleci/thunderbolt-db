@@ -660,6 +660,20 @@ impl TableRowsView {
     pub(crate) fn index_keys(&self, column: &str, value: &str) -> Vec<String> {
         self.payload().index_keys(column, value)
     }
+
+    /// STRATA S-E.6: the pinned generation's PAYLOAD `Arc` — the streaming cold-tier cache's
+    /// validity identity. Every table write COW-publishes a FRESH `Arc<TableVersionData>`
+    /// (`with_table_mut` -> `Arc::new`), so pointer equality means "not one write has touched this
+    /// table since the pin"; holding the clone pins the allocation, so the comparison is ABA-safe
+    /// (the address can never be reused while cached). The Empty arm returns the shared
+    /// empty-store sentinel (the cache is keyed per table name, so cross-table sharing is fine,
+    /// and a table's first write publishes a fresh Arc that no longer matches it).
+    pub(crate) fn generation_payload(&self) -> Arc<TableVersionData> {
+        match self {
+            TableRowsView::Resident(handle) => Arc::clone(handle.get()),
+            TableRowsView::Empty(data) => Arc::clone(data),
+        }
+    }
 }
 
 /// One pinned, statement-stable relational read snapshot (prereq #1, write-half Stage 4). Holds the
