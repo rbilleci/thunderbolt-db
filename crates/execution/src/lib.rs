@@ -17377,6 +17377,21 @@ pub enum ExprStep {
         needle_idx: u32,
         negate: bool,
     },
+    /// Push the mask `(scalar_on_left ? needle <cmp> textcol[i] : textcol[i] <cmp> needle) ? 1 : 0`
+    /// for the resident TEXT column at (`offsets_byte_offset`, `bytes_byte_offset`) — LEXICOGRAPHIC
+    /// unsigned byte compare (memcmp of the common prefix, shorter sorts first), matching Rust
+    /// `str::cmp`. `cmp`: 0=eq/1=lt/2=le/3=gt/4=ge/5=ne. The needle bytes are
+    /// `text_needles[needle_idx]` (the same out-of-band channel as `TextEqMask`). Lets the mask VM
+    /// combine text INEQUALITIES with AND/OR — text ranges (`name >= 'a' AND name < 'm'`) and
+    /// nullable-text inequalities (via a following validity MaskBinary). Launches the SAME kernel as
+    /// the standalone `expr_text_compare_scalar_filter` (`gpu_db_resident_text_compare_scalar_to_mask`).
+    TextCmpMask {
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        needle_idx: u32,
+        scalar_on_left: bool,
+        cmp: u32,
+    },
     /// Push the mask `(textcol[i] LIKE pattern) ? 1 : 0` for the resident TEXT column at
     /// (`offsets_byte_offset`, `bytes_byte_offset`). The pattern is the COMPILED u32 token array (escapes
     /// resolved on the host: each token `(op<<8)|byte`, op 0=literal/1=`_`/2=`%`), stored LE-serialized in
@@ -17617,6 +17632,17 @@ fn run_resident_arith_program<'r>(
         .any(|s| matches!(s, ExprStep::TextEqMask { .. }))
     {
         Some(primary.cached_function(c"gpu_db_resident_text_eq_scalar_to_mask", &ptx)?)
+    } else {
+        None
+    };
+    // Text ordering (< <= > >=) -> i32 mask via the lexicographic byte-compare kernel (the SAME kernel
+    // the standalone text-inequality fast path launches), so the VM can combine text ranges
+    // (`name >= 'a' AND name < 'm'`) with AND/OR. Lazy (only if a TextCmpMask step is present).
+    let text_cmp_mask_fn = if program
+        .iter()
+        .any(|s| matches!(s, ExprStep::TextCmpMask { .. }))
+    {
+        Some(primary.cached_function(c"gpu_db_resident_text_compare_scalar_to_mask", &ptx)?)
     } else {
         None
     };
@@ -18070,6 +18096,55 @@ fn run_resident_arith_program<'r>(
                     (&mut a5 as *mut u32).cast::<c_void>(),
                     (&mut a6 as *mut u64).cast::<c_void>(),
                     (&mut a7 as *mut u64).cast::<c_void>(),
+                ];
+                launch(function, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::TextCmpMask {
+                offsets_byte_offset,
+                bytes_byte_offset,
+                needle_idx,
+                scalar_on_left,
+                cmp,
+            } => {
+                // textcol[i] <cmp> needle (lexicographic unsigned bytes, shorter-first) -> i32 mask
+                // pushed on the stack. Same needle H2D discipline as TextEqMask (lease >= 1 byte; the
+                // kernel never reads the pointer when needle_len == 0 since minlen == 0).
+                let needle = text_needles.get(needle_idx as usize).ok_or(
+                    CudaRuntimeProbeError::InvalidInputLength(needle_idx as usize),
+                )?;
+                let function =
+                    text_cmp_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let needle_lease = primary.lease_device_buffer(needle.len().max(1))?;
+                if !needle.is_empty() {
+                    check_cuda(unsafe {
+                        cu_memcpy_htod(
+                            needle_lease.ptr,
+                            needle.as_ptr().cast::<c_void>(),
+                            needle.len(),
+                        )
+                    })?;
+                }
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = resident_base;
+                let mut a1 = offsets_byte_offset;
+                let mut a2 = bytes_byte_offset;
+                let mut a3 = needle_lease.ptr;
+                let mut a4 = needle.len() as u64;
+                let mut a5 = u32::from(scalar_on_left);
+                let mut a6 = cmp;
+                let mut a7 = n;
+                let mut a8 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u64).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u32).cast::<c_void>(),
+                    (&mut a6 as *mut u32).cast::<c_void>(),
+                    (&mut a7 as *mut u64).cast::<c_void>(),
+                    (&mut a8 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
                 stack.push(out);

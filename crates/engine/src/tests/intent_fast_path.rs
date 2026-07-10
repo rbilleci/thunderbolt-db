@@ -3140,6 +3140,59 @@ fn gpu_text_inequality_dml_resolves_on_device() {
     }
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a TEXT RANGE DELETE (`name >= 'b' AND name < 'd'` —
+/// a text inequality INSIDE an AND) resolves ON THE DEVICE via the new `TextCmpMask` mask-VM step
+/// (the same lexicographic byte-compare kernel, composed with `MaskBinary` AND). Also exercises the
+/// NULLABLE-text composition: a NULL `name` row is excluded by the validity AND (3VL), never matched
+/// or mis-ordered by its empty placeholder span. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_text_range_dml_resolves_on_device() {
+    // Non-null range: 'a','b','c','d' with `>= 'b' AND < 'd'` -> delete 'b','c' (ids 2,3).
+    {
+        let Some(engine) = gpu_elided_pk_table_with_column(
+            "name TEXT",
+            &[(1, "'a'"), (2, "'b'"), (3, "'c'"), (4, "'d'")],
+        ) else {
+            return;
+        };
+        let before = engine.dml_device_resolve_hits();
+        engine
+            .execute_dml_concurrent(9, "DELETE FROM t WHERE name >= 'b' AND name < 'd'")
+            .unwrap();
+        assert!(
+            engine.dml_device_resolve_hits() > before,
+            "a text RANGE DELETE must RESOLVE on the device (TextCmpMask in the mask VM)"
+        );
+        assert!(engine.table_install_elided("t"), "text range DELETE must NOT de-elide");
+        assert_eq!(gpu_ids_of_t(&engine), vec![1, 4], "'b','c' deleted; 'a','d' kept");
+    }
+    // NULLABLE-text range: a NULL name row must be excluded by 3VL (its empty placeholder span would
+    // otherwise sort below 'b' — but NULL is UNKNOWN, not ''), and the table stays elided.
+    {
+        let Some(engine) = gpu_elided_pk_table_with_column(
+            "name TEXT",
+            &[(1, "'a'"), (2, "'b'"), (3, "NULL"), (4, "'c'")],
+        ) else {
+            return;
+        };
+        let before = engine.dml_device_resolve_hits();
+        engine
+            .execute_dml_concurrent(9, "DELETE FROM t WHERE name >= 'a' AND name < 'z'")
+            .unwrap();
+        assert!(
+            engine.dml_device_resolve_hits() > before,
+            "a nullable-text range DELETE must RESOLVE on the device"
+        );
+        assert!(engine.table_install_elided("t"), "nullable-text range must NOT de-elide");
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![3],
+            "'a','b','c' deleted; the NULL row survives (3VL: NULL is UNKNOWN, never < 'z')"
+        );
+    }
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, multi-statement elision): a MULTI-ENTRY commit BATCH of INSERTs
 /// (the group-commit batcher grouping GpuBatched inserts under load — the SQL-text write path) now
 /// KEEPS the table ELIDED via ONE incremental device append per table, instead of de-eliding the

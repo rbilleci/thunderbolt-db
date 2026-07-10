@@ -1837,9 +1837,9 @@ fn compile_predicate_program(
         program.push(ExprStep::MaskBinary { op: bool_op });
         return Ok(());
     }
-    // TEXT comparison leaf -> a mask step the VM combines with AND/OR (so text IN / multi-text WHERE / a
-    // nullable-text or compound LIKE run on the GPU). LIKE -> TextLikeMask; `=`/`<>` -> TextEqMask. int4
-    // leaves fall through to the arith VM below.
+    // TEXT comparison leaf -> a mask step the VM combines with AND/OR (so text IN / multi-text WHERE /
+    // text RANGES / a nullable-text or compound LIKE run on the GPU). LIKE -> TextLikeMask; `=`/`<>` ->
+    // TextEqMask; `<`/`<=`/`>`/`>=` -> TextCmpMask (ADR-006). int4 leaves fall through to the arith VM.
     if expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table) {
         if matches!(op, ResidentBinaryOp::Like) {
             return compile_text_like_leaf(lhs, rhs, table, snapshot, program, needles);
@@ -1915,10 +1915,13 @@ fn compile_predicate_program(
     }
 }
 
-/// Compile a TEXT comparison leaf (`textcol = 'lit'` / `<>`) into a `TextEqMask` VM step + record its
-/// needle bytes in `needles` (indexed by `needle_idx`). Mirrors the single-comparison text fast path
-/// but as a mask the VM can AND/OR. `=` -> negate false, `<>` -> negate true; text inequalities (need
-/// collation sort keys) and text column-vs-column are follow-ons, rejected here (never mis-answered).
+/// Compile a TEXT comparison leaf into a mask VM step + record its needle bytes in `needles` (indexed
+/// by `needle_idx`). `=` -> `TextEqMask` (negate false), `<>` -> `TextEqMask` (negate true);
+/// `<`/`<=`/`>`/`>=` (ADR-006) -> `TextCmpMask` (the lexicographic byte-compare kernel, matching the
+/// host `str::cmp`; a column-on-RIGHT `'lit' < col` sets `scalar_on_left` — the kernel negates the
+/// ordinal). Mirrors the single-comparison text fast paths but as masks the VM can AND/OR — text
+/// ranges (`name >= 'a' AND name < 'm'`), text IN, and mixed text+int4 WHEREs. Text column-vs-column
+/// is a follow-on, rejected (never mis-answered).
 fn compile_text_eq_leaf(
     op: ResidentBinaryOp,
     lhs: &ResidentExpr,
@@ -1928,45 +1931,61 @@ fn compile_text_eq_leaf(
     program: &mut Vec<ExprStep>,
     needles: &mut Vec<Vec<u8>>,
 ) -> Result<(), ExecuteError> {
-    let negate = match op {
-        ResidentBinaryOp::Eq => false,
-        ResidentBinaryOp::Ne => true,
-        _ => {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "text inequalities need collation sort keys (a follow-on); only = and <> run on the GPU"
-                    .to_string(),
-            )));
-        }
-    };
-    let (col, literal) = match (text_column_index(lhs, table), text_column_index(rhs, table)) {
-        (Some(col), None) if text_literal_value(rhs).is_some() => {
-            (col, text_literal_value(rhs).expect("checked"))
-        }
-        (None, Some(col)) if text_literal_value(lhs).is_some() => {
-            (col, text_literal_value(lhs).expect("checked"))
-        }
-        (Some(_), Some(_)) => {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "text column-vs-column comparison is a follow-on".to_string(),
-            )));
-        }
-        _ => {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "text comparison must be a column against a literal".to_string(),
-            )));
-        }
-    };
+    // (col, literal, column_on_left). Equality is symmetric; the inequality kernel needs the side.
+    let (col, literal, column_on_left) =
+        match (text_column_index(lhs, table), text_column_index(rhs, table)) {
+            (Some(col), None) if text_literal_value(rhs).is_some() => {
+                (col, text_literal_value(rhs).expect("checked"), true)
+            }
+            (None, Some(col)) if text_literal_value(lhs).is_some() => {
+                (col, text_literal_value(lhs).expect("checked"), false)
+            }
+            (Some(_), Some(_)) => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "text column-vs-column comparison is a follow-on".to_string(),
+                )));
+            }
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "text comparison must be a column against a literal".to_string(),
+                )));
+            }
+        };
     let layout = resident_device_text_column_layout(snapshot, table, col)?;
     let needle_idx = needles.len() as u32;
     needles.push(literal.as_bytes().to_vec());
-    program.push(ExprStep::TextEqMask {
-        offsets_byte_offset: layout.offsets_byte_offset,
-        bytes_byte_offset: layout.bytes_byte_offset,
-        needle_idx,
-        negate,
-    });
-    // 3VL: a NULL text operand makes `=`/`<>` UNKNOWN ⇒ the row is not selected (its placeholder is an
-    // empty span, which would otherwise mis-match `= ''` / mis-pass `<> 'x'`).
+    match op {
+        ResidentBinaryOp::Eq | ResidentBinaryOp::Ne => {
+            program.push(ExprStep::TextEqMask {
+                offsets_byte_offset: layout.offsets_byte_offset,
+                bytes_byte_offset: layout.bytes_byte_offset,
+                needle_idx,
+                negate: matches!(op, ResidentBinaryOp::Ne),
+            });
+        }
+        ResidentBinaryOp::Lt
+        | ResidentBinaryOp::Le
+        | ResidentBinaryOp::Gt
+        | ResidentBinaryOp::Ge => {
+            let cmp = predicate_compare_code(op).expect("lt/le/gt/ge have compare codes");
+            program.push(ExprStep::TextCmpMask {
+                offsets_byte_offset: layout.offsets_byte_offset,
+                bytes_byte_offset: layout.bytes_byte_offset,
+                needle_idx,
+                // The kernel evaluates `scalar <cmp> textcol[i]` when scalar_on_left — i.e. when the
+                // COLUMN is on the RIGHT of the original comparison.
+                scalar_on_left: !column_on_left,
+                cmp,
+            });
+        }
+        _ => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports text = <> < <= > >= and LIKE only".to_string(),
+            )));
+        }
+    }
+    // 3VL: a NULL text operand makes any comparison UNKNOWN ⇒ the row is not selected (its placeholder
+    // is an empty span, which would otherwise mis-match `= ''` / mis-pass `<> 'x'` / mis-order `< 'x'`).
     push_column_validity_and(col, table, snapshot, program)
 }
 
