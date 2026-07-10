@@ -5,7 +5,11 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `de289200` (CPU-ENGINE RETIREMENT — NINETEEN merged wins: NULLABLE-UUID
+**Updated:** 2026-07-10. **Base:** `main` @ `bedde09e` (CPU-ENGINE RETIREMENT — TWENTY merged wins: NULLABLE-TIMESTAMP
+ranges + COMPOUND TIMESTAMP READS on-device (the nullable local gate gains an I64 case for {Int8,Timestamp}; a NEW
+timestamp scalar VM leaf accepts Int8Literal (DML micros) AND TextLiteral (read bounds, parsed) via LoadColumnI64 +
+CompareScalarI64 + validity — arm-steal audited byte-for-byte equivalent; ts-vs-ts col-vs-col in AND newly works via
+CompareBuffers@I64, test-covered) `bedde09e`; NULLABLE-UUID
 ranges + IN resolve ON-DEVICE (a LOCAL I32-mask gate in the nullable branch — after the simple helpers, zero
 diversion audited; per-leaf validity-AND is the 3VL net, READ-pinned with a zero-anchored range whose NULL
 placeholder matches both bounds, sabotage-proven) `de289200`; UUID RANGES +
