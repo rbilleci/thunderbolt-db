@@ -150,25 +150,179 @@ pub(crate) struct ColdTableChunks {
     build_copin_s: Index,
     chunk_target_bytes: u64,
     total_payload_bytes: u64,
+    /// S-E.6b: this table's payloads live in the unlinked spill file (counts against the DISK cap,
+    /// not the RAM cap).
+    spilled: bool,
     chunks: Vec<ColdChunk>,
 }
 
 /// One cached chunk: the exact device payload bytes + the descriptor template the build produced.
 pub(crate) struct ColdChunk {
-    payload: Arc<Vec<u8>>,
+    payload: ColdPayload,
     snapshot: RelationalResidencySnapshot,
     row_count: u64,
 }
 
+/// S-E.6b: where a cached chunk's payload bytes live — host RAM below the spill threshold, or an
+/// UNLINKED spill file above it (created then `remove_file`d with the handle kept open: the OS
+/// reclaims the space on the last close — crash-safe, zero litter, no startup sweep; positional
+/// `read_exact_at` reads are seek-free and thread-safe). The spill directory honors `TMPDIR`
+/// (production points it at NVMe; the test profile already pins it to `target/tmp`).
+enum ColdPayload {
+    Ram(Arc<Vec<u8>>),
+    Spilled {
+        file: Arc<std::fs::File>,
+        offset: u64,
+        len: usize,
+    },
+}
+
+impl ColdPayload {
+    /// Materialize the payload bytes for a replay upload. A spill-read failure is an `Err` the
+    /// caller turns into a MISS/defer — never a wrong answer.
+    fn read(&self) -> Result<std::borrow::Cow<'_, [u8]>, ()> {
+        match self {
+            ColdPayload::Ram(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
+            ColdPayload::Spilled { file, offset, len } => {
+                use std::os::unix::fs::FileExt;
+                let mut bytes = vec![0u8; *len];
+                file.read_exact_at(&mut bytes, *offset).map_err(|_| ())?;
+                Ok(std::borrow::Cow::Owned(bytes))
+            }
+        }
+    }
+}
+
 /// Accumulates a fold's scan-built chunks for install (discarded on any defer/error/early-exit —
-/// only a COMPLETE scan installs).
+/// only a COMPLETE scan installs). S-E.6b: once the captured bytes cross the SPILL threshold the
+/// builder opens an unlinked spill file, retro-writes the RAM chunks captured so far, and
+/// write-throughs every later chunk — so an over-RAM table's capture never holds its payloads in
+/// host memory (the very tables streaming exists for are the ones that must spill).
 struct ColdCacheBuilder {
     generation: Arc<crate::resident_storage::TableVersionData>,
     build_copin_s: Index,
     chunk_target_bytes: u64,
     total_payload_bytes: u64,
     chunks: Vec<ColdChunk>,
+    /// The open spill file + its append offset once the threshold tripped (`None` = all-RAM).
+    spill: Option<(Arc<std::fs::File>, u64)>,
+    /// A spill IO error poisons the capture (the fold keeps running; the install is skipped).
+    poisoned: bool,
 }
+
+impl ColdCacheBuilder {
+    /// Append one captured chunk, spilling at the threshold. On any IO error the builder poisons
+    /// itself (no install) — the fold's own compute path is unaffected.
+    fn push(&mut self, payload: Vec<u8>, snapshot: RelationalResidencySnapshot, row_count: u64) {
+        use std::io::Write;
+        if self.poisoned {
+            return;
+        }
+        self.total_payload_bytes = self.total_payload_bytes.saturating_add(payload.len() as u64);
+        if self.spill.is_none() && self.total_payload_bytes > streaming_cold_spill_threshold() {
+            // Threshold crossed: open the unlinked spill file and retro-write the RAM prefix.
+            let Ok(file) = unlinked_spill_file() else {
+                self.poisoned = true;
+                return;
+            };
+            let mut writer: &std::fs::File = file.as_ref();
+            let mut offset = 0u64;
+            for chunk in &mut self.chunks {
+                let ColdPayload::Ram(bytes) = &chunk.payload else {
+                    self.poisoned = true;
+                    return;
+                };
+                if writer.write_all(bytes).is_err() {
+                    self.poisoned = true;
+                    return;
+                }
+                let len = bytes.len();
+                chunk.payload = ColdPayload::Spilled {
+                    file: Arc::clone(&file),
+                    offset,
+                    len,
+                };
+                offset += len as u64;
+            }
+            self.spill = Some((file, offset));
+        }
+        let cold_payload = match &mut self.spill {
+            None => ColdPayload::Ram(Arc::new(payload)),
+            Some((file, offset)) => {
+                use std::io::Write;
+                let mut writer = file.as_ref();
+                if writer.write_all(&payload).is_err() {
+                    self.poisoned = true;
+                    return;
+                }
+                let chunk_offset = *offset;
+                *offset += payload.len() as u64;
+                ColdPayload::Spilled {
+                    file: Arc::clone(file),
+                    offset: chunk_offset,
+                    len: payload.len(),
+                }
+            }
+        };
+        self.chunks.push(ColdChunk {
+            payload: cold_payload,
+            snapshot,
+            row_count,
+        });
+    }
+}
+
+/// Create an UNLINKED spill file in the `TMPDIR`-honoring temp directory: created, then
+/// `remove_file`d while the handle stays open (unix) — the OS reclaims the bytes on the last
+/// close, so a crash leaks nothing and no startup sweep exists to forget.
+fn unlinked_spill_file() -> Result<Arc<std::fs::File>, ()> {
+    let dir = std::env::temp_dir();
+    // pid + monotonic seq + wall-nanos: the name exists only for the create+unlink instant, but a
+    // predictable name on a SHARED temp dir would let a local nuisance pre-create it (create_new
+    // fails -> poison -> CPU fallback; O_EXCL already blocks anything worse — audit LOW).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let name = format!(
+        "gpu-db-stream-spill-{}-{}-{nanos}",
+        std::process::id(),
+        SPILL_FILE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let path = dir.join(name);
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|_| ())?;
+    std::fs::remove_file(&path).map_err(|_| ())?;
+    Ok(Arc::new(file))
+}
+
+/// Uniquifies spill file names within the process (the path exists only for the create+unlink
+/// instant, but two concurrent builds must not collide in it).
+static SPILL_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// S-E.6b: the RAM->spill threshold for a single table's capture. A `#[cfg(test)]` override lets
+/// the GPU tests force spilling on small tables (NOT product config — the no-flag mandate).
+fn streaming_cold_spill_threshold() -> u64 {
+    #[cfg(test)]
+    {
+        let forced = STREAMING_COLD_SPILL_THRESHOLD_TEST.load(Ordering::Relaxed);
+        if forced != 0 {
+            return forced;
+        }
+    }
+    STREAMING_COLD_SPILL_THRESHOLD_BYTES
+}
+
+/// Captures above this stay out of host RAM (spilled). Engine-internal, not config.
+const STREAMING_COLD_SPILL_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(test)]
+pub(crate) static STREAMING_COLD_SPILL_THRESHOLD_TEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl std::fmt::Debug for ColdTableChunks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -185,6 +339,9 @@ impl std::fmt::Debug for ColdTableChunks {
 /// The cache is INTERIM double-residency next to the MVCC tuple store it shadows; both retire with
 /// ADR-006 (the sealed shard bytes become the only cold representation).
 const STREAMING_COLD_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// S-E.6b: the spilled-class cap (unlinked NVMe/temp files). Engine-internal, not config.
+const STREAMING_COLD_DISK_CAP_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
 impl StreamAccum {
     fn new(agg: StreamAgg) -> Self {
@@ -563,6 +720,9 @@ impl Engine {
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
                 let Ok(next) = self.stage_cold_chunk(chunk) else {
+                    // A failed replay (e.g. a bad spill read) evicts the entry so the next read
+                    // rebuilds instead of defer-thrashing (audit LOW).
+                    self.evict_streaming_cold(&select.table);
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 if let Some(prev) = staged.replace(next) {
@@ -598,6 +758,8 @@ impl Engine {
                 chunk_target_bytes,
                 total_payload_bytes: 0,
                 chunks: Vec::new(),
+                spill: None,
+                poisoned: false,
             });
             let mut cursor = table_rows.store().seq_scan_open(visibility)?;
             while let Some(tuple) = cursor.next() {
@@ -780,6 +942,9 @@ impl Engine {
                     break;
                 }
                 let Ok(next) = self.stage_cold_chunk(chunk) else {
+                    // A failed replay (e.g. a bad spill read) evicts the entry so the next read
+                    // rebuilds instead of defer-thrashing (audit LOW).
+                    self.evict_streaming_cold(&select.table);
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 let to_compute = if remaining_take.is_some() {
@@ -818,6 +983,8 @@ impl Engine {
                 chunk_target_bytes,
                 total_payload_bytes: 0,
                 chunks: Vec::new(),
+                spill: None,
+                poisoned: false,
             });
             let mut cursor = table_rows.store().seq_scan_open(visibility)?;
             while let Some(tuple) = cursor.next() {
@@ -1173,6 +1340,9 @@ impl Engine {
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
                 let Ok(next) = self.stage_cold_chunk(chunk) else {
+                    // A failed replay (e.g. a bad spill read) evicts the entry so the next read
+                    // rebuilds instead of defer-thrashing (audit LOW).
+                    self.evict_streaming_cold(&select.table);
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 if let Some(prev) = staged.replace(next) {
@@ -1258,6 +1428,8 @@ impl Engine {
                 chunk_target_bytes,
                 total_payload_bytes: 0,
                 chunks: Vec::new(),
+                spill: None,
+                poisoned: false,
             });
             let mut cursor = table_rows.store().seq_scan_open(visibility)?;
             while let Some(tuple) = cursor.next() {
@@ -1627,6 +1799,9 @@ impl Engine {
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
                 let Ok(next) = self.stage_cold_chunk(chunk) else {
+                    // A failed replay (e.g. a bad spill read) evicts the entry so the next read
+                    // rebuilds instead of defer-thrashing (audit LOW).
+                    self.evict_streaming_cold(&select.table);
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 if let Some(prev) = staged.replace(next) {
@@ -1717,6 +1892,8 @@ impl Engine {
                 chunk_target_bytes,
                 total_payload_bytes: 0,
                 chunks: Vec::new(),
+                spill: None,
+                poisoned: false,
             });
             let mut cursor = table_rows.store().seq_scan_open(visibility)?;
             while let Some(tuple) = cursor.next() {
@@ -2155,15 +2332,10 @@ impl Engine {
             .streaming_fold_peak_chunk_bytes
             .fetch_max(snapshot.resident_bytes, Ordering::Relaxed);
         // S-E.6: capture the built payload bytes for the cold tier (the upload already staged them
-        // into pinned memory; keeping the Vec is zero extra copies).
+        // into pinned memory; keeping the Vec is zero extra copies). Above the spill threshold the
+        // builder streams them to the unlinked spill file instead of holding RAM (S-E.6b).
         if let Some(builder) = capture {
-            builder.total_payload_bytes =
-                builder.total_payload_bytes.saturating_add(payload.len() as u64);
-            builder.chunks.push(ColdChunk {
-                payload: Arc::new(payload),
-                snapshot: snapshot.clone(),
-                row_count: chunk_rows.len() as u64,
-            });
+            builder.push(payload, snapshot.clone(), chunk_rows.len() as u64);
         }
         Ok(StagedChunk {
             snapshot,
@@ -2172,12 +2344,30 @@ impl Engine {
         })
     }
 
+    /// S-E.6b (audit LOW): evict a table's cold entry after a replay failure — a bad spill file
+    /// (disk fault) would otherwise defer-thrash every future streaming read on the table; dropping
+    /// the entry lets the next read rebuild it.
+    fn evict_streaming_cold(&self, table_name: &str) {
+        let residency = &self.read_state.residency;
+        let _publish = residency
+            .streaming_cold_lock
+            .lock()
+            .expect("streaming cold-tier lock poisoned");
+        let mut map = std::collections::BTreeMap::clone(&residency.streaming_cold_chunks.load());
+        if map.remove(table_name).is_some() {
+            residency.streaming_cold_chunks.store(Arc::new(map));
+        }
+    }
+
     /// S-E.6: stage one COLD chunk — re-upload the cached device payload bytes (async copy stream),
     /// with a fresh proof stamped onto the cached descriptor template. No decode, no assembly.
     fn stage_cold_chunk(&self, chunk: &ColdChunk) -> Result<StagedChunk, ()> {
         let runtime = self.cuda_driver_probe_runtime();
+        // RAM chunks borrow; spilled chunks positional-read from the unlinked file (an IO error is
+        // a defer, never a wrong answer).
+        let payload = chunk.payload.read()?;
         let pending = runtime
-            .retain_device_memory_copy_async(chunk.snapshot.gpu_id, &chunk.payload)
+            .retain_device_memory_copy_async(chunk.snapshot.gpu_id, &payload)
             .map_err(|_| ())?;
         self.read_state
             .residency
@@ -2253,7 +2443,17 @@ impl Engine {
     /// `rehydrate_elided_serialized` pattern). CAP policy (audit F2): an entry alone over the cap
     /// never installs (rebuild-then-clear thrash); a combined breach evicts the OTHER entries.
     fn install_streaming_cold(&self, table_name: &str, builder: ColdCacheBuilder) {
-        if builder.total_payload_bytes > STREAMING_COLD_CAP_BYTES {
+        // A spill IO error poisoned the capture: the chunk list is incomplete — never install it.
+        if builder.poisoned {
+            return;
+        }
+        let spilled = builder.spill.is_some();
+        let class_cap = if spilled {
+            STREAMING_COLD_DISK_CAP_BYTES
+        } else {
+            STREAMING_COLD_CAP_BYTES
+        };
+        if builder.total_payload_bytes > class_cap {
             return;
         }
         if self.mvcc_read_skips_leader_check() {
@@ -2271,6 +2471,7 @@ impl Engine {
             build_copin_s: builder.build_copin_s,
             chunk_target_bytes: builder.chunk_target_bytes,
             total_payload_bytes: builder.total_payload_bytes,
+            spilled,
             chunks: builder.chunks,
         });
         let residency = &self.read_state.residency;
@@ -2280,15 +2481,25 @@ impl Engine {
             .expect("streaming cold-tier lock poisoned");
         let mut map = std::collections::BTreeMap::clone(&residency.streaming_cold_chunks.load());
         map.insert(table_name.to_string(), entry);
-        let total: u64 = map.values().map(|c| c.total_payload_bytes).sum();
-        if total > STREAMING_COLD_CAP_BYTES {
+        // Per-class caps (RAM vs spilled/DISK): a breach evicts the OTHER entries of that class.
+        let class_total: u64 = map
+            .values()
+            .filter(|c| c.spilled == spilled)
+            .map(|c| c.total_payload_bytes)
+            .sum();
+        if class_total > class_cap {
             let kept = map.remove(table_name).expect("just inserted");
-            map.clear();
+            map.retain(|_, c| c.spilled != spilled);
             map.insert(table_name.to_string(), kept);
         }
         residency
             .streaming_cold_builds
             .fetch_add(1, Ordering::Relaxed);
+        if spilled {
+            residency
+                .streaming_cold_spills
+                .fetch_add(1, Ordering::Relaxed);
+        }
         residency.streaming_cold_chunks.store(Arc::new(map));
     }
 
@@ -2403,6 +2614,14 @@ impl Engine {
         self.read_state
             .residency
             .streaming_cold_builds
+            .load(Ordering::Relaxed)
+    }
+
+    /// S-E.6b telemetry: cold-tier installs whose payloads live in the unlinked spill file.
+    pub fn streaming_cold_spills(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_cold_spills
             .load(Ordering::Relaxed)
     }
 }

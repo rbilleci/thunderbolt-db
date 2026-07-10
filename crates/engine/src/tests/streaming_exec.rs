@@ -977,3 +977,79 @@ fn gpu_streaming_cold_tier_invalidates_on_write() {
         "a DELETE must invalidate the cold tier"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_cold_tier_spills_and_replays_from_disk() {
+    // S-E.6b: over the spill threshold the cold tier lives in an UNLINKED temp file, not host RAM.
+    // Force a tiny threshold (test-only override) so the capture spills, then prove: the spill
+    // counter fired; replays (aggregates AND the exact-order projection — chunk offsets must map
+    // back byte-exactly) match the scan build; a write invalidates; a rebuilt spill serves again.
+    crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
+        .store(1024, std::sync::atomic::Ordering::Relaxed);
+    let result = std::panic::catch_unwind(|| {
+        let mut e = Engine::new_local();
+        let mut seq = 0u64;
+        if !gpu_available(&mut e, &mut seq) {
+            return;
+        }
+        seq += 1;
+        e.execute_text(seq, "CREATE TABLE big (a INT)").unwrap();
+        const N: i32 = 1500;
+        let mut values = String::new();
+        for i in 0..N {
+            if i > 0 {
+                values.push(',');
+            }
+            values.push_str(&format!("({i})"));
+        }
+        seq += 1;
+        e.execute_text(seq, &format!("INSERT INTO big (a) VALUES {values}"))
+            .unwrap();
+        e.set_relational_residency_budget_bytes(0, 4096);
+
+        // Build: 6000B of payloads > the 1KB forced threshold -> the capture SPILLS.
+        let count = e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM big"))
+            .unwrap();
+        assert_eq!(count.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(i64::from(N))]]);
+        assert!(
+            e.streaming_cold_spills() >= 1,
+            "the capture must have SPILLED (threshold forced to 1KB)"
+        );
+        // Aggregate replay from disk.
+        let hits_before = e.streaming_cold_hits();
+        let sum = e
+            .execute_relational_select(&select("SELECT SUM(a) FROM big"))
+            .unwrap();
+        let expected_sum: i64 = (0..i64::from(N)).sum();
+        assert_eq!(sum.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(expected_sum)]]);
+        assert!(e.streaming_cold_hits() > hits_before, "spilled replay served the SUM");
+        // EXACT-ORDER projection replay: chunk offsets must round-trip byte-exactly (a swapped or
+        // misaligned positional read would reorder or corrupt rows).
+        let rows = e
+            .execute_relational_select(&select("SELECT a FROM big WHERE a >= 1000"))
+            .unwrap();
+        let expected: Vec<Vec<SqlValue>> = (1000..N).map(|i| vec![SqlValue::Int4(i)]).collect();
+        assert_eq!(rows.rows.clone().into_boxed(), expected, "spilled projection byte-exact");
+
+        // A write invalidates the spilled entry (generation change), and the rebuild re-spills.
+        let spills_before = e.streaming_cold_spills();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)").unwrap();
+        let count = e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM big"))
+            .unwrap();
+        assert_eq!(
+            count.rows.clone().into_boxed(),
+            vec![vec![SqlValue::Int8(i64::from(N) + 1)]],
+            "post-write count fresh (stale spilled replay would say N)"
+        );
+        assert!(e.streaming_cold_spills() > spills_before, "the rebuild re-spilled");
+    });
+    crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

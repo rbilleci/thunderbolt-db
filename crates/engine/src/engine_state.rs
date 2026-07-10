@@ -649,6 +649,8 @@ pub(crate) struct ResidencyReadState {
     pub(crate) streaming_cold_hits: std::sync::atomic::AtomicU64,
     /// STRATA S-E.6: cold-tier builds installed (a fold's scan captured its chunks for reuse).
     pub(crate) streaming_cold_builds: std::sync::atomic::AtomicU64,
+    /// STRATA S-E.6b: cold-tier installs spilled to the unlinked temp file (over the RAM threshold).
+    pub(crate) streaming_cold_spills: std::sync::atomic::AtomicU64,
     /// RETIREMENT A4e: tables whose commits ELIDE the host tuple-store + value-index install
     /// (device-authoritative). Entered after first admission when eligible under the default-OFF
     /// flag; LEFT (sticky de-elision) via rehydration when any resolve/gather declines. COW set —
