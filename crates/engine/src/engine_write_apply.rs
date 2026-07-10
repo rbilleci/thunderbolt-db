@@ -1590,11 +1590,11 @@ impl Engine {
                     },
                 )
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                let visibility = StorageVisibility {
+                let mut visibility = StorageVisibility {
                     read_txn_id: txn_id,
                 };
                 let prefix = relational_key_prefix(&update.table);
-                let table_rows = self.read_state.mvcc.table_rows(&update.table);
+                let mut table_rows = self.read_state.mvcc.table_rows(&update.table);
                 // PHASE C slice 1b: resolve the matches via the value index and validate the
                 // touched images index-driven; ineligible (range-only / self-FK / flag off) ->
                 // the scan block below, unchanged.
@@ -1602,6 +1602,7 @@ impl Engine {
                     .foreign_keys
                     .iter()
                     .any(|foreign_key| foreign_key.referenced_table == table.name);
+                let was_elided = self.table_install_elided(&table.name);
                 let index_resolved =
                     if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
                         None
@@ -1615,16 +1616,23 @@ impl Engine {
                         )? {
                             Some(matches) => Some(matches),
                             None => {
-                                // A5 FLIP SI FIX: the decline may have REHYDRATED (fresh COW
-                                // generation) — re-pin or the fallback resolves stale images
-                                // (see engine_dml_prepare's ladder for the full account).
-                                // The SHADOWING (unlike the prepare ladders' outer-mut) is
-                                // sufficient here: these preflight ladders run only for
-                                // CONSTRAINED tables, which are non-elided BY ELIGIBILITY, so
-                                // no rehydration can actually fire — the re-pin is
-                                // defense-in-depth and the downstream validator's original
-                                // binding is provably fresh (audit N2).
-                                let table_rows = self.read_state.mvcc.table_rows(&table.name);
+                                // A5 FLIP SI FIX + ADR-006 (CHECK-elided tables, audit HIGH fix):
+                                // the decline may have REHYDRATED (a fresh COW generation) — with
+                                // CHECK tables now ELIGIBLE to elide, this preflight ladder CAN see
+                                // a mid-preflight rehydrate (the old "constrained ⇒ non-elided"
+                                // premise is gone). Re-pin the OUTER binding (the prepare ladders'
+                                // pattern) so the else-scan below reads the post-rehydrate
+                                // generation — a stale scan would see ZERO elided-era rows and pass
+                                // the CHECK/unique validators VACUOUSLY (a constraint bypass). If
+                                // the table de-elided here, also RAISE the read boundary to the
+                                // committed seq (the DDL-validator seam): the reconcile stamps
+                                // elided-era rows at committed_seq, which a facade txn id below it
+                                // (post-recovery) would silently miss.
+                                table_rows = self.read_state.mvcc.table_rows(&table.name);
+                                if was_elided && !self.table_install_elided(&table.name) {
+                                    visibility.read_txn_id =
+                                        visibility.read_txn_id.max(self.committed_seq());
+                                }
                                 Self::resolve_dml_matches_via_value_index(
                                     table,
                                     &table_rows,

@@ -467,8 +467,9 @@ impl Engine {
                     && self.host_install_elision_enabled()
                     && !self.table_install_elided(table_name)
                 {
-                    // Audit B1: eligibility = strictly-Int4 AND constraint-free both directions
-                    // (the published snapshot is the same catalog `cat` mirrors here).
+                    // Audit B1: eligibility = device-authoritative types AND FK-free both directions
+                    // (CHECK is row-local and no longer blocks — ADR-006; the published snapshot is
+                    // the same catalog `cat` mirrors here).
                     let snapshot = self.catalog_snapshot();
                     if self.table_elision_eligible(&snapshot, table_name) {
                         self.set_table_install_elided(table_name, true);

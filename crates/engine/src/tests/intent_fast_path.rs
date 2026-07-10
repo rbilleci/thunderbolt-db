@@ -3251,6 +3251,185 @@ fn gpu_date_range_dml_resolves_on_device() {
     }
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, structural): a CHECK-constrained table now ELIDES — CHECK
+/// validation is ROW-LOCAL (`validate_check_constraints_for_rows` evaluates the NEW values only,
+/// never the tuple store), so the stale-host-store invariant is unaffected. Pins the full lifecycle:
+/// the table elides; a violating INSERT on the ELIDED table errors (and changes nothing); valid DML
+/// lands on-device; a violating UPDATE (new image from the device materialize) errors; and ALTER ADD
+/// CHECK sees ELIDED-ERA device rows via the rehydrate-first DDL validator (rejects a new constraint
+/// an elided-era row violates). GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_check_constrained_table_elides() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT, CONSTRAINT v_pos CHECK (v > 0))",
+        )
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    engine
+        .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 10)")
+        .unwrap();
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    engine
+        .execute_dml_concurrent(3, "INSERT INTO t VALUES (2, 20)")
+        .unwrap();
+    assert!(
+        engine.table_install_elided("t"),
+        "a CHECK-constrained (FK-free) table must now ELIDE (CHECK is row-local)"
+    );
+
+    // A VIOLATING insert on the ELIDED table errors (row-local validation) and changes nothing.
+    let err = engine
+        .execute_dml_concurrent(4, "INSERT INTO t VALUES (3, -5)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("check constraint"), "violation must name the CHECK, got: {err}");
+    assert!(engine.table_install_elided("t"), "a rejected insert must not de-elide");
+    assert_eq!(gpu_ids_of_t(&engine), vec![1, 2], "the violating row was NOT inserted");
+
+    // A VALID insert lands on-device, still elided.
+    engine
+        .execute_dml_concurrent(5, "INSERT INTO t VALUES (3, 30)")
+        .unwrap();
+    assert!(engine.table_install_elided("t"));
+    assert_eq!(gpu_ids_of_t(&engine), vec![1, 2, 3]);
+
+    // A VIOLATING UPDATE errors (the candidate new image is built from the DEVICE-materialized row).
+    let err = engine
+        .execute_dml_concurrent(6, "UPDATE t SET v = -1 WHERE id = 2")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("check constraint"), "update violation must name the CHECK, got: {err}");
+    assert!(engine.table_install_elided("t"), "a rejected update must not de-elide");
+
+    // A VALID update works on-device.
+    engine
+        .execute_dml_concurrent(7, "UPDATE t SET v = 25 WHERE id = 2")
+        .unwrap();
+    assert_eq!(gpu_ids_of_t(&engine), vec![1, 2, 3]);
+
+    // ALTER ADD CHECK must see ELIDED-ERA rows (ids 2,3 live only on the device): a constraint that
+    // an elided-era row violates (v <= 21 fails for v=25 and v=30) must be REJECTED — the DDL
+    // row-validator rehydrates first (elision-safe by construction). A permissive one is accepted.
+    let err = engine
+        .execute_text(8, "ALTER TABLE t ADD CONSTRAINT v_small CHECK (v < 21)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.to_lowercase().contains("check") || err.to_lowercase().contains("violat"),
+        "ADD CHECK must validate ELIDED-ERA device rows (v=25/30 violate v<21), got: {err}"
+    );
+    engine
+        .execute_text(9, "ALTER TABLE t ADD CONSTRAINT v_cap CHECK (v < 1000)")
+        .unwrap();
+}
+
+/// CPU-ENGINE RETIREMENT (ADR-006, audit HIGH regression pin): a MID-PREFLIGHT REHYDRATE must not
+/// bypass CHECK. On an ELIDED CHECK table, an `execute_text` UPDATE whose WHERE the device resolve
+/// DECLINES (a mixed int8+text AND — the decline REHYDRATES/de-elides mid-preflight) used to fall back
+/// to a scan on the STALE pre-rehydrate store handle: zero visible rows -> the CHECK validated
+/// VACUOUSLY -> the apply then wrote the violating value to the real rows. The preflight now RE-PINS
+/// the outer store view (+ raises the read boundary) after the decline — the violating UPDATE must
+/// ERROR and change nothing. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_check_elided_preflight_rehydrate_no_bypass() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE t (id INT PRIMARY KEY, big BIGINT, name TEXT, v INT, \
+             CONSTRAINT v_pos CHECK (v > 0))",
+        )
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    engine
+        .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 5, 'x', 10)")
+        .unwrap();
+    let snap = engine.populate_relational_residency_snapshot("t");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    engine
+        .execute_dml_concurrent(3, "INSERT INTO t VALUES (2, 7, 'y', 20)")
+        .unwrap();
+    assert!(engine.table_install_elided("t"), "the CHECK table must elide first");
+    // THE LOAD-BEARING ROW: inserted AFTER elision entered, so it is ELIDED-ERA (device-only — the
+    // stale pre-rehydrate host handle cannot see it). The bypass requires the WHERE to match THIS row.
+    engine
+        .execute_dml_concurrent(4, "INSERT INTO t VALUES (3, 9, 'z', 30)")
+        .unwrap();
+    assert!(engine.table_install_elided("t"), "still elided after the device-only insert");
+
+    // The BYPASS shape: a RANGE-ONLY mixed int8+text AND — the device predicate rejects the mixed
+    // widths AND the value index declines (no Eq leaf) -> the else-SCAN runs. The decline
+    // REHYDRATES mid-preflight. The violating UPDATE targets the ELIDED-ERA row and must still be
+    // REJECTED by the (re-pinned) scan — the stale handle would see zero matches and pass vacuously.
+    let err = engine
+        .execute_text(5, "UPDATE t SET v = -1 WHERE big > 8 AND name > 'a'")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("check constraint"),
+        "the mid-preflight-rehydrate UPDATE must REJECT the CHECK violation (was: silently \
+         committed via the stale-scan vacuous pass), got: {err}"
+    );
+    // The matched (elided-era) row is UNCHANGED (v=30, not -1).
+    let Command::Select(s) = parse_command("SELECT v FROM t WHERE id = 3").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .next()
+            .and_then(|r| r.first()),
+        Some(&SqlValue::Int4(30)),
+        "the violating UPDATE must not have changed the elided-era row"
+    );
+    // And a VALID update through the same declining shape works (the re-pinned scan finds the row).
+    engine
+        .execute_text(6, "UPDATE t SET v = 31 WHERE big > 8 AND name > 'a'")
+        .unwrap();
+    assert_eq!(
+        engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .next()
+            .and_then(|r| r.first()),
+        Some(&SqlValue::Int4(31)),
+        "a valid update through the declining shape must land (the re-pin sees the elided-era row)"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a BOOL-EQUALITY DELETE on an ELIDED table resolves ON
 /// THE DEVICE — the DML builder lowers `flag = true` to a `BoolLiteral` the existing device
 /// `try_lower_bool_predicate` (1-bit bitmap → mask) evaluates; the hit materializes its bool on-device

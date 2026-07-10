@@ -8635,7 +8635,15 @@ impl Engine {
             // same i32 device index (`compound_key_fingerprint`).
             !index.unique || index_all_key_columns_foldable(table, index)
         }) && unique_ok
-            && table.check_constraints.is_empty()
+            // CHECK constraints DO NOT block elision (ADR-006): CHECK validation is ROW-LOCAL —
+            // `validate_check_constraints_for_rows` evaluates the NEW values only (host-held
+            // control-plane literals / device-materialized update images), never the tuple store; and
+            // ALTER ADD CHECK's existing-row validation scans via the elision-safe-by-construction
+            // DDL row-validator (which rehydrates first). The ledger-#18 re-resolve coverage proof
+            // already treats CHECK as deterministic-on-values. FK stays blocked BOTH directions:
+            // FK validation scans OTHER tables' host rows (`visible_relational_rows` on children /
+            // parent lookups), which elision deliberately leaves stale — device FK probes are the
+            // follow-on that lifts it.
             && table.foreign_keys.is_empty()
             && !catalog.relational_catalog.values().any(|other| {
                 other
