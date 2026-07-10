@@ -10,7 +10,20 @@ FOLDABLE OPERATOR CLASSES of ADR-012 are ALL STREAMING** — scalar reductions, 
 BY/DISTINCT, ORDER BY/top-N; user chose this track at the predicate-edges boundary). **>>> ACTIVE TRACK: STRATA
 STREAMING EXECUTOR (ADR-012 / PLAN §2 S-E) <<<** — over-VRAM reads run ON THE DEVICE by folding over bounded chunks
 (admit chunk → reduce on device → combine partial → evict → next), never all shards resident.
-**S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy):** the
+**S-E.6a DONE (`0a9b2fae`) — THE COLD TIER + THE S-E.5 RETURN: streaming replays DEVICE-FORMAT chunk bytes, 79×/33×.**
+A streamed table's chunk payloads cache in host RAM on the first fold build and REPLAY byte-for-byte thereafter —
+the ~68% host decode wall is GONE on hits (COUNT 181ms→2.3ms, SUM 184ms→5.5ms, 100k rows/25 chunks). The S-E.5
+overlap pipeline MERGED BACK as the path in the same commit (its economics flipped exactly as predicted). MVCC
+validity (audit HIGH adopted): generation-Arc ptr-equality alone can't carry SI (commits publish the generation
+BEFORE bumping committed_seq) — installs run under the COMMIT LOCK proving `committed_seq == build_copin_s` with
+the generation unchanged (no stamp above the build boundary), hits require `reader_copin_s >= build_copin_s`
+(boundary-invariance). Cap policy + stale-entry eviction + docs (audit M/M/L/L) adopted. Cache = INTERIM
+double-residency beside the tuple store; both retire with ADR-006. Gates: lib 501/501, streaming 13/13 (incl. the
+write-invalidation gate, generation-sabotage-verified), sweep 432/434 (same 2 pre-existing), clippy clean.
+REMAINING S-E.6b+: NVMe spill of the cold chunks; shard-granular evict/prefetch API; admission laying down sealed
+shards for over-VRAM tables (the cache then stops shadowing and becomes the primary representation).
+**S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy — RESOLVED:
+merged back via S-E.6a above):** the
 copy/compute-overlap pipeline (async pinned-staged uploads on a private copy stream + the stage-N/compute-N-1
 lookahead in all four folds) was built, tested 11/11, and A/B'd NEUTRAL — {185,179,181}ms vs {185,178,177}ms
 (COUNT over 100k rows / 25 chunks). ROOT CAUSE (measured): the fold is HOST-STAGING-BOUND at every chunk size —
@@ -58,8 +71,8 @@ reach); a genuine overflow surfaces. Opus audit CLEAN on MVCC/combine/gate/chart
 NULL/empty-text as 0 bytes → whole-table upload for null-heavy tables) fixed via device-byte accounting +
 regression-gated; LOW (per-chunk overflow now surfaces uniformly) adopted. Gates: engine lib 501/501, GPU streaming
 4/4, clippy clean, FULL GPU sweep 422/424 (the 2 fails = `capacity_payload_tests::{a1_device_row_identity,
-a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.6 raw-shard-bytes/NVMe cold tier + shard-granular evict (SUBSUMES S-E.5 — the branched
-overlap pipeline returns with it). Memory `strata-streaming-executor`. AVG deferred (needs the (sum,count) pair —
+a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.6b+ NVMe spill + shard-granular evict/prefetch (S-E.6a cold tier + the S-E.5 return SHIPPED
+`0a9b2fae`). Memory `strata-streaming-executor`. AVG deferred (needs the (sum,count) pair —
 scalar AND grouped); grouped COUNT(DISTINCT) deferred (not associatively decomposable).
 
 **Prior base** `7432ebf6` (CPU-ENGINE RETIREMENT — THIRTY merged wins, **THE
