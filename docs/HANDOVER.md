@@ -20,8 +20,13 @@ the generation unchanged (no stamp above the build boundary), hits require `read
 (boundary-invariance). Cap policy + stale-entry eviction + docs (audit M/M/L/L) adopted. Cache = INTERIM
 double-residency beside the tuple store; both retire with ADR-006. Gates: lib 501/501, streaming 13/13 (incl. the
 write-invalidation gate, generation-sabotage-verified), sweep 432/434 (same 2 pre-existing), clippy clean.
-REMAINING S-E.6b+: NVMe spill of the cold chunks; shard-granular evict/prefetch API; admission laying down sealed
-shards for over-VRAM tables (the cache then stops shadowing and becomes the primary representation).
+**S-E.6b DONE (`078f59f6`): cold-tier NVMe SPILL** — captures >256MiB stream to an UNLINKED temp file during the scan
+(create+unlink, OS-reclaimed, crash-safe; TMPDIR-honoring; positional read_exact_at replay into the async pinned
+upload; IO errors poison-or-defer, never wrong; 128GiB disk-class cap beside the 4GiB RAM cap). Over-RAM tables —
+previously refused installs — now cache. Audit MERGE-SAFE zero C/H/M (offset bookkeeping cursor-exact; async buffer
+lifetime safe); both LOWs adopted (replay-failure eviction; nanos in spill names). REMAINING S-E.6c+: shard-granular
+evict/prefetch API; admission laying down sealed shards for over-VRAM tables (the cache then stops shadowing and
+becomes the primary representation).
 **S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy — RESOLVED:
 merged back via S-E.6a above):** the
 copy/compute-overlap pipeline (async pinned-staged uploads on a private copy stream + the stage-N/compute-N-1
