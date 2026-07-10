@@ -3442,6 +3442,189 @@ fn gpu_fk_referenced_parent_elides() {
     assert_eq!(ids, vec![1, 3], "customer 2 deleted; 1 and 3 (referenced) remain");
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, structural — FK elision, CHILD side): a table WITH outbound
+/// foreign keys (non-self-referencing, i32 fk columns) now ELIDES. Its own INSERTs validate the
+/// parent on-device (item 3); the INBOUND child-reference check on a parent DELETE (`does any child
+/// row carry fk = departed key?`) runs ON THE DEVICE via the new Eq scan-locate fallback in
+/// `device_visible_row_with_value` — the hash-index probe declines on the DUPLICATE-heavy fk column
+/// (two orders share customer 1 to force it), and the child must STAY ELIDED. The load-bearing pin:
+/// the referencing child rows are ELIDED-ERA (device-only) — a stale/vacuous answer would wrongly
+/// ALLOW the parent delete (an orphan). GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_fk_child_table_elides() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    engine
+        .execute_text(2, "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT)")
+        .unwrap();
+    engine
+        .execute_text(
+            3,
+            "ALTER TABLE ONLY orders ADD CONSTRAINT orders_fk FOREIGN KEY (customer_id) \
+             REFERENCES customers(id)",
+        )
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    engine
+        .execute_text(4, "INSERT INTO customers VALUES (1, 'ada')")
+        .unwrap();
+    engine
+        .execute_text(5, "INSERT INTO customers VALUES (2, 'bob')")
+        .unwrap();
+    engine
+        .execute_dml_concurrent(6, "INSERT INTO orders VALUES (100, 1)")
+        .unwrap();
+    let snap = engine.populate_relational_residency_snapshot("orders");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    engine
+        .execute_dml_concurrent(7, "INSERT INTO orders VALUES (101, 1)")
+        .unwrap();
+    assert!(
+        engine.table_install_elided("orders"),
+        "an FK-CHILD table (outbound i32 fk, non-self-ref) must now ELIDE"
+    );
+    // ELIDED-ERA child rows referencing customer 2 (device-only; two rows -> the fk column is
+    // duplicate-heavy so the hash-index probe declines -> the Eq scan-locate serves the check).
+    engine
+        .execute_dml_concurrent(8, "INSERT INTO orders VALUES (102, 2)")
+        .unwrap();
+    engine
+        .execute_dml_concurrent(9, "INSERT INTO orders VALUES (103, 2)")
+        .unwrap();
+    assert!(engine.table_install_elided("orders"), "still elided (device-only referencing rows)");
+
+    // THE LOAD-BEARING PIN: deleting customer 2 — referenced ONLY by ELIDED-ERA device rows — must
+    // be REJECTED, and the child must STAY ELIDED (the check ran on-device; a de-elide means the
+    // ladder fell back to rehydration; a vacuous pass would orphan orders 102/103).
+    let err = engine
+        .execute_text(10, "DELETE FROM customers WHERE id = 2")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("foreign key"),
+        "deleting a parent referenced by elided-era child rows must reject, got: {err}"
+    );
+    assert!(
+        engine.table_install_elided("orders"),
+        "the child-reference check must run ON-DEVICE (the child stays elided)"
+    );
+    // Child INSERT with a missing parent still rejects while elided; a valid one lands.
+    let err = engine
+        .execute_text(11, "INSERT INTO orders VALUES (104, 999)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("foreign key"), "missing parent must reject, got: {err}");
+    engine
+        .execute_text(12, "INSERT INTO orders VALUES (105, 1)")
+        .unwrap();
+    assert!(engine.table_install_elided("orders"), "valid child insert keeps the child elided");
+}
+
+/// CPU-ENGINE RETIREMENT (ADR-006, audit follow-up — DATE fk column): the Eq scan-locate fallback
+/// must lower a DATE fk needle through the CANONICAL date string (`format_date`), NOT a raw-days
+/// Int4Literal — the lowering hard-rejects that shape (`date = 5`, PG semantics), and the decline
+/// would REHYDRATE the elided Date-fk child on EVERY parent delete (correct answers, systematic
+/// thrash). Duplicate fk dates force the hash-index decline -> the scan arm; the child must STAY
+/// ELIDED through a rejected referenced-parent delete AND an allowed unreferenced one. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_fk_child_date_fk_stays_elided() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE days (d DATE PRIMARY KEY, note TEXT)")
+        .unwrap();
+    engine
+        .execute_text(2, "CREATE TABLE events (id INT PRIMARY KEY, on_day DATE)")
+        .unwrap();
+    engine
+        .execute_text(
+            3,
+            "ALTER TABLE ONLY events ADD CONSTRAINT events_fk FOREIGN KEY (on_day) \
+             REFERENCES days(d)",
+        )
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    engine
+        .execute_text(4, "INSERT INTO days VALUES ('2024-03-01', 'kickoff')")
+        .unwrap();
+    engine
+        .execute_text(5, "INSERT INTO days VALUES ('2024-03-02', 'review')")
+        .unwrap();
+    engine
+        .execute_dml_concurrent(6, "INSERT INTO events VALUES (1, '2024-03-01')")
+        .unwrap();
+    let snap = engine.populate_relational_residency_snapshot("events");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    engine
+        .execute_dml_concurrent(7, "INSERT INTO events VALUES (2, '2024-03-01')")
+        .unwrap();
+    assert!(
+        engine.table_install_elided("events"),
+        "an FK-CHILD table (outbound DATE fk, non-self-ref) must now ELIDE"
+    );
+    // ELIDED-ERA rows referencing '2024-03-02' — duplicated so the hash-index probe declines and
+    // the Eq scan-locate serves the inbound check with a DATE needle.
+    engine
+        .execute_dml_concurrent(8, "INSERT INTO events VALUES (3, '2024-03-02')")
+        .unwrap();
+    engine
+        .execute_dml_concurrent(9, "INSERT INTO events VALUES (4, '2024-03-02')")
+        .unwrap();
+    assert!(engine.table_install_elided("events"), "still elided (device-only referencing rows)");
+
+    // Deleting the referenced date must REJECT with the child STILL elided (a de-elide means the
+    // Date needle declined the device scan and fell back to rehydration — the thrash this pins).
+    let err = engine
+        .execute_text(10, "DELETE FROM days WHERE d = '2024-03-02'")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("foreign key"),
+        "deleting a date referenced by elided-era child rows must reject, got: {err}"
+    );
+    assert!(
+        engine.table_install_elided("events"),
+        "the DATE child-reference check must run ON-DEVICE (the child stays elided)"
+    );
+    // An UNREFERENCED-date parent delete probes the same scan arm (finds rows with the fk value
+    // absent) and must SUCCEED — still without de-eliding the child.
+    engine
+        .execute_text(11, "INSERT INTO days VALUES ('2024-03-03', 'spare')")
+        .unwrap();
+    engine
+        .execute_text(12, "DELETE FROM days WHERE d = '2024-03-03'")
+        .unwrap();
+    assert!(
+        engine.table_install_elided("events"),
+        "an allowed parent delete keeps the child elided (no-match scan answered on-device)"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, audit HIGH regression pin): a MID-PREFLIGHT REHYDRATE must not
 /// bypass CHECK. On an ELIDED CHECK table, an `execute_text` UPDATE whose WHERE the device resolve
 /// DECLINES (a mixed int8+text AND — the decline REHYDRATES/de-elides mid-preflight) used to fall back

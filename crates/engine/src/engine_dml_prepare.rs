@@ -1184,7 +1184,7 @@ impl Engine {
     fn device_visible_row_with_value(
         &self,
         table: &RelationalTable,
-        visibility: StorageVisibility,
+        mut visibility: StorageVisibility,
         column_idx: usize,
         value: &SqlValue,
         exclude_keys: Option<&BTreeSet<String>>,
@@ -1196,7 +1196,47 @@ impl Engine {
         // section encoding; anything else declines to the host ladder.
         let needle =
             crate::engine_residency::i32_section_needle(table.columns.get(column_idx)?.ty, value)?;
-        let hits = self.locate_resident_pk_via_shard_index_detailed(table, column_idx, needle)?;
+        let hits = match self.locate_resident_pk_via_shard_index_detailed(table, column_idx, needle)
+        {
+            Some(hits) => hits,
+            None => {
+                // ADR-006 (child-side FK elision): the hash-index probe DECLINES on a NON-UNIQUE
+                // column (dup-bearing shards — an FK column is inherently duplicate-heavy). On an
+                // ELIDED table, falling to the host ladder would REHYDRATE (de-elide) on every
+                // inbound-FK child check — so scan-locate the Eq ON THE DEVICE instead (the same
+                // W0-guarded, generation-consistent locate the range-DML resolve uses); the per-hit
+                // loop below applies visibility + the exclude set + the exact-value recheck. Any
+                // locate decline -> `None` -> the host ladder (rehydrate) stays the safety net. A
+                // NON-elided table keeps the host value-index probe (cheap, correct).
+                if !self.table_install_elided(&table.name) {
+                    return None;
+                }
+                // BOUNDARY RAISE (the FINDING-C class, applied preemptively): the host-ladder
+                // fallback this arm replaces REHYDRATES and probes at a boundary raised to
+                // `committed_seq` — and the materialize CONTRACT requires read_txn >= the current
+                // published seq (stamped elided appends carry their commit seq; a facade txn id can
+                // lag it post-recovery). Match the fallback's strength: a lower boundary here would
+                // MISS a committed referencing child row = a wrongly-ALLOWED parent delete (orphan).
+                visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
+                // A Date column's needle IS its days-since-epoch section image, but the lowering
+                // hard-rejects a raw-days Int4Literal against a Date column (`date = 5`, PG
+                // semantics) — round-trip through the CANONICAL date string instead (the DML
+                // builder's Date arm), or an elided Date-fk child would rehydrate on EVERY
+                // parent delete. Int4/Int2 compare as the exact i32 section image.
+                let rhs = match table.columns.get(column_idx)?.ty {
+                    gpu_db_sql::SqlType::Date => crate::engine_expr::ResidentExpr::TextLiteral(
+                        gpu_db_sql::datetime::format_date(needle),
+                    ),
+                    _ => crate::engine_expr::ResidentExpr::Int4Literal(needle),
+                };
+                let predicate = crate::engine_expr::ResidentExpr::Binary {
+                    op: crate::engine_expr::ResidentBinaryOp::Eq,
+                    lhs: Box::new(crate::engine_expr::ResidentExpr::Column(column_idx)),
+                    rhs: Box::new(rhs),
+                };
+                self.locate_resident_delete_slots_detailed(table, &predicate)?
+            }
+        };
         let mut answer = false;
         for hit in &hits {
             let region = hit.row_id.as_ref()?;
