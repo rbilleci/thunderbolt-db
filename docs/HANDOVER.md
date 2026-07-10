@@ -5,10 +5,20 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `d26d41a7` (STRATA STREAMING EXECUTOR — S-E.1 + S-E.2 SHIPPED; user
-chose this track at the predicate-edges boundary). **>>> ACTIVE TRACK: STRATA STREAMING EXECUTOR (ADR-012 /
+**Updated:** 2026-07-10. **Base:** `main` @ `8036cfb7` (STRATA STREAMING EXECUTOR — S-E.1 + S-E.2 + S-E.3 SHIPPED;
+user chose this track at the predicate-edges boundary). **>>> ACTIVE TRACK: STRATA STREAMING EXECUTOR (ADR-012 /
 PLAN §2 S-E) <<<** — over-VRAM reads run ON THE DEVICE by folding over bounded chunks (admit chunk → reduce on
 device → combine partial → evict → next), never all shards resident.
+**S-E.3 DONE (`8036cfb7`):** GROUP BY (COUNT/SUM/MIN/MAX) + single-col DISTINCT over an over-budget table stream via
+the TWO-LEVEL fold — per-chunk device grouped partials → concat (control plane) → ONE final device merge over a
+synthesized `__stream_partials` relation (COUNT folds as SUM(count), SUM as SUM(sum), MIN/MAX as the extreme; the
+host never groups). Mid-scan COMPACTION re-merges an over-target accumulator (the persistent accumulator as periodic
+device re-merge); over-budget true cardinality DEFERS honestly (pre-upload BUDGET GATE — audit MEDIUM adopted:
+partials can be WIDER than source rows (4B key→12B partial), the merge must never bust the budget it honors;
+peak≤budget regression-gated). Grouped AVG / COUNT(DISTINCT) decline (not associatively decomposable). Audit: no
+C/H — "never returns a wrong answer"; NULL-key round-trip + Sum(int8) scale-parity + synthesized-relation isolation
+traced correct. Gates: lib 501/501, streaming 9/9, sweep 428/430 (same 2 pre-existing), clippy clean, triple
+sabotage (merge kind / compaction drop / budget gate).
 **S-E.2 DONE (`d26d41a7`):** a plain `All`/`Columns` PROJECTION over an over-budget table streams — per chunk the
 WHERE + column gather run on the device (the same transient-source fold), survivors CONCAT (the §13 projection
 combine); LIMIT/OFFSET = cross-chunk windowing of the survivor stream (device gather bounded to skip+take per
@@ -31,9 +41,9 @@ reach); a genuine overflow surfaces. Opus audit CLEAN on MVCC/combine/gate/chart
 NULL/empty-text as 0 bytes → whole-table upload for null-heavy tables) fixed via device-byte accounting +
 regression-gated; LOW (per-chunk overflow now surfaces uniformly) adopted. Gates: engine lib 501/501, GPU streaming
 4/4, clippy clean, FULL GPU sweep 422/424 (the 2 fails = `capacity_payload_tests::{a1_device_row_identity,
-a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.3 GROUP BY/DISTINCT (persistent device accumulator), S-E.4 ORDER BY (k-way run merge),
+a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.4 ORDER BY (k-way run merge),
 S-E.5 copy/compute overlap (copy stream + prefetch/evict API), S-E.6 NVMe cold tier. Memory
-`strata-streaming-executor`. AVG deferred (needs the (sum,count) pair).
+`strata-streaming-executor`. AVG deferred (needs the (sum,count) pair — scalar AND grouped).
 
 **Prior base** `7432ebf6` (CPU-ENGINE RETIREMENT — THIRTY merged wins, **THE
 PREDICATE-EDGES ARC IS COMPLETE**: every scalar type × operator × operand-shape (literal, col-vs-col, mixed-width
