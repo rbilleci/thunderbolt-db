@@ -5,7 +5,11 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `3445c6ac` (CPU-ENGINE RETIREMENT — TWENTY-EIGHT merged wins:
+**Updated:** 2026-07-10. **Base:** `main` @ `034c5429` (CPU-ENGINE RETIREMENT — TWENTY-NINE merged wins:
+BOOL INEQUALITIES on-device via constant-fold (PG `false < true`: `<`/`<=`/`>`/`>=` vs a bool literal fold to
+equality masks or ConstMask verdicts, NO new kernel; the const-TRUE shapes carry the validity AND = the ONLY 3VL
+net, sabotage-proven; literal-on-left flips the op; both `compile_bool_leaf` + the non-null peephole; DML builder
+bool arm Eq→all comparisons; audit SOUND zero defects, 16/16 fold rows verified) `034c5429`;
 MIXED-WIDTH predicate groups on-device (int8/ts scalar leaves beside int4/int2/text/bool/date/uuid compile into ONE
 I32 program via width-safe `LoadColumnI64` arms — the SV3b conjunct contract; LOCAL `mixed_width_i32_elem` gates at
 4 sites, NOT a `predicate_vm_elem_type` widening; kills the "mixed int8/text" de-elide = the CHECK-bypass decline
