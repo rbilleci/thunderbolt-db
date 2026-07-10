@@ -32,6 +32,7 @@ mod snapshot_residency; // snapshot meta + residency invalidation
 mod sql_catalog; // numeric coercion, pg_catalog, GPU bridge, constraints
 mod sql_dml; // relational SQL CRUD, COPY, ALTER COLUMN, sequences, matviews
 mod sql_pg; // SQL -> ResidentExpr binding via libpg_query (general GPU executor, Charter rule 2)
+mod streaming_exec; // STRATA S-E.1: out-of-core streaming scalar reductions (ADR-012)
 mod text_batching; // execute_text/read, batching, transactions, replication-role gating
 mod write_half; // SI ledger, active snapshots, concurrent DML, stage-0 replay
 mod write_set; // prepare_* write-set + apply_delta round-trips

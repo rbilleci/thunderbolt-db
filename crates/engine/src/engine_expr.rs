@@ -289,7 +289,7 @@ pub(crate) fn like_pattern_for_literal_prefix(prefix: &str) -> String {
 /// Int4Literal` leaf (`resident_route_grouped_aggregate_shape`), but the general DNF here is robust to
 /// any int4 OR-of-AND filter the bound may carry. A `LikePrefix` leaf becomes an on-device `LIKE` (see
 /// [`like_pattern_for_literal_prefix`]).
-fn resident_predicate_from_bound_filters(
+pub(crate) fn resident_predicate_from_bound_filters(
     bound: &BoundRelationalSelect,
 ) -> Result<Option<ResidentExpr>, ExecuteError> {
     let groups: Vec<Vec<(usize, crate::SelectFilterOp, SqlValue)>> =

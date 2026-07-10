@@ -108,6 +108,7 @@ mod engine_retained_read;
 mod engine_select_bind;
 mod engine_select_exec;
 mod engine_sql_pg;
+mod engine_streaming_exec;
 mod engine_wal_archive;
 mod engine_write_apply;
 

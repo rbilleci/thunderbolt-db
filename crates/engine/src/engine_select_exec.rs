@@ -309,6 +309,17 @@ impl Engine {
                 Err(_) => return self.execute_relational_select_cpu_pinned(select),
             }
         }
+        // STRATA S-E.1 (streaming executor, ADR-012): before de-eliding an over-VRAM aggregate to the CPU
+        // host engine, try the OUT-OF-CORE streaming fold — chunk the table's visible rows to the residency
+        // budget and reduce each chunk (COUNT(*)/SUM/MIN/MAX) ON THE DEVICE, combining partials host-side
+        // (control plane), never all shards resident at once. Gated on a configured per-GPU budget + a
+        // foldable scalar reduction; `None` = not applicable -> the CPU path runs unchanged (default
+        // behavior is byte-identical). Any shape the device cannot express defers to the CPU path INSIDE
+        // the fold, so this only ever ADDS on-device reach — never a wrong result.
+        if let Some(result) = self.try_streaming_scalar_reduction(select) {
+            on_pinned();
+            return result;
+        }
         self.execute_relational_select_cpu_pinned_instrumented(select, on_pinned)
     }
 

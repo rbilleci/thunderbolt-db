@@ -622,6 +622,19 @@ pub(crate) struct ResidencyReadState {
     /// pinned path). The non-vacuity signal that a wider-type / non-enumerated read shape stayed on the
     /// GPU — output equality with the CPU oracle can't prove WHICH engine ran. `Relaxed` monotonic counter.
     pub(crate) general_read_fallback_hits: std::sync::atomic::AtomicU64,
+    /// STRATA S-E.1 (streaming executor, ADR-012): count of relational SELECTs whose scalar reduction
+    /// (COUNT(*) / SUM / MIN / MAX) was served OUT-OF-CORE by the streaming fold — the table's visible
+    /// rows chunked to a per-GPU byte budget, each chunk uploaded + reduced ON THE DEVICE, partials
+    /// combined host-side (control plane), never all shards resident at once. The non-vacuity signal
+    /// that an over-VRAM aggregate stayed on the GPU instead of the interim CPU host engine. `Relaxed`.
+    pub(crate) streaming_fold_hits: std::sync::atomic::AtomicU64,
+    /// STRATA S-E.1: total streaming chunks reduced across all folds (a fold over an over-budget table
+    /// runs >1). Proves bounded-residency chunking actually fired (a single-chunk fold == 1).
+    pub(crate) streaming_fold_chunks: std::sync::atomic::AtomicU64,
+    /// STRATA S-E.1: the high-water device bytes of any single streaming chunk (the peak transient
+    /// residency of the fold). The out-of-core proof: this stays <= the configured budget even when the
+    /// whole table's bytes dwarf it. `fetch_max`, monotonic across the process.
+    pub(crate) streaming_fold_peak_chunk_bytes: std::sync::atomic::AtomicU64,
     /// RETIREMENT A4e: tables whose commits ELIDE the host tuple-store + value-index install
     /// (device-authoritative). Entered after first admission when eligible under the default-OFF
     /// flag; LEFT (sticky de-elision) via rehydration when any resolve/gather declines. COW set —
