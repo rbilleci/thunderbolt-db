@@ -19,6 +19,36 @@ pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
 /// carries the FULL-CATALOG index, which `lower_resident_predicate` translates to the shard's section
 /// offset (int4 or int8 by the column's catalog type — a program is mono-typed, so all leaves in a group
 /// must share the element width; a mixed int4/int8 predicate hard-errors on lowering and declines).
+/// ADR-006 (FK child elision, all fk column types): the CANONICAL Eq literal for a device
+/// scan-probe of `value` against a column of type `ty` — one arm per device-scannable type,
+/// mirroring `dml_filter_groups_to_device_predicate`'s Eq lowering EXACTLY (Date/Uuid round-trip
+/// their canonical strings — a raw-days/raw-bytes literal is a hard error in the lowering; Int2
+/// compares as its i32 section image; Timestamp as raw micros via the type-discriminating
+/// Int8Literal). A mismatched `(ty, value)` pair (incl. NULL) declines to the host ladder.
+fn device_eq_scan_literal(
+    ty: gpu_db_sql::SqlType,
+    value: &SqlValue,
+) -> Option<crate::engine_expr::ResidentExpr> {
+    use crate::engine_expr::ResidentExpr;
+    use gpu_db_sql::SqlType;
+    Some(match (ty, value) {
+        (SqlType::Int4, SqlValue::Int4(v)) => ResidentExpr::Int4Literal(*v),
+        (SqlType::Int2, SqlValue::Int2(v)) => ResidentExpr::Int4Literal(i32::from(*v)),
+        (SqlType::Date, SqlValue::Date(v)) => {
+            ResidentExpr::TextLiteral(gpu_db_sql::datetime::format_date(*v))
+        }
+        (SqlType::Int8, SqlValue::Int8(v)) => ResidentExpr::Int8Literal(*v),
+        (SqlType::Timestamp, SqlValue::Timestamp(v)) => ResidentExpr::Int8Literal(*v),
+        (SqlType::Numeric { .. }, SqlValue::Numeric(d)) => ResidentExpr::NumericLiteral(*d),
+        (SqlType::Text, SqlValue::Text(s)) => ResidentExpr::TextLiteral(s.clone()),
+        (SqlType::Uuid, SqlValue::Uuid(bytes)) => {
+            ResidentExpr::TextLiteral(gpu_db_sql::uuid::format_uuid(bytes))
+        }
+        (SqlType::Bool, SqlValue::Bool(v)) => ResidentExpr::BoolLiteral(*v),
+        _ => return None,
+    })
+}
+
 fn dml_filter_groups_to_device_predicate(
     table: &RelationalTable,
     filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
@@ -1192,20 +1222,23 @@ impl Engine {
         if !self.dml_device_validate_enabled() {
             return None;
         }
-        // TYPE-COVERAGE track 2: i32-section needles (Int4/Date/Int2) probe with the exact
-        // section encoding; anything else declines to the host ladder.
-        let needle =
-            crate::engine_residency::i32_section_needle(table.columns.get(column_idx)?.ty, value)?;
-        let hits = match self.locate_resident_pk_via_shard_index_detailed(table, column_idx, needle)
-        {
+        // TYPE-COVERAGE track 2: i32-section needles (Int4/Date/Int2) probe the device hash
+        // index with the exact section encoding; other types have NO device index and go
+        // straight to the elided scan arm below.
+        let column_ty = table.columns.get(column_idx)?.ty;
+        let index_hits = crate::engine_residency::i32_section_needle(column_ty, value).and_then(
+            |needle| self.locate_resident_pk_via_shard_index_detailed(table, column_idx, needle),
+        );
+        let hits = match index_hits {
             Some(hits) => hits,
             None => {
                 // ADR-006 (child-side FK elision): the hash-index probe DECLINES on a NON-UNIQUE
-                // column (dup-bearing shards — an FK column is inherently duplicate-heavy). On an
-                // ELIDED table, falling to the host ladder would REHYDRATE (de-elide) on every
-                // inbound-FK child check — so scan-locate the Eq ON THE DEVICE instead (the same
-                // W0-guarded, generation-consistent locate the range-DML resolve uses); the per-hit
-                // loop below applies visibility + the exclude set + the exact-value recheck. Any
+                // column (dup-bearing shards — an FK column is inherently duplicate-heavy) and
+                // never serves a non-i32 column at all. On an ELIDED table, falling to the host
+                // ladder would REHYDRATE (de-elide) on every inbound-FK child check — so
+                // scan-locate the Eq ON THE DEVICE instead (the same W0-guarded,
+                // generation-consistent locate the range-DML resolve uses); the per-hit loop
+                // below applies visibility + the exclude set + the exact-value recheck. Any
                 // locate decline -> `None` -> the host ladder (rehydrate) stays the safety net. A
                 // NON-elided table keeps the host value-index probe (cheap, correct).
                 if !self.table_install_elided(&table.name) {
@@ -1218,17 +1251,7 @@ impl Engine {
                 // lag it post-recovery). Match the fallback's strength: a lower boundary here would
                 // MISS a committed referencing child row = a wrongly-ALLOWED parent delete (orphan).
                 visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
-                // A Date column's needle IS its days-since-epoch section image, but the lowering
-                // hard-rejects a raw-days Int4Literal against a Date column (`date = 5`, PG
-                // semantics) — round-trip through the CANONICAL date string instead (the DML
-                // builder's Date arm), or an elided Date-fk child would rehydrate on EVERY
-                // parent delete. Int4/Int2 compare as the exact i32 section image.
-                let rhs = match table.columns.get(column_idx)?.ty {
-                    gpu_db_sql::SqlType::Date => crate::engine_expr::ResidentExpr::TextLiteral(
-                        gpu_db_sql::datetime::format_date(needle),
-                    ),
-                    _ => crate::engine_expr::ResidentExpr::Int4Literal(needle),
-                };
+                let rhs = device_eq_scan_literal(column_ty, value)?;
                 let predicate = crate::engine_expr::ResidentExpr::Binary {
                     op: crate::engine_expr::ResidentBinaryOp::Eq,
                     lhs: Box::new(crate::engine_expr::ResidentExpr::Column(column_idx)),

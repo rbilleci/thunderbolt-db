@@ -3625,6 +3625,190 @@ fn gpu_fk_child_date_fk_stays_elided() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, FK child side — NON-i32 fk columns): UUID / BIGINT / TEXT fk
+/// children now ELIDE. These types have NO device hash index, so the inbound child-reference
+/// check rides `device_eq_scan_literal` → the Eq scan-locate — three DISTINCT kernel paths (uuid
+/// = b128 byte compare via the canonical `format_uuid` round-trip; int8 = CompareScalarI64; text
+/// = byte-exact blob compare). Per pair: elided-era referencing rows (duplicated fk values),
+/// a rejected referenced-parent delete with the child STAYING elided, and an allowed
+/// unreferenced delete. The parents (uuid/int8/text PK, not foldable) stay NON-elided — their
+/// parent-exists probes take the host value index; only the CHILD side is device-native here.
+/// GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_fk_child_noni32_fk_columns_stay_elided() {
+    const TXN0: u64 = 1000;
+    let mut engine = Engine::new_local();
+    for (parent_ddl, child_ddl, fk_ddl) in [
+        (
+            "CREATE TABLE vendors (vid UUID PRIMARY KEY, vname TEXT)",
+            "CREATE TABLE parts (id INT PRIMARY KEY, vendor_id UUID)",
+            "ALTER TABLE ONLY parts ADD CONSTRAINT parts_fk FOREIGN KEY (vendor_id) \
+             REFERENCES vendors(vid)",
+        ),
+        (
+            "CREATE TABLE accounts (aid BIGINT PRIMARY KEY, aname TEXT)",
+            "CREATE TABLE ledgers (id INT PRIMARY KEY, account_id BIGINT)",
+            "ALTER TABLE ONLY ledgers ADD CONSTRAINT ledgers_fk FOREIGN KEY (account_id) \
+             REFERENCES accounts(aid)",
+        ),
+        (
+            "CREATE TABLE cats (code TEXT PRIMARY KEY, cname TEXT)",
+            "CREATE TABLE items (id INT PRIMARY KEY, cat_code TEXT)",
+            "ALTER TABLE ONLY items ADD CONSTRAINT items_fk FOREIGN KEY (cat_code) \
+             REFERENCES cats(code)",
+        ),
+        (
+            "CREATE TABLE prices (amt NUMERIC(10,2) PRIMARY KEY, pname TEXT)",
+            "CREATE TABLE quotes (id INT PRIMARY KEY, quote_amt NUMERIC(10,2))",
+            "ALTER TABLE ONLY quotes ADD CONSTRAINT quotes_fk FOREIGN KEY (quote_amt) \
+             REFERENCES prices(amt)",
+        ),
+        (
+            "CREATE TABLE slots (at TIMESTAMP PRIMARY KEY, sname TEXT)",
+            "CREATE TABLE bookings (id INT PRIMARY KEY, slot_at TIMESTAMP)",
+            "ALTER TABLE ONLY bookings ADD CONSTRAINT bookings_fk FOREIGN KEY (slot_at) \
+             REFERENCES slots(at)",
+        ),
+    ] {
+        // One monotone txn-id stream with headroom over every commit seq this test produces:
+        // the NON-elided parent probes run at the RAW facade boundary (no committed_seq raise),
+        // so a txn id BELOW the row's commit seq would hide the parent row (the known
+        // facade-id/commit-seq decoupling seam — a harness artifact here, not the subject).
+        engine.execute_text(TXN0 + 1, parent_ddl).unwrap();
+        engine.execute_text(TXN0 + 2, child_ddl).unwrap();
+        engine.execute_text(TXN0 + 3, fk_ddl).unwrap();
+    }
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    // Per pair: (child, parent, pk_col, [kept, departing, missing] key literals).
+    let sections: [(&str, &str, &str, [&str; 3]); 5] = [
+        (
+            "parts",
+            "vendors",
+            "vid",
+            [
+                "'00000000-0000-0000-0000-000000000001'",
+                "'00000000-0000-0000-0000-000000000002'",
+                "'00000000-0000-0000-0000-000000000099'",
+            ],
+        ),
+        // > i32::MAX so a truncating i32 needle could never accidentally match.
+        ("ledgers", "accounts", "aid", ["4294967300", "4294967301", "9999999999"]),
+        ("items", "cats", "code", ["'alpha'", "'beta'", "'zzz'"]),
+        ("quotes", "prices", "amt", ["10.25", "20.50", "99.99"]),
+        (
+            "bookings",
+            "slots",
+            "at",
+            ["'2024-06-01 09:00:00'", "'2024-06-01 10:00:00'", "'2024-06-01 23:00:00'"],
+        ),
+    ];
+    let txn_ids = AtomicU64::new(TXN0 + 10);
+    let mut gpu_checked = false;
+    for (child, parent, pk_col, [kept, departing, missing]) in sections {
+        macro_rules! sql {
+            ($s:expr) => {
+                engine.execute_text(txn_ids.fetch_add(1, Ordering::Relaxed), &$s)
+            };
+        }
+        sql!(format!("INSERT INTO {parent} VALUES ({kept}, 'keep')")).unwrap();
+        sql!(format!("INSERT INTO {parent} VALUES ({departing}, 'ref')")).unwrap();
+        sql!(format!("INSERT INTO {child} VALUES (1, {kept})")).unwrap();
+        if !gpu_checked {
+            let snap = engine.populate_relational_residency_snapshot(child);
+            if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+                return; // no usable GPU
+            }
+            gpu_checked = true;
+        }
+        sql!(format!("INSERT INTO {child} VALUES (2, {kept})")).unwrap();
+        assert!(
+            engine.table_install_elided(child),
+            "{child}: a non-i32 fk child (outbound fk, non-self-ref) must now ELIDE"
+        );
+        // ELIDED-ERA rows referencing the departing key — duplicated, and non-i32 columns have
+        // no device index at all, so the Eq scan-locate serves the check with a
+        // uuid/int8/text needle.
+        sql!(format!("INSERT INTO {child} VALUES (3, {departing})")).unwrap();
+        sql!(format!("INSERT INTO {child} VALUES (4, {departing})")).unwrap();
+        assert!(
+            engine.table_install_elided(child),
+            "{child}: still elided (device-only referencing rows)"
+        );
+        let err = sql!(format!("DELETE FROM {parent} WHERE {pk_col} = {departing}"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("foreign key"),
+            "{parent}: deleting a key referenced by elided-era child rows must reject, got: {err}"
+        );
+        assert!(
+            engine.table_install_elided(child),
+            "{child}: the child-reference check must run ON-DEVICE (the child stays elided)"
+        );
+        // A child INSERT with a missing parent still rejects while elided; a valid one lands.
+        let err = sql!(format!("INSERT INTO {child} VALUES (9, {missing})"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("foreign key"), "{child}: missing parent must reject, got: {err}");
+        sql!(format!("INSERT INTO {child} VALUES (10, {kept})")).unwrap();
+        assert!(
+            engine.table_install_elided(child),
+            "{child}: rejected + valid inserts keep the child elided"
+        );
+        // An UNREFERENCED parent key deletes fine — the no-match scan answers on-device and the
+        // child STAYS elided (a de-elide here is the rehydrate-per-parent-delete thrash).
+        sql!(format!("INSERT INTO {parent} VALUES ({missing}, 'spare')")).unwrap();
+        sql!(format!("DELETE FROM {parent} WHERE {pk_col} = {missing}")).unwrap();
+        assert!(
+            engine.table_install_elided(child),
+            "{child}: an allowed parent delete keeps the child elided"
+        );
+    }
+
+    // BOOL fk addendum (audit LOW-1): the 1-bit bitmap-vs-validity lowering on the inbound scan.
+    // Bool can't follow the loop (only two possible keys — no "missing parent" literal exists):
+    // referenced `false` must reject with the child STAYING elided; unreferenced `true` deletes.
+    let txn = || txn_ids.fetch_add(1, Ordering::Relaxed);
+    engine.execute_text(txn(), "CREATE TABLE toggles (f BOOL PRIMARY KEY, tname TEXT)").unwrap();
+    engine.execute_text(txn(), "CREATE TABLE states (id INT PRIMARY KEY, flag BOOL)").unwrap();
+    engine
+        .execute_text(
+            txn(),
+            "ALTER TABLE ONLY states ADD CONSTRAINT states_fk FOREIGN KEY (flag) \
+             REFERENCES toggles(f)",
+        )
+        .unwrap();
+    engine.execute_text(txn(), "INSERT INTO toggles VALUES (true, 'on')").unwrap();
+    engine.execute_text(txn(), "INSERT INTO toggles VALUES (false, 'off')").unwrap();
+    engine.execute_text(txn(), "INSERT INTO states VALUES (1, false)").unwrap();
+    engine.execute_text(txn(), "INSERT INTO states VALUES (2, false)").unwrap();
+    assert!(engine.table_install_elided("states"), "states: a bool fk child must now ELIDE");
+    let err = engine
+        .execute_text(txn(), "DELETE FROM toggles WHERE f = false")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("foreign key"), "referenced bool parent must reject, got: {err}");
+    assert!(
+        engine.table_install_elided("states"),
+        "states: the bool child-reference check must run ON-DEVICE (the child stays elided)"
+    );
+    engine.execute_text(txn(), "DELETE FROM toggles WHERE f = true").unwrap();
+    assert!(
+        engine.table_install_elided("states"),
+        "states: an allowed bool parent delete keeps the child elided"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, audit HIGH regression pin): a MID-PREFLIGHT REHYDRATE must not
 /// bypass CHECK. On an ELIDED CHECK table, an `execute_text` UPDATE whose WHERE the device resolve
 /// DECLINES (a mixed int8+text AND — the decline REHYDRATES/de-elides mid-preflight) used to fall back

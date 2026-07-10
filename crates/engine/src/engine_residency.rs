@@ -8642,33 +8642,20 @@ impl Engine {
             // DDL row-validator (which rehydrates first). The ledger-#18 re-resolve coverage proof
             // already treats CHECK as deterministic-on-values.
             //
-            // OUTBOUND FKs no longer block (ADR-006 FK elision, child side) when: (a) the table is
+            // OUTBOUND FKs no longer block (ADR-006 FK elision, child side) when the table is
             // not SELF-REFERENCING (the prepare ladders' self-FK arm keeps the scan-validator
-            // semantics — "a new row may provide for another new row" — which wants the host path),
-            // and (b) every fk COLUMN on this table is i32-section, so the inbound child-reference
-            // check (`does any child row carry fk_col = departed_parent_key?`) stays device-native:
-            // the hash-index probe declines on the duplicate-heavy fk column and the ELIDED scan
-            // fallback in `device_visible_row_with_value` serves it via the Eq scan-locate. The
-            // child's OWN writes never need its host rows (item 3 probes the PARENT; new images are
+            // semantics — "a new row may provide for another new row" — which wants the host
+            // path). The inbound child-reference check (`does any child row carry fk_col =
+            // departed_parent_key?`) stays device-native for EVERY fk column type the column
+            // gate above admits: the ELIDED scan fallback in `device_visible_row_with_value`
+            // serves it via the Eq scan-locate (`device_eq_scan_literal` has one canonical arm
+            // per type; i32-section columns may answer from the hash index first). The child's
+            // OWN writes never need its host rows (item 3 probes the PARENT; new images are
             // host-held/device-materialized).
             && !table
                 .foreign_keys
                 .iter()
                 .any(|fk| fk.referenced_table == table_name)
-            && table.foreign_keys.iter().all(|fk| {
-                table
-                    .columns
-                    .iter()
-                    .find(|c| c.name == fk.column)
-                    .is_some_and(|c| {
-                        matches!(
-                            c.ty,
-                            gpu_db_sql::SqlType::Int4
-                                | gpu_db_sql::SqlType::Date
-                                | gpu_db_sql::SqlType::Int2
-                        )
-                    })
-            })
             // INBOUND FKs no longer block (ADR-006 FK elision, parent side): a table REFERENCED by
             // other tables may elide when EVERY inbound FK's referenced column (on THIS table) is a
             // single-column i32-section PK/UNIQUE — exactly the shape `device_visible_row_with_value`
