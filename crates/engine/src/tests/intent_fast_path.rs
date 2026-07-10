@@ -3090,6 +3090,47 @@ fn gpu_nullable_uuid_range_dml_resolves_on_device() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a NULLABLE-timestamp RANGE DELETE resolves ON THE
+/// DEVICE — the nullable branch's local gate now also runs {Int8, Timestamp} column sets at I64
+/// (`Int8Literal` leaves = 8-byte load + CompareScalarI64 + per-leaf validity AND). The range SPANS the
+/// NULL placeholder's epoch (0 micros), so only the validity AND keeps the NULL row out of the device
+/// mask; the NULL row (id=3) must SURVIVE the purge and the table stays elided. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nullable_timestamp_range_dml_resolves_on_device() {
+    let seed: &[(i64, &str)] = &[
+        (1, "'2020-01-01 00:00:00'"),
+        (2, "'2020-06-01 00:00:00'"),
+        (3, "NULL"),
+        (4, "'2021-01-01 00:00:00'"),
+    ];
+    let Some(engine) = gpu_elided_pk_table_with_column("ts TIMESTAMP", seed) else {
+        return;
+    };
+    // The range spans BOTH plausible epoch-0 anchors (1970 / 2000), so the NULL placeholder (0 micros)
+    // is INSIDE the range — the per-leaf validity AND is what excludes it on the device.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(
+            9,
+            "DELETE FROM t WHERE ts >= '1960-01-01 00:00:00' AND ts <= '2035-01-01 00:00:00'",
+        )
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a NULLABLE-timestamp RANGE DELETE must RESOLVE on the device (the local I64 gate)"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a nullable-timestamp range DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        gpu_ids_of_t(&engine),
+        vec![3],
+        "ids 1,2,4 deleted; the NULL-timestamp row survives (3VL, placeholder-spanning range)"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a BOOL-EQUALITY DELETE on an ELIDED table resolves ON
 /// THE DEVICE — the DML builder lowers `flag = true` to a `BoolLiteral` the existing device
 /// `try_lower_bool_predicate` (1-bit bitmap → mask) evaluates; the hit materializes its bool on-device

@@ -534,16 +534,34 @@ fn gpu_resident_expr_where_3vl_over_nullable_timestamp() {
         vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(5)]],
         "col-vs-col ts < ts2 must exclude NULL-ts rows (3VL)"
     );
-    // A COMPOUND nullable timestamp predicate is still a clean error (the temporal peephole is simple-only).
-    let err = e
+    // A COMPOUND nullable timestamp predicate now RUNS ON THE GPU (ADR-006: the nullable branch's
+    // local I64 gate + the VM's timestamp scalar leaf, which parses the TextLiteral bound to micros
+    // via `LoadColumnI64` + `CompareScalarI64` + the per-leaf validity AND). `ts < noon AND
+    // ts2 > 06:00` -> ts before noon (ids 1, 5); the NULL-ts rows (2, 4) are excluded by 3VL even
+    // though their placeholder micros 0 satisfies `< noon` — the validity AND is load-bearing.
+    let r = e
         .execute_resident_expr_select_sql(
             "SELECT id FROM tts WHERE ts < '2024-01-15 12:00:00' AND ts2 > '2024-01-15 06:00:00'",
         )
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("not yet supported"),
-        "compound nullable timestamp WHERE must clean-error, got: {err}"
+        .expect("compound nullable timestamp WHERE runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(5)]],
+        "compound nullable ts WHERE: ids 1,5 (before noon); NULL rows excluded (3VL, placeholder \
+         micros 0 would otherwise match)"
+    );
+    // ts-vs-ts COL-VS-COL inside an AND (audit LOW adopted — the newly-reachable shape): lowers via
+    // the general CompareBuffers arm at I64 (two 8-byte loads) + per-leaf validity. `ts < ts2 AND
+    // ts2 > 06:00` -> the same ids 1,5; NULL-ts rows excluded even though placeholder 0 < noon.
+    let r = e
+        .execute_resident_expr_select_sql(
+            "SELECT id FROM tts WHERE ts < ts2 AND ts2 > '2024-01-15 06:00:00'",
+        )
+        .expect("ts-vs-ts col-vs-col inside AND runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(5)]],
+        "col-vs-col ts < ts2 inside AND: ids 1,5; NULL rows excluded (3VL)"
     );
 }
 

@@ -1844,6 +1844,52 @@ fn compile_predicate_program(
     if expr_mentions_uuid(lhs, table) || expr_mentions_uuid(rhs, table) {
         return compile_uuid_leaf(*op, lhs, rhs, table, snapshot, program, needles);
     }
+    // TIMESTAMP scalar-comparison leaf (ADR-006): a BARE timestamp Column against a TextLiteral (the
+    // read path's bound, parsed to micros) or a raw-micros Int8Literal (the DML builder's bound) —
+    // checked BEFORE text for the same reason as uuid (the TextLiteral would mis-route to the text
+    // compiler and error). Emits `LoadColumnI64` (an 8-byte load REGARDLESS of the program's elem — the
+    // SV3b mixed-width step, so this leaf is width-safe in an I32 or I64 program) + `CompareScalarI64`
+    // + the per-leaf validity AND. Makes compound timestamp WHEREs (nullable or not) run on the GPU.
+    // Timestamp col-vs-col inside AND/OR and arith subtrees stay follow-ons (clean error → decline).
+    {
+        let ts_scalar = match (timestamp_column_index(lhs, table), timestamp_column_index(rhs, table))
+        {
+            (Some(col), None)
+                if matches!(
+                    rhs.as_ref(),
+                    ResidentExpr::TextLiteral(_) | ResidentExpr::Int8Literal(_)
+                ) =>
+            {
+                Some((col, timestamp_literal_micros(rhs)?, false))
+            }
+            (None, Some(col))
+                if matches!(
+                    lhs.as_ref(),
+                    ResidentExpr::TextLiteral(_) | ResidentExpr::Int8Literal(_)
+                ) =>
+            {
+                Some((col, timestamp_literal_micros(lhs)?, true))
+            }
+            _ => None,
+        };
+        if let Some((col, micros, scalar_on_left)) = ts_scalar {
+            let Some(cmp) = predicate_compare_code(*op) else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "a timestamp predicate leaf must be a comparison (eq/ne/lt/le/gt/ge)"
+                        .to_string(),
+                )));
+            };
+            let byte_offset = resident_device_int8_column_offset(snapshot, table, col)?;
+            program.push(ExprStep::LoadColumnI64 { byte_offset });
+            program.push(ExprStep::CompareScalarI64 {
+                cmp,
+                scalar: micros,
+                scalar_on_left,
+            });
+            // 3VL: a NULL timestamp operand (placeholder micros 0) is UNKNOWN ⇒ excluded.
+            return push_column_validity_and(col, table, snapshot, program);
+        }
+    }
     // TEXT comparison leaf -> a mask step the VM combines with AND/OR (so text IN / multi-text WHERE /
     // text RANGES / a nullable-text or compound LIKE run on the GPU). LIKE -> TextLikeMask; `=`/`<>` ->
     // TextEqMask; `<`/`<=`/`>`/`>=` -> TextCmpMask (ADR-006). int4 leaves fall through to the arith VM.
@@ -8441,9 +8487,10 @@ impl Engine {
             // i64 section (Int8/Timestamp) — NOT via `predicate_vm_elem_type`, which the nullable-read
             // branch keys off (folding Timestamp in there would divert nullable-timestamp 3VL reads).
             // A MIXED timestamp/other-type predicate fails this check → clean error, never a silent
-            // mis-answer at one element width. (`compile_predicate_program` itself errors cleanly if a
-            // bound is not an `Int8Literal` — e.g. a `TextLiteral` from a non-DML build — so it can
-            // never mis-read a text needle against the i64 column.)
+            // mis-answer at one element width. (`compile_predicate_program`'s TIMESTAMP leaf accepts
+            // both an `Int8Literal` (raw micros — the DML builder) AND a `TextLiteral` bound (parsed
+            // via `timestamp_literal_micros` — the read path); an unparseable literal errors cleanly,
+            // so it can never mis-read a text needle against the i64 column.)
             let mut cols = Vec::new();
             collect_expr_columns(predicate, &mut cols);
             let all_i64_section = !cols.is_empty()
@@ -9474,30 +9521,45 @@ impl Engine {
                         return Ok(indices);
                     }
                 }
-                // NULLABLE uuid AND/OR (ADR-006): uuid is not in `predicate_vm_elem_type`'s I32 set
-                // (deliberately — widening the SHARED helper diverts working paths; the timestamp
-                // lesson), so a nullable uuid range/IN missed the VM block above and used to hit the
-                // final error. Gate LOCALLY: top-level And/Or whose every referenced column is
-                // I32-mask-compatible (uuid leaves are mask-only `UuidCmpMask` steps — no column load —
-                // and int4/int2/text/bool leaves run at I32). Each leaf appends its own validity-AND
-                // (3VL), exactly how the elem-Some VM block serves nullable int4/text today.
+                // NULLABLE uuid / timestamp AND/OR (ADR-006): uuid + timestamp are not in
+                // `predicate_vm_elem_type`'s sets (deliberately — widening the SHARED helper diverts
+                // working paths; the timestamp lesson), so a nullable uuid range/IN or a nullable
+                // timestamp range missed the VM block above and used to hit the final error. Gate
+                // LOCALLY by column set: {Uuid, Int4, Int2, Text, Bool} runs at I32 (uuid/text/bool
+                // leaves are mask-only, int4/int2 load 4 bytes); {Int8, Timestamp} runs at I64 (a
+                // timestamp is i64 micros in the int8 section; the `Int8Literal` leaf arm loads 8
+                // bytes + CompareScalarI64). ZERO DIVERSION: all-non-uuid I32 combos and all-Int8
+                // took the elem-Some block above, so these gates fire only with a uuid / timestamp
+                // column present — shapes that previously ERRORED. Each leaf appends its own
+                // validity-AND (3VL), exactly how the elem-Some VM block serves nullable int4/text.
                 if matches!(op, ResidentBinaryOp::And | ResidentBinaryOp::Or) {
                     let mut cols = Vec::new();
                     collect_expr_columns(predicate, &mut cols);
-                    let i32_mask_compatible = !cols.is_empty()
-                        && cols.iter().all(|&col| {
-                            matches!(
-                                table.columns.get(col).map(|column| column.ty),
-                                Some(
-                                    SqlType::Uuid
-                                        | SqlType::Int4
-                                        | SqlType::Int2
-                                        | SqlType::Text
-                                        | SqlType::Bool
-                                )
+                    let ty = |col: usize| table.columns.get(col).map(|column| column.ty);
+                    let local_elem = if cols.is_empty() {
+                        None
+                    } else if cols.iter().all(|&col| {
+                        matches!(
+                            ty(col),
+                            Some(
+                                SqlType::Uuid
+                                    | SqlType::Int4
+                                    | SqlType::Int2
+                                    | SqlType::Text
+                                    | SqlType::Bool
                             )
-                        });
-                    if i32_mask_compatible {
+                        )
+                    }) {
+                        Some(ResidentElemType::I32)
+                    } else if cols
+                        .iter()
+                        .all(|&col| matches!(ty(col), Some(SqlType::Int8 | SqlType::Timestamp)))
+                    {
+                        Some(ResidentElemType::I64)
+                    } else {
+                        None
+                    };
+                    if let Some(elem) = local_elem {
                         let mut program = Vec::new();
                         let mut needles: Vec<Vec<u8>> = Vec::new();
                         compile_predicate_program(
@@ -9505,10 +9567,7 @@ impl Engine {
                         )?;
                         return device_memory
                             .run_expr_predicate_filter_with_text(
-                                &program,
-                                &needles,
-                                row_count,
-                                ResidentElemType::I32,
+                                &program, &needles, row_count, elem,
                             )
                             .map_err(|err| {
                                 ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
