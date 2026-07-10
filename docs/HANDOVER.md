@@ -5,7 +5,12 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `b18a018e` (CPU-ENGINE RETIREMENT — TWENTY-TWO merged wins: DATE RANGES
+**Updated:** 2026-07-10. **Base:** `main` @ `6fba4ecb` (CPU-ENGINE RETIREMENT — TWENTY-THREE merged wins:
+CHECK-CONSTRAINED TABLES ELIDE (the first constraint class lifted — CHECK is row-local; ADD CHECK's existing-row
+scan is elision-safe-by-construction; wave/lanes still route CHECK to the full off-lock prepare; FK stays blocked
+both directions) + the audit-HIGH preflight stale-scan bypass FIXED (a mid-preflight rehydrate left the UPDATE
+else-scan on a stale handle → vacuous CHECK pass → a DURABLE violating WAL entry that wedges all later commits;
+fix = re-pin the outer view + raise the boundary, sabotage-verified) `6fba4ecb`; DATE RANGES
 on-device for DML + reads (a DATE VM leaf, 4-byte LoadColumn I32-ONLY by audited width discipline; bounds are
 CANONICAL `format_date` TextLiterals in the DML builder AND the &Select bridge — `date = 5` stays a HARD ERROR, a
 sweep-caught PG regression fixed via the uuid format/parse pattern; placeholder-spanning read pin stays-elided +
