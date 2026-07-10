@@ -5,12 +5,18 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `451bb054` (CPU-ENGINE RETIREMENT — TWENTY-FIVE merged wins:
+**Updated:** 2026-07-10. **Base:** `main` @ `aa75c11c` (CPU-ENGINE RETIREMENT — TWENTY-SIX merged wins:
+FK CHILD TABLES ELIDE (**the LAST structural elision class** — outbound-FK gate lifted to non-self-referencing +
+all-fk-columns-i32-section; the inbound child-reference check on a parent DELETE runs ON-DEVICE via a new Eq
+scan-locate fallback in `device_visible_row_with_value` when the dup-intolerant hash-index probe declines on the
+duplicate-heavy fk column — same W0-guarded locate as range-DML, boundary RAISED to `committed_seq` per the
+materialize contract, DATE fk needles round-trip the canonical `format_date` string since a raw-days Int4Literal is
+a hard error and the decline would rehydrate on EVERY parent delete; opus audit SOUND, both residuals adopted;
+sabotage-verified both arms) `aa75c11c`;
 FK-REFERENCED PARENTS ELIDE (inbound-FK eligibility lifted for i32-PK-referenced tables — the FK validators were
 already elision-aware via `visible_row_with_value`'s device arm; child INSERTs' parent-exists + parent DELETEs'
 surviving-provider probes run ON-DEVICE, decline→rehydrate; + the DELETE-arm mid-preflight re-pin (the CHECK audit's
-deferred twin) + PG MATCH-SIMPLE NULL-fk 3VL in both validator families; outbound/child-side FKs still block = the
-remaining sub-slice) `451bb054`;
+deferred twin) + PG MATCH-SIMPLE NULL-fk 3VL in both validator families) `451bb054`;
 CHECK-on-NULL PG 3VL fix (NULL SATISFIES a CHECK — both engine evaluators guarded; legacy gpu-db-server emulator
 divergence noted-not-patched per the charter ruling) `337454c7`;
 CHECK-CONSTRAINED TABLES ELIDE (the first constraint class lifted — CHECK is row-local; ADD CHECK's existing-row
@@ -98,7 +104,9 @@ rehydrate-with-delta; maintained tables excluded from invalidate+auto-admit). Op
 tables take the immediate single-entry commit (never batch) — only CONSTRAINT-FREE int4 tables batch, and they elide.
 REMAINING de-elide/host triggers: multi-entry batches with a DELETE/UPDATE (or non-DML) still de-elide (insert-only
 this slice); WIDER-TYPE range DML (int8/numeric/timestamp now on-device; text range still declines); NULL-bearing
-shard `gather_resident_table_rows_from_device` edge (mostly closed by `bb2a2c03`); CHECK/FK block elision. ARCHITECTURAL
+shard `gather_resident_table_rows_from_device` edge (mostly closed by `bb2a2c03`); CHECK + FK (both directions) now
+ELIDE (`6fba4ecb`/`451bb054`/`aa75c11c` — the structural classes are CLOSED; remaining edges are marginal predicate
+shapes: bool inequalities, text/uuid col-vs-col in AND, mixed int8+text/bool widths). ARCHITECTURAL
 GATES (a program, per ADR-012, user chose "shrink achievable surface"): non-resident/over-VRAM tables need the STRATA
 STREAMING EXECUTOR (the documented terminal gate); views/matviews; JOINs beyond the 2-table `=` chain; window
 functions (absent from the grammar). See memory `type-coverage-14`, `scalability-ledger`.
