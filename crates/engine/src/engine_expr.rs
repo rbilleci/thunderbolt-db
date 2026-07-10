@@ -322,6 +322,19 @@ fn resident_predicate_from_bound_filters(
                         prefix,
                     ))),
                 }
+            } else if let SqlValue::Date(days) = value {
+                // A BOUND date filter (ADR-006 date compound): emit the CANONICAL date string, which
+                // the date peephole / DATE VM leaf parse back to the identical days (`format_date` /
+                // `parse_date` round-trip — the uuid pattern). NOT a raw-days `Int4Literal`: that node
+                // is what a BARE INTEGER lowers to, and `date = 5` must stay a hard error (PG
+                // semantics), so the date lowerers reject Int4Literal by design.
+                ResidentExpr::Binary {
+                    op: having_op_to_resident(*op),
+                    lhs: Box::new(ResidentExpr::Column(*idx)),
+                    rhs: Box::new(ResidentExpr::TextLiteral(
+                        gpu_db_sql::datetime::format_date(*days),
+                    )),
+                }
             } else {
                 ResidentExpr::Binary {
                     op: having_op_to_resident(*op),
@@ -1047,6 +1060,11 @@ fn date_literal_days(expr: &ResidentExpr) -> Result<i32, ExecuteError> {
                 )))
             })
         }
+        // NB (ADR-006 date compound): deliberately NOT accepting a raw-days `Int4Literal` here — the
+        // READ path lowers a plain integer literal to `Int4Literal`, and `date = 5` must stay a HARD
+        // ERROR (PG semantics), never silently treat 5 as days. The DML builder instead emits a
+        // `TextLiteral(format_date(days))` (the canonical renderer; parse_date round-trips), exactly
+        // like the uuid builder's `format_uuid` needle.
         _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "a date column compares only to a date literal or another date column".to_string(),
         ))),
@@ -1887,6 +1905,43 @@ fn compile_predicate_program(
                 scalar_on_left,
             });
             // 3VL: a NULL timestamp operand (placeholder micros 0) is UNKNOWN ⇒ excluded.
+            return push_column_validity_and(col, table, snapshot, program);
+        }
+    }
+    // DATE scalar-comparison leaf (ADR-006): a BARE date Column against a TextLiteral (the read path's
+    // bound, parsed to days) or a raw-days Int4Literal (the DML builder's bound) — checked BEFORE text
+    // for the same mis-route reason. A date is i32 DAYS in the int4 section, so this emits a plain
+    // `LoadColumn` + `CompareScalar` — 4-byte, VALID ONLY IN AN I32 PROGRAM. Width discipline: every
+    // path that compiles date leaves runs at I32 (the non-null And/Or/Ne branch and the nullable local
+    // gate's I32 set); the I64 int8 general path REJECTS mixed int8/date, and the I64/I128 nullable
+    // arms exclude Date — so a date leaf can never enter a non-I32 program.
+    {
+        // TextLiteral ONLY (both the read path's bound and the DML builder's `format_date` bound) —
+        // an `Int4Literal` against a date column must stay a hard error (`date = 5`, PG semantics),
+        // so it deliberately falls through to the generic arm (whose offset resolver rejects Date).
+        let date_scalar = match (date_column_index(lhs, table), date_column_index(rhs, table)) {
+            (Some(col), None) if matches!(rhs.as_ref(), ResidentExpr::TextLiteral(_)) => {
+                Some((col, date_literal_days(rhs)?, false))
+            }
+            (None, Some(col)) if matches!(lhs.as_ref(), ResidentExpr::TextLiteral(_)) => {
+                Some((col, date_literal_days(lhs)?, true))
+            }
+            _ => None,
+        };
+        if let Some((col, days, scalar_on_left)) = date_scalar {
+            let Some(cmp) = predicate_compare_code(*op) else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "a date predicate leaf must be a comparison (eq/ne/lt/le/gt/ge)".to_string(),
+                )));
+            };
+            let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;
+            program.push(ExprStep::LoadColumn { byte_offset });
+            program.push(ExprStep::CompareScalar {
+                cmp,
+                scalar: days,
+                scalar_on_left,
+            });
+            // 3VL: a NULL date operand (placeholder days 0) is UNKNOWN ⇒ excluded.
             return push_column_validity_and(col, table, snapshot, program);
         }
     }
@@ -8320,10 +8375,14 @@ impl Engine {
         // Mixed int8/text or int8/bool (e.g. `bigcol > 5 AND tag = 'a'` / `AND flag`) mixes the i64 VM
         // with i32 text/bool masks -- a follow-on; reject rather than run the untested path (text/bool
         // AND/OR runs under the i32 VM, with int4). int8-only AND/OR stays on this i64 VM.
+        // ADR-006 (date compound) WIDTH DISCIPLINE: mixed int8/DATE is also rejected — the DATE VM leaf
+        // emits a 4-byte `LoadColumn`, which in this I64 program would mis-read 8 bytes per slot.
         if expr_mentions_text(lhs, table)
             || expr_mentions_text(rhs, table)
             || expr_mentions_bool_column(lhs, table)
             || expr_mentions_bool_column(rhs, table)
+            || expr_mentions_date(lhs, table)
+            || expr_mentions_date(rhs, table)
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "the general GPU executor does not support mixed int8/text or int8/bool expressions yet"
@@ -8393,11 +8452,11 @@ impl Engine {
             return Ok(None);
         }
         let Some(cmp) = predicate_compare_code(compare) else {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "the general GPU executor supports only simple date comparisons (date AND/OR and \
-                 arithmetic are follow-ons)"
-                    .to_string(),
-            )));
+            // AND/OR (ADR-006 date compound): fall through — the And/Or branch of
+            // `lower_resident_predicate` runs `compile_predicate_program` at I32, whose DATE leaf
+            // (LoadColumn 4-byte + CompareScalar days + validity) serves date ranges. A shape the
+            // leaf can't express errors there and the caller declines — never a silent mis-answer.
+            return Ok(None);
         };
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
@@ -9539,6 +9598,8 @@ impl Engine {
                     let local_elem = if cols.is_empty() {
                         None
                     } else if cols.iter().all(|&col| {
+                        // Date joins the I32 set (ADR-006 date compound): a date is i32 days in the
+                        // int4 section, and its VM leaf emits a 4-byte LoadColumn — I32-only.
                         matches!(
                             ty(col),
                             Some(
@@ -9547,6 +9608,7 @@ impl Engine {
                                     | SqlType::Int2
                                     | SqlType::Text
                                     | SqlType::Bool
+                                    | SqlType::Date
                             )
                         )
                     }) {

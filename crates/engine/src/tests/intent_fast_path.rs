@@ -3164,6 +3164,93 @@ fn gpu_nullable_numeric_range_dml_resolves_on_device() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a DATE RANGE DELETE (`d >= X AND d < Y` — the month
+/// purge shape) resolves ON THE DEVICE — the DML builder lowers a date bound to a raw-days
+/// `Int4Literal`, and the new DATE VM leaf (4-byte LoadColumn + CompareScalar + validity, I32-only by
+/// width discipline) serves the AND. Includes the nullable 3VL pin: the range SPANS the NULL
+/// placeholder's epoch (days 0), so only the validity AND keeps the NULL row alive. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_date_range_dml_resolves_on_device() {
+    // Non-null: dates Jan..Apr; delete Feb..Mar (>= '2024-02-01' AND < '2024-04-01') -> ids 2,3.
+    {
+        let seed: &[(i64, &str)] = &[
+            (1, "'2024-01-15'"),
+            (2, "'2024-02-15'"),
+            (3, "'2024-03-15'"),
+            (4, "'2024-04-15'"),
+        ];
+        let Some(engine) = gpu_elided_pk_table_with_column("d DATE", seed) else {
+            return;
+        };
+        let before = engine.dml_device_resolve_hits();
+        engine
+            .execute_dml_concurrent(9, "DELETE FROM t WHERE d >= '2024-02-01' AND d < '2024-04-01'")
+            .unwrap();
+        assert!(
+            engine.dml_device_resolve_hits() > before,
+            "a date RANGE DELETE must RESOLVE on the device (the DATE VM leaf)"
+        );
+        assert!(engine.table_install_elided("t"), "date range DELETE must NOT de-elide");
+        assert_eq!(gpu_ids_of_t(&engine), vec![1, 4], "Feb+Mar (ids 2,3) purged exactly");
+    }
+    // Nullable 3VL pin: the range spans BOTH plausible epoch-0 anchors (1970/2000), so the NULL
+    // placeholder (days 0) is IN-range — only the per-leaf validity AND excludes it.
+    {
+        let seed: &[(i64, &str)] =
+            &[(1, "'2024-01-15'"), (2, "NULL"), (3, "'2024-03-15'")];
+        let Some(engine) = gpu_elided_pk_table_with_column("d DATE", seed) else {
+            return;
+        };
+        // READ 3VL PIN (audit LOW adopted — the decisive assertion, doctrine): a placeholder-spanning
+        // range READ has NO recheck net; only the DATE leaf's validity-AND excludes the NULL row.
+        {
+            let Command::Select(s) = parse_command(
+                "SELECT id FROM t WHERE d >= '1960-01-01' AND d <= '2035-01-01'",
+            )
+            .unwrap() else {
+                unreachable!()
+            };
+            let mut got: Vec<i32> = engine
+                .execute_relational_select(&s)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| match r.first() {
+                    Some(SqlValue::Int4(n)) => *n,
+                    other => panic!("unexpected id: {other:?}"),
+                })
+                .collect();
+            got.sort_unstable();
+            assert_eq!(
+                got,
+                vec![1, 3],
+                "the placeholder-spanning date range READ must EXCLUDE the NULL row (id=2) — the \
+                 per-leaf validity-AND is the only net (placeholder days 0 is in-range)"
+            );
+            assert!(
+                engine.table_install_elided("t"),
+                "the date range READ must run ON-DEVICE (stay elided) — a de-elide means the read \
+                 fell to the CPU pinned path and the [1,3] result proves nothing about the device"
+            );
+        }
+        let before = engine.dml_device_resolve_hits();
+        engine
+            .execute_dml_concurrent(9, "DELETE FROM t WHERE d >= '1960-01-01' AND d <= '2035-01-01'")
+            .unwrap();
+        assert!(
+            engine.dml_device_resolve_hits() > before,
+            "a NULLABLE-date RANGE DELETE must RESOLVE on the device"
+        );
+        assert!(engine.table_install_elided("t"), "nullable-date range must NOT de-elide");
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![2],
+            "ids 1,3 deleted; the NULL-date row survives (3VL, placeholder-spanning range)"
+        );
+    }
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a BOOL-EQUALITY DELETE on an ELIDED table resolves ON
 /// THE DEVICE — the DML builder lowers `flag = true` to a `BoolLiteral` the existing device
 /// `try_lower_bool_predicate` (1-bit bitmap → mask) evaluates; the hit materializes its bool on-device

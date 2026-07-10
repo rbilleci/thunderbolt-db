@@ -49,6 +49,13 @@ fn dml_filter_groups_to_device_predicate(
                 (Some(SqlType::Int4), SqlValue::Int4(v)) => ResidentExpr::Int4Literal(*v),
                 (Some(SqlType::Int8), SqlValue::Int8(v)) => ResidentExpr::Int8Literal(*v),
                 (Some(SqlType::Timestamp), SqlValue::Timestamp(v)) => ResidentExpr::Int8Literal(*v),
+                // A date bound lowers to the CANONICAL date string (ADR-006 date compound): the date
+                // VM leaf / date peephole parse it back to the identical days via `parse_date` (a
+                // lossless round-trip, the uuid `format_uuid` pattern). NOT a raw-days Int4Literal —
+                // that shape must stay a hard error (`date = 5`, PG semantics) on the read path.
+                (Some(SqlType::Date), SqlValue::Date(v)) => {
+                    ResidentExpr::TextLiteral(gpu_db_sql::datetime::format_date(*v))
+                }
                 (Some(SqlType::Numeric { .. }), SqlValue::Numeric(d)) => {
                     ResidentExpr::NumericLiteral(*d)
                 }
