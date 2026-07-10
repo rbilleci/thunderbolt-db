@@ -1801,6 +1801,106 @@ fn predicate_vm_elem_type(
     }
 }
 
+/// ADR-006 (MIXED-WIDTH groups): TRUE iff every i64-section (Int8/Timestamp) column in `expr`
+/// appears ONLY as a BARE `Column` compared against a scalar literal — the shapes the WIDTH-SAFE
+/// I64 scalar leaves serve (`LoadColumnI64` loads 8 bytes REGARDLESS of the program elem and
+/// `CompareScalarI64` immediately consumes that buffer — the SV3b mixed-width VM contract). Any
+/// other i64 usage (an arithmetic subtree, col-vs-col — where `LoadColumn`/`CompareBuffers` obey
+/// the PROGRAM width and would 4-byte-mis-read in an I32 program) fails the check. `IsNull` is
+/// width-free (it reads the validity bitmap, never the value section).
+fn i64_section_leaves_scalar_only(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    let mentions_i64 = |e: &ResidentExpr| {
+        let mut cols = Vec::new();
+        collect_expr_columns(e, &mut cols);
+        cols.iter().any(|&col| {
+            matches!(
+                table.columns.get(col).map(|column| column.ty),
+                Some(SqlType::Int8 | SqlType::Timestamp)
+            )
+        })
+    };
+    match expr {
+        ResidentExpr::Binary { op, lhs, rhs } if boolean_op_code(*op).is_some() => {
+            i64_section_leaves_scalar_only(lhs, table)
+                && i64_section_leaves_scalar_only(rhs, table)
+        }
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            let scalar_side_ok = |col_side: &ResidentExpr, lit_side: &ResidentExpr| {
+                let ResidentExpr::Column(col) = col_side else {
+                    return false; // an arith subtree mentioning i64 -> width-unsafe
+                };
+                match table.columns.get(*col).map(|column| column.ty) {
+                    // The int8 scalar arms accept an i64 or a widened i32 literal.
+                    Some(SqlType::Int8) => matches!(
+                        lit_side,
+                        ResidentExpr::Int8Literal(_) | ResidentExpr::Int4Literal(_)
+                    ),
+                    // The timestamp leaf accepts raw micros (DML) or a parsed text bound (reads).
+                    Some(SqlType::Timestamp) => matches!(
+                        lit_side,
+                        ResidentExpr::Int8Literal(_) | ResidentExpr::TextLiteral(_)
+                    ),
+                    _ => false,
+                }
+            };
+            match (mentions_i64(lhs), mentions_i64(rhs)) {
+                (false, false) => true,
+                (true, true) => false, // i64 col-vs-col / both-sides usage
+                (true, false) => scalar_side_ok(lhs, rhs),
+                (false, true) => scalar_side_ok(rhs, lhs),
+            }
+        }
+        ResidentExpr::IsNull { .. } => true,
+        // A bare i64 Column used AS the predicate (invalid SQL for non-bool) is width-unsafe.
+        ResidentExpr::Column(_) => !mentions_i64(expr),
+        _ => true, // literals mention no column
+    }
+}
+
+/// ADR-006 (MIXED-WIDTH groups): the LOCAL I32 gate for a predicate `predicate_vm_elem_type`
+/// declines — `Some(I32)` iff every column is I32-mask-servable ({Int4, Int2, Text, Bool, Date,
+/// Uuid} — 4-byte loads or mask-only leaves) or an i64-section column used ONLY in width-safe
+/// scalar leaves (`i64_section_leaves_scalar_only`). ALL-i64-section predicates return `None`
+/// so the proven I64 paths (int8 general VM / timestamp AND-OR / nullable I64 gate) keep serving
+/// them — this gate exists for genuinely MIXED groups (e.g. `big > 5 AND name = 'x'`), which
+/// previously hard-errored everywhere. Deliberately NOT a widening of the SHARED
+/// `predicate_vm_elem_type` (the timestamp-diversion lesson: widening the shared helper reroutes
+/// working read paths); every caller opts in LOCALLY.
+fn mixed_width_i32_elem(
+    predicate: &ResidentExpr,
+    table: &RelationalTable,
+) -> Option<ResidentElemType> {
+    let mut cols = Vec::new();
+    collect_expr_columns(predicate, &mut cols);
+    if cols.is_empty() {
+        return None;
+    }
+    let ty = |col: usize| table.columns.get(col).map(|column| column.ty);
+    let all_servable = cols.iter().all(|&col| {
+        matches!(
+            ty(col),
+            Some(
+                SqlType::Int4
+                    | SqlType::Int2
+                    | SqlType::Text
+                    | SqlType::Bool
+                    | SqlType::Date
+                    | SqlType::Uuid
+                    | SqlType::Int8
+                    | SqlType::Timestamp
+            )
+        )
+    });
+    let all_i64_section = cols
+        .iter()
+        .all(|&col| matches!(ty(col), Some(SqlType::Int8 | SqlType::Timestamp)));
+    if all_servable && !all_i64_section && i64_section_leaves_scalar_only(predicate, table) {
+        Some(ResidentElemType::I32)
+    } else {
+        None
+    }
+}
+
 /// Compile a boolean predicate expression into postfix [`ExprStep`] bytecode that leaves one MASK on
 /// the VM stack. Recurses: `AND`/`OR` compile both operand predicates then a `MaskBinary`; a
 /// comparison compiles its arithmetic operand(s) (via [`compile_arith_program`]) then a
@@ -1969,6 +2069,47 @@ fn compile_predicate_program(
                 .to_string(),
         )));
     };
+    // ADR-006 (MIXED-WIDTH groups): a BARE Int8 column against an int literal is a WIDTH-SAFE
+    // scalar leaf — `LoadColumnI64` (8-byte load regardless of the program elem, the SV3b step)
+    // + `CompareScalarI64` (immediately consumes that buffer) — so `big > 5` composes inside an
+    // I32 program (mixed int8+int4/text/bool/date/uuid AND-OR). ARM-STEAL equivalence in an I64
+    // program (the pure-int8 path): `LoadColumn`@I64 is the SAME `gpu_db_resident_i64_load_column`
+    // kernel, `CompareScalar`@I64 widens its i32 scalar via `i64::from` exactly like the widening
+    // below, and `push_leaf_validity_and(&[Column])` reduces to `push_column_validity_and(col)`.
+    // (Timestamp scalar leaves are handled by the dedicated leaf above; int8 ARITH subtrees fall
+    // through to `compile_arith_program`, which stays program-width — I64-only paths.)
+    let int8_scalar_column = |e: &ResidentExpr| match e {
+        ResidentExpr::Column(col)
+            if table.columns.get(*col).map(|column| column.ty) == Some(SqlType::Int8) =>
+        {
+            Some(*col)
+        }
+        _ => None,
+    };
+    let int_literal_i64 = |e: &ResidentExpr| match e {
+        ResidentExpr::Int8Literal(v) => Some(*v),
+        ResidentExpr::Int4Literal(v) => Some(i64::from(*v)),
+        _ => None,
+    };
+    let int8_scalar_leaf = match (
+        int8_scalar_column(lhs).zip(int_literal_i64(rhs)),
+        int8_scalar_column(rhs).zip(int_literal_i64(lhs)),
+    ) {
+        (Some((col, scalar)), _) => Some((col, scalar, false)),
+        (_, Some((col, scalar))) => Some((col, scalar, true)),
+        _ => None,
+    };
+    if let Some((col, scalar, scalar_on_left)) = int8_scalar_leaf {
+        let byte_offset = resident_device_int8_column_offset(snapshot, table, col)?;
+        program.push(ExprStep::LoadColumnI64 { byte_offset });
+        program.push(ExprStep::CompareScalarI64 {
+            cmp,
+            scalar,
+            scalar_on_left,
+        });
+        // 3VL: a NULL int8 operand (placeholder 0) is UNKNOWN ⇒ excluded.
+        return push_column_validity_and(col, table, snapshot, program);
+    }
     match (lhs.as_ref(), rhs.as_ref()) {
         (value, ResidentExpr::Int4Literal(scalar)) if !is_int4_literal(value) => {
             compile_arith_program(value, table, snapshot, program)?;
@@ -8366,28 +8507,43 @@ impl Engine {
         if !mentions_int8 {
             return Ok(None);
         }
-        if expr_mentions_int4_column(lhs, table) || expr_mentions_int4_column(rhs, table) {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "the general GPU executor does not support mixed int4/int8 expressions yet"
-                    .to_string(),
-            )));
-        }
-        // Mixed int8/text or int8/bool (e.g. `bigcol > 5 AND tag = 'a'` / `AND flag`) mixes the i64 VM
-        // with i32 text/bool masks -- a follow-on; reject rather than run the untested path (text/bool
-        // AND/OR runs under the i32 VM, with int4). int8-only AND/OR stays on this i64 VM.
-        // ADR-006 (date compound) WIDTH DISCIPLINE: mixed int8/DATE is also rejected — the DATE VM leaf
-        // emits a 4-byte `LoadColumn`, which in this I64 program would mis-read 8 bytes per slot.
-        if expr_mentions_text(lhs, table)
+        // ADR-006 (MIXED-WIDTH groups): a mixed int8+{int4,int2,text,bool,date,uuid} predicate
+        // now runs on the I32 mask VM when every int8 leaf is a WIDTH-SAFE scalar comparison (the
+        // `LoadColumnI64`+`CompareScalarI64` arm — see `mixed_width_i32_elem`): fall through
+        // (`Ok(None)`) to the general And/Or I32 branch. Otherwise: a mix bearing a 4-BYTE value
+        // leaf (int4/int2/date — `LoadColumn` follows the program width and would 8-byte mis-read
+        // in this I64 program; int2 was the audit's MEDIUM: it used to slip past this block into
+        // the I64 compile) or a text/bool mask leaf keeps the HARD ERROR — never a silent
+        // mis-answer at one element width. A UUID-ONLY mix with non-scalar int8 (col-vs-col /
+        // arith) deliberately falls THROUGH to the I64 compile below — the uuid leaf is a
+        // width-agnostic mask (`UuidCmpMask` reads b128 bytes, not elem-strided) and that path
+        // pre-dates this slice (audit LOW: rejecting it here regressed a working shape).
+        // int8-only predicates stay on this i64 VM below.
+        let mentions_width_bound = expr_mentions_int4_column(lhs, table)
+            || expr_mentions_int4_column(rhs, table)
+            || expr_mentions_int2(lhs, table)
+            || expr_mentions_int2(rhs, table)
+            || expr_mentions_text(lhs, table)
             || expr_mentions_text(rhs, table)
             || expr_mentions_bool_column(lhs, table)
             || expr_mentions_bool_column(rhs, table)
             || expr_mentions_date(lhs, table)
-            || expr_mentions_date(rhs, table)
+            || expr_mentions_date(rhs, table);
+        if mentions_width_bound
+            || expr_mentions_uuid(lhs, table)
+            || expr_mentions_uuid(rhs, table)
         {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "the general GPU executor does not support mixed int8/text or int8/bool expressions yet"
-                    .to_string(),
-            )));
+            if mixed_width_i32_elem(predicate, table).is_some() {
+                return Ok(None);
+            }
+            if mentions_width_bound {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "the general GPU executor supports a mixed int8 predicate only when every \
+                     int8 leaf is a bare-column scalar comparison"
+                        .to_string(),
+                )));
+            }
+            // uuid-only mix with non-scalar int8: the pre-slice I64 path serves it correctly.
         }
         let mut program = Vec::new();
         let mut needles: Vec<Vec<u8>> = Vec::new();
@@ -8568,9 +8724,17 @@ impl Engine {
                     .map(Some)
                     .map_err(map_err);
             }
+            // ADR-006 (MIXED-WIDTH groups): a mixed ts+{int4,text,bool,date,uuid} AND/OR whose
+            // i64-section leaves are all WIDTH-SAFE scalar comparisons (the timestamp leaf emits
+            // `LoadColumnI64` regardless of the program elem) falls through to the general And/Or
+            // I32 branch instead of erroring.
+            if mixed_width_i32_elem(predicate, table).is_some() {
+                return Ok(None);
+            }
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "the general GPU executor supports timestamp AND/OR only over a timestamp-only \
-                 (i64) predicate; a mixed-type timestamp AND/OR and arithmetic are follow-ons"
+                 (i64) predicate or a mixed group of width-safe scalar leaves; timestamp \
+                 arithmetic is a follow-on"
                     .to_string(),
             )));
         };
@@ -8961,9 +9125,18 @@ impl Engine {
             return Ok(None);
         }
         let Some(cmp) = predicate_compare_code(compare) else {
+            // ADR-006 (MIXED-WIDTH groups): int2 AND/OR falls THROUGH to the general And/Or I32
+            // branch — an int2 leaf is a 4-byte `LoadColumn` + `CompareScalar` in an I32 program
+            // (the int4 section; `predicate_vm_elem_type` has always classed Int2 as I32), so
+            // all-int2/int4 groups and int8+int2 mixes (the audit's MEDIUM: this error used to
+            // block the int2 arm of the mixed fall-through) compile there. Non-boolean
+            // non-comparison shapes keep the hard error.
+            if boolean_op_code(compare).is_some() {
+                return Ok(None);
+            }
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "the general GPU executor supports only simple smallint comparisons (smallint \
-                 AND/OR and arithmetic are follow-ons)"
+                 arithmetic is a follow-on)"
                     .to_string(),
             )));
         };
@@ -9473,13 +9646,19 @@ impl Engine {
             // tombstoned rows. NB: this is NOT the CPU fallback (that fires only on residency invalidation);
             // it surfaces as a query error. Inert until DELETE tombstoning is wired (SV4) -- at which point
             // extending visibility to these shapes (or routing them to the CPU-pinned path) is the follow-up.
-            let elem = predicate_vm_elem_type(predicate, table).ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident visibility filter: this WHERE predicate is not VM-lowerable (mixed width / \
-                     unsupported shape) so the MVCC visibility conjunct cannot be composed"
-                        .to_string(),
-                ))
-            })?;
+            // ADR-006 (MIXED-WIDTH groups): a mixed int8/ts + i32-servable WHERE with width-safe
+            // scalar i64 leaves composes with the (i64) visibility conjuncts at I32 — the same
+            // LoadColumnI64-self-consumed contract the conjuncts themselves use. LOCAL fallback,
+            // not a widening of the shared `predicate_vm_elem_type`.
+            let elem = predicate_vm_elem_type(predicate, table)
+                .or_else(|| mixed_width_i32_elem(predicate, table))
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident visibility filter: this WHERE predicate is not VM-lowerable (mixed width / \
+                         unsupported shape) so the MVCC visibility conjunct cannot be composed"
+                            .to_string(),
+                    ))
+                })?;
             let mut program: Vec<gpu_db_execution::ExprStep> = Vec::new();
             let mut needles: Vec<Vec<u8>> = Vec::new();
             compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
@@ -9619,7 +9798,13 @@ impl Engine {
                     {
                         Some(ResidentElemType::I64)
                     } else {
-                        None
+                        // ADR-006 (MIXED-WIDTH groups): a nullable mixed int8/ts + i32-servable
+                        // group runs at I32 when every i64 leaf is a width-safe scalar comparison.
+                        // ZERO DIVERSION: the two branches above already served every all-I32-set
+                        // and all-i64-section combination — this fires only for mixed sets, which
+                        // previously fell to the final error. Each leaf appends its own
+                        // validity-AND (3VL), including the int8 scalar arm.
+                        mixed_width_i32_elem(predicate, table)
                     };
                     if let Some(elem) = local_elem {
                         let mut program = Vec::new();

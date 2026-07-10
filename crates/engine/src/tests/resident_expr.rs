@@ -437,14 +437,16 @@ fn gpu_resident_expr_where_nullable_mixed_type_clean_errors() {
         err.contains("mixed numeric/integer") || err.contains("not yet supported"),
         "mixed numeric/int nullable WHERE must clean-error, got: {err}"
     );
-    // Mixed int4 + nullable int8 predicate -> clean error (the VM is mono-typed).
-    let err = e
+    // Mixed int4 + NULLABLE int8 now RUNS at I32 (ADR-006 mixed-width groups: the nullable
+    // branch's third local gate; the int8 leaf carries its own validity AND). `big > 5 AND a < 3`
+    // -> a=1 (big 10); a=2 is NULL-big (excluded by 3VL); a=3 fails a<3.
+    let r = e
         .execute_resident_expr_select_sql("SELECT a FROM tm WHERE big > 5 AND a < 3")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("not yet supported") || err.contains("mixed"),
-        "mixed int4/int8 nullable WHERE must clean-error, got: {err}"
+        .expect("mixed int4 + nullable int8 WHERE runs on the GPU (mixed-width group)");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)]],
+        "big>5 AND a<3 => a=1 only (NULL-big row excluded by 3VL)"
     );
 }
 
@@ -563,6 +565,108 @@ fn gpu_resident_expr_where_3vl_over_nullable_timestamp() {
         vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(5)]],
         "col-vs-col ts < ts2 inside AND: ids 1,5; NULL rows excluded (3VL)"
     );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_mixed_width_where_3vl() {
+    // ADR-006 (MIXED-WIDTH groups): a WHERE mixing an INT8 scalar leaf with i32-servable leaves
+    // (text/bool/int4/timestamp) runs ON THE GPU at I32 — the int8 leaf loads 8 bytes via the
+    // width-safe `LoadColumnI64` arm (`mixed_width_i32_elem`). Used to hard-error ("mixed
+    // int8/text") -> CPU. big values straddle i32::MAX so a 4-byte mis-read can't fake the
+    // answer; the NULL-big rows pin 3VL with a PLACEHOLDER-SPANNING bound (placeholder 0
+    // satisfies `big >= 0` — only the validity AND excludes them; reads have NO recheck net).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tmw (id INT, big BIGINT, name TEXT, f BOOL)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tmw (id,big,name,f) VALUES \
+         (1,4294967300,'hit',true),\
+         (2,NULL,'hit',true),\
+         (3,50,'hit',false),\
+         (4,NULL,'miss',true),\
+         (5,4294967301,'miss',true),\
+         (6,4294967302,'hit',false)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tmw").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // NULLABLE mixed int8+text (the local third-branch gate): `big > i32::MAX AND name = 'hit'`
+    // -> ids 1, 6 (id 3 fails the range at 50, id 5 fails the eq, NULLs 2/4 excluded by 3VL).
+    let r = e
+        .execute_resident_expr_select_sql(
+            "SELECT id FROM tmw WHERE big > 2147483647 AND name = 'hit'",
+        )
+        .expect("mixed int8+text WHERE runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(6)]],
+        "mixed int8+text AND: full-width int8 compare + text eq; NULLs excluded"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    // PLACEHOLDER-SPANNING 3VL pin: `big >= 0 AND name = 'hit'` — the NULL placeholder (0)
+    // satisfies the bound, so ONLY the per-leaf validity AND keeps ids 2 out.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tmw WHERE big >= 0 AND name = 'hit'")
+        .expect("placeholder-spanning mixed WHERE runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)], vec![SqlValue::Int4(6)]],
+        "placeholder-spanning mixed AND: NULL-big row 2 must be excluded by validity, not value"
+    );
+    // MIXED bool+int8 (`f = true AND big > i32::MAX` -> ids 1, 5): the bool leaf is a mask step,
+    // the int8 leaf an 8-byte scalar compare, composed in one I32 program.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tmw WHERE f = true AND big > 2147483647")
+        .expect("mixed bool+int8 WHERE runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(5)]],
+        "mixed bool+int8 AND: ids 1,5"
+    );
+    // NON-NULL mixed int8+text (the int8-general-path fall-through, no nullable branch): a
+    // separate all-non-null table.
+    e.execute_text(3, "CREATE TABLE tmw2 (id INT, big BIGINT, name TEXT, small SMALLINT)")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO tmw2 (id,big,name,small) VALUES \
+         (1,4294967300,'a',7),(2,10,'a',7),(3,4294967301,'b',9)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tmw2").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let r = e
+        .execute_resident_expr_select_sql(
+            "SELECT id FROM tmw2 WHERE big > 2147483647 AND name = 'a'",
+        )
+        .expect("non-null mixed int8+text WHERE runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)]],
+        "non-null mixed int8+text AND: id 1 only (2 fails the range, 3 fails the eq)"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    // NON-NULL mixed int8+int2 (the audit's MEDIUM: this shape used to SLIP PAST the mixed
+    // block — int2 was unchecked — into the I64 compile, where the 4-byte int2 slot was read at
+    // an 8-byte stride = silent wrong rows). Now it routes to I32 like the rest: id 1 only
+    // (id 2 fails the big range, id 3 fails small=7).
+    let r = e
+        .execute_resident_expr_select_sql(
+            "SELECT id FROM tmw2 WHERE big > 2147483647 AND small = 7",
+        )
+        .expect("non-null mixed int8+int2 WHERE runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)]],
+        "non-null mixed int8+int2 AND: id 1 only (an 8-byte int2 mis-read could not produce this)"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
 }
 
 #[test]
@@ -1630,11 +1734,17 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
         "big>100 AND big2>100 => all rows (64-bit)"
     );
 
-    // MIXED int4/int8 inside AND must hard-error (the routing gap bypassed the mixed-type guard).
-    assert!(
-        e.execute_resident_expr_select_sql("SELECT a FROM t WHERE big > 5 AND a < 3")
-            .is_err(),
-        "mixed int4/int8 AND -> hard error, not a wrong answer"
+    // MIXED int4/int8 inside AND now RUNS at I32 (ADR-006 mixed-width groups: the int8 leaf is a
+    // width-safe `LoadColumnI64` scalar compare) — it used to hard-error. `big` is all > i32::MAX
+    // (and > 5), so the pin is row-exactness: a 4-byte mis-read could not return exactly a<3.
+    let mixed = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE big > 5 AND a < 3")
+        .expect("mixed int4/int8 AND runs on the GPU (mixed-width group)");
+    let mixed_expected: Vec<Vec<SqlValue>> =
+        (0..3).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(
+        mixed.rows, mixed_expected,
+        "big>5 AND a<3 => a in {{0,1,2}} (all bigs exceed 5)"
     );
 }
 

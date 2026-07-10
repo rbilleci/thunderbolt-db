@@ -3809,6 +3809,145 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, MIXED-WIDTH groups): a DELETE/UPDATE whose WHERE mixes an INT8
+/// scalar leaf with i32-servable leaves (text/bool/int4) resolves ON THE DEVICE — the int8 leaf
+/// lowers via the width-safe `LoadColumnI64`+`CompareScalarI64` arm inside an I32 program
+/// (`mixed_width_i32_elem`), the shape that used to hard-error ("mixed int8/text") and de-elide.
+/// This is EXACTLY the decline recipe the CHECK-bypass repro used — closing it removes that
+/// rehydrate trigger. The second DELETE runs over VERSIONED shards (the earlier UPDATE tombstoned
+/// + appended), pinning the visibility-branch `mixed_width_i32_elem` fallback. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_mixed_width_dml_resolves_on_device() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE m (id INT PRIMARY KEY, big BIGINT, name TEXT, flag BOOL)",
+        )
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    let mut txn = 2u64;
+    engine
+        .execute_dml_concurrent(txn, "INSERT INTO m VALUES (1, 4294967300, 'keep', true)")
+        .unwrap();
+    txn += 1;
+    let snap = engine.populate_relational_residency_snapshot("m");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    // big values straddle i32::MAX so a 4-byte mis-read could never fake the right answer.
+    for (id, big, name, flag) in [
+        (2i64, 4_294_967_301i64, "drop", "false"),
+        (3, 100, "drop", "false"),
+        (4, 4_294_967_302, "drop", "true"),
+        (5, 4_294_967_303, "hold", "false"),
+    ] {
+        engine
+            .execute_dml_concurrent(
+                txn,
+                &format!("INSERT INTO m VALUES ({id}, {big}, '{name}', {flag})"),
+            )
+            .unwrap();
+        txn += 1;
+    }
+    assert!(engine.table_install_elided("m"), "the table must elide first");
+
+    let ids = |engine: &Engine| -> Vec<i64> {
+        let Command::Select(s) = parse_command("SELECT id FROM m").unwrap() else {
+            unreachable!()
+        };
+        let mut out: Vec<i64> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n as i64,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(ids(&engine), vec![1, 2, 3, 4, 5]);
+
+    // MIXED int8+text DELETE (`big > i32::MAX AND name = 'drop'` -> ids 2, 4; id 3's big=100
+    // fails the range, id 5's name fails the eq) ON THE DEVICE, STAYS ELIDED.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(txn, "DELETE FROM m WHERE big > 2147483647 AND name = 'drop'")
+        .unwrap();
+    txn += 1;
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a mixed int8+text DELETE must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("m"), "a mixed int8+text DELETE must NOT de-elide");
+    assert_eq!(ids(&engine), vec![1, 3, 5], "exactly the big>i32::MAX 'drop' rows (2,4) deleted");
+
+    // MIXED bool+int8 UPDATE (`flag = false AND big > i32::MAX` -> id 5) ON THE DEVICE.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(
+            txn,
+            "UPDATE m SET name = 'held' WHERE flag = false AND big > 2147483647",
+        )
+        .unwrap();
+    txn += 1;
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a mixed bool+int8 UPDATE must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("m"), "a mixed bool+int8 UPDATE must NOT de-elide");
+
+    // VERSIONED-shard mixed READ (the LOAD-BEARING pin for the visibility-branch
+    // `mixed_width_i32_elem` fallback — audit note adopted): the UPDATE above tombstoned the old
+    // id-5 row and appended its twin, and a VERSIONED shard FORCES the mask VM so the WHERE can
+    // compose with the on-device visibility conjuncts (SV3b). Without the fallback this mixed
+    // WHERE hard-errors there -> CPU-pinned -> rehydrate/DE-ELIDE, so stays-elided + row-exact
+    // (exactly ONE id-5 version, the live 'held' twin, not the tombstoned original) prove the
+    // versioned path served it.
+    let Command::Select(vsel) =
+        parse_command("SELECT id FROM m WHERE flag = false AND big > 2147483647").unwrap()
+    else {
+        unreachable!()
+    };
+    let vrows = engine.execute_relational_select(&vsel).unwrap().rows;
+    assert_eq!(
+        vrows,
+        vec![vec![SqlValue::Int4(5)]],
+        "versioned-shard mixed read: exactly the LIVE id-5 twin (no tombstoned duplicate)"
+    );
+    assert!(
+        engine.table_install_elided("m"),
+        "the versioned-shard mixed read must NOT de-elide (the visibility-branch fallback)"
+    );
+
+    // MIXED int4+int8 DELETE over the now-VERSIONED shards (the UPDATE tombstoned + appended a
+    // twin): the WHERE composes with the on-device visibility conjuncts at I32 (the
+    // `mixed_width_i32_elem` fallback in the visibility branch). id 5 (renamed 'held') matches.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(txn, "DELETE FROM m WHERE id > 4 AND big = 4294967303")
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a mixed int4+int8 DELETE over versioned shards must RESOLVE on the device"
+    );
+    assert!(engine.table_install_elided("m"), "the versioned-shard DELETE must NOT de-elide");
+    assert_eq!(ids(&engine), vec![1, 3], "id 5 deleted; 1 ('keep') and 3 (big=100) survive");
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, audit HIGH regression pin): a MID-PREFLIGHT REHYDRATE must not
 /// bypass CHECK. On an ELIDED CHECK table, an `execute_text` UPDATE whose WHERE the device resolve
 /// DECLINES (a mixed int8+text AND — the decline REHYDRATES/de-elides mid-preflight) used to fall back

@@ -10,15 +10,6 @@ use super::*;
 /// the seq_scan produced. `None` from the resolver = index-ineligible -> the caller scans.
 pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
 
-/// CPU-ENGINE RETIREMENT (ADR-006): lower a DELETE/UPDATE's `filter_groups` (OR of AND-groups) into an
-/// `ResidentExpr` DNF (`Column(catalog_idx) <op> literal`, AND within a group, OR across groups) for the
-/// device predicate scan-locate. Supports INT4/INT8/TIMESTAMP (I32/I64 VM), NUMERIC (I128 VM), and TEXT
-/// EQUALITY (`= 'lit'` only, via the device byte-wise text kernel — text has no device ordering, so text
-/// `<`/`>`/LIKE decline). ANY other leaf (a NULL, a LIKE-prefix, a text inequality, or an empty group)
-/// returns `None` so the caller declines to the host rehydrate. `Column`
-/// carries the FULL-CATALOG index, which `lower_resident_predicate` translates to the shard's section
-/// offset (int4 or int8 by the column's catalog type — a program is mono-typed, so all leaves in a group
-/// must share the element width; a mixed int4/int8 predicate hard-errors on lowering and declines).
 /// ADR-006 (FK child elision, all fk column types): the CANONICAL Eq literal for a device
 /// scan-probe of `value` against a column of type `ty` — one arm per device-scannable type,
 /// mirroring `dml_filter_groups_to_device_predicate`'s Eq lowering EXACTLY (Date/Uuid round-trip
@@ -49,6 +40,17 @@ fn device_eq_scan_literal(
     })
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006): lower a DELETE/UPDATE's `filter_groups` (OR of AND-groups) into an
+/// `ResidentExpr` DNF (`Column(catalog_idx) <op> literal`, AND within a group, OR across groups) for the
+/// device predicate scan-locate. Supports INT4/INT8/TIMESTAMP (I32/I64 VM), NUMERIC (I128 VM), and TEXT
+/// EQUALITY (`= 'lit'` only, via the device byte-wise text kernel — text has no device ordering, so text
+/// `<`/`>`/LIKE decline). ANY other leaf (a NULL, a LIKE-prefix, a text inequality, or an empty group)
+/// returns `None` so the caller declines to the host rehydrate. `Column`
+/// carries the FULL-CATALOG index, which `lower_resident_predicate` translates to the shard's section
+/// offset (int4 or int8 by the column's catalog type). MIXED-WIDTH groups (int8/timestamp scalar
+/// leaves beside int4/text/bool/date/uuid — e.g. `big > 5 AND name = 'x'`) lower at I32 via the
+/// width-safe `LoadColumnI64` scalar arms (ADR-006, `mixed_width_i32_elem`); an int8 ARITH subtree
+/// in a mixed group still hard-errors on lowering and declines.
 fn dml_filter_groups_to_device_predicate(
     table: &RelationalTable,
     filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
