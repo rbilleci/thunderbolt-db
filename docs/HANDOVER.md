@@ -5,10 +5,18 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `8036cfb7` (STRATA STREAMING EXECUTOR — S-E.1 + S-E.2 + S-E.3 SHIPPED;
-user chose this track at the predicate-edges boundary). **>>> ACTIVE TRACK: STRATA STREAMING EXECUTOR (ADR-012 /
-PLAN §2 S-E) <<<** — over-VRAM reads run ON THE DEVICE by folding over bounded chunks (admit chunk → reduce on
-device → combine partial → evict → next), never all shards resident.
+**Updated:** 2026-07-10. **Base:** `main` @ `318ca05f` (STRATA STREAMING EXECUTOR — S-E.1..S-E.4 SHIPPED: **the
+FOLDABLE OPERATOR CLASSES of ADR-012 are ALL STREAMING** — scalar reductions, filter/project+window, GROUP
+BY/DISTINCT, ORDER BY/top-N; user chose this track at the predicate-edges boundary). **>>> ACTIVE TRACK: STRATA
+STREAMING EXECUTOR (ADR-012 / PLAN §2 S-E) <<<** — over-VRAM reads run ON THE DEVICE by folding over bounded chunks
+(admit chunk → reduce on device → combine partial → evict → next), never all shards resident.
+**S-E.4 DONE (`318ca05f`):** single-key ORDER BY streams — TOP-N = per-chunk DEVICE sort + window (a chunk's local
+top-(m+n) is its only possible global-window contribution, invariant audit-proven through compaction) → concat →
+device compaction re-sort/re-window → ONE final device sort + the real window over a synthesized "__stream_runs"
+relation; UNBOUNDED = plain per-chunk filter/project + one final device sort, honest defer when survivors outgrow
+the budget. The sort NEVER runs on the host. Audit MERGE-SAFE zero C/H/M; one LOW adopted (decline the ORDER-BY-
+expression empty-string sentinel up front). Gates: lib 501/501, streaming 11/11, sweep 430/432 (same 2 pre-existing
+a1/a4c, proven on origin/main), clippy clean, sabotage (compaction window + the enforcing sort budget gate).
 **S-E.3 DONE (`8036cfb7`):** GROUP BY (COUNT/SUM/MIN/MAX) + single-col DISTINCT over an over-budget table stream via
 the TWO-LEVEL fold — per-chunk device grouped partials → concat (control plane) → ONE final device merge over a
 synthesized `__stream_partials` relation (COUNT folds as SUM(count), SUM as SUM(sum), MIN/MAX as the extreme; the
@@ -41,9 +49,9 @@ reach); a genuine overflow surfaces. Opus audit CLEAN on MVCC/combine/gate/chart
 NULL/empty-text as 0 bytes → whole-table upload for null-heavy tables) fixed via device-byte accounting +
 regression-gated; LOW (per-chunk overflow now surfaces uniformly) adopted. Gates: engine lib 501/501, GPU streaming
 4/4, clippy clean, FULL GPU sweep 422/424 (the 2 fails = `capacity_payload_tests::{a1_device_row_identity,
-a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.4 ORDER BY (k-way run merge),
-S-E.5 copy/compute overlap (copy stream + prefetch/evict API), S-E.6 NVMe cold tier. Memory
-`strata-streaming-executor`. AVG deferred (needs the (sum,count) pair — scalar AND grouped).
+a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.5 copy/compute overlap (copy stream + prefetch/evict API), S-E.6 NVMe cold tier + shard-
+granular evict. Memory `strata-streaming-executor`. AVG deferred (needs the (sum,count) pair — scalar AND grouped);
+grouped COUNT(DISTINCT) deferred (not associatively decomposable).
 
 **Prior base** `7432ebf6` (CPU-ENGINE RETIREMENT — THIRTY merged wins, **THE
 PREDICATE-EDGES ARC IS COMPLETE**: every scalar type × operator × operand-shape (literal, col-vs-col, mixed-width
