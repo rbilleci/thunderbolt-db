@@ -10,6 +10,15 @@ FOLDABLE OPERATOR CLASSES of ADR-012 are ALL STREAMING** — scalar reductions, 
 BY/DISTINCT, ORDER BY/top-N; user chose this track at the predicate-edges boundary). **>>> ACTIVE TRACK: STRATA
 STREAMING EXECUTOR (ADR-012 / PLAN §2 S-E) <<<** — over-VRAM reads run ON THE DEVICE by folding over bounded chunks
 (admit chunk → reduce on device → combine partial → evict → next), never all shards resident.
+**S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy):** the
+copy/compute-overlap pipeline (async pinned-staged uploads on a private copy stream + the stage-N/compute-N-1
+lookahead in all four folds) was built, tested 11/11, and A/B'd NEUTRAL — {185,179,181}ms vs {185,178,177}ms
+(COUNT over 100k rows / 25 chunks). ROOT CAUSE (measured): the fold is HOST-STAGING-BOUND at every chunk size —
+host scan+decode+build ≈68%, "upload" ≈9% (itself mostly host payload assembly; the raw PCIe copy of a chunk is
+~10µs), device compute ≈1%. The ~1.3µs/row MVCC decode is the ADR-006 interim host store (charter forbids
+optimizing it); until S-E.6 makes the cold tier RAW DEVICE-FORMAT SHARD BYTES (no per-row decode), there is
+nothing for the copy engine to overlap with. The branch returns AS the path with S-E.6 (upload becomes dominant
+then). The `retain_device_memory_copy_async`/`PendingCudaResidentDeviceCopy` primitive lives on that branch.
 **S-E.4 DONE (`318ca05f`):** single-key ORDER BY streams — TOP-N = per-chunk DEVICE sort + window (a chunk's local
 top-(m+n) is its only possible global-window contribution, invariant audit-proven through compaction) → concat →
 device compaction re-sort/re-window → ONE final device sort + the real window over a synthesized "__stream_runs"
@@ -49,9 +58,9 @@ reach); a genuine overflow surfaces. Opus audit CLEAN on MVCC/combine/gate/chart
 NULL/empty-text as 0 bytes → whole-table upload for null-heavy tables) fixed via device-byte accounting +
 regression-gated; LOW (per-chunk overflow now surfaces uniformly) adopted. Gates: engine lib 501/501, GPU streaming
 4/4, clippy clean, FULL GPU sweep 422/424 (the 2 fails = `capacity_payload_tests::{a1_device_row_identity,
-a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.5 copy/compute overlap (copy stream + prefetch/evict API), S-E.6 NVMe cold tier + shard-
-granular evict. Memory `strata-streaming-executor`. AVG deferred (needs the (sum,count) pair — scalar AND grouped);
-grouped COUNT(DISTINCT) deferred (not associatively decomposable).
+a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.6 raw-shard-bytes/NVMe cold tier + shard-granular evict (SUBSUMES S-E.5 — the branched
+overlap pipeline returns with it). Memory `strata-streaming-executor`. AVG deferred (needs the (sum,count) pair —
+scalar AND grouped); grouped COUNT(DISTINCT) deferred (not associatively decomposable).
 
 **Prior base** `7432ebf6` (CPU-ENGINE RETIREMENT — THIRTY merged wins, **THE
 PREDICATE-EDGES ARC IS COMPLETE**: every scalar type × operator × operand-shape (literal, col-vs-col, mixed-width
