@@ -5,7 +5,12 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `aa75c11c` (CPU-ENGINE RETIREMENT — TWENTY-SIX merged wins:
+**Updated:** 2026-07-10. **Base:** `main` @ `4c1a830a` (CPU-ENGINE RETIREMENT — TWENTY-SEVEN merged wins:
+NON-i32 FK COLUMNS ELIDE (uuid/int8/text/timestamp/numeric/bool fk children — NEW `device_eq_scan_literal` one
+canonical Eq arm per device-scannable type feeding the elided scan arm; the `i32_section_needle` early-decline in
+`device_visible_row_with_value` is gone; the per-fk-column eligibility check DROPPED since the main column gate is
+exactly the helper's set; non-i32-PK parents stay non-elided/host-probed; audit SOUND zero defects; 5-type loop test
++ bool addendum, sabotage-verified) `4c1a830a`;
 FK CHILD TABLES ELIDE (**the LAST structural elision class** — outbound-FK gate lifted to non-self-referencing +
 all-fk-columns-i32-section; the inbound child-reference check on a parent DELETE runs ON-DEVICE via a new Eq
 scan-locate fallback in `device_visible_row_with_value` when the dup-intolerant hash-index probe declines on the
