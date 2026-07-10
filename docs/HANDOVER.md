@@ -5,7 +5,28 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `7432ebf6` (CPU-ENGINE RETIREMENT — THIRTY merged wins, **THE
+**Updated:** 2026-07-10. **Base:** `main` @ `570c7fa4` (STRATA STREAMING EXECUTOR — S-E.1 out-of-core scalar
+reductions SHIPPED, the ADR-012 architectural program's first slice; user chose this track at the
+predicate-edges boundary). **>>> ACTIVE TRACK: STRATA STREAMING EXECUTOR (ADR-012 / PLAN §2 S-E) <<<** — over-VRAM
+reads run ON THE DEVICE by folding over bounded chunks (admit chunk → reduce on device → combine partial → evict →
+next), never all shards resident. **S-E.1 DONE (`570c7fa4`):** a `COUNT(*)/SUM/MIN/MAX` over a table larger than the
+configured per-GPU residency budget now streams on the device instead of de-eliding to the CPU host engine — new
+`engine_streaming_exec.rs` folds the MVCC-visible rows into byte-bounded chunks, each uploaded as a transient
+`build_transient_relation_residency` source + reduced via the existing `execute_resident_expr_select_with_binding`
+(filter + reduce on the GPU), partials combined host-side (COUNT=Σ, SUM int4→Int8 i128-checked / int8+numeric→
+`Decimal128::checked_add`, MIN/MAX via `compare_sql_values` skipping NULL); peak residency = one chunk (gauge
+`streaming_fold_peak_chunk_bytes` ≤ budget). Activation gates on a CONFIGURED budget so default behavior is
+byte-identical (no test sets one); any executor error defers to the authoritative CPU path (streaming only ADDS
+reach); a genuine overflow surfaces. Opus audit CLEAN on MVCC/combine/gate/charter/defer; HIGH (chunk sizing counted
+NULL/empty-text as 0 bytes → whole-table upload for null-heavy tables) fixed via device-byte accounting +
+regression-gated; LOW (per-chunk overflow now surfaces uniformly) adopted. Gates: engine lib 501/501, GPU streaming
+4/4, clippy clean, FULL GPU sweep 422/424 (the 2 fails = `capacity_payload_tests::{a1_device_row_identity,
+a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.2 streaming
+filter/project + LIMIT, S-E.3 GROUP BY/DISTINCT (persistent device accumulator), S-E.4 ORDER BY (k-way run merge),
+S-E.5 copy/compute overlap (copy stream + prefetch/evict API), S-E.6 NVMe cold tier. Memory
+`strata-streaming-executor`. AVG deferred (needs the (sum,count) pair).
+
+**Prior base** `7432ebf6` (CPU-ENGINE RETIREMENT — THIRTY merged wins, **THE
 PREDICATE-EDGES ARC IS COMPLETE**: every scalar type × operator × operand-shape (literal, col-vs-col, mixed-width
 group) × nullability now resolves ON-DEVICE for DML + reads, alone or in AND/OR; the remaining CPU-engine-deletion
 work is the ADR-012 ARCHITECTURAL program (STRATA streaming executor, JOIN grammar, views, window functions):
