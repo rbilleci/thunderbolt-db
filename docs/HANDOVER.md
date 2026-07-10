@@ -5,7 +5,12 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `4c1a830a` (CPU-ENGINE RETIREMENT — TWENTY-SEVEN merged wins:
+**Updated:** 2026-07-10. **Base:** `main` @ `3445c6ac` (CPU-ENGINE RETIREMENT — TWENTY-EIGHT merged wins:
+MIXED-WIDTH predicate groups on-device (int8/ts scalar leaves beside int4/int2/text/bool/date/uuid compile into ONE
+I32 program via width-safe `LoadColumnI64` arms — the SV3b conjunct contract; LOCAL `mixed_width_i32_elem` gates at
+4 sites, NOT a `predicate_vm_elem_type` widening; kills the "mixed int8/text" de-elide = the CHECK-bypass decline
+recipe; audit MEDIUM int8+int2 I64 mis-read fixed + int2 AND/OR newly served; audit LOW uuid+int8-col-vs-col I64
+path restored; int8 arith in a mix still hard-errors; double-sabotaged) `3445c6ac`;
 NON-i32 FK COLUMNS ELIDE (uuid/int8/text/timestamp/numeric/bool fk children — NEW `device_eq_scan_literal` one
 canonical Eq arm per device-scannable type feeding the elided scan arm; the `i32_section_needle` early-decline in
 `device_visible_row_with_value` is gone; the per-fk-column eligibility check DROPPED since the main column gate is
