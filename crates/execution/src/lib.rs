@@ -17392,6 +17392,19 @@ pub enum ExprStep {
         scalar_on_left: bool,
         cmp: u32,
     },
+    /// Push the mask `(scalar_on_left ? needle <cmp> uuid[i] : uuid[i] <cmp> needle) ? 1 : 0` for the
+    /// resident UUID column (16 raw bytes/row in the b128 section at `byte_offset`) — unsigned
+    /// big-endian 16-byte memcmp (PG's uuid order == Rust `[u8;16]::cmp`). `cmp`: 0=eq/1=lt/2=le/
+    /// 3=gt/4=ge/5=ne. The 16 needle bytes are `text_needles[needle_idx]` (the same out-of-band varlen
+    /// channel). Lets the mask VM combine uuid comparisons with AND/OR — uuid IN, uuid ranges, mixed
+    /// uuid+int4/text WHEREs. Launches the SAME kernel as the standalone
+    /// `expr_uuid_compare_scalar_filter` (`gpu_db_resident_uuid_compare_scalar_to_mask`).
+    UuidCmpMask {
+        byte_offset: u64,
+        needle_idx: u32,
+        scalar_on_left: bool,
+        cmp: u32,
+    },
     /// Push the mask `(textcol[i] LIKE pattern) ? 1 : 0` for the resident TEXT column at
     /// (`offsets_byte_offset`, `bytes_byte_offset`). The pattern is the COMPILED u32 token array (escapes
     /// resolved on the host: each token `(op<<8)|byte`, op 0=literal/1=`_`/2=`%`), stored LE-serialized in
@@ -17643,6 +17656,16 @@ fn run_resident_arith_program<'r>(
         .any(|s| matches!(s, ExprStep::TextCmpMask { .. }))
     {
         Some(primary.cached_function(c"gpu_db_resident_text_compare_scalar_to_mask", &ptx)?)
+    } else {
+        None
+    };
+    // uuid comparison -> i32 mask via the byte-wise b128 compare kernel (the SAME kernel the standalone
+    // uuid fast path launches), so the VM can combine uuid `=`/`<`/`IN` with AND/OR. Lazy (only if used).
+    let uuid_cmp_mask_fn = if program
+        .iter()
+        .any(|s| matches!(s, ExprStep::UuidCmpMask { .. }))
+    {
+        Some(primary.cached_function(c"gpu_db_resident_uuid_compare_scalar_to_mask", &ptx)?)
     } else {
         None
     };
@@ -18145,6 +18168,51 @@ fn run_resident_arith_program<'r>(
                     (&mut a6 as *mut u32).cast::<c_void>(),
                     (&mut a7 as *mut u64).cast::<c_void>(),
                     (&mut a8 as *mut u64).cast::<c_void>(),
+                ];
+                launch(function, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::UuidCmpMask {
+                byte_offset,
+                needle_idx,
+                scalar_on_left,
+                cmp,
+            } => {
+                // uuid[i] <cmp> needle (unsigned big-endian 16-byte memcmp) -> i32 mask pushed on the
+                // stack. The needle MUST be exactly 16 bytes (the kernel reads a fixed 16); a
+                // wrong-length needle is a compile-side bug surfaced loudly here.
+                let needle = text_needles.get(needle_idx as usize).ok_or(
+                    CudaRuntimeProbeError::InvalidInputLength(needle_idx as usize),
+                )?;
+                if needle.len() != 16 {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(needle.len()));
+                }
+                let function =
+                    uuid_cmp_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let needle_lease = primary.lease_device_buffer(16)?;
+                check_cuda(unsafe {
+                    cu_memcpy_htod(
+                        needle_lease.ptr,
+                        needle.as_ptr().cast::<c_void>(),
+                        needle.len(),
+                    )
+                })?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = resident_base;
+                let mut a1 = byte_offset;
+                let mut a2 = needle_lease.ptr;
+                let mut a3 = u32::from(scalar_on_left);
+                let mut a4 = cmp;
+                let mut a5 = n;
+                let mut a6 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u64).cast::<c_void>(),
+                    (&mut a3 as *mut u32).cast::<c_void>(),
+                    (&mut a4 as *mut u32).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
+                    (&mut a6 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
                 stack.push(out);

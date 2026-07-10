@@ -2964,6 +2964,58 @@ fn gpu_uuid_predicate_dml_resolves_on_device() {
     assert_eq!(gpu_ids_of_t(&engine), vec![2, 4], "exactly the two <a>-uuid rows deleted");
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): uuid comparisons INSIDE AND/OR resolve ON THE DEVICE
+/// via the new `UuidCmpMask` mask-VM step (the same b128 memcmp kernel, composed with MaskBinary) —
+/// uuid RANGES (`u >= A AND u <= B`), uuid IN (an OR of `=`), and MIXED uuid+int4 WHEREs. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_uuid_range_and_in_dml_resolve_on_device() {
+    let u = |n: u8| format!("'00000000-0000-0000-0000-0000000000{n:02}'");
+    let seed_uuids: Vec<(i64, String)> = (1..=5i64).map(|i| (i, u(i as u8))).collect();
+    let seed: Vec<(i64, &str)> = seed_uuids.iter().map(|(i, s)| (*i, s.as_str())).collect();
+
+    // uuid RANGE: <02> <= u <= <04> -> ids 2,3,4.
+    {
+        let Some(engine) = gpu_elided_pk_table_with_column("u UUID", &seed) else {
+            return;
+        };
+        let before = engine.dml_device_resolve_hits();
+        engine
+            .execute_dml_concurrent(
+                9,
+                "DELETE FROM t WHERE u >= '00000000-0000-0000-0000-000000000002' \
+                 AND u <= '00000000-0000-0000-0000-000000000004'",
+            )
+            .unwrap();
+        assert!(
+            engine.dml_device_resolve_hits() > before,
+            "a uuid RANGE DELETE must RESOLVE on the device (UuidCmpMask in the mask VM)"
+        );
+        assert!(engine.table_install_elided("t"), "uuid range DELETE must NOT de-elide");
+        assert_eq!(gpu_ids_of_t(&engine), vec![1, 5], "ids 2,3,4 (the range) deleted");
+    }
+    // uuid IN: (<01>, <04>) -> ids 1,4 (an OR of uuid equalities through the mask VM).
+    {
+        let Some(engine) = gpu_elided_pk_table_with_column("u UUID", &seed) else {
+            return;
+        };
+        let before = engine.dml_device_resolve_hits();
+        engine
+            .execute_dml_concurrent(
+                9,
+                "DELETE FROM t WHERE u IN ('00000000-0000-0000-0000-000000000001', \
+                 '00000000-0000-0000-0000-000000000004')",
+            )
+            .unwrap();
+        assert!(
+            engine.dml_device_resolve_hits() > before,
+            "a uuid IN DELETE must RESOLVE on the device"
+        );
+        assert!(engine.table_install_elided("t"), "uuid IN DELETE must NOT de-elide");
+        assert_eq!(gpu_ids_of_t(&engine), vec![2, 3, 5], "ids 1,4 (the IN list) deleted");
+    }
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a BOOL-EQUALITY DELETE on an ELIDED table resolves ON
 /// THE DEVICE — the DML builder lowers `flag = true` to a `BoolLiteral` the existing device
 /// `try_lower_bool_predicate` (1-bit bitmap → mask) evaluates; the hit materializes its bool on-device

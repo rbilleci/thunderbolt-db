@@ -1837,6 +1837,13 @@ fn compile_predicate_program(
         program.push(ExprStep::MaskBinary { op: bool_op });
         return Ok(());
     }
+    // UUID comparison leaf -> a `UuidCmpMask` step (ADR-006) — checked BEFORE text because a uuid
+    // literal is a `TextLiteral` (which would otherwise route this leaf to the text compiler and
+    // error); `expr_mentions_uuid` keys on a uuid COLUMN, which no text leaf has. Covers uuid IN
+    // (OR of `=`), uuid ranges, and mixed uuid+int4/text WHEREs.
+    if expr_mentions_uuid(lhs, table) || expr_mentions_uuid(rhs, table) {
+        return compile_uuid_leaf(*op, lhs, rhs, table, snapshot, program, needles);
+    }
     // TEXT comparison leaf -> a mask step the VM combines with AND/OR (so text IN / multi-text WHERE /
     // text RANGES / a nullable-text or compound LIKE run on the GPU). LIKE -> TextLikeMask; `=`/`<>` ->
     // TextEqMask; `<`/`<=`/`>`/`>=` -> TextCmpMask (ADR-006). int4 leaves fall through to the arith VM.
@@ -1986,6 +1993,55 @@ fn compile_text_eq_leaf(
     }
     // 3VL: a NULL text operand makes any comparison UNKNOWN ⇒ the row is not selected (its placeholder
     // is an empty span, which would otherwise mis-match `= ''` / mis-pass `<> 'x'` / mis-order `< 'x'`).
+    push_column_validity_and(col, table, snapshot, program)
+}
+
+/// Compile a UUID comparison leaf (`uuidcol <cmp> 'uuid-literal'`, either operand order) into a
+/// `UuidCmpMask` VM step + record the literal's 16 bytes in `needles` (ADR-006). Mirrors the
+/// single-comparison uuid fast path (`try_lower_uuid_predicate`) but as a mask the VM can AND/OR —
+/// uuid IN (an OR of `=`), uuid ranges, mixed uuid+int4/text WHEREs. All six comparison ops lower
+/// (uuid is byte-comparable, PG's uuid order). uuid column-vs-column inside AND/OR is a follow-on.
+fn compile_uuid_leaf(
+    op: ResidentBinaryOp,
+    lhs: &ResidentExpr,
+    rhs: &ResidentExpr,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprStep>,
+    needles: &mut Vec<Vec<u8>>,
+) -> Result<(), ExecuteError> {
+    let Some(cmp) = predicate_compare_code(op) else {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "a uuid predicate leaf must be a comparison (eq/ne/lt/le/gt/ge)".to_string(),
+        )));
+    };
+    let (col, needle, column_on_left) =
+        match (uuid_column_index(lhs, table), uuid_column_index(rhs, table)) {
+            (Some(col), None) => (col, uuid_literal_bytes(rhs)?, true),
+            (None, Some(col)) => (col, uuid_literal_bytes(lhs)?, false),
+            (Some(_), Some(_)) => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "uuid column-vs-column inside AND/OR is a follow-on".to_string(),
+                )));
+            }
+            (None, None) => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "a uuid predicate must involve a uuid column".to_string(),
+                )));
+            }
+        };
+    let byte_offset = resident_device_numeric_column_offset(snapshot, table, col)?;
+    let needle_idx = needles.len() as u32;
+    needles.push(needle.to_vec());
+    program.push(ExprStep::UuidCmpMask {
+        byte_offset,
+        needle_idx,
+        // The kernel evaluates `needle <cmp> uuid[i]` when scalar_on_left — the COLUMN on the RIGHT.
+        scalar_on_left: !column_on_left,
+        cmp,
+    });
+    // 3VL: a NULL uuid operand makes any comparison UNKNOWN ⇒ the row is not selected (its 16-zero-byte
+    // placeholder would otherwise mis-match `= '00000000-...'` / mis-order `< x`).
     push_column_validity_and(col, table, snapshot, program)
 }
 
@@ -8708,11 +8764,11 @@ impl Engine {
             return Ok(None);
         }
         let Some(cmp) = predicate_compare_code(compare) else {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "the general GPU executor supports only simple uuid comparisons (uuid AND/OR is a \
-                 follow-on)"
-                    .to_string(),
-            )));
+            // AND/OR (ADR-006): fall through — the And/Or branch of `lower_resident_predicate` runs
+            // `compile_predicate_program`, whose uuid leaf compiles to a `UuidCmpMask` mask-VM step
+            // (uuid IN / uuid ranges / mixed uuid+int4/text). Never a silent mis-answer: a shape the
+            // leaf compiler can't express errors there and the caller declines.
+            return Ok(None);
         };
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
