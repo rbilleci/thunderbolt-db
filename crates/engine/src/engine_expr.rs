@@ -9459,8 +9459,8 @@ impl Engine {
                     return Ok(indices);
                 }
                 // A nullable uuid SIMPLE comparison: the uuid memcmp peephole resolves the operand's
-                // validity bitmap and AND's it with the compare mask (uuid has no VM step). A uuid AND/OR
-                // is its own clean error from inside the helper.
+                // validity bitmap and AND's it with the compare mask (uuid has no VM step). Runs BEFORE
+                // the uuid AND/OR block below so col-vs-col and every simple shape keep this proven path.
                 if expr_mentions_uuid(lhs, table) || expr_mentions_uuid(rhs, table) {
                     if let Some(indices) = self.try_lower_uuid_predicate(
                         *op,
@@ -9472,6 +9472,47 @@ impl Engine {
                         row_count,
                     )? {
                         return Ok(indices);
+                    }
+                }
+                // NULLABLE uuid AND/OR (ADR-006): uuid is not in `predicate_vm_elem_type`'s I32 set
+                // (deliberately — widening the SHARED helper diverts working paths; the timestamp
+                // lesson), so a nullable uuid range/IN missed the VM block above and used to hit the
+                // final error. Gate LOCALLY: top-level And/Or whose every referenced column is
+                // I32-mask-compatible (uuid leaves are mask-only `UuidCmpMask` steps — no column load —
+                // and int4/int2/text/bool leaves run at I32). Each leaf appends its own validity-AND
+                // (3VL), exactly how the elem-Some VM block serves nullable int4/text today.
+                if matches!(op, ResidentBinaryOp::And | ResidentBinaryOp::Or) {
+                    let mut cols = Vec::new();
+                    collect_expr_columns(predicate, &mut cols);
+                    let i32_mask_compatible = !cols.is_empty()
+                        && cols.iter().all(|&col| {
+                            matches!(
+                                table.columns.get(col).map(|column| column.ty),
+                                Some(
+                                    SqlType::Uuid
+                                        | SqlType::Int4
+                                        | SqlType::Int2
+                                        | SqlType::Text
+                                        | SqlType::Bool
+                                )
+                            )
+                        });
+                    if i32_mask_compatible {
+                        let mut program = Vec::new();
+                        let mut needles: Vec<Vec<u8>> = Vec::new();
+                        compile_predicate_program(
+                            predicate, table, snapshot, &mut program, &mut needles,
+                        )?;
+                        return device_memory
+                            .run_expr_predicate_filter_with_text(
+                                &program,
+                                &needles,
+                                row_count,
+                                ResidentElemType::I32,
+                            )
+                            .map_err(|err| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                            });
                     }
                 }
             }

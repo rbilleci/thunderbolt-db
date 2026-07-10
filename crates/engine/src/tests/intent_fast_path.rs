@@ -3016,6 +3016,80 @@ fn gpu_uuid_range_and_in_dml_resolve_on_device() {
     }
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a NULLABLE-uuid RANGE DELETE resolves ON THE DEVICE —
+/// the nullable branch's new LOCAL I32-mask gate routes a uuid AND/OR through the mask VM (UuidCmpMask +
+/// per-leaf validity AND), so the NULL uuid row is excluded by 3VL (its 16-zero-byte placeholder would
+/// otherwise sort below every needle) and SURVIVES a wide range purge. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nullable_uuid_range_dml_resolves_on_device() {
+    let u = |n: u8| format!("'00000000-0000-0000-0000-0000000000{n:02}'");
+    let seed_uuids: Vec<(i64, String)> = vec![
+        (1, u(1)),
+        (2, u(2)),
+        (3, "NULL".to_string()),
+        (4, u(4)),
+    ];
+    let seed: Vec<(i64, &str)> = seed_uuids.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let Some(engine) = gpu_elided_pk_table_with_column("u UUID", &seed) else {
+        return;
+    };
+    // READ 3VL PIN (audit MEDIUM adopted — the decisive assertion): a zero-anchored range READ has NO
+    // recheck net (the mask-VM answer is authoritative), and the NULL uuid's device placeholder is 16
+    // ZERO BYTES, which MATCHES both bounds — ONLY `compile_uuid_leaf`'s per-leaf validity-AND excludes
+    // it. The NULL row (id=3) must be ABSENT from the read result.
+    {
+        let Command::Select(s) = parse_command(
+            "SELECT id FROM t WHERE u >= '00000000-0000-0000-0000-000000000000' \
+             AND u <= '00000000-0000-0000-0000-000000000004'",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let mut got: Vec<i32> = engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(SqlValue::Int4(n)) => *n,
+                other => panic!("unexpected id: {other:?}"),
+            })
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![1, 2, 4],
+            "the zero-anchored uuid range READ must EXCLUDE the NULL row (id=3) — the per-leaf \
+             validity-AND is the only net (the placeholder's zero bytes match both bounds)"
+        );
+    }
+
+    // Range starting at the ALL-ZERO uuid: <00> <= u <= <04>. Same 3VL through the DML path (which
+    // additionally rechecks). The NULL row (id=3) must SURVIVE, on-device + elided.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(
+            9,
+            "DELETE FROM t WHERE u >= '00000000-0000-0000-0000-000000000000' \
+             AND u <= '00000000-0000-0000-0000-000000000004'",
+        )
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a NULLABLE-uuid RANGE DELETE must RESOLVE on the device (the local I32-mask gate)"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a nullable-uuid range DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        gpu_ids_of_t(&engine),
+        vec![3],
+        "ids 1,2,4 deleted; the NULL-uuid row survives (3VL: NULL is UNKNOWN, never in range)"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a BOOL-EQUALITY DELETE on an ELIDED table resolves ON
 /// THE DEVICE — the DML builder lowers `flag = true` to a `BoolLiteral` the existing device
 /// `try_lower_bool_predicate` (1-bit bitmap → mask) evaluates; the hit materializes its bool on-device
