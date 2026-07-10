@@ -5,7 +5,11 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `a7a74935` (CPU-ENGINE RETIREMENT — SEVENTEEN merged wins: TEXT RANGES +
+**Updated:** 2026-07-10. **Base:** `main` @ `9184fab9` (CPU-ENGINE RETIREMENT — EIGHTEEN merged wins: UUID RANGES +
+uuid IN resolve ON-DEVICE via `ExprStep::UuidCmpMask` (the b128 memcmp kernel composed into the mask VM —
+`u>=A AND u<=B`, `u IN (A,B)`, mixed uuid+int4/text; uuid leaf dispatched BEFORE text since a uuid literal is a
+TextLiteral; `try_lower_uuid_predicate` AND/OR falls through Ok(None), blast radius audited clean; nullable-uuid
+AND still declines cleanly = a later slice) `9184fab9`; TEXT RANGES +
 nullable-text inequalities resolve ON-DEVICE via `ExprStep::TextCmpMask` (the text-compare kernel composed into the
 mask VM — `name>='b' AND name<'d'`, nullable 3VL validity-AND, mixed text+int4; Eq/Ne restructure audited
 behavior-identical; ABI verified vs the proven launcher) `a7a74935`; TEXT INEQUALITIES
