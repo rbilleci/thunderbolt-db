@@ -3131,6 +3131,39 @@ fn gpu_nullable_timestamp_range_dml_resolves_on_device() {
     );
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, coverage pin): a NULLABLE-numeric RANGE DELETE resolves ON THE
+/// DEVICE — `try_lower_nullable_numeric_predicate`'s AND/OR arm (validity-aware
+/// `compile_numeric_predicate_program` per side + MaskBinary at I128) already serves it; this pins
+/// that capability. The range INCLUDES 0.00 (the NULL placeholder mantissa is 0), so only the
+/// per-leaf validity AND keeps the NULL row alive — the load-bearing 3VL case. GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nullable_numeric_range_dml_resolves_on_device() {
+    let seed: &[(i64, &str)] = &[(1, "10.00"), (2, "50.00"), (3, "NULL"), (4, "90.00")];
+    let Some(engine) = gpu_elided_pk_table_with_column("amt NUMERIC(12,2)", seed) else {
+        return;
+    };
+    // The range spans 0.00 (the NULL placeholder mantissa) through 100.00 — every non-null row
+    // matches, and ONLY the validity AND excludes the NULL row on the device.
+    let before = engine.dml_device_resolve_hits();
+    engine
+        .execute_dml_concurrent(9, "DELETE FROM t WHERE amt >= 0.00 AND amt <= 100.00")
+        .unwrap();
+    assert!(
+        engine.dml_device_resolve_hits() > before,
+        "a NULLABLE-numeric RANGE DELETE must RESOLVE on the device"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a nullable-numeric range DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        gpu_ids_of_t(&engine),
+        vec![3],
+        "ids 1,2,4 deleted; the NULL-numeric row survives (3VL, placeholder-mantissa-0 in range)"
+    );
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a BOOL-EQUALITY DELETE on an ELIDED table resolves ON
 /// THE DEVICE — the DML builder lowers `flag = true` to a `BoolLiteral` the existing device
 /// `try_lower_bool_predicate` (1-bit bitmap → mask) evaluates; the hit materializes its bool on-device
