@@ -5,7 +5,10 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-09. **Base:** `main` @ `7e06610e` (CPU-ENGINE RETIREMENT — SIXTEEN merged wins: TEXT INEQUALITIES
+**Updated:** 2026-07-10. **Base:** `main` @ `a7a74935` (CPU-ENGINE RETIREMENT — SEVENTEEN merged wins: TEXT RANGES +
+nullable-text inequalities resolve ON-DEVICE via `ExprStep::TextCmpMask` (the text-compare kernel composed into the
+mask VM — `name>='b' AND name<'d'`, nullable 3VL validity-AND, mixed text+int4; Eq/Ne restructure audited
+behavior-identical; ABI verified vs the proven launcher) `a7a74935`; TEXT INEQUALITIES
 `<`/`>`/`<=`/`>=` resolve ON-DEVICE for BOTH DML + reads via a NEW hand-written PTX kernel
 `gpu_db_resident_text_compare_scalar_to_mask` (lexicographic unsigned byte compare, shorter-sorts-first,
 byte-identical to `str::cmp` == the recheck; opus-audited instruction-by-instruction; scalar_on_left + nullable
