@@ -1728,17 +1728,18 @@ impl Engine {
                 }
                 let filter_groups = bind_delete_filter_groups(table, delete)
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                let visibility = StorageVisibility {
+                let mut visibility = StorageVisibility {
                     read_txn_id: txn_id,
                 };
                 let prefix = relational_key_prefix(&delete.table);
-                let table_rows = self.read_state.mvcc.table_rows(&delete.table);
+                let mut table_rows = self.read_state.mvcc.table_rows(&delete.table);
                 // PHASE C slice 1b: resolve the deletions via the value index and run the
                 // inbound-FK check over the REMOVED provider values; ineligible -> the scan.
                 let self_referencing_fk = table
                     .foreign_keys
                     .iter()
                     .any(|foreign_key| foreign_key.referenced_table == table.name);
+                let was_elided = self.table_install_elided(&table.name);
                 let index_resolved =
                     if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
                         None
@@ -1752,16 +1753,18 @@ impl Engine {
                         )? {
                             Some(matches) => Some(matches),
                             None => {
-                                // A5 FLIP SI FIX: the decline may have REHYDRATED (fresh COW
-                                // generation) — re-pin or the fallback resolves stale images
-                                // (see engine_dml_prepare's ladder for the full account).
-                                // The SHADOWING (unlike the prepare ladders' outer-mut) is
-                                // sufficient here: these preflight ladders run only for
-                                // CONSTRAINED tables, which are non-elided BY ELIGIBILITY, so
-                                // no rehydration can actually fire — the re-pin is
-                                // defense-in-depth and the downstream validator's original
-                                // binding is provably fresh (audit N2).
-                                let table_rows = self.read_state.mvcc.table_rows(&table.name);
+                                // A5 FLIP SI FIX + ADR-006 (FK-referenced tables can now ELIDE —
+                                // the audit's deferred DELETE-arm twin of the UPDATE-arm fix): the
+                                // decline may have REHYDRATED mid-preflight. Re-pin the OUTER
+                                // binding (the else-scan below reads it — a stale handle would
+                                // miss elided-era rows and run the inbound-FK check over a
+                                // truncated row set) and raise the read boundary when the table
+                                // de-elided (the reconcile stamps at committed_seq).
+                                table_rows = self.read_state.mvcc.table_rows(&table.name);
+                                if was_elided && !self.table_install_elided(&table.name) {
+                                    visibility.read_txn_id =
+                                        visibility.read_txn_id.max(self.committed_seq());
+                                }
                                 Self::resolve_dml_matches_via_value_index(
                                     table,
                                     &table_rows,

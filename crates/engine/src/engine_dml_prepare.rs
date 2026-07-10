@@ -1590,6 +1590,11 @@ impl Engine {
             let parent_idx = relational_column_index(parent, &foreign_key.referenced_column)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             for row in new_images {
+                // PG 3VL (MATCH SIMPLE): a NULL fk value references nothing — no provider needed
+                // (and a structural NULL==NULL index hit on a parent NULL must not "provide").
+                if matches!(row[child_idx], SqlValue::Null) {
+                    continue;
+                }
                 if !self.visible_row_with_value(
                     parent,
                     visibility,
@@ -1625,6 +1630,11 @@ impl Engine {
                 let mut checked: BTreeSet<&SqlValue> = BTreeSet::new();
                 for old in removed_images {
                     let value = &old[parent_idx];
+                    // A removed NULL provider value cannot orphan anyone: a NULL fk passes
+                    // regardless (PG MATCH SIMPLE) and NULL never "provides".
+                    if matches!(value, SqlValue::Null) {
+                        continue;
+                    }
                     if !checked.insert(value) || new_provider_values.contains(value) {
                         continue;
                     }

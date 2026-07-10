@@ -1594,6 +1594,38 @@ fn check_constraint_null_is_satisfied_pg_semantics() {
         .contains("violated"));
 }
 
+/// PG 3VL (MATCH SIMPLE): a NULL foreign-key value SATISFIES the constraint — it references
+/// nothing, so no provider is required. Pins INSERT-NULL-fk passes, UPDATE-to-NULL-fk passes,
+/// and a real missing key still rejects (both validator families share the rule).
+#[test]
+fn foreign_key_null_is_satisfied_pg_semantics() {
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE p (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE c (id INT PRIMARY KEY, pid INT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "ALTER TABLE ONLY c ADD CONSTRAINT c_fk FOREIGN KEY (pid) REFERENCES p(id)",
+    )
+    .unwrap();
+    e.execute_text(4, "INSERT INTO p VALUES (1, 'a')").unwrap();
+    // NULL fk passes (references nothing).
+    e.execute_text(5, "INSERT INTO c (id, pid) VALUES (10, NULL)")
+        .unwrap();
+    // A real missing key still rejects.
+    assert!(e
+        .execute_text(6, "INSERT INTO c VALUES (11, 999)")
+        .unwrap_err()
+        .to_string()
+        .contains("foreign key"));
+    e.execute_text(7, "INSERT INTO c VALUES (12, 1)").unwrap();
+    // UPDATE a valid fk to NULL passes.
+    e.execute_text(8, "UPDATE c SET pid = NULL WHERE id = 12").unwrap();
+    // Deleting the now-unreferenced parent succeeds (NULL fks never pin a provider).
+    e.execute_text(9, "DELETE FROM p WHERE id = 1").unwrap();
+}
+
 #[test]
 fn relational_foreign_keys_enforce_and_replay_from_wal() {
     let e = Engine::new_local();

@@ -8640,16 +8640,43 @@ impl Engine {
             // control-plane literals / device-materialized update images), never the tuple store; and
             // ALTER ADD CHECK's existing-row validation scans via the elision-safe-by-construction
             // DDL row-validator (which rehydrates first). The ledger-#18 re-resolve coverage proof
-            // already treats CHECK as deterministic-on-values. FK stays blocked BOTH directions:
-            // FK validation scans OTHER tables' host rows (`visible_relational_rows` on children /
-            // parent lookups), which elision deliberately leaves stale — device FK probes are the
-            // follow-on that lifts it.
+            // already treats CHECK as deterministic-on-values.
+            //
+            // OUTBOUND FKs still block: a CHILD table's own writes need parent lookups on OTHER
+            // tables and its rows feed the scan validator's child side — the child-elision slice
+            // is the follow-on.
             && table.foreign_keys.is_empty()
-            && !catalog.relational_catalog.values().any(|other| {
-                other
-                    .foreign_keys
-                    .iter()
-                    .any(|fk| fk.referenced_table == table_name)
+            // INBOUND FKs no longer block (ADR-006 FK elision, parent side): a table REFERENCED by
+            // other tables may elide when EVERY inbound FK's referenced column (on THIS table) is a
+            // single-column i32-section PK/UNIQUE — exactly the shape `device_visible_row_with_value`
+            // answers ON THE DEVICE (`locate_resident_pk_via_shard_index_detailed` + the elided
+            // materialize), so a child INSERT's parent-exists probe and a parent DELETE's
+            // surviving-provider probe stay device-native (a decline rehydrates — the existing
+            // safety net, never a wrong answer). The unique-index requirement means `unique_ok`
+            // above already demanded the constrained-elision device flags for such a table.
+            // A parent DELETE/UPDATE's own inbound-FK validation reads the CHILDREN (non-elided —
+            // outbound FKs still block) via the host, and its own rows are the host-held candidates.
+            && catalog.relational_catalog.values().all(|other| {
+                other.foreign_keys.iter().all(|fk| {
+                    fk.referenced_table != table_name
+                        || table.indexes.iter().any(|index| {
+                            index.unique
+                                && index.key_columns.len() == 1
+                                && index.column == fk.referenced_column
+                                && table
+                                    .columns
+                                    .iter()
+                                    .find(|c| c.name == fk.referenced_column)
+                                    .is_some_and(|c| {
+                                        matches!(
+                                            c.ty,
+                                            gpu_db_sql::SqlType::Int4
+                                                | gpu_db_sql::SqlType::Date
+                                                | gpu_db_sql::SqlType::Int2
+                                        )
+                                    })
+                        })
+                })
             })
     }
 

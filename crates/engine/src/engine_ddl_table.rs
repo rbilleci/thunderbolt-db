@@ -768,6 +768,12 @@ impl Engine {
             .map(|row| row[parent_column_idx].clone())
             .collect::<BTreeSet<_>>();
         for row in child_rows {
+            // PG 3VL (MATCH SIMPLE): a NULL foreign-key value SATISFIES the constraint — it
+            // references nothing, so no provider is required (and a NULL in the parent's unique
+            // column is never a provider). Same rule as the CHECK-on-NULL fix.
+            if matches!(row[child_column_idx], SqlValue::Null) {
+                continue;
+            }
             if !parent_values.contains(&row[child_column_idx]) {
                 return Err(EngineError::ApplyFailed(format!(
                     "insert or update on table \"{}\" violates foreign key constraint \"{}\"",

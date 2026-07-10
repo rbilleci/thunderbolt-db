@@ -3339,6 +3339,109 @@ fn gpu_check_constrained_table_elides() {
         .unwrap();
 }
 
+/// CPU-ENGINE RETIREMENT (ADR-006, structural — FK elision, parent side): a table REFERENCED by
+/// foreign keys now ELIDES when its referenced column is an i32-section single-column PK — the FK
+/// validators' parent-exists / surviving-provider lookups run through `visible_row_with_value`, whose
+/// device arm probes the elided parent's PK index + materializes visibility ON THE DEVICE. Pins the
+/// lifecycle: the referenced parent elides; a child INSERT referencing an ELIDED-ERA parent key (a
+/// device-only row) SUCCEEDS (the device probe must SEE it — the load-bearing pin); a child INSERT
+/// referencing a MISSING key is REJECTED and nothing durable/wedging results (later statements work);
+/// a parent DELETE of a referenced key is REJECTED; a parent DELETE of an unreferenced key succeeds.
+/// GPU-gated.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_fk_referenced_parent_elides() {
+    let mut engine = Engine::new_local();
+    engine
+        .execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    engine
+        .execute_text(2, "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT)")
+        .unwrap();
+    engine
+        .execute_text(
+            20,
+            "ALTER TABLE ONLY orders ADD CONSTRAINT orders_fk FOREIGN KEY (customer_id) \
+             REFERENCES customers(id)",
+        )
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine.set_dml_device_resolve_enabled(true);
+    engine.set_resident_delete_tombstone_enabled(true);
+    engine.set_resident_update_tombstone_enabled(true);
+
+    engine
+        .execute_dml_concurrent(3, "INSERT INTO customers VALUES (1, 'ada')")
+        .unwrap();
+    let snap = engine.populate_relational_residency_snapshot("customers");
+    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+        return; // no usable GPU
+    }
+    engine
+        .execute_dml_concurrent(4, "INSERT INTO customers VALUES (2, 'bob')")
+        .unwrap();
+    assert!(
+        engine.table_install_elided("customers"),
+        "an FK-REFERENCED parent (i32 PK) must now ELIDE"
+    );
+    // ELIDED-ERA parent key: device-only (the stale host store cannot see it).
+    engine
+        .execute_dml_concurrent(5, "INSERT INTO customers VALUES (3, 'eve')")
+        .unwrap();
+    assert!(engine.table_install_elided("customers"), "still elided after the device-only insert");
+
+    // THE LOAD-BEARING PIN: a child INSERT referencing the ELIDED-ERA key (3) must SUCCEED — the
+    // parent-exists probe must SEE the device-only row (a stale/vacuous answer would reject it).
+    engine
+        .execute_text(6, "INSERT INTO orders VALUES (100, 3)")
+        .unwrap();
+    assert!(
+        engine.table_install_elided("customers"),
+        "the parent probe must run ON-DEVICE (the parent stays elided; a de-elide means the \
+         validator fell back to rehydration)"
+    );
+    // A MISSING parent key is rejected — and nothing durable/wedging results.
+    let err = engine
+        .execute_text(7, "INSERT INTO orders VALUES (101, 999)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("foreign key"), "missing parent must reject, got: {err}");
+    engine
+        .execute_text(8, "INSERT INTO orders VALUES (102, 1)")
+        .unwrap(); // later statements still work (no wedge)
+
+    // Parent DELETE of a REFERENCED key (3, referenced by order 100) is REJECTED.
+    let err = engine
+        .execute_text(9, "DELETE FROM customers WHERE id = 3")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("foreign key"), "deleting a referenced parent must reject, got: {err}");
+    // Parent DELETE of an UNREFERENCED key (2) succeeds.
+    engine
+        .execute_text(10, "DELETE FROM customers WHERE id = 2")
+        .unwrap();
+    let Command::Select(s) = parse_command("SELECT id FROM customers").unwrap() else {
+        unreachable!()
+    };
+    let mut ids: Vec<i32> = engine
+        .execute_relational_select(&s)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match r.first() {
+            Some(SqlValue::Int4(n)) => *n,
+            other => panic!("unexpected id: {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 3], "customer 2 deleted; 1 and 3 (referenced) remain");
+}
+
 /// CPU-ENGINE RETIREMENT (ADR-006, audit HIGH regression pin): a MID-PREFLIGHT REHYDRATE must not
 /// bypass CHECK. On an ELIDED CHECK table, an `execute_text` UPDATE whose WHERE the device resolve
 /// DECLINES (a mixed int8+text AND — the decline REHYDRATES/de-elides mid-preflight) used to fall back
