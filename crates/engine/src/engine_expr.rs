@@ -200,7 +200,9 @@ fn having_op_to_resident(op: crate::SelectFilterOp) -> ResidentBinaryOp {
 /// `&Select`->general bridge. `GroupedCount { column }` groups by `column` with a COUNT(*) (no value
 /// column); the others carry `(group_column, value_column)`. Returns `None` for a projection that is
 /// not a legacy grouped form (already `GroupedAggregates`, or not grouped) -- the caller leaves it as-is.
-fn grouped_projection_to_aggregates(projection: &SelectProjection) -> Option<SelectProjection> {
+pub(crate) fn grouped_projection_to_aggregates(
+    projection: &SelectProjection,
+) -> Option<SelectProjection> {
     let (group_column, aggregate) = match projection {
         SelectProjection::GroupedCount { column } => (
             column.clone(),

@@ -35,9 +35,13 @@
 
 use super::*;
 
-use crate::engine_expr::{resident_predicate_from_bound_filters, ResidentExecSource, ResidentExpr};
+use crate::engine_expr::{
+    grouped_projection_to_aggregates, resident_predicate_from_bound_filters, ResidentExecSource,
+    ResidentExpr,
+};
 use crate::rel_exec_helpers::{
-    bind_relational_select, compare_sql_values, decode_relational_row, relational_key_prefix,
+    bind_relational_select, catalog_relation_table, compare_sql_values, decode_relational_row,
+    relational_key_prefix,
 };
 use std::sync::atomic::Ordering;
 
@@ -219,25 +223,95 @@ fn is_overflow_error(err: &ExecuteError) -> bool {
     message.contains("overflow") || message.contains("out of range")
 }
 
-/// The streaming operator class serving a SELECT: a scalar reduction fold (S-E.1) or a filter/project
-/// concat fold (S-E.2).
+/// The streaming operator class serving a SELECT: a scalar reduction fold (S-E.1), a filter/project
+/// concat fold (S-E.2), or a grouped / distinct two-level fold (S-E.3).
 enum StreamShape {
     Reduction(StreamAgg),
     Projection,
+    /// `GROUP BY g` with Count/Sum/Min/Max aggregates — the normalized [`SelectProjection::
+    /// GroupedAggregates`] form. `distinct_key_only` = the shape is a synthesized `SELECT DISTINCT col`
+    /// (a GROUP BY col + COUNT(*) whose count column is dropped from the result, exactly the distinct
+    /// bridge's synthesis).
+    Grouped {
+        normalized: SelectProjection,
+        distinct_key_only: bool,
+    },
 }
 
-/// Classify a SELECT as a streamable shape, or `None` for the non-foldable classes (GROUP BY / DISTINCT /
-/// ORDER BY / HAVING — S-E.3/S-E.4 follow-ons). A SCALAR reduction (COUNT(*)/SUM/MIN/MAX, no LIMIT/OFFSET —
-/// PG applies LIMIT to the one-row aggregate result, a shape not worth streaming) folds by combine; a plain
-/// `All`/`Columns` projection folds by CONCAT, with LIMIT/OFFSET as cross-chunk windowing (LIMIT without
-/// ORDER BY is any-N-rows per SQL, so early-exit + scan-order windowing is a valid instance).
+/// Classify a SELECT as a streamable shape, or `None` for the non-foldable classes (ORDER BY — S-E.4;
+/// HAVING; grouped AVG / COUNT(DISTINCT) — not associatively decomposable from per-chunk partials). A
+/// SCALAR reduction (COUNT(*)/SUM/MIN/MAX, no LIMIT/OFFSET — PG applies LIMIT to the one-row aggregate
+/// result, a shape not worth streaming) folds by combine; a plain `All`/`Columns` projection folds by
+/// CONCAT, with LIMIT/OFFSET as cross-chunk windowing (LIMIT without ORDER BY is any-N-rows per SQL, so
+/// early-exit + scan-order windowing is a valid instance); GROUP BY / DISTINCT fold TWO-LEVEL (per-chunk
+/// device partials -> concat -> one final device merge pass).
 fn streaming_shape(select: &Select) -> Option<StreamShape> {
-    if select.distinct
-        || select.group_by.is_some()
-        || !select.order_by.is_empty()
-        || !select.having_groups.is_empty()
-    {
+    if !select.order_by.is_empty() || !select.having_groups.is_empty() {
         return None;
+    }
+    // S-E.3 DISTINCT: single-column `SELECT DISTINCT col` == `SELECT col, COUNT(*) GROUP BY col` with
+    // the count dropped (the distinct bridge's own synthesis) — so it rides the grouped fold.
+    if select.distinct {
+        if select.group_by.is_some() || select.limit.is_some() || select.offset.is_some() {
+            return None;
+        }
+        let SelectProjection::Columns(columns) = &select.projection else {
+            return None;
+        };
+        let [column] = columns.as_slice() else {
+            return None;
+        };
+        return Some(StreamShape::Grouped {
+            normalized: SelectProjection::GroupedAggregates {
+                group_column: column.clone(),
+                aggregates: vec![GroupedAggregate {
+                    kind: GroupedAggKind::Count,
+                    value_column: None,
+                }],
+            },
+            distinct_key_only: true,
+        });
+    }
+    // S-E.3 GROUP BY: normalize the legacy 1-aggregate forms to GroupedAggregates (as the grouped
+    // bridge does) and accept only associatively-decomposable kinds: COUNT merges as SUM(count),
+    // SUM as SUM(sum), MIN as MIN(min), MAX as MAX(max). AVG needs the (sum,count) pair and
+    // COUNT(DISTINCT) is not decomposable from per-chunk distinct counts — both decline to CPU.
+    if let Some(group_column) = &select.group_by {
+        if select.limit.is_some() || select.offset.is_some() {
+            return None;
+        }
+        let normalized = match grouped_projection_to_aggregates(&select.projection) {
+            Some(normalized) => normalized,
+            None => match &select.projection {
+                SelectProjection::GroupedAggregates { .. } => select.projection.clone(),
+                _ => return None,
+            },
+        };
+        let SelectProjection::GroupedAggregates {
+            group_column: normalized_key,
+            aggregates,
+        } = &normalized
+        else {
+            return None;
+        };
+        if normalized_key != group_column {
+            return None;
+        }
+        if !aggregates.iter().all(|aggregate| {
+            matches!(
+                aggregate.kind,
+                GroupedAggKind::Count
+                    | GroupedAggKind::Sum
+                    | GroupedAggKind::Min
+                    | GroupedAggKind::Max
+            )
+        }) {
+            return None;
+        }
+        return Some(StreamShape::Grouped {
+            normalized,
+            distinct_key_only: false,
+        });
     }
     match &select.projection {
         SelectProjection::All | SelectProjection::Columns(_) => Some(StreamShape::Projection),
@@ -297,6 +371,20 @@ impl Engine {
             StreamShape::Projection => self.run_streaming_projection_fold(
                 select,
                 &table,
+                &bound,
+                predicate.as_ref(),
+                copin_s,
+                gpu_id,
+                budget,
+            ),
+            StreamShape::Grouped {
+                normalized,
+                distinct_key_only,
+            } => self.run_streaming_grouped_fold(
+                select,
+                &table,
+                normalized,
+                distinct_key_only,
                 &bound,
                 predicate.as_ref(),
                 copin_s,
@@ -610,6 +698,444 @@ impl Engine {
             *take -= kept;
         }
         rows_out.append(&mut rows);
+        ChunkOutcome::Ok
+    }
+
+    /// STRATA S-E.3 — the GROUP BY / DISTINCT two-level fold. LEVEL 1: each byte-bounded chunk runs the
+    /// (normalized) grouped aggregate ON THE DEVICE, producing partial group rows `(key, agg_1..agg_N)`.
+    /// LEVEL 2: the partials CONCAT (control-plane, the S-E.2 combine) into an accumulator that is itself
+    /// a synthesized relation, and ONE final device grouped pass MERGES them — COUNT folds as SUM(count),
+    /// SUM as SUM(sum), MIN as MIN(min), MAX as MAX(max) — so the host never groups or aggregates; it only
+    /// stages partials and re-types merged cells (the same control-plane narrowing class as the scalar
+    /// fold's finalize). If the accumulator outgrows the chunk budget mid-scan it is COMPACTED by the same
+    /// device merge (the "persistent accumulator" realized as periodic re-merge); if even the compacted
+    /// (true-cardinality) partials exceed the budget, the query defers to the CPU path — honest coverage.
+    /// DISTINCT rides this fold via the distinct bridge's own synthesis (GROUP BY col + COUNT dropped).
+    #[allow(clippy::too_many_arguments)]
+    fn run_streaming_grouped_fold(
+        &self,
+        select: &Select,
+        table: &RelationalTable,
+        normalized: SelectProjection,
+        distinct_key_only: bool,
+        bound: &BoundRelationalSelect,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+        gpu_id: u16,
+        budget: u64,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let chunk_target_bytes = (budget / 2).max(1);
+        let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
+        let SelectProjection::GroupedAggregates {
+            group_column,
+            aggregates,
+        } = &normalized
+        else {
+            return self.execute_relational_select_cpu_pinned(select);
+        };
+
+        // The per-chunk grouped select: the normalized projection over the ORIGINAL table (WHERE rides
+        // the predicate; ORDER BY/LIMIT/HAVING are absent by the classifier).
+        let mut grouped_select = select.clone();
+        grouped_select.distinct = false;
+        grouped_select.group_by = Some(group_column.clone());
+        grouped_select.projection = normalized.clone();
+        let Ok(grouped_bound) = bind_relational_select(table, &grouped_select) else {
+            return self.execute_relational_select_cpu_pinned(select);
+        };
+
+        // The synthesized PARTIALS relation: `(key, __p0..__pN)` with each partial column typed by its
+        // aggregate — Count -> Int8; Sum(int2/int4) -> Int8, Sum(int8) -> Numeric(38,0), Sum(numeric) ->
+        // the column's numeric type; Min/Max -> the value column's own type. An unsupported combination
+        // (e.g. SUM over text) declines to the CPU path, which raises the proper SQL error.
+        let key_type = match table
+            .columns
+            .iter()
+            .find(|column| &column.name == group_column)
+        {
+            Some(column) => column.ty,
+            None => return self.execute_relational_select_cpu_pinned(select),
+        };
+        let mut partial_columns: Vec<(String, SqlType)> =
+            vec![(group_column.clone(), key_type)];
+        // Guard the reserved partial names (a user column literally named `__pN` would collide).
+        if group_column.starts_with("__p") {
+            return self.execute_relational_select_cpu_pinned(select);
+        }
+        for (i, aggregate) in aggregates.iter().enumerate() {
+            let partial_type = match aggregate.kind {
+                GroupedAggKind::Count => Some(SqlType::Int8),
+                GroupedAggKind::Sum | GroupedAggKind::Min | GroupedAggKind::Max => {
+                    let value_type = aggregate.value_column.as_ref().and_then(|name| {
+                        table
+                            .columns
+                            .iter()
+                            .find(|column| &column.name == name)
+                            .map(|column| column.ty)
+                    });
+                    match (aggregate.kind, value_type) {
+                        (GroupedAggKind::Sum, Some(SqlType::Int2 | SqlType::Int4)) => {
+                            Some(SqlType::Int8)
+                        }
+                        (GroupedAggKind::Sum, Some(SqlType::Int8)) => Some(SqlType::Numeric {
+                            precision: 38,
+                            scale: 0,
+                        }),
+                        (GroupedAggKind::Sum, Some(numeric @ SqlType::Numeric { .. })) => {
+                            Some(numeric)
+                        }
+                        (GroupedAggKind::Min | GroupedAggKind::Max, Some(value_type)) => {
+                            Some(value_type)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match partial_type {
+                Some(ty) => partial_columns.push((format!("__p{i}"), ty)),
+                None => return self.execute_relational_select_cpu_pinned(select),
+            }
+        }
+        let partial_types: Vec<SqlType> = partial_columns.iter().map(|(_, ty)| *ty).collect();
+        let partial_column_refs: Vec<(&str, SqlType)> = partial_columns
+            .iter()
+            .map(|(name, ty)| (name.as_str(), *ty))
+            .collect();
+        let partials_table =
+            catalog_relation_table(&table.schema, "__stream_partials", &partial_column_refs);
+
+        // The MERGE select over the partials relation: GROUP BY key with the fold aggregate per column.
+        let merge_select = Select {
+            table: partials_table.name.clone(),
+            distinct: false,
+            projection: SelectProjection::GroupedAggregates {
+                group_column: group_column.clone(),
+                aggregates: aggregates
+                    .iter()
+                    .enumerate()
+                    .map(|(i, aggregate)| GroupedAggregate {
+                        kind: match aggregate.kind {
+                            // COUNT partials fold by SUMMING; SUM partials by SUMMING.
+                            GroupedAggKind::Count | GroupedAggKind::Sum => GroupedAggKind::Sum,
+                            other => other,
+                        },
+                        value_column: Some(format!("__p{i}")),
+                    })
+                    .collect(),
+            },
+            group_by: Some(group_column.clone()),
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let Ok(merge_bound) = bind_relational_select(&partials_table, &merge_select) else {
+            return self.execute_relational_select_cpu_pinned(select);
+        };
+        // Which merged columns re-type back to Int8 (the merge SUM widens Int8 partials to Numeric(_,0);
+        // COUNT and SUM-over-int2/int4 are Int8-typed partials — their merged cells narrow back).
+        let narrow_to_int8: Vec<bool> = aggregates
+            .iter()
+            .zip(partial_types.iter().skip(1))
+            .map(|(aggregate, partial_ty)| {
+                matches!(
+                    aggregate.kind,
+                    GroupedAggKind::Count | GroupedAggKind::Sum
+                ) && matches!(partial_ty, SqlType::Int8)
+            })
+            .collect();
+
+        let mut partials_acc: Vec<Vec<SqlValue>> = Vec::new();
+        let mut partials_bytes: u64 = 0;
+        let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
+        let mut chunk_bytes: u64 = 0;
+        let mut chunks_run: u64 = 0;
+
+        let prefix = relational_key_prefix(&select.table);
+        let visibility = StorageVisibility {
+            read_txn_id: copin_s,
+        };
+        {
+            let table_rows = self.read_state.mvcc.table_rows(&select.table);
+            let mut cursor = table_rows.store().seq_scan_open(visibility)?;
+            while let Some(tuple) = cursor.next() {
+                if !tuple.key.starts_with(&prefix) {
+                    continue;
+                }
+                let decoded = decode_relational_row(&tuple.value, &table.columns)?;
+                chunk_bytes =
+                    chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+                chunk_rows.push(decoded);
+                if chunk_bytes >= chunk_target_bytes {
+                    match self.grouped_streaming_chunk(
+                        &grouped_select,
+                        table,
+                        &grouped_bound,
+                        predicate,
+                        copin_s,
+                        group_column,
+                        &chunk_rows,
+                        &partial_types,
+                        &mut partials_acc,
+                        &mut partials_bytes,
+                    ) {
+                        ChunkOutcome::Ok => {}
+                        ChunkOutcome::Defer => {
+                            return self.execute_relational_select_cpu_pinned(select)
+                        }
+                        ChunkOutcome::Hard(err) => return Err(err),
+                    }
+                    chunks_run += 1;
+                    chunk_rows.clear();
+                    chunk_bytes = 0;
+                    // COMPACTION: the accumulator outgrew the chunk budget — device-merge it down to
+                    // one row per true group. If even the compacted form exceeds the budget, the group
+                    // cardinality itself is over-budget: defer (S-E.4+ may spill; v1 is honest).
+                    if partials_bytes >= chunk_target_bytes {
+                        match self.merge_streaming_partials(
+                            &merge_select,
+                            &partials_table,
+                            &merge_bound,
+                            copin_s,
+                            group_column,
+                            &narrow_to_int8,
+                            &mut partials_acc,
+                            &mut partials_bytes,
+                            &partial_types,
+                            budget,
+                        ) {
+                            ChunkOutcome::Ok => {}
+                            ChunkOutcome::Defer => {
+                                return self.execute_relational_select_cpu_pinned(select)
+                            }
+                            ChunkOutcome::Hard(err) => return Err(err),
+                        }
+                        if partials_bytes >= chunk_target_bytes {
+                            return self.execute_relational_select_cpu_pinned(select);
+                        }
+                    }
+                }
+            }
+        }
+        if !chunk_rows.is_empty() {
+            match self.grouped_streaming_chunk(
+                &grouped_select,
+                table,
+                &grouped_bound,
+                predicate,
+                copin_s,
+                group_column,
+                &chunk_rows,
+                &partial_types,
+                &mut partials_acc,
+                &mut partials_bytes,
+            ) {
+                ChunkOutcome::Ok => {}
+                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
+                ChunkOutcome::Hard(err) => return Err(err),
+            }
+            chunks_run += 1;
+        }
+
+        // FINAL MERGE: fold duplicate keys across chunks into the one true group table. An empty
+        // accumulator (empty table / all rows filtered) is PG's empty grouped result: ZERO rows.
+        if !partials_acc.is_empty() {
+            match self.merge_streaming_partials(
+                &merge_select,
+                &partials_table,
+                &merge_bound,
+                copin_s,
+                group_column,
+                &narrow_to_int8,
+                &mut partials_acc,
+                &mut partials_bytes,
+                &partial_types,
+                budget,
+            ) {
+                ChunkOutcome::Ok => {}
+                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
+                ChunkOutcome::Hard(err) => return Err(err),
+            }
+        }
+        let mut rows_out = std::mem::take(&mut partials_acc);
+        // DISTINCT: drop the synthesized COUNT column — the bare distinct keys.
+        if distinct_key_only {
+            for row in &mut rows_out {
+                row.truncate(1);
+            }
+        }
+
+        self.read_state
+            .residency
+            .streaming_fold_hits
+            .fetch_add(1, Ordering::Relaxed);
+        self.read_state
+            .residency
+            .streaming_fold_chunks
+            .fetch_add(chunks_run, Ordering::Relaxed);
+
+        // Columns: DISTINCT keeps the outer (single-column) binding; grouped uses the NORMALIZED
+        // binding (byte-identical to the grouped bridge, which also binds the normalized form).
+        let columns = if distinct_key_only {
+            bound.selected_columns.clone()
+        } else {
+            grouped_bound.selected_columns.clone()
+        };
+        Ok(RelationalSelectResult {
+            columns: Arc::new(columns),
+            rows: rows_out.into(),
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            fallback_reason: None,
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
+        })
+    }
+
+    /// LEVEL 1 of the grouped fold: upload one chunk, run the grouped aggregate ON THE DEVICE, and append
+    /// its partial group rows to the accumulator (concat — the control-plane combine).
+    #[allow(clippy::too_many_arguments)]
+    fn grouped_streaming_chunk(
+        &self,
+        grouped_select: &Select,
+        table: &RelationalTable,
+        grouped_bound: &BoundRelationalSelect,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+        group_column: &str,
+        chunk_rows: &[Vec<SqlValue>],
+        partial_types: &[SqlType],
+        partials_acc: &mut Vec<Vec<SqlValue>>,
+        partials_bytes: &mut u64,
+    ) -> ChunkOutcome {
+        let (descriptor, device_memory) =
+            match self.build_transient_relation_residency(table, chunk_rows) {
+                Ok(pair) => pair,
+                Err(_) => return ChunkOutcome::Defer,
+            };
+        self.read_state
+            .residency
+            .streaming_fold_peak_chunk_bytes
+            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
+        let src = ResidentExecSource {
+            descriptor: Arc::new(descriptor),
+            device_memory: Arc::new(device_memory),
+            row_count: chunk_rows.len() as u64,
+        };
+        let group_key_columns = [group_column.to_string()];
+        let result = match self.execute_resident_expr_select_with_binding(
+            grouped_select,
+            table,
+            Some(&src),
+            grouped_bound.clone(),
+            copin_s,
+            predicate,
+            None,
+            &[],
+            &[],
+            None,
+            &group_key_columns,
+        ) {
+            Ok(result) => result,
+            Err(err) if is_overflow_error(&err) => return ChunkOutcome::Hard(err),
+            Err(_) => return ChunkOutcome::Defer,
+        };
+        for row in result.rows.into_boxed() {
+            *partials_bytes =
+                partials_bytes.saturating_add(chunk_row_device_bytes(&row, partial_types));
+            partials_acc.push(row);
+        }
+        ChunkOutcome::Ok
+    }
+
+    /// LEVEL 2 of the grouped fold: upload the accumulated partials as a transient relation and run ONE
+    /// device grouped pass that MERGES duplicate keys (SUM/SUM/MIN/MAX per column), then re-type the
+    /// merged cells back to the canonical partial types (the merge SUM widens Int8 partials to
+    /// Numeric(_,0); narrowing back is the same control-plane cast as the scalar fold's finalize — a
+    /// narrow overflow defers, matching PG's own running-accumulation error surface). Replaces the
+    /// accumulator in place. Serves BOTH the mid-scan compaction and the final merge.
+    ///
+    /// BUDGET GATE (S-E.3 audit Finding 1): a partial row can be WIDER than its source rows (a 4-byte
+    /// key + an 8-byte count = 12B partials from 4B rows), so a near-unique-key chunk can inflate the
+    /// accumulator past the budget before the over-cardinality defer triggers. The merge must never be
+    /// the thing that busts the budget it exists to honor — defer WITHOUT uploading when the accumulator
+    /// exceeds it (the CPU path serves the query; the peak-bytes gauge invariant stays <= budget).
+    #[allow(clippy::too_many_arguments)]
+    fn merge_streaming_partials(
+        &self,
+        merge_select: &Select,
+        partials_table: &RelationalTable,
+        merge_bound: &BoundRelationalSelect,
+        copin_s: Index,
+        group_column: &str,
+        narrow_to_int8: &[bool],
+        partials_acc: &mut Vec<Vec<SqlValue>>,
+        partials_bytes: &mut u64,
+        partial_types: &[SqlType],
+        budget: u64,
+    ) -> ChunkOutcome {
+        if *partials_bytes > budget {
+            return ChunkOutcome::Defer;
+        }
+        let (descriptor, device_memory) =
+            match self.build_transient_relation_residency(partials_table, partials_acc) {
+                Ok(pair) => pair,
+                Err(_) => return ChunkOutcome::Defer,
+            };
+        self.read_state
+            .residency
+            .streaming_fold_peak_chunk_bytes
+            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
+        let src = ResidentExecSource {
+            descriptor: Arc::new(descriptor),
+            device_memory: Arc::new(device_memory),
+            row_count: partials_acc.len() as u64,
+        };
+        let group_key_columns = [group_column.to_string()];
+        let result = match self.execute_resident_expr_select_with_binding(
+            merge_select,
+            partials_table,
+            Some(&src),
+            merge_bound.clone(),
+            copin_s,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            &group_key_columns,
+        ) {
+            Ok(result) => result,
+            Err(err) if is_overflow_error(&err) => return ChunkOutcome::Hard(err),
+            Err(_) => return ChunkOutcome::Defer,
+        };
+        let mut merged: Vec<Vec<SqlValue>> = Vec::new();
+        let mut merged_bytes: u64 = 0;
+        for mut row in result.rows.into_boxed() {
+            // Re-type: merged column i+1 narrows Numeric(_,0) -> Int8 where the partial is Int8-typed.
+            for (agg_idx, narrow) in narrow_to_int8.iter().enumerate() {
+                if !narrow {
+                    continue;
+                }
+                let cell = &mut row[agg_idx + 1];
+                match cell {
+                    SqlValue::Numeric(d) if d.scale == 0 => match i64::try_from(d.mantissa) {
+                        Ok(narrowed) => *cell = SqlValue::Int8(narrowed),
+                        Err(_) => return ChunkOutcome::Defer,
+                    },
+                    SqlValue::Null | SqlValue::Int8(_) => {}
+                    _ => return ChunkOutcome::Defer,
+                }
+            }
+            merged_bytes =
+                merged_bytes.saturating_add(chunk_row_device_bytes(&row, partial_types));
+            merged.push(row);
+        }
+        *partials_acc = merged;
+        *partials_bytes = merged_bytes;
         ChunkOutcome::Ok
     }
 
