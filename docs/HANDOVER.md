@@ -5,7 +5,14 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `034c5429` (CPU-ENGINE RETIREMENT — TWENTY-NINE merged wins:
+**Updated:** 2026-07-10. **Base:** `main` @ `7432ebf6` (CPU-ENGINE RETIREMENT — THIRTY merged wins, **THE
+PREDICATE-EDGES ARC IS COMPLETE**: every scalar type × operator × operand-shape (literal, col-vs-col, mixed-width
+group) × nullability now resolves ON-DEVICE for DML + reads, alone or in AND/OR; the remaining CPU-engine-deletion
+work is the ADR-012 ARCHITECTURAL program (STRATA streaming executor, JOIN grammar, views, window functions):
+TEXT/UUID COL-VS-COL on-device (NEW per-row two-column text byte-compare PTX kernel, audit-verified line-for-line;
+uuid composes the existing b128 columns kernel as `UuidCmpColumnsMask`; BOTH-validity 3VL sabotage-proven; **PTX
+LESSON: comments must be PURE ASCII — em-dashes 218 the whole module on the Blackwell driver JIT while ptxas
+passes**, memory `ptx-ascii-comments-jit`) `7432ebf6`;
 BOOL INEQUALITIES on-device via constant-fold (PG `false < true`: `<`/`<=`/`>`/`>=` vs a bool literal fold to
 equality masks or ConstMask verdicts, NO new kernel; the const-TRUE shapes carry the validity AND = the ONLY 3VL
 net, sabotage-proven; literal-on-left flips the op; both `compile_bool_leaf` + the non-null peephole; DML builder
