@@ -5,11 +5,21 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `570c7fa4` (STRATA STREAMING EXECUTOR — S-E.1 out-of-core scalar
-reductions SHIPPED, the ADR-012 architectural program's first slice; user chose this track at the
-predicate-edges boundary). **>>> ACTIVE TRACK: STRATA STREAMING EXECUTOR (ADR-012 / PLAN §2 S-E) <<<** — over-VRAM
-reads run ON THE DEVICE by folding over bounded chunks (admit chunk → reduce on device → combine partial → evict →
-next), never all shards resident. **S-E.1 DONE (`570c7fa4`):** a `COUNT(*)/SUM/MIN/MAX` over a table larger than the
+**Updated:** 2026-07-10. **Base:** `main` @ `d26d41a7` (STRATA STREAMING EXECUTOR — S-E.1 + S-E.2 SHIPPED; user
+chose this track at the predicate-edges boundary). **>>> ACTIVE TRACK: STRATA STREAMING EXECUTOR (ADR-012 /
+PLAN §2 S-E) <<<** — over-VRAM reads run ON THE DEVICE by folding over bounded chunks (admit chunk → reduce on
+device → combine partial → evict → next), never all shards resident.
+**S-E.2 DONE (`d26d41a7`):** a plain `All`/`Columns` PROJECTION over an over-budget table streams — per chunk the
+WHERE + column gather run on the device (the same transient-source fold), survivors CONCAT (the §13 projection
+combine); LIMIT/OFFSET = cross-chunk windowing of the survivor stream (device gather bounded to skip+take per
+chunk; the executor's own control-plane-windowing precedent) and a satisfied LIMIT STOPS THE SCAN EARLY (tail never
+staged). Ordering deterministic (both paths iterate ascending TupleId) so exact-order CPU differentials are sound.
+Entry generalized to `try_streaming_select` (StreamShape: Reduction | Projection). Opus audit MERGE-SAFE, zero
+C/H/M findings (windowing hand-traced; per-chunk re-bind proven single-filter; classifier misroute-free; charter
+defensible; LOW WHERE-arith overflow parity unreachable — the lowered predicate grammar is col-op-literal only).
+Gates: lib 501/501, streaming 6/6, sweep 425/427 (same 2 pre-existing), clippy clean, sabotage-verified
+(early-exit + offset drain).
+**S-E.1 DONE (`570c7fa4`):** a `COUNT(*)/SUM/MIN/MAX` over a table larger than the
 configured per-GPU residency budget now streams on the device instead of de-eliding to the CPU host engine — new
 `engine_streaming_exec.rs` folds the MVCC-visible rows into byte-bounded chunks, each uploaded as a transient
 `build_transient_relation_residency` source + reduced via the existing `execute_resident_expr_select_with_binding`
@@ -21,8 +31,7 @@ reach); a genuine overflow surfaces. Opus audit CLEAN on MVCC/combine/gate/chart
 NULL/empty-text as 0 bytes → whole-table upload for null-heavy tables) fixed via device-byte accounting +
 regression-gated; LOW (per-chunk overflow now surfaces uniformly) adopted. Gates: engine lib 501/501, GPU streaming
 4/4, clippy clean, FULL GPU sweep 422/424 (the 2 fails = `capacity_payload_tests::{a1_device_row_identity,
-a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.2 streaming
-filter/project + LIMIT, S-E.3 GROUP BY/DISTINCT (persistent device accumulator), S-E.4 ORDER BY (k-way run merge),
+a4c_device_gather}`, CONFIRMED PRE-EXISTING on clean origin/main, unrelated). REMAINING slices: S-E.3 GROUP BY/DISTINCT (persistent device accumulator), S-E.4 ORDER BY (k-way run merge),
 S-E.5 copy/compute overlap (copy stream + prefetch/evict API), S-E.6 NVMe cold tier. Memory
 `strata-streaming-executor`. AVG deferred (needs the (sum,count) pair).
 
