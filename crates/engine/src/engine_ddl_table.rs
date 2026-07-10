@@ -693,6 +693,14 @@ impl Engine {
             let column_idx = relational_column_index(table, &constraint.column)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             for row in rows {
+                // PG 3VL: a CHECK is violated only when the predicate evaluates to FALSE — a NULL
+                // operand makes it UNKNOWN, which SATISFIES the constraint (PostgreSQL: "the check
+                // expression should ... yield true or the null value"). `select_filter_matches`
+                // returns false for a NULL operand (WHERE semantics: exclude), which here would
+                // wrongly treat UNKNOWN as a violation — so NULL passes explicitly.
+                if matches!(row[column_idx], SqlValue::Null) {
+                    continue;
+                }
                 if !select_filter_matches(&row[column_idx], constraint.op, &constraint.value) {
                     return Err(EngineError::ApplyFailed(format!(
                         "new row for relation \"{}\" violates check constraint \"{}\"",
@@ -813,6 +821,11 @@ impl Engine {
             },
         )?;
         for row in rows {
+            // PG 3VL (same rule as `validate_check_constraints_for_rows`): an existing NULL value
+            // makes the check UNKNOWN, which SATISFIES it — ADD CHECK must not reject over NULLs.
+            if matches!(row[column_idx], SqlValue::Null) {
+                continue;
+            }
             if !select_filter_matches(&row[column_idx], add.filter.op, &add.filter.value) {
                 return Err(EngineError::ApplyFailed(format!(
                     "check constraint \"{}\" is violated by some row",

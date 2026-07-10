@@ -1549,6 +1549,51 @@ fn relational_check_constraints_enforce_and_replay_from_wal() {
         .contains("violates check constraint"));
 }
 
+/// PG 3VL: a CHECK constraint is violated only when its predicate evaluates to FALSE — a NULL
+/// operand makes it UNKNOWN, which SATISFIES the constraint ("the check expression should ...
+/// yield true or the null value"). Pins: (a) an INSERT with a NULL checked value succeeds; (b) an
+/// UPDATE setting the checked column to NULL succeeds; (c) ADD CHECK over existing NULL rows
+/// succeeds; (d) a FALSE value still rejects everywhere. Was: NULL wrongly treated as a violation
+/// (`select_filter_matches` returns false on NULL — correct for WHERE, wrong for CHECK).
+#[test]
+fn check_constraint_null_is_satisfied_pg_semantics() {
+    let e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE m (id INT PRIMARY KEY, v INT, CONSTRAINT v_pos CHECK (v > 0))",
+    )
+    .unwrap();
+    // (a) NULL passes the CHECK on INSERT.
+    e.execute_text(2, "INSERT INTO m (id, v) VALUES (1, NULL)")
+        .unwrap();
+    // (d) FALSE still rejects.
+    assert!(e
+        .execute_text(3, "INSERT INTO m (id, v) VALUES (2, -1)")
+        .unwrap_err()
+        .to_string()
+        .contains("violates check constraint"));
+    e.execute_text(4, "INSERT INTO m (id, v) VALUES (3, 5)")
+        .unwrap();
+    // (b) an UPDATE to NULL passes; an UPDATE to a FALSE value rejects.
+    e.execute_text(5, "UPDATE m SET v = NULL WHERE id = 3").unwrap();
+    assert!(e
+        .execute_text(6, "UPDATE m SET v = -7 WHERE id = 1")
+        .unwrap_err()
+        .to_string()
+        .contains("violates check constraint"));
+    // (c) ADD CHECK over existing NULL rows succeeds (both rows now hold v = NULL).
+    e.execute_text(7, "ALTER TABLE m ADD CONSTRAINT v_cap CHECK (v < 1000)")
+        .unwrap();
+    // And ADD CHECK still rejects when a NON-NULL row violates.
+    e.execute_text(8, "INSERT INTO m (id, v) VALUES (4, 500)").unwrap();
+    assert!(e
+        .execute_text(9, "ALTER TABLE m ADD CONSTRAINT v_tiny CHECK (v < 100)")
+        .unwrap_err()
+        .to_string()
+        .to_lowercase()
+        .contains("violated"));
+}
+
 #[test]
 fn relational_foreign_keys_enforce_and_replay_from_wal() {
     let e = Engine::new_local();
