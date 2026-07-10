@@ -859,3 +859,43 @@ fn streaming_reduction_absent_without_budget_uses_host_path() {
     assert_eq!(sum.rows, vec![vec![SqlValue::Int8(10)]]);
     assert_eq!(e.streaming_fold_hits(), 0, "SUM stays on the host path too");
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_ab_probe() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    const N: i32 = 100_000;
+    for batch in 0..10 {
+        let mut values = String::new();
+        for j in 0..(N / 10) {
+            let i = batch * (N / 10) + j;
+            if j > 0 {
+                values.push(',');
+            }
+            values.push_str(&format!("({i}, {})", i * 2));
+        }
+        seq += 1;
+        e.execute_text(seq, &format!("INSERT INTO big (a, b) VALUES {values}"))
+            .unwrap();
+    }
+    e.set_relational_residency_budget_bytes(0, 65536);
+    // warm-up
+    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM big")).unwrap();
+    for run in 0..3 {
+        let t = std::time::Instant::now();
+        let c = e.execute_relational_select(&select("SELECT COUNT(*) FROM big")).unwrap();
+        let t1 = t.elapsed().as_micros();
+        let t = std::time::Instant::now();
+        let s = e.execute_relational_select(&select("SELECT SUM(a) FROM big")).unwrap();
+        let t2 = t.elapsed().as_micros();
+        assert_eq!(c.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(100_000)]]);
+        assert_eq!(s.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(4_999_950_000i64)]]);
+        eprintln!("ABPROBE run={run} count_us={t1} sum_us={t2}");
+    }
+}

@@ -105,6 +105,31 @@ enum ChunkOutcome {
     Hard(ExecuteError),
 }
 
+/// STRATA S-E.5: a chunk whose transient device upload is IN FLIGHT on a private copy stream. The fold
+/// stages chunk N, then computes chunk N-1 — so N's PCIe DMA overlaps N-1's kernels (separate streams)
+/// and the host's staging of N+1 (MEASURED: the fold is host-staging-bound at ~68%, upload ~9%, compute
+/// ~1%; the lookahead hides the upload+compute slices under the host build — the host build itself is
+/// the interim MVCC-store decode, ADR-006 deletion debt retired by the raw-shard-bytes cold tier, S-E.6).
+/// Residency invariant: at most TWO chunks are transiently resident (one uploading + one computing),
+/// each <= the chunk target = budget/2, so the total stays <= the budget.
+struct StagedChunk {
+    snapshot: RelationalResidencySnapshot,
+    pending: gpu_db_execution::PendingCudaResidentDeviceCopy,
+    row_count: u64,
+}
+
+impl StagedChunk {
+    /// Block until the upload completes and wrap the chunk as an executor source.
+    fn ready(self) -> Result<ResidentExecSource, ()> {
+        let device_memory = self.pending.wait().map_err(|_| ())?;
+        Ok(ResidentExecSource {
+            descriptor: Arc::new(self.snapshot),
+            device_memory: Arc::new(device_memory),
+            row_count: self.row_count,
+        })
+    }
+}
+
 impl StreamAccum {
     fn new(agg: StreamAgg) -> Self {
         match agg {
@@ -467,6 +492,9 @@ impl Engine {
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
         let mut chunks_run: u64 = 0;
+        // S-E.5: the ONE-chunk lookahead — the staged chunk's upload is in flight while the previous
+        // chunk computes and the next chunk's rows stage on the host.
+        let mut staged: Option<StagedChunk> = None;
 
         let prefix = relational_key_prefix(&select.table);
         let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
@@ -489,34 +517,75 @@ impl Engine {
                     chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    match self.reduce_streaming_chunk(
-                        select,
-                        table,
-                        bound,
-                        predicate,
-                        copin_s,
-                        agg,
-                        gpu_id,
-                        &chunk_rows,
-                        &count_select,
-                        &count_bound,
-                        &mut accum,
-                    ) {
-                        ChunkOutcome::Ok => {}
-                        ChunkOutcome::Defer => {
-                            return self.execute_relational_select_cpu_pinned(select)
+                    // S-E.5 lookahead: stage this chunk (its upload overlaps), compute the PREVIOUS.
+                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows) else {
+                        return self.execute_relational_select_cpu_pinned(select);
+                    };
+                    if let Some(prev) = staged.replace(next) {
+                        let Ok(src) = prev.ready() else {
+                            return self.execute_relational_select_cpu_pinned(select);
+                        };
+                        match self.reduce_streaming_chunk(
+                            select,
+                            table,
+                            bound,
+                            predicate,
+                            copin_s,
+                            agg,
+                            &src,
+                            &count_select,
+                            &count_bound,
+                            &mut accum,
+                        ) {
+                            ChunkOutcome::Ok => {}
+                            ChunkOutcome::Defer => {
+                                return self.execute_relational_select_cpu_pinned(select)
+                            }
+                            ChunkOutcome::Hard(err) => return Err(err),
                         }
-                        ChunkOutcome::Hard(err) => return Err(err),
+                        chunks_run += 1;
                     }
-                    chunks_run += 1;
                     chunk_rows.clear();
                     chunk_bytes = 0;
                 }
             }
         }
         // The final (partial) chunk. When the table is EMPTY (or the tail cleared exactly), still run one
-        // chunk so the aggregate gets its PG empty-set semantics (COUNT -> 0, SUM/MIN/MAX -> NULL).
-        if !chunk_rows.is_empty() || chunks_run == 0 {
+        // chunk so the aggregate gets its PG empty-set semantics (COUNT -> 0, SUM/MIN/MAX -> NULL). Then
+        // DRAIN the pipeline (the last staged chunk still needs its compute).
+        if !chunk_rows.is_empty() || (chunks_run == 0 && staged.is_none()) {
+            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows) else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
+            if let Some(prev) = staged.replace(next) {
+                let Ok(src) = prev.ready() else {
+                    return self.execute_relational_select_cpu_pinned(select);
+                };
+                match self.reduce_streaming_chunk(
+                    select,
+                    table,
+                    bound,
+                    predicate,
+                    copin_s,
+                    agg,
+                    &src,
+                    &count_select,
+                    &count_bound,
+                    &mut accum,
+                ) {
+                    ChunkOutcome::Ok => {}
+                    ChunkOutcome::Defer => {
+                        return self.execute_relational_select_cpu_pinned(select)
+                    }
+                    ChunkOutcome::Hard(err) => return Err(err),
+                }
+                chunks_run += 1;
+            }
+        }
+        if let Some(prev) = staged.take() {
+            let Ok(src) = prev.ready() else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
             match self.reduce_streaming_chunk(
                 select,
                 table,
@@ -524,8 +593,7 @@ impl Engine {
                 predicate,
                 copin_s,
                 agg,
-                gpu_id,
-                &chunk_rows,
+                &src,
                 &count_select,
                 &count_bound,
                 &mut accum,
@@ -593,6 +661,10 @@ impl Engine {
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
         let mut chunks_run: u64 = 0;
+        // S-E.5 lookahead — for the UNBOUNDED scan only: with a LIMIT the early-exit decision needs
+        // THIS chunk's contribution before scanning further, so limited queries compute eagerly
+        // (semantics identical to pre-pipeline, including "the tail is never staged").
+        let mut staged: Option<StagedChunk> = None;
 
         let prefix = relational_key_prefix(&select.table);
         let visibility = StorageVisibility {
@@ -614,37 +686,86 @@ impl Engine {
                     chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    match self.project_streaming_chunk(
-                        &mut chunk_select,
-                        table,
-                        predicate,
-                        copin_s,
-                        &chunk_rows,
-                        &mut remaining_skip,
-                        &mut remaining_take,
-                        &mut rows_out,
-                    ) {
-                        ChunkOutcome::Ok => {}
-                        ChunkOutcome::Defer => {
-                            return self.execute_relational_select_cpu_pinned(select)
+                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows) else {
+                        return self.execute_relational_select_cpu_pinned(select);
+                    };
+                    let to_compute = if remaining_take.is_some() {
+                        Some(next) // limited: compute eagerly (early-exit fidelity)
+                    } else {
+                        staged.replace(next) // unbounded: pipeline one chunk ahead
+                    };
+                    if let Some(prev) = to_compute {
+                        let Ok(src) = prev.ready() else {
+                            return self.execute_relational_select_cpu_pinned(select);
+                        };
+                        match self.project_streaming_chunk(
+                            &mut chunk_select,
+                            table,
+                            predicate,
+                            copin_s,
+                            &src,
+                            &mut remaining_skip,
+                            &mut remaining_take,
+                            &mut rows_out,
+                        ) {
+                            ChunkOutcome::Ok => {}
+                            ChunkOutcome::Defer => {
+                                return self.execute_relational_select_cpu_pinned(select)
+                            }
+                            ChunkOutcome::Hard(err) => return Err(err),
                         }
-                        ChunkOutcome::Hard(err) => return Err(err),
+                        chunks_run += 1;
                     }
-                    chunks_run += 1;
                     chunk_rows.clear();
                     chunk_bytes = 0;
                 }
             }
         }
         // The final (partial) chunk — skipped when the LIMIT already filled (rows staged before the
-        // early-exit tripped would be dropped by the window anyway; don't upload them).
+        // early-exit tripped would be dropped by the window anyway; don't upload them). Then DRAIN the
+        // unbounded pipeline (the last staged chunk still needs its compute).
         if !chunk_rows.is_empty() && remaining_take != Some(0) {
+            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows) else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
+            let to_compute = if remaining_take.is_some() {
+                Some(next)
+            } else {
+                staged.replace(next)
+            };
+            if let Some(prev) = to_compute {
+                let Ok(src) = prev.ready() else {
+                    return self.execute_relational_select_cpu_pinned(select);
+                };
+                match self.project_streaming_chunk(
+                    &mut chunk_select,
+                    table,
+                    predicate,
+                    copin_s,
+                    &src,
+                    &mut remaining_skip,
+                    &mut remaining_take,
+                    &mut rows_out,
+                ) {
+                    ChunkOutcome::Ok => {}
+                    ChunkOutcome::Defer => {
+                        return self.execute_relational_select_cpu_pinned(select)
+                    }
+                    ChunkOutcome::Hard(err) => return Err(err),
+                }
+                chunks_run += 1;
+            }
+        }
+        if let Some(prev) = staged.take() {
+            let Ok(src) = prev.ready() else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
             match self.project_streaming_chunk(
                 &mut chunk_select,
                 table,
                 predicate,
                 copin_s,
-                &chunk_rows,
+                &src,
                 &mut remaining_skip,
                 &mut remaining_take,
                 &mut rows_out,
@@ -685,7 +806,7 @@ impl Engine {
         table: &RelationalTable,
         predicate: Option<&ResidentExpr>,
         copin_s: Index,
-        chunk_rows: &[Vec<SqlValue>],
+        src: &ResidentExecSource,
         remaining_skip: &mut usize,
         remaining_take: &mut Option<usize>,
         rows_out: &mut Vec<Vec<SqlValue>>,
@@ -697,24 +818,10 @@ impl Engine {
             Ok(chunk_bound) => chunk_bound,
             Err(_) => return ChunkOutcome::Defer,
         };
-        let (descriptor, device_memory) =
-            match self.build_transient_relation_residency(table, chunk_rows) {
-                Ok(pair) => pair,
-                Err(_) => return ChunkOutcome::Defer,
-            };
-        self.read_state
-            .residency
-            .streaming_fold_peak_chunk_bytes
-            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
-        let src = ResidentExecSource {
-            descriptor: Arc::new(descriptor),
-            device_memory: Arc::new(device_memory),
-            row_count: chunk_rows.len() as u64,
-        };
         let result = match self.execute_resident_expr_select_with_binding(
             chunk_select,
             table,
-            Some(&src),
+            Some(src),
             chunk_bound,
             copin_s,
             predicate,
@@ -898,6 +1005,9 @@ impl Engine {
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
         let mut chunks_run: u64 = 0;
+        // S-E.5: the one-chunk lookahead (drained BEFORE any accumulator merge so a chunk upload never
+        // rides alongside the merge upload — the residency invariant stays two-chunks-max).
+        let mut staged: Option<StagedChunk> = None;
 
         let prefix = relational_key_prefix(&select.table);
         let visibility = StorageVisibility {
@@ -915,30 +1025,65 @@ impl Engine {
                     chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    match self.grouped_streaming_chunk(
-                        &grouped_select,
-                        table,
-                        &grouped_bound,
-                        predicate,
-                        copin_s,
-                        group_column,
-                        &chunk_rows,
-                        &partial_types,
-                        &mut partials_acc,
-                        &mut partials_bytes,
-                    ) {
-                        ChunkOutcome::Ok => {}
-                        ChunkOutcome::Defer => {
-                            return self.execute_relational_select_cpu_pinned(select)
+                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows) else {
+                        return self.execute_relational_select_cpu_pinned(select);
+                    };
+                    if let Some(prev) = staged.replace(next) {
+                        let Ok(src) = prev.ready() else {
+                            return self.execute_relational_select_cpu_pinned(select);
+                        };
+                        match self.grouped_streaming_chunk(
+                            &grouped_select,
+                            table,
+                            &grouped_bound,
+                            predicate,
+                            copin_s,
+                            group_column,
+                            &src,
+                            &partial_types,
+                            &mut partials_acc,
+                            &mut partials_bytes,
+                        ) {
+                            ChunkOutcome::Ok => {}
+                            ChunkOutcome::Defer => {
+                                return self.execute_relational_select_cpu_pinned(select)
+                            }
+                            ChunkOutcome::Hard(err) => return Err(err),
                         }
-                        ChunkOutcome::Hard(err) => return Err(err),
+                        chunks_run += 1;
                     }
-                    chunks_run += 1;
                     chunk_rows.clear();
                     chunk_bytes = 0;
                     // COMPACTION: the accumulator outgrew the chunk budget — device-merge it down to
                     // one row per true group. If even the compacted form exceeds the budget, the group
                     // cardinality itself is over-budget: defer (S-E.4+ may spill; v1 is honest).
+                    // Drain the in-flight chunk FIRST so the merge upload never overlaps a chunk upload.
+                    if partials_bytes >= chunk_target_bytes {
+                        if let Some(prev) = staged.take() {
+                            let Ok(src) = prev.ready() else {
+                            return self.execute_relational_select_cpu_pinned(select);
+                        };
+                        match self.grouped_streaming_chunk(
+                            &grouped_select,
+                            table,
+                            &grouped_bound,
+                            predicate,
+                            copin_s,
+                            group_column,
+                            &src,
+                            &partial_types,
+                            &mut partials_acc,
+                            &mut partials_bytes,
+                        ) {
+                            ChunkOutcome::Ok => {}
+                            ChunkOutcome::Defer => {
+                                return self.execute_relational_select_cpu_pinned(select)
+                            }
+                            ChunkOutcome::Hard(err) => return Err(err),
+                        }
+                        chunks_run += 1;
+                        }
+                    }
                     if partials_bytes >= chunk_target_bytes {
                         match self.merge_streaming_partials(
                             &merge_select,
@@ -966,6 +1111,13 @@ impl Engine {
             }
         }
         if !chunk_rows.is_empty() {
+            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows) else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
+            if let Some(prev) = staged.replace(next) {
+                let Ok(src) = prev.ready() else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
             match self.grouped_streaming_chunk(
                 &grouped_select,
                 table,
@@ -973,7 +1125,56 @@ impl Engine {
                 predicate,
                 copin_s,
                 group_column,
-                &chunk_rows,
+                &src,
+                &partial_types,
+                &mut partials_acc,
+                &mut partials_bytes,
+            ) {
+                ChunkOutcome::Ok => {}
+                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
+                ChunkOutcome::Hard(err) => return Err(err),
+            }
+            chunks_run += 1;
+            }
+        }
+        // Pipeline-lag compaction: the tail-block compute lands one whole chunk's partials AFTER the
+        // loop's last compaction check, so re-check here — else the accumulator can reach the drain
+        // compute already over-target and overshoot the merge budget gate (defer where the pre-pipeline
+        // fold compacted and succeeded).
+        if partials_bytes >= chunk_target_bytes {
+            match self.merge_streaming_partials(
+                &merge_select,
+                &partials_table,
+                &merge_bound,
+                copin_s,
+                group_column,
+                &narrow_to_int8,
+                &mut partials_acc,
+                &mut partials_bytes,
+                &partial_types,
+                budget,
+            ) {
+                ChunkOutcome::Ok => {}
+                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
+                ChunkOutcome::Hard(err) => return Err(err),
+            }
+            if partials_bytes >= chunk_target_bytes {
+                return self.execute_relational_select_cpu_pinned(select);
+            }
+        }
+        // DRAIN the pipeline before the final merge (no chunk upload alongside the merge upload).
+        if let Some(prev) = staged.take() {
+            let Ok(src) = prev.ready() else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
+            match self.grouped_streaming_chunk(
+                &grouped_select,
+                table,
+                &grouped_bound,
+                predicate,
+                copin_s,
+                group_column,
+                &src,
                 &partial_types,
                 &mut partials_acc,
                 &mut partials_bytes,
@@ -1050,30 +1251,16 @@ impl Engine {
         predicate: Option<&ResidentExpr>,
         copin_s: Index,
         group_column: &str,
-        chunk_rows: &[Vec<SqlValue>],
+        src: &ResidentExecSource,
         partial_types: &[SqlType],
         partials_acc: &mut Vec<Vec<SqlValue>>,
         partials_bytes: &mut u64,
     ) -> ChunkOutcome {
-        let (descriptor, device_memory) =
-            match self.build_transient_relation_residency(table, chunk_rows) {
-                Ok(pair) => pair,
-                Err(_) => return ChunkOutcome::Defer,
-            };
-        self.read_state
-            .residency
-            .streaming_fold_peak_chunk_bytes
-            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
-        let src = ResidentExecSource {
-            descriptor: Arc::new(descriptor),
-            device_memory: Arc::new(device_memory),
-            row_count: chunk_rows.len() as u64,
-        };
         let group_key_columns = [group_column.to_string()];
         let result = match self.execute_resident_expr_select_with_binding(
             grouped_select,
             table,
-            Some(&src),
+            Some(src),
             grouped_bound.clone(),
             copin_s,
             predicate,
@@ -1178,6 +1365,8 @@ impl Engine {
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
         let mut chunks_run: u64 = 0;
+        // S-E.5: the one-chunk lookahead (drained BEFORE any accumulator sort upload).
+        let mut staged: Option<StagedChunk> = None;
 
         let prefix = relational_key_prefix(&select.table);
         let visibility = StorageVisibility {
@@ -1195,26 +1384,60 @@ impl Engine {
                     chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    match self.ordered_streaming_chunk(
-                        &chunk_select,
-                        table,
-                        &chunk_bound,
-                        predicate,
-                        copin_s,
-                        &chunk_rows,
-                        &partial_types,
-                        &mut runs_acc,
-                        &mut runs_bytes,
-                    ) {
-                        ChunkOutcome::Ok => {}
-                        ChunkOutcome::Defer => {
-                            return self.execute_relational_select_cpu_pinned(select)
+                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows) else {
+                        return self.execute_relational_select_cpu_pinned(select);
+                    };
+                    if let Some(prev) = staged.replace(next) {
+                        let Ok(src) = prev.ready() else {
+                            return self.execute_relational_select_cpu_pinned(select);
+                        };
+                        match self.ordered_streaming_chunk(
+                            &chunk_select,
+                            table,
+                            &chunk_bound,
+                            predicate,
+                            copin_s,
+                            &src,
+                            &partial_types,
+                            &mut runs_acc,
+                            &mut runs_bytes,
+                        ) {
+                            ChunkOutcome::Ok => {}
+                            ChunkOutcome::Defer => {
+                                return self.execute_relational_select_cpu_pinned(select)
+                            }
+                            ChunkOutcome::Hard(err) => return Err(err),
                         }
-                        ChunkOutcome::Hard(err) => return Err(err),
+                        chunks_run += 1;
                     }
-                    chunks_run += 1;
                     chunk_rows.clear();
                     chunk_bytes = 0;
+                    // Drain the in-flight chunk FIRST so an accumulator sort upload never overlaps it.
+                    if runs_bytes >= chunk_target_bytes {
+                        if let Some(prev) = staged.take() {
+                            let Ok(src) = prev.ready() else {
+                            return self.execute_relational_select_cpu_pinned(select);
+                        };
+                        match self.ordered_streaming_chunk(
+                            &chunk_select,
+                            table,
+                            &chunk_bound,
+                            predicate,
+                            copin_s,
+                            &src,
+                            &partial_types,
+                            &mut runs_acc,
+                            &mut runs_bytes,
+                        ) {
+                            ChunkOutcome::Ok => {}
+                            ChunkOutcome::Defer => {
+                                return self.execute_relational_select_cpu_pinned(select)
+                            }
+                            ChunkOutcome::Hard(err) => return Err(err),
+                        }
+                        chunks_run += 1;
+                        }
+                    }
                     if runs_bytes >= chunk_target_bytes {
                         match top_n {
                             // TOP-N compaction: device re-sort + truncate to the window bound.
@@ -1255,13 +1478,75 @@ impl Engine {
             }
         }
         if !chunk_rows.is_empty() {
+            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows) else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
+            if let Some(prev) = staged.replace(next) {
+                let Ok(src) = prev.ready() else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
             match self.ordered_streaming_chunk(
                 &chunk_select,
                 table,
                 &chunk_bound,
                 predicate,
                 copin_s,
-                &chunk_rows,
+                &src,
+                &partial_types,
+                &mut runs_acc,
+                &mut runs_bytes,
+            ) {
+                ChunkOutcome::Ok => {}
+                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
+                ChunkOutcome::Hard(err) => return Err(err),
+            }
+            chunks_run += 1;
+            }
+        }
+        // Pipeline-lag re-check (mirrors the grouped fold): the tail-block compute lands one chunk's
+        // runs after the loop's last check — re-compact (top-N) / re-gate (unbounded) before draining.
+        if runs_bytes >= chunk_target_bytes {
+            match top_n {
+                Some(_) => {
+                    match self.sort_streaming_runs(
+                        &compact_select,
+                        &runs_table,
+                        &compact_bound,
+                        copin_s,
+                        &partial_types,
+                        &mut runs_acc,
+                        &mut runs_bytes,
+                        budget,
+                    ) {
+                        ChunkOutcome::Ok => {}
+                        ChunkOutcome::Defer => {
+                            return self.execute_relational_select_cpu_pinned(select)
+                        }
+                        ChunkOutcome::Hard(err) => return Err(err),
+                    }
+                    if runs_bytes > budget {
+                        return self.execute_relational_select_cpu_pinned(select);
+                    }
+                }
+                None => {
+                    if runs_bytes > budget {
+                        return self.execute_relational_select_cpu_pinned(select);
+                    }
+                }
+            }
+        }
+        // DRAIN the pipeline before the final sort (no chunk upload alongside the sort upload).
+        if let Some(prev) = staged.take() {
+            let Ok(src) = prev.ready() else {
+                return self.execute_relational_select_cpu_pinned(select);
+            };
+            match self.ordered_streaming_chunk(
+                &chunk_select,
+                table,
+                &chunk_bound,
+                predicate,
+                copin_s,
+                &src,
                 &partial_types,
                 &mut runs_acc,
                 &mut runs_bytes,
@@ -1322,31 +1607,17 @@ impl Engine {
         chunk_bound: &BoundRelationalSelect,
         predicate: Option<&ResidentExpr>,
         copin_s: Index,
-        chunk_rows: &[Vec<SqlValue>],
+        src: &ResidentExecSource,
         partial_types: &[SqlType],
         runs_acc: &mut Vec<Vec<SqlValue>>,
         runs_bytes: &mut u64,
     ) -> ChunkOutcome {
-        let (descriptor, device_memory) =
-            match self.build_transient_relation_residency(table, chunk_rows) {
-                Ok(pair) => pair,
-                Err(_) => return ChunkOutcome::Defer,
-            };
-        self.read_state
-            .residency
-            .streaming_fold_peak_chunk_bytes
-            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
-        let src = ResidentExecSource {
-            descriptor: Arc::new(descriptor),
-            device_memory: Arc::new(device_memory),
-            row_count: chunk_rows.len() as u64,
-        };
         let order_by_exprs: Vec<Option<ResidentExpr>> = vec![None; chunk_select.order_by.len()];
         let order_by_nulls_first: Vec<Option<bool>> = vec![None; chunk_select.order_by.len()];
         let result = match self.execute_resident_expr_select_with_binding(
             chunk_select,
             table,
-            Some(&src),
+            Some(src),
             chunk_bound.clone(),
             copin_s,
             predicate,
@@ -1517,6 +1788,29 @@ impl Engine {
         ChunkOutcome::Ok
     }
 
+    /// STRATA S-E.5: stage one chunk — build its transient payload (host) and enqueue the upload on a
+    /// private copy stream (async when the driver supports it). The caller computes the PREVIOUSLY
+    /// staged chunk next, so this upload overlaps that compute and the subsequent host staging.
+    fn stage_streaming_chunk(
+        &self,
+        table: &RelationalTable,
+        chunk_rows: &[Vec<SqlValue>],
+    ) -> Result<StagedChunk, ()> {
+        let (snapshot, pending) = self
+            .build_transient_relation_residency_async(table, chunk_rows)
+            .map_err(|_| ())?;
+        // The out-of-core proof: the ACTUAL transient device bytes for this chunk (fetch_max monotonic).
+        self.read_state
+            .residency
+            .streaming_fold_peak_chunk_bytes
+            .fetch_max(snapshot.resident_bytes, Ordering::Relaxed);
+        Ok(StagedChunk {
+            snapshot,
+            pending,
+            row_count: chunk_rows.len() as u64,
+        })
+    }
+
     /// Upload one chunk as a transient resident source, reduce it on the device, and fold the partial in.
     /// One upload; a COUNT(*) launch (the empty-filtered-set guard + the COUNT value); and, for
     /// SUM/MIN/MAX with survivors, the reduction launch. The transient source drops (device memory freed)
@@ -1530,35 +1824,17 @@ impl Engine {
         predicate: Option<&ResidentExpr>,
         copin_s: Index,
         agg: StreamAgg,
-        gpu_id: u16,
-        chunk_rows: &[Vec<SqlValue>],
+        src: &ResidentExecSource,
         count_select: &Select,
         count_bound: &BoundRelationalSelect,
         accum: &mut StreamAccum,
     ) -> ChunkOutcome {
-        let (descriptor, device_memory) =
-            match self.build_transient_relation_residency(table, chunk_rows) {
-                Ok(pair) => pair,
-                Err(_) => return ChunkOutcome::Defer,
-            };
-        // The out-of-core proof: the ACTUAL transient device bytes for this chunk (fetch_max monotonic).
-        self.read_state
-            .residency
-            .streaming_fold_peak_chunk_bytes
-            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
-        let src = ResidentExecSource {
-            descriptor: Arc::new(descriptor),
-            device_memory: Arc::new(device_memory),
-            row_count: chunk_rows.len() as u64,
-        };
-        let _ = gpu_id;
-
         // COUNT(*) over the chunk (predicate applied on-device): both the COUNT value AND the empty-set
         // guard for SUM/MIN/MAX (the general reduction hard-errors over an empty filtered set).
         let chunk_count = match self.execute_resident_expr_select_with_binding(
             count_select,
             table,
-            Some(&src),
+            Some(src),
             count_bound.clone(),
             copin_s,
             predicate,
@@ -1586,7 +1862,7 @@ impl Engine {
         let value = match self.execute_resident_expr_select_with_binding(
             select,
             table,
-            Some(&src),
+            Some(src),
             bound.clone(),
             copin_s,
             predicate,

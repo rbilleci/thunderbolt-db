@@ -727,6 +727,75 @@ impl Drop for PooledStreamOwned {
     }
 }
 
+/// STRATA S-E.5: an IN-FLIGHT async HtoD upload of a retained device allocation (built by
+/// [`CudaRuntime::retain_device_memory_copy_async`]). The copy is enqueued on a private pooled
+/// stream from a pinned staging buffer; the allocation must not be read (no kernel launched
+/// against it) until [`Self::wait`] returns. Dropping an un-waited handle still synchronizes the
+/// stream (best-effort) before releasing the pinned buffer — the staging bytes are never handed
+/// back to the pool while the DMA could still be reading them.
+pub struct PendingCudaResidentDeviceCopy {
+    memory: Option<CudaResidentDeviceMemory>,
+    in_flight: Option<PendingCopyTransport>,
+}
+
+struct PendingCopyTransport {
+    primary: Arc<GpuPrimaryContext>,
+    pooled: Option<PooledStream>,
+    pinned: Option<(*mut c_void, usize)>,
+}
+
+// The transport carries a raw pinned-host pointer + a pooled stream handle across the staging →
+// compute boundary of the streaming fold, exactly as `PooledStreamOwned` carries its stream across
+// submit→complete. Access is externally synchronized (one fold thread drives it).
+unsafe impl Send for PendingCopyTransport {}
+
+impl PendingCopyTransport {
+    /// Synchronize the copy stream, then return the stream + pinned buffer to their pools.
+    /// Idempotent (fields are taken); called by `wait()` and (best-effort) by Drop.
+    fn complete(&mut self) -> Result<(), CudaRuntimeProbeError> {
+        let mut result = Ok(());
+        if let Some(pooled) = self.pooled.take() {
+            let set = self.primary.set_current();
+            let sync =
+                check_cuda(unsafe { (self.primary.cu_stream_synchronize)(pooled.stream) });
+            self.primary.release_pooled_stream(pooled);
+            result = set.and(sync);
+        }
+        if let Some((ptr, capacity)) = self.pinned.take() {
+            self.primary.release_pinned_host_buffer(ptr, capacity);
+        }
+        result
+    }
+}
+
+impl Drop for PendingCopyTransport {
+    fn drop(&mut self) {
+        let _ = self.complete();
+    }
+}
+
+impl PendingCudaResidentDeviceCopy {
+    /// The allocation's proof metadata — available IMMEDIATELY (the descriptor build does not need
+    /// to wait for the copy; only kernel launches do).
+    pub fn metadata(&self) -> &CudaDeviceMemoryProof {
+        self.memory
+            .as_ref()
+            .expect("pending device copy already waited")
+            .metadata()
+    }
+
+    /// Block until the upload is complete and return the (now kernel-safe) retained allocation.
+    pub fn wait(mut self) -> Result<CudaResidentDeviceMemory, CudaRuntimeProbeError> {
+        if let Some(mut transport) = self.in_flight.take() {
+            transport.complete()?;
+        }
+        Ok(self
+            .memory
+            .take()
+            .expect("pending device copy already waited"))
+    }
+}
+
 /// RAII handle to a pooled pinned (page-locked) host staging buffer; returns it to the pool on
 /// every exit (success, error, or panic). `ptr` is a raw host pointer the route reads back
 /// through after the async D2H completes (i.e. after the stream sync).
@@ -3574,6 +3643,111 @@ impl CudaDriverRuntime {
             device_ptr: resident.device_ptr,
             primary: resident.primary,
             last_kernel_event_elapsed_us: Mutex::new(None),
+        })
+    }
+
+    /// STRATA S-E.5 (streaming copy/compute overlap): retain a device allocation whose HtoD upload is
+    /// enqueued ASYNCHRONOUSLY on a private pooled stream from a pinned staging buffer, so the DMA
+    /// overlaps whatever the host (chunk staging) and the SMs (the previous chunk's kernels, on their
+    /// own streams) are doing. The allocation MUST NOT be read until [`PendingCudaResidentDeviceCopy::
+    /// wait`] returns. When the async symbols / pinned pool are unavailable the copy degrades to the
+    /// proven synchronous path and `wait()` is a no-op — behavior-identical, just unoverlapped.
+    pub fn retain_device_memory_copy_async(
+        &self,
+        gpu_id: u16,
+        payload: &[u8],
+    ) -> Result<PendingCudaResidentDeviceCopy, CudaRuntimeProbeError> {
+        if !self.snapshot.driver_available || gpu_id >= self.snapshot.device_count {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+        if payload.is_empty() {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let device = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|device| device.id == gpu_id)
+            .cloned()
+            .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
+        let primary = gpu_primary_context(gpu_id)?;
+        primary.set_current()?;
+        // Degrade to the synchronous copy when true-async staging is unavailable (missing
+        // cuMemcpyHtoDAsync, or no pinned buffer — an async copy from PAGEABLE memory is not
+        // asynchronous with respect to the host, so it would be overlap theater).
+        let Some(htod_async) = primary.cu_memcpy_htod_async else {
+            return Ok(PendingCudaResidentDeviceCopy {
+                memory: Some(self.retain_device_memory_copy(gpu_id, payload)?),
+                in_flight: None,
+            });
+        };
+        let Some(pinned) = primary.lease_pinned_host_buffer(payload.len()) else {
+            return Ok(PendingCudaResidentDeviceCopy {
+                memory: Some(self.retain_device_memory_copy(gpu_id, payload)?),
+                in_flight: None,
+            });
+        };
+        // Stage the payload into the pinned buffer (a host memcpy — cheap next to the PCIe copy it
+        // unblocks), then take OWNED custody of the lease fields (the pending handle outlives this
+        // call; the transport releases them back to the pool after the sync).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                pinned.ptr.cast::<u8>(),
+                payload.len(),
+            );
+        }
+        let pinned_ptr = pinned.ptr;
+        let pinned_capacity = pinned.capacity;
+        std::mem::forget(pinned);
+
+        let pooled = match primary.acquire_pooled_stream() {
+            Ok(pooled) => pooled,
+            Err(err) => {
+                primary.release_pinned_host_buffer(pinned_ptr, pinned_capacity);
+                return Err(err);
+            }
+        };
+        let mut device_ptr = 0_u64;
+        if let Err(err) =
+            check_cuda(unsafe { (primary.cu_mem_alloc)(&mut device_ptr, payload.len()) })
+        {
+            primary.release_pooled_stream(pooled);
+            primary.release_pinned_host_buffer(pinned_ptr, pinned_capacity);
+            return Err(err);
+        }
+        // From here the allocation is RAII-owned by the memory handle (its Drop frees it).
+        let memory = CudaResidentDeviceMemory {
+            metadata: CudaDeviceMemoryProof {
+                gpu_id,
+                device_name: device.name,
+                allocated_bytes: payload.len() as u64,
+                copied_bytes: payload.len() as u64,
+                retained: true,
+            },
+            device_ptr,
+            primary: Arc::clone(&primary),
+            last_kernel_event_elapsed_us: Mutex::new(None),
+        };
+        if let Err(err) = check_cuda(unsafe {
+            htod_async(
+                device_ptr,
+                pinned_ptr.cast_const(),
+                payload.len(),
+                pooled.stream,
+            )
+        }) {
+            primary.release_pooled_stream(pooled);
+            primary.release_pinned_host_buffer(pinned_ptr, pinned_capacity);
+            return Err(err);
+        }
+        Ok(PendingCudaResidentDeviceCopy {
+            memory: Some(memory),
+            in_flight: Some(PendingCopyTransport {
+                primary,
+                pooled: Some(pooled),
+                pinned: Some((pinned_ptr, pinned_capacity)),
+            }),
         })
     }
 

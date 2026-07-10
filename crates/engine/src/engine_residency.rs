@@ -10025,6 +10025,90 @@ impl Engine {
         Ok((snapshot, device_memory))
     }
 
+    /// STRATA S-E.5: [`Engine::build_transient_relation_residency`] with the HtoD upload enqueued
+    /// ASYNCHRONOUSLY (pinned staging + a private pooled copy stream), so the DMA overlaps the caller's
+    /// host staging of the NEXT chunk and the previous chunk's kernels. The descriptor is complete
+    /// immediately (proof metadata is allocation-time); the allocation must not be kernel-read until
+    /// the returned pending copy's `wait()`. Falls back to the synchronous copy transparently when
+    /// async staging is unavailable (`wait()` is then a no-op).
+    pub(crate) fn build_transient_relation_residency_async(
+        &self,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+    ) -> Result<
+        (
+            RelationalResidencySnapshot,
+            gpu_db_execution::PendingCudaResidentDeviceCopy,
+        ),
+        ExecuteError,
+    > {
+        let gpu_id = self.planner.default_gpu_id();
+        let column_names: Vec<String> = table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
+        let resident_device_int4_columns = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let resident_device_int8_columns = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let resident_device_numeric_columns = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let (
+            device_payload,
+            resident_device_text_columns,
+            resident_device_bool_columns,
+            resident_device_int4_column_stats,
+            _resident_device_b128_columns,
+            resident_device_null_columns,
+        ) = build_relational_device_payload(&column_names, &column_types, rows)?;
+        let runtime = self.cuda_driver_probe_runtime();
+        let pending = runtime
+            .retain_device_memory_copy_async(gpu_id, &device_payload)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let snapshot = RelationalResidencySnapshot {
+            gpu_id,
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            generation: 1,
+            row_count: rows.len(),
+            capacity: rows.len(),
+            column_count: table.columns.len(),
+            resident_bytes: device_payload.len() as u64,
+            resident_device_int4_columns,
+            resident_device_int4_column_stats,
+            resident_device_int8_columns,
+            resident_device_numeric_columns,
+            resident_device_bool_columns,
+            resident_device_text_columns,
+            resident_device_null_columns,
+            valid_through_index: self.committed_seq(),
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            invalidated_by_memory_pressure: false,
+            memory_pressure_active: false,
+            last_refresh_cost: None,
+            admission_budget_bytes: None,
+            resident_bytes_after_admission: 0,
+            evicted_tables_on_admission: Vec::new(),
+            device_memory_proof: Some(pending.metadata().clone()),
+        };
+        Ok((snapshot, pending))
+    }
+
     pub fn install_benchmark_relational_residency_chunks(
         &mut self,
         install: BenchmarkRelationalResidencyChunkInstall<'_>,
