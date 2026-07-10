@@ -23,9 +23,15 @@
 //! residency budget (the operator's VRAM-management signal); with no budget there is no notion of
 //! "over-VRAM" and the read stays on the interim host path — so default behavior is byte-identical.
 //!
-//! Follow-ons (see PLAN S-E): streaming filter/project + LIMIT (S-E.2), GROUP BY / DISTINCT with a
-//! persistent device accumulator (S-E.3), ORDER BY via k-way run merge (S-E.4), and copy/compute overlap
-//! (S-E.5). AVG is deferred (it needs the (sum, count) pair combined, not the divided per-chunk average).
+//! **S-E.2 (here too): streaming filter/project.** A plain `All`/`Columns` projection folds by CONCAT
+//! (the ARCHITECTURE §13 projection combine): each chunk's device-filtered + device-gathered survivors
+//! append to the result, with LIMIT/OFFSET applied as cross-chunk windowing of the survivor stream (the
+//! executor's own "LIMIT/OFFSET as control-plane WINDOWING" precedent) and a satisfied LIMIT stopping the
+//! scan early — the table tail is never staged.
+//!
+//! Follow-ons (see PLAN S-E): GROUP BY / DISTINCT with a persistent device accumulator (S-E.3), ORDER BY
+//! via k-way run merge (S-E.4), and copy/compute overlap (S-E.5). AVG is deferred (it needs the
+//! (sum, count) pair combined, not the divided per-chunk average).
 
 use super::*;
 
@@ -213,37 +219,48 @@ fn is_overflow_error(err: &ExecuteError) -> bool {
     message.contains("overflow") || message.contains("out of range")
 }
 
-/// Classify a SELECT as a foldable SCALAR reduction, or `None` if any non-foldable shape is present
-/// (GROUP BY / DISTINCT / ORDER BY / LIMIT / OFFSET / HAVING, or a non-{COUNT*,SUM,MIN,MAX} projection).
-fn streaming_reduction_agg(select: &Select) -> Option<StreamAgg> {
+/// The streaming operator class serving a SELECT: a scalar reduction fold (S-E.1) or a filter/project
+/// concat fold (S-E.2).
+enum StreamShape {
+    Reduction(StreamAgg),
+    Projection,
+}
+
+/// Classify a SELECT as a streamable shape, or `None` for the non-foldable classes (GROUP BY / DISTINCT /
+/// ORDER BY / HAVING — S-E.3/S-E.4 follow-ons). A SCALAR reduction (COUNT(*)/SUM/MIN/MAX, no LIMIT/OFFSET —
+/// PG applies LIMIT to the one-row aggregate result, a shape not worth streaming) folds by combine; a plain
+/// `All`/`Columns` projection folds by CONCAT, with LIMIT/OFFSET as cross-chunk windowing (LIMIT without
+/// ORDER BY is any-N-rows per SQL, so early-exit + scan-order windowing is a valid instance).
+fn streaming_shape(select: &Select) -> Option<StreamShape> {
     if select.distinct
         || select.group_by.is_some()
         || !select.order_by.is_empty()
-        || select.limit.is_some()
-        || select.offset.is_some()
         || !select.having_groups.is_empty()
     {
         return None;
     }
     match &select.projection {
-        SelectProjection::CountAll => Some(StreamAgg::Count),
-        SelectProjection::Sum { .. } => Some(StreamAgg::Sum),
-        SelectProjection::Min { .. } => Some(StreamAgg::Min),
-        SelectProjection::Max { .. } => Some(StreamAgg::Max),
+        SelectProjection::All | SelectProjection::Columns(_) => Some(StreamShape::Projection),
+        _ if select.limit.is_some() || select.offset.is_some() => None,
+        SelectProjection::CountAll => Some(StreamShape::Reduction(StreamAgg::Count)),
+        SelectProjection::Sum { .. } => Some(StreamShape::Reduction(StreamAgg::Sum)),
+        SelectProjection::Min { .. } => Some(StreamShape::Reduction(StreamAgg::Min)),
+        SelectProjection::Max { .. } => Some(StreamShape::Reduction(StreamAgg::Max)),
         _ => None,
     }
 }
 
 impl Engine {
-    /// STRATA S-E.1: try to serve a scalar reduction OUT-OF-CORE via the streaming fold. Returns
-    /// `Some(result)` when the streaming path handled the read (`Ok`) or must surface a genuine SQL error
-    /// (`Err`); `None` to fall through to the caller's path (the CPU pinned read). It NEVER returns a wrong
-    /// answer: any shape the device cannot express defers to the authoritative CPU path.
-    pub(crate) fn try_streaming_scalar_reduction(
+    /// STRATA S-E.1/S-E.2: try to serve a SELECT OUT-OF-CORE via a streaming fold — a scalar reduction
+    /// (combine partials) or a filter/project (concat + windowing). Returns `Some(result)` when the
+    /// streaming path handled the read (`Ok`) or must surface a genuine SQL error (`Err`); `None` to fall
+    /// through to the caller's path (the CPU pinned read). It NEVER returns a wrong answer: any shape the
+    /// device cannot express defers to the authoritative CPU path.
+    pub(crate) fn try_streaming_select(
         &self,
         select: &Select,
     ) -> Option<Result<RelationalSelectResult, ExecuteError>> {
-        let agg = streaming_reduction_agg(select)?;
+        let shape = streaming_shape(select)?;
         let gpu_id = self.planner.default_gpu_id();
         // Activation gate: a per-GPU residency budget must be configured (the operator's VRAM-management
         // signal). With no budget there is no notion of "over-VRAM" -> stay on the interim host path
@@ -266,7 +283,27 @@ impl Engine {
         bound.filters.clear();
         bound.filter_groups.clear();
 
-        Some(self.run_streaming_reduction_fold(select, &table, &bound, predicate.as_ref(), copin_s, agg, gpu_id, budget))
+        Some(match shape {
+            StreamShape::Reduction(agg) => self.run_streaming_reduction_fold(
+                select,
+                &table,
+                &bound,
+                predicate.as_ref(),
+                copin_s,
+                agg,
+                gpu_id,
+                budget,
+            ),
+            StreamShape::Projection => self.run_streaming_projection_fold(
+                select,
+                &table,
+                &bound,
+                predicate.as_ref(),
+                copin_s,
+                gpu_id,
+                budget,
+            ),
+        })
     }
 
     /// The fold driver: scan the table's MVCC-visible rows at the pinned boundary, accumulate them into
@@ -387,6 +424,193 @@ impl Engine {
             fallback_reason: None,
             access_path: Arc::new(RelationalAccessPath::FullTableScan),
         })
+    }
+
+    /// STRATA S-E.2 — the filter/project fold: scan the visible rows into byte-bounded chunks; per chunk,
+    /// run the projection (predicate + column gather ON THE DEVICE, with a device-side LIMIT bounding the
+    /// gather to the rows still needed) and CONCAT the returned rows — the ARCHITECTURE §13 projection
+    /// combine. LIMIT/OFFSET are cross-chunk WINDOWING of the concatenated survivor stream: the same
+    /// control-plane index slicing the executor itself performs on its survivor vector ("LIMIT/OFFSET as
+    /// control-plane WINDOWING", engine_expr.rs) — LIMIT without ORDER BY is any-N-rows per SQL, so
+    /// scan-order windowing is a valid instance. A satisfied LIMIT stops the scan EARLY: the tail of the
+    /// table is never even staged (the out-of-core win compounds).
+    #[allow(clippy::too_many_arguments)]
+    fn run_streaming_projection_fold(
+        &self,
+        select: &Select,
+        table: &RelationalTable,
+        bound: &BoundRelationalSelect,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+        gpu_id: u16,
+        budget: u64,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let chunk_target_bytes = (budget / 2).max(1);
+        let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
+        // The per-chunk select: the SAME projection + WHERE, OFFSET dropped (applied cross-chunk — a
+        // chunk cannot know the prior chunks' survivor count at bind time) and LIMIT re-derived per
+        // chunk from the rows still needed (skip-span rows must also be gathered; they are dropped at
+        // the cross-chunk window below — a bounded cost of OFFSET over a stream).
+        let mut chunk_select = select.clone();
+        chunk_select.offset = None;
+        chunk_select.limit = None;
+
+        let mut remaining_skip: usize = select.offset.unwrap_or(0);
+        let mut remaining_take: Option<usize> = select.limit;
+        let mut rows_out: Vec<Vec<SqlValue>> = Vec::new();
+        let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
+        let mut chunk_bytes: u64 = 0;
+        let mut chunks_run: u64 = 0;
+
+        let prefix = relational_key_prefix(&select.table);
+        let visibility = StorageVisibility {
+            read_txn_id: copin_s,
+        };
+        {
+            let table_rows = self.read_state.mvcc.table_rows(&select.table);
+            let mut cursor = table_rows.store().seq_scan_open(visibility)?;
+            while let Some(tuple) = cursor.next() {
+                // LIMIT satisfied -> STOP the scan: no further row is staged, decoded, or uploaded.
+                if remaining_take == Some(0) {
+                    break;
+                }
+                if !tuple.key.starts_with(&prefix) {
+                    continue;
+                }
+                let decoded = decode_relational_row(&tuple.value, &table.columns)?;
+                chunk_bytes =
+                    chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+                chunk_rows.push(decoded);
+                if chunk_bytes >= chunk_target_bytes {
+                    match self.project_streaming_chunk(
+                        &mut chunk_select,
+                        table,
+                        predicate,
+                        copin_s,
+                        &chunk_rows,
+                        &mut remaining_skip,
+                        &mut remaining_take,
+                        &mut rows_out,
+                    ) {
+                        ChunkOutcome::Ok => {}
+                        ChunkOutcome::Defer => {
+                            return self.execute_relational_select_cpu_pinned(select)
+                        }
+                        ChunkOutcome::Hard(err) => return Err(err),
+                    }
+                    chunks_run += 1;
+                    chunk_rows.clear();
+                    chunk_bytes = 0;
+                }
+            }
+        }
+        // The final (partial) chunk — skipped when the LIMIT already filled (rows staged before the
+        // early-exit tripped would be dropped by the window anyway; don't upload them).
+        if !chunk_rows.is_empty() && remaining_take != Some(0) {
+            match self.project_streaming_chunk(
+                &mut chunk_select,
+                table,
+                predicate,
+                copin_s,
+                &chunk_rows,
+                &mut remaining_skip,
+                &mut remaining_take,
+                &mut rows_out,
+            ) {
+                ChunkOutcome::Ok => {}
+                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
+                ChunkOutcome::Hard(err) => return Err(err),
+            }
+            chunks_run += 1;
+        }
+
+        self.read_state
+            .residency
+            .streaming_fold_hits
+            .fetch_add(1, Ordering::Relaxed);
+        self.read_state
+            .residency
+            .streaming_fold_chunks
+            .fetch_add(chunks_run, Ordering::Relaxed);
+
+        Ok(RelationalSelectResult {
+            columns: Arc::new(bound.selected_columns.clone()),
+            rows: rows_out.into(),
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            fallback_reason: None,
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
+        })
+    }
+
+    /// Upload one chunk as a transient resident source, run the projection on the device (bounded by a
+    /// device-side LIMIT of skip+take), then CONCAT the survivors into `rows_out` through the cross-chunk
+    /// OFFSET/LIMIT window. The transient source drops at the end of the call (one chunk resident).
+    #[allow(clippy::too_many_arguments)]
+    fn project_streaming_chunk(
+        &self,
+        chunk_select: &mut Select,
+        table: &RelationalTable,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+        chunk_rows: &[Vec<SqlValue>],
+        remaining_skip: &mut usize,
+        remaining_take: &mut Option<usize>,
+        rows_out: &mut Vec<Vec<SqlValue>>,
+    ) -> ChunkOutcome {
+        // Device gather bound: the skip-span rows must still be gathered (dropped at the window below),
+        // so the device LIMIT is skip + take. No LIMIT -> unbounded (every survivor gathers).
+        chunk_select.limit = remaining_take.map(|take| remaining_skip.saturating_add(take));
+        let chunk_bound = match bind_relational_select(table, chunk_select) {
+            Ok(chunk_bound) => chunk_bound,
+            Err(_) => return ChunkOutcome::Defer,
+        };
+        let (descriptor, device_memory) =
+            match self.build_transient_relation_residency(table, chunk_rows) {
+                Ok(pair) => pair,
+                Err(_) => return ChunkOutcome::Defer,
+            };
+        self.read_state
+            .residency
+            .streaming_fold_peak_chunk_bytes
+            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
+        let src = ResidentExecSource {
+            descriptor: Arc::new(descriptor),
+            device_memory: Arc::new(device_memory),
+            row_count: chunk_rows.len() as u64,
+        };
+        let result = match self.execute_resident_expr_select_with_binding(
+            chunk_select,
+            table,
+            Some(&src),
+            chunk_bound,
+            copin_s,
+            predicate,
+            None,
+            &[],
+            &[],
+            None,
+            &[],
+        ) {
+            Ok(result) => result,
+            Err(err) if is_overflow_error(&err) => return ChunkOutcome::Hard(err),
+            Err(_) => return ChunkOutcome::Defer,
+        };
+        let mut rows = result.rows.into_boxed();
+        // Cross-chunk OFFSET: drop this chunk's survivors that fall inside the remaining skip span.
+        if *remaining_skip > 0 {
+            let dropped = (*remaining_skip).min(rows.len());
+            rows.drain(..dropped);
+            *remaining_skip -= dropped;
+        }
+        // Cross-chunk LIMIT: keep only the rows still needed (the scan early-exits once this hits 0).
+        if let Some(take) = remaining_take {
+            let kept = rows.len().min(*take);
+            rows.truncate(kept);
+            *take -= kept;
+        }
+        rows_out.append(&mut rows);
+        ChunkOutcome::Ok
     }
 
     /// Upload one chunk as a transient resident source, reduce it on the device, and fold the partial in.
