@@ -17405,6 +17405,28 @@ pub enum ExprStep {
         scalar_on_left: bool,
         cmp: u32,
     },
+    /// Push the mask `(text_a[i] <cmp> text_b[i]) ? 1 : 0` for TWO resident TEXT columns — the
+    /// COLUMN-VS-COLUMN twin of `TextCmpMask` (ADR-006): per-row lexicographic unsigned byte
+    /// memcmp (shorter sorts first), matching Rust `str::cmp` == the host recheck. `cmp` codes
+    /// 0=eq/1=lt/2=le/3=gt/4=ge/5=ne. Column order is positional (`a <cmp> b`) — no side flag.
+    /// Launches the NEW `gpu_db_resident_text_compare_columns_to_mask` kernel.
+    TextCmpColumnsMask {
+        a_offsets_byte_offset: u64,
+        a_bytes_byte_offset: u64,
+        b_offsets_byte_offset: u64,
+        b_bytes_byte_offset: u64,
+        cmp: u32,
+    },
+    /// Push the mask `(uuid_a[i] <cmp> uuid_b[i]) ? 1 : 0` for TWO resident UUID columns (16 raw
+    /// bytes/row each in the b128 section) — the COLUMN-VS-COLUMN twin of `UuidCmpMask` (ADR-006):
+    /// unsigned big-endian 16-byte memcmp per row, `cmp` codes 0=eq/1=lt/2=le/3=gt/4=ge/5=ne. Lets
+    /// the mask VM combine `ua <cmp> ub` with AND/OR. Launches the SAME kernel as the standalone
+    /// col-vs-col path (`gpu_db_resident_uuid_compare_columns_to_mask`).
+    UuidCmpColumnsMask {
+        a_byte_offset: u64,
+        b_byte_offset: u64,
+        cmp: u32,
+    },
     /// Push the mask `(textcol[i] LIKE pattern) ? 1 : 0` for the resident TEXT column at
     /// (`offsets_byte_offset`, `bytes_byte_offset`). The pattern is the COMPILED u32 token array (escapes
     /// resolved on the host: each token `(op<<8)|byte`, op 0=literal/1=`_`/2=`%`), stored LE-serialized in
@@ -17666,6 +17688,26 @@ fn run_resident_arith_program<'r>(
         .any(|s| matches!(s, ExprStep::UuidCmpMask { .. }))
     {
         Some(primary.cached_function(c"gpu_db_resident_uuid_compare_scalar_to_mask", &ptx)?)
+    } else {
+        None
+    };
+    // text COL-VS-COL -> i32 mask (ADR-006): the per-row two-column lexicographic byte-compare
+    // kernel, so the VM can combine `ta <cmp> tb` with AND/OR. Lazy (only if used).
+    let text_cmp_columns_mask_fn = if program
+        .iter()
+        .any(|s| matches!(s, ExprStep::TextCmpColumnsMask { .. }))
+    {
+        Some(primary.cached_function(c"gpu_db_resident_text_compare_columns_to_mask", &ptx)?)
+    } else {
+        None
+    };
+    // uuid COL-VS-COL -> i32 mask (ADR-006: the SAME kernel the standalone col-vs-col path
+    // launches), so the VM can combine `ua <cmp> ub` with AND/OR. Lazy (only if used).
+    let uuid_cmp_columns_mask_fn = if program
+        .iter()
+        .any(|s| matches!(s, ExprStep::UuidCmpColumnsMask { .. }))
+    {
+        Some(primary.cached_function(c"gpu_db_resident_uuid_compare_columns_to_mask", &ptx)?)
     } else {
         None
     };
@@ -18213,6 +18255,70 @@ fn run_resident_arith_program<'r>(
                     (&mut a4 as *mut u32).cast::<c_void>(),
                     (&mut a5 as *mut u64).cast::<c_void>(),
                     (&mut a6 as *mut u64).cast::<c_void>(),
+                ];
+                launch(function, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::TextCmpColumnsMask {
+                a_offsets_byte_offset,
+                a_bytes_byte_offset,
+                b_offsets_byte_offset,
+                b_bytes_byte_offset,
+                cmp,
+            } => {
+                // text_a[i] <cmp> text_b[i] (per-row lexicographic unsigned byte memcmp, shorter
+                // sorts first) -> i32 mask pushed on the stack. ABI mirrors the kernel param
+                // order EXACTLY: (resident_ptr, a_offsets, a_bytes, b_offsets, b_bytes,
+                // comparison, n, out_mask_ptr).
+                let function = text_cmp_columns_mask_fn
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = resident_base;
+                let mut a1 = a_offsets_byte_offset;
+                let mut a2 = a_bytes_byte_offset;
+                let mut a3 = b_offsets_byte_offset;
+                let mut a4 = b_bytes_byte_offset;
+                let mut a5 = cmp;
+                let mut a6 = n;
+                let mut a7 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u64).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u32).cast::<c_void>(),
+                    (&mut a6 as *mut u64).cast::<c_void>(),
+                    (&mut a7 as *mut u64).cast::<c_void>(),
+                ];
+                launch(function, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::UuidCmpColumnsMask {
+                a_byte_offset,
+                b_byte_offset,
+                cmp,
+            } => {
+                // uuid_a[i] <cmp> uuid_b[i] (unsigned big-endian 16-byte memcmp per row) -> i32
+                // mask pushed on the stack. ABI mirrors the standalone
+                // `launch_cuda_resident_uuid_compare_columns_filter` launcher EXACTLY:
+                // (resident_ptr, a_byte_offset, b_byte_offset, comparison, n, out_mask_ptr).
+                let function = uuid_cmp_columns_mask_fn
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = resident_base;
+                let mut a1 = a_byte_offset;
+                let mut a2 = b_byte_offset;
+                let mut a3 = cmp;
+                let mut a4 = n;
+                let mut a5 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u64).cast::<c_void>(),
+                    (&mut a3 as *mut u32).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
                 stack.push(out);

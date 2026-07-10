@@ -2170,7 +2170,8 @@ fn compile_predicate_program(
 /// host `str::cmp`; a column-on-RIGHT `'lit' < col` sets `scalar_on_left` — the kernel negates the
 /// ordinal). Mirrors the single-comparison text fast paths but as masks the VM can AND/OR — text
 /// ranges (`name >= 'a' AND name < 'm'`), text IN, and mixed text+int4 WHEREs. Text column-vs-column
-/// is a follow-on, rejected (never mis-answered).
+/// (ADR-006) -> `TextCmpColumnsMask` (the per-row two-column byte-compare kernel; both validity
+/// masks AND'd — either operand NULL is UNKNOWN).
 fn compile_text_eq_leaf(
     op: ResidentBinaryOp,
     lhs: &ResidentExpr,
@@ -2189,10 +2190,29 @@ fn compile_text_eq_leaf(
             (None, Some(col)) if text_literal_value(lhs).is_some() => {
                 (col, text_literal_value(lhs).expect("checked"), false)
             }
-            (Some(_), Some(_)) => {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "text column-vs-column comparison is a follow-on".to_string(),
-                )));
+            (Some(a), Some(b)) => {
+                // COL-VS-COL (ADR-006): the per-row two-column lexicographic byte-compare kernel
+                // as a mask step (`ta <cmp> tb`, positional — no side flip). All six ops share
+                // one cmp-code kernel. 3VL: EITHER operand NULL is UNKNOWN — AND both columns'
+                // validity masks (a NULL row's EMPTY placeholder span would otherwise compare as
+                // "" and mis-order).
+                let Some(cmp) = predicate_compare_code(op) else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "a text col-vs-col leaf must be a comparison (eq/ne/lt/le/gt/ge)"
+                            .to_string(),
+                    )));
+                };
+                let a_layout = resident_device_text_column_layout(snapshot, table, a)?;
+                let b_layout = resident_device_text_column_layout(snapshot, table, b)?;
+                program.push(ExprStep::TextCmpColumnsMask {
+                    a_offsets_byte_offset: a_layout.offsets_byte_offset,
+                    a_bytes_byte_offset: a_layout.bytes_byte_offset,
+                    b_offsets_byte_offset: b_layout.offsets_byte_offset,
+                    b_bytes_byte_offset: b_layout.bytes_byte_offset,
+                    cmp,
+                });
+                push_column_validity_and(a, table, snapshot, program)?;
+                return push_column_validity_and(b, table, snapshot, program);
             }
             _ => {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -2242,7 +2262,8 @@ fn compile_text_eq_leaf(
 /// `UuidCmpMask` VM step + record the literal's 16 bytes in `needles` (ADR-006). Mirrors the
 /// single-comparison uuid fast path (`try_lower_uuid_predicate`) but as a mask the VM can AND/OR —
 /// uuid IN (an OR of `=`), uuid ranges, mixed uuid+int4/text WHEREs. All six comparison ops lower
-/// (uuid is byte-comparable, PG's uuid order). uuid column-vs-column inside AND/OR is a follow-on.
+/// (uuid is byte-comparable, PG's uuid order). uuid column-vs-column (ADR-006) -> the per-row b128
+/// columns kernel as a `UuidCmpColumnsMask` step, both validity masks AND'd.
 fn compile_uuid_leaf(
     op: ResidentBinaryOp,
     lhs: &ResidentExpr,
@@ -2261,10 +2282,20 @@ fn compile_uuid_leaf(
         match (uuid_column_index(lhs, table), uuid_column_index(rhs, table)) {
             (Some(col), None) => (col, uuid_literal_bytes(rhs)?, true),
             (None, Some(col)) => (col, uuid_literal_bytes(lhs)?, false),
-            (Some(_), Some(_)) => {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "uuid column-vs-column inside AND/OR is a follow-on".to_string(),
-                )));
+            (Some(a), Some(b)) => {
+                // COL-VS-COL inside AND/OR (ADR-006): the same per-row b128 memcmp kernel the
+                // standalone col-vs-col path launches, composed as a mask step. Column order is
+                // positional (`ua <cmp> ub`), so no side flip. 3VL: EITHER operand NULL makes the
+                // comparison UNKNOWN — AND both columns' validity masks.
+                let a_byte_offset = resident_device_numeric_column_offset(snapshot, table, a)?;
+                let b_byte_offset = resident_device_numeric_column_offset(snapshot, table, b)?;
+                program.push(ExprStep::UuidCmpColumnsMask {
+                    a_byte_offset,
+                    b_byte_offset,
+                    cmp,
+                });
+                push_column_validity_and(a, table, snapshot, program)?;
+                return push_column_validity_and(b, table, snapshot, program);
             }
             (None, None) => {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -9237,9 +9268,9 @@ impl Engine {
     /// Try to lower a SIMPLE text comparison (`textcol = 'lit'` / `textcol <> 'lit'`, either operand
     /// order) to surviving row indices via the byte-wise text-equality kernel (the type matrix, doc
     /// 19). Equality is byte identity -- PG deterministic-collation semantics. Returns None for a
-    /// non-text predicate (the other type paths handle it). Text INEQUALITIES (need collation sort
-    /// keys), `LIKE`, text `AND`/`OR`, text column-vs-column, and text mixed with another type are hard
-    /// errors -- never a silent mis-answer.
+    /// non-text predicate (the other type paths handle it). Inequalities, LIKE, and col-vs-col
+    /// (ADR-006) lower via their kernels below; text `AND`/`OR` falls through to the mask VM; text
+    /// mixed with another type in ONE comparison is a hard error -- never a silent mis-answer.
     #[allow(clippy::too_many_arguments)]
     fn try_lower_text_predicate(
         &self,
@@ -9276,6 +9307,25 @@ impl Engine {
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
+        // COL-VS-COL single comparison (ADR-006): BOTH sides are text columns — run the per-row
+        // two-column compare kernel via a one-leaf mask program (`compile_text_eq_leaf`'s
+        // col-vs-col arm, which ANDs BOTH validity masks — either operand NULL is UNKNOWN). All
+        // six ops; `a LIKE b` (col-vs-col LIKE) errors cleanly inside the leaf. The AND/OR shapes
+        // already composed via the fall-through above.
+        if text_column_index(lhs, table).is_some() && text_column_index(rhs, table).is_some() {
+            let mut program = Vec::new();
+            let mut needles: Vec<Vec<u8>> = Vec::new();
+            compile_text_eq_leaf(compare, lhs, rhs, table, snapshot, &mut program, &mut needles)?;
+            return device_memory
+                .run_expr_predicate_filter_with_text(
+                    &program,
+                    &needles,
+                    row_count,
+                    ResidentElemType::I32,
+                )
+                .map(Some)
+                .map_err(map_err);
+        }
         // textcol LIKE 'pattern' (the pattern is on the right; LIKE is NOT symmetric). The host
         // compiles the pattern (resolving `\` escapes) to the kernel's u32 token array.
         if matches!(compare, ResidentBinaryOp::Like) {
@@ -9318,11 +9368,6 @@ impl Engine {
                     }
                     (None, Some(col)) if text_literal_value(lhs).is_some() => {
                         (col, text_literal_value(lhs).expect("checked"), true)
-                    }
-                    (Some(_), Some(_)) => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "text column-vs-column comparison is a follow-on".to_string(),
-                        )));
                     }
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -9376,11 +9421,6 @@ impl Engine {
             }
             (None, Some(col)) if text_literal_value(lhs).is_some() => {
                 (col, text_literal_value(lhs).expect("checked"))
-            }
-            (Some(_), Some(_)) => {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "text column-vs-column comparison is a follow-on".to_string(),
-                )));
             }
             _ => {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(

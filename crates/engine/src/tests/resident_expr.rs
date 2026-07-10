@@ -743,6 +743,103 @@ fn gpu_resident_expr_mixed_width_where_3vl() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_col_vs_col_text_uuid() {
+    // ADR-006 (col-vs-col, the LAST predicate edge): `text_a <cmp> text_b` runs per-row on the
+    // NEW two-column lexicographic byte-compare kernel (singles + inside AND/OR), and
+    // `uuid_a <cmp> uuid_b` composes inside AND/OR via the existing b128 columns kernel as a
+    // mask step. Rows are ADVERSARIAL for the text kernel (the hand-PTX doctrine): byte order
+    // ('B' < 'b'), shorter-prefix-first ('ab' < 'b'), length tiebreak ('ab' > 'a'), equal,
+    // empty-vs-nonempty. 3VL: a NULL operand's placeholder (empty span / 16 zero bytes) sorts
+    // below everything — only the BOTH-validity AND keeps those rows out.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tcc (id INT, a TEXT, b TEXT, u1 UUID, u2 UUID)")
+        .unwrap();
+    let u = |n: u32| format!("00000000-0000-0000-0000-{n:012x}");
+    let z2 = u(2);
+    e.execute_text(
+        2,
+        &format!(
+            "INSERT INTO tcc (id,a,b,u1,u2) VALUES \
+             (1,'B','b','{0}','{z2}'),\
+             (2,'ab','b','{z2}','{z2}'),\
+             (3,'ab','a','{z2}','{0}'),\
+             (4,'same','same','{0}','{0}'),\
+             (5,'','x','{0}','{z2}'),\
+             (6,NULL,'x',NULL,'{z2}'),\
+             (7,'q',NULL,'{0}',NULL),\
+             (8,'zé','za','{z2}','{z2}'),\
+             (9,'abc','abd','{z2}','{z2}')",
+            u(1)
+        ),
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tcc").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // SINGLE text col-vs-col `a < b`: 1 ('B'<'b' byte order), 2 ('ab'<'b' first byte), 5 (''<'x'
+    // shorter-first). 3 ('ab'>'a'), 4 (equal) fail; 6/7 are NULL-operand rows — the placeholder
+    // empty span would sort below everything, only validity excludes them.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tcc WHERE a < b")
+        .expect("text col-vs-col single runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(5)],
+            vec![SqlValue::Int4(9)],
+        ],
+        "a < b: byte order + shorter-first + multi-char prefix ('abc'<'abd'); row 8 ('z\u{e9}' vs \
+         'za') must NOT match - the 0xC3 lead byte compares UNSIGNED above 'a' (a signed compare \
+         would leak it); NULL rows excluded by BOTH-validity 3VL"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    // SINGLE `a = b`: row 4 only (empty-vs-'x' and NULLs excluded).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tcc WHERE a = b")
+        .expect("text col-vs-col equality runs on the GPU");
+    assert_eq!(r.rows, vec![vec![SqlValue::Int4(4)]], "a = b: the equal row only");
+    // Text col-vs-col INSIDE AND (the mask-VM composition): `a >= b AND id < 7` -> 3, 4
+    // (row 7's NULL b excluded by validity, not by the id bound — id 7 fails both).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tcc WHERE a >= b AND id < 90")
+        .expect("text col-vs-col inside AND runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(4)], vec![SqlValue::Int4(8)]],
+        "a >= b AND id: length tiebreak ('ab' > 'a') + equal + UNSIGNED high-bit ('z\u{e9}' >= \
+         'za'); NULL-b row 7 excluded (3VL)"
+    );
+    // UUID col-vs-col INSIDE AND: `u1 < u2 AND id < 90` -> 1, 5 (byte-wise b128; row 2 equal,
+    // row 3 u1>u2, row 4 equal; row 6's NULL u1 = 16 ZERO bytes < u2 — validity excludes it).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tcc WHERE u1 < u2 AND id < 90")
+        .expect("uuid col-vs-col inside AND runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(5)]],
+        "u1 < u2 in AND: NULL-u1 row 6 (zero-byte placeholder < u2) excluded by validity"
+    );
+    // UUID equality in AND: `u1 = u2 AND id < 90` -> 2, 4 (row 7's NULL u2 excluded).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tcc WHERE u1 = u2 AND id < 90")
+        .expect("uuid col-vs-col equality inside AND runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(4)],
+            vec![SqlValue::Int4(8)],
+            vec![SqlValue::Int4(9)],
+        ],
+        "u1 = u2 in AND: rows 2,4,8,9; NULL rows excluded (3VL)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_where_3vl_over_nullable_numeric() {
     // M3 (doc 21): a WHERE over a nullable NUMERIC column excludes NULL rows on the GPU. A numeric is an
     // i128 mantissa whose value exceeds the VM's i32 CompareScalar, so a same-or-coarser-scale comparison
