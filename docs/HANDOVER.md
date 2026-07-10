@@ -5,7 +5,12 @@
 > **mandate** in CHARTER.md; the **plan** in PLAN.md. The E2.5c campaign detail + gate ledger is in
 > HANDOVER_REMAINING_WORK.md; the WAL/conveyor research record is in WRITE_CONVEYOR.md.
 
-**Updated:** 2026-07-10. **Base:** `main` @ `337454c7` (CPU-ENGINE RETIREMENT — TWENTY-FOUR merged wins:
+**Updated:** 2026-07-10. **Base:** `main` @ `451bb054` (CPU-ENGINE RETIREMENT — TWENTY-FIVE merged wins:
+FK-REFERENCED PARENTS ELIDE (inbound-FK eligibility lifted for i32-PK-referenced tables — the FK validators were
+already elision-aware via `visible_row_with_value`'s device arm; child INSERTs' parent-exists + parent DELETEs'
+surviving-provider probes run ON-DEVICE, decline→rehydrate; + the DELETE-arm mid-preflight re-pin (the CHECK audit's
+deferred twin) + PG MATCH-SIMPLE NULL-fk 3VL in both validator families; outbound/child-side FKs still block = the
+remaining sub-slice) `451bb054`;
 CHECK-on-NULL PG 3VL fix (NULL SATISFIES a CHECK — both engine evaluators guarded; legacy gpu-db-server emulator
 divergence noted-not-patched per the charter ruling) `337454c7`;
 CHECK-CONSTRAINED TABLES ELIDE (the first constraint class lifted — CHECK is row-local; ADD CHECK's existing-row
