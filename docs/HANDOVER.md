@@ -35,14 +35,16 @@ scalar partials (StreamAccum/compare_sql_values gone); the cross-chunk OFFSET/LI
 the streaming module's host relational computation is ZERO outside two registered items (the grouped per-round
 narrow — see the hazard below — and the cold tier/scan-build, deletion trigger 6c-1..3). Audit MERGE-SAFE zero
 C/H with the standing charter-drift section; three LOWs adopted.
-**⚠ OPEN HAZARD (found by 6c-0's renorm attempt, honestly reverted): the grouped merge over b128 (numeric)
-partials produces ORDER-DEPENDENT DUPLICATE GROUPS** — latent in shipped S-E.3 (reachable: SUM(bigint/numeric)
-GROUP BY over a streamed table; never test-exercised). REPRO: run `gpu_streaming_cold_tier_spills_and_replays_
-from_disk` then `gpu_streaming_distinct_over_budget_set_union` in one process WITH Count partials declared
-Numeric{38,0} (the reverted 6c-0(c) diff) — a duplicate Int4(0) group appears; isolation passes (fresh driver
-pages ARE zero; pool-recycled scratch is not). PRIME SUSPECT: un-memset accumulator slots (slot_count/slot_sum/
-slot_sum_hi) in `launch_cuda_group_by_i32_count_sum`'s leased buffers (execution/lib.rs ~8481-8560 — the key
-slots get fill kernels, those don't visibly). NEXT SLICE = pin + fix this kernel, then re-land 6c-0(c).
+**✅ HAZARD FIXED (`0c96d1d3`): the MASKED-PASS2 phantom-group kernel bug.** Root cause (device-probed, NOT the
+suspected un-memset accumulators — those were already filled): grouped numeric aggregation is TWO-PASS; pass 1
+writes `row_slots` ONLY inside its mask-skippable MIN/MAX block; pass 2 (`numeric_minmax_lo`) launched
+UNCONDITIONALLY and scattered slot_min/max through STALE POOLED row_slots — unbounded OOB writes corrupting
+adjacent pool buffers (the compactor's out_count inflated -> a phantom group (Int4(0), Null) from never-scattered
+stale bytes; order-dependent because fresh driver pages are zero). FIX = one line: pass2 gates on
+`value_is_numeric && (agg_mask & 12) != 0`, matching its producer. REGRESSION GATE = the suite order
+`cold_tier_spills` -> `distinct_over_budget` (deterministic under sabotage); a new shape test pins numeric
+partials + SUM mask reaching the merge. **6c-0(c) RE-LANDED in the same commit** — the per-round host narrow
+loop is DELETED (the last of the three glosses); the wrap/narrow are staging-encode/readback coercions.
 **S-E.6c remaining (device-first, deletion-gated):** (1) sealed shards WITH
 on-device version stamps (SV3b/SV6) as the PRIMARY over-VRAM representation, fold consumes shard bytes directly →
 DELETE the cold cache + scan-build in that merge; (2) writes: INSERT appends a sealed cold shard (no rebuild),
