@@ -429,6 +429,18 @@ fn gpu_streaming_projection_limit_offset_windows_and_early_exits() {
         "cross-chunk OFFSET+LIMIT window"
     );
 
+    // 6c-0 coverage (audit LOW): OFFSET WITHOUT LIMIT — unbounded take, device-sliced [offset, len).
+    let offset_only = e
+        .execute_relational_select(&select("SELECT a FROM big OFFSET 1495"))
+        .unwrap();
+    let expected_tail: Vec<Vec<SqlValue>> = (1495..N).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(offset_only.rows.clone().into_boxed(), expected_tail, "OFFSET without LIMIT");
+    // 6c-0 coverage (audit LOW): LIMIT 0 — zero chunks, empty result, no error.
+    let zero = e
+        .execute_relational_select(&select("SELECT a FROM big LIMIT 0"))
+        .unwrap();
+    assert!(zero.rows.is_empty(), "LIMIT 0 is the empty result");
+
     // Differential vs the CPU pinned path for the same windowed query.
     e.clear_relational_residency_budget_bytes(0);
     let cpu = e

@@ -40,8 +40,7 @@ use crate::engine_expr::{
     ResidentExpr,
 };
 use crate::rel_exec_helpers::{
-    bind_relational_select, catalog_relation_table, compare_sql_values, decode_relational_row,
-    relational_key_prefix,
+    bind_relational_select, catalog_relation_table, decode_relational_row, relational_key_prefix,
 };
 use std::sync::atomic::Ordering;
 
@@ -79,22 +78,6 @@ enum StreamAgg {
     Sum,
     Min,
     Max,
-}
-
-/// The running SUM partial. The executor returns `Int8` for `SUM(int4)` and `Numeric` for
-/// `SUM(int8)`/`SUM(numeric)`; a fold sees ONE column type, so the kind is fixed after the first
-/// non-null contribution (a mismatch => defer to CPU, never a wrong combine).
-enum SumPartial {
-    Empty,
-    Int(i128),
-    Dec(Decimal128),
-}
-
-/// The cross-chunk accumulator: the host-side (control-plane) COMBINE of the per-chunk device partials.
-enum StreamAccum {
-    Count(i128),
-    Sum(SumPartial),
-    Extreme { is_max: bool, current: Option<SqlValue> },
 }
 
 /// A chunk's device reduction either combined cleanly, or hit a shape the streaming path should hand back
@@ -343,114 +326,52 @@ const STREAMING_COLD_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// S-E.6b: the spilled-class cap (unlinked NVMe/temp files). Engine-internal, not config.
 const STREAMING_COLD_DISK_CAP_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
-impl StreamAccum {
-    fn new(agg: StreamAgg) -> Self {
-        match agg {
-            StreamAgg::Count => StreamAccum::Count(0),
-            StreamAgg::Sum => StreamAccum::Sum(SumPartial::Empty),
-            StreamAgg::Min => StreamAccum::Extreme {
-                is_max: false,
-                current: None,
-            },
-            StreamAgg::Max => StreamAccum::Extreme {
-                is_max: true,
-                current: None,
-            },
-        }
-    }
-
-    /// Fold one chunk's device COUNT(*) (always available — the empty-filtered-set guard).
-    fn add_count(&mut self, chunk_count: i64) {
-        if let StreamAccum::Count(total) = self {
-            *total += i128::from(chunk_count);
-        }
-    }
-
-    /// Fold one chunk's device SUM/MIN/MAX value into the running partial. A `Null` value (an all-NULL
-    /// filtered chunk) contributes nothing (PG). Returns `Defer` on an unexpected variant.
-    fn combine_value(&mut self, value: SqlValue) -> ChunkOutcome {
-        match self {
-            StreamAccum::Count(_) => ChunkOutcome::Ok,
-            StreamAccum::Sum(partial) => {
-                match value {
-                    SqlValue::Null => ChunkOutcome::Ok,
-                    // SUM(int4) -> Int8 partials: accumulate as i128 (the running total can exceed i64;
-                    // the final narrow to bigint is overflow-checked in `finalize`).
-                    SqlValue::Int8(n) => match partial {
-                        SumPartial::Empty => {
-                            *partial = SumPartial::Int(i128::from(n));
-                            ChunkOutcome::Ok
-                        }
-                        SumPartial::Int(acc) => {
-                            *acc += i128::from(n);
-                            ChunkOutcome::Ok
-                        }
-                        SumPartial::Dec(_) => ChunkOutcome::Defer,
-                    },
-                    // SUM(int8)/SUM(numeric) -> Numeric partials at the column scale: checked scale-aligned
-                    // add (a genuine numeric overflow surfaces as a hard error, matching PG + the executor).
-                    SqlValue::Numeric(d) => match partial {
-                        SumPartial::Empty => {
-                            *partial = SumPartial::Dec(d);
-                            ChunkOutcome::Ok
-                        }
-                        SumPartial::Dec(acc) => match acc.checked_add(d) {
-                            Ok(sum) => {
-                                *acc = sum;
-                                ChunkOutcome::Ok
-                            }
-                            Err(_) => ChunkOutcome::Hard(ExecuteError::Engine(
-                                EngineError::ApplyFailed("numeric field overflow".to_string()),
-                            )),
-                        },
-                        SumPartial::Int(_) => ChunkOutcome::Defer,
-                    },
-                    _ => ChunkOutcome::Defer,
-                }
+/// 6c-0 (charter-drift ruling): the SCALAR combine runs ON THE DEVICE. Per-chunk partials collect as
+/// rows of a synthesized one-column relation and ONE final device aggregate pass folds them — the
+/// S-E.3 synthesized-relation merge shape (`catalog_relation_table` + injected src). The former host
+/// accumulator (StreamAccum: Decimal128 adds, compare_sql_values extremes) is DELETED in this merge.
+/// The partial column's type + the fold aggregate per original shape (the S-E.3 typing rules):
+/// COUNT -> Int8 partials folded by SUM; SUM(int2/4) -> Int8 by SUM; SUM(int8) -> Numeric{38,0} by
+/// SUM; SUM(numeric{p,s}) -> same numeric by SUM; MIN/MAX -> the value type by MIN/MAX. Returns None
+/// when the value type is not device-reducible (the per-chunk pass would have deferred anyway).
+fn scalar_partial_plan(
+    table: &RelationalTable,
+    select: &Select,
+    agg: StreamAgg,
+) -> Option<(SqlType, SelectProjection)> {
+    let value_type = |column: &String| {
+        table
+            .columns
+            .iter()
+            .find(|c| &c.name == column)
+            .map(|c| c.ty)
+    };
+    let partial = "__p0".to_string();
+    match (agg, &select.projection) {
+        (StreamAgg::Count, _) => Some((SqlType::Int8, SelectProjection::Sum { column: partial })),
+        (StreamAgg::Sum, SelectProjection::Sum { column }) => match value_type(column)? {
+            SqlType::Int2 | SqlType::Int4 => {
+                Some((SqlType::Int8, SelectProjection::Sum { column: partial }))
             }
-            StreamAccum::Extreme { is_max, current } => {
-                if matches!(value, SqlValue::Null) {
-                    return ChunkOutcome::Ok;
-                }
-                match current {
-                    None => *current = Some(value),
-                    Some(existing) => {
-                        let ordering = compare_sql_values(&value, existing);
-                        let take = if *is_max {
-                            ordering == std::cmp::Ordering::Greater
-                        } else {
-                            ordering == std::cmp::Ordering::Less
-                        };
-                        if take {
-                            *current = Some(value);
-                        }
-                    }
-                }
-                ChunkOutcome::Ok
+            SqlType::Int8 => Some((
+                SqlType::Numeric {
+                    precision: 38,
+                    scale: 0,
+                },
+                SelectProjection::Sum { column: partial },
+            )),
+            numeric @ SqlType::Numeric { .. } => {
+                Some((numeric, SelectProjection::Sum { column: partial }))
             }
+            _ => None,
+        },
+        (StreamAgg::Min, SelectProjection::Min { column }) => {
+            Some((value_type(column)?, SelectProjection::Min { column: partial }))
         }
-    }
-
-    /// The combined scalar: COUNT -> Int8; SUM -> the partial narrowed to its PG type (NULL if no
-    /// non-null contribution); MIN/MAX -> the extreme (NULL over an empty/all-null set).
-    fn finalize(self) -> Result<SqlValue, ExecuteError> {
-        match self {
-            StreamAccum::Count(total) => i64::try_from(total).map(SqlValue::Int8).map_err(|_| {
-                ExecuteError::Engine(EngineError::ApplyFailed(
-                    "bigint out of range in COUNT(*)".to_string(),
-                ))
-            }),
-            StreamAccum::Sum(SumPartial::Empty) => Ok(SqlValue::Null),
-            StreamAccum::Sum(SumPartial::Int(total)) => {
-                i64::try_from(total).map(SqlValue::Int8).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(
-                        "bigint out of range".to_string(),
-                    ))
-                })
-            }
-            StreamAccum::Sum(SumPartial::Dec(sum)) => Ok(SqlValue::Numeric(sum)),
-            StreamAccum::Extreme { current, .. } => Ok(current.unwrap_or(SqlValue::Null)),
+        (StreamAgg::Max, SelectProjection::Max { column }) => {
+            Some((value_type(column)?, SelectProjection::Max { column: partial }))
         }
+        _ => None,
     }
 }
 
@@ -700,8 +621,14 @@ impl Engine {
             s
         };
         let count_bound = bind_relational_select(table, &count_select)?;
+        // 6c-0: the device-combine plan (partial column type + the fold aggregate). A value type the
+        // device cannot reduce declines here (the per-chunk pass would defer on it anyway).
+        let Some((partial_type, fold_projection)) = scalar_partial_plan(table, select, agg) else {
+            return self.execute_relational_select_cpu_pinned(select);
+        };
 
-        let mut accum = StreamAccum::new(agg);
+        let mut partials: Vec<Vec<SqlValue>> = Vec::new();
+        let mut total_matched: i64 = 0;
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
         let mut chunks_run: u64 = 0;
@@ -739,7 +666,8 @@ impl Engine {
                         &src,
                         &count_select,
                         &count_bound,
-                        &mut accum,
+                        &mut partials,
+                        &mut total_matched,
                     ) {
                         ChunkOutcome::Ok => {}
                         ChunkOutcome::Defer => {
@@ -793,7 +721,8 @@ impl Engine {
                             &src,
                             &count_select,
                             &count_bound,
-                            &mut accum,
+                            &mut partials,
+                            &mut total_matched,
                         ) {
                             ChunkOutcome::Ok => {}
                             ChunkOutcome::Defer => {
@@ -829,7 +758,8 @@ impl Engine {
                     &src,
                     &count_select,
                     &count_bound,
-                    &mut accum,
+                    &mut partials,
+                    &mut total_matched,
                 ) {
                     ChunkOutcome::Ok => {}
                     ChunkOutcome::Defer => {
@@ -854,7 +784,8 @@ impl Engine {
                 &src,
                 &count_select,
                 &count_bound,
-                &mut accum,
+                &mut partials,
+                &mut total_matched,
             ) {
                 ChunkOutcome::Ok => {}
                 ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
@@ -863,7 +794,51 @@ impl Engine {
             chunks_run += 1;
         }
 
-        let value = accum.finalize()?;
+        // 6c-0: the CROSS-CHUNK COMBINE runs ON THE DEVICE — one aggregate pass over the collected
+        // partials as a synthesized one-column relation. Zero matched rows emits PG's empty-set
+        // result (COUNT->0, else NULL) from CARDINALITY bookkeeping alone — charter basis: kernel
+        // orchestration (the host may decide WHETHER to launch from row counts, and the device SUM
+        // fold over an empty partial set could not represent COUNT's 0 anyway); no data VALUE is
+        // read or combined on the host here (audit 6c-0 LOW: justified from charter text, not
+        // precedent, per the charter-drift ruling).
+        let value = if total_matched == 0 {
+            match agg {
+                StreamAgg::Count => SqlValue::Int8(0),
+                _ => SqlValue::Null,
+            }
+        } else {
+            match self.combine_scalar_partials_on_device(
+                select,
+                table,
+                partial_type,
+                &fold_projection,
+                copin_s,
+                &partials,
+                budget,
+            ) {
+                Ok(value) => value,
+                // An all-NULL partial set (every matched row NULL in every chunk) hard-errors the
+                // device scalar path; the CPU path serves it — honest edge coverage, never wrong.
+                Err(()) => return self.execute_relational_select_cpu_pinned(select),
+            }
+        };
+        // 6c-0 readback boundary: the device SUM over Int8 partials returns Numeric(_,0) (PG's SUM
+        // ladder); COUNT / SUM(int4) present as bigint on the wire — ONE checked narrow of the single
+        // result cell at materialization (the charter's readback carve-out; a narrow overflow is PG's
+        // own "bigint out of range").
+        let value = match (&value, agg, matches!(partial_type, SqlType::Int8)) {
+            (SqlValue::Numeric(d), StreamAgg::Count | StreamAgg::Sum, true) if d.scale == 0 => {
+                match i64::try_from(d.mantissa) {
+                    Ok(narrowed) => SqlValue::Int8(narrowed),
+                    Err(_) => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "bigint out of range".to_string(),
+                        )))
+                    }
+                }
+            }
+            _ => value,
+        };
         // S-E.6: a COMPLETE scan installs its captured chunks for byte-replay by later reads.
         if let Some(builder) = capture {
             self.install_streaming_cold(&select.table, builder);
@@ -909,16 +884,20 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let chunk_target_bytes = (budget / 2).max(1);
         let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
-        // The per-chunk select: the SAME projection + WHERE, OFFSET dropped (applied cross-chunk — a
-        // chunk cannot know the prior chunks' survivor count at bind time) and LIMIT re-derived per
-        // chunk from the rows still needed (skip-span rows must also be gathered; they are dropped at
-        // the cross-chunk window below — a bounded cost of OFFSET over a stream).
+        // 6c-0: the WINDOW BOUND = offset+limit. Per chunk the DEVICE limit is this constant (a
+        // chunk's first `bound` survivors are its only possible global-window contribution); the
+        // cross-chunk window itself runs as ONE final device pass. The fold's early-exit is pure
+        // cardinality flow-control (`collected >= bound`), never value-based windowing on the host.
+        let window_bound: Option<usize> = select
+            .limit
+            .map(|limit| select.offset.unwrap_or(0).saturating_add(limit));
         let mut chunk_select = select.clone();
         chunk_select.offset = None;
-        chunk_select.limit = None;
+        chunk_select.limit = window_bound;
+        let Ok(chunk_bound) = bind_relational_select(table, &chunk_select) else {
+            return self.execute_relational_select_cpu_pinned(select);
+        };
 
-        let mut remaining_skip: usize = select.offset.unwrap_or(0);
-        let mut remaining_take: Option<usize> = select.limit;
         let mut rows_out: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
@@ -938,7 +917,7 @@ impl Engine {
         };
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
-                if remaining_take == Some(0) {
+                if window_bound.is_some_and(|bound| rows_out.len() >= bound) {
                     break;
                 }
                 let Ok(next) = self.stage_cold_chunk(chunk) else {
@@ -947,7 +926,7 @@ impl Engine {
                     self.evict_streaming_cold(&select.table);
                     return self.execute_relational_select_cpu_pinned(select);
                 };
-                let to_compute = if remaining_take.is_some() {
+                let to_compute = if window_bound.is_some() {
                     Some(next)
                 } else {
                     staged.replace(next)
@@ -957,13 +936,12 @@ impl Engine {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
                     match self.project_streaming_chunk(
-                        &mut chunk_select,
+                        &chunk_select,
                         table,
+                        &chunk_bound,
                         predicate,
                         copin_s,
                         &src,
-                        &mut remaining_skip,
-                        &mut remaining_take,
                         &mut rows_out,
                     ) {
                         ChunkOutcome::Ok => {}
@@ -990,7 +968,7 @@ impl Engine {
             while let Some(tuple) = cursor.next() {
                 // LIMIT satisfied -> STOP the scan: no further row is staged, decoded, or uploaded.
                 // The capture is INCOMPLETE at an early exit — discard it (never install a partial set).
-                if remaining_take == Some(0) {
+                if window_bound.is_some_and(|bound| rows_out.len() >= bound) {
                     capture = None;
                     break;
                 }
@@ -1006,7 +984,7 @@ impl Engine {
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
-                    let to_compute = if remaining_take.is_some() {
+                    let to_compute = if window_bound.is_some() {
                         Some(next) // limited: compute eagerly (early-exit fidelity)
                     } else {
                         staged.replace(next) // unbounded: pipeline one chunk ahead
@@ -1016,13 +994,12 @@ impl Engine {
                             return self.execute_relational_select_cpu_pinned(select);
                         };
                         match self.project_streaming_chunk(
-                            &mut chunk_select,
+                            &chunk_select,
                             table,
+                            &chunk_bound,
                             predicate,
                             copin_s,
                             &src,
-                            &mut remaining_skip,
-                            &mut remaining_take,
                             &mut rows_out,
                         ) {
                             ChunkOutcome::Ok => {}
@@ -1041,11 +1018,11 @@ impl Engine {
         // The final (partial) chunk — skipped when the LIMIT already filled (rows staged before the
         // early-exit tripped would be dropped by the window anyway; don't upload them). Then DRAIN the
         // unbounded pipeline (the last staged chunk still needs its compute).
-        if !chunk_rows.is_empty() && remaining_take != Some(0) {
+        if !chunk_rows.is_empty() && window_bound.is_none_or(|bound| rows_out.len() < bound) {
             let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, &mut capture) else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
-            let to_compute = if remaining_take.is_some() {
+            let to_compute = if window_bound.is_some() {
                 Some(next)
             } else {
                 staged.replace(next)
@@ -1055,13 +1032,12 @@ impl Engine {
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 match self.project_streaming_chunk(
-                    &mut chunk_select,
+                    &chunk_select,
                     table,
+                    &chunk_bound,
                     predicate,
                     copin_s,
                     &src,
-                    &mut remaining_skip,
-                    &mut remaining_take,
                     &mut rows_out,
                 ) {
                     ChunkOutcome::Ok => {}
@@ -1078,13 +1054,12 @@ impl Engine {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             match self.project_streaming_chunk(
-                &mut chunk_select,
+                &chunk_select,
                 table,
+                &chunk_bound,
                 predicate,
                 copin_s,
                 &src,
-                &mut remaining_skip,
-                &mut remaining_take,
                 &mut rows_out,
             ) {
                 ChunkOutcome::Ok => {}
@@ -1094,6 +1069,16 @@ impl Engine {
             chunks_run += 1;
         }
 
+        // 6c-0: the cross-chunk OFFSET/LIMIT window — ONE device pass over the collected survivors
+        // (the executor's own window path); without a window the concat IS the result. A window-pass
+        // decline (e.g. the collected set over budget) defers to the CPU path — never a wrong window.
+        if (select.limit.is_some() || select.offset.is_some())
+            && self
+                .window_streaming_rows(select, bound, copin_s, &mut rows_out, budget)
+                .is_err()
+        {
+            return self.execute_relational_select_cpu_pinned(select);
+        }
         // S-E.6: a COMPLETE scan installs its captured chunks (None after a LIMIT early-exit).
         if let Some(builder) = capture {
             self.install_streaming_cold(&select.table, builder);
@@ -1118,32 +1103,27 @@ impl Engine {
     }
 
     /// Upload one chunk as a transient resident source, run the projection on the device (bounded by a
-    /// device-side LIMIT of skip+take), then CONCAT the survivors into `rows_out` through the cross-chunk
-    /// OFFSET/LIMIT window. The transient source drops at the end of the call (one chunk resident).
+    /// device-side LIMIT of the window bound — a chunk's first `offset+limit` survivors are its only
+    /// possible contribution to the global window), and CONCAT the survivors. 6c-0 (charter-drift
+    /// ruling): the former host drain/truncate windowing is DELETED — the cross-chunk window runs as
+    /// ONE final device pass (`window_streaming_rows`); the fold's early-exit is pure CARDINALITY
+    /// flow-control on the collected count.
     #[allow(clippy::too_many_arguments)]
     fn project_streaming_chunk(
         &self,
-        chunk_select: &mut Select,
+        chunk_select: &Select,
         table: &RelationalTable,
+        chunk_bound: &BoundRelationalSelect,
         predicate: Option<&ResidentExpr>,
         copin_s: Index,
         src: &ResidentExecSource,
-        remaining_skip: &mut usize,
-        remaining_take: &mut Option<usize>,
         rows_out: &mut Vec<Vec<SqlValue>>,
     ) -> ChunkOutcome {
-        // Device gather bound: the skip-span rows must still be gathered (dropped at the window below),
-        // so the device LIMIT is skip + take. No LIMIT -> unbounded (every survivor gathers).
-        chunk_select.limit = remaining_take.map(|take| remaining_skip.saturating_add(take));
-        let chunk_bound = match bind_relational_select(table, chunk_select) {
-            Ok(chunk_bound) => chunk_bound,
-            Err(_) => return ChunkOutcome::Defer,
-        };
         let result = match self.execute_resident_expr_select_with_binding(
             chunk_select,
             table,
             Some(src),
-            chunk_bound,
+            chunk_bound.clone(),
             copin_s,
             predicate,
             None,
@@ -1156,21 +1136,65 @@ impl Engine {
             Err(err) if is_overflow_error(&err) => return ChunkOutcome::Hard(err),
             Err(_) => return ChunkOutcome::Defer,
         };
-        let mut rows = result.rows.into_boxed();
-        // Cross-chunk OFFSET: drop this chunk's survivors that fall inside the remaining skip span.
-        if *remaining_skip > 0 {
-            let dropped = (*remaining_skip).min(rows.len());
-            rows.drain(..dropped);
-            *remaining_skip -= dropped;
-        }
-        // Cross-chunk LIMIT: keep only the rows still needed (the scan early-exits once this hits 0).
-        if let Some(take) = remaining_take {
-            let kept = rows.len().min(*take);
-            rows.truncate(kept);
-            *take -= kept;
-        }
-        rows_out.append(&mut rows);
+        rows_out.append(&mut result.rows.into_boxed());
         ChunkOutcome::Ok
+    }
+
+    /// 6c-0: the cross-chunk OFFSET/LIMIT window as ONE device pass — the collected survivors upload
+    /// as a synthesized relation and the executor applies `[OFFSET, OFFSET+LIMIT)` on its own window
+    /// path (`sort_streaming_runs` with an EMPTY ORDER BY — the S-E.4 machinery minus the sort).
+    fn window_streaming_rows(
+        &self,
+        select: &Select,
+        bound: &BoundRelationalSelect,
+        copin_s: Index,
+        rows_out: &mut Vec<Vec<SqlValue>>,
+        budget: u64,
+    ) -> Result<(), ()> {
+        let window_column_refs: Vec<(&str, SqlType)> = bound
+            .selected_columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty))
+            .collect();
+        let partial_types: Vec<SqlType> = window_column_refs.iter().map(|(_, ty)| *ty).collect();
+        let window_table =
+            catalog_relation_table(&select.table, "__stream_window", &window_column_refs);
+        let window_select = Select {
+            table: window_table.name.clone(),
+            distinct: false,
+            projection: SelectProjection::Columns(
+                window_column_refs
+                    .iter()
+                    .map(|(name, _)| (*name).to_string())
+                    .collect(),
+            ),
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: select.limit,
+            offset: select.offset,
+        };
+        let window_bound = bind_relational_select(&window_table, &window_select).map_err(|_| ())?;
+        let mut rows_bytes: u64 = rows_out
+            .iter()
+            .map(|row| chunk_row_device_bytes(row, &partial_types))
+            .sum();
+        match self.sort_streaming_runs(
+            &window_select,
+            &window_table,
+            &window_bound,
+            copin_s,
+            &partial_types,
+            rows_out,
+            &mut rows_bytes,
+            budget,
+        ) {
+            ChunkOutcome::Ok => Ok(()),
+            _ => Err(()),
+        }
     }
 
     /// STRATA S-E.3 — the GROUP BY / DISTINCT two-level fold. LEVEL 1: each byte-bounded chunk runs the
@@ -1308,8 +1332,12 @@ impl Engine {
         let Ok(merge_bound) = bind_relational_select(&partials_table, &merge_select) else {
             return self.execute_relational_select_cpu_pinned(select);
         };
-        // Which merged columns re-type back to Int8 (the merge SUM widens Int8 partials to Numeric(_,0);
-        // COUNT and SUM-over-int2/int4 are Int8-typed partials — their merged cells narrow back).
+        // 6c-0 ATTEMPTED + REVERTED (registered debt, memory `charter-drift-execution-discipline`):
+        // declaring these partials Numeric{38,0} (narrow-once-at-readback) EXPOSED an order-dependent
+        // duplicate-group bug in the grouped merge over b128 partials (uninitialized-scratch class —
+        // see the HANDOVER hazard note). Until that kernel path is fixed, the Int8 partials + the
+        // per-round narrow below stay — the narrow remains REGISTERED host debt, now blocked on the
+        // numeric-grouped-merge hazard, NOT accepted as compliant.
         let narrow_to_int8: Vec<bool> = aggregates
             .iter()
             .zip(partial_types.iter().skip(1))
@@ -2290,7 +2318,8 @@ impl Engine {
         let mut merged: Vec<Vec<SqlValue>> = Vec::new();
         let mut merged_bytes: u64 = 0;
         for mut row in result.rows.into_boxed() {
-            // Re-type: merged column i+1 narrows Numeric(_,0) -> Int8 where the partial is Int8-typed.
+            // Re-type: merged column i+1 narrows Numeric(_,0) -> Int8 where the partial is Int8-typed
+            // (REGISTERED host debt — see the note at `narrow_to_int8`).
             for (agg_idx, narrow) in narrow_to_int8.iter().enumerate() {
                 if !narrow {
                     continue;
@@ -2519,7 +2548,8 @@ impl Engine {
         src: &ResidentExecSource,
         count_select: &Select,
         count_bound: &BoundRelationalSelect,
-        accum: &mut StreamAccum,
+        partials: &mut Vec<Vec<SqlValue>>,
+        total_matched: &mut i64,
     ) -> ChunkOutcome {
         // COUNT(*) over the chunk (predicate applied on-device): both the COUNT value AND the empty-set
         // guard for SUM/MIN/MAX (the general reduction hard-errors over an empty filtered set).
@@ -2543,8 +2573,10 @@ impl Engine {
             Err(_) => return ChunkOutcome::Defer,
         };
 
+        *total_matched = total_matched.saturating_add(chunk_count);
         if agg == StreamAgg::Count {
-            accum.add_count(chunk_count);
+            // 6c-0: the chunk's COUNT becomes an Int8 partial row; the device SUM pass folds them.
+            partials.push(vec![SqlValue::Int8(chunk_count)]);
             return ChunkOutcome::Ok;
         }
         if chunk_count == 0 {
@@ -2575,7 +2607,81 @@ impl Engine {
             Err(err) if is_overflow_error(&err) => return ChunkOutcome::Hard(err),
             Err(_) => return ChunkOutcome::Defer,
         };
-        accum.combine_value(value)
+        // 6c-0: the chunk's device partial (Null for an all-NULL matched set — the final pass's M3
+        // validity conjunct skips it in-kernel) collects as a one-column row; NO host combine.
+        partials.push(vec![value]);
+        ChunkOutcome::Ok
+    }
+
+    /// 6c-0: the final SCALAR combine — ONE device aggregate pass over the collected partials
+    /// uploaded as a synthesized one-column relation (the S-E.3 merge shape; the same pre-upload
+    /// budget gate). Err(()) = the caller defers to the CPU path.
+    #[allow(clippy::too_many_arguments)]
+    fn combine_scalar_partials_on_device(
+        &self,
+        select: &Select,
+        table: &RelationalTable,
+        partial_type: SqlType,
+        fold_projection: &SelectProjection,
+        copin_s: Index,
+        partials: &[Vec<SqlValue>],
+        budget: u64,
+    ) -> Result<SqlValue, ()> {
+        let _ = (select, table);
+        let partials_bytes: u64 = partials
+            .iter()
+            .map(|row| chunk_row_device_bytes(row, &[partial_type]))
+            .sum();
+        if partials_bytes > budget {
+            return Err(());
+        }
+        let scalar_table =
+            catalog_relation_table("public", "__stream_scalar", &[("__p0", partial_type)]);
+        let fold_select = Select {
+            table: scalar_table.name.clone(),
+            distinct: false,
+            projection: fold_projection.clone(),
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let fold_bound = bind_relational_select(&scalar_table, &fold_select).map_err(|_| ())?;
+        let (descriptor, device_memory) = self
+            .build_transient_relation_residency(&scalar_table, partials)
+            .map_err(|_| ())?;
+        self.read_state
+            .residency
+            .streaming_fold_peak_chunk_bytes
+            .fetch_max(descriptor.resident_bytes, Ordering::Relaxed);
+        let src = ResidentExecSource {
+            descriptor: Arc::new(descriptor),
+            device_memory: Arc::new(device_memory),
+            row_count: partials.len() as u64,
+        };
+        let result = self
+            .execute_resident_expr_select_with_binding(
+                &fold_select,
+                &scalar_table,
+                Some(&src),
+                fold_bound,
+                copin_s,
+                None,
+                None,
+                &[],
+                &[],
+                None,
+                &[],
+            )
+            .map_err(|_| ())?;
+        match result.rows.iter().next().and_then(|row| row.first()) {
+            Some(cell) => Ok(cell.clone()),
+            None => Err(()),
+        }
     }
 
     /// STRATA S-E.1 telemetry: streaming folds served (non-vacuity — an over-VRAM aggregate stayed on the
