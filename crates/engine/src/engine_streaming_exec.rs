@@ -41,6 +41,7 @@ use crate::engine_expr::{
 };
 use crate::rel_exec_helpers::{
     bind_relational_select, catalog_relation_table, decode_relational_row, relational_key_prefix,
+    relational_row_key,
 };
 use std::sync::atomic::Ordering;
 
@@ -3239,6 +3240,145 @@ impl Engine {
         self.read_state
             .residency
             .streaming_cold_spills
+            .load(Ordering::Relaxed)
+    }
+
+    /// P3 (sealed-shards-primary): the DML WHERE-locate as a STREAMING FOLD — a DELETE/UPDATE on a
+    /// NON-ADMITTED table whose predicate the value index cannot bound (no Eq leaf) previously fell
+    /// to the pure-host seq_scan + `select_filter_matches` loop (the CPU relational engine's core,
+    /// ADR-006 debt; the resident device arm needs shards a non-admitted table does not have). Here
+    /// the predicate runs ON THE DEVICE over bounded chunks instead: the table's visible rows are
+    /// staged with a synthesized trailing `__row_id` int8 column (the S-E.3 synthesized-relation
+    /// pattern — real columns keep their catalog indexes, so the DML predicate lowering binds
+    /// unchanged), each chunk is device-filtered + gathered, and each survivor's `__row_id` maps it
+    /// back to `(row_id, row_key, row image)` — the same `DmlResolvedMatch` triple every other arm
+    /// yields. The host stages/decodes (the REGISTERED 6c-1 scan-build staging debt, deletion
+    /// trigger = P4) and reassembles identity — it never evaluates the predicate. Visibility is
+    /// exact by construction (the scan is boundary-pinned like the host arm); the device predicate
+    /// is trusted exactly as every streaming READ trusts it (no host recheck — the read folds set
+    /// the precedent and the differentials gate it). Returns `None` to DECLINE (no budget, elided,
+    /// un-lowerable predicate, any staging/executor failure) — the caller falls to the host scan,
+    /// never a wrong answer; `Some(vec![])` is a VALID zero-match resolve.
+    pub(crate) fn try_streaming_dml_locate(
+        &self,
+        table: &RelationalTable,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        visibility: StorageVisibility,
+        table_rows: &crate::resident_storage::TableRowsView,
+    ) -> Option<Vec<(u64, String, Vec<SqlValue>)>> {
+        let gpu_id = self.planner.default_gpu_id();
+        let budget = self.relational_residency_budget_bytes(gpu_id)?;
+        if budget == 0 {
+            return None;
+        }
+        // Never locate through an ELIDED table's host store (stale by design); its resolve is the
+        // resident device arm upstream.
+        if self.table_install_elided(&table.name) {
+            return None;
+        }
+        let predicate =
+            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)?;
+        // The synthesized locate relation: the real columns (catalog order, indexes unchanged) plus
+        // the trailing row-identity column the survivors carry back.
+        let mut locate_columns: Vec<(String, SqlType)> = table
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.ty))
+            .collect();
+        locate_columns.push(("__row_id".to_string(), SqlType::Int8));
+        let locate_refs: Vec<(&str, SqlType)> = locate_columns
+            .iter()
+            .map(|(name, ty)| (name.as_str(), *ty))
+            .collect();
+        let locate_table = catalog_relation_table(&table.schema, "__stream_locate", &locate_refs);
+        let chunk_select = Select {
+            table: locate_table.name.clone(),
+            distinct: false,
+            projection: SelectProjection::All,
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let chunk_bound = bind_relational_select(&locate_table, &chunk_select).ok()?;
+        let column_types: Vec<SqlType> = locate_columns.iter().map(|(_, ty)| *ty).collect();
+        let chunk_target_bytes = (budget / 2).max(1);
+        let copin_s = visibility.read_txn_id;
+        let prefix = relational_key_prefix(&table.name);
+
+        let mut matches: Vec<(u64, String, Vec<SqlValue>)> = Vec::new();
+        let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
+        let mut chunk_bytes: u64 = 0;
+        let mut capture: Option<ColdCacheBuilder> = None; // never capture: not the table's schema
+        let mut run_chunk = |chunk_rows: &[Vec<SqlValue>],
+                             matches: &mut Vec<(u64, String, Vec<SqlValue>)>|
+         -> Result<(), ()> {
+            let staged = self.stage_streaming_chunk(&locate_table, chunk_rows, (1, 0), &mut capture)?;
+            let src = staged.ready()?;
+            let result = self
+                .execute_resident_expr_select_with_binding(
+                    &chunk_select,
+                    &locate_table,
+                    Some(&src),
+                    chunk_bound.clone(),
+                    copin_s,
+                    Some(&predicate),
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    &[],
+                )
+                .map_err(|_| ())?;
+            for row in result.rows.iter() {
+                let mut row = row.to_vec();
+                // The trailing survivor cell IS the identity (staged from tuple.tuple_id below).
+                let Some(SqlValue::Int8(id)) = row.pop() else {
+                    return Err(());
+                };
+                let row_id = id as u64;
+                matches.push((row_id, relational_row_key(&table.name, row_id), row));
+            }
+            Ok(())
+        };
+
+        let mut cursor = table_rows.store().seq_scan_open(visibility).ok()?;
+        while let Some(tuple) = cursor.next() {
+            if !tuple.key.starts_with(&prefix) {
+                continue;
+            }
+            let mut decoded = decode_relational_row(&tuple.value, &table.columns).ok()?;
+            decoded.push(SqlValue::Int8(tuple.tuple_id as i64));
+            chunk_bytes = chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+            chunk_rows.push(decoded);
+            if chunk_bytes >= chunk_target_bytes {
+                if run_chunk(&chunk_rows, &mut matches).is_err() {
+                    return None;
+                }
+                chunk_rows.clear();
+                chunk_bytes = 0;
+            }
+        }
+        drop(cursor);
+        if !chunk_rows.is_empty() && run_chunk(&chunk_rows, &mut matches).is_err() {
+            return None;
+        }
+        self.read_state
+            .residency
+            .dml_streaming_resolve_hits
+            .fetch_add(1, Ordering::Relaxed);
+        Some(matches)
+    }
+
+    /// P3 telemetry: DML WHERE-locates resolved on-device via the streaming fold.
+    pub fn dml_streaming_resolve_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .dml_streaming_resolve_hits
             .load(Ordering::Relaxed)
     }
 

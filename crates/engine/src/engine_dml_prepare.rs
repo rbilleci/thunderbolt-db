@@ -51,7 +51,7 @@ fn device_eq_scan_literal(
 /// leaves beside int4/text/bool/date/uuid — e.g. `big > 5 AND name = 'x'`) lower at I32 via the
 /// width-safe `LoadColumnI64` scalar arms (ADR-006, `mixed_width_i32_elem`); an int8 ARITH subtree
 /// in a mixed group still hard-errors on lowering and declines.
-fn dml_filter_groups_to_device_predicate(
+pub(crate) fn dml_filter_groups_to_device_predicate(
     table: &RelationalTable,
     filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
 ) -> Option<crate::engine_expr::ResidentExpr> {
@@ -589,13 +589,27 @@ impl Engine {
                         // the truly-current version live forever; a stale-EMPTY view silently
                         // LOSES the update (0 matches). RE-PIN before every fallback.
                         table_rows = self.read_state.mvcc.table_rows(&table.name);
-                        Self::resolve_dml_matches_via_value_index(
+                        match Self::resolve_dml_matches_via_value_index(
                             &table,
                             &table_rows,
                             &filter_groups,
                             visibility,
                             &prefix,
-                        )?
+                        )? {
+                            Some(matches) => Some(matches),
+                            // P3 (sealed-shards-primary): a NON-ADMITTED table with a range-only
+                            // WHERE — the device arm has no shards and the value index no Eq
+                            // bound. The predicate runs ON-DEVICE as a streaming fold over the
+                            // SAME pinned view (bounded chunks, trailing __row_id identity)
+                            // instead of the host seq_scan+filter loop below; a decline (no
+                            // budget / un-lowerable / any failure) still falls to that loop.
+                            None => self.try_streaming_dml_locate(
+                                table,
+                                &filter_groups,
+                                visibility,
+                                &table_rows,
+                            ),
+                        }
                     }
                 }
             };
@@ -1907,13 +1921,27 @@ impl Engine {
                         // the truly-current version live forever; a stale-EMPTY view silently
                         // LOSES the update (0 matches). RE-PIN before every fallback.
                         table_rows = self.read_state.mvcc.table_rows(&table.name);
-                        Self::resolve_dml_matches_via_value_index(
+                        match Self::resolve_dml_matches_via_value_index(
                             &table,
                             &table_rows,
                             &filter_groups,
                             visibility,
                             &prefix,
-                        )?
+                        )? {
+                            Some(matches) => Some(matches),
+                            // P3 (sealed-shards-primary): a NON-ADMITTED table with a range-only
+                            // WHERE — the device arm has no shards and the value index no Eq
+                            // bound. The predicate runs ON-DEVICE as a streaming fold over the
+                            // SAME pinned view (bounded chunks, trailing __row_id identity)
+                            // instead of the host seq_scan+filter loop below; a decline (no
+                            // budget / un-lowerable / any failure) still falls to that loop.
+                            None => self.try_streaming_dml_locate(
+                                table,
+                                &filter_groups,
+                                visibility,
+                                &table_rows,
+                            ),
+                        }
                     }
                 }
             };

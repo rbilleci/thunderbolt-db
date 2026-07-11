@@ -72,6 +72,24 @@ NOTE: wider-type (int8-bearing) tables DO NOT elide under defaults — shard ADM
 sections decline in-place appends), so the "versioned wider-type elided reads de-elide" residue is
 UNREACHABLE today; the real gap is wider-type elision eligibility (i64-section append kernels), a full
 slice for a future session.
+**P3 DONE: THE DML WHERE-LOCATE AS A STREAMING FOLD** — a DELETE/UPDATE on a NON-ADMITTED (over-budget)
+table with a range-only WHERE previously fell to the PURE-HOST seq_scan + `select_filter_matches` loop (the
+CPU relational engine's core; the device arm has no shards there, the value index no Eq bound). The locate
+now runs ON-DEVICE: `try_streaming_dml_locate` stages the visible rows with a synthesized trailing
+`__row_id` int8 column (S-E.3 synthesized-relation pattern; real columns keep their catalog indexes so the
+DML predicate lowering binds unchanged), device-filters + gathers each bounded chunk, and maps survivors
+back to `(row_id, row_key, row image)` — hooked in BOTH `prepare_delete`/`prepare_update` ladders after the
+value-index decline (INSIDE the else-arm: the self-referencing-FK bypass still forces the host arm — its
+index-arm FK validation is wrong for self-reference). NO host recheck (the read folds' precedent; the
+executor path applies exact 3VL validity) — audit traced the sibling arms' rechecks to THEIR coarse
+NULL-blind locate kernel, NOT the lowering. Any decline/failure falls to the host loop (never a wrong
+answer); `Some(vec![])` = a valid 0-match resolve; counter `dml_streaming_resolve_hits`. Audit MERGE-SAFE
+zero C/H; MEDIUM adopted as the TYPE-MATRIX DIFFERENTIAL gate (text/date/numeric/bigint-OR-bool/UPDATE over
+a NULL-bearing table vs a host-arm twin — the recheck-free path is now differential-gated beyond int4);
+LOWs ledgered (chunk-boundary match asserts; the pre-existing unbounded concurrent transient-residency
+class). Gates: 5+1 GPU tests, 2 sabotages bite (identity off-by-one, predicate dropped), sweep 447/447,
+lib 502/502, clippy Δ0. The host seq_scan loop REMAINS for the no-budget/unlowerable general case — it is
+the interim store's operational path, deleted with the store at P4.
 **HOST-DEBT BALANCE SHEET (the charter-drift ruling's boundary accounting, 2026-07-11):**
 DELETED this arc: the host scalar combine (~130 LOC incl. all value comparisons/arithmetic), the host
 LIMIT/OFFSET windowing (~30 LOC), the per-round grouped narrow loop (~25 LOC), the throwaway upload per rebuilt
