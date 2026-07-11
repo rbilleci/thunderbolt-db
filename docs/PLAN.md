@@ -109,37 +109,55 @@ Spec: ARCHITECTURE §7 + §13.
   extended. **EXCLUSIONS:** uniqueness-constrained tables (device-index/fingerprint route later), FK-edged
   tables, elided tables, multi-GPU.
 
-- **S-E.P5 — THE DEVICE INDEX OVER CHUNKS (keyed chunk-authoritative tables; designed 2026-07-11).**
-  Lifts the class's no-PK/UNIQUE exclusion — the gate keeping most real tables in the host engine — and is
-  the named deletion trigger for the reverse-gather decoder. RECON FACTS: the kernels are ALL
-  source-agnostic (`submit_compound_fold_fingerprints` takes a raw base_ptr+offsets; the write-locate /
-  dense-probe kernels take `{index_ptr, mask, shift}` structs; `build_int4_pk_hash_table_host_visible` +
-  `retain_device_memory_copy` build persistent OFF-BUDGET device buffers) — only the cache/lifecycle
-  wrappers are shard-shaped; the dup-tolerant in-place INSERT kernel does NOT apply (chunks are immutable
-  per-epoch; rebuild-not-insert).
-  **DESIGN:**
-  - **CHUNK IDENTITY:** ColdChunk gains a process-monotonic `chunk_id` — assigned at construction,
-    PRESERVED by reuse and sidecar stamps (the payload is untouched; visibility applies at the probe's
-    recheck), ROTATED by rebuild/compaction. The index cache keys `(table, chunk_id, key_id)` — so tail
-    appends build ONE new index (the new chunk's), stamps build none, and compaction invalidates exactly
-    the compacted chunk's.
-  - **THE INDEX:** per chunk, per key: fingerprints via the device fold (compound/text/b128; single-int4
-    reads the column) → `build_int4_pk_hash_table_host_visible` (all-visible build — the sidecar is
-    recheck-time) → one persistent `retain_device_memory_copy` buffer (~8·2·rows bytes), cached like
-    `shard_pk_device_index` but epoch-free. NEW: explicit VRAM accounting for index buffers (none exists
-    today for the shard twin either — add a counter + a cap with LRU eviction, rebuilt on demand).
-  - **INSERT UNIQUENESS (the class-gate lift):** prepare's class arm for keyed tables: in-batch dedup +
-    per-row probe across all chunk indexes (the multi-shard write-locate kernel shape: one launch, all
-    chunks' index ptrs) + the full-tuple recheck via the P4-1 decoder at the hit's (chunk, slot) with the
-    sidecar mask — a masked hit is NOT a conflict (the dup-tolerant advance-past-match discipline).
-  - **BY-KEY DML:** Eq-on-key locates via the index probe instead of the full predicate fold (the fold
-    stays for range WHERE).
-  - **ELIGIBILITY:** `chunk_class_eligible` admits unique-indexed tables once the probe path exists; FK
-    edges stay excluded (their own track).
-  **SLICES:** P5-1 the chunk-index cache + build (counters, cap, eviction); P5-2 the INSERT-uniqueness
-  probe + recheck + the gate lift (differential vs the host validate on a twin); P5-3 by-key DML locate;
-  P5-4 the reverse-gather deletion assessment (its trigger fires when de-auth/DDL exits can run
-  device-side end-to-end — likely still needed for DDL sweeps; re-scope honestly).
+- **S-E.P5 — THE DEVICE INDEX OVER CHUNKS (keyed chunk-authoritative tables; designed 2026-07-11,
+  REVISED per the adversarial design review — NEEDS-REVISION, all findings adopted).** Lifts the class's
+  no-PK/UNIQUE exclusion for VRAM-RESIDENT-INDEX working sets (review H1: admitting ANY keyed table makes
+  a point INSERT O(all-chunks) — probe-every-chunk + LRU thrash under the commit mutex — a REGRESSION vs
+  the host value_index exactly on the over-VRAM tables the class targets; over-VRAM keyed tables need a
+  chunk-skipping structure (per-chunk key bloom/zone-map pruning) — a LATER slice). RECON: every kernel is
+  source-agnostic (`submit_compound_fold_fingerprints` raw base_ptr; write-locate/dense-probe take
+  {index_ptr,mask,shift}; `build_int4_pk_hash_table_host_visible` + `retain_device_memory_copy` = the
+  persistent off-budget buffer pattern); only the shard cache wrappers need chunk-shaped twins; the
+  in-place INSERT kernel does not apply (chunks immutable — rebuild-per-payload, never insert-in-place).
+  **DESIGN (revised):**
+  - **CHUNK IDENTITY (review H3 — a correctness landmine):** ColdChunk gains a monotonic `chunk_id`,
+    allocated ONLY at the two genuine-payload constructors (tail append; compaction survivors) and
+    PRESERVED by every verbatim clone (re-pin, base-clone, untouched-clone) — fresh iff the payload bytes
+    are new (a compacted chunk inheriting its source's id would serve the OLD index over NEW bytes:
+    probe-slot misalignment = silent false-negative dup = C2). `chunk_id` (content identity, the cache
+    key) COEXISTS with positional `chunk_idx` + `entry_epoch` (the stamp coordinate token) — never
+    conflate; never cache a chunk_idx across entry Arcs (L3).
+  - **THE INDEX:** per (table, chunk_id, key_id): device-fold fingerprints → all-visible hash table →
+    one persistent retained buffer (~16B/row), with NEW explicit VRAM accounting + cap + LRU (eviction
+    frees; rebuilt on demand). BUILD AT CLASS ENTRY, not lazily on the insert path (review H2: a lazy
+    first-probe build from a SPILLED payload = an NVMe read under the ONE commit mutex stalling every
+    table's commits); eligibility (H1) requires the full index set to fit the cap.
+  - **THE RECHECK IS DEVICE-SIDE (review M1/M2 — a PREREQUISITE slice):** a probe hit rechecks by
+    reading ONLY the hit slot's bytes from the staged chunk buffer (the chunk analog of
+    `materialize_resident_row_via_hit`; O(1) DtoH per hit) honoring the sidecar mask per-slot — NEVER the
+    whole-chunk host decode (O(chunk)/hit AND a charter breach that would ENTRENCH the reverse-gather on
+    the hot path). A masked (dead) hit is not a conflict.
+  - **INSERT UNIQUENESS:** in-batch host dedup + one multi-chunk write-locate launch + the device slot
+    recheck. **UPDATE SELF-EXCLUSION (review C1):** the class UPDATE stamps its old coords in the COMMIT
+    HOOK, so at probe time the old version is still live — the new-image probe must SKIP hits whose
+    (chunk, slot) coordinates are in the update's own located set (the chunk-space `touched_keys`
+    analog); probe/recheck at the statement snapshot, self-exclude by coordinate — a hit OUTSIDE the set
+    is a genuine dup, INSIDE is the update-reinsert. Without this every same-key UPDATE false-rejects.
+  - **DURABILITY INVARIANT (review C2):** a recheck FALSE-ACCEPT is RPO-VIOLATING, not merely wrong-now —
+    the duplicate is durable in the WAL and replay's HOST validate rejects it: an acked commit becomes
+    unreplayable. The P5-2 gate MUST include a REPLAY DIFFERENTIAL (adversarial fingerprint
+    near-collisions through the chunk path → crash → replay through the host path → identical
+    accept/reject sets), not just a live twin.
+  - **BY-KEY DML:** Eq-on-key locates via the probe (range WHERE keeps the fold). Serial-route reliance
+    is LOAD-BEARING (L1): the probe runs under the commit mutex; any future off-mutex prober must adopt
+    the ensure_shard_pk_device_index lock discipline.
+  - **P5-4 RE-SCOPED (review angle 7):** P5 does NOT delete the reverse gather — it survives for COLD
+    de-auth/DDL sweeps; P5's honest contribution is keeping it OFF the hot path (the device recheck).
+    The ledger row's trigger is re-worded accordingly.
+  **SLICES:** P5-0 the device slot-addressed chunk recheck (decode differential vs the P4-1 decoder);
+  P5-1 the chunk-index cache (chunk_id + build-at-entry + accounting/cap/LRU); P5-2 INSERT uniqueness +
+  the C1 self-exclusion + the C2 replay differential + the H1-gated eligibility lift; P5-3 by-key DML
+  locate; P5-later chunk-skipping for over-VRAM keyed tables.
 
 **Golden wire tests** (acceptance spec): drive SQL over the real pgwire socket
 (`crates/server/tests/pgwire_roundtrip.rs` pattern), assert exact rows + that the GPU sharded route served them
