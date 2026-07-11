@@ -247,7 +247,16 @@ the read path for maintained tables (6c-3, delta-bounded). REMAINING REGISTERED 
 sealed-shards-primary): the cold tier + scan-build machinery (~2.5k LOC — grew this arc but its HOST-RELATIONAL
 content is zero: staging, orchestration cardinality, boundary coercions only); the interim double-residency
 (tuple store + cold bytes). NET: host RELATIONAL computation in the streaming path = ZERO.
-**>>> ACTIVE ARC (user-ruled 2026-07-11): SEALED-SHARDS-PRIMARY P1..P4 <<<** — design in memory
+**>>> ACTIVE ARC (the deletion directive, 2026-07-11): S-E.P5 — THE DEVICE INDEX OVER CHUNKS <<<**
+(PLAN §2 S-E.P5, design adversarially reviewed + revised). SHIPPED SINCE THE P4 CLOSURE: store-row
+RECLAMATION `de4a4f34` (class entry DELETES the host chains + value index — the no-fence soundness
+audited leg-by-leg; de-auth chunk-only, the rank enumeration deleted), fence-free COMPACTION `dc7851bb`
+(post-publish BY DESIGN — a pre-publish install lets a boundary-1 bind born-skip survivors; dead slots +
+sidecars physically deleted), P5-0 `8b1621d4` (the device slot recheck — the M1 prerequisite). ACTIVE
+SLICE: P5-1 (the chunk-index cache: chunk_id fresh-iff-payload-new at exactly the two genuine-payload
+constructors; entry-time index builds; VRAM accounting + cap + LRU; the eligibility gate lifts only in
+P5-2 with the C1 self-exclusion + the C2 replay differential).
+**THE PRIOR ARC (SEALED-SHARDS-PRIMARY P1..P4, COMPLETE):** — design in memory
 `strata-streaming-executor`; P2 SV2 tombstone sidecars; P3 DML resolve via streaming folds; P4 the store
 deletion for streamed tables + the registered cold-tier debt payoff. The ADR-006 store deletion follows.
 **P1 DONE: THE DURABLE COLD CHECKPOINT** — the cold tier survives restarts via the checkpoint model (bulk
