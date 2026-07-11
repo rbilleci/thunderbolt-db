@@ -133,8 +133,13 @@ loud error) + `reverse_gather_streamed_rows` (whole-entry, scan order). REGISTER
 de-auth only; deletion trigger = device-index-over-chunks); #[allow(dead_code)] until the P4-2b/P4-3
 callers land. Focused audit MERGE-SAFE (field-for-field encoder symmetry confirmed; both LOWs adopted:
 full NULL matrix in the gate, loud sidecar error). Gate: all-types round-trip differential + stamped-delete
-exclusion; 2 sabotages bite (validity inverted, mask dropped). ACTIVE SLICE: P4-2a (chunk-native
-locate+stamp per PLAN §2).
+exclusion; 2 sabotages bite (validity inverted, mask dropped). **P4-2a SHIPPED (`7a9a5b5b`): chunk-native locate + locate-driven stamp** — lower_resident_predicate over
+staged chunks (sidecar vis composed; slots native, no __slot column) + coordinate-driven sidecar stamps at
+the deleting boundary with the generation unchanged. TWO P4-2b OBLIGATIONS doc-contracted on the pair: the
+coordinate token / single commit-lock critical section, and the store-divergence rebuild hazard (store must
+be dropped/frozen for class tables first). ACTIVE SLICE: P4-2b (the class + write path per PLAN §2 —
+recon the commit-hook/elision-enter sites, honor the two obligations + H1 mutual exclusion + M1 serial
+route + M2 commit-lock bound + M3 RYW de-auth).
 **>>> NEXT ARC: P4 — DELETE THE HOST TUPLE STORE FOR STREAMED TABLES <<<** (the ADR-006 endgame for the
 streaming class; fresh-session-sized, decompose into audited slices):
 (P4a) DURABLE VALIDITY: the runtime generation-Arc validity dies with the store — the (artifact boundary,
