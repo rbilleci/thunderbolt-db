@@ -184,9 +184,36 @@ stand in; the gate predicate is textually identical across all six sites). Sweep
 normally; nothing is ever dropped (the freeze defers reclamation to P4-5's fenced VACUUM), so there is no
 "drop just-replayed rows" step — the P1 artifact warm-starts the cache at the seam and the class RE-ENTERS
 at its next eligible commit. Composition verified by the existing P1 + class-entry gates.
-REMAINING: P4-5 (VACUUM sidecar compaction — rewrite a heavily-stamped chunk from surviving slots as a
-device gather; the frozen-store RAM reclamation behind a reader fence; the arc's host-debt balance sheet +
-deletion-sweep accounting).
+**P4-5 RESOLVED: LEDGER CLOSURE — COMPACTION IS FENCE-GATED BY DESIGN.** Working the de-auth interaction:
+compacting a chunk moves its payload boundary ABOVE the freeze, flipping it into the de-auth's TAIL arm
+(its rows would RE-INSERT beside their still-frozen store chains = double rows), and re-borning tail rows
+at the compaction boundary loses them for readers pinned between the real born and the compaction — BOTH
+are the reader-fence problem the frozen-store RAM reclamation was already deferred behind. An unfenced
+compaction would be a plausible-but-wrong MVCC violation; it is NOT shipped. REGISTERED (one row, one
+trigger): **sidecar compaction + frozen-store RAM reclamation, prerequisite = a MIN-ACTIVE-READ-BOUNDARY
+tracker** (a fence proving no reader below the compaction/reclamation boundary) — with it, both become a
+single quiesced maintenance pass (compact survivors via the device projection gather, drop sidecars,
+reclaim the frozen chains) and the class's steady-state RAM cost drops to chunks-only.
+
+**═══ THE SEALED-SHARDS-PRIMARY ARC — HOST-DEBT BALANCE SHEET (track boundary, 2026-07-11) ═══**
+**DELETED from the host (the ADR-006 wins):** for CHUNK-AUTHORITATIVE tables the host tuple store's WRITE
+PATH is GONE — no tuple installs, no value-index writes, no version-chain appends (the counters:
+chunk_class_skipped_installs); DML locate for class tables runs ON-DEVICE (the chunk-native locate); the
+per-write O(chunk) DELETE maintenance became an O(8B/row) sidecar stamp (P2) and class DML became
+coordinate stamps (P4-2b-ii); range-DML WHERE-locates on ALL non-admitted tables run on-device (P3).
+**RELOCATED DOWNWARD:** cold-tier maintenance moved from read-time patches to commit-time tail
+appends/stamps for the class; recovery warm-starts from the durable artifact (P1/P2b) instead of
+first-read scans.
+**REGISTERED DEBT (open rows, each with a named trigger):** (1) the REVERSE GATHER host columnar decoder
+(control-plane de-auth/import only; trigger = the device-index-over-chunks route lifting the no-uniqueness
+class gate); (2) the SCAN-BUILD (build_cold_chunks/first-build staging — still the bootstrap + de-auth
+import path; honestly OPEN, off the steady hot path since 6c-1/6c-3); (3) the FROZEN-STORE RAM (the
+freeze-not-drop C3 closure keeps pre-entry chains resident; trigger = the min-active-read-boundary fence
+above, shared with compaction); (4) the class INSERT's unbounded tail growth between compactions (same
+trigger). **NET:** host RELATIONAL COMPUTATION on the class's steady path = ZERO (writes: statement-row
+encode = staging; reads: device folds; DML: device locate + sidecar bookkeeping); the host's remaining
+roles are the charter's own (WAL, orchestration, staging, boundary coercions) plus the four registered
+rows above.
 **>>> NEXT ARC: P4 — DELETE THE HOST TUPLE STORE FOR STREAMED TABLES <<<** (the ADR-006 endgame for the
 streaming class; fresh-session-sized, decompose into audited slices):
 (P4a) DURABLE VALIDITY: the runtime generation-Arc validity dies with the store — the (artifact boundary,

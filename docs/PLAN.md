@@ -51,9 +51,11 @@ Spec: ARCHITECTURE §7 + §13.
   today. Flip only once the read path is in the CPU ballpark (kill the coalescer per-item cost → wave engine, §3).
   Empirically flipping breaks 19/731 tests; that contract migration rides with the flip.
 
-- **S-E.P4 — CHUNK-AUTHORITATIVE TABLES (the store deletion for the streaming class; sealed-shards-primary
-  endgame; designed 2026-07-11, REVISED per the adversarial design review — verdict NEEDS-REVISION, all
-  findings adopted).** P1/P2/P2b/P3 shipped the *durability and read* primitives; the review PROVED the
+- **S-E.P4 — CHUNK-AUTHORITATIVE TABLES ✅ SHIPPED 2026-07-11 (P4-1 `01520c2d`, P4-2a `7a9a5b5b`,
+  P4-2b-i `4a22ef91`, P4-2b-ii `e5f17765`, P4-3 `144a7494`; P4-4 moot under freeze-not-drop; P4-5 =
+  ledger closure — sidecar compaction + frozen-store reclamation REGISTERED behind the
+  min-active-read-boundary fence; the arc balance sheet is in HANDOVER).** Original design (revised per
+  the adversarial review):** P1/P2/P2b/P3 shipped the *durability and read* primitives; the review PROVED the
   write-side primitives are NOT reusable store-free (the P3 locate derives identity from a store scan; the
   P2 stamp is driven by the store-generation change-log diff and old/new chain classification) — P4 builds
   chunk-native twins first. THE CLASS (no flag — intrinsic, sticky, self-entered): cold entry exists + NO
