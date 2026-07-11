@@ -60,8 +60,21 @@ pure hits. Rebuilds no longer spend a throwaway DMA (payload-only builder). AUDI
 committed_seq is NOT frozen under the commit mutex (lanes publish lock-free) — the invariant is the
 STRICT-EQUALITY install guard + generation ptr identity + per-read visibility; never weaken the generation check
 on a frozen-seq assumption.
-**S-E.6c remaining:** sealed shards as PRIMARY (cold bytes stop shadowing the tuple store; on-device tombstone
-regions SV2-style; the ADR-006 store deletion follows).
+**FULL GPU SWEEP GREEN 438/438 (`e685a0b2`)** — the two long-failing gates (a1/a4c) root-caused: their HOST-STORE
+ORACLE premise died when the plain-int4 shape became elision-eligible (device-authoritative commits leave the
+store stale BY DESIGN); pinned with the sibling-gate pattern + a4c's obsolete "gather must decline NULLs"
+modernized to positively gate the NULL-aware gather. Audited MERGE-SAFE.
+**HOST-DEBT BALANCE SHEET (the charter-drift ruling's boundary accounting, 2026-07-11):**
+DELETED this arc: the host scalar combine (~130 LOC incl. all value comparisons/arithmetic), the host
+LIMIT/OFFSET windowing (~30 LOC), the per-round grouped narrow loop (~25 LOC), the throwaway upload per rebuilt
+chunk (F4). RELOCATED DOWNWARD: the O(table)-per-write scan-build became O(delta)-per-write (6c-1) and moved off
+the read path for maintained tables (6c-3, delta-bounded). REMAINING REGISTERED (deletion trigger =
+sealed-shards-primary): the cold tier + scan-build machinery (~2.5k LOC — grew this arc but its HOST-RELATIONAL
+content is zero: staging, orchestration cardinality, boundary coercions only); the interim double-residency
+(tuple store + cold bytes). NET: host RELATIONAL computation in the streaming path = ZERO.
+**S-E.6c remaining:** sealed shards as PRIMARY — design BANKED in memory `strata-streaming-executor`
+(P1 checkpoint/manifest recovery via the 6c-1 patcher as WAL-suffix replay; P2 SV2 tombstone sidecars; P3 DML
+resolve via streaming folds; P4 the store deletion for streamed tables). The ADR-006 store deletion follows.
 **S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy — RESOLVED:
 merged back via S-E.6a above):** the
 copy/compute-overlap pipeline (async pinned-staged uploads on a private copy stream + the stage-N/compute-N-1
