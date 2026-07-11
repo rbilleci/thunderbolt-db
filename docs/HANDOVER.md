@@ -268,9 +268,20 @@ differential; de-auth purges the table's key-index cache entries; saturating H1 
 fingerprint COLLISION cannot be birthday-found (the final fold round is a BIJECTION of the last word —
 fp(a1,b1)==fp(a2,b2) reduces to h1(a1)^h1(a2)==b1^b2), so the gate CONSTRUCTS it by bucketing
 first-word states on their top 12 bits; verified against the real fingerprint before use. Txn-test
-lesson: a txn's statements all carry the BEGIN's seq (the txn id). ACTIVE SLICE: P5-3 — by-key DML
-locate via the probe (DELETE/UPDATE WHERE key = v probes instead of the full fold scan; range WHERE
-keeps the fold); then P5-later chunk-skipping (bloom/zone) for over-VRAM keyed tables.
+lesson: a txn's statements all carry the BEGIN's seq (the txn id). P5-3 SHIPPED `40f6cf89` (audit
+MERGE-SAFE zero C/H): BY-KEY DML LOCATE — an Eq-on-unique-key WHERE resolves class DELETE/UPDATE via
+the probe + P5-0 slot rechecks with images from the RECHECKED slots (the reverse-gather decoder off the
+point-DML hot path); the whole group re-applies host-side per hit (collision kill + residual filters);
+range/OR/NULL/partial-key/any-failure fall to the fold — never a decline. Audit MEDIUM adopted: the
+probe mirrors the fold's rtx<freeze DECLINE (sub-freeze boundary -> the caller's DE-AUTH valve, never a
+silent 0-row DML — every class chunk is born at-or-above the freeze so the born gate would mask ALL
+hits). Compound-key probe-vs-fold DML twins gate the folded needle (a divergence = a silently LOST
+delete). S-E.P5 SLICES ALL SHIPPED (P5-0..3). REMAINING IN P5: chunk-skipping (bloom/zone pruning) for
+over-VRAM keyed tables — index-set-over-cap tables currently refuse class entry (H1). NEXT FRONTIER
+(the deletion directive): pick from (a) P5-later chunk-skipping; (b) the ADR-012 architectural program
+(JOINs/views/windows on the streaming executor); (c) widening class ELIGIBILITY (CHECK-bearing tables
+enter today? FK tables still refuse — inbound-FK validation needs cross-table device probes); (d) the
+cold tier/scan-build registered debt (trigger: sealed-shards-primary — now largely paid by P1..P4).
 **THE PRIOR ARC (SEALED-SHARDS-PRIMARY P1..P4, COMPLETE):** — design in memory
 `strata-streaming-executor`; P2 SV2 tombstone sidecars; P3 DML resolve via streaming folds; P4 the store
 deletion for streamed tables + the registered cold-tier debt payoff. The ADR-006 store deletion follows.

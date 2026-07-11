@@ -158,7 +158,8 @@ Spec: ARCHITECTURE §7 + §13.
   P4-1 decoder); P5-1 ✅ `cddce252` the chunk-index cache (chunk_id + build-at-entry +
   accounting/cap/LRU); P5-2 ✅ `629452c9` INSERT/UPDATE uniqueness at all four choke points + the C1
   self-exclusion + the C2 replay differentials (int4 + text) + the H1/H2-gated eligibility lift + the
-  covered-route class refusal (audit MERGE-SAFE zero C/H); P5-3 by-key DML locate (ACTIVE); P5-later
+  covered-route class refusal (audit MERGE-SAFE zero C/H); P5-3 ✅ `40f6cf89` by-key DML locate (probe +
+  recheck-materialized images, rtx<freeze de-auth valve mirrored, compound twins gated); P5-later
   chunk-skipping for over-VRAM keyed tables.
 
 **Golden wire tests** (acceptance spec): drive SQL over the real pgwire socket
