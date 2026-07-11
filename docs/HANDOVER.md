@@ -254,10 +254,23 @@ audited leg-by-leg; de-auth chunk-only, the rank enumeration deleted), fence-fre
 (post-publish BY DESIGN — a pre-publish install lets a boundary-1 bind born-skip survivors; dead slots +
 sidecars physically deleted), P5-0 `8b1621d4` (the device slot recheck — the M1 prerequisite). P5-1 SHIPPED
 `cddce252` (chunk_id content identity; the accounted+capped index cache; the fold-path blob_offsets HIGH
-fixed + gated; dup-tolerant builds; the chunk_key_needle parity contract). ACTIVE SLICE: P5-2 — INSERT
-uniqueness (probe + the P5-0 device recheck at the statement snapshot) + the C1 UPDATE coordinate
-self-exclusion + the C2 REPLAY differential (a false-accept is RPO-violating) + the H1-gated eligibility
-lift (keyed tables admit only when the index set fits the cap; indexes build at entry).
+fixed + gated; dup-tolerant builds; the chunk_key_needle parity contract). P5-2 SHIPPED `629452c9`
+(audit MERGE-SAFE zero C/H): THE KEYED-CLASS LIFT — unique-keyed tables ENTER the class (host rows
+reclaimed); uniqueness validates ON-DEVICE at ALL FOUR choke points (prepare_insert, prepare_update,
+both txn-preflight arms — the txn preflight is the txn path's ONLY unique guard, commit-time de-auth
+runs after it) via per-chunk key-index probe + P5-0 slot recheck at the statement snapshot (masked hit
+≠ conflict; collision fails full-tuple recheck; in-batch host-exact; NULL keys DECLINE to host —
+structural NULL==NULL can't ride the fold); C1 = packed-coordinate self-exclusion under the epoch token
+(resolve + probe share the entry.chunks enumerate space); H1/H2 = the estimated index set must fit the
+cap and BUILDS AT ENTRY under the commit lock; the covered lane route refuses class tables (its apply
+has no class arm — a routed write would be lost). Adopted audit findings: TEXT-key gate + replay
+differential; de-auth purges the table's key-index cache entries; saturating H1 sum. Gate craft: a
+fingerprint COLLISION cannot be birthday-found (the final fold round is a BIJECTION of the last word —
+fp(a1,b1)==fp(a2,b2) reduces to h1(a1)^h1(a2)==b1^b2), so the gate CONSTRUCTS it by bucketing
+first-word states on their top 12 bits; verified against the real fingerprint before use. Txn-test
+lesson: a txn's statements all carry the BEGIN's seq (the txn id). ACTIVE SLICE: P5-3 — by-key DML
+locate via the probe (DELETE/UPDATE WHERE key = v probes instead of the full fold scan; range WHERE
+keeps the fold); then P5-later chunk-skipping (bloom/zone) for over-VRAM keyed tables.
 **THE PRIOR ARC (SEALED-SHARDS-PRIMARY P1..P4, COMPLETE):** — design in memory
 `strata-streaming-executor`; P2 SV2 tombstone sidecars; P3 DML resolve via streaming folds; P4 the store
 deletion for streamed tables + the registered cold-tier debt payoff. The ADR-006 store deletion follows.

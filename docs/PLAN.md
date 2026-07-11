@@ -154,10 +154,12 @@ Spec: ARCHITECTURE §7 + §13.
   - **P5-4 RE-SCOPED (review angle 7):** P5 does NOT delete the reverse gather — it survives for COLD
     de-auth/DDL sweeps; P5's honest contribution is keeping it OFF the hot path (the device recheck).
     The ledger row's trigger is re-worded accordingly.
-  **SLICES:** P5-0 the device slot-addressed chunk recheck (decode differential vs the P4-1 decoder);
-  P5-1 the chunk-index cache (chunk_id + build-at-entry + accounting/cap/LRU); P5-2 INSERT uniqueness +
-  the C1 self-exclusion + the C2 replay differential + the H1-gated eligibility lift; P5-3 by-key DML
-  locate; P5-later chunk-skipping for over-VRAM keyed tables.
+  **SLICES:** P5-0 ✅ `8b1621d4` the device slot-addressed chunk recheck (decode differential vs the
+  P4-1 decoder); P5-1 ✅ `cddce252` the chunk-index cache (chunk_id + build-at-entry +
+  accounting/cap/LRU); P5-2 ✅ `629452c9` INSERT/UPDATE uniqueness at all four choke points + the C1
+  self-exclusion + the C2 replay differentials (int4 + text) + the H1/H2-gated eligibility lift + the
+  covered-route class refusal (audit MERGE-SAFE zero C/H); P5-3 by-key DML locate (ACTIVE); P5-later
+  chunk-skipping for over-VRAM keyed tables.
 
 **Golden wire tests** (acceptance spec): drive SQL over the real pgwire socket
 (`crates/server/tests/pgwire_roundtrip.rs` pattern), assert exact rows + that the GPU sharded route served them
