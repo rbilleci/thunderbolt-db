@@ -119,7 +119,21 @@ pub struct InMemoryTupleStore {
     // on-read contract; relational row keys are unique per table so a slot is normally a single id.
     // `Arc`-wrapped like a chain, so a clone shares id-lists until `Arc::make_mut` copies one (COW).
     key_to_tuple_ids: imbl::OrdMap<String, std::sync::Arc<Vec<TupleId>>>,
+    // The WRITE-SIDE CHANGE LOG (6c-1 fix): a monotonic mutation epoch + the last
+    // `CHANGE_LOG_CAP` `(epoch, tuple_id)` mutations. `changed_tuple_ids` between two
+    // generations reads the log slice `(old.epoch, new.epoch]` — EXACT O(delta) ids by
+    // construction. It exists because `imbl::OrdMap::diff` was PROVEN to MISS real changes
+    // (repro: three sequential single-row deletes against pinned generations — the third
+    // vanished from the diff while the chains' contents differed), silently corrupting any
+    // consumer that trusts the structural diff. Structural diffing is BANNED for
+    // correctness-bearing deltas; the out-of-window fallback is a full pointer-pruned key walk.
+    epoch: u64,
+    recent_changes: imbl::Vector<(u64, TupleId)>,
 }
+
+/// The change-log window. A delta wider than this (one giant bulk write, or a generation gap
+/// spanning many epochs) falls back to the O(n) walk — correct, just not O(delta).
+const CHANGE_LOG_CAP: usize = 65536;
 
 impl InMemoryTupleStore {
     pub fn new() -> Self {
@@ -127,22 +141,125 @@ impl InMemoryTupleStore {
             next_tuple_id: 1,
             versions: imbl::OrdMap::new(),
             key_to_tuple_ids: imbl::OrdMap::new(),
+            epoch: 0,
+            recent_changes: imbl::Vector::new(),
+        }
+    }
+
+    /// Record one mutation in the change log (called by every `versions`-mutating write).
+    fn record_change(&mut self, tuple_id: TupleId) {
+        self.epoch += 1;
+        self.recent_changes.push_back((self.epoch, tuple_id));
+        if self.recent_changes.len() > CHANGE_LOG_CAP {
+            self.recent_changes.pop_front();
         }
     }
 
     /// STRATA 6c-1 (chunk-granular cold-tier patching): the TupleIds whose version CHAINS differ
-    /// between two store generations. Every write COW-publishes fresh chain Arcs along its path
-    /// while untouched subtrees stay POINTER-EQUAL, so `imbl::OrdMap::diff` visits only the changed
-    /// paths — O(delta), not O(table). Control-plane addressing only (no row values inspected).
+    /// between two store generations (`self` = the older, pinned one). PRIMARY SOURCE: the
+    /// write-side change log — the slice `(self.epoch, newer.epoch]` is exactly the mutated ids,
+    /// O(delta) by construction. `imbl::OrdMap::diff` is DELIBERATELY NOT USED: it was proven to
+    /// MISS real changes (the pinned-generation triple-delete repro), which silently corrupts
+    /// every consumer. When the log window does not cover the gap (bulk write / long-lived pin),
+    /// fall back to a FULL parallel key walk with per-chain `Arc` pointer pruning — O(n) but
+    /// correct by construction (a pointer-unequal but content-equal chain is a harmless spurious
+    /// id: the consumer rebuilds a clean chunk). Control-plane addressing only.
+    /// CONTRACT (audit LOW): the log-slice arm is truthful only when `newer` DESCENDS from
+    /// `self` (every caller diffs a pinned past snapshot of a table against that table's live
+    /// lineage). Two SIBLING generations sharing an epoch range would lie here — nothing in the
+    /// engine produces that shape; a wholesale store replacement restarts at epoch 0 and lands
+    /// in `newer.epoch < self.epoch`, which takes the fallback walk.
     pub fn changed_tuple_ids(&self, newer: &Self) -> Vec<TupleId> {
-        self.versions
-            .diff(&newer.versions)
-            .map(|item| match item {
-                imbl::ordmap::DiffItem::Add(id, _) => *id,
-                imbl::ordmap::DiffItem::Update { new: (id, _), .. } => *id,
-                imbl::ordmap::DiffItem::Remove(id, _) => *id,
+        if newer.epoch == self.epoch {
+            return Vec::new();
+        }
+        if newer.epoch > self.epoch {
+            let covered = newer
+                .recent_changes
+                .front()
+                .is_some_and(|(first, _)| *first <= self.epoch + 1);
+            if covered {
+                let mut ids: Vec<TupleId> = newer
+                    .recent_changes
+                    .iter()
+                    .filter(|(epoch, _)| *epoch > self.epoch)
+                    .map(|(_, id)| *id)
+                    .collect();
+                ids.sort_unstable();
+                ids.dedup();
+                return ids;
+            }
+        }
+        // Out-of-window fallback: zip both key-ordered maps; a key present on one side only, or
+        // present on both with pointer-UNEQUAL chains, is changed.
+        let mut ids = Vec::new();
+        let mut a = self.versions.iter().peekable();
+        let mut b = newer.versions.iter().peekable();
+        loop {
+            match (a.peek(), b.peek()) {
+                (Some((ka, va)), Some((kb, vb))) => match ka.cmp(kb) {
+                    std::cmp::Ordering::Equal => {
+                        if !std::sync::Arc::ptr_eq(va, vb) {
+                            ids.push(**ka);
+                        }
+                        a.next();
+                        b.next();
+                    }
+                    std::cmp::Ordering::Less => {
+                        ids.push(**ka);
+                        a.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        ids.push(**kb);
+                        b.next();
+                    }
+                },
+                (Some((ka, _)), None) => {
+                    ids.push(**ka);
+                    a.next();
+                }
+                (None, Some((kb, _))) => {
+                    ids.push(**kb);
+                    b.next();
+                }
+                (None, None) => break,
+            }
+        }
+        ids
+    }
+
+    /// P2 (cold-chunk tombstone sidecars): one chain's versions, for the patch classifier's
+    /// old-vs-new comparison. Control-plane addressing only (no row values inspected by the
+    /// caller beyond structural equality).
+    pub fn chain(&self, id: TupleId) -> Option<&std::sync::Arc<Vec<TupleVersion>>> {
+        self.versions.get(&id)
+    }
+
+    /// P2 (cold-chunk tombstone sidecars): COUNT of chains with a visible version in the
+    /// INCLUSIVE TupleId range — the sidecar's SLOT-RANK walk (a chunk's slots are its visible
+    /// rows in TupleId order, so a row's slot is the count of visible ids below it in the
+    /// chunk's range). Same visibility semantics as `visible_versions_in_range`, without the
+    /// clones.
+    pub fn visible_count_in_range(
+        &self,
+        visibility: Visibility,
+        lo: TupleId,
+        hi: TupleId,
+    ) -> Result<usize, StorageError> {
+        Self::validate_visibility(visibility)?;
+        if lo > hi {
+            return Ok(0);
+        }
+        Ok(self
+            .versions
+            .range(lo..=hi)
+            .filter(|(_, versions)| {
+                versions
+                    .iter()
+                    .rev()
+                    .any(|version| Self::is_visible(version, visibility))
             })
-            .collect()
+            .count())
     }
 
     /// STRATA 6c-1: the newest VISIBLE version per chain within an INCLUSIVE TupleId range — the
@@ -211,6 +328,12 @@ impl InMemoryTupleStore {
                 dropped.push((chain_key, *id));
             }
         }
+        // CHANGE-LOG NOTE (audit LOW): pruning deliberately does NOT `record_change` — every
+        // touched version has `deleted_by <= safe_txn_id` (the GC horizon = the minimum live
+        // snapshot), so the mutation is invisible to every servable reader and cannot change a
+        // served result; the DELETE that preceded the prune was already recorded at its commit,
+        // and an out-of-window diff's fallback walk catches pruned keys structurally. If the
+        // horizon/servability invariant ever weakens, this exemption must be revisited.
         self.versions = pruned;
         for (key, id) in dropped {
             self.index_key_remove(&key, id);
@@ -359,6 +482,7 @@ impl InMemoryTupleStore {
             }]),
         );
         self.index_key_insert(&key, tuple_id);
+        self.record_change(tuple_id);
         Ok(tuple_id)
     }
 
@@ -391,6 +515,7 @@ impl InMemoryTupleStore {
             }]),
         );
         self.index_key_insert(&key, tuple_id);
+        self.record_change(tuple_id);
         Ok(tuple_id)
     }
 
@@ -493,6 +618,7 @@ impl TupleStore for InMemoryTupleStore {
             created_by: txn_id,
             deleted_by: None,
         });
+        self.record_change(tuple_id);
         Ok(())
     }
 
@@ -503,6 +629,7 @@ impl TupleStore for InMemoryTupleStore {
 
         let current = self.current_version_mut(tuple_id)?;
         current.deleted_by = Some(txn_id);
+        self.record_change(tuple_id);
         Ok(())
     }
 
@@ -538,6 +665,84 @@ impl TupleStore for InMemoryTupleStore {
         visibility: Visibility,
     ) -> Result<Option<TupleVersion>, StorageError> {
         Ok(self.index_lookup(key, visibility)?.into_iter().next())
+    }
+}
+
+#[cfg(test)]
+mod change_log_tests {
+    use super::*;
+
+    fn store_with_rows(n: u64) -> InMemoryTupleStore {
+        let mut store = InMemoryTupleStore::new();
+        for i in 0..n {
+            store
+                .tuple_insert(
+                    NewTuple {
+                        key: format!("k{i:08}"),
+                        value: format!("v{i}"),
+                    },
+                    1,
+                )
+                .expect("insert");
+        }
+        store
+    }
+
+    /// The pinned-generation triple-delete shape that `imbl::OrdMap::diff` was PROVEN to miss
+    /// (the third delete's id vanished while the chains differed) — the change log must report
+    /// every step, at the store level, forever.
+    #[test]
+    fn pinned_generation_deltas_report_every_delete() {
+        let mut store = store_with_rows(1500);
+        let g0 = store.clone();
+        store.tuple_delete(101, 5).expect("d1");
+        let g1 = store.clone();
+        assert_eq!(g0.changed_tuple_ids(&g1), vec![101]);
+        store.tuple_delete(701, 6).expect("d2");
+        let g2 = store.clone();
+        assert_eq!(g1.changed_tuple_ids(&g2), vec![701]);
+        store.tuple_delete(1401, 7).expect("d3");
+        let g3 = store.clone();
+        assert_eq!(g2.changed_tuple_ids(&g3), vec![1401]);
+        // And spanning multiple mutations: the window slice dedups + sorts.
+        assert_eq!(g0.changed_tuple_ids(&g3), vec![101, 701, 1401]);
+    }
+
+    /// AUDIT MEDIUM (adopted): the OUT-OF-WINDOW fallback walk is the correctness backstop when
+    /// a pin outlives `CHANGE_LOG_CAP` mutations — drive the log past the cap and assert the
+    /// fallback still reports exactly the changed ids (adds, updates, deletes).
+    #[test]
+    fn out_of_window_fallback_walk_reports_every_delta() {
+        let mut store = store_with_rows(64);
+        let pinned = store.clone();
+        // Blow the window: > CHANGE_LOG_CAP mutations after the pin (updates on one row).
+        for i in 0..(CHANGE_LOG_CAP as u64 + 10) {
+            store
+                .tuple_update(1, format!("spin{i}"), 10 + i)
+                .expect("update");
+        }
+        // Plus a delete and an insert whose ids must ALSO survive the fallback.
+        store.tuple_delete(33, 999_999).expect("delete");
+        let added = store
+            .tuple_insert(
+                NewTuple {
+                    key: "fresh".to_string(),
+                    value: "x".to_string(),
+                },
+                1_000_000,
+            )
+            .expect("insert");
+        // The window cannot cover the pin now — this exercises the zip walk.
+        assert!(
+            store.recent_changes.front().map(|(e, _)| *e).unwrap_or(0) > pinned.epoch + 1,
+            "premise: the log window no longer covers the pinned epoch"
+        );
+        let mut changed = pinned.changed_tuple_ids(&store);
+        changed.sort_unstable();
+        assert_eq!(changed, vec![1, 33, added]);
+        // Symmetric sanity: an untouched clone diffs empty through the fast path.
+        let same = store.clone();
+        assert_eq!(store.changed_tuple_ids(&same), Vec::<TupleId>::new());
     }
 }
 
