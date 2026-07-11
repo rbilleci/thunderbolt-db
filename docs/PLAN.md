@@ -51,6 +51,62 @@ Spec: ARCHITECTURE §7 + §13.
   today. Flip only once the read path is in the CPU ballpark (kill the coalescer per-item cost → wave engine, §3).
   Empirically flipping breaks 19/731 tests; that contract migration rides with the flip.
 
+- **S-E.P4 — CHUNK-AUTHORITATIVE TABLES (the store deletion for the streaming class; sealed-shards-primary
+  endgame; designed 2026-07-11, REVISED per the adversarial design review — verdict NEEDS-REVISION, all
+  findings adopted).** P1/P2/P2b/P3 shipped the *durability and read* primitives; the review PROVED the
+  write-side primitives are NOT reusable store-free (the P3 locate derives identity from a store scan; the
+  P2 stamp is driven by the store-generation change-log diff and old/new chain classification) — P4 builds
+  chunk-native twins first. THE CLASS (no flag — intrinsic, sticky, self-entered): cold entry exists + NO
+  PK/UNIQUE + NO FK edge in either direction + the RUNTIME over-budget/not-admissible test (review H1: the
+  catalog "elision-ineligible" predicate is self-contradictory — a no-constraint int4 heap IS
+  elision-eligible; type-ineligibility ⟺ chunk-unencodability). ENTER at the commit hook under an EXPLICIT
+  mutual-exclusion interlock with the elision ENTER (H1: a post-VACUUM budget change can trip both in one
+  commit). RUNTIME-DERIVED: recovery replays the WAL into the store normally and the class re-enters
+  (capture → drop rows); the artifact is the warm start. RECOVERY MATRIX INTERLOCK (H3): the store-row drop
+  AND any WAL truncation covering class-table writes are gated on a DURABLE cold artifact covering the
+  truncated suffix — else `store-dropped + WAL-truncated + artifact-missing` is unrecoverable.
+  **SLICES (re-scoped):**
+  - **P4-1 THE REVERSE GATHER — a NEW host columnar decoder (C2: not an elision twin; the elision
+    rehydrate reads resident device shards which over-budget tables do not have).** Decode ColdPayload
+    bytes (int4/int8/b128 sections, text blobs, bool bitmaps, null bitmaps) + sidecar masks back into
+    store tuples. IDENTITY (C2): chunks carry no per-row ids — fresh row_ids are synthesized on rebuild
+    (sound for the no-PK/no-FK class; `advance_row_id` discipline preserved). Charter (M4): this is NEW
+    registered host debt — ledger row with deletion trigger = the device-index-over-chunks route. Gate:
+    store → chunks → drop → rebuild → byte-identical reads differential.
+  - **P4-2a CHUNK-NATIVE LOCATE + STAMP (C1, new primitives):** a device locate over the CHUNKS
+    THEMSELVES yielding (chunk_idx, slot) — chunks gain a synthesized slot-identity at upload (the P3
+    __row_id pattern applied to chunk sources instead of store scans) — and a locate-driven stamp path
+    (no store diff, no chain classification). INSERT tail-append builds from the STATEMENT's rows.
+  - **P4-2b THE CLASS + WRITE PATH:** apply skips the store install (elision early-return pattern;
+    row-id allocator still advances); the chunk patch is the materialization: INSERT = tail from
+    statement rows; DELETE = P4-2a locate+stamp; UPDATE = stamp-old + tail-append-new at a fresh row id.
+    Patch failure de-authoritizes via P4-1 (never fails the acked commit). SERIAL-ROUTE GUARANTEE (M1):
+    class tables are forced onto the serial apply (the lane pump's covered-insert wave assumes a resident
+    open shard + PK by-key resolve — both absent here). COMMIT-LOCK BOUND (M2): bulk tails are chunked
+    with the patch bounded per commit-lock hold (ledger row; the elision precedent is incremental device
+    appends). RYW (M3): multi-statement transactions that write-then-read a class table de-authoritize
+    (v1) — intra-txn tail staging is the later lift.
+  - **P4-3 READ COMPLETENESS + THE MVCC GATES (C3, the hard one):** validity stops being generation-Arc
+    equality (meaningless without store installs) — an is-chunk-authoritative check + boundary rules.
+    PER-CHUNK BORN GATE: a reader skips chunks with `payload_copin_s > reader_copin_s` (tail appends are
+    born at their boundary; the field exists, the gate must use it per-chunk). Deletes below the reader
+    already serve via the sidecar (`deleted_by > rtx`). ENTRY QUIESCE RULE: class entry requires the
+    global-min pinned read snapshot >= the entry boundary (a reader straddling the capture would need
+    rows the scan never emitted — unrecoverable from chunks); a straddling reader post-entry
+    de-authoritizes LOUDLY (counted; not the steady state). The CPU-pinned fallback must NEVER silently
+    read the empty store (the elision-guard pattern at the dispatch seam, extended to this class).
+  - **P4-4 RECOVERY SHORT-CIRCUIT:** at the P1 seam a restored class table drops its just-replayed store
+    rows after the suffix patches land; the store-mode fallback stays; plus the H3 truncation gate.
+  - **P4-5 THE DELETION SWEEP:** VACUUM sidecar compaction (device gather of surviving slots); the
+    cold-tier/scan-build ledger row CLOSES (scan-build = bootstrap/de-auth import only); the M4 reverse-
+    gather row OPENS; host-debt balance sheet.
+  **NON-ISSUES (review-confirmed):** SI ledger reads (table,row_key)+unique slots only — a no-PK class
+  records none, correct no-op; sequences/DEFAULTs read the catalog; no triggers. **DDL SEAM (H2):** the
+  DDL preflight sweeps class tables through P4-1 BEFORE any `visible_relational_rows` read (ADD
+  PK/UNIQUE/CHECK/FK would validate vacuously against an empty store) — the elision rehydrate-sweep seam,
+  extended. **EXCLUSIONS:** uniqueness-constrained tables (device-index/fingerprint route later), FK-edged
+  tables, elided tables, multi-GPU.
+
 **Golden wire tests** (acceptance spec): drive SQL over the real pgwire socket
 (`crates/server/tests/pgwire_roundtrip.rs` pattern), assert exact rows + that the GPU sharded route served them
 (non-vacuous), differential vs 1/N shards/host, **with NULL data**, GPU-guarded.
