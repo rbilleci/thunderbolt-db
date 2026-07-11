@@ -252,10 +252,12 @@ content is zero: staging, orchestration cardinality, boundary coercions only); t
 RECLAMATION `de4a4f34` (class entry DELETES the host chains + value index — the no-fence soundness
 audited leg-by-leg; de-auth chunk-only, the rank enumeration deleted), fence-free COMPACTION `dc7851bb`
 (post-publish BY DESIGN — a pre-publish install lets a boundary-1 bind born-skip survivors; dead slots +
-sidecars physically deleted), P5-0 `8b1621d4` (the device slot recheck — the M1 prerequisite). ACTIVE
-SLICE: P5-1 (the chunk-index cache: chunk_id fresh-iff-payload-new at exactly the two genuine-payload
-constructors; entry-time index builds; VRAM accounting + cap + LRU; the eligibility gate lifts only in
-P5-2 with the C1 self-exclusion + the C2 replay differential).
+sidecars physically deleted), P5-0 `8b1621d4` (the device slot recheck — the M1 prerequisite). P5-1 SHIPPED
+`cddce252` (chunk_id content identity; the accounted+capped index cache; the fold-path blob_offsets HIGH
+fixed + gated; dup-tolerant builds; the chunk_key_needle parity contract). ACTIVE SLICE: P5-2 — INSERT
+uniqueness (probe + the P5-0 device recheck at the statement snapshot) + the C1 UPDATE coordinate
+self-exclusion + the C2 REPLAY differential (a false-accept is RPO-violating) + the H1-gated eligibility
+lift (keyed tables admit only when the index set fits the cap; indexes build at entry).
 **THE PRIOR ARC (SEALED-SHARDS-PRIMARY P1..P4, COMPLETE):** — design in memory
 `strata-streaming-executor`; P2 SV2 tombstone sidecars; P3 DML resolve via streaming folds; P4 the store
 deletion for streamed tables + the registered cold-tier debt payoff. The ADR-006 store deletion follows.
