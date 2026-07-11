@@ -748,6 +748,10 @@ impl Engine {
         };
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
+                // P4-3 born gate: a chunk born after this reader's boundary is invisible to it.
+                if chunk.payload_copin_s > copin_s {
+                    continue;
+                }
                 let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
@@ -1040,6 +1044,10 @@ impl Engine {
         };
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
+                // P4-3 born gate: a chunk born after this reader's boundary is invisible to it.
+                if chunk.payload_copin_s > copin_s {
+                    continue;
+                }
                 if window_bound.is_some_and(|bound| rows_out.len() >= bound) {
                     break;
                 }
@@ -1525,6 +1533,10 @@ impl Engine {
         };
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
+                // P4-3 born gate: a chunk born after this reader's boundary is invisible to it.
+                if chunk.payload_copin_s > copin_s {
+                    continue;
+                }
                 let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
@@ -2045,6 +2057,10 @@ impl Engine {
         };
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
+                // P4-3 born gate: a chunk born after this reader's boundary is invisible to it.
+                if chunk.payload_copin_s > copin_s {
+                    continue;
+                }
                 let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
@@ -3192,8 +3208,27 @@ impl Engine {
             }
             return None;
         }
-        if cold.chunk_target_bytes != chunk_target_bytes || copin_s < cold.build_copin_s {
+        if cold.chunk_target_bytes != chunk_target_bytes {
             return None;
+        }
+        // P4-3 — THE BORN GATE (design review C3): a CLASS table's entry boundary advances with
+        // every tail append, so `copin_s >= build` would MISS any reader pinned below the latest
+        // write and thrash de-auth. Class hits require only `copin_s >= the FREEZE boundary`
+        // (below it the frozen chains serve exactly); the replay arms skip chunks BORN LATER
+        // (`payload_copin_s > copin_s`) and the sidecar mask handles deletes — exact MVCC per
+        // reader. Non-class entries keep the strict boundary rule (their chunks are rebuilt at
+        // the entry boundary; no per-chunk born discipline exists for them).
+        match self.table_chunk_authoritative(table_name) {
+            Some(freeze) => {
+                if copin_s < freeze {
+                    return None;
+                }
+            }
+            None => {
+                if copin_s < cold.build_copin_s {
+                    return None;
+                }
+            }
         }
         self.read_state
             .residency
@@ -3689,8 +3724,27 @@ impl Engine {
             .relational_catalog
             .get(table_name)
             .cloned()?;
+        // Audit LOW (P4-3): the same entry-level floor as the locate — a class gather below the
+        // freeze would silently DROP freeze-rebuilt base chunks via the born skip; decline instead
+        // (the frozen store serves those boundaries).
+        match self.table_chunk_authoritative(table_name) {
+            Some(freeze) => {
+                if rtx < freeze {
+                    return None;
+                }
+            }
+            None => {
+                if rtx < entry.build_copin_s {
+                    return None;
+                }
+            }
+        }
         let mut rows: Vec<Vec<SqlValue>> = Vec::new();
         for chunk in &entry.chunks {
+            // P4-3 born gate: chunks born after `rtx` are invisible to that boundary.
+            if chunk.payload_copin_s > rtx {
+                continue;
+            }
             match decode_cold_chunk_rows(&table, chunk, rtx) {
                 Ok(mut decoded) => rows.append(&mut decoded),
                 Err(err) => return Some(Err(err)),
@@ -3736,12 +3790,24 @@ impl Engine {
             .load()
             .get(&table.name)
             .cloned()?;
-        if rtx < entry.build_copin_s {
-            return None; // below the entry boundary — the chunks cannot serve this reader
+        // P4-3: class entries serve any boundary at-or-above the FREEZE (the born gate skips
+        // later-born chunks below); non-class entries keep the strict entry-boundary rule.
+        match self.table_chunk_authoritative(&table.name) {
+            Some(freeze) => {
+                if rtx < freeze {
+                    return None;
+                }
+            }
+            None => {
+                if rtx < entry.build_copin_s {
+                    return None;
+                }
+            }
         }
         let mut out: Vec<(usize, Vec<u32>)> = Vec::new();
         for (idx, chunk) in entry.chunks.iter().enumerate() {
-            if chunk.row_count == 0 {
+            if chunk.row_count == 0 || chunk.payload_copin_s > rtx {
+                // Empty, or born after this boundary (the P4-3 born gate).
                 continue;
             }
             let staged = self.stage_cold_chunk(chunk, rtx).ok()?;

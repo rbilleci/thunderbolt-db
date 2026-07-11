@@ -171,8 +171,22 @@ REPLACE IT with re-resolve+stamp under the lock, never a drop. LOWs noted: UPDAT
 non-atomicity on device error = the accepted de-auth-on-append-failure precedent (delete-shaped); pseudo-
 key/SI-keyspace overlap latent-inert (serial-only). Unfiltered `DELETE FROM t` resolves 0 rows through the
 prepare ladder ENGINE-WIDE (empty filter_groups match nothing — pre-existing, discovered here; the class
-exit test uses the DDL sweep instead). ACTIVE: P4-3 (born-gate + read-completeness enumeration), P4-4
-(recovery short-circuit), P4-5 (VACUUM sidecar compaction + the deletion sweep/balance sheet).
+exit test uses the DDL sweep instead). **P4-3 SHIPPED: THE BORN GATE** — class hits require only `rtx >= FREEZE` (the entry boundary advances
+per tail append — the old rule would MISS any reader pinned below the latest write = the C3 thrash cliff);
+every replay surface (4 folds, the locate, the reverse gather) skips chunks `payload_copin_s > rtx`; with
+the sidecar mask (`deleted_by > rtx`) the visibility algebra is EXACT per-reader MVCC (audit: "textbook" —
+the UPDATE old/new transition atomic at D via matching strict compares; base-chunk union == visible-at-
+freeze by the disjoint-range tiling; non-class arms inert). Audit MERGE-SAFE zero C/H/M; LOW-1 adopted
+(the gather gained the same freeze floor — a below-freeze gather would silently drop freeze-rebuilt base
+chunks); LOW-2 noted (the fold loops at old boundaries are single-threaded-untestable — the gather/locate
+stand in; the gate predicate is textually identical across all six sites). Sweep 456/456.
+**P4-4 RESOLVED AS A DESIGN NOTE (freeze-not-drop made it moot):** recovery replays the WAL into the store
+normally; nothing is ever dropped (the freeze defers reclamation to P4-5's fenced VACUUM), so there is no
+"drop just-replayed rows" step — the P1 artifact warm-starts the cache at the seam and the class RE-ENTERS
+at its next eligible commit. Composition verified by the existing P1 + class-entry gates.
+REMAINING: P4-5 (VACUUM sidecar compaction — rewrite a heavily-stamped chunk from surviving slots as a
+device gather; the frozen-store RAM reclamation behind a reader fence; the arc's host-debt balance sheet +
+deletion-sweep accounting).
 **>>> NEXT ARC: P4 — DELETE THE HOST TUPLE STORE FOR STREAMED TABLES <<<** (the ADR-006 endgame for the
 streaming class; fresh-session-sized, decompose into audited slices):
 (P4a) DURABLE VALIDITY: the runtime generation-Arc validity dies with the store — the (artifact boundary,
