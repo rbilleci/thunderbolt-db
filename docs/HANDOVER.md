@@ -45,10 +45,18 @@ stale bytes; order-dependent because fresh driver pages are zero). FIX = one lin
 `cold_tier_spills` -> `distinct_over_budget` (deterministic under sabotage); a new shape test pins numeric
 partials + SUM mask reaching the merge. **6c-0(c) RE-LANDED in the same commit** — the per-round host narrow
 loop is DELETED (the last of the three glosses); the wrap/narrow are staging-encode/readback coercions.
-**S-E.6c remaining (device-first, deletion-gated):** (1) sealed shards WITH
-on-device version stamps (SV3b/SV6) as the PRIMARY over-VRAM representation, fold consumes shard bytes directly →
-DELETE the cold cache + scan-build in that merge; (2) writes: INSERT appends a sealed cold shard (no rebuild),
-DELETE/UPDATE via per-shard tombstone regions interpreted ON-DEVICE.
+**6c-1 DONE (`6687d5e0`): CHUNK-GRANULAR DELTA MAINTENANCE** — a write PATCHES the cold tier in O(delta): imbl
+COW-chain diff (the cache's own generation pin FORCES the clone — refcount>=2 → make_mut can't keep the pointer →
+diff complete BY CONSTRUCTION, audit-proven vs imbl source) → effective-range tiling → rebuild ONLY dirty chunks +
+tail (INSERT = pure tail, ZERO rebuilds; 1-row DELETE = exactly ONE — both gated). Spill-aware rebuilds (audit F1),
+tail-runt coalescing caps ping-pong fragmentation (F2, remaining O(chunks)/patch walk = ledgered), patch installs
+excluded from the builds counter (F3), empty→insert covered (F6). The scan-build debt: O(table)/write →
+O(delta)/write. **6c-2 (tombstone sidecars) DEFERRED as low-leverage post-6c-1** (deletes are already O(one-chunk);
+sidecars pay off when cold bytes become PRIMARY — folded into the 6c-3+ arc).
+**S-E.6c remaining:** 6c-3 = EAGER cold-tier maintenance at the auto-admit commit hook (over-VRAM tables
+build/patch at commit, best-effort off the ack path — deletes the lazy first-read O(table) scan from the READ
+path); then sealed shards as PRIMARY (cold bytes stop shadowing the tuple store; on-device tombstone regions
+SV2-style; the ADR-006 store deletion follows).
 **S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy — RESOLVED:
 merged back via S-E.6a above):** the
 copy/compute-overlap pipeline (async pinned-staged uploads on a private copy stream + the stage-N/compute-N-1
