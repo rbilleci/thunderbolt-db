@@ -155,8 +155,24 @@ served BEFORE streaming dispatch); L5 lane-apply debug_assert; L6 tails build as
 builder retro-spill would poison on a spilled base; unbounded entry growth accepted-by-design + ledgered,
 VACUUM compaction = P4-5). #[cfg(test)] CHUNK_CLASS_ENTRY_ENABLED_TEST keeps three store-driven gates on
 their machinery. COVERAGE GAP (next slice): a live COPY-into-class-table test (the C1 scenario is fixed
-structurally, untested end-to-end). ACTIVE SLICE: P4-2b-ii (DELETE/UPDATE via the P4-2a locate+stamp
-under the commit lock, honoring the coordinate-token obligation).
+structurally, untested end-to-end). **P4-2b-ii SHIPPED: CLASS DELETE/UPDATE VIA LOCATE+STAMP** — prepare resolves class DML FROM THE CHUNKS
+(P4-2a locate with sidecar vis + P4-1 unmasked slot-aligned decode; matches = packed (chunk<<32|slot)
+pseudo-ids + fabricated keys); the delta carries the ENTRY EPOCH (ColdTableChunks.entry_epoch, bumped at
+every install — the P4-2a coordinate token as a u64); the apply skips the frozen store; the commit hook
+stamps the coordinates iff the installed entry still carries the epoch (routed through the CLASS install —
+the general strict-equality proof cannot hold pre-publish, the tail-append precedent) and UPDATE =
+stamp-old + tail-append-new (U2 shape). DE-AUTH EXTENDED: sidecar stamps REPLAY into the store (base
+chunks: slot→store-id via the rank enumeration at the payload boundary, stamps>freeze only; tail chunks:
+insert-at-born + own-stamp tombstones) — the exited store is MVCC-WHOLE at every boundary (gated by the
+DDL-sweep exit's closed-form SUM). Audit MERGE-SAFE zero C/H; the MEDIUM is a LATENT-UNREACHABLE
+lost-delete on epoch drift (single-entry class DML runs prepare→apply→hook under ONE held commit mutex;
+multi-entry de-auths up front) — doc-contracted at the fallback arm: THE OFF-LOCK-PREPARE FUTURE MUST
+REPLACE IT with re-resolve+stamp under the lock, never a drop. LOWs noted: UPDATE stamp/append
+non-atomicity on device error = the accepted de-auth-on-append-failure precedent (delete-shaped); pseudo-
+key/SI-keyspace overlap latent-inert (serial-only). Unfiltered `DELETE FROM t` resolves 0 rows through the
+prepare ladder ENGINE-WIDE (empty filter_groups match nothing — pre-existing, discovered here; the class
+exit test uses the DDL sweep instead). ACTIVE: P4-3 (born-gate + read-completeness enumeration), P4-4
+(recovery short-circuit), P4-5 (VACUUM sidecar compaction + the deletion sweep/balance sheet).
 **>>> NEXT ARC: P4 — DELETE THE HOST TUPLE STORE FOR STREAMED TABLES <<<** (the ADR-006 endgame for the
 streaming class; fresh-session-sized, decompose into audited slices):
 (P4a) DURABLE VALIDITY: the runtime generation-Arc validity dies with the store — the (artifact boundary,

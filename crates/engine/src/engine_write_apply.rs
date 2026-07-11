@@ -147,7 +147,18 @@ impl Engine {
                 installs,
                 value_index_entries,
                 updated_old_rows: _,
+                class_epoch,
             } => {
+                // P4-2b-ii: a class UPDATE's store is frozen — the commit hook stamps the old
+                // coordinates + tail-appends the new images (the installs' ids are PACKED
+                // coordinates, not tuple ids; a store write here would corrupt a live chain).
+                if class_epoch.is_some() {
+                    self.read_state
+                        .residency
+                        .chunk_class_skipped_installs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
                 // RETIREMENT A4e: elided tables have no host tuples to rewrite — the device
                 // tombstone+append (SV5/A4b) is the data plane.
                 if self.table_install_elided(&table) {
@@ -175,7 +186,16 @@ impl Engine {
                 table,
                 tuple_ids,
                 deleted_rows: _,
+                class_epoch,
             } => {
+                // P4-2b-ii: class DELETE — the ids are packed coordinates; the hook stamps them.
+                if class_epoch.is_some() {
+                    self.read_state
+                        .residency
+                        .chunk_class_skipped_installs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
                 // RETIREMENT A4e: elided tables have no host tuples to tombstone — the device
                 // tombstone (SV4b/A4b) is the data plane.
                 if self.table_install_elided(&table) {
@@ -354,7 +374,16 @@ impl Engine {
         cat: &mut DdlCatalogState,
         delete: Delete,
         txn_id: TxnId,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, WriteSet)>, EngineError> {
+    ) -> Result<
+        Option<(
+            String,
+            Vec<Vec<SqlValue>>,
+            WriteSet,
+            // P4-2b-ii: the class stamp inputs (packed coordinates + the entry epoch).
+            Option<(Vec<u64>, u64)>,
+        )>,
+        EngineError,
+    > {
         // Stage 2 split: PURE prepare (resolve matches + FK preflight + write-set) then a
         // `&mut self` tombstone install. `txn_id` is the commit-seq used as both the read boundary
         // and the version stamp, identical to the old direct apply (still under the commit lock).
@@ -368,8 +397,14 @@ impl Engine {
             PreparedMutation::Delete {
                 table,
                 deleted_rows,
-                ..
-            } => Some((table.clone(), deleted_rows.clone(), delta.write_set.clone())),
+                tuple_ids,
+                class_epoch,
+            } => Some((
+                table.clone(),
+                deleted_rows.clone(),
+                delta.write_set.clone(),
+                class_epoch.map(|epoch| (tuple_ids.clone(), epoch)),
+            )),
             _ => None,
         };
         self.apply_delta_serialized(cat, delta, txn_id, None)?;
@@ -388,6 +423,8 @@ impl Engine {
             Vec<Vec<SqlValue>>,
             Option<Vec<u64>>,
             WriteSet,
+            // P4-2b-ii: the class coordinate token.
+            Option<u64>,
         )>,
         EngineError,
     > {
@@ -405,6 +442,7 @@ impl Engine {
                 table,
                 installs,
                 updated_old_rows,
+                class_epoch,
                 ..
             } => {
                 // RETIREMENT A4b: identities ride the installs' KEYS (exact parallel to old/new
@@ -425,6 +463,7 @@ impl Engine {
                         .collect(),
                     row_ids,
                     delta.write_set.clone(),
+                    *class_epoch,
                 ))
             }
             _ => None,

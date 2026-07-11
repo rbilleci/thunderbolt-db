@@ -541,11 +541,7 @@ impl Engine {
                                 .relational_catalog
                                 .get(table_name)
                                 .map(|table| {
-                                    self.append_streaming_cold_tail(
-                                        table,
-                                        rows,
-                                        publish_index,
-                                    )
+                                    self.append_streaming_cold_tail(table, rows, publish_index)
                                 })
                                 .unwrap_or(false);
                             if !appended {
@@ -553,9 +549,79 @@ impl Engine {
                             }
                         }
                         AppliedRowMutation::Insert { .. } => {}
-                        _ => {
-                            self.deauthoritize_chunk_table(table_name, true)?;
-                        }
+                        // P4-2b-ii: class DELETE — stamp the packed coordinates iff the
+                        // installed entry still carries the prepare-time epoch (the P4-2a
+                        // coordinate token); any mismatch/failure exits the class LOUDLY.
+                        AppliedRowMutation::Delete {
+                            rows, class_stamp, ..
+                        } => match class_stamp {
+                            Some((coords, epoch)) if !rows.is_empty() => {
+                                if !self.stamp_class_coordinates(
+                                    table_name,
+                                    coords,
+                                    *epoch,
+                                    publish_index,
+                                ) {
+                                    // ⚠️ AUDIT CONTRACT (MEDIUM, latent): this fallback DROPS
+                                    // the in-flight delete from the LIVE store (the apply
+                                    // skipped it; the de-auth replay lacks its stamps — WAL
+                                    // replay recovers it). UNREACHABLE today: single-entry
+                                    // class DML runs prepare→apply→hook under ONE held commit
+                                    // mutex, so the epoch cannot drift. The OFF-LOCK-PREPARE
+                                    // future (see the write-path plan) MUST replace this arm
+                                    // with re-resolve+stamp under the lock — never a drop.
+                                    eprintln!(
+                                        "[gpu-db] class stamp REFUSED for \"{table_name}\" \
+                                         (epoch drift) — de-authoritizing; the live store \
+                                         DROPS this delete until WAL replay (latent-unreachable \
+                                         path, see the P4-2b-ii audit contract)"
+                                    );
+                                    self.deauthoritize_chunk_table(table_name, true)?;
+                                }
+                            }
+                            Some(_) => {} // a 0-row class delete: nothing to stamp
+                            // Resolved via a non-class arm while classed (a de-auth raced the
+                            // prepare): the store now holds the truth — exit.
+                            None => {
+                                self.deauthoritize_chunk_table(table_name, true)?;
+                            }
+                        },
+                        // P4-2b-ii: class UPDATE = stamp the OLD coordinates + tail-append the
+                        // NEW images at this commit (the U2 tombstone-old/append-new shape).
+                        AppliedRowMutation::Update {
+                            new_rows,
+                            row_ids,
+                            class_epoch,
+                            ..
+                        } => match (class_epoch, row_ids) {
+                            (Some(epoch), Some(coords)) if !new_rows.is_empty() => {
+                                let stamped = self.stamp_class_coordinates(
+                                    table_name,
+                                    coords,
+                                    *epoch,
+                                    publish_index,
+                                );
+                                let appended = stamped
+                                    && cat
+                                        .relational_catalog
+                                        .get(table_name)
+                                        .map(|table| {
+                                            self.append_streaming_cold_tail(
+                                                table,
+                                                new_rows,
+                                                publish_index,
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                if !appended {
+                                    self.deauthoritize_chunk_table(table_name, true)?;
+                                }
+                            }
+                            (Some(_), _) => {} // 0-row class update: nothing to do
+                            _ => {
+                                self.deauthoritize_chunk_table(table_name, true)?;
+                            }
+                        },
                     }
                 }
             }
@@ -1302,13 +1368,14 @@ impl Engine {
                 // replay it re-resolves to the SAME 0 rows deterministically (all ops on a key
                 // are lane-serialized in seq order) — a legal no-op, not corruption. `None` =
                 // 0 rows applied; the delete simply affected nothing.
-                let Some((table, rows, write_set)) = applied else {
+                let Some((table, rows, write_set, _class_stamp)) = applied else {
                     return Ok(None);
                 };
                 return Ok(Some(AppliedRowMutation::Delete {
                     table,
                     rows,
                     write_set,
+                    class_stamp: None,
                 }));
             }
             crate::wal_binary::BinaryWalRecord::UpdateByKey(record) => {
@@ -1365,7 +1432,7 @@ impl Engine {
                 // the new version lands at a FRESH `new_row_id`, so without this the rehydrate
                 // would leave two live rows sharing the pk (audit MEDIUM).
                 let (old_rows, old_row_ids) = match self.apply_delete(cat, delete, entry.index)? {
-                    Some((_, rows, del_write_set)) => {
+                    Some((_, rows, del_write_set, _class_stamp)) => {
                         let prefix = relational_key_prefix(&record.table);
                         let ids: Vec<u64> = del_write_set
                             .rows
@@ -1403,6 +1470,7 @@ impl Engine {
                 };
                 self.apply_delta(delta, entry.index, None)?;
                 return Ok(Some(AppliedRowMutation::Update {
+                    class_epoch: None, // replay: never a class table (process-local flag)
                     table: record.table,
                     old_rows,
                     new_rows: vec![new_values],
@@ -1689,25 +1757,30 @@ impl Engine {
                 );
             }
             Command::Delete(delete) => {
-                applied =
-                    self.apply_delete(cat, delete, commit_seq)?
-                        .map(|(table, rows, write_set)| AppliedRowMutation::Delete {
-                            table,
-                            rows,
-                            write_set,
-                        });
+                applied = self.apply_delete(cat, delete, commit_seq)?.map(
+                    |(table, rows, write_set, class_stamp)| AppliedRowMutation::Delete {
+                        table,
+                        rows,
+                        write_set,
+                        class_stamp,
+                    },
+                );
             }
             Command::Update(update) => {
                 applied = self.apply_update(cat, update, commit_seq)?.map(
-                    |(table, old_rows, new_rows, row_ids, write_set)| AppliedRowMutation::Update {
-                        table,
-                        old_rows,
-                        new_rows,
-                        row_ids,
-                        // Classic in-place update REUSES the old row-id for the new version, so the
-                        // elided-rehydrate upsert overwrites it — no separate removal needed.
-                        old_row_ids: None,
-                        write_set,
+                    |(table, old_rows, new_rows, row_ids, write_set, class_epoch)| {
+                        AppliedRowMutation::Update {
+                            table,
+                            old_rows,
+                            new_rows,
+                            row_ids,
+                            class_epoch,
+                            // Classic in-place update REUSES the old row-id for the new
+                            // version, so the elided-rehydrate upsert overwrites it — no
+                            // separate removal needed.
+                            old_row_ids: None,
+                            write_set,
+                        }
                     },
                 );
             }

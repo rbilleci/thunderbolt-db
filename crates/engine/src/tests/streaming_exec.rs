@@ -2225,7 +2225,8 @@ fn gpu_cold_sidecar_stamps_mask_rows_across_chunks() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     const N: i32 = 1500;
     let mut values = String::new();
     for i in 0..N {
@@ -2242,7 +2243,12 @@ fn gpu_cold_sidecar_stamps_mask_rows_across_chunks() {
     // Build the cold tier (multi-chunk).
     let q_count = select("SELECT COUNT(*) FROM big");
     assert_eq!(
-        e.execute_relational_select(&q_count).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        e.execute_relational_select(&q_count)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>(),
         vec![vec![SqlValue::Int8(i64::from(N))]]
     );
     assert!(e.streaming_cold_builds() >= 1);
@@ -2251,14 +2257,24 @@ fn gpu_cold_sidecar_stamps_mask_rows_across_chunks() {
     // Each Eq-DELETE resolves via the value index (host arm) and must EAGERLY STAMP at commit.
     for a in [100, 700, 1400] {
         seq += 1;
-        e.execute_text(seq, &format!("DELETE FROM big WHERE a = {a}")).unwrap();
+        e.execute_text(seq, &format!("DELETE FROM big WHERE a = {a}"))
+            .unwrap();
     }
     assert_eq!(e.streaming_cold_stamps(), 3, "three rows stamped");
-    assert_eq!(e.streaming_cold_chunks_rebuilt(), 0, "no rebuild for pure deletes");
+    assert_eq!(
+        e.streaming_cold_chunks_rebuilt(),
+        0,
+        "no rebuild for pure deletes"
+    );
 
     // Aggregate through stamped chunks.
     assert_eq!(
-        e.execute_relational_select(&q_count).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        e.execute_relational_select(&q_count)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>(),
         vec![vec![SqlValue::Int8(i64::from(N) - 3)]]
     );
     // VALUE-SENSITIVE reads through the stamped chunks (COUNT alone cannot catch a mask on the
@@ -2302,13 +2318,17 @@ fn gpu_cold_sidecar_stamps_mask_rows_across_chunks() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
+    // A STORE-DRIVEN-era gate (P2 stamps + the P2b artifact round-trip against a replayed twin
+    // whose id space must match): the class would shift ids via skipped installs mid-test.
+    let _class_off = ClassEntryDisabled::new();
     let mut e = Engine::new_local();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     const N: i32 = 900;
     let mut values = String::new();
     for i in 0..N {
@@ -2339,22 +2359,33 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
     // INSERT -> pure tail patch; the STAMPED chunk is REUSED (stamps preserved, still masked).
     let rebuilt_before = e.streaming_cold_chunks_rebuilt();
     seq += 1;
-    e.execute_text(seq, "INSERT INTO big (a, b) VALUES (100000, 1)").unwrap();
+    e.execute_text(seq, "INSERT INTO big (a, b) VALUES (100000, 1)")
+        .unwrap();
     assert_eq!(
         e.streaming_cold_chunks_rebuilt(),
         rebuilt_before,
         "INSERT stays a pure tail append beside a stamped chunk"
     );
-    assert_eq!(count(&e), i64::from(N), "tail row visible AND the stamp still masks");
+    assert_eq!(
+        count(&e),
+        i64::from(N),
+        "tail row visible AND the stamp still masks"
+    );
 
     // UPDATE (same-id version chain change) -> the classifier must refuse the stamp downgrade;
     // the rebuild arm serves it. Correctness is the assert; the arm split is the counter.
     seq += 1;
-    e.execute_text(seq, "UPDATE big SET b = -7 WHERE a = 20").unwrap();
+    e.execute_text(seq, "UPDATE big SET b = -7 WHERE a = 20")
+        .unwrap();
     assert_eq!(count(&e), i64::from(N), "update preserves cardinality");
     let q_probe = select("SELECT b FROM big WHERE a = 20");
     assert_eq!(
-        e.execute_relational_select(&q_probe).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        e.execute_relational_select(&q_probe)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>(),
         vec![vec![SqlValue::Int4(-7)]],
         "the updated value must be visible through the streaming read"
     );
@@ -2364,7 +2395,10 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
     // stamped rows STAY MASKED (no store consultation, no rebuild).
     seq += 1;
     e.execute_text(seq, "DELETE FROM big WHERE a = 30").unwrap();
-    assert!(e.streaming_cold_stamps() >= 2, "premise: the entry carries a sidecar");
+    assert!(
+        e.streaming_cold_stamps() >= 2,
+        "premise: the entry carries a sidecar"
+    );
     let dir = std::env::temp_dir().join(format!(
         "gpu-db-p2b-ckpt-roundtrip-{}-{}",
         std::process::id(),
@@ -2379,7 +2413,10 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
     let written = e
         .write_streaming_cold_checkpoint(&base, 1, boundary, boundary + 1)
         .expect("capture runs");
-    assert_eq!(written, 1, "the v2 artifact must carry the sidecar-bearing entry");
+    assert_eq!(
+        written, 1,
+        "the v2 artifact must carry the sidecar-bearing entry"
+    );
 
     // The twin replays the identical statement history (same commit boundary), restores the
     // artifact directly, and its FIRST streaming read replays the stamped bytes.
@@ -2389,10 +2426,10 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
         return;
     }
     twin_seq += 1;
-    twin.execute_text(twin_seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    twin.execute_text(twin_seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     twin_seq += 1;
-    twin
-        .execute_text(twin_seq, &format!("INSERT INTO big (a, b) VALUES {values}"))
+    twin.execute_text(twin_seq, &format!("INSERT INTO big (a, b) VALUES {values}"))
         .unwrap();
     for statement in [
         "DELETE FROM big WHERE a = 10",
@@ -2409,10 +2446,21 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
         "premise: the twin reached the artifact boundary"
     );
     let restored = twin.restore_streaming_cold_checkpoint(&base, 1);
-    assert_eq!(restored, 1, "the twin must restore the sidecar-bearing entry");
+    assert_eq!(
+        restored, 1,
+        "the twin must restore the sidecar-bearing entry"
+    );
     twin.set_relational_residency_budget_bytes(0, 4096);
-    assert_eq!(count(&twin), i64::from(N) - 1, "restored stamps still mask (a=10, a=30 gone; tail row present)");
-    assert_eq!(twin.streaming_cold_builds(), 0, "the restore IS the build — no scan");
+    assert_eq!(
+        count(&twin),
+        i64::from(N) - 1,
+        "restored stamps still mask (a=10, a=30 gone; tail row present)"
+    );
+    assert_eq!(
+        twin.streaming_cold_builds(),
+        0,
+        "the restore IS the build — no scan"
+    );
     assert!(twin.streaming_cold_hits() >= 1);
 
     // AUDIT LOW (adopted): a POST-RESTORE delete pins the persisted `payload_copin_s` — the
@@ -2420,8 +2468,12 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
     // defaulted the boundary to the seam would exclude the already-stamped rows from the rank,
     // shift the slot, and mask the WRONG row. COUNT is slot-blind; the closed-form SUM bites.
     twin_seq += 1;
-    twin.execute_text(twin_seq, "DELETE FROM big WHERE a = 40").unwrap();
-    assert!(twin.streaming_cold_stamps() >= 1, "the post-restore delete must STAMP");
+    twin.execute_text(twin_seq, "DELETE FROM big WHERE a = 40")
+        .unwrap();
+    assert!(
+        twin.streaming_cold_stamps() >= 1,
+        "the post-restore delete must STAMP"
+    );
     assert_eq!(count(&twin), i64::from(N) - 2);
     let expected_sum: i64 = (0..i64::from(N)).sum::<i64>() - 10 - 30 - 40 + 100000;
     let sum = twin
@@ -2444,14 +2496,18 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
 #[test]
 fn cow_change_log_reports_every_pinned_generation_delta() {
     let e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     const N: i32 = 1500;
     let mut values = String::new();
     for i in 0..N {
-        if i > 0 { values.push(','); }
+        if i > 0 {
+            values.push(',');
+        }
         values.push_str(&format!("({i}, {})", i * 2));
     }
-    e.execute_text(2, &format!("INSERT INTO big (a, b) VALUES {values}")).unwrap();
+    e.execute_text(2, &format!("INSERT INTO big (a, b) VALUES {values}"))
+        .unwrap();
     let g0 = e.read_state.mvcc.table_rows("big").generation_payload();
     e.execute_text(3, "DELETE FROM big WHERE a = 100").unwrap();
     let g1 = e.read_state.mvcc.table_rows("big").generation_payload();
@@ -2503,12 +2559,38 @@ fn gpu_reverse_gather_round_trips_all_types_and_sidecars() {
             values.push(',');
         }
         // Audit LOW: a NULL in EVERY nullable section type (i32/i64/b128/bool/text/uuid paths).
-        let t = if i % 7 == 0 { "NULL".into() } else { format!("'txt{:04}'", i) };
-        let n = if i % 5 == 0 { "NULL".into() } else { format!("{}.{:02}", i, i % 100) };
-        let big = if i % 11 == 0 { "NULL".into() } else { format!("{}", i64::from(i) * 1_000_000_007) };
-        let s16 = if i % 13 == 0 { "NULL".into() } else { format!("{}", i % 300 - 150) };
-        let flag = if i % 17 == 0 { "NULL".into() } else if i % 2 == 0 { "true".into() } else { "false".to_string() };
-        let u = if i % 19 == 0 { "NULL".into() } else { format!("'00000000-0000-0000-0000-{:012x}'", i) };
+        let t = if i % 7 == 0 {
+            "NULL".into()
+        } else {
+            format!("'txt{:04}'", i)
+        };
+        let n = if i % 5 == 0 {
+            "NULL".into()
+        } else {
+            format!("{}.{:02}", i, i % 100)
+        };
+        let big = if i % 11 == 0 {
+            "NULL".into()
+        } else {
+            format!("{}", i64::from(i) * 1_000_000_007)
+        };
+        let s16 = if i % 13 == 0 {
+            "NULL".into()
+        } else {
+            format!("{}", i % 300 - 150)
+        };
+        let flag = if i % 17 == 0 {
+            "NULL".into()
+        } else if i % 2 == 0 {
+            "true".into()
+        } else {
+            "false".to_string()
+        };
+        let u = if i % 19 == 0 {
+            "NULL".into()
+        } else {
+            format!("'00000000-0000-0000-0000-{:012x}'", i)
+        };
         values.push_str(&format!(
             "({i}, {s16}, {big}, '2024-{:02}-{:02}', '2024-01-01 00:{:02}:{:02}', {n}, {flag}, {t}, {u})",
             1 + (i % 12),
@@ -2518,27 +2600,45 @@ fn gpu_reverse_gather_round_trips_all_types_and_sidecars() {
         ));
     }
     seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO mix VALUES {values}")).unwrap();
+    e.execute_text(seq, &format!("INSERT INTO mix VALUES {values}"))
+        .unwrap();
 
     // The ORACLE: the store's visible rows BEFORE streaming (host path, scan order).
     let q = select("SELECT a, s, big, d, ts, n, flag, t, u FROM mix");
-    let oracle = e.execute_relational_select(&q).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+    let oracle = e
+        .execute_relational_select(&q)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
     assert_eq!(oracle.len(), N as usize);
 
     // Stream -> cold chunks; reverse-gather at the current boundary.
     e.set_relational_residency_budget_bytes(0, 4096);
-    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM mix")).unwrap();
-    assert!(e.streaming_cold_builds() >= 1, "premise: a cold entry exists");
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM mix"))
+        .unwrap();
+    assert!(
+        e.streaming_cold_builds() >= 1,
+        "premise: a cold entry exists"
+    );
     let gathered = e
         .reverse_gather_streamed_rows("mix", e.committed_seq())
         .expect("cold entry present")
         .expect("decode succeeds");
-    assert_eq!(gathered, oracle, "the reverse gather must reproduce the store rows exactly");
+    assert_eq!(
+        gathered, oracle,
+        "the reverse gather must reproduce the store rows exactly"
+    );
 
     // A stamped DELETE: the gather at the current boundary must exclude EXACTLY that row.
     seq += 1;
     e.execute_text(seq, "DELETE FROM mix WHERE a = 42").unwrap();
-    assert!(e.streaming_cold_stamps() >= 1, "premise: the delete STAMPED");
+    assert!(
+        e.streaming_cold_stamps() >= 1,
+        "premise: the delete STAMPED"
+    );
     let gathered = e
         .reverse_gather_streamed_rows("mix", e.committed_seq())
         .expect("cold entry present")
@@ -2548,7 +2648,10 @@ fn gpu_reverse_gather_round_trips_all_types_and_sidecars() {
         .filter(|row| row[0] != SqlValue::Int4(42))
         .cloned()
         .collect();
-    assert_eq!(gathered, want, "the sidecar mask must apply kernel-identically on the host");
+    assert_eq!(
+        gathered, want,
+        "the sidecar mask must apply kernel-identically on the host"
+    );
 }
 
 // ========== P4-2a (chunk-authoritative tables): chunk-native locate + locate-driven stamp ==========
@@ -2566,7 +2669,8 @@ fn gpu_chunk_native_locate_matches_store_locate() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     const N: i32 = 1500;
     let mut values = String::new();
     for i in 0..N {
@@ -2580,10 +2684,17 @@ fn gpu_chunk_native_locate_matches_store_locate() {
         .unwrap();
     e.set_relational_residency_budget_bytes(0, 4096);
     // Build the cold entry (multi-chunk).
-    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM big")).unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM big"))
+        .unwrap();
     assert!(e.streaming_cold_builds() >= 1);
 
-    let table = e.catalog_snapshot().relational_catalog.get("big").cloned().unwrap();
+    let table = e
+        .catalog_snapshot()
+        .relational_catalog
+        .get("big")
+        .cloned()
+        .unwrap();
     // A range + OR shape (value-index-unbindable): a > 1200 OR b < 100.
     let filter_groups: Vec<Vec<(usize, SelectFilterOp, SqlValue)>> = vec![
         vec![(0, SelectFilterOp::Gt, SqlValue::Int4(1200))],
@@ -2609,7 +2720,9 @@ fn gpu_chunk_native_locate_matches_store_locate() {
     let mut got: Vec<Vec<SqlValue>> = located
         .iter()
         .flat_map(|(chunk_idx, slots)| {
-            slots.iter().map(|slot| entry_rows[*chunk_idx][*slot as usize].clone())
+            slots
+                .iter()
+                .map(|slot| entry_rows[*chunk_idx][*slot as usize].clone())
         })
         .collect();
     // The store-driven P3 locate on the SAME pinned view.
@@ -2624,7 +2737,10 @@ fn gpu_chunk_native_locate_matches_store_locate() {
     got.sort();
     want.sort();
     assert_eq!(got.len(), 349, "1201..=1499 (299) + b<100 => a<50 (50)");
-    assert_eq!(got, want, "chunk-native locate == store-driven locate (row values)");
+    assert_eq!(
+        got, want,
+        "chunk-native locate == store-driven locate (row values)"
+    );
 }
 
 /// THE STAMP ISOLATION GATE: locate coordinates on the chunks, stamp them at the current
@@ -2641,7 +2757,8 @@ fn gpu_locate_driven_stamp_masks_rows_without_store() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     const N: i32 = 1500;
     let mut values = String::new();
     for i in 0..N {
@@ -2654,9 +2771,16 @@ fn gpu_locate_driven_stamp_masks_rows_without_store() {
     e.execute_text(seq, &format!("INSERT INTO big (a, b) VALUES {values}"))
         .unwrap();
     e.set_relational_residency_budget_bytes(0, 4096);
-    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM big")).unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM big"))
+        .unwrap();
 
-    let table = e.catalog_snapshot().relational_catalog.get("big").cloned().unwrap();
+    let table = e
+        .catalog_snapshot()
+        .relational_catalog
+        .get("big")
+        .cloned()
+        .unwrap();
     let filter_groups: Vec<Vec<(usize, SelectFilterOp, SqlValue)>> =
         vec![vec![(0, SelectFilterOp::Gte, SqlValue::Int4(1490))]];
     let predicate =
@@ -2678,12 +2802,19 @@ fn gpu_locate_driven_stamp_masks_rows_without_store() {
     // Chunk-served views exclude the stamped rows; the STORE was never written.
     let q_count = select("SELECT COUNT(*) FROM big");
     assert_eq!(
-        e.execute_relational_select(&q_count).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        e.execute_relational_select(&q_count)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>(),
         vec![vec![SqlValue::Int8(i64::from(N) - 10)]],
         "streaming COUNT masks the stamped rows"
     );
     let expected_sum: i64 = (0..i64::from(N) - 10).sum();
-    let sum = e.execute_relational_select(&select("SELECT SUM(a) FROM big")).unwrap();
+    let sum = e
+        .execute_relational_select(&select("SELECT SUM(a) FROM big"))
+        .unwrap();
     assert_eq!(
         sum.rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
         vec![vec![SqlValue::Int8(expected_sum)]],
@@ -2693,7 +2824,11 @@ fn gpu_locate_driven_stamp_masks_rows_without_store() {
         .reverse_gather_streamed_rows("big", e.committed_seq())
         .unwrap()
         .unwrap();
-    assert_eq!(gathered.len(), (N - 10) as usize, "the reverse gather agrees");
+    assert_eq!(
+        gathered.len(),
+        (N - 10) as usize,
+        "the reverse gather agrees"
+    );
 
     // Idempotence of visibility: re-locating the same predicate finds NOTHING (the sidecar mask
     // composes into the locate — stamped slots are invisible to it).
@@ -2734,7 +2869,9 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
     }
     for (engine, s) in [(&mut e, &mut seq), (&mut twin, &mut twin_seq)] {
         *s += 1;
-        engine.execute_text(*s, "CREATE TABLE facts (a INT, t TEXT)").unwrap();
+        engine
+            .execute_text(*s, "CREATE TABLE facts (a INT, t TEXT)")
+            .unwrap();
         *s += 1;
         engine
             .execute_text(*s, &format!("INSERT INTO facts (a, t) VALUES {values}"))
@@ -2752,35 +2889,76 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
     assert_eq!(count(&e), i64::from(N));
     assert_eq!(e.chunk_class_entries(), 0);
     seq += 1;
-    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')").unwrap();
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')")
+        .unwrap();
     twin_seq += 1;
-    twin.execute_text(twin_seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')").unwrap();
-    assert_eq!(e.chunk_class_entries(), 1, "the table must ENTER the class at this commit");
+    twin.execute_text(
+        twin_seq,
+        "INSERT INTO facts (a, t) VALUES (100000, 'enter')",
+    )
+    .unwrap();
+    assert_eq!(
+        e.chunk_class_entries(),
+        1,
+        "the table must ENTER the class at this commit"
+    );
 
     // FROZEN: the store's version count stops moving; the chunks carry the tails.
-    let frozen_versions = e.read_state.mvcc.table_rows("facts").store().all_versions().len();
+    let frozen_versions = e
+        .read_state
+        .mvcc
+        .table_rows("facts")
+        .store()
+        .all_versions()
+        .len();
     for k in 0..5 {
         seq += 1;
-        e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES ({}, 'tail{k}')", 200000 + k))
-            .unwrap();
+        e.execute_text(
+            seq,
+            &format!(
+                "INSERT INTO facts (a, t) VALUES ({}, 'tail{k}')",
+                200000 + k
+            ),
+        )
+        .unwrap();
         twin_seq += 1;
-        twin.execute_text(twin_seq, &format!("INSERT INTO facts (a, t) VALUES ({}, 'tail{k}')", 200000 + k))
-            .unwrap();
+        twin.execute_text(
+            twin_seq,
+            &format!(
+                "INSERT INTO facts (a, t) VALUES ({}, 'tail{k}')",
+                200000 + k
+            ),
+        )
+        .unwrap();
     }
-    assert_eq!(e.chunk_class_skipped_installs(), 5, "five commits skipped the host install");
     assert_eq!(
-        e.read_state.mvcc.table_rows("facts").store().all_versions().len(),
+        e.chunk_class_skipped_installs(),
+        5,
+        "five commits skipped the host install"
+    );
+    assert_eq!(
+        e.read_state
+            .mvcc
+            .table_rows("facts")
+            .store()
+            .all_versions()
+            .len(),
         frozen_versions,
         "the store is FROZEN at the class boundary"
     );
-    assert_eq!(count(&e), i64::from(N) + 6, "the streamed read sees every tail row");
+    assert_eq!(
+        count(&e),
+        i64::from(N) + 6,
+        "the streamed read sees every tail row"
+    );
     assert_eq!(e.chunk_class_deauths(), 0, "no exit yet");
 
     // A value-sensitive streamed read through the tails (SUM over a).
-    let expected_sum: i64 = (0..i64::from(N)).sum::<i64>()
-        + 100000
-        + (0..5).map(|k| 200000 + k).sum::<i64>();
-    let sum = e.execute_relational_select(&select("SELECT SUM(a) FROM facts")).unwrap();
+    let expected_sum: i64 =
+        (0..i64::from(N)).sum::<i64>() + 100000 + (0..5).map(|k| 200000 + k).sum::<i64>();
+    let sum = e
+        .execute_relational_select(&select("SELECT SUM(a) FROM facts"))
+        .unwrap();
     assert_eq!(
         sum.rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
         vec![vec![SqlValue::Int8(expected_sum)]]
@@ -2790,39 +2968,80 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
     // post-freeze delta into the store, the class exits, and the host path serves EVERYTHING.
     e.clear_relational_residency_budget_bytes(0);
     let q_rows = select("SELECT a, t FROM facts ORDER BY a");
-    let got = e.execute_relational_select(&q_rows).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
-    assert_eq!(e.chunk_class_deauths(), 1, "the unstreamable read exited the class LOUDLY");
-    let want = twin.execute_relational_select(&q_rows).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+    let got = e
+        .execute_relational_select(&q_rows)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        e.chunk_class_deauths(),
+        1,
+        "the unstreamable read exited the class LOUDLY"
+    );
+    let want = twin
+        .execute_relational_select(&q_rows)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
     assert_eq!(got.len(), (N + 6) as usize);
-    assert_eq!(got, want, "post-de-auth host reads == the never-classed twin");
+    assert_eq!(
+        got, want,
+        "post-de-auth host reads == the never-classed twin"
+    );
     assert!(
-        e.read_state.mvcc.table_rows("facts").store().all_versions().len() > frozen_versions,
+        e.read_state
+            .mvcc
+            .table_rows("facts")
+            .store()
+            .all_versions()
+            .len()
+            > frozen_versions,
         "the delta replayed into the store"
     );
 
     // Post-exit writes are plain store writes again.
     seq += 1;
-    e.execute_text(seq, "DELETE FROM facts WHERE a = 100000").unwrap();
+    e.execute_text(seq, "DELETE FROM facts WHERE a = 100000")
+        .unwrap();
     twin_seq += 1;
-    twin.execute_text(twin_seq, "DELETE FROM facts WHERE a = 100000").unwrap();
-    let got = e.execute_relational_select(&q_rows).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
-    let want = twin.execute_relational_select(&q_rows).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+    twin.execute_text(twin_seq, "DELETE FROM facts WHERE a = 100000")
+        .unwrap();
+    let got = e
+        .execute_relational_select(&q_rows)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
+    let want = twin
+        .execute_relational_select(&q_rows)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
     assert_eq!(got, want);
 }
 
-/// DML on a class table exits FIRST (the prepare guard), then resolves against a whole store —
-/// and an ELIGIBLE-but-elision-ELIGIBLE table must take ELISION, never the class (H1 mutual
-/// exclusion; an int4-only keyless heap IS elision-eligible).
+/// P4-2b-ii — CLASS DML STAYS CLASSED: DELETE stamps the chunk-native coordinates (no de-auth,
+/// no store touch); UPDATE stamps the old versions and tail-appends the new images; every
+/// streamed read reflects them exactly (closed-form SUM); an UNLOWERABLE predicate still falls
+/// back to the loud de-auth exit.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_chunk_class_dml_deauths_and_elision_takes_precedence() {
+fn gpu_chunk_class_dml_stamps_without_deauth() {
     let mut e = Engine::new_local();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT)")
+        .unwrap();
     const N: i32 = 1200;
     let mut values = String::new();
     for i in 0..N {
@@ -2832,23 +3051,102 @@ fn gpu_chunk_class_dml_deauths_and_elision_takes_precedence() {
         values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
     }
     seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES {values}")).unwrap();
+    e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES {values}"))
+        .unwrap();
     e.set_relational_residency_budget_bytes(0, 8192);
     let q_count = select("SELECT COUNT(*) FROM facts");
-    let _ = e.execute_relational_select(&q_count).unwrap();
-    seq += 1;
-    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')").unwrap();
-    assert_eq!(e.chunk_class_entries(), 1);
-    seq += 1;
-    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100001, 'tail')").unwrap();
-
-    // A range DELETE: the prepare guard de-authoritizes, then the host arm deletes correctly.
-    seq += 1;
-    e.execute_text(seq, "DELETE FROM facts WHERE a > 99999").unwrap();
-    assert_eq!(e.chunk_class_deauths(), 1, "DML exits the class first");
-    let count = match e.execute_relational_select(&q_count).unwrap().rows.row(0)[0] {
-        SqlValue::Int8(n) => n,
-        ref other => panic!("count: {other:?}"),
+    let count = |e: &Engine| -> i64 {
+        match e.execute_relational_select(&q_count).unwrap().rows.row(0)[0] {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("count: {other:?}"),
+        }
     };
-    assert_eq!(count, i64::from(N), "both tail rows deleted; the base intact");
+    let sum_a = |e: &Engine| -> i64 {
+        match e
+            .execute_relational_select(&select("SELECT SUM(a) FROM facts"))
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("sum: {other:?}"),
+        }
+    };
+    let _ = count(&e);
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')")
+        .unwrap();
+    assert_eq!(e.chunk_class_entries(), 1);
+
+    // CLASS DELETE: a range WHERE resolves from the chunks (spanning the base AND the tail-
+    // absorbed enter row: a=100000 also matches), stamps, and STAYS CLASSED.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM facts WHERE a >= 1195")
+        .unwrap();
+    assert_eq!(
+        e.chunk_class_deauths(),
+        0,
+        "the class DELETE must NOT de-auth"
+    );
+    assert_eq!(
+        e.streaming_cold_stamps(),
+        6,
+        "rows 1195..=1199 AND a=100000 stamped"
+    );
+    assert_eq!(count(&e), i64::from(N) - 5);
+    let expected_sum: i64 = (0..1195i64).sum::<i64>();
+    assert_eq!(
+        sum_a(&e),
+        expected_sum,
+        "SUM reflects EXACTLY the stamped rows"
+    );
+
+    // CLASS UPDATE: stamp-old + tail-append-new, still classed.
+    let stamps_before = e.streaming_cold_stamps();
+    seq += 1;
+    e.execute_text(seq, "UPDATE facts SET a = -7 WHERE a = 1000")
+        .unwrap();
+    assert_eq!(
+        e.chunk_class_deauths(),
+        0,
+        "the class UPDATE must NOT de-auth"
+    );
+    assert!(
+        e.streaming_cold_stamps() > stamps_before,
+        "the old version stamped"
+    );
+    assert_eq!(count(&e), i64::from(N) - 5, "cardinality preserved");
+    assert_eq!(
+        sum_a(&e),
+        expected_sum - 1000 - 7,
+        "the new image replaced the old in every streamed read"
+    );
+
+    // The class survives further INSERTs after DML.
+    let skipped_before = e.chunk_class_skipped_installs();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (500000, 'post')")
+        .unwrap();
+    assert!(
+        e.chunk_class_skipped_installs() > skipped_before,
+        "still classed"
+    );
+    assert_eq!(sum_a(&e), expected_sum - 1000 - 7 + 500000);
+
+    // The H2 DDL SWEEP exit: any non-DML statement de-authoritizes every class table BEFORE its
+    // preflight reads the store — the replayed store must be MVCC-whole (tails inserted at their
+    // born boundaries, every post-freeze stamp applied as a tombstone).
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE zzz (x INT)").unwrap();
+    assert_eq!(e.chunk_class_deauths(), 1, "the DDL sweep exits the class");
+    assert_eq!(
+        count(&e),
+        i64::from(N) - 4,
+        "the de-authed store serves the exact post-DML state (stamps replayed, tails present)"
+    );
+    assert_eq!(
+        sum_a(&e),
+        expected_sum - 1000 - 7 + 500000,
+        "value-exact after the exit"
+    );
 }

@@ -557,71 +557,84 @@ impl Engine {
             .foreign_keys
             .iter()
             .any(|foreign_key| foreign_key.referenced_table == table.name);
-        // P4-2b (S-E.P4): DELETE/UPDATE on a CHUNK-AUTHORITATIVE table DE-AUTHORITIZES first
-        // (the sticky exit; the write path for stamps is P4-2b-ii) — the ladder below then
-        // resolves against a WHOLE store, never the frozen one.
+        // P4-2b-ii: a CHUNK-AUTHORITATIVE table resolves FROM THE CHUNKS (the P4-2a locate +
+        // the P4-1 decoder; ids = PACKED coordinates; the epoch is the coordinate token the
+        // commit hook verifies before stamping). A decline (unlowerable WHERE, any failure)
+        // DE-AUTHORITIZES — the sticky exit stays the correctness backstop — and the ladder
+        // below resolves against the then-whole store.
+        let mut class_epoch: Option<u64> = None;
+        let mut class_resolved: Option<Vec<DmlResolvedMatch>> = None;
         if self.table_chunk_authoritative(&table.name).is_some() {
-            self.deauthoritize_chunk_table(&table.name, false)?;
-            table_rows = self.read_state.mvcc.table_rows(&table.name);
-        }
-        let index_resolved: Option<Vec<DmlResolvedMatch>> =
-            if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
-                // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
-                // the scan below reads the stale store.
-                if self.table_install_elided(&table.name) {
-                    // LOCK-AWARE + committed_seq stamps (audit f80f2350 FINDING B + the
-                    // facade-seq poison find — see `visible_row_with_value`). Also closes the
-                    // GAP-1 TOCTOU: a table eliding between the concurrent guard's check and
-                    // this prepare now rehydrates under the commit lock, never a bare
-                    // `with_table_mut` race.
-                    self.rehydrate_elided_serialized(&table.name)?;
-                    // A5 FLIP SI FIX: the scan below must read the FRESH generation.
+            match self.resolve_class_dml_matches(table, &filter_groups, visibility) {
+                Some((matches, epoch)) => {
+                    class_epoch = Some(epoch);
+                    class_resolved = Some(matches);
+                }
+                None => {
+                    self.deauthoritize_chunk_table(&table.name, false)?;
                     table_rows = self.read_state.mvcc.table_rows(&table.name);
                 }
-                None
-            } else {
-                // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);
-                // any decline falls to the value-index resolve (slice 1), then the scan below.
-                match self.resolve_dml_matches_via_device(
-                    &table,
-                    &filter_groups,
-                    visibility,
-                    &table_rows,
-                )? {
-                    Some(matches) => Some(matches),
-                    None => {
-                        // A5 FLIP SI FIX (the SV6 elided-churn double-read): the device decline
-                        // may have REHYDRATED — a COW publish of a FRESH host generation — and
-                        // the view pinned above predates it. Falling back on the stale view
-                        // resolves a STALE OLD IMAGE, whose visibility-blind tombstone locate
-                        // then stamps an ALREADY-DEAD slot (exact-count 1 passes!) and leaves
-                        // the truly-current version live forever; a stale-EMPTY view silently
-                        // LOSES the update (0 matches). RE-PIN before every fallback.
-                        table_rows = self.read_state.mvcc.table_rows(&table.name);
-                        match Self::resolve_dml_matches_via_value_index(
-                            &table,
-                            &table_rows,
+            }
+        }
+        let index_resolved: Option<Vec<DmlResolvedMatch>> = if class_resolved.is_some() {
+            class_resolved
+        } else if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
+            // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
+            // the scan below reads the stale store.
+            if self.table_install_elided(&table.name) {
+                // LOCK-AWARE + committed_seq stamps (audit f80f2350 FINDING B + the
+                // facade-seq poison find — see `visible_row_with_value`). Also closes the
+                // GAP-1 TOCTOU: a table eliding between the concurrent guard's check and
+                // this prepare now rehydrates under the commit lock, never a bare
+                // `with_table_mut` race.
+                self.rehydrate_elided_serialized(&table.name)?;
+                // A5 FLIP SI FIX: the scan below must read the FRESH generation.
+                table_rows = self.read_state.mvcc.table_rows(&table.name);
+            }
+            None
+        } else {
+            // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);
+            // any decline falls to the value-index resolve (slice 1), then the scan below.
+            match self.resolve_dml_matches_via_device(
+                &table,
+                &filter_groups,
+                visibility,
+                &table_rows,
+            )? {
+                Some(matches) => Some(matches),
+                None => {
+                    // A5 FLIP SI FIX (the SV6 elided-churn double-read): the device decline
+                    // may have REHYDRATED — a COW publish of a FRESH host generation — and
+                    // the view pinned above predates it. Falling back on the stale view
+                    // resolves a STALE OLD IMAGE, whose visibility-blind tombstone locate
+                    // then stamps an ALREADY-DEAD slot (exact-count 1 passes!) and leaves
+                    // the truly-current version live forever; a stale-EMPTY view silently
+                    // LOSES the update (0 matches). RE-PIN before every fallback.
+                    table_rows = self.read_state.mvcc.table_rows(&table.name);
+                    match Self::resolve_dml_matches_via_value_index(
+                        &table,
+                        &table_rows,
+                        &filter_groups,
+                        visibility,
+                        &prefix,
+                    )? {
+                        Some(matches) => Some(matches),
+                        // P3 (sealed-shards-primary): a NON-ADMITTED table with a range-only
+                        // WHERE — the device arm has no shards and the value index no Eq
+                        // bound. The predicate runs ON-DEVICE as a streaming fold over the
+                        // SAME pinned view (bounded chunks, trailing __row_id identity)
+                        // instead of the host seq_scan+filter loop below; a decline (no
+                        // budget / un-lowerable / any failure) still falls to that loop.
+                        None => self.try_streaming_dml_locate(
+                            table,
                             &filter_groups,
                             visibility,
-                            &prefix,
-                        )? {
-                            Some(matches) => Some(matches),
-                            // P3 (sealed-shards-primary): a NON-ADMITTED table with a range-only
-                            // WHERE — the device arm has no shards and the value index no Eq
-                            // bound. The predicate runs ON-DEVICE as a streaming fold over the
-                            // SAME pinned view (bounded chunks, trailing __row_id identity)
-                            // instead of the host seq_scan+filter loop below; a decline (no
-                            // budget / un-lowerable / any failure) still falls to that loop.
-                            None => self.try_streaming_dml_locate(
-                                table,
-                                &filter_groups,
-                                visibility,
-                                &table_rows,
-                            ),
-                        }
+                            &table_rows,
+                        ),
                     }
                 }
-            };
+            }
+        };
         let index_arm = index_resolved.is_some();
         let deletes: Vec<DmlResolvedMatch> = match index_resolved {
             Some(matches) => matches,
@@ -719,6 +732,7 @@ impl Engine {
                 table: delete.table.clone(),
                 tuple_ids,
                 deleted_rows,
+                class_epoch,
             },
         })
     }
@@ -1899,71 +1913,84 @@ impl Engine {
             .foreign_keys
             .iter()
             .any(|foreign_key| foreign_key.referenced_table == table.name);
-        // P4-2b (S-E.P4): DELETE/UPDATE on a CHUNK-AUTHORITATIVE table DE-AUTHORITIZES first
-        // (the sticky exit; the write path for stamps is P4-2b-ii) — the ladder below then
-        // resolves against a WHOLE store, never the frozen one.
+        // P4-2b-ii: a CHUNK-AUTHORITATIVE table resolves FROM THE CHUNKS (the P4-2a locate +
+        // the P4-1 decoder; ids = PACKED coordinates; the epoch is the coordinate token the
+        // commit hook verifies before stamping). A decline (unlowerable WHERE, any failure)
+        // DE-AUTHORITIZES — the sticky exit stays the correctness backstop — and the ladder
+        // below resolves against the then-whole store.
+        let mut class_epoch: Option<u64> = None;
+        let mut class_resolved: Option<Vec<DmlResolvedMatch>> = None;
         if self.table_chunk_authoritative(&table.name).is_some() {
-            self.deauthoritize_chunk_table(&table.name, false)?;
-            table_rows = self.read_state.mvcc.table_rows(&table.name);
-        }
-        let index_resolved: Option<Vec<DmlResolvedMatch>> =
-            if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
-                // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
-                // the scan below reads the stale store.
-                if self.table_install_elided(&table.name) {
-                    // LOCK-AWARE + committed_seq stamps (audit f80f2350 FINDING B + the
-                    // facade-seq poison find — see `visible_row_with_value`). Also closes the
-                    // GAP-1 TOCTOU: a table eliding between the concurrent guard's check and
-                    // this prepare now rehydrates under the commit lock, never a bare
-                    // `with_table_mut` race.
-                    self.rehydrate_elided_serialized(&table.name)?;
-                    // A5 FLIP SI FIX: the scan below must read the FRESH generation.
+            match self.resolve_class_dml_matches(table, &filter_groups, visibility) {
+                Some((matches, epoch)) => {
+                    class_epoch = Some(epoch);
+                    class_resolved = Some(matches);
+                }
+                None => {
+                    self.deauthoritize_chunk_table(&table.name, false)?;
                     table_rows = self.read_state.mvcc.table_rows(&table.name);
                 }
-                None
-            } else {
-                // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);
-                // any decline falls to the value-index resolve (slice 1), then the scan below.
-                match self.resolve_dml_matches_via_device(
-                    &table,
-                    &filter_groups,
-                    visibility,
-                    &table_rows,
-                )? {
-                    Some(matches) => Some(matches),
-                    None => {
-                        // A5 FLIP SI FIX (the SV6 elided-churn double-read): the device decline
-                        // may have REHYDRATED — a COW publish of a FRESH host generation — and
-                        // the view pinned above predates it. Falling back on the stale view
-                        // resolves a STALE OLD IMAGE, whose visibility-blind tombstone locate
-                        // then stamps an ALREADY-DEAD slot (exact-count 1 passes!) and leaves
-                        // the truly-current version live forever; a stale-EMPTY view silently
-                        // LOSES the update (0 matches). RE-PIN before every fallback.
-                        table_rows = self.read_state.mvcc.table_rows(&table.name);
-                        match Self::resolve_dml_matches_via_value_index(
-                            &table,
-                            &table_rows,
+            }
+        }
+        let index_resolved: Option<Vec<DmlResolvedMatch>> = if class_resolved.is_some() {
+            class_resolved
+        } else if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
+            // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
+            // the scan below reads the stale store.
+            if self.table_install_elided(&table.name) {
+                // LOCK-AWARE + committed_seq stamps (audit f80f2350 FINDING B + the
+                // facade-seq poison find — see `visible_row_with_value`). Also closes the
+                // GAP-1 TOCTOU: a table eliding between the concurrent guard's check and
+                // this prepare now rehydrates under the commit lock, never a bare
+                // `with_table_mut` race.
+                self.rehydrate_elided_serialized(&table.name)?;
+                // A5 FLIP SI FIX: the scan below must read the FRESH generation.
+                table_rows = self.read_state.mvcc.table_rows(&table.name);
+            }
+            None
+        } else {
+            // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);
+            // any decline falls to the value-index resolve (slice 1), then the scan below.
+            match self.resolve_dml_matches_via_device(
+                &table,
+                &filter_groups,
+                visibility,
+                &table_rows,
+            )? {
+                Some(matches) => Some(matches),
+                None => {
+                    // A5 FLIP SI FIX (the SV6 elided-churn double-read): the device decline
+                    // may have REHYDRATED — a COW publish of a FRESH host generation — and
+                    // the view pinned above predates it. Falling back on the stale view
+                    // resolves a STALE OLD IMAGE, whose visibility-blind tombstone locate
+                    // then stamps an ALREADY-DEAD slot (exact-count 1 passes!) and leaves
+                    // the truly-current version live forever; a stale-EMPTY view silently
+                    // LOSES the update (0 matches). RE-PIN before every fallback.
+                    table_rows = self.read_state.mvcc.table_rows(&table.name);
+                    match Self::resolve_dml_matches_via_value_index(
+                        &table,
+                        &table_rows,
+                        &filter_groups,
+                        visibility,
+                        &prefix,
+                    )? {
+                        Some(matches) => Some(matches),
+                        // P3 (sealed-shards-primary): a NON-ADMITTED table with a range-only
+                        // WHERE — the device arm has no shards and the value index no Eq
+                        // bound. The predicate runs ON-DEVICE as a streaming fold over the
+                        // SAME pinned view (bounded chunks, trailing __row_id identity)
+                        // instead of the host seq_scan+filter loop below; a decline (no
+                        // budget / un-lowerable / any failure) still falls to that loop.
+                        None => self.try_streaming_dml_locate(
+                            table,
                             &filter_groups,
                             visibility,
-                            &prefix,
-                        )? {
-                            Some(matches) => Some(matches),
-                            // P3 (sealed-shards-primary): a NON-ADMITTED table with a range-only
-                            // WHERE — the device arm has no shards and the value index no Eq
-                            // bound. The predicate runs ON-DEVICE as a streaming fold over the
-                            // SAME pinned view (bounded chunks, trailing __row_id identity)
-                            // instead of the host seq_scan+filter loop below; a decline (no
-                            // budget / un-lowerable / any failure) still falls to that loop.
-                            None => self.try_streaming_dml_locate(
-                                table,
-                                &filter_groups,
-                                visibility,
-                                &table_rows,
-                            ),
-                        }
+                            &table_rows,
+                        ),
                     }
                 }
-            };
+            }
+        };
         let index_arm = index_resolved.is_some();
         match index_resolved {
             Some(matches) => {
@@ -2101,6 +2128,7 @@ impl Engine {
                 installs: updates,
                 value_index_entries,
                 updated_old_rows,
+                class_epoch,
             },
         })
     }

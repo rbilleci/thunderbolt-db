@@ -173,6 +173,9 @@ pub(crate) enum PreparedMutation {
         /// assignments overwrote them. The commit path tombstones the old resident slot + appends the new
         /// image (from `installs`) in place instead of the O(table) re-admit.
         updated_old_rows: Vec<Vec<SqlValue>>,
+        /// P4-2b-ii: the class coordinate token (see `Delete::class_epoch`); `installs` ids are
+        /// then packed coordinates of the OLD versions.
+        class_epoch: Option<u64>,
     },
     /// Existing versions to tombstone, by tuple_id, in `table`'s partition. `deleted_rows` carries the
     /// resolved row images (catalog order) SV4b surfaces to the commit path so a single-entry DELETE can
@@ -181,6 +184,11 @@ pub(crate) enum PreparedMutation {
         table: String,
         tuple_ids: Vec<u64>,
         deleted_rows: Vec<Vec<SqlValue>>,
+        /// P4-2b-ii: `Some(entry_epoch)` on a CHUNK-AUTHORITATIVE table — `tuple_ids` are then
+        /// PACKED (chunk_idx << 32 | slot) coordinates from the chunk-native resolve, the apply
+        /// skips the (frozen) store, and the commit hook stamps them iff the installed entry
+        /// still carries this epoch (the P4-2a coordinate token).
+        class_epoch: Option<u64>,
     },
 }
 
@@ -205,6 +213,9 @@ pub(crate) enum AppliedRowMutation {
         table: String,
         rows: Vec<Vec<SqlValue>>,
         write_set: WriteSet,
+        /// P4-2b-ii: the class stamp inputs — packed coordinates + the entry epoch (`None` on a
+        /// non-class delete).
+        class_stamp: Option<(Vec<u64>, u64)>,
     },
     Update {
         table: String,
@@ -215,6 +226,10 @@ pub(crate) enum AppliedRowMutation {
         /// them (A1). `None` for any unparseable key -> the commit arm declines the incremental
         /// path (re-admit, always correct).
         row_ids: Option<Vec<u64>>,
+        /// P4-2b-ii: the class coordinate token — `Some(entry_epoch)` when `row_ids` are PACKED
+        /// (chunk_idx, slot) coordinates from the chunk-native resolve; the commit hook stamps
+        /// the old versions + tail-appends `new_rows` iff the installed entry still carries it.
+        class_epoch: Option<u64>,
         /// U2: the OLD versions' row-ids to REMOVE on an elided-rehydrate fallback. A classic
         /// in-place update reuses the old id for the new version (`row_ids == old ids`), so the
         /// upsert overwrites and no explicit removal is needed (`None`). A U2 lane update installs

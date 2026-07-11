@@ -680,8 +680,7 @@ pub(crate) struct ResidencyReadState {
     /// install; the cold chunks are the materialization); readers pinned BELOW it are served by
     /// the frozen chains (exact MVCC), everything at-or-above streams. COW map, publishers
     /// serialize on the commit path (entry/exit run under the commit lock).
-    pub(crate) chunk_authoritative_tables:
-        ArcSwap<std::collections::BTreeMap<String, Index>>,
+    pub(crate) chunk_authoritative_tables: ArcSwap<std::collections::BTreeMap<String, Index>>,
     /// P4-2b: class entries (the non-vacuity signal for the store deletion).
     pub(crate) chunk_class_entries: std::sync::atomic::AtomicU64,
     /// P4-2b: commits that skipped the host install for a class table.

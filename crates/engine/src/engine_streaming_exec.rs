@@ -158,8 +158,19 @@ pub(crate) struct ColdTableChunks {
     /// S-E.6b: this table's payloads live in the unlinked spill file (counts against the DISK cap,
     /// not the RAM cap).
     spilled: bool,
+    /// P4-2b-ii — THE COORDINATE TOKEN (the P4-2a obligation): a process-monotonic install epoch.
+    /// (chunk_idx, slot) coordinates located against epoch E are valid ONLY while the installed
+    /// entry still carries E — any re-install (tail append, stamp, patch) bumps it, and a stale
+    /// token falls back to de-authoritization instead of mis-stamping re-tiled chunks.
+    pub(crate) entry_epoch: u64,
     pub(crate) chunks: Vec<ColdChunk>,
 }
+
+/// P4-2b-ii: a class DML resolve's matches — the standard (pseudo_id, row_key, image) triples.
+pub(crate) type ClassDmlMatches = Vec<(u64, String, Vec<SqlValue>)>;
+
+/// P4-2b-ii: the global entry-epoch allocator (never reused; process-local like the class map).
+static COLD_ENTRY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// One cached chunk: the exact device payload bytes + the descriptor template the build produced.
 pub(crate) struct ColdChunk {
@@ -3268,6 +3279,7 @@ impl Engine {
             chunk_target_bytes: builder.chunk_target_bytes,
             total_payload_bytes: builder.total_payload_bytes,
             spilled,
+            entry_epoch: COLD_ENTRY_EPOCH.fetch_add(1, Ordering::Relaxed),
             chunks: builder.chunks,
         });
         let residency = &self.read_state.residency;
@@ -3840,7 +3852,16 @@ impl Engine {
             spill: None,
             poisoned: false,
         };
-        if !self.install_streaming_cold_inner(table_name, builder, true, commit_lock_held) {
+        // P4-2b-ii: a CLASS table stamps mid-commit (pre-publish) — the general install's strict
+        // committed==build equality cannot hold there; the class install's structural settledness
+        // (held commit lock + serial-only class + frozen-generation check) applies (the tail-
+        // append precedent). Non-class callers (the P4-2a isolation shape) keep the full proof.
+        let installed = if self.table_chunk_authoritative(table_name).is_some() {
+            self.install_streaming_cold_class(table_name, builder)
+        } else {
+            self.install_streaming_cold_inner(table_name, builder, true, commit_lock_held)
+        };
+        if !installed {
             return false;
         }
         self.read_state
@@ -3922,19 +3943,26 @@ impl Engine {
             return;
         }
         let residency = &self.read_state.residency;
-        let Some(entry) = residency.streaming_cold_chunks.load().get(table_name).cloned() else {
+        let Some(entry) = residency
+            .streaming_cold_chunks
+            .load()
+            .get(table_name)
+            .cloned()
+        else {
             return;
         };
-        let current = self.read_state.mvcc.table_rows(table_name).generation_payload();
-        if !Arc::ptr_eq(&entry.generation, &current)
-            || entry.build_copin_s != self.committed_seq()
+        let current = self
+            .read_state
+            .mvcc
+            .table_rows(table_name)
+            .generation_payload();
+        if !Arc::ptr_eq(&entry.generation, &current) || entry.build_copin_s != self.committed_seq()
         {
             return; // not fresh at THIS commit — a later commit's hook will retry
         }
         let boundary = entry.build_copin_s;
-        let mut map = std::collections::BTreeMap::clone(
-            &residency.chunk_authoritative_tables.load(),
-        );
+        let mut map =
+            std::collections::BTreeMap::clone(&residency.chunk_authoritative_tables.load());
         map.insert(table_name.to_string(), boundary);
         residency.chunk_authoritative_tables.store(Arc::new(map));
         residency
@@ -3958,7 +3986,11 @@ impl Engine {
             return true;
         }
         let residency = &self.read_state.residency;
-        let Some(entry) = residency.streaming_cold_chunks.load().get(&table.name).cloned()
+        let Some(entry) = residency
+            .streaming_cold_chunks
+            .load()
+            .get(&table.name)
+            .cloned()
         else {
             return false;
         };
@@ -4039,7 +4071,11 @@ impl Engine {
         if builder.poisoned {
             return false;
         }
-        let current = self.read_state.mvcc.table_rows(table_name).generation_payload();
+        let current = self
+            .read_state
+            .mvcc
+            .table_rows(table_name)
+            .generation_payload();
         if !Arc::ptr_eq(&builder.generation, &current) {
             return false;
         }
@@ -4055,6 +4091,7 @@ impl Engine {
             chunk_target_bytes: builder.chunk_target_bytes,
             total_payload_bytes: builder.total_payload_bytes,
             spilled,
+            entry_epoch: COLD_ENTRY_EPOCH.fetch_add(1, Ordering::Relaxed),
             chunks: builder.chunks,
         });
         let residency = &self.read_state.residency;
@@ -4113,18 +4150,68 @@ impl Engine {
             }
             if let Some(entry) = entry {
                 for chunk in &entry.chunks {
-                    // P4-2b-i is INSERT-only: the post-freeze delta = tail chunks born above the
-                    // freeze (sidecar stamps above the freeze arrive with P4-2b-ii).
+                    // P4-2b-ii: the post-freeze delta = TAIL chunks (born above the freeze,
+                    // replayed as inserts + their own stamps) AND post-freeze SIDECAR STAMPS on
+                    // BASE chunks (replayed as tuple_deletes onto the frozen chains — the slot
+                    // maps to its store id by the rank enumeration at the payload boundary).
+                    // Stamps AT-OR-BELOW the freeze predate the class (the store already holds
+                    // them — replaying would double-delete).
                     if chunk.payload_copin_s <= freeze {
-                        continue;
-                    }
-                    let rows =
-                        decode_cold_chunk_rows(&table, chunk, chunk.payload_copin_s)
+                        let Some(sidecar) = &chunk.deleted_by else {
+                            continue;
+                        };
+                        let payload_vis = StorageVisibility {
+                            read_txn_id: chunk.payload_copin_s,
+                        };
+                        let visible = engine
+                            .read_state
+                            .mvcc
+                            .table_rows(table_name)
+                            .store()
+                            .visible_versions_in_range(
+                                payload_vis,
+                                chunk.tuple_range.0,
+                                chunk.tuple_range.1,
+                            )
                             .map_err(|e| {
                                 EngineError::ApplyFailed(format!(
-                                    "de-authoritization decode failed: {e}"
+                                    "de-authoritization slot enumeration failed: {e}"
                                 ))
                             })?;
+                        let live = i64::from_le_bytes([COLD_DELETED_BY_LIVE_FILL_BYTE; 8]);
+                        let mut deletes: Vec<(gpu_db_storage::TupleId, Index)> = Vec::new();
+                        for slot in 0..chunk.row_count as usize {
+                            let raw = i64::from_le_bytes(
+                                sidecar[slot * 8..slot * 8 + 8].try_into().expect("8"),
+                            );
+                            let stamp = raw as u64;
+                            if raw != live && stamp > freeze {
+                                let id =
+                                    visible.get(slot).map(|v| v.tuple_id).ok_or_else(|| {
+                                        EngineError::ApplyFailed(
+                                            "de-authoritization slot rank out of range".to_string(),
+                                        )
+                                    })?;
+                                deletes.push((id, stamp));
+                            }
+                        }
+                        if !deletes.is_empty() {
+                            engine.read_state.mvcc.with_table_mut(table_name, |data| {
+                                for (id, stamp) in &deletes {
+                                    data.rows
+                                        .tuple_delete(*id, *stamp)
+                                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                                }
+                                Ok::<(), EngineError>(())
+                            })?;
+                        }
+                        continue;
+                    }
+                    // A TAIL chunk: UNMASKED decode is slot-aligned; every row inserts at its
+                    // born boundary, then its own post-freeze stamps replay as deletes.
+                    let rows = decode_cold_chunk_rows(&table, chunk, 0).map_err(|e| {
+                        EngineError::ApplyFailed(format!("de-authoritization decode failed: {e}"))
+                    })?;
                     let born = chunk.payload_copin_s;
                     // Fresh row ids (the class INSERT advanced the allocator without assigning;
                     // ids are internal-only for a keyless FK-free table — divergence from the
@@ -4138,9 +4225,7 @@ impl Engine {
                                 .next_row_id
                                 .fetch_add(1, Ordering::Relaxed);
                             (
-                                crate::rel_exec_helpers::relational_row_key(
-                                    table_name, row_id,
-                                ),
+                                crate::rel_exec_helpers::relational_row_key(table_name, row_id),
                                 row,
                             )
                         })
@@ -4164,33 +4249,40 @@ impl Engine {
                                     *tuple_id,
                                     gpu_db_storage::NewTuple {
                                         key: key.clone(),
-                                        value: crate::rel_exec_helpers::encode_relational_row(
-                                            row,
-                                        ),
+                                        value: crate::rel_exec_helpers::encode_relational_row(row),
                                     },
                                     born,
                                 )
-                                .map_err(|err| {
-                                    EngineError::ApplyFailed(err.to_string())
-                                })?;
+                                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                         }
                         for (entry_key, row_keys) in &index_entries {
-                            let mut slot = data
-                                .value_index
-                                .get(entry_key)
-                                .cloned()
-                                .unwrap_or_default();
+                            let mut slot =
+                                data.value_index.get(entry_key).cloned().unwrap_or_default();
                             slot.extend(row_keys.iter().cloned());
                             data.value_index.insert(entry_key.clone(), slot);
+                        }
+                        // The tail's own stamps (a row inserted then deleted post-freeze): the
+                        // chain gets created@born + deleted@stamp — exact MVCC at every boundary.
+                        if let Some(sidecar) = &chunk.deleted_by {
+                            for (slot, tuple_id) in tuple_ids.iter().enumerate() {
+                                let raw = i64::from_le_bytes(
+                                    sidecar[slot * 8..slot * 8 + 8].try_into().expect("8"),
+                                );
+                                let live = i64::from_le_bytes([COLD_DELETED_BY_LIVE_FILL_BYTE; 8]);
+                                if raw != live {
+                                    data.rows
+                                        .tuple_delete(*tuple_id, raw as u64)
+                                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                                }
+                            }
                         }
                         Ok::<(), EngineError>(())
                     })?;
                 }
             }
             // Leave the class + evict the (now superseded-generation) cache entry.
-            let mut map = std::collections::BTreeMap::clone(
-                &residency.chunk_authoritative_tables.load(),
-            );
+            let mut map =
+                std::collections::BTreeMap::clone(&residency.chunk_authoritative_tables.load());
             map.remove(table_name);
             residency.chunk_authoritative_tables.store(Arc::new(map));
             engine.evict_streaming_cold(table_name);
@@ -4204,6 +4296,83 @@ impl Engine {
         }
         let _commit_guard = self.commit_state();
         exit(self)
+    }
+
+    /// P4-2b-ii — resolve a class table's DELETE/UPDATE matches FROM THE CHUNKS: the P4-2a
+    /// locate yields (chunk_idx, slot) coordinates (sidecar mask composed — tombstoned slots
+    /// never re-match), the P4-1 decoder extracts each coordinate's row image (an UNMASKED
+    /// rtx=0 decode is slot-aligned: every slot visible, direct indexing), and the match triple
+    /// fabricates its identity from the PACKED coordinate (class rows have no store row ids;
+    /// the pseudo-id is unique within the entry epoch, which rides the delta as the P4-2a
+    /// COORDINATE TOKEN — the commit hook stamps only while the installed entry still carries
+    /// it). `None` = decline (unlowerable predicate, any locate/decode failure) — the caller
+    /// de-authoritizes (the sticky exit stays the correctness backstop).
+    pub(crate) fn resolve_class_dml_matches(
+        &self,
+        table: &RelationalTable,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        visibility: StorageVisibility,
+    ) -> Option<(ClassDmlMatches, u64)> {
+        let predicate =
+            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)?;
+        let entry = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(&table.name)
+            .cloned()?;
+        let epoch = entry.entry_epoch;
+        let located =
+            self.locate_streaming_cold_slots(table, &predicate, visibility.read_txn_id)?;
+        let mut matches: ClassDmlMatches = Vec::new();
+        for (chunk_idx, slots) in &located {
+            let chunk = entry.chunks.get(*chunk_idx)?;
+            let unmasked = decode_cold_chunk_rows(table, chunk, 0).ok()?;
+            for slot in slots {
+                let image = unmasked.get(*slot as usize)?.clone();
+                let pseudo_id = ((*chunk_idx as u64) << 32) | u64::from(*slot);
+                let key = crate::rel_exec_helpers::relational_row_key(&table.name, pseudo_id);
+                matches.push((pseudo_id, key, image));
+            }
+        }
+        Some((matches, epoch))
+    }
+
+    /// P4-2b-ii — the commit hook's STAMP arm: verify the COORDINATE TOKEN (the entry installed
+    /// NOW must still carry the prepare-time epoch — any interposed install re-tiled or advanced
+    /// it) and tombstone the packed coordinates at the committing boundary. `false` = the caller
+    /// must de-authoritize (never a mis-stamp).
+    pub(crate) fn stamp_class_coordinates(
+        &self,
+        table_name: &str,
+        packed: &[u64],
+        epoch: u64,
+        stamp: Index,
+    ) -> bool {
+        let Some(entry) = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(table_name)
+            .cloned()
+        else {
+            return false;
+        };
+        if entry.entry_epoch != epoch {
+            return false; // the token expired — coordinates may be misaligned
+        }
+        let mut per_chunk: std::collections::BTreeMap<usize, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for p in packed {
+            per_chunk
+                .entry((p >> 32) as usize)
+                .or_default()
+                .push((p & 0xFFFF_FFFF) as u32);
+        }
+        let located: Vec<(usize, Vec<u32>)> = per_chunk.into_iter().collect();
+        self.stamp_streaming_cold_slots(table_name, &located, stamp, true)
     }
 
     /// P4-2b telemetry.
@@ -4739,13 +4908,14 @@ pub(crate) fn decode_cold_chunk_rows(
                 SqlType::Text => {
                     let layout = resident_device_text_column_layout(d, table, idx)
                         .map_err(|_| map_err("text layout"))?;
-                    let lo =
-                        read_u64(layout.offsets_byte_offset as usize + slot * 8)? as usize;
+                    let lo = read_u64(layout.offsets_byte_offset as usize + slot * 8)? as usize;
                     let hi =
                         read_u64(layout.offsets_byte_offset as usize + (slot + 1) * 8)? as usize;
                     let span = bytes
-                        .get(layout.bytes_byte_offset as usize + lo
-                            ..layout.bytes_byte_offset as usize + hi)
+                        .get(
+                            layout.bytes_byte_offset as usize + lo
+                                ..layout.bytes_byte_offset as usize + hi,
+                        )
                         .ok_or_else(|| map_err("payload truncated (text)"))?;
                     SqlValue::Text(
                         std::str::from_utf8(span)
