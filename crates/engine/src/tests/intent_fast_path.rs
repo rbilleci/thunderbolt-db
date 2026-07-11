@@ -1670,7 +1670,10 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
     let mut engine = Engine::new_local();
     engine
-        .execute_text(1, "CREATE TABLE ut (a INT, u UUID, v INT, PRIMARY KEY (a, u))")
+        .execute_text(
+            1,
+            "CREATE TABLE ut (a INT, u UUID, v INT, PRIMARY KEY (a, u))",
+        )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
@@ -1702,13 +1705,21 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
     }
     let mut warmed = false;
     for i in 0..10_000_u32 {
-        sql!(&format!("INSERT INTO ut VALUES ({}, '{}', 0)", 1000 + i, uuid(i))).unwrap();
+        sql!(&format!(
+            "INSERT INTO ut VALUES ({}, '{}', 0)",
+            1000 + i,
+            uuid(i)
+        ))
+        .unwrap();
         if engine.table_install_elided("ut") {
             warmed = true;
             break;
         }
     }
-    assert!(warmed, "uuid compound-PK table never entered elision on a GPU box");
+    assert!(
+        warmed,
+        "uuid compound-PK table never entered elision on a GPU box"
+    );
 
     // Tuple uniqueness over the b128 key: a distinct uuid commits; the exact (a,u) tuple repeats -> 23505.
     sql!(&format!("INSERT INTO ut VALUES (5, '{}', 1)", uuid(7))).unwrap();
@@ -1743,8 +1754,7 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
         "uuid compound DELETE must stay device-native, not de-elide"
     );
     // Correctness (may de-elide the versioned table): exactly the (5, uuid(7)) row remains for a=5.
-    let Command::Select(count) =
-        parse_command("SELECT COUNT(*) FROM ut WHERE a = 5").unwrap()
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM ut WHERE a = 5").unwrap()
     else {
         unreachable!()
     };
@@ -1768,7 +1778,10 @@ fn gpu_compound_text_key_elides_and_validates_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
     let mut engine = Engine::new_local();
     engine
-        .execute_text(1, "CREATE TABLE tt (a INT, s TEXT, v INT, PRIMARY KEY (a, s))")
+        .execute_text(
+            1,
+            "CREATE TABLE tt (a INT, s TEXT, v INT, PRIMARY KEY (a, s))",
+        )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
@@ -1794,13 +1807,21 @@ fn gpu_compound_text_key_elides_and_validates_on_device() {
     }
     let mut warmed = false;
     for i in 0..10_000_u32 {
-        sql!(&format!("INSERT INTO tt VALUES ({}, 'k{}', 0)", 1000 + i, i)).unwrap();
+        sql!(&format!(
+            "INSERT INTO tt VALUES ({}, 'k{}', 0)",
+            1000 + i,
+            i
+        ))
+        .unwrap();
         if engine.table_install_elided("tt") {
             warmed = true;
             break;
         }
     }
-    assert!(warmed, "text compound-PK table never entered elision on a GPU box");
+    assert!(
+        warmed,
+        "text compound-PK table never entered elision on a GPU box"
+    );
 
     // The DEVICE write-locate must actually fire for the text compound key (non-vacuity).
     let hits_before = engine.device_write_locate_hits();
@@ -1840,8 +1861,7 @@ fn gpu_compound_text_key_elides_and_validates_on_device() {
 
     // Read-your-writes over the elided text-compound table: the distinct tuples for a=5 are exactly
     // {alpha-KEY, beta, gamma} (3 rows).
-    let Command::Select(count) =
-        parse_command("SELECT COUNT(*) FROM tt WHERE a = 5").unwrap()
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM tt WHERE a = 5").unwrap()
     else {
         unreachable!()
     };
@@ -1863,7 +1883,10 @@ fn gpu_compound_text_key_elides_and_validates_on_device() {
 fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
     let mut engine = Engine::new_local();
     engine
-        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8, g INT8, s TEXT)")
+        .execute_text(
+            1,
+            "CREATE TABLE t (id INT PRIMARY KEY, b INT8, g INT8, s TEXT)",
+        )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
@@ -1881,14 +1904,21 @@ fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
         .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // self-guard: no usable GPU
     }
     for id in 2..=12i64 {
         engine
             .execute_dml_concurrent(
                 txn,
-                &format!("INSERT INTO t VALUES ({id}, {}, {}, 'v{id}')", id * 10, id % 3),
+                &format!(
+                    "INSERT INTO t VALUES ({id}, {}, {}, 'v{id}')",
+                    id * 10,
+                    id % 3
+                ),
             )
             .unwrap();
         txn += 1;
@@ -1911,7 +1941,11 @@ fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
         let res = engine.execute_relational_select(&select).unwrap();
         let fired = engine.general_read_fallback_hits() > before;
         let elided_after = engine.table_install_elided("t");
-        (fired, elided_after, res.rows.iter().map(|r| r.to_vec()).collect())
+        (
+            fired,
+            elided_after,
+            res.rows.iter().map(|r| r.to_vec()).collect(),
+        )
     };
 
     // int8 scalar aggregate: SUM(bigint) -> numeric (PG spec); sum(10..120 step 10) = 780.
@@ -1921,7 +1955,10 @@ fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
             vec![vec![SqlValue::Numeric(gpu_db_sql::Decimal128::new(780, 0))]],
         ),
         // int8-filtered projection: b = 50 -> id 5.
-        ("SELECT id FROM t WHERE b = 50", vec![vec![SqlValue::Int4(5)]]),
+        (
+            "SELECT id FROM t WHERE b = 50",
+            vec![vec![SqlValue::Int4(5)]],
+        ),
         // DISTINCT over an int8 column -> {0,1,2}.
         (
             "SELECT DISTINCT g FROM t",
@@ -2016,12 +2053,18 @@ fn gpu_zero_match_dml_keeps_table_elided() {
         .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // self-guard: no usable GPU
     }
     for id in 2..=6i64 {
         engine
-            .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES ({id}, {}, 'v{id}')", id * 100))
+            .execute_dml_concurrent(
+                txn,
+                &format!("INSERT INTO t VALUES ({id}, {}, 'v{id}')", id * 100),
+            )
             .unwrap();
         txn += 1;
     }
@@ -2031,7 +2074,14 @@ fn gpu_zero_match_dml_keeps_table_elided() {
         let Command::Select(s) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
             unreachable!()
         };
-        match engine.execute_relational_select(&s).unwrap().rows.iter().next().and_then(|r| r.first()) {
+        match engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .next()
+            .and_then(|r| r.first())
+        {
             Some(SqlValue::Int8(n)) => *n,
             other => panic!("unexpected COUNT: {other:?}"),
         }
@@ -2047,14 +2097,26 @@ fn gpu_zero_match_dml_keeps_table_elided() {
     ] {
         engine.execute_dml_concurrent(txn, stmt).unwrap();
         txn += 1;
-        assert!(engine.table_install_elided("t"), "zero-match {stmt:?} must NOT de-elide");
+        assert!(
+            engine.table_install_elided("t"),
+            "zero-match {stmt:?} must NOT de-elide"
+        );
         assert_eq!(count(&engine), 6, "zero-match {stmt:?} changed no rows");
     }
 
     // Sanity: a MATCHING DELETE still works + stays elided (the fix didn't break the real path).
-    engine.execute_dml_concurrent(txn, "DELETE FROM t WHERE id = 3").unwrap();
-    assert!(engine.table_install_elided("t"), "a matching DELETE stays elided");
-    assert_eq!(count(&engine), 5, "the matching DELETE removed exactly one row");
+    engine
+        .execute_dml_concurrent(txn, "DELETE FROM t WHERE id = 3")
+        .unwrap();
+    assert!(
+        engine.table_install_elided("t"),
+        "a matching DELETE stays elided"
+    );
+    assert_eq!(
+        count(&engine),
+        5,
+        "the matching DELETE removed exactly one row"
+    );
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, NULL coverage): an INSERT carrying a NULL used to DE-ELIDE the table
@@ -2081,10 +2143,15 @@ fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
     engine.set_resident_delete_tombstone_enabled(true);
 
     let mut txn = 2u64;
-    engine.execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 10)").unwrap();
+    engine
+        .execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 10)")
+        .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // self-guard: no usable GPU
     }
     for id in 2..=6i64 {
@@ -2096,7 +2163,9 @@ fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
     assert!(engine.table_install_elided("t"), "table must elide first");
 
     // INSERT a NULL value: must STAY ELIDED (was: de-elide).
-    engine.execute_dml_concurrent(txn, "INSERT INTO t VALUES (7, NULL)").unwrap();
+    engine
+        .execute_dml_concurrent(txn, "INSERT INTO t VALUES (7, NULL)")
+        .unwrap();
     txn += 1;
     assert!(
         engine.table_install_elided("t"),
@@ -2132,11 +2201,16 @@ fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
         vec![vec![SqlValue::Int4(7)]],
         "IS NULL finds exactly the null row"
     );
-    assert!(engine.table_install_elided("t"), "reads must not de-elide the null-bearing table");
+    assert!(
+        engine.table_install_elided("t"),
+        "reads must not de-elide the null-bearing table"
+    );
 
     // A DML that must REHYDRATE the null-bearing table (materialize declines a null shard) de-elides
     // SAFELY now that the gather materializes nulls — no "device-authoritative invariant broken" crash.
-    engine.execute_dml_concurrent(txn, "DELETE FROM t WHERE id = 5").unwrap();
+    engine
+        .execute_dml_concurrent(txn, "DELETE FROM t WHERE id = 5")
+        .unwrap();
     assert_eq!(
         read(&engine, "SELECT COUNT(*) FROM t"),
         vec![vec![SqlValue::Int8(6)]],
@@ -2173,10 +2247,15 @@ fn gpu_range_dml_resolves_on_device_without_deelide() {
     engine.set_resident_update_tombstone_enabled(true);
 
     let mut txn = 2u64;
-    engine.execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 10)").unwrap();
+    engine
+        .execute_dml_concurrent(txn, "INSERT INTO t VALUES (1, 10)")
+        .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // self-guard: no usable GPU
     }
     for id in 2..=8i64 {
@@ -2208,42 +2287,71 @@ fn gpu_range_dml_resolves_on_device_without_deelide() {
 
     // Zero-match RANGE DELETE -> device resolve, no rows, STAYS ELIDED.
     let before = engine.dml_device_resolve_hits();
-    engine.execute_dml_concurrent(txn, "DELETE FROM t WHERE id > 100000").unwrap();
+    engine
+        .execute_dml_concurrent(txn, "DELETE FROM t WHERE id > 100000")
+        .unwrap();
     txn += 1;
     assert!(
         engine.dml_device_resolve_hits() > before,
         "zero-match range DELETE must RESOLVE on the device (counter advances)"
     );
-    assert!(engine.table_install_elided("t"), "zero-match range DELETE must NOT de-elide");
+    assert!(
+        engine.table_install_elided("t"),
+        "zero-match range DELETE must NOT de-elide"
+    );
     assert_eq!(ids(&engine), (1..=8).collect::<Vec<_>>(), "no rows deleted");
 
     // Matching RANGE DELETE (id > 6) -> deletes ids 7,8 ON THE DEVICE, STAYS ELIDED.
     let before = engine.dml_device_resolve_hits();
-    engine.execute_dml_concurrent(txn, "DELETE FROM t WHERE id > 6").unwrap();
+    engine
+        .execute_dml_concurrent(txn, "DELETE FROM t WHERE id > 6")
+        .unwrap();
     txn += 1;
     assert!(
         engine.dml_device_resolve_hits() > before,
         "matching range DELETE must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("t"), "matching range DELETE must NOT de-elide");
-    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>(), "ids 7,8 deleted exactly");
+    assert!(
+        engine.table_install_elided("t"),
+        "matching range DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        (1..=6).collect::<Vec<_>>(),
+        "ids 7,8 deleted exactly"
+    );
 
     // Matching RANGE UPDATE (id <= 2 SET v=0) -> updates ids 1,2 ON THE DEVICE, STAYS ELIDED.
     let before = engine.dml_device_resolve_hits();
-    engine.execute_dml_concurrent(txn, "UPDATE t SET v = 0 WHERE id <= 2").unwrap();
+    engine
+        .execute_dml_concurrent(txn, "UPDATE t SET v = 0 WHERE id <= 2")
+        .unwrap();
     txn += 1;
     assert!(
         engine.dml_device_resolve_hits() > before,
         "matching range UPDATE must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("t"), "matching range UPDATE must NOT de-elide");
+    assert!(
+        engine.table_install_elided("t"),
+        "matching range UPDATE must NOT de-elide"
+    );
     // The update kept the row set (still ids 1..=6) and set v=0 for ids 1,2.
-    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>(), "UPDATE changed no id set");
+    assert_eq!(
+        ids(&engine),
+        (1..=6).collect::<Vec<_>>(),
+        "UPDATE changed no id set"
+    );
     let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE v = 0").unwrap() else {
         unreachable!()
     };
     assert_eq!(
-        engine.execute_relational_select(&cnt).unwrap().rows.iter().next().and_then(|r| r.first()),
+        engine
+            .execute_relational_select(&cnt)
+            .unwrap()
+            .rows
+            .iter()
+            .next()
+            .and_then(|r| r.first()),
         Some(&SqlValue::Int8(2)),
         "exactly ids 1,2 now have v=0"
     );
@@ -2274,10 +2382,15 @@ fn gpu_int8_range_dml_resolves_on_device() {
     // b = id * 2_000_000_000 -> ids 3..=8 have b > i32::MAX (2.1e9), so the bound cannot be an Int4Literal.
     let big = 2_000_000_000i64;
     let mut txn = 2u64;
-    engine.execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES (1, {})", big)).unwrap();
+    engine
+        .execute_dml_concurrent(txn, &format!("INSERT INTO t VALUES (1, {})", big))
+        .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // self-guard: no usable GPU
     }
     for id in 2..=8i64 {
@@ -2317,8 +2430,15 @@ fn gpu_int8_range_dml_resolves_on_device() {
         engine.dml_device_resolve_hits() > before,
         "int8 range DELETE with a >i32 bound must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("t"), "int8 range DELETE must NOT de-elide");
-    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>(), "ids 7,8 (b=14e9,16e9) deleted exactly");
+    assert!(
+        engine.table_install_elided("t"),
+        "int8 range DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        (1..=6).collect::<Vec<_>>(),
+        "ids 7,8 (b=14e9,16e9) deleted exactly"
+    );
 
     // A LARGE-bound int8 range UPDATE (b <= 4e9 = 2*big -> ids 1,2; 4e9 > i32::MAX) resolves ON THE
     // DEVICE, STAYS ELIDED.
@@ -2331,13 +2451,26 @@ fn gpu_int8_range_dml_resolves_on_device() {
         engine.dml_device_resolve_hits() > before,
         "int8 range UPDATE with a >i32 bound must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("t"), "int8 range UPDATE must NOT de-elide");
-    assert_eq!(ids(&engine), (1..=6).collect::<Vec<_>>(), "UPDATE changed no id set");
+    assert!(
+        engine.table_install_elided("t"),
+        "int8 range UPDATE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        (1..=6).collect::<Vec<_>>(),
+        "UPDATE changed no id set"
+    );
     let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE b = 0").unwrap() else {
         unreachable!()
     };
     assert_eq!(
-        engine.execute_relational_select(&cnt).unwrap().rows.iter().next().and_then(|r| r.first()),
+        engine
+            .execute_relational_select(&cnt)
+            .unwrap()
+            .rows
+            .iter()
+            .next()
+            .and_then(|r| r.first()),
         Some(&SqlValue::Int8(2)),
         "exactly ids 1,2 (b=2e9,4e9) now have b=0"
     );
@@ -2371,7 +2504,10 @@ fn gpu_timestamp_range_delete_resolves_on_device() {
         .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // self-guard: no usable GPU
     }
     for (id, month) in (2..=6i64).zip(2..=6) {
@@ -2412,8 +2548,15 @@ fn gpu_timestamp_range_delete_resolves_on_device() {
         engine.dml_device_resolve_hits() > before,
         "timestamp range DELETE must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("t"), "timestamp range DELETE must NOT de-elide");
-    assert_eq!(ids(&engine), vec![4, 5, 6], "ids 1,2,3 (Jan-Mar) purged exactly");
+    assert!(
+        engine.table_install_elided("t"),
+        "timestamp range DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        vec![4, 5, 6],
+        "ids 1,2,3 (Jan-Mar) purged exactly"
+    );
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a MULTI-BOUND timestamp range DELETE/UPDATE
@@ -2446,7 +2589,10 @@ fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
         .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     for (id, month) in (2..=6i64).zip(2..=6) {
@@ -2495,7 +2641,11 @@ fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
         engine.table_install_elided("t"),
         "a multi-bound timestamp range DELETE must NOT de-elide"
     );
-    assert_eq!(ids(&engine), vec![1, 5, 6], "ids 2,3,4 (Feb-Apr) purged exactly");
+    assert_eq!(
+        ids(&engine),
+        vec![1, 5, 6],
+        "ids 2,3,4 (Feb-Apr) purged exactly"
+    );
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a DELETE/UPDATE on a table with NULL-BEARING columns
@@ -2526,7 +2676,10 @@ fn gpu_nullable_column_dml_resolves_on_device() {
         .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 'a')")
         .unwrap();
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     engine
@@ -2577,12 +2730,14 @@ fn gpu_nullable_column_dml_resolves_on_device() {
         engine.table_install_elided("t"),
         "a DELETE on a null-bearing table must NOT de-elide"
     );
-    assert_eq!(ids(&engine), vec![1, 4], "ids 2 (NULL) and 3 deleted exactly");
+    assert_eq!(
+        ids(&engine),
+        vec![1, 4],
+        "ids 2 (NULL) and 3 deleted exactly"
+    );
 
     // The surviving NULL row (id=4) is intact + reads back as NULL.
-    let Command::Select(sel) =
-        parse_command("SELECT notes FROM t WHERE id = 4").unwrap()
-    else {
+    let Command::Select(sel) = parse_command("SELECT notes FROM t WHERE id = 4").unwrap() else {
         unreachable!()
     };
     assert_eq!(
@@ -2627,7 +2782,10 @@ fn gpu_numeric_range_dml_resolves_on_device() {
         .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // self-guard: no usable GPU
     }
     for id in 2..=6i64 {
@@ -2667,25 +2825,49 @@ fn gpu_numeric_range_dml_resolves_on_device() {
         engine.dml_device_resolve_hits() > before,
         "numeric range DELETE must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("t"), "numeric range DELETE must NOT de-elide");
-    assert_eq!(ids(&engine), (1..=5).collect::<Vec<_>>(), "id 6 (amt=300) deleted exactly");
+    assert!(
+        engine.table_install_elided("t"),
+        "numeric range DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        (1..=5).collect::<Vec<_>>(),
+        "id 6 (amt=300) deleted exactly"
+    );
 
     // MULTI-BOUND numeric range UPDATE (100 <= amt <= 200 -> ids 2,3,4) — the AND path — ON THE DEVICE.
     let before = engine.dml_device_resolve_hits();
     engine
-        .execute_dml_concurrent(txn, "UPDATE t SET amt = 0.00 WHERE amt >= 100.00 AND amt <= 200.00")
+        .execute_dml_concurrent(
+            txn,
+            "UPDATE t SET amt = 0.00 WHERE amt >= 100.00 AND amt <= 200.00",
+        )
         .unwrap();
     assert!(
         engine.dml_device_resolve_hits() > before,
         "multi-bound numeric range UPDATE must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("t"), "numeric range UPDATE must NOT de-elide");
-    assert_eq!(ids(&engine), (1..=5).collect::<Vec<_>>(), "UPDATE changed no id set");
-    let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE amt = 0.00").unwrap() else {
+    assert!(
+        engine.table_install_elided("t"),
+        "numeric range UPDATE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        (1..=5).collect::<Vec<_>>(),
+        "UPDATE changed no id set"
+    );
+    let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE amt = 0.00").unwrap()
+    else {
         unreachable!()
     };
     assert_eq!(
-        engine.execute_relational_select(&cnt).unwrap().rows.iter().next().and_then(|r| r.first()),
+        engine
+            .execute_relational_select(&cnt)
+            .unwrap()
+            .rows
+            .iter()
+            .next()
+            .and_then(|r| r.first()),
         Some(&SqlValue::Int8(3)),
         "exactly ids 2,3,4 (amt 100,150,200) now have amt=0"
     );
@@ -2720,7 +2902,10 @@ fn gpu_text_predicate_dml_resolves_on_device() {
         .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     for (id, name) in [(2i64, "bob"), (3, "carol"), (4, "bob")] {
@@ -2729,7 +2914,10 @@ fn gpu_text_predicate_dml_resolves_on_device() {
             .unwrap();
         txn += 1;
     }
-    assert!(engine.table_install_elided("t"), "the text table must elide first");
+    assert!(
+        engine.table_install_elided("t"),
+        "the text table must elide first"
+    );
 
     let ids = |engine: &Engine| -> Vec<i64> {
         let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
@@ -2764,7 +2952,11 @@ fn gpu_text_predicate_dml_resolves_on_device() {
         engine.table_install_elided("t"),
         "a text-equality DELETE must NOT de-elide"
     );
-    assert_eq!(ids(&engine), vec![1, 3], "exactly the two 'bob' rows (2,4) deleted");
+    assert_eq!(
+        ids(&engine),
+        vec![1, 3],
+        "exactly the two 'bob' rows (2,4) deleted"
+    );
 
     // TEXT-EQ UPDATE (name = 'carol' -> id 3) ON THE DEVICE, STAYS ELIDED.
     let before = engine.dml_device_resolve_hits();
@@ -2779,7 +2971,8 @@ fn gpu_text_predicate_dml_resolves_on_device() {
         engine.table_install_elided("t"),
         "a text-equality UPDATE must NOT de-elide"
     );
-    let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE name = 'CAROL'").unwrap()
+    let Command::Select(cnt) =
+        parse_command("SELECT COUNT(*) FROM t WHERE name = 'CAROL'").unwrap()
     else {
         unreachable!()
     };
@@ -2822,15 +3015,24 @@ fn gpu_like_prefix_dml_resolves_on_device() {
         .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 'alice')")
         .unwrap();
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     for (id, name) in [(2i64, "bob"), (3, "bobby"), (4, "carol")] {
         engine
-            .execute_dml_concurrent(id as u64 + 1, &format!("INSERT INTO t VALUES ({id}, '{name}')"))
+            .execute_dml_concurrent(
+                id as u64 + 1,
+                &format!("INSERT INTO t VALUES ({id}, '{name}')"),
+            )
             .unwrap();
     }
-    assert!(engine.table_install_elided("t"), "the text table must elide first");
+    assert!(
+        engine.table_install_elided("t"),
+        "the text table must elide first"
+    );
 
     let ids = |engine: &Engine| -> Vec<i64> {
         let Command::Select(s) = parse_command("SELECT id FROM t").unwrap() else {
@@ -2877,7 +3079,10 @@ fn gpu_like_prefix_dml_resolves_on_device() {
 fn gpu_elided_pk_table_with_column(col_ddl: &str, seed: &[(i64, &str)]) -> Option<Engine> {
     let mut engine = Engine::new_local();
     engine
-        .execute_text(1, &format!("CREATE TABLE t (id INT PRIMARY KEY, {col_ddl})"))
+        .execute_text(
+            1,
+            &format!("CREATE TABLE t (id INT PRIMARY KEY, {col_ddl})"),
+        )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
@@ -2897,7 +3102,10 @@ fn gpu_elided_pk_table_with_column(col_ddl: &str, seed: &[(i64, &str)]) -> Optio
         txn += 1;
     }
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return None; // no usable GPU
     }
     for (id, v) in seed.iter().skip(1) {
@@ -2906,7 +3114,10 @@ fn gpu_elided_pk_table_with_column(col_ddl: &str, seed: &[(i64, &str)]) -> Optio
             .unwrap();
         txn += 1;
     }
-    assert!(engine.table_install_elided("t"), "the table must elide first");
+    assert!(
+        engine.table_install_elided("t"),
+        "the table must elide first"
+    );
     Some(engine)
 }
 
@@ -2938,8 +3149,7 @@ fn gpu_ids_of_t(engine: &Engine) -> Vec<i64> {
 fn gpu_uuid_predicate_dml_resolves_on_device() {
     let a = "'00000000-0000-0000-0000-000000000001'";
     let b = "'00000000-0000-0000-0000-000000000002'";
-    let Some(engine) =
-        gpu_elided_pk_table_with_column("u UUID", &[(1, a), (2, b), (3, a), (4, b)])
+    let Some(engine) = gpu_elided_pk_table_with_column("u UUID", &[(1, a), (2, b), (3, a), (4, b)])
     else {
         return;
     };
@@ -2961,7 +3171,11 @@ fn gpu_uuid_predicate_dml_resolves_on_device() {
         engine.table_install_elided("t"),
         "a uuid-equality DELETE must NOT de-elide"
     );
-    assert_eq!(gpu_ids_of_t(&engine), vec![2, 4], "exactly the two <a>-uuid rows deleted");
+    assert_eq!(
+        gpu_ids_of_t(&engine),
+        vec![2, 4],
+        "exactly the two <a>-uuid rows deleted"
+    );
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): uuid comparisons INSIDE AND/OR resolve ON THE DEVICE
@@ -2991,8 +3205,15 @@ fn gpu_uuid_range_and_in_dml_resolve_on_device() {
             engine.dml_device_resolve_hits() > before,
             "a uuid RANGE DELETE must RESOLVE on the device (UuidCmpMask in the mask VM)"
         );
-        assert!(engine.table_install_elided("t"), "uuid range DELETE must NOT de-elide");
-        assert_eq!(gpu_ids_of_t(&engine), vec![1, 5], "ids 2,3,4 (the range) deleted");
+        assert!(
+            engine.table_install_elided("t"),
+            "uuid range DELETE must NOT de-elide"
+        );
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![1, 5],
+            "ids 2,3,4 (the range) deleted"
+        );
     }
     // uuid IN: (<01>, <04>) -> ids 1,4 (an OR of uuid equalities through the mask VM).
     {
@@ -3011,8 +3232,15 @@ fn gpu_uuid_range_and_in_dml_resolve_on_device() {
             engine.dml_device_resolve_hits() > before,
             "a uuid IN DELETE must RESOLVE on the device"
         );
-        assert!(engine.table_install_elided("t"), "uuid IN DELETE must NOT de-elide");
-        assert_eq!(gpu_ids_of_t(&engine), vec![2, 3, 5], "ids 1,4 (the IN list) deleted");
+        assert!(
+            engine.table_install_elided("t"),
+            "uuid IN DELETE must NOT de-elide"
+        );
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![2, 3, 5],
+            "ids 1,4 (the IN list) deleted"
+        );
     }
 }
 
@@ -3024,12 +3252,8 @@ fn gpu_uuid_range_and_in_dml_resolve_on_device() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_nullable_uuid_range_dml_resolves_on_device() {
     let u = |n: u8| format!("'00000000-0000-0000-0000-0000000000{n:02}'");
-    let seed_uuids: Vec<(i64, String)> = vec![
-        (1, u(1)),
-        (2, u(2)),
-        (3, "NULL".to_string()),
-        (4, u(4)),
-    ];
+    let seed_uuids: Vec<(i64, String)> =
+        vec![(1, u(1)), (2, u(2)), (3, "NULL".to_string()), (4, u(4))];
     let seed: Vec<(i64, &str)> = seed_uuids.iter().map(|(i, s)| (*i, s.as_str())).collect();
     let Some(engine) = gpu_elided_pk_table_with_column("u UUID", &seed) else {
         return;
@@ -3185,30 +3409,39 @@ fn gpu_date_range_dml_resolves_on_device() {
         };
         let before = engine.dml_device_resolve_hits();
         engine
-            .execute_dml_concurrent(9, "DELETE FROM t WHERE d >= '2024-02-01' AND d < '2024-04-01'")
+            .execute_dml_concurrent(
+                9,
+                "DELETE FROM t WHERE d >= '2024-02-01' AND d < '2024-04-01'",
+            )
             .unwrap();
         assert!(
             engine.dml_device_resolve_hits() > before,
             "a date RANGE DELETE must RESOLVE on the device (the DATE VM leaf)"
         );
-        assert!(engine.table_install_elided("t"), "date range DELETE must NOT de-elide");
-        assert_eq!(gpu_ids_of_t(&engine), vec![1, 4], "Feb+Mar (ids 2,3) purged exactly");
+        assert!(
+            engine.table_install_elided("t"),
+            "date range DELETE must NOT de-elide"
+        );
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![1, 4],
+            "Feb+Mar (ids 2,3) purged exactly"
+        );
     }
     // Nullable 3VL pin: the range spans BOTH plausible epoch-0 anchors (1970/2000), so the NULL
     // placeholder (days 0) is IN-range — only the per-leaf validity AND excludes it.
     {
-        let seed: &[(i64, &str)] =
-            &[(1, "'2024-01-15'"), (2, "NULL"), (3, "'2024-03-15'")];
+        let seed: &[(i64, &str)] = &[(1, "'2024-01-15'"), (2, "NULL"), (3, "'2024-03-15'")];
         let Some(engine) = gpu_elided_pk_table_with_column("d DATE", seed) else {
             return;
         };
         // READ 3VL PIN (audit LOW adopted — the decisive assertion, doctrine): a placeholder-spanning
         // range READ has NO recheck net; only the DATE leaf's validity-AND excludes the NULL row.
         {
-            let Command::Select(s) = parse_command(
-                "SELECT id FROM t WHERE d >= '1960-01-01' AND d <= '2035-01-01'",
-            )
-            .unwrap() else {
+            let Command::Select(s) =
+                parse_command("SELECT id FROM t WHERE d >= '1960-01-01' AND d <= '2035-01-01'")
+                    .unwrap()
+            else {
                 unreachable!()
             };
             let mut got: Vec<i32> = engine
@@ -3236,13 +3469,19 @@ fn gpu_date_range_dml_resolves_on_device() {
         }
         let before = engine.dml_device_resolve_hits();
         engine
-            .execute_dml_concurrent(9, "DELETE FROM t WHERE d >= '1960-01-01' AND d <= '2035-01-01'")
+            .execute_dml_concurrent(
+                9,
+                "DELETE FROM t WHERE d >= '1960-01-01' AND d <= '2035-01-01'",
+            )
             .unwrap();
         assert!(
             engine.dml_device_resolve_hits() > before,
             "a NULLABLE-date RANGE DELETE must RESOLVE on the device"
         );
-        assert!(engine.table_install_elided("t"), "nullable-date range must NOT de-elide");
+        assert!(
+            engine.table_install_elided("t"),
+            "nullable-date range must NOT de-elide"
+        );
         assert_eq!(
             gpu_ids_of_t(&engine),
             vec![2],
@@ -3282,7 +3521,10 @@ fn gpu_check_constrained_table_elides() {
         .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 10)")
         .unwrap();
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     engine
@@ -3298,9 +3540,19 @@ fn gpu_check_constrained_table_elides() {
         .execute_dml_concurrent(4, "INSERT INTO t VALUES (3, -5)")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("check constraint"), "violation must name the CHECK, got: {err}");
-    assert!(engine.table_install_elided("t"), "a rejected insert must not de-elide");
-    assert_eq!(gpu_ids_of_t(&engine), vec![1, 2], "the violating row was NOT inserted");
+    assert!(
+        err.contains("check constraint"),
+        "violation must name the CHECK, got: {err}"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a rejected insert must not de-elide"
+    );
+    assert_eq!(
+        gpu_ids_of_t(&engine),
+        vec![1, 2],
+        "the violating row was NOT inserted"
+    );
 
     // A VALID insert lands on-device, still elided.
     engine
@@ -3314,8 +3566,14 @@ fn gpu_check_constrained_table_elides() {
         .execute_dml_concurrent(6, "UPDATE t SET v = -1 WHERE id = 2")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("check constraint"), "update violation must name the CHECK, got: {err}");
-    assert!(engine.table_install_elided("t"), "a rejected update must not de-elide");
+    assert!(
+        err.contains("check constraint"),
+        "update violation must name the CHECK, got: {err}"
+    );
+    assert!(
+        engine.table_install_elided("t"),
+        "a rejected update must not de-elide"
+    );
 
     // A VALID update works on-device.
     engine
@@ -3356,7 +3614,10 @@ fn gpu_fk_referenced_parent_elides() {
         .execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
     engine
-        .execute_text(2, "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT)")
+        .execute_text(
+            2,
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT)",
+        )
         .unwrap();
     engine
         .execute_text(
@@ -3379,7 +3640,10 @@ fn gpu_fk_referenced_parent_elides() {
         .execute_dml_concurrent(3, "INSERT INTO customers VALUES (1, 'ada')")
         .unwrap();
     let snap = engine.populate_relational_residency_snapshot("customers");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     engine
@@ -3393,7 +3657,10 @@ fn gpu_fk_referenced_parent_elides() {
     engine
         .execute_dml_concurrent(5, "INSERT INTO customers VALUES (3, 'eve')")
         .unwrap();
-    assert!(engine.table_install_elided("customers"), "still elided after the device-only insert");
+    assert!(
+        engine.table_install_elided("customers"),
+        "still elided after the device-only insert"
+    );
 
     // THE LOAD-BEARING PIN: a child INSERT referencing the ELIDED-ERA key (3) must SUCCEED — the
     // parent-exists probe must SEE the device-only row (a stale/vacuous answer would reject it).
@@ -3410,7 +3677,10 @@ fn gpu_fk_referenced_parent_elides() {
         .execute_text(7, "INSERT INTO orders VALUES (101, 999)")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("foreign key"), "missing parent must reject, got: {err}");
+    assert!(
+        err.contains("foreign key"),
+        "missing parent must reject, got: {err}"
+    );
     engine
         .execute_text(8, "INSERT INTO orders VALUES (102, 1)")
         .unwrap(); // later statements still work (no wedge)
@@ -3420,7 +3690,10 @@ fn gpu_fk_referenced_parent_elides() {
         .execute_text(9, "DELETE FROM customers WHERE id = 3")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("foreign key"), "deleting a referenced parent must reject, got: {err}");
+    assert!(
+        err.contains("foreign key"),
+        "deleting a referenced parent must reject, got: {err}"
+    );
     // Parent DELETE of an UNREFERENCED key (2) succeeds.
     engine
         .execute_text(10, "DELETE FROM customers WHERE id = 2")
@@ -3439,7 +3712,11 @@ fn gpu_fk_referenced_parent_elides() {
         })
         .collect();
     ids.sort_unstable();
-    assert_eq!(ids, vec![1, 3], "customer 2 deleted; 1 and 3 (referenced) remain");
+    assert_eq!(
+        ids,
+        vec![1, 3],
+        "customer 2 deleted; 1 and 3 (referenced) remain"
+    );
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, structural — FK elision, CHILD side): a table WITH outbound
@@ -3458,7 +3735,10 @@ fn gpu_fk_child_table_elides() {
         .execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
     engine
-        .execute_text(2, "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT)")
+        .execute_text(
+            2,
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT)",
+        )
         .unwrap();
     engine
         .execute_text(
@@ -3487,7 +3767,10 @@ fn gpu_fk_child_table_elides() {
         .execute_dml_concurrent(6, "INSERT INTO orders VALUES (100, 1)")
         .unwrap();
     let snap = engine.populate_relational_residency_snapshot("orders");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     engine
@@ -3505,7 +3788,10 @@ fn gpu_fk_child_table_elides() {
     engine
         .execute_dml_concurrent(9, "INSERT INTO orders VALUES (103, 2)")
         .unwrap();
-    assert!(engine.table_install_elided("orders"), "still elided (device-only referencing rows)");
+    assert!(
+        engine.table_install_elided("orders"),
+        "still elided (device-only referencing rows)"
+    );
 
     // THE LOAD-BEARING PIN: deleting customer 2 — referenced ONLY by ELIDED-ERA device rows — must
     // be REJECTED, and the child must STAY ELIDED (the check ran on-device; a de-elide means the
@@ -3527,11 +3813,17 @@ fn gpu_fk_child_table_elides() {
         .execute_text(11, "INSERT INTO orders VALUES (104, 999)")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("foreign key"), "missing parent must reject, got: {err}");
+    assert!(
+        err.contains("foreign key"),
+        "missing parent must reject, got: {err}"
+    );
     engine
         .execute_text(12, "INSERT INTO orders VALUES (105, 1)")
         .unwrap();
-    assert!(engine.table_install_elided("orders"), "valid child insert keeps the child elided");
+    assert!(
+        engine.table_install_elided("orders"),
+        "valid child insert keeps the child elided"
+    );
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, audit follow-up — DATE fk column): the Eq scan-locate fallback
@@ -3577,7 +3869,10 @@ fn gpu_fk_child_date_fk_stays_elided() {
         .execute_dml_concurrent(6, "INSERT INTO events VALUES (1, '2024-03-01')")
         .unwrap();
     let snap = engine.populate_relational_residency_snapshot("events");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     engine
@@ -3595,7 +3890,10 @@ fn gpu_fk_child_date_fk_stays_elided() {
     engine
         .execute_dml_concurrent(9, "INSERT INTO events VALUES (4, '2024-03-02')")
         .unwrap();
-    assert!(engine.table_install_elided("events"), "still elided (device-only referencing rows)");
+    assert!(
+        engine.table_install_elided("events"),
+        "still elided (device-only referencing rows)"
+    );
 
     // Deleting the referenced date must REJECT with the child STILL elided (a de-elide means the
     // Date needle declined the device scan and fell back to rehydration — the thrash this pins).
@@ -3702,14 +4000,23 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
             ],
         ),
         // > i32::MAX so a truncating i32 needle could never accidentally match.
-        ("ledgers", "accounts", "aid", ["4294967300", "4294967301", "9999999999"]),
+        (
+            "ledgers",
+            "accounts",
+            "aid",
+            ["4294967300", "4294967301", "9999999999"],
+        ),
         ("items", "cats", "code", ["'alpha'", "'beta'", "'zzz'"]),
         ("quotes", "prices", "amt", ["10.25", "20.50", "99.99"]),
         (
             "bookings",
             "slots",
             "at",
-            ["'2024-06-01 09:00:00'", "'2024-06-01 10:00:00'", "'2024-06-01 23:00:00'"],
+            [
+                "'2024-06-01 09:00:00'",
+                "'2024-06-01 10:00:00'",
+                "'2024-06-01 23:00:00'",
+            ],
         ),
     ];
     let txn_ids = AtomicU64::new(TXN0 + 10);
@@ -3725,7 +4032,10 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         sql!(format!("INSERT INTO {child} VALUES (1, {kept})")).unwrap();
         if !gpu_checked {
             let snap = engine.populate_relational_residency_snapshot(child);
-            if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+            if snap
+                .map(|s| s.device_memory_proof.is_none())
+                .unwrap_or(true)
+            {
                 return; // no usable GPU
             }
             gpu_checked = true;
@@ -3759,7 +4069,10 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         let err = sql!(format!("INSERT INTO {child} VALUES (9, {missing})"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("foreign key"), "{child}: missing parent must reject, got: {err}");
+        assert!(
+            err.contains("foreign key"),
+            "{child}: missing parent must reject, got: {err}"
+        );
         sql!(format!("INSERT INTO {child} VALUES (10, {kept})")).unwrap();
         assert!(
             engine.table_install_elided(child),
@@ -3779,8 +4092,15 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
     // Bool can't follow the loop (only two possible keys — no "missing parent" literal exists):
     // referenced `false` must reject with the child STAYING elided; unreferenced `true` deletes.
     let txn = || txn_ids.fetch_add(1, Ordering::Relaxed);
-    engine.execute_text(txn(), "CREATE TABLE toggles (f BOOL PRIMARY KEY, tname TEXT)").unwrap();
-    engine.execute_text(txn(), "CREATE TABLE states (id INT PRIMARY KEY, flag BOOL)").unwrap();
+    engine
+        .execute_text(
+            txn(),
+            "CREATE TABLE toggles (f BOOL PRIMARY KEY, tname TEXT)",
+        )
+        .unwrap();
+    engine
+        .execute_text(txn(), "CREATE TABLE states (id INT PRIMARY KEY, flag BOOL)")
+        .unwrap();
     engine
         .execute_text(
             txn(),
@@ -3788,21 +4108,37 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
              REFERENCES toggles(f)",
         )
         .unwrap();
-    engine.execute_text(txn(), "INSERT INTO toggles VALUES (true, 'on')").unwrap();
-    engine.execute_text(txn(), "INSERT INTO toggles VALUES (false, 'off')").unwrap();
-    engine.execute_text(txn(), "INSERT INTO states VALUES (1, false)").unwrap();
-    engine.execute_text(txn(), "INSERT INTO states VALUES (2, false)").unwrap();
-    assert!(engine.table_install_elided("states"), "states: a bool fk child must now ELIDE");
+    engine
+        .execute_text(txn(), "INSERT INTO toggles VALUES (true, 'on')")
+        .unwrap();
+    engine
+        .execute_text(txn(), "INSERT INTO toggles VALUES (false, 'off')")
+        .unwrap();
+    engine
+        .execute_text(txn(), "INSERT INTO states VALUES (1, false)")
+        .unwrap();
+    engine
+        .execute_text(txn(), "INSERT INTO states VALUES (2, false)")
+        .unwrap();
+    assert!(
+        engine.table_install_elided("states"),
+        "states: a bool fk child must now ELIDE"
+    );
     let err = engine
         .execute_text(txn(), "DELETE FROM toggles WHERE f = false")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("foreign key"), "referenced bool parent must reject, got: {err}");
+    assert!(
+        err.contains("foreign key"),
+        "referenced bool parent must reject, got: {err}"
+    );
     assert!(
         engine.table_install_elided("states"),
         "states: the bool child-reference check must run ON-DEVICE (the child stays elided)"
     );
-    engine.execute_text(txn(), "DELETE FROM toggles WHERE f = true").unwrap();
+    engine
+        .execute_text(txn(), "DELETE FROM toggles WHERE f = true")
+        .unwrap();
     assert!(
         engine.table_install_elided("states"),
         "states: an allowed bool parent delete keeps the child elided"
@@ -3842,7 +4178,10 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         .unwrap();
     txn += 1;
     let snap = engine.populate_relational_residency_snapshot("m");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     // big values straddle i32::MAX so a 4-byte mis-read could never fake the right answer.
@@ -3860,7 +4199,10 @@ fn gpu_mixed_width_dml_resolves_on_device() {
             .unwrap();
         txn += 1;
     }
-    assert!(engine.table_install_elided("m"), "the table must elide first");
+    assert!(
+        engine.table_install_elided("m"),
+        "the table must elide first"
+    );
 
     let ids = |engine: &Engine| -> Vec<i64> {
         let Command::Select(s) = parse_command("SELECT id FROM m").unwrap() else {
@@ -3885,15 +4227,25 @@ fn gpu_mixed_width_dml_resolves_on_device() {
     // fails the range, id 5's name fails the eq) ON THE DEVICE, STAYS ELIDED.
     let before = engine.dml_device_resolve_hits();
     engine
-        .execute_dml_concurrent(txn, "DELETE FROM m WHERE big > 2147483647 AND name = 'drop'")
+        .execute_dml_concurrent(
+            txn,
+            "DELETE FROM m WHERE big > 2147483647 AND name = 'drop'",
+        )
         .unwrap();
     txn += 1;
     assert!(
         engine.dml_device_resolve_hits() > before,
         "a mixed int8+text DELETE must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("m"), "a mixed int8+text DELETE must NOT de-elide");
-    assert_eq!(ids(&engine), vec![1, 3, 5], "exactly the big>i32::MAX 'drop' rows (2,4) deleted");
+    assert!(
+        engine.table_install_elided("m"),
+        "a mixed int8+text DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        vec![1, 3, 5],
+        "exactly the big>i32::MAX 'drop' rows (2,4) deleted"
+    );
 
     // MIXED bool+int8 UPDATE (`flag = false AND big > i32::MAX` -> id 5) ON THE DEVICE.
     let before = engine.dml_device_resolve_hits();
@@ -3908,7 +4260,10 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         engine.dml_device_resolve_hits() > before,
         "a mixed bool+int8 UPDATE must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("m"), "a mixed bool+int8 UPDATE must NOT de-elide");
+    assert!(
+        engine.table_install_elided("m"),
+        "a mixed bool+int8 UPDATE must NOT de-elide"
+    );
 
     // VERSIONED-shard mixed READ (the LOAD-BEARING pin for the visibility-branch
     // `mixed_width_i32_elem` fallback — audit note adopted): the UPDATE above tombstoned the old
@@ -3944,8 +4299,15 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         engine.dml_device_resolve_hits() > before,
         "a mixed int4+int8 DELETE over versioned shards must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("m"), "the versioned-shard DELETE must NOT de-elide");
-    assert_eq!(ids(&engine), vec![1, 3], "id 5 deleted; 1 ('keep') and 3 (big=100) survive");
+    assert!(
+        engine.table_install_elided("m"),
+        "the versioned-shard DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        vec![1, 3],
+        "id 5 deleted; 1 ('keep') and 3 (big=100) survive"
+    );
 
     // BOOL INEQUALITY DML (ADR-006: `flag < true` ⇔ `flag = false` — the bool leaves constant-
     // fold PG's false<true ordering; the DML builder now lowers bool comparisons, not just Eq).
@@ -3958,8 +4320,15 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         engine.dml_device_resolve_hits() > before,
         "a bool-inequality DELETE must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("m"), "a bool-inequality DELETE must NOT de-elide");
-    assert_eq!(ids(&engine), vec![1], "flag < true deleted exactly the flag=false row (3)");
+    assert!(
+        engine.table_install_elided("m"),
+        "a bool-inequality DELETE must NOT de-elide"
+    );
+    assert_eq!(
+        ids(&engine),
+        vec![1],
+        "flag < true deleted exactly the flag=false row (3)"
+    );
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, audit HIGH regression pin): a MID-PREFLIGHT REHYDRATE must not
@@ -3994,19 +4363,28 @@ fn gpu_check_elided_preflight_rehydrate_no_bypass() {
         .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 5, 'x', 10)")
         .unwrap();
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     engine
         .execute_dml_concurrent(3, "INSERT INTO t VALUES (2, 7, 'y', 20)")
         .unwrap();
-    assert!(engine.table_install_elided("t"), "the CHECK table must elide first");
+    assert!(
+        engine.table_install_elided("t"),
+        "the CHECK table must elide first"
+    );
     // THE LOAD-BEARING ROW: inserted AFTER elision entered, so it is ELIDED-ERA (device-only — the
     // stale pre-rehydrate host handle cannot see it). The bypass requires the WHERE to match THIS row.
     engine
         .execute_dml_concurrent(4, "INSERT INTO t VALUES (3, 9, 'z', 30)")
         .unwrap();
-    assert!(engine.table_install_elided("t"), "still elided after the device-only insert");
+    assert!(
+        engine.table_install_elided("t"),
+        "still elided after the device-only insert"
+    );
 
     // The BYPASS shape: a RANGE-ONLY mixed int8+text AND — the device predicate rejects the mixed
     // widths AND the value index declines (no Eq leaf) -> the else-SCAN runs. The decline
@@ -4081,7 +4459,11 @@ fn gpu_bool_predicate_dml_resolves_on_device() {
         engine.table_install_elided("t"),
         "a bool-equality DELETE must NOT de-elide"
     );
-    assert_eq!(gpu_ids_of_t(&engine), vec![2, 4], "exactly the two flag=true rows deleted");
+    assert_eq!(
+        gpu_ids_of_t(&engine),
+        vec![2, 4],
+        "exactly the two flag=true rows deleted"
+    );
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, charter-pure): a UUID ORDERING (`>`) DELETE on an ELIDED table
@@ -4098,20 +4480,32 @@ fn gpu_uuid_inequality_dml_resolves_on_device() {
     let high_byte = "'01000000-0000-0000-0000-000000000000'";
     let Some(engine) = gpu_elided_pk_table_with_column(
         "u UUID",
-        &[(1, &u(1)), (2, &u(2)), (3, &u(3)), (4, &u(4)), (5, high_byte)],
+        &[
+            (1, &u(1)),
+            (2, &u(2)),
+            (3, &u(3)),
+            (4, &u(4)),
+            (5, high_byte),
+        ],
     ) else {
         return;
     };
     // DELETE WHERE u > <02> -> ids 3, 4 (last byte) AND 5 (first byte 01 > 00) ON THE DEVICE, ELIDED.
     let before = engine.dml_device_resolve_hits();
     engine
-        .execute_dml_concurrent(9, "DELETE FROM t WHERE u > '00000000-0000-0000-0000-000000000002'")
+        .execute_dml_concurrent(
+            9,
+            "DELETE FROM t WHERE u > '00000000-0000-0000-0000-000000000002'",
+        )
         .unwrap();
     assert!(
         engine.dml_device_resolve_hits() > before,
         "a uuid ordering DELETE must RESOLVE on the device"
     );
-    assert!(engine.table_install_elided("t"), "a uuid ordering DELETE must NOT de-elide");
+    assert!(
+        engine.table_install_elided("t"),
+        "a uuid ordering DELETE must NOT de-elide"
+    );
     assert_eq!(
         gpu_ids_of_t(&engine),
         vec![1, 2],
@@ -4140,7 +4534,10 @@ fn gpu_in_list_dml_resolves_on_device() {
             engine.dml_device_resolve_hits() > before,
             "an int4 IN DELETE must RESOLVE on the device"
         );
-        assert!(engine.table_install_elided("t"), "int4 IN DELETE must NOT de-elide");
+        assert!(
+            engine.table_install_elided("t"),
+            "int4 IN DELETE must NOT de-elide"
+        );
         assert_eq!(gpu_ids_of_t(&engine), vec![1, 3], "ids 2,4 deleted");
     }
     // text IN.
@@ -4159,8 +4556,15 @@ fn gpu_in_list_dml_resolves_on_device() {
             engine.dml_device_resolve_hits() > before,
             "a text IN DELETE must RESOLVE on the device"
         );
-        assert!(engine.table_install_elided("t"), "text IN DELETE must NOT de-elide");
-        assert_eq!(gpu_ids_of_t(&engine), vec![2, 4], "the 'a' and 'c' rows deleted");
+        assert!(
+            engine.table_install_elided("t"),
+            "text IN DELETE must NOT de-elide"
+        );
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![2, 4],
+            "the 'a' and 'c' rows deleted"
+        );
     }
 }
 
@@ -4190,7 +4594,10 @@ fn gpu_text_inequality_dml_resolves_on_device() {
             engine.dml_device_resolve_hits() > before,
             "a text inequality DELETE must RESOLVE on the device"
         );
-        assert!(engine.table_install_elided("t"), "text `<` must NOT de-elide");
+        assert!(
+            engine.table_install_elided("t"),
+            "text `<` must NOT de-elide"
+        );
         assert_eq!(
             gpu_ids_of_t(&engine),
             vec![2, 3],
@@ -4205,7 +4612,10 @@ fn gpu_text_inequality_dml_resolves_on_device() {
         engine
             .execute_dml_concurrent(9, "DELETE FROM t WHERE name > 'a'")
             .unwrap();
-        assert!(engine.table_install_elided("t"), "text `>` must NOT de-elide");
+        assert!(
+            engine.table_install_elided("t"),
+            "text `>` must NOT de-elide"
+        );
         assert_eq!(
             gpu_ids_of_t(&engine),
             vec![1, 5],
@@ -4220,7 +4630,10 @@ fn gpu_text_inequality_dml_resolves_on_device() {
         engine
             .execute_dml_concurrent(9, "DELETE FROM t WHERE name >= 'b'")
             .unwrap();
-        assert!(engine.table_install_elided("t"), "text `>=` must NOT de-elide");
+        assert!(
+            engine.table_install_elided("t"),
+            "text `>=` must NOT de-elide"
+        );
         assert_eq!(
             gpu_ids_of_t(&engine),
             vec![1, 4, 5],
@@ -4253,8 +4666,15 @@ fn gpu_text_range_dml_resolves_on_device() {
             engine.dml_device_resolve_hits() > before,
             "a text RANGE DELETE must RESOLVE on the device (TextCmpMask in the mask VM)"
         );
-        assert!(engine.table_install_elided("t"), "text range DELETE must NOT de-elide");
-        assert_eq!(gpu_ids_of_t(&engine), vec![1, 4], "'b','c' deleted; 'a','d' kept");
+        assert!(
+            engine.table_install_elided("t"),
+            "text range DELETE must NOT de-elide"
+        );
+        assert_eq!(
+            gpu_ids_of_t(&engine),
+            vec![1, 4],
+            "'b','c' deleted; 'a','d' kept"
+        );
     }
     // NULLABLE-text range: a NULL name row must be excluded by 3VL (its empty placeholder span would
     // otherwise sort below 'b' — but NULL is UNKNOWN, not ''), and the table stays elided.
@@ -4273,7 +4693,10 @@ fn gpu_text_range_dml_resolves_on_device() {
             engine.dml_device_resolve_hits() > before,
             "a nullable-text range DELETE must RESOLVE on the device"
         );
-        assert!(engine.table_install_elided("t"), "nullable-text range must NOT de-elide");
+        assert!(
+            engine.table_install_elided("t"),
+            "nullable-text range must NOT de-elide"
+        );
         assert_eq!(
             gpu_ids_of_t(&engine),
             vec![3],
@@ -4295,7 +4718,9 @@ fn gpu_text_range_dml_resolves_on_device() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_multi_entry_insert_batch_stays_elided() {
     let mut engine = Engine::new_local();
-    engine.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT, v INT)")
+        .unwrap();
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
 
@@ -4310,7 +4735,10 @@ fn gpu_multi_entry_insert_batch_stays_elided() {
     // Seed row 1 as a batch of ONE (single-entry path), then admit residency — self-guard on no GPU.
     commit_batch(&engine, &[(2, payload("INSERT INTO t VALUES (1, 10)"))]);
     let snap = engine.populate_relational_residency_snapshot("t");
-    if snap.map(|s| s.device_memory_proof.is_none()).unwrap_or(true) {
+    if snap
+        .map(|s| s.device_memory_proof.is_none())
+        .unwrap_or(true)
+    {
         return; // no usable GPU
     }
     // Two more single-entry commits drive the (now-resident) table into elision — ENTER needs a
@@ -4409,13 +4837,23 @@ fn zero_row_dml_must_not_enter_elision_on_nonelided_table() {
 
     // A subsequent real INSERT still commits + reads back (without the guard the table would be elided with
     // no device backing, and this path would hit the rehydrate "invariant broken" hard error).
-    engine.execute_text(4, "INSERT INTO t VALUES (1, 10)").unwrap();
-    engine.execute_text(5, "INSERT INTO t VALUES (2, 20)").unwrap();
+    engine
+        .execute_text(4, "INSERT INTO t VALUES (1, 10)")
+        .unwrap();
+    engine
+        .execute_text(5, "INSERT INTO t VALUES (2, 20)")
+        .unwrap();
     let Command::Select(s) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
         unreachable!()
     };
     assert_eq!(
-        engine.execute_relational_select(&s).unwrap().rows.iter().next().and_then(|r| r.first()),
+        engine
+            .execute_relational_select(&s)
+            .unwrap()
+            .rows
+            .iter()
+            .next()
+            .and_then(|r| r.first()),
         Some(&SqlValue::Int8(2)),
         "both inserts visible (no lost rows / no hard error)"
     );
@@ -4434,10 +4872,16 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
     let mut engine = Engine::new_local();
     engine
-        .execute_text(1, "CREATE TABLE ct (a INT8, b INT8, v INT, PRIMARY KEY (a, b))")
+        .execute_text(
+            1,
+            "CREATE TABLE ct (a INT8, b INT8, v INT, PRIMARY KEY (a, b))",
+        )
         .unwrap();
     engine
-        .execute_text(2, "CREATE TABLE mt (a INT, b INT8, v INT, PRIMARY KEY (a, b))")
+        .execute_text(
+            2,
+            "CREATE TABLE mt (a INT, b INT8, v INT, PRIMARY KEY (a, b))",
+        )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
@@ -4477,7 +4921,10 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
             break;
         }
     }
-    assert!(warmed, "i64 compound-PK table never entered elision on a GPU box");
+    assert!(
+        warmed,
+        "i64 compound-PK table never entered elision on a GPU box"
+    );
 
     // Tuple uniqueness over i64 keys: distinct tuples commit; the exact tuple repeats -> 23505.
     sql!("INSERT INTO ct VALUES (5000000000, 2, 10)").unwrap(); // same a, different b -> OK
@@ -4584,7 +5031,10 @@ fn gpu_compound_delete_update_by_key_stays_device_native() {
     use std::sync::atomic::{AtomicU64, Ordering};
     let mut engine = Engine::new_local();
     engine
-        .execute_text(1, "CREATE TABLE ct (a INT, b INT, v INT, PRIMARY KEY (a, b))")
+        .execute_text(
+            1,
+            "CREATE TABLE ct (a INT, b INT, v INT, PRIMARY KEY (a, b))",
+        )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
@@ -4609,13 +5059,21 @@ fn gpu_compound_delete_update_by_key_stays_device_native() {
     }
     let mut warmed = false;
     for i in 0..10_000_i32 {
-        sql!(&format!("INSERT INTO ct VALUES ({}, {}, 0)", 2_000_000 + i, i)).unwrap();
+        sql!(&format!(
+            "INSERT INTO ct VALUES ({}, {}, 0)",
+            2_000_000 + i,
+            i
+        ))
+        .unwrap();
         if engine.table_install_elided("ct") {
             warmed = true;
             break;
         }
     }
-    assert!(warmed, "compound-PK table never entered elision on a GPU box");
+    assert!(
+        warmed,
+        "compound-PK table never entered elision on a GPU box"
+    );
     // Two rows sharing the first key column a=5 but differing in b.
     sql!("INSERT INTO ct VALUES (5, 1, 100)").unwrap();
     sql!("INSERT INTO ct VALUES (5, 2, 200)").unwrap();
@@ -4635,8 +5093,7 @@ fn gpu_compound_delete_update_by_key_stays_device_native() {
 
     // TUPLE EXACTNESS: (5,1) is gone; (5,2) survives (a DELETE keyed on the tuple, not column a).
     let count_a5 = |engine: &Engine| -> i64 {
-        let Command::Select(sel) =
-            parse_command("SELECT COUNT(*) FROM ct WHERE a = 5").unwrap()
+        let Command::Select(sel) = parse_command("SELECT COUNT(*) FROM ct WHERE a = 5").unwrap()
         else {
             unreachable!()
         };
@@ -4645,7 +5102,11 @@ fn gpu_compound_delete_update_by_key_stays_device_native() {
             ref other => panic!("unexpected count value {other:?}"),
         }
     };
-    assert_eq!(count_a5(&engine), 1, "exactly one a=5 row remains after deleting (5,1)");
+    assert_eq!(
+        count_a5(&engine),
+        1,
+        "exactly one a=5 row remains after deleting (5,1)"
+    );
 
     // UPDATE by the full compound key -> device resolve; stays elided; hits the right tuple.
     sql!("UPDATE ct SET v = 999 WHERE a = 5 AND b = 2").unwrap();
@@ -4653,8 +5114,7 @@ fn gpu_compound_delete_update_by_key_stays_device_native() {
         engine.table_install_elided("ct"),
         "compound UPDATE must not de-elide the table"
     );
-    let Command::Select(sel) =
-        parse_command("SELECT v FROM ct WHERE a = 5 AND b = 2").unwrap()
+    let Command::Select(sel) = parse_command("SELECT v FROM ct WHERE a = 5 AND b = 2").unwrap()
     else {
         unreachable!()
     };

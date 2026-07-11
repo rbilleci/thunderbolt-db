@@ -14,10 +14,14 @@ use super::*;
 /// drop it (so it leaves no residency / budget footprint). Returns false to SKIP a GPU test off-box.
 fn gpu_available(e: &mut Engine, seq: &mut u64) -> bool {
     *seq += 1;
-    e.execute_text(*seq, "CREATE TABLE __se_probe (x INT)").unwrap();
+    e.execute_text(*seq, "CREATE TABLE __se_probe (x INT)")
+        .unwrap();
     *seq += 1;
-    e.execute_text(*seq, "INSERT INTO __se_probe VALUES (1)").unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("__se_probe").unwrap();
+    e.execute_text(*seq, "INSERT INTO __se_probe VALUES (1)")
+        .unwrap();
+    let snapshot = e
+        .populate_relational_residency_snapshot("__se_probe")
+        .unwrap();
     let available = snapshot.device_memory_proof.is_some();
     *seq += 1;
     e.execute_text(*seq, "DROP TABLE __se_probe").unwrap();
@@ -41,7 +45,8 @@ fn gpu_streaming_reduction_over_budget_stays_on_device_out_of_core() {
     }
 
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     const N: i32 = 1500;
     let mut values = String::new();
     for i in 0..N {
@@ -146,7 +151,8 @@ fn gpu_streaming_reduction_bigint_sum_combines_as_numeric() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE amounts (v BIGINT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE amounts (v BIGINT)")
+        .unwrap();
     const N: i64 = 800;
     // Values large enough that the running total exceeds i64 conceptually is unnecessary here — the point
     // is that SUM(int8) returns NUMERIC per chunk, exercising the scale-aligned Decimal128 checked_add
@@ -305,7 +311,10 @@ fn gpu_streaming_reduction_empty_table_pg_semantics() {
         vec![vec![SqlValue::Null]],
         "MAX over empty = NULL"
     );
-    assert!(e.streaming_fold_hits() >= 1, "streaming fold fired for the empty table");
+    assert!(
+        e.streaming_fold_hits() >= 1,
+        "streaming fold fired for the empty table"
+    );
 }
 
 #[test]
@@ -319,7 +328,8 @@ fn gpu_streaming_projection_over_budget_filters_on_device() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     const N: i32 = 1500;
     let mut values = String::new();
     for i in 0..N {
@@ -339,7 +349,11 @@ fn gpu_streaming_projection_over_budget_filters_on_device() {
         .execute_relational_select(&select("SELECT a FROM big WHERE a >= 1000"))
         .unwrap();
     let expected: Vec<Vec<SqlValue>> = (1000..N).map(|i| vec![SqlValue::Int4(i)]).collect();
-    assert_eq!(result.rows.clone().into_boxed(), expected, "device-filtered projection");
+    assert_eq!(
+        result.rows.clone().into_boxed(),
+        expected,
+        "device-filtered projection"
+    );
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert!(e.streaming_fold_hits() >= 1, "the projection fold fired");
     assert!(
@@ -407,7 +421,11 @@ fn gpu_streaming_projection_limit_offset_windows_and_early_exits() {
         .execute_relational_select(&select("SELECT a FROM big LIMIT 5"))
         .unwrap();
     let expected_first5: Vec<Vec<SqlValue>> = (0..5).map(|i| vec![SqlValue::Int4(i)]).collect();
-    assert_eq!(limited.rows.clone().into_boxed(), expected_first5, "LIMIT 5 rows");
+    assert_eq!(
+        limited.rows.clone().into_boxed(),
+        expected_first5,
+        "LIMIT 5 rows"
+    );
     assert_eq!(
         e.streaming_fold_chunks() - chunks_before,
         1,
@@ -434,7 +452,11 @@ fn gpu_streaming_projection_limit_offset_windows_and_early_exits() {
         .execute_relational_select(&select("SELECT a FROM big OFFSET 1495"))
         .unwrap();
     let expected_tail: Vec<Vec<SqlValue>> = (1495..N).map(|i| vec![SqlValue::Int4(i)]).collect();
-    assert_eq!(offset_only.rows.clone().into_boxed(), expected_tail, "OFFSET without LIMIT");
+    assert_eq!(
+        offset_only.rows.clone().into_boxed(),
+        expected_tail,
+        "OFFSET without LIMIT"
+    );
     // 6c-0 coverage (audit LOW): LIMIT 0 — zero chunks, empty result, no error.
     let zero = e
         .execute_relational_select(&select("SELECT a FROM big LIMIT 0"))
@@ -476,7 +498,8 @@ fn gpu_streaming_grouped_over_budget_two_level_merge() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (g INT, a INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (g INT, a INT)")
+        .unwrap();
     const N: i32 = 1500;
     let mut values = String::new();
     for i in 0..N {
@@ -519,7 +542,10 @@ fn gpu_streaming_grouped_over_budget_two_level_merge() {
         "multi-chunk grouped fold, got {}",
         e.streaming_fold_chunks()
     );
-    assert!(e.streaming_fold_peak_chunk_bytes() <= budget, "peak bounded");
+    assert!(
+        e.streaming_fold_peak_chunk_bytes() <= budget,
+        "peak bounded"
+    );
 
     let sum = e
         .execute_relational_select(&select("SELECT g, SUM(a) FROM big GROUP BY g"))
@@ -553,8 +579,7 @@ fn gpu_streaming_grouped_over_budget_two_level_merge() {
             "SELECT g, COUNT(*) FROM big WHERE a >= 700 GROUP BY g",
         ))
         .unwrap();
-    let filtered_count_of =
-        |g: i64| (700..i64::from(N)).filter(|i| i % 7 == g).count() as i64;
+    let filtered_count_of = |g: i64| (700..i64::from(N)).filter(|i| i % 7 == g).count() as i64;
     assert_eq!(
         sorted_rows(&filtered),
         group_rows(&|g| SqlValue::Int8(filtered_count_of(g))),
@@ -566,7 +591,11 @@ fn gpu_streaming_grouped_over_budget_two_level_merge() {
     let cpu = e
         .execute_relational_select(&select("SELECT g, SUM(a) FROM big GROUP BY g"))
         .unwrap();
-    assert_eq!(sorted_rows(&cpu), sorted_rows(&sum), "GPU streaming == CPU oracle");
+    assert_eq!(
+        sorted_rows(&cpu),
+        sorted_rows(&sum),
+        "GPU streaming == CPU oracle"
+    );
 }
 
 #[test]
@@ -599,7 +628,11 @@ fn gpu_streaming_distinct_over_budget_set_union() {
         .execute_relational_select(&select("SELECT DISTINCT v FROM big"))
         .unwrap();
     let expected: Vec<Vec<SqlValue>> = (0..13).map(|v| vec![SqlValue::Int4(v)]).collect();
-    assert_eq!(sorted_rows(&result), expected, "distinct set union across chunks");
+    assert_eq!(
+        sorted_rows(&result),
+        expected,
+        "distinct set union across chunks"
+    );
     assert_eq!(result.columns.len(), 1, "count column dropped");
     assert!(e.streaming_fold_hits() >= 1, "distinct fold fired");
     assert!(
@@ -741,21 +774,32 @@ fn gpu_streaming_ordered_top_n_across_chunks() {
         "multi-chunk ordered fold, got {}",
         e.streaming_fold_chunks()
     );
-    assert!(e.streaming_fold_peak_chunk_bytes() <= budget, "peak bounded");
+    assert!(
+        e.streaming_fold_peak_chunk_bytes() <= budget,
+        "peak bounded"
+    );
 
     let desc = e
         .execute_relational_select(&select("SELECT a FROM big ORDER BY a DESC LIMIT 5"))
         .unwrap();
     let expected_desc: Vec<Vec<SqlValue>> =
         (0..5).map(|i| vec![SqlValue::Int4(N - 1 - i)]).collect();
-    assert_eq!(desc.rows.clone().into_boxed(), expected_desc, "DESC top-5 from the last chunk");
+    assert_eq!(
+        desc.rows.clone().into_boxed(),
+        expected_desc,
+        "DESC top-5 from the last chunk"
+    );
 
     // OFFSET windows on the device in the final pass.
     let offset = e
         .execute_relational_select(&select("SELECT a FROM big ORDER BY a LIMIT 5 OFFSET 7"))
         .unwrap();
     let expected_offset: Vec<Vec<SqlValue>> = (7..12).map(|i| vec![SqlValue::Int4(i)]).collect();
-    assert_eq!(offset.rows.clone().into_boxed(), expected_offset, "OFFSET+LIMIT window");
+    assert_eq!(
+        offset.rows.clone().into_boxed(),
+        expected_offset,
+        "OFFSET+LIMIT window"
+    );
 
     // WHERE + ORDER BY + LIMIT: predicate on-device per chunk, then the ordered window.
     let filtered = e
@@ -765,7 +809,11 @@ fn gpu_streaming_ordered_top_n_across_chunks() {
         .unwrap();
     let expected_filtered: Vec<Vec<SqlValue>> =
         (700..703).map(|i| vec![SqlValue::Int4(i)]).collect();
-    assert_eq!(filtered.rows.clone().into_boxed(), expected_filtered, "filtered ordered window");
+    assert_eq!(
+        filtered.rows.clone().into_boxed(),
+        expected_filtered,
+        "filtered ordered window"
+    );
 
     // COMPACTION: LIMIT 400 -> each chunk contributes up to 400 run rows (1600B), the accumulator
     // crosses the 2KB target after chunk 2 and must device-compact — the result stays exact.
@@ -784,7 +832,11 @@ fn gpu_streaming_ordered_top_n_across_chunks() {
     let cpu = e
         .execute_relational_select(&select("SELECT a FROM big ORDER BY a DESC LIMIT 5"))
         .unwrap();
-    assert_eq!(cpu.rows.clone().into_boxed(), expected_desc, "CPU oracle DESC top-5");
+    assert_eq!(
+        cpu.rows.clone().into_boxed(),
+        expected_desc,
+        "CPU oracle DESC top-5"
+    );
 }
 
 #[test]
@@ -818,9 +870,12 @@ fn gpu_streaming_ordered_unbounded_fits_or_defers() {
     let sorted = e
         .execute_relational_select(&select("SELECT a FROM big WHERE a >= 1400 ORDER BY a DESC"))
         .unwrap();
-    let expected: Vec<Vec<SqlValue>> =
-        (0..100).map(|i| vec![SqlValue::Int4(N - 1 - i)]).collect();
-    assert_eq!(sorted.rows.clone().into_boxed(), expected, "unbounded ordered survivors");
+    let expected: Vec<Vec<SqlValue>> = (0..100).map(|i| vec![SqlValue::Int4(N - 1 - i)]).collect();
+    assert_eq!(
+        sorted.rows.clone().into_boxed(),
+        expected,
+        "unbounded ordered survivors"
+    );
     let hits_after = e.streaming_fold_hits();
     assert!(hits_after >= 1, "unbounded ordered fold fired");
 
@@ -828,7 +883,11 @@ fn gpu_streaming_ordered_unbounded_fits_or_defers() {
     let deferred = e
         .execute_relational_select(&select("SELECT a FROM big ORDER BY a"))
         .unwrap();
-    assert_eq!(deferred.rows.len(), N as usize, "deferred full ordered scan served by CPU");
+    assert_eq!(
+        deferred.rows.len(),
+        N as usize,
+        "deferred full ordered scan served by CPU"
+    );
     assert_eq!(
         deferred.rows.clone().into_boxed()[0],
         vec![SqlValue::Int4(0)],
@@ -882,7 +941,8 @@ fn gpu_streaming_cold_tier_replay_probe() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     const N: i32 = 100_000;
     for batch in 0..10 {
         let mut values = String::new();
@@ -899,18 +959,33 @@ fn gpu_streaming_cold_tier_replay_probe() {
     }
     e.set_relational_residency_budget_bytes(0, 65536);
     // warm-up
-    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM big")).unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM big"))
+        .unwrap();
     for run in 0..3 {
         let t = std::time::Instant::now();
-        let c = e.execute_relational_select(&select("SELECT COUNT(*) FROM big")).unwrap();
+        let c = e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM big"))
+            .unwrap();
         let t1 = t.elapsed().as_micros();
         let t = std::time::Instant::now();
-        let s = e.execute_relational_select(&select("SELECT SUM(a) FROM big")).unwrap();
+        let s = e
+            .execute_relational_select(&select("SELECT SUM(a) FROM big"))
+            .unwrap();
         let t2 = t.elapsed().as_micros();
-        assert_eq!(c.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(100_000)]]);
-        assert_eq!(s.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(4_999_950_000i64)]]);
+        assert_eq!(
+            c.rows.clone().into_boxed(),
+            vec![vec![SqlValue::Int8(100_000)]]
+        );
+        assert_eq!(
+            s.rows.clone().into_boxed(),
+            vec![vec![SqlValue::Int8(4_999_950_000i64)]]
+        );
         eprintln!("COLDPROBE run={run} count_us={t1} sum_us={t2}");
-        assert!(e.streaming_cold_hits() >= 1, "cold tier served the repeat reads");
+        assert!(
+            e.streaming_cold_hits() >= 1,
+            "cold tier served the repeat reads"
+        );
     }
 }
 
@@ -951,7 +1026,10 @@ fn gpu_streaming_cold_tier_invalidates_on_write() {
     };
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
     let builds_after_first = e.streaming_cold_builds();
-    assert!(builds_after_first >= 1, "the first streaming read installs the cold tier");
+    assert!(
+        builds_after_first >= 1,
+        "the first streaming read installs the cold tier"
+    );
     let hits_before = e.streaming_cold_hits();
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
     assert!(
@@ -963,11 +1041,15 @@ fn gpu_streaming_cold_tier_invalidates_on_write() {
         .execute_relational_select(&select("SELECT SUM(a) FROM big"))
         .unwrap();
     let expected_sum: i64 = (0..i64::from(N)).sum();
-    assert_eq!(sum.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(expected_sum)]]);
+    assert_eq!(
+        sum.rows.clone().into_boxed(),
+        vec![vec![SqlValue::Int8(expected_sum)]]
+    );
 
     // INSERT -> the generation Arc changes -> MISS -> fresh scan sees N+1 (a stale hit would say N).
     seq += 1;
-    e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)").unwrap();
+    e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)")
+        .unwrap();
     assert_eq!(
         count(&e),
         vec![vec![SqlValue::Int8(i64::from(N) + 1)]],
@@ -979,14 +1061,21 @@ fn gpu_streaming_cold_tier_invalidates_on_write() {
         builds_after_first,
         "the post-write read PATCHES — no fresh build"
     );
-    assert!(e.streaming_cold_patches() >= 1, "the write was served by a PATCH");
+    assert!(
+        e.streaming_cold_patches() >= 1,
+        "the write was served by a PATCH"
+    );
     // The rebuilt cache serves hits again...
     let hits_before = e.streaming_cold_hits();
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N) + 1)]]);
-    assert!(e.streaming_cold_hits() > hits_before, "rebuilt cache hits again");
+    assert!(
+        e.streaming_cold_hits() > hits_before,
+        "rebuilt cache hits again"
+    );
     // ...and a DELETE invalidates again.
     seq += 1;
-    e.execute_text(seq, "DELETE FROM big WHERE a = 100000").unwrap();
+    e.execute_text(seq, "DELETE FROM big WHERE a = 100000")
+        .unwrap();
     assert_eq!(
         count(&e),
         vec![vec![SqlValue::Int8(i64::from(N))]],
@@ -1028,7 +1117,10 @@ fn gpu_streaming_cold_tier_spills_and_replays_from_disk() {
         let count = e
             .execute_relational_select(&select("SELECT COUNT(*) FROM big"))
             .unwrap();
-        assert_eq!(count.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(i64::from(N))]]);
+        assert_eq!(
+            count.rows.clone().into_boxed(),
+            vec![vec![SqlValue::Int8(i64::from(N))]]
+        );
         assert!(
             e.streaming_cold_spills() >= 1,
             "the capture must have SPILLED (threshold forced to 1KB)"
@@ -1039,20 +1131,31 @@ fn gpu_streaming_cold_tier_spills_and_replays_from_disk() {
             .execute_relational_select(&select("SELECT SUM(a) FROM big"))
             .unwrap();
         let expected_sum: i64 = (0..i64::from(N)).sum();
-        assert_eq!(sum.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(expected_sum)]]);
-        assert!(e.streaming_cold_hits() > hits_before, "spilled replay served the SUM");
+        assert_eq!(
+            sum.rows.clone().into_boxed(),
+            vec![vec![SqlValue::Int8(expected_sum)]]
+        );
+        assert!(
+            e.streaming_cold_hits() > hits_before,
+            "spilled replay served the SUM"
+        );
         // EXACT-ORDER projection replay: chunk offsets must round-trip byte-exactly (a swapped or
         // misaligned positional read would reorder or corrupt rows).
         let rows = e
             .execute_relational_select(&select("SELECT a FROM big WHERE a >= 1000"))
             .unwrap();
         let expected: Vec<Vec<SqlValue>> = (1000..N).map(|i| vec![SqlValue::Int4(i)]).collect();
-        assert_eq!(rows.rows.clone().into_boxed(), expected, "spilled projection byte-exact");
+        assert_eq!(
+            rows.rows.clone().into_boxed(),
+            expected,
+            "spilled projection byte-exact"
+        );
 
         // A write invalidates the spilled entry (generation change), and the rebuild re-spills.
         let spills_before = e.streaming_cold_spills();
         seq += 1;
-        e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)").unwrap();
+        e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)")
+            .unwrap();
         let count = e
             .execute_relational_select(&select("SELECT COUNT(*) FROM big"))
             .unwrap();
@@ -1061,7 +1164,10 @@ fn gpu_streaming_cold_tier_spills_and_replays_from_disk() {
             vec![vec![SqlValue::Int8(i64::from(N) + 1)]],
             "post-write count fresh (stale spilled replay would say N)"
         );
-        assert!(e.streaming_cold_spills() > spills_before, "the rebuild re-spilled");
+        assert!(
+            e.streaming_cold_spills() > spills_before,
+            "the rebuild re-spilled"
+        );
     });
     crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1103,15 +1209,20 @@ fn gpu_streaming_grouped_bigint_sum_repro() {
         e.execute_text(seq, &format!("INSERT INTO contam (a) VALUES {values}"))
             .unwrap();
         e.set_relational_residency_budget_bytes(0, 4096);
-        let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM contam")).unwrap();
-        let _ = e.execute_relational_select(&select("SELECT SUM(a) FROM contam")).unwrap();
+        let _ = e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM contam"))
+            .unwrap();
+        let _ = e
+            .execute_relational_select(&select("SELECT SUM(a) FROM contam"))
+            .unwrap();
         let _ = e
             .execute_relational_select(&select("SELECT a FROM contam WHERE a >= 1000"))
             .unwrap();
 
         // Phase 2: grouped SUM(bigint) over a streamed table -> numeric partials in the merge.
         seq += 1;
-        e.execute_text(seq, "CREATE TABLE gb (g INT, v BIGINT)").unwrap();
+        e.execute_text(seq, "CREATE TABLE gb (g INT, v BIGINT)")
+            .unwrap();
         let mut values = String::new();
         for i in 0..1500i64 {
             if i > 0 {
@@ -1133,7 +1244,10 @@ fn gpu_streaming_grouped_bigint_sum_repro() {
                     .filter(|i| i % 13 == g)
                     .map(|i| (1000 + i) as i128)
                     .sum();
-                vec![SqlValue::Int4(g as i32), SqlValue::Numeric(Decimal128::new(sum, 0))]
+                vec![
+                    SqlValue::Int4(g as i32),
+                    SqlValue::Numeric(Decimal128::new(sum, 0)),
+                ]
             })
             .collect();
         assert_eq!(rows.len(), 13, "13 groups, no duplicates: got {rows:?}");
@@ -1184,11 +1298,16 @@ fn gpu_streaming_cold_tier_patches_deltas_chunk_granular() {
     };
     // Build (~3 chunks of 512 rows).
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
-    assert_eq!(e.streaming_cold_patches(), 0, "first read is a build, not a patch");
+    assert_eq!(
+        e.streaming_cold_patches(),
+        0,
+        "first read is a build, not a patch"
+    );
 
     // INSERT -> tail-append patch: zero dirty chunks rebuilt.
     seq += 1;
-    e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)").unwrap();
+    e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)")
+        .unwrap();
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N) + 1)]]);
     assert_eq!(e.streaming_cold_patches(), 1, "the write PATCHED the entry");
     assert_eq!(
@@ -1197,15 +1316,21 @@ fn gpu_streaming_cold_tier_patches_deltas_chunk_granular() {
         "an INSERT is a pure TAIL append — no existing chunk rebuilds"
     );
 
-    // One-row DELETE inside the FIRST chunk -> exactly ONE dirty chunk rebuilds.
+    // One-row DELETE inside the FIRST chunk -> P2: a SIDECAR STAMP, zero rebuilds (the chunk's
+    // bytes stay; the tombstone masks the row in-kernel at replay).
     seq += 1;
     e.execute_text(seq, "DELETE FROM big WHERE a = 3").unwrap();
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
     assert_eq!(e.streaming_cold_patches(), 2);
     assert_eq!(
         e.streaming_cold_chunks_rebuilt(),
+        0,
+        "a pure one-row DELETE STAMPS its chunk's sidecar — nothing rebuilds (P2)"
+    );
+    assert_eq!(
+        e.streaming_cold_stamps(),
         1,
-        "a one-row DELETE rebuilds EXACTLY its one chunk (of several)"
+        "exactly the deleted row is tombstone-stamped"
     );
 
     // Aggregate exactness through the patched chunks (SUM over the survivors + the tail row).
@@ -1213,12 +1338,19 @@ fn gpu_streaming_cold_tier_patches_deltas_chunk_granular() {
     let sum = e
         .execute_relational_select(&select("SELECT SUM(a) FROM big"))
         .unwrap();
-    assert_eq!(sum.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(expected_sum)]]);
+    assert_eq!(
+        sum.rows.clone().into_boxed(),
+        vec![vec![SqlValue::Int8(expected_sum)]]
+    );
 
     // The patched entry serves plain hits again (no further patches).
     let patches = e.streaming_cold_patches();
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
-    assert_eq!(e.streaming_cold_patches(), patches, "clean hit after the patch");
+    assert_eq!(
+        e.streaming_cold_patches(),
+        patches,
+        "clean hit after the patch"
+    );
 
     // F6 (audit): the EMPTY-table sentinel -> INSERT patch path (the (1,0) sentinel chunk's hi=0
     // routes every new id to the tail; no panic, exact results).
@@ -1231,9 +1363,14 @@ fn gpu_streaming_cold_tier_patches_deltas_chunk_granular() {
             .clone()
             .into_boxed()
     };
-    assert_eq!(hollow_count(&e), vec![vec![SqlValue::Int8(0)]], "empty build");
+    assert_eq!(
+        hollow_count(&e),
+        vec![vec![SqlValue::Int8(0)]],
+        "empty build"
+    );
     seq += 1;
-    e.execute_text(seq, "INSERT INTO hollow (a) VALUES (1), (2)").unwrap();
+    e.execute_text(seq, "INSERT INTO hollow (a) VALUES (1), (2)")
+        .unwrap();
     assert_eq!(
         hollow_count(&e),
         vec![vec![SqlValue::Int8(2)]],
@@ -1280,7 +1417,8 @@ fn gpu_streaming_cold_tier_eager_commit_maintenance() {
 
     // THE COMMIT ITSELF patches — no read in between.
     seq += 1;
-    e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)").unwrap();
+    e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)")
+        .unwrap();
     assert_eq!(
         e.streaming_cold_patches(),
         1,
@@ -1290,18 +1428,32 @@ fn gpu_streaming_cold_tier_eager_commit_maintenance() {
     // The next read is a CLEAN HIT: correct result, no read-time patch.
     let hits_before = e.streaming_cold_hits();
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N) + 1)]]);
-    assert_eq!(e.streaming_cold_patches(), 1, "no read-time patch — the read was a clean hit");
+    assert_eq!(
+        e.streaming_cold_patches(),
+        1,
+        "no read-time patch — the read was a clean hit"
+    );
     assert!(e.streaming_cold_hits() > hits_before);
 
-    // A DELETE commit patches eagerly too (one dirty chunk).
+    // A DELETE commit patches eagerly too — P2: a SIDECAR STAMP at commit, zero rebuilds.
     let rebuilt_before = e.streaming_cold_chunks_rebuilt();
+    let stamps_before = e.streaming_cold_stamps();
     seq += 1;
     e.execute_text(seq, "DELETE FROM big WHERE a = 3").unwrap();
-    assert_eq!(e.streaming_cold_patches(), 2, "the DELETE commit patched eagerly");
+    assert_eq!(
+        e.streaming_cold_patches(),
+        2,
+        "the DELETE commit patched eagerly"
+    );
     assert_eq!(
         e.streaming_cold_chunks_rebuilt(),
-        rebuilt_before + 1,
-        "exactly one dirty chunk rebuilt at commit"
+        rebuilt_before,
+        "the eager DELETE patch STAMPS — no chunk rebuild at commit (P2)"
+    );
+    assert_eq!(
+        e.streaming_cold_stamps(),
+        stamps_before + 1,
+        "the commit stamped exactly the deleted row"
     );
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
 }
@@ -1322,27 +1474,35 @@ fn cold_checkpoint_descriptor_round_trips() {
         column_count: 4,
         resident_bytes: 4096,
         resident_device_int4_columns: vec!["a".into(), "b".into()],
-        resident_device_int4_column_stats: vec![crate::relational_model::ResidentDeviceInt4ColumnStats {
-            name: "a".into(),
-            min: -7,
-            max: 900,
-        }],
+        resident_device_int4_column_stats: vec![
+            crate::relational_model::ResidentDeviceInt4ColumnStats {
+                name: "a".into(),
+                min: -7,
+                max: 900,
+            },
+        ],
         resident_device_int8_columns: vec!["big".into()],
         resident_device_numeric_columns: vec!["price".into()],
-        resident_device_bool_columns: vec![crate::relational_model::ResidentDeviceBoolColumnLayout {
-            name: "flag".into(),
-            bitmap_byte_offset: 128,
-        }],
-        resident_device_text_columns: vec![crate::relational_model::ResidentDeviceTextColumnLayout {
-            name: "name".into(),
-            offsets_byte_offset: 256,
-            bytes_byte_offset: 304,
-            bytes_len: 77,
-        }],
-        resident_device_null_columns: vec![crate::relational_model::ResidentDeviceNullBitmapLayout {
-            name: "b".into(),
-            bitmap_byte_offset: 512,
-        }],
+        resident_device_bool_columns: vec![
+            crate::relational_model::ResidentDeviceBoolColumnLayout {
+                name: "flag".into(),
+                bitmap_byte_offset: 128,
+            },
+        ],
+        resident_device_text_columns: vec![
+            crate::relational_model::ResidentDeviceTextColumnLayout {
+                name: "name".into(),
+                offsets_byte_offset: 256,
+                bytes_byte_offset: 304,
+                bytes_len: 77,
+            },
+        ],
+        resident_device_null_columns: vec![
+            crate::relational_model::ResidentDeviceNullBitmapLayout {
+                name: "b".into(),
+                bitmap_byte_offset: 512,
+            },
+        ],
         valid_through_index: 99,
         invalidated_by_txn_id: None,
         invalidated_at_index: None,
@@ -1370,7 +1530,10 @@ fn cold_checkpoint_descriptor_round_trips() {
 /// keeps the shape elision-ineligible so the streaming scan's store premise holds) has
 /// `serial_rows` rows from the serial (pre-activation) phase and 24 fabricated lane-commit rows.
 /// Returns (wal base path, expected row count, next fabricated row id base, next lane seq).
-fn p1_lanes_streaming_fixture(tag: &str, serial_rows: i32) -> Option<(std::path::PathBuf, i64, u64)> {
+fn p1_lanes_streaming_fixture(
+    tag: &str,
+    serial_rows: i32,
+) -> Option<(std::path::PathBuf, i64, u64)> {
     let dir = std::env::temp_dir().join(format!(
         "gpu-db-cold-ckpt-{tag}-{}-{}",
         std::process::id(),
@@ -1389,7 +1552,8 @@ fn p1_lanes_streaming_fixture(tag: &str, serial_rows: i32) -> Option<(std::path:
             return None; // off-box: skip
         }
         seq += 1;
-        e.execute_text(seq, "CREATE TABLE t (a INT, b INT)").unwrap();
+        e.execute_text(seq, "CREATE TABLE t (a INT, b INT)")
+            .unwrap();
         let mut values = String::new();
         for i in 0..serial_rows {
             if i > 0 {
@@ -1409,9 +1573,11 @@ fn p1_lanes_streaming_fixture(tag: &str, serial_rows: i32) -> Option<(std::path:
         let set = gpu_db_wal::FuaWalLaneSet::create(&base, 2, 2, tiny).expect("create lanes");
         for seq in 0..24u64 {
             let values = vec![SqlValue::Int4(10_000 + seq as i32), SqlValue::Int4(0)];
-            let payload =
-                crate::wal_binary::try_encode_binary_insert("t", &[(row_base + seq, values.as_slice())])
-                    .expect("binary encode");
+            let payload = crate::wal_binary::try_encode_binary_insert(
+                "t",
+                &[(row_base + seq, values.as_slice())],
+            )
+            .expect("binary encode");
             set.append(
                 (seq % 2) as usize,
                 seq,
@@ -1464,7 +1630,11 @@ fn gpu_cold_checkpoint_restores_streaming_cold_across_reopen() {
         "{}.cold-checkpoint.{cut}",
         base.file_name().unwrap().to_string_lossy()
     ));
-    assert!(artifact.exists(), "artifact {} must exist", artifact.display());
+    assert!(
+        artifact.exists(),
+        "artifact {} must exist",
+        artifact.display()
+    );
 
     // REOPEN: the seam install restores the cold tier; the first streaming read is a byte REPLAY
     // (a HIT with zero fresh scan-builds), and the answer matches.
@@ -1538,7 +1708,11 @@ fn gpu_cold_checkpoint_patches_forward_post_checkpoint_wal_suffix() {
         "suffix replay must patch the restored entry via the commit hooks"
     );
     e.set_relational_residency_budget_bytes(0, budget);
-    assert_eq!(p1_count(&e), expected + 6, "the suffix rows must be visible");
+    assert_eq!(
+        p1_count(&e),
+        expected + 6,
+        "the suffix rows must be visible"
+    );
     assert!(e.streaming_cold_hits() >= 1);
     assert_eq!(
         e.streaming_cold_builds(),
@@ -1579,7 +1753,11 @@ fn gpu_cold_checkpoint_corrupt_artifact_is_skipped_never_wrong() {
         "a checksum-failed artifact must restore NOTHING"
     );
     e.set_relational_residency_budget_bytes(0, budget);
-    assert_eq!(p1_count(&e), expected, "the read rebuilds from the store — never wrong");
+    assert_eq!(
+        p1_count(&e),
+        expected,
+        "the read rebuilds from the store — never wrong"
+    );
     assert!(
         e.streaming_cold_builds() >= 1,
         "the skipped restore leaves the first read to scan + capture"
@@ -1628,7 +1806,11 @@ fn gpu_cold_checkpoint_boundary_mismatch_is_skipped() {
         "a boundary-mismatched artifact must restore NOTHING (checksum alone cannot catch it)"
     );
     e.set_relational_residency_budget_bytes(0, budget);
-    assert_eq!(p1_count(&e), expected, "the read rebuilds from the store — never wrong");
+    assert_eq!(
+        p1_count(&e),
+        expected,
+        "the read rebuilds from the store — never wrong"
+    );
     assert!(e.streaming_cold_builds() >= 1);
 }
 
@@ -1658,7 +1840,11 @@ fn gpu_cold_checkpoint_restores_under_lane_pump_frontier_watermark() {
         let lanes = e.intent_lanes.as_ref().expect("lanes installed");
         let frontier = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire) + 24;
         e.publish_committed_seq(frontier);
-        assert_eq!(e.committed_seq(), frontier, "premise: frontier-convention watermark");
+        assert_eq!(
+            e.committed_seq(),
+            frontier,
+            "premise: frontier-convention watermark"
+        );
         let cut = e.checkpoint_intent_lanes().expect("lanes checkpoint");
         assert_eq!(cut, 24);
         assert!(
@@ -1706,7 +1892,9 @@ fn gpu_streaming_dml_locate_range_delete_on_device() {
     }
     for (engine, s) in [(&mut e, &mut seq), (&mut twin, &mut twin_seq)] {
         *s += 1;
-        engine.execute_text(*s, "CREATE TABLE big (a INT, b INT)").unwrap();
+        engine
+            .execute_text(*s, "CREATE TABLE big (a INT, b INT)")
+            .unwrap();
         *s += 1;
         engine
             .execute_text(*s, &format!("INSERT INTO big (a, b) VALUES {values}"))
@@ -1716,20 +1904,34 @@ fn gpu_streaming_dml_locate_range_delete_on_device() {
 
     assert_eq!(e.dml_streaming_resolve_hits(), 0);
     seq += 1;
-    e.execute_text(seq, "DELETE FROM big WHERE a > 1200").unwrap();
+    e.execute_text(seq, "DELETE FROM big WHERE a > 1200")
+        .unwrap();
     assert_eq!(
         e.dml_streaming_resolve_hits(),
         1,
         "the range DELETE locate must resolve via the streaming fold"
     );
     twin_seq += 1;
-    twin.execute_text(twin_seq, "DELETE FROM big WHERE a > 1200").unwrap();
+    twin.execute_text(twin_seq, "DELETE FROM big WHERE a > 1200")
+        .unwrap();
 
     // Differential: identical surviving rows (read both through the same CPU-pinned path).
     e.clear_relational_residency_budget_bytes(0);
     let q = select("SELECT a, b FROM big ORDER BY a");
-    let got = e.execute_relational_select(&q).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
-    let want = twin.execute_relational_select(&q).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+    let got = e
+        .execute_relational_select(&q)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
+    let want = twin
+        .execute_relational_select(&q)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
     assert_eq!(got.len(), 1201, "rows 0..=1200 survive");
     assert_eq!(got, want, "device locate == host locate");
 }
@@ -1756,7 +1958,9 @@ fn gpu_streaming_dml_locate_range_update_on_device() {
     }
     for (engine, s) in [(&mut e, &mut seq), (&mut twin, &mut twin_seq)] {
         *s += 1;
-        engine.execute_text(*s, "CREATE TABLE big (a INT, b INT)").unwrap();
+        engine
+            .execute_text(*s, "CREATE TABLE big (a INT, b INT)")
+            .unwrap();
         *s += 1;
         engine
             .execute_text(*s, &format!("INSERT INTO big (a, b) VALUES {values}"))
@@ -1765,21 +1969,33 @@ fn gpu_streaming_dml_locate_range_update_on_device() {
     e.set_relational_residency_budget_bytes(0, 4096);
 
     seq += 1;
-    e.execute_text(seq, "UPDATE big SET b = -5 WHERE a >= 1400").unwrap();
+    e.execute_text(seq, "UPDATE big SET b = -5 WHERE a >= 1400")
+        .unwrap();
     assert_eq!(
         e.dml_streaming_resolve_hits(),
         1,
         "the range UPDATE locate must resolve via the streaming fold"
     );
     twin_seq += 1;
-    twin
-        .execute_text(twin_seq, "UPDATE big SET b = -5 WHERE a >= 1400")
+    twin.execute_text(twin_seq, "UPDATE big SET b = -5 WHERE a >= 1400")
         .unwrap();
 
     e.clear_relational_residency_budget_bytes(0);
     let q = select("SELECT a, b FROM big ORDER BY a");
-    let got = e.execute_relational_select(&q).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
-    let want = twin.execute_relational_select(&q).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+    let got = e
+        .execute_relational_select(&q)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
+    let want = twin
+        .execute_relational_select(&q)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
     assert_eq!(got.len(), N as usize);
     assert_eq!(got, want, "device locate == host locate");
     assert_eq!(
@@ -1800,7 +2016,8 @@ fn gpu_streaming_dml_locate_zero_matches_is_a_resolve() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     const N: i32 = 1500;
     let mut values = String::new();
     for i in 0..N {
@@ -1815,12 +2032,22 @@ fn gpu_streaming_dml_locate_zero_matches_is_a_resolve() {
     e.set_relational_residency_budget_bytes(0, 4096);
 
     seq += 1;
-    e.execute_text(seq, "DELETE FROM big WHERE a > 999999").unwrap();
-    assert_eq!(e.dml_streaming_resolve_hits(), 1, "0-match locate still resolves on-device");
+    e.execute_text(seq, "DELETE FROM big WHERE a > 999999")
+        .unwrap();
+    assert_eq!(
+        e.dml_streaming_resolve_hits(),
+        1,
+        "0-match locate still resolves on-device"
+    );
 
     let q = select("SELECT COUNT(*) FROM big");
     assert_eq!(
-        e.execute_relational_select(&q).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        e.execute_relational_select(&q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>(),
         vec![vec![SqlValue::Int8(i64::from(N))]],
         "nothing deleted"
     );
@@ -1837,7 +2064,8 @@ fn gpu_streaming_dml_locate_declines_without_budget() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)")
+        .unwrap();
     seq += 1;
     e.execute_text(seq, "INSERT INTO big (a, b) VALUES (1, 2), (5, 6), (9, 10)")
         .unwrap();
@@ -1846,7 +2074,12 @@ fn gpu_streaming_dml_locate_declines_without_budget() {
     assert_eq!(e.dml_streaming_resolve_hits(), 0, "no budget -> host arm");
     let q = select("SELECT COUNT(*) FROM big");
     assert_eq!(
-        e.execute_relational_select(&q).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        e.execute_relational_select(&q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>(),
         vec![vec![SqlValue::Int8(1)]]
     );
 }
@@ -1930,9 +2163,235 @@ fn gpu_streaming_dml_locate_type_matrix_differential() {
         twin.execute_text(twin_seq, statement).unwrap();
 
         e.clear_relational_residency_budget_bytes(0);
-        let got = e.execute_relational_select(&q).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
-        let want = twin.execute_relational_select(&q).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
-        assert_eq!(got, want, "statement {i} ({statement}): device locate != host locate");
+        let got = e
+            .execute_relational_select(&q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>();
+        let want = twin
+            .execute_relational_select(&q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            got, want,
+            "statement {i} ({statement}): device locate != host locate"
+        );
         e.set_relational_residency_budget_bytes(0, 4096);
     }
+}
+
+// ========== P2 (sealed-shards-primary): SV2 tombstone sidecars for cold chunks ==========
+
+/// Multi-row deletes across SEVERAL chunks stamp sidecars (zero rebuilds) and every read shape —
+/// aggregate AND row-level projection — masks the tombstoned rows in-kernel, matching a
+/// host-path twin exactly.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_cold_sidecar_stamps_mask_rows_across_chunks() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    const N: i32 = 1500;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {})", i * 2));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO big (a, b) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+
+    // Build the cold tier (multi-chunk).
+    let q_count = select("SELECT COUNT(*) FROM big");
+    assert_eq!(
+        e.execute_relational_select(&q_count).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        vec![vec![SqlValue::Int8(i64::from(N))]]
+    );
+    assert!(e.streaming_cold_builds() >= 1);
+
+    // Rows 100, 700 and 1400 live in DIFFERENT chunks (ids ascending; ~12 chunks of ~128 rows).
+    // Each Eq-DELETE resolves via the value index (host arm) and must EAGERLY STAMP at commit.
+    for a in [100, 700, 1400] {
+        seq += 1;
+        e.execute_text(seq, &format!("DELETE FROM big WHERE a = {a}")).unwrap();
+    }
+    assert_eq!(e.streaming_cold_stamps(), 3, "three rows stamped");
+    assert_eq!(e.streaming_cold_chunks_rebuilt(), 0, "no rebuild for pure deletes");
+
+    // Aggregate through stamped chunks.
+    assert_eq!(
+        e.execute_relational_select(&q_count).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        vec![vec![SqlValue::Int8(i64::from(N) - 3)]]
+    );
+    // VALUE-SENSITIVE reads through the stamped chunks (COUNT alone cannot catch a mask on the
+    // WRONG slot): SUM must reflect exactly WHICH rows are masked (closed form), and a bounded
+    // window projection around a deleted row must return exactly the surviving neighbors (small
+    // survivor set — no honest-defer; an unbounded ORDER BY here would defer to the CPU and
+    // test nothing).
+    let expected_sum: i64 = (0..i64::from(N)).sum::<i64>() - 100 - 700 - 1400;
+    let sum = e
+        .execute_relational_select(&select("SELECT SUM(a) FROM big"))
+        .unwrap();
+    assert_eq!(
+        sum.rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        vec![vec![SqlValue::Int8(expected_sum)]],
+        "SUM through stamped chunks must miss exactly the deleted rows"
+    );
+    let q_window = select("SELECT a FROM big WHERE a >= 98 AND a <= 102");
+    let got = e
+        .execute_relational_select(&q_window)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        got,
+        vec![
+            vec![SqlValue::Int4(98)],
+            vec![SqlValue::Int4(99)],
+            vec![SqlValue::Int4(101)],
+            vec![SqlValue::Int4(102)],
+        ],
+        "the window around the deleted row must skip EXACTLY it"
+    );
+}
+
+/// Mixed workload over a stamped entry: a DELETE stamps, an INSERT tail-patches with the stamped
+/// chunk REUSED (its sidecar preserved), an UPDATE (same-id version chain) falls to the REBUILD
+/// arm — every step correct, and a stamped entry DECLINES the P1 cold checkpoint (the v1
+/// artifact has no sidecar sections; benign skip, ledgered as P2b).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_cold_sidecar_mixed_workload_and_checkpoint_decline() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    const N: i32 = 900;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {})", i * 2));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO big (a, b) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+    let q_count = select("SELECT COUNT(*) FROM big");
+    let count = |e: &Engine| -> i64 {
+        match e.execute_relational_select(&q_count).unwrap().rows.row(0)[0] {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("count: {other:?}"),
+        }
+    };
+    assert_eq!(count(&e), i64::from(N));
+
+    // DELETE -> stamp.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM big WHERE a = 10").unwrap();
+    assert_eq!(e.streaming_cold_stamps(), 1);
+    assert_eq!(count(&e), i64::from(N) - 1);
+
+    // INSERT -> pure tail patch; the STAMPED chunk is REUSED (stamps preserved, still masked).
+    let rebuilt_before = e.streaming_cold_chunks_rebuilt();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO big (a, b) VALUES (100000, 1)").unwrap();
+    assert_eq!(
+        e.streaming_cold_chunks_rebuilt(),
+        rebuilt_before,
+        "INSERT stays a pure tail append beside a stamped chunk"
+    );
+    assert_eq!(count(&e), i64::from(N), "tail row visible AND the stamp still masks");
+
+    // UPDATE (same-id version chain change) -> the classifier must refuse the stamp downgrade;
+    // the rebuild arm serves it. Correctness is the assert; the arm split is the counter.
+    seq += 1;
+    e.execute_text(seq, "UPDATE big SET b = -7 WHERE a = 20").unwrap();
+    assert_eq!(count(&e), i64::from(N), "update preserves cardinality");
+    let q_probe = select("SELECT b FROM big WHERE a = 20");
+    assert_eq!(
+        e.execute_relational_select(&q_probe).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        vec![vec![SqlValue::Int4(-7)]],
+        "the updated value must be visible through the streaming read"
+    );
+
+    // P1 interop: re-stamp a fresh delete so the entry is sidecar-bearing, then a direct capture
+    // must DECLINE it (0 tables written) — the v1 artifact cannot carry sidecars.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM big WHERE a = 30").unwrap();
+    let map_has_sidecar = e.streaming_cold_stamps() >= 2;
+    assert!(map_has_sidecar, "premise: the entry carries a sidecar");
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-p2-ckpt-decline-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("db.wal");
+    let boundary = e.committed_seq();
+    let written = e
+        .write_streaming_cold_checkpoint(&base, 1, boundary, boundary + 1)
+        .expect("capture runs");
+    assert_eq!(written, 0, "a sidecar-bearing entry must DECLINE the v1 artifact");
+}
+
+/// THE CHANGE-LOG REGRESSION (found by P2's stamp counter, but 6c-1-era): `imbl::OrdMap::diff`
+/// MISSED a real change — three sequential single-row deletes, each against a freshly pinned
+/// generation (the cold-tier entry's exact usage), and the THIRD delete vanished from the diff
+/// while the two generations' chains provably differed (deleted_by None vs Some). A missed delta
+/// = a patched cold entry silently serving a deleted row. `changed_tuple_ids` therefore reads
+/// the store's WRITE-SIDE CHANGE LOG (exact by construction) and structural diffing is BANNED
+/// for correctness-bearing deltas. This is the minimal CPU repro, pinned forever.
+#[test]
+fn cow_change_log_reports_every_pinned_generation_delta() {
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE big (a INT, b INT)").unwrap();
+    const N: i32 = 1500;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 { values.push(','); }
+        values.push_str(&format!("({i}, {})", i * 2));
+    }
+    e.execute_text(2, &format!("INSERT INTO big (a, b) VALUES {values}")).unwrap();
+    let g0 = e.read_state.mvcc.table_rows("big").generation_payload();
+    e.execute_text(3, "DELETE FROM big WHERE a = 100").unwrap();
+    let g1 = e.read_state.mvcc.table_rows("big").generation_payload();
+    assert_eq!(g0.rows.changed_tuple_ids(&g1.rows), vec![101]);
+    drop(g0);
+    e.execute_text(4, "DELETE FROM big WHERE a = 700").unwrap();
+    let g2 = e.read_state.mvcc.table_rows("big").generation_payload();
+    assert_eq!(g1.rows.changed_tuple_ids(&g2.rows), vec![701]);
+    drop(g1);
+    e.execute_text(5, "DELETE FROM big WHERE a = 1400").unwrap();
+    let g3 = e.read_state.mvcc.table_rows("big").generation_payload();
+    // The chains provably differ...
+    assert_eq!(g2.rows.chain(1401).map(|c| c[0].deleted_by), Some(None));
+    assert_eq!(g3.rows.chain(1401).map(|c| c[0].deleted_by), Some(Some(5)));
+    // ...and the delta MUST say so (the imbl structural diff returned [] here).
+    assert_eq!(
+        g2.rows.changed_tuple_ids(&g3.rows),
+        vec![1401],
+        "the pinned-generation delta must report the third delete"
+    );
 }

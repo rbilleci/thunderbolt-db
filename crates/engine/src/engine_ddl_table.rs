@@ -95,9 +95,10 @@ impl Engine {
         // partial coverage; b128/text are follow-ups), so nothing silently-wrong ships.
         let compound_key_ok = |cols: &[String]| -> bool {
             cols.iter().all(|name| {
-                columns.iter().find(|c| &c.name == name).is_some_and(|c| {
-                    crate::engine_residency::compound_key_type_supported(c.ty)
-                })
+                columns
+                    .iter()
+                    .find(|c| &c.name == name)
+                    .is_some_and(|c| crate::engine_residency::compound_key_type_supported(c.ty))
             })
         };
         if primary_key

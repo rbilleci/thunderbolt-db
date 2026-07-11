@@ -90,6 +90,30 @@ LOWs ledgered (chunk-boundary match asserts; the pre-existing unbounded concurre
 class). Gates: 5+1 GPU tests, 2 sabotages bite (identity off-by-one, predicate dropped), sweep 447/447,
 lib 502/502, clippy Δ0. The host seq_scan loop REMAINS for the no-budget/unlowerable general case — it is
 the interim store's operational path, deleted with the store at P4.
+**⚠️ HAZARD FIXED (`c0ffd35a`): `imbl::OrdMap::diff` MISSES REAL CHANGES — a latent 6c-1-era WRONG ANSWER on
+main.** P2's stamp counter caught it: three sequential single-row deletes, each patched against a freshly
+pinned generation, and the THIRD delete's id vanished from `changed_tuple_ids` while the chains provably
+differed (pure-CPU repro pinned in tests). A missed delta = a patched cold entry silently serving a deleted
+row. FIX: the store's WRITE-SIDE CHANGE LOG (epoch + capped (epoch,id) ring; delta = the log slice — exact
+O(delta) by construction; out-of-window = a full pointer-pruned key walk). **STRUCTURAL DIFFING IS BANNED
+for correctness-bearing deltas.** GC pruning stays exempt (horizon/servability invariant, documented).
+**P2 DONE: SV2 TOMBSTONE SIDECARS FOR COLD CHUNKS** — a pure DELETE now STAMPS its chunk's on-demand
+`deleted_by` sidecar (dense i64/slot, 0x7F-live — the SV2 shard format; COW O(8B×rows), absent for
+delete-free chunks) instead of the O(chunk) decode+rebuild; the replay uploads payload + 8-aligned sidecar
+as ONE buffer and the executor's mask VM ANDs `deleted_by > read_txn_id` IN-KERNEL (the sanctioned
+src=Some + vis=Some seam — first caller). Chunks carry `payload_copin_s` (the payload's OWN boundary,
+preserved by stamps/reuse) — the slot is the id's RANK among payload-visible ids in the chunk range (a
+metadata walk on the pinned generation; audit-proven boundary-invariant across patches). classify_pure_delete
+tolerates EXACTLY one previously-live payload version gaining deleted_by; anything else (tail growth,
+same-chain UPDATE appends, double deletes, vanished chains) keeps the rebuild arm. created_by NEVER
+materialized (payload boundary = the D3 hwm); NO version columns on rows (SV1/SV2, settled). Sidecar-bearing
+entries DECLINE the P1 v1 artifact (benign; artifact v2 = ledgered P2b). Audit MERGE-SAFE zero C/H (slot-rank
+stability, classifier strictness, mask boundary, alignment all traced); MEDIUM adopted (the out-of-window
+fallback walk now has its own storage-level gate); LOWs adopted (prune-site + lineage-contract docs).
+Gates: 2 new GPU tests (value-sensitive SUM + bounded-window projection — a plain COUNT or an over-budget
+ORDER-BY differential CANNOT catch a wrong-slot mask: the former is slot-blind, the latter honestly defers
+to the CPU), 6c-1/6c-3 tests updated to stamp semantics, 3 sabotages bite (mask dropped, slot off-by-one,
+capture-decline removed), sweep 450/450, workspace green, clippy Δ0.
 **HOST-DEBT BALANCE SHEET (the charter-drift ruling's boundary accounting, 2026-07-11):**
 DELETED this arc: the host scalar combine (~130 LOC incl. all value comparisons/arithmetic), the host
 LIMIT/OFFSET windowing (~30 LOC), the per-round grouped narrow loop (~25 LOC), the throwaway upload per rebuilt

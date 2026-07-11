@@ -582,9 +582,13 @@ impl Engine {
                 // apply-layer guard in `apply_create_table`.
                 let ct_compound_ok = |cols: &[String]| -> bool {
                     cols.iter().all(|name| {
-                        create.columns.iter().find(|c| &c.name == name).is_some_and(|c| {
-                            crate::engine_residency::compound_key_type_supported(c.ty)
-                        })
+                        create
+                            .columns
+                            .iter()
+                            .find(|c| &c.name == name)
+                            .is_some_and(|c| {
+                                crate::engine_residency::compound_key_type_supported(c.ty)
+                            })
                     })
                 };
                 if create
@@ -673,7 +677,9 @@ impl Engine {
                     })
                     .collect::<Result<Vec<usize>, _>>()?;
                 if column_idxs.len() > 1
-                    && !column_idxs.iter().all(|&i| crate::engine_residency::compound_key_type_supported(table.columns[i].ty))
+                    && !column_idxs.iter().all(|&i| {
+                        crate::engine_residency::compound_key_type_supported(table.columns[i].ty)
+                    })
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
@@ -731,7 +737,9 @@ impl Engine {
                     })
                     .collect::<Result<Vec<usize>, _>>()?;
                 if column_idxs.len() > 1
-                    && !column_idxs.iter().all(|&i| crate::engine_residency::compound_key_type_supported(table.columns[i].ty))
+                    && !column_idxs.iter().all(|&i| {
+                        crate::engine_residency::compound_key_type_supported(table.columns[i].ty)
+                    })
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \
@@ -796,7 +804,9 @@ impl Engine {
                     })
                     .collect::<Result<Vec<usize>, _>>()?;
                 if column_idxs.len() > 1
-                    && !column_idxs.iter().all(|&i| crate::engine_residency::compound_key_type_supported(table.columns[i].ty))
+                    && !column_idxs.iter().all(|&i| {
+                        crate::engine_residency::compound_key_type_supported(table.columns[i].ty)
+                    })
                 {
                     return Err(EngineError::ApplyFailed(
                         "compound PRIMARY KEY / UNIQUE constraints are not yet supported \

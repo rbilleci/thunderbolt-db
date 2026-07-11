@@ -661,6 +661,9 @@ pub(crate) struct ResidencyReadState {
     /// P1 (sealed-shards-primary): cold-tier tables restored from the checkpoint artifact at reopen
     /// (the warm-start signal — the first streaming read after recovery replays bytes, no scan).
     pub(crate) streaming_cold_restored: std::sync::atomic::AtomicU64,
+    /// P2 (sealed-shards-primary): cold-chunk rows tombstone-STAMPED into deleted_by sidecars in
+    /// place of an O(chunk) rebuild (the SV2 win; chunks_rebuilt stays flat for pure deletes).
+    pub(crate) streaming_cold_stamps: std::sync::atomic::AtomicU64,
     /// P3 (sealed-shards-primary): DELETE/UPDATE WHERE-locates resolved ON-DEVICE via the streaming
     /// fold (a non-admitted table whose predicate the value index could not bound — previously the
     /// pure-host seq_scan+filter loop, the reachable CPU-relational-engine residue).

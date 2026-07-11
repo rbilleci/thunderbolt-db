@@ -1270,7 +1270,9 @@ impl Engine {
                             .rows
                             .iter()
                             .filter_map(|r| {
-                                crate::engine_residency::parse_relational_row_id(&r.row_key, &prefix)
+                                crate::engine_residency::parse_relational_row_id(
+                                    &r.row_key, &prefix,
+                                )
                             })
                             .collect();
                         (rows, ids)

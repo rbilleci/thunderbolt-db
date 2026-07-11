@@ -1575,7 +1575,8 @@ fn check_constraint_null_is_satisfied_pg_semantics() {
     e.execute_text(4, "INSERT INTO m (id, v) VALUES (3, 5)")
         .unwrap();
     // (b) an UPDATE to NULL passes; an UPDATE to a FALSE value rejects.
-    e.execute_text(5, "UPDATE m SET v = NULL WHERE id = 3").unwrap();
+    e.execute_text(5, "UPDATE m SET v = NULL WHERE id = 3")
+        .unwrap();
     assert!(e
         .execute_text(6, "UPDATE m SET v = -7 WHERE id = 1")
         .unwrap_err()
@@ -1585,7 +1586,8 @@ fn check_constraint_null_is_satisfied_pg_semantics() {
     e.execute_text(7, "ALTER TABLE m ADD CONSTRAINT v_cap CHECK (v < 1000)")
         .unwrap();
     // And ADD CHECK still rejects when a NON-NULL row violates.
-    e.execute_text(8, "INSERT INTO m (id, v) VALUES (4, 500)").unwrap();
+    e.execute_text(8, "INSERT INTO m (id, v) VALUES (4, 500)")
+        .unwrap();
     assert!(e
         .execute_text(9, "ALTER TABLE m ADD CONSTRAINT v_tiny CHECK (v < 100)")
         .unwrap_err()
@@ -1621,7 +1623,8 @@ fn foreign_key_null_is_satisfied_pg_semantics() {
         .contains("foreign key"));
     e.execute_text(7, "INSERT INTO c VALUES (12, 1)").unwrap();
     // UPDATE a valid fk to NULL passes.
-    e.execute_text(8, "UPDATE c SET pid = NULL WHERE id = 12").unwrap();
+    e.execute_text(8, "UPDATE c SET pid = NULL WHERE id = 12")
+        .unwrap();
     // Deleting the now-unreferenced parent succeeds (NULL fks never pin a provider).
     e.execute_text(9, "DELETE FROM p WHERE id = 1").unwrap();
 }
@@ -3747,8 +3750,11 @@ fn compound_primary_key_over_i64_columns_enforces_tuple_uniqueness() {
     // MIXED int4+int8 key — is accepted and enforces TUPLE uniqueness (host validate path; the on-device
     // path is proven by the GPU sweep). b128/text key columns stay rejected (follow-ups).
     let e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE ct (a INT8, b INT8, v INT, PRIMARY KEY (a, b))")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE ct (a INT8, b INT8, v INT, PRIMARY KEY (a, b))",
+    )
+    .unwrap();
     e.execute_text(2, "INSERT INTO ct VALUES (5000000000, 1, 10)")
         .unwrap();
     e.execute_text(3, "INSERT INTO ct VALUES (5000000000, 2, 20)")
@@ -3764,8 +3770,11 @@ fn compound_primary_key_over_i64_columns_enforces_tuple_uniqueness() {
     );
 
     // MIXED int4 + int8 compound PK.
-    e.execute_text(6, "CREATE TABLE mt (a INT, b INT8, v INT, PRIMARY KEY (a, b))")
-        .unwrap();
+    e.execute_text(
+        6,
+        "CREATE TABLE mt (a INT, b INT8, v INT, PRIMARY KEY (a, b))",
+    )
+    .unwrap();
     e.execute_text(7, "INSERT INTO mt VALUES (1, 8000000000, 0)")
         .unwrap();
     e.execute_text(8, "INSERT INTO mt VALUES (1, 8000000001, 0)")
@@ -3776,8 +3785,11 @@ fn compound_primary_key_over_i64_columns_enforces_tuple_uniqueness() {
 
     // COMPOUND KEYS (wider types, Stage 2c): b128 (Uuid / Numeric) key columns are now ACCEPTED and
     // enforce tuple uniqueness.
-    e.execute_text(10, "CREATE TABLE ut (a INT, u UUID, v INT, PRIMARY KEY (a, u))")
-        .unwrap();
+    e.execute_text(
+        10,
+        "CREATE TABLE ut (a INT, u UUID, v INT, PRIMARY KEY (a, u))",
+    )
+    .unwrap();
     e.execute_text(
         11,
         "INSERT INTO ut VALUES (1, '00000000-0000-0000-0000-000000000001', 0)",
@@ -3800,16 +3812,21 @@ fn compound_primary_key_over_i64_columns_enforces_tuple_uniqueness() {
         "CREATE TABLE nt (a INT, n NUMERIC(20,4), v INT, PRIMARY KEY (a, n))",
     )
     .unwrap();
-    e.execute_text(15, "INSERT INTO nt VALUES (1, 1.5, 0)").unwrap();
-    e.execute_text(16, "INSERT INTO nt VALUES (1, 2.5, 0)").unwrap(); // distinct -> OK
+    e.execute_text(15, "INSERT INTO nt VALUES (1, 1.5, 0)")
+        .unwrap();
+    e.execute_text(16, "INSERT INTO nt VALUES (1, 2.5, 0)")
+        .unwrap(); // distinct -> OK
     assert!(e
         .execute_text(17, "INSERT INTO nt VALUES (1, 1.5, 9)")
         .is_err()); // duplicate (a, n) tuple -> 23505
 
     // COMPOUND KEYS (wider types, Stage 2d): a TEXT (variable-length) key column is now ACCEPTED and
     // enforces tuple uniqueness (each text column folds to one word = the FNV-1a hash of its bytes).
-    e.execute_text(18, "CREATE TABLE tt (a INT, s TEXT, v INT, PRIMARY KEY (a, s))")
-        .unwrap();
+    e.execute_text(
+        18,
+        "CREATE TABLE tt (a INT, s TEXT, v INT, PRIMARY KEY (a, s))",
+    )
+    .unwrap();
     e.execute_text(19, "INSERT INTO tt VALUES (1, 'alpha', 0)")
         .unwrap();
     e.execute_text(20, "INSERT INTO tt VALUES (1, 'beta', 0)")

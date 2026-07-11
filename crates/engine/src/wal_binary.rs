@@ -409,9 +409,12 @@ mod w5b_tests {
         // PUMP PATCH OFFSET (non-vacuous): the pump stamps its claimed row id at
         // `binary_update_new_row_id_offset` into a PLACEHOLDER-0 record; patching there must land
         // EXACTLY on the decoded new_row_id (a wrong offset = silent identity corruption).
-        let placeholder =
-            encode_binary_update_by_key("public_t", "id", 42, 0, &new_row).unwrap();
-        assert_eq!(placeholder.len(), payload.len(), "placeholder is byte-width identical");
+        let placeholder = encode_binary_update_by_key("public_t", "id", 42, 0, &new_row).unwrap();
+        assert_eq!(
+            placeholder.len(),
+            payload.len(),
+            "placeholder is byte-width identical"
+        );
         let off = binary_update_new_row_id_offset("public_t", "id");
         let mut patched = placeholder.clone();
         patched[off..off + 8].copy_from_slice(&7_000_001u64.to_le_bytes());

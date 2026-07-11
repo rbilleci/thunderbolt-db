@@ -936,7 +936,8 @@ impl Engine {
                 let mut fp_tail: Vec<i32> = Vec::with_capacity(new_rows.len());
                 let mut foldable = true;
                 for row in new_rows {
-                    match crate::engine_residency::compound_index_row_fingerprint(table, index, row) {
+                    match crate::engine_residency::compound_index_row_fingerprint(table, index, row)
+                    {
                         Some(fp) => fp_tail.push(fp),
                         None => {
                             foldable = false;
@@ -1465,9 +1466,11 @@ impl Engine {
                     Some(SqlType::Numeric { .. }) | Some(SqlType::Uuid) => {
                         resident_device_numeric_column_offset(&descriptor, table, p).ok()
                     }
-                    Some(SqlType::Text) => resident_device_text_column_layout(&descriptor, table, p)
-                        .ok()
-                        .map(|layout| layout.offsets_byte_offset),
+                    Some(SqlType::Text) => {
+                        resident_device_text_column_layout(&descriptor, table, p)
+                            .ok()
+                            .map(|layout| layout.offsets_byte_offset)
+                    }
                     _ => resident_device_int4_column_offset(&descriptor, table, p).ok(),
                 })
                 .collect::<Option<Vec<u64>>>()?;
@@ -1475,9 +1478,11 @@ impl Engine {
             let blob_offsets = positions
                 .iter()
                 .map(|&p| match table.columns.get(p).map(|c| c.ty) {
-                    Some(SqlType::Text) => resident_device_text_column_layout(&descriptor, table, p)
-                        .ok()
-                        .map(|layout| layout.bytes_byte_offset),
+                    Some(SqlType::Text) => {
+                        resident_device_text_column_layout(&descriptor, table, p)
+                            .ok()
+                            .map(|layout| layout.bytes_byte_offset)
+                    }
                     _ => Some(0),
                 })
                 .collect::<Option<Vec<u64>>>()?;

@@ -486,7 +486,10 @@ pub(crate) fn compound_index_row_fingerprint(
     let mut words: Vec<i32> = Vec::with_capacity(index.key_columns.len());
     for name in &index.key_columns {
         let pos = table.columns.iter().position(|c| &c.name == name)?;
-        words.extend(sql_value_key_words(table.columns[pos].ty, values.get(pos)?)?);
+        words.extend(sql_value_key_words(
+            table.columns[pos].ty,
+            values.get(pos)?,
+        )?);
     }
     Some(compound_key_fingerprint(&words))
 }
@@ -517,7 +520,14 @@ pub(crate) fn sql_value_key_words(ty: gpu_db_sql::SqlType, value: &SqlValue) -> 
         }
         (gpu_db_sql::SqlType::Uuid, SqlValue::Uuid(bytes)) => Some(
             (0..4)
-                .map(|i| i32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]))
+                .map(|i| {
+                    i32::from_le_bytes([
+                        bytes[4 * i],
+                        bytes[4 * i + 1],
+                        bytes[4 * i + 2],
+                        bytes[4 * i + 3],
+                    ])
+                })
                 .collect(),
         ),
         // TEXT (variable-length): no fixed section width, so the column folds to ONE word = the FNV-1a
@@ -547,7 +557,9 @@ pub(crate) fn fnv1a_bytes(bytes: &[u8]) -> i32 {
 /// supported as a compound key column. A type is a valid compound key column IFF this returns `Some`.
 pub(crate) fn key_column_width_words(ty: gpu_db_sql::SqlType) -> Option<u32> {
     match ty {
-        gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2 => Some(1),
+        gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2 => {
+            Some(1)
+        }
         gpu_db_sql::SqlType::Int8 | gpu_db_sql::SqlType::Timestamp => Some(2),
         gpu_db_sql::SqlType::Numeric { .. } | gpu_db_sql::SqlType::Uuid => Some(4),
         gpu_db_sql::SqlType::Text => Some(0), // text sentinel (variable-length, hashed on-device)
@@ -11063,7 +11075,10 @@ impl Engine {
                     {
                         Some(layout) => per_col.push(Some(
                             device_memory
-                                .read_resident_i32_column(layout.bitmap_byte_offset, rows.div_ceil(32))
+                                .read_resident_i32_column(
+                                    layout.bitmap_byte_offset,
+                                    rows.div_ceil(32),
+                                )
                                 .ok()?,
                         )),
                         None => per_col.push(None),
@@ -11202,47 +11217,50 @@ impl Engine {
                             }
                         }
                         match column {
-                        GatheredColumn::I32(vals) => {
-                            sql_value_from_i32_section(catalog_column.ty, vals[slot])
-                        }
-                        GatheredColumn::I64(halves) => {
-                            let lo = halves[slot * 2] as u32 as u64;
-                            let hi = halves[slot * 2 + 1] as u32 as u64;
-                            sql_value_from_i64_section(catalog_column.ty, (lo | (hi << 32)) as i64)
-                        }
-                        GatheredColumn::Bool(words) => {
-                            let bit = (words[slot / 32] as u32 >> (slot % 32)) & 1;
-                            Some(SqlValue::Bool(bit == 1))
-                        }
-                        GatheredColumn::B128(words) => {
-                            // Reassemble the 16 LE bytes (4 u32 words) for this slot.
-                            let mut bytes = [0u8; 16];
-                            for w in 0..4 {
-                                bytes[w * 4..w * 4 + 4]
-                                    .copy_from_slice(&words[slot * 4 + w].to_le_bytes());
+                            GatheredColumn::I32(vals) => {
+                                sql_value_from_i32_section(catalog_column.ty, vals[slot])
                             }
-                            match catalog_column.ty {
-                                gpu_db_sql::SqlType::Numeric { scale, .. } => {
-                                    // numeric = i128 mantissa LE, at the column's declared scale
-                                    // (byte-identical to the on-device projection's Decimal128::new).
-                                    Some(SqlValue::Numeric(gpu_db_sql::Decimal128::new(
-                                        i128::from_le_bytes(bytes),
-                                        scale,
-                                    )))
+                            GatheredColumn::I64(halves) => {
+                                let lo = halves[slot * 2] as u32 as u64;
+                                let hi = halves[slot * 2 + 1] as u32 as u64;
+                                sql_value_from_i64_section(
+                                    catalog_column.ty,
+                                    (lo | (hi << 32)) as i64,
+                                )
+                            }
+                            GatheredColumn::Bool(words) => {
+                                let bit = (words[slot / 32] as u32 >> (slot % 32)) & 1;
+                                Some(SqlValue::Bool(bit == 1))
+                            }
+                            GatheredColumn::B128(words) => {
+                                // Reassemble the 16 LE bytes (4 u32 words) for this slot.
+                                let mut bytes = [0u8; 16];
+                                for w in 0..4 {
+                                    bytes[w * 4..w * 4 + 4]
+                                        .copy_from_slice(&words[slot * 4 + w].to_le_bytes());
                                 }
-                                // uuid = the raw 16 bytes (storage wrote them verbatim).
-                                gpu_db_sql::SqlType::Uuid => Some(SqlValue::Uuid(bytes)),
-                                _ => None,
+                                match catalog_column.ty {
+                                    gpu_db_sql::SqlType::Numeric { scale, .. } => {
+                                        // numeric = i128 mantissa LE, at the column's declared scale
+                                        // (byte-identical to the on-device projection's Decimal128::new).
+                                        Some(SqlValue::Numeric(gpu_db_sql::Decimal128::new(
+                                            i128::from_le_bytes(bytes),
+                                            scale,
+                                        )))
+                                    }
+                                    // uuid = the raw 16 bytes (storage wrote them verbatim).
+                                    gpu_db_sql::SqlType::Uuid => Some(SqlValue::Uuid(bytes)),
+                                    _ => None,
+                                }
                             }
-                        }
-                        GatheredColumn::Text(offsets, blob) => {
-                            // row `slot` = blob[offsets[slot]..offsets[slot+1]] as UTF-8.
-                            let start = offsets[slot] as usize;
-                            let end = offsets[slot + 1] as usize;
-                            blob.get(start..end)
-                                .and_then(|b| std::str::from_utf8(b).ok())
-                                .map(|s| SqlValue::Text(s.to_string()))
-                        }
+                            GatheredColumn::Text(offsets, blob) => {
+                                // row `slot` = blob[offsets[slot]..offsets[slot+1]] as UTF-8.
+                                let start = offsets[slot] as usize;
+                                let end = offsets[slot + 1] as usize;
+                                blob.get(start..end)
+                                    .and_then(|b| std::str::from_utf8(b).ok())
+                                    .map(|s| SqlValue::Text(s.to_string()))
+                            }
                         }
                     })
                     .collect::<Option<Vec<SqlValue>>>()?;

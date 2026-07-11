@@ -577,8 +577,11 @@ fn gpu_resident_expr_mixed_width_where_3vl() {
     // answer; the NULL-big rows pin 3VL with a PLACEHOLDER-SPANNING bound (placeholder 0
     // satisfies `big >= 0` — only the validity AND excludes them; reads have NO recheck net).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tmw (id INT, big BIGINT, name TEXT, f BOOL)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE tmw (id INT, big BIGINT, name TEXT, f BOOL)",
+    )
+    .unwrap();
     e.execute_text(
         2,
         "INSERT INTO tmw (id,big,name,f) VALUES \
@@ -614,7 +617,11 @@ fn gpu_resident_expr_mixed_width_where_3vl() {
         .expect("placeholder-spanning mixed WHERE runs on the GPU");
     assert_eq!(
         r.rows,
-        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)], vec![SqlValue::Int4(6)]],
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Int4(6)]
+        ],
         "placeholder-spanning mixed AND: NULL-big row 2 must be excluded by validity, not value"
     );
     // MIXED bool+int8 (`f = true AND big > i32::MAX` -> ids 1, 5): the bool leaf is a mask step,
@@ -629,8 +636,11 @@ fn gpu_resident_expr_mixed_width_where_3vl() {
     );
     // NON-NULL mixed int8+text (the int8-general-path fall-through, no nullable branch): a
     // separate all-non-null table.
-    e.execute_text(3, "CREATE TABLE tmw2 (id INT, big BIGINT, name TEXT, small SMALLINT)")
-        .unwrap();
+    e.execute_text(
+        3,
+        "CREATE TABLE tmw2 (id INT, big BIGINT, name TEXT, small SMALLINT)",
+    )
+    .unwrap();
     e.execute_text(
         4,
         "INSERT INTO tmw2 (id,big,name,small) VALUES \
@@ -666,9 +676,13 @@ fn gpu_resident_expr_mixed_width_where_3vl() {
     );
     // NULLABLE-BOOL 3VL trap: `nb <= true` folds to a CONSTANT-TRUE mask that never reads the
     // value bitmap — ONLY the validity AND can exclude the NULL row (UNKNOWN, PG 3VL).
-    e.execute_text(5, "CREATE TABLE tbn (id INT, nb BOOL)").unwrap();
-    e.execute_text(6, "INSERT INTO tbn (id,nb) VALUES (1,true),(2,NULL),(3,false)")
+    e.execute_text(5, "CREATE TABLE tbn (id INT, nb BOOL)")
         .unwrap();
+    e.execute_text(
+        6,
+        "INSERT INTO tbn (id,nb) VALUES (1,true),(2,NULL),(3,false)",
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("tbn").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -685,7 +699,11 @@ fn gpu_resident_expr_mixed_width_where_3vl() {
     let r = e
         .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE nb > true AND id > 0")
         .expect("nullable-bool > true runs on the GPU");
-    assert_eq!(r.rows, Vec::<Vec<SqlValue>>::new(), "nb > true is constant FALSE");
+    assert_eq!(
+        r.rows,
+        Vec::<Vec<SqlValue>>::new(),
+        "nb > true is constant FALSE"
+    );
     // Literal-on-left flips the op: `true > nb` ⇔ `nb < true` ⇔ `nb = false`.
     let r = e
         .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE true > nb AND id > 0")
@@ -707,11 +725,19 @@ fn gpu_resident_expr_mixed_width_where_3vl() {
     let r = e
         .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE nb <= false AND id > 0")
         .expect("nb <= false runs on the GPU");
-    assert_eq!(r.rows, vec![vec![SqlValue::Int4(3)]], "nb <= false ⇔ nb = false");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(3)]],
+        "nb <= false ⇔ nb = false"
+    );
     let r = e
         .execute_resident_expr_select_sql("SELECT id FROM tbn WHERE nb >= true AND id > 0")
         .expect("nb >= true runs on the GPU");
-    assert_eq!(r.rows, vec![vec![SqlValue::Int4(1)]], "nb >= true ⇔ nb = true");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)]],
+        "nb >= true ⇔ nb = true"
+    );
     // The PEEPHOLE const-true ALL-indices arm (non-null single comparison, no AND): tmw's `f` is
     // a NON-null bool (the nullable-branch gate keys on the REFERENCED columns only), so this is
     // the direct pin of try_lower_bool_predicate's (0..n) return.
@@ -752,8 +778,11 @@ fn gpu_resident_expr_col_vs_col_text_uuid() {
     // empty-vs-nonempty. 3VL: a NULL operand's placeholder (empty span / 16 zero bytes) sorts
     // below everything — only the BOTH-validity AND keeps those rows out.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tcc (id INT, a TEXT, b TEXT, u1 UUID, u2 UUID)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE tcc (id INT, a TEXT, b TEXT, u1 UUID, u2 UUID)",
+    )
+    .unwrap();
     let u = |n: u32| format!("00000000-0000-0000-0000-{n:012x}");
     let z2 = u(2);
     e.execute_text(
@@ -800,7 +829,11 @@ fn gpu_resident_expr_col_vs_col_text_uuid() {
     let r = e
         .execute_resident_expr_select_sql("SELECT id FROM tcc WHERE a = b")
         .expect("text col-vs-col equality runs on the GPU");
-    assert_eq!(r.rows, vec![vec![SqlValue::Int4(4)]], "a = b: the equal row only");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(4)]],
+        "a = b: the equal row only"
+    );
     // Text col-vs-col INSIDE AND (the mask-VM composition): `a >= b AND id < 7` -> 3, 4
     // (row 7's NULL b excluded by validity, not by the id bound — id 7 fails both).
     let r = e
@@ -808,7 +841,11 @@ fn gpu_resident_expr_col_vs_col_text_uuid() {
         .expect("text col-vs-col inside AND runs on the GPU");
     assert_eq!(
         r.rows,
-        vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(4)], vec![SqlValue::Int4(8)]],
+        vec![
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Int4(4)],
+            vec![SqlValue::Int4(8)]
+        ],
         "a >= b AND id: length tiebreak ('ab' > 'a') + equal + UNSIGNED high-bit ('z\u{e9}' >= \
          'za'); NULL-b row 7 excluded (3VL)"
     );
@@ -1909,8 +1946,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
     let mixed = e
         .execute_resident_expr_select_sql("SELECT a FROM t WHERE big > 5 AND a < 3")
         .expect("mixed int4/int8 AND runs on the GPU (mixed-width group)");
-    let mixed_expected: Vec<Vec<SqlValue>> =
-        (0..3).map(|i| vec![SqlValue::Int4(i)]).collect();
+    let mixed_expected: Vec<Vec<SqlValue>> = (0..3).map(|i| vec![SqlValue::Int4(i)]).collect();
     assert_eq!(
         mixed.rows, mixed_expected,
         "big>5 AND a<3 => a in {{0,1,2}} (all bigs exceed 5)"

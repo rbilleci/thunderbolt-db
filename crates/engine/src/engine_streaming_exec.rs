@@ -100,17 +100,34 @@ struct StagedChunk {
     snapshot: RelationalResidencySnapshot,
     pending: gpu_db_execution::PendingCudaResidentDeviceCopy,
     row_count: u64,
+    /// P2: the tombstone mask of a sidecar-bearing COLD chunk (`deleted_by > read_txn_id`, applied
+    /// IN-KERNEL by the mask VM through the sanctioned src=Some + vis=Some seam). `None` for
+    /// scan-built and sidecar-free chunks — byte-identical pre-P2 behavior.
+    visibility: Option<crate::engine_expr::ResidentVisibility>,
 }
 
 impl StagedChunk {
-    /// Block until the upload completes and wrap the chunk as an executor source.
-    fn ready(self) -> Result<ResidentExecSource, ()> {
+    /// Block until the upload completes and wrap the chunk as an executor source. Returns the
+    /// chunk's tombstone mask (if any) beside the source — the caller threads it into the
+    /// per-chunk execute.
+    fn ready(
+        self,
+    ) -> Result<
+        (
+            ResidentExecSource,
+            Option<crate::engine_expr::ResidentVisibility>,
+        ),
+        (),
+    > {
         let device_memory = self.pending.wait().map_err(|_| ())?;
-        Ok(ResidentExecSource {
-            descriptor: Arc::new(self.snapshot),
-            device_memory: Arc::new(device_memory),
-            row_count: self.row_count,
-        })
+        Ok((
+            ResidentExecSource {
+                descriptor: Arc::new(self.snapshot),
+                device_memory: Arc::new(device_memory),
+                row_count: self.row_count,
+            },
+            self.visibility,
+        ))
     }
 }
 
@@ -155,7 +172,26 @@ pub(crate) struct ColdChunk {
     /// bytes verbatim (chain identity: an untouched range's version chains are pointer-identical
     /// across the COW generations, so its visible set at any settled boundary is unchanged).
     tuple_range: (u64, u64),
+    /// P2 (sealed-shards-primary): the boundary the PAYLOAD's row set reflects — set at scan /
+    /// rebuild / restore, PRESERVED by stamp-patches and reuse (unlike the entry's install
+    /// boundary, which advances with every patch). A deleted TupleId's SLOT is its rank among the
+    /// ids visible at THIS boundary within the chunk's range (scan order IS TupleId order), so the
+    /// rank walk must anchor here, never at the entry boundary.
+    payload_copin_s: Index,
+    /// P2 (SV2 sparse versioning): the on-demand `deleted_by` tombstone SIDECAR — dense i64/slot,
+    /// `0x7F`-live fill (a large POSITIVE signed i64: the mask compare is the SIGNED s64 kernel),
+    /// COW-stamped host bytes. ABSENT for a delete-free chunk (it pays nothing — the SV2/HyPer
+    /// property). At replay the sidecar is appended to the device buffer after the 8-aligned
+    /// payload and applied IN-KERNEL via `ResidentVisibility { deleted_by_offset }` (`deleted_by >
+    /// read_txn_id`). `created_by` is NEVER materialized for chunks — the payload boundary IS the
+    /// D3 high-water mark (every payload row born-visible at it). NO version metadata rides the
+    /// row payload itself (SV1/SV2, settled).
+    deleted_by: Option<Arc<Vec<u8>>>,
 }
+
+/// P2: the SV2 live-fill byte for a cold chunk's `deleted_by` sidecar (mirrors the shard regions'
+/// `DELETED_BY_LIVE_FILL_BYTE` — see engine_residency.rs).
+const COLD_DELETED_BY_LIVE_FILL_BYTE: u8 = 0x7F;
 
 /// S-E.6b: where a cached chunk's payload bytes live — host RAM below the spill threshold, or an
 /// UNLINKED spill file above it (created then `remove_file`d with the handle kept open: the OS
@@ -219,7 +255,9 @@ impl ColdCacheBuilder {
         if self.poisoned {
             return;
         }
-        self.total_payload_bytes = self.total_payload_bytes.saturating_add(payload.len() as u64);
+        self.total_payload_bytes = self
+            .total_payload_bytes
+            .saturating_add(payload.len() as u64);
         if self.spill.is_none() && self.total_payload_bytes > streaming_cold_spill_threshold() {
             // Threshold crossed: open the unlinked spill file and retro-write the RAM prefix.
             let Ok(file) = unlinked_spill_file() else {
@@ -270,6 +308,9 @@ impl ColdCacheBuilder {
             snapshot,
             row_count,
             tuple_range,
+            // A freshly built payload reflects the builder's boundary and has no tombstones.
+            payload_copin_s: self.build_copin_s,
+            deleted_by: None,
         });
     }
 }
@@ -389,12 +430,14 @@ fn scalar_partial_plan(
             }
             _ => None,
         },
-        (StreamAgg::Min, SelectProjection::Min { column }) => {
-            Some((value_type(column)?, SelectProjection::Min { column: partial }))
-        }
-        (StreamAgg::Max, SelectProjection::Max { column }) => {
-            Some((value_type(column)?, SelectProjection::Max { column: partial }))
-        }
+        (StreamAgg::Min, SelectProjection::Min { column }) => Some((
+            value_type(column)?,
+            SelectProjection::Min { column: partial },
+        )),
+        (StreamAgg::Max, SelectProjection::Max { column }) => Some((
+            value_type(column)?,
+            SelectProjection::Max { column: partial },
+        )),
         _ => None,
     }
 }
@@ -423,7 +466,9 @@ enum StreamShape {
     /// (`Some` = a top-N stream: each chunk's device-sorted local top-(skip+take) is its only possible
     /// contribution to the global window; `None` = unbounded — the whole survivor set must fit the
     /// budget for the final device sort, else defer).
-    Ordered { top_n: Option<usize> },
+    Ordered {
+        top_n: Option<usize>,
+    },
 }
 
 /// Classify a SELECT as a streamable shape, or `None` for the non-foldable classes (ORDER BY — S-E.4;
@@ -672,14 +717,14 @@ impl Engine {
         };
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
-                let Ok(next) = self.stage_cold_chunk(chunk) else {
+                let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
                     self.evict_streaming_cold(&select.table);
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 if let Some(prev) = staged.replace(next) {
-                    let Ok(src) = prev.ready() else {
+                    let Ok((src, chunk_vis)) = prev.ready() else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
                     match self.reduce_streaming_chunk(
@@ -690,6 +735,7 @@ impl Engine {
                         copin_s,
                         agg,
                         &src,
+                        chunk_vis,
                         &count_select,
                         &count_bound,
                         &mut partials,
@@ -697,7 +743,7 @@ impl Engine {
                     ) {
                         ChunkOutcome::Ok => {}
                         ChunkOutcome::Defer => {
-                        return self.execute_relational_select_cpu_pinned(select)
+                            return self.execute_relational_select_cpu_pinned(select)
                         }
                         ChunkOutcome::Hard(err) => return Err(err),
                     }
@@ -740,11 +786,13 @@ impl Engine {
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
                     // S-E.5 lookahead: stage this chunk (its upload overlaps), compute the PREVIOUS.
-                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
+                    let Ok(next) =
+                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                    else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
                     if let Some(prev) = staged.replace(next) {
-                        let Ok(src) = prev.ready() else {
+                        let Ok((src, chunk_vis)) = prev.ready() else {
                             return self.execute_relational_select_cpu_pinned(select);
                         };
                         match self.reduce_streaming_chunk(
@@ -755,6 +803,7 @@ impl Engine {
                             copin_s,
                             agg,
                             &src,
+                            chunk_vis,
                             &count_select,
                             &count_bound,
                             &mut partials,
@@ -778,11 +827,13 @@ impl Engine {
         // chunk so the aggregate gets its PG empty-set semantics (COUNT -> 0, SUM/MIN/MAX -> NULL). Then
         // DRAIN the pipeline (the last staged chunk still needs its compute).
         if !chunk_rows.is_empty() || (chunks_run == 0 && staged.is_none()) {
-            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
+            let Ok(next) =
+                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+            else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             if let Some(prev) = staged.replace(next) {
-                let Ok(src) = prev.ready() else {
+                let Ok((src, chunk_vis)) = prev.ready() else {
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 match self.reduce_streaming_chunk(
@@ -793,6 +844,7 @@ impl Engine {
                     copin_s,
                     agg,
                     &src,
+                    chunk_vis,
                     &count_select,
                     &count_bound,
                     &mut partials,
@@ -808,7 +860,7 @@ impl Engine {
             }
         }
         if let Some(prev) = staged.take() {
-            let Ok(src) = prev.ready() else {
+            let Ok((src, chunk_vis)) = prev.ready() else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             match self.reduce_streaming_chunk(
@@ -819,6 +871,7 @@ impl Engine {
                 copin_s,
                 agg,
                 &src,
+                chunk_vis,
                 &count_select,
                 &count_bound,
                 &mut partials,
@@ -959,7 +1012,7 @@ impl Engine {
                 if window_bound.is_some_and(|bound| rows_out.len() >= bound) {
                     break;
                 }
-                let Ok(next) = self.stage_cold_chunk(chunk) else {
+                let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
                     self.evict_streaming_cold(&select.table);
@@ -971,7 +1024,7 @@ impl Engine {
                     staged.replace(next)
                 };
                 if let Some(prev) = to_compute {
-                    let Ok(src) = prev.ready() else {
+                    let Ok((src, chunk_vis)) = prev.ready() else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
                     match self.project_streaming_chunk(
@@ -981,6 +1034,7 @@ impl Engine {
                         predicate,
                         copin_s,
                         &src,
+                        chunk_vis,
                         &mut rows_out,
                     ) {
                         ChunkOutcome::Ok => {}
@@ -1029,7 +1083,8 @@ impl Engine {
                 };
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                    let Ok(next) =
+                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
@@ -1039,7 +1094,7 @@ impl Engine {
                         staged.replace(next) // unbounded: pipeline one chunk ahead
                     };
                     if let Some(prev) = to_compute {
-                        let Ok(src) = prev.ready() else {
+                        let Ok((src, chunk_vis)) = prev.ready() else {
                             return self.execute_relational_select_cpu_pinned(select);
                         };
                         match self.project_streaming_chunk(
@@ -1049,6 +1104,7 @@ impl Engine {
                             predicate,
                             copin_s,
                             &src,
+                            chunk_vis,
                             &mut rows_out,
                         ) {
                             ChunkOutcome::Ok => {}
@@ -1069,7 +1125,9 @@ impl Engine {
         // early-exit tripped would be dropped by the window anyway; don't upload them). Then DRAIN the
         // unbounded pipeline (the last staged chunk still needs its compute).
         if !chunk_rows.is_empty() && window_bound.is_none_or(|bound| rows_out.len() < bound) {
-            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
+            let Ok(next) =
+                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+            else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             let to_compute = if window_bound.is_some() {
@@ -1078,7 +1136,7 @@ impl Engine {
                 staged.replace(next)
             };
             if let Some(prev) = to_compute {
-                let Ok(src) = prev.ready() else {
+                let Ok((src, chunk_vis)) = prev.ready() else {
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 match self.project_streaming_chunk(
@@ -1088,6 +1146,7 @@ impl Engine {
                     predicate,
                     copin_s,
                     &src,
+                    chunk_vis,
                     &mut rows_out,
                 ) {
                     ChunkOutcome::Ok => {}
@@ -1100,7 +1159,7 @@ impl Engine {
             }
         }
         if let Some(prev) = staged.take() {
-            let Ok(src) = prev.ready() else {
+            let Ok((src, chunk_vis)) = prev.ready() else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             match self.project_streaming_chunk(
@@ -1110,6 +1169,7 @@ impl Engine {
                 predicate,
                 copin_s,
                 &src,
+                chunk_vis,
                 &mut rows_out,
             ) {
                 ChunkOutcome::Ok => {}
@@ -1167,6 +1227,7 @@ impl Engine {
         predicate: Option<&ResidentExpr>,
         copin_s: Index,
         src: &ResidentExecSource,
+        visibility: Option<crate::engine_expr::ResidentVisibility>,
         rows_out: &mut Vec<Vec<SqlValue>>,
     ) -> ChunkOutcome {
         let result = match self.execute_resident_expr_select_with_binding(
@@ -1176,7 +1237,7 @@ impl Engine {
             chunk_bound.clone(),
             copin_s,
             predicate,
-            None,
+            visibility,
             &[],
             &[],
             None,
@@ -1302,8 +1363,7 @@ impl Engine {
             Some(column) => column.ty,
             None => return self.execute_relational_select_cpu_pinned(select),
         };
-        let mut partial_columns: Vec<(String, SqlType)> =
-            vec![(group_column.clone(), key_type)];
+        let mut partial_columns: Vec<(String, SqlType)> = vec![(group_column.clone(), key_type)];
         // Guard the reserved partial names (a user column literally named `__pN` would collide).
         if group_column.starts_with("__p") {
             return self.execute_relational_select_cpu_pinned(select);
@@ -1402,10 +1462,8 @@ impl Engine {
             .iter()
             .zip(partial_types.iter().skip(1))
             .map(|(aggregate, partial_ty)| {
-                matches!(
-                    aggregate.kind,
-                    GroupedAggKind::Count | GroupedAggKind::Sum
-                ) && matches!(partial_ty, SqlType::Numeric { .. })
+                matches!(aggregate.kind, GroupedAggKind::Count | GroupedAggKind::Sum)
+                    && matches!(partial_ty, SqlType::Numeric { .. })
                     && aggregate.value_column.as_ref().is_none_or(|name| {
                         table
                             .columns
@@ -1436,14 +1494,14 @@ impl Engine {
         };
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
-                let Ok(next) = self.stage_cold_chunk(chunk) else {
+                let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
                     self.evict_streaming_cold(&select.table);
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 if let Some(prev) = staged.replace(next) {
-                    let Ok(src) = prev.ready() else {
+                    let Ok((src, chunk_vis)) = prev.ready() else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
                     match self.grouped_streaming_chunk(
@@ -1454,6 +1512,7 @@ impl Engine {
                         copin_s,
                         group_column,
                         &src,
+                        chunk_vis,
                         &partial_types,
                         &bigint_as_numeric,
                         &mut partials_acc,
@@ -1470,7 +1529,7 @@ impl Engine {
                 // The loop's compaction, with the same drain-first discipline.
                 if partials_bytes >= chunk_target_bytes {
                     if let Some(prev) = staged.take() {
-                        let Ok(src) = prev.ready() else {
+                        let Ok((src, chunk_vis)) = prev.ready() else {
                             return self.execute_relational_select_cpu_pinned(select);
                         };
                         match self.grouped_streaming_chunk(
@@ -1481,6 +1540,7 @@ impl Engine {
                             copin_s,
                             group_column,
                             &src,
+                            chunk_vis,
                             &partial_types,
                             &bigint_as_numeric,
                             &mut partials_acc,
@@ -1549,12 +1609,13 @@ impl Engine {
                 };
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                    let Ok(next) =
+                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
                     if let Some(prev) = staged.replace(next) {
-                        let Ok(src) = prev.ready() else {
+                        let Ok((src, chunk_vis)) = prev.ready() else {
                             return self.execute_relational_select_cpu_pinned(select);
                         };
                         match self.grouped_streaming_chunk(
@@ -1565,6 +1626,7 @@ impl Engine {
                             copin_s,
                             group_column,
                             &src,
+                            chunk_vis,
                             &partial_types,
                             &bigint_as_numeric,
                             &mut partials_acc,
@@ -1587,29 +1649,30 @@ impl Engine {
                     // Drain the in-flight chunk FIRST so the merge upload never overlaps a chunk upload.
                     if partials_bytes >= chunk_target_bytes {
                         if let Some(prev) = staged.take() {
-                            let Ok(src) = prev.ready() else {
-                            return self.execute_relational_select_cpu_pinned(select);
-                        };
-                        match self.grouped_streaming_chunk(
-                            &grouped_select,
-                            table,
-                            &grouped_bound,
-                            predicate,
-                            copin_s,
-                            group_column,
-                            &src,
-                            &partial_types,
-                            &bigint_as_numeric,
-                            &mut partials_acc,
-                            &mut partials_bytes,
-                        ) {
-                            ChunkOutcome::Ok => {}
-                            ChunkOutcome::Defer => {
-                                return self.execute_relational_select_cpu_pinned(select)
+                            let Ok((src, chunk_vis)) = prev.ready() else {
+                                return self.execute_relational_select_cpu_pinned(select);
+                            };
+                            match self.grouped_streaming_chunk(
+                                &grouped_select,
+                                table,
+                                &grouped_bound,
+                                predicate,
+                                copin_s,
+                                group_column,
+                                &src,
+                                chunk_vis,
+                                &partial_types,
+                                &bigint_as_numeric,
+                                &mut partials_acc,
+                                &mut partials_bytes,
+                            ) {
+                                ChunkOutcome::Ok => {}
+                                ChunkOutcome::Defer => {
+                                    return self.execute_relational_select_cpu_pinned(select)
+                                }
+                                ChunkOutcome::Hard(err) => return Err(err),
                             }
-                            ChunkOutcome::Hard(err) => return Err(err),
-                        }
-                        chunks_run += 1;
+                            chunks_run += 1;
                         }
                     }
                     if partials_bytes >= chunk_target_bytes {
@@ -1638,31 +1701,36 @@ impl Engine {
             }
         }
         if !chunk_rows.is_empty() {
-            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
+            let Ok(next) =
+                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+            else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             if let Some(prev) = staged.replace(next) {
-                let Ok(src) = prev.ready() else {
-                return self.execute_relational_select_cpu_pinned(select);
-            };
-            match self.grouped_streaming_chunk(
-                &grouped_select,
-                table,
-                &grouped_bound,
-                predicate,
-                copin_s,
-                group_column,
-                &src,
-                &partial_types,
-                &bigint_as_numeric,
-                &mut partials_acc,
-                &mut partials_bytes,
-            ) {
-                ChunkOutcome::Ok => {}
-                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
-                ChunkOutcome::Hard(err) => return Err(err),
-            }
-            chunks_run += 1;
+                let Ok((src, chunk_vis)) = prev.ready() else {
+                    return self.execute_relational_select_cpu_pinned(select);
+                };
+                match self.grouped_streaming_chunk(
+                    &grouped_select,
+                    table,
+                    &grouped_bound,
+                    predicate,
+                    copin_s,
+                    group_column,
+                    &src,
+                    chunk_vis,
+                    &partial_types,
+                    &bigint_as_numeric,
+                    &mut partials_acc,
+                    &mut partials_bytes,
+                ) {
+                    ChunkOutcome::Ok => {}
+                    ChunkOutcome::Defer => {
+                        return self.execute_relational_select_cpu_pinned(select)
+                    }
+                    ChunkOutcome::Hard(err) => return Err(err),
+                }
+                chunks_run += 1;
             }
         }
         // Pipeline-lag compaction: the tail-block compute lands one whole chunk's partials AFTER the
@@ -1691,7 +1759,7 @@ impl Engine {
         }
         // DRAIN the pipeline before the final merge (no chunk upload alongside the merge upload).
         if let Some(prev) = staged.take() {
-            let Ok(src) = prev.ready() else {
+            let Ok((src, chunk_vis)) = prev.ready() else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             match self.grouped_streaming_chunk(
@@ -1702,6 +1770,7 @@ impl Engine {
                 copin_s,
                 group_column,
                 &src,
+                chunk_vis,
                 &partial_types,
                 &bigint_as_numeric,
                 &mut partials_acc,
@@ -1805,6 +1874,7 @@ impl Engine {
         copin_s: Index,
         group_column: &str,
         src: &ResidentExecSource,
+        visibility: Option<crate::engine_expr::ResidentVisibility>,
         partial_types: &[SqlType],
         bigint_as_numeric: &[bool],
         partials_acc: &mut Vec<Vec<SqlValue>>,
@@ -1818,7 +1888,7 @@ impl Engine {
             grouped_bound.clone(),
             copin_s,
             predicate,
-            None,
+            visibility,
             &[],
             &[],
             None,
@@ -1944,14 +2014,14 @@ impl Engine {
         };
         if let Some(cold) = &cold {
             for chunk in &cold.chunks {
-                let Ok(next) = self.stage_cold_chunk(chunk) else {
+                let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
                     self.evict_streaming_cold(&select.table);
                     return self.execute_relational_select_cpu_pinned(select);
                 };
                 if let Some(prev) = staged.replace(next) {
-                    let Ok(src) = prev.ready() else {
+                    let Ok((src, chunk_vis)) = prev.ready() else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
                     match self.ordered_streaming_chunk(
@@ -1961,6 +2031,7 @@ impl Engine {
                         predicate,
                         copin_s,
                         &src,
+                        chunk_vis,
                         &partial_types,
                         &mut runs_acc,
                         &mut runs_bytes,
@@ -1976,7 +2047,7 @@ impl Engine {
                 // The loop's compaction/defer checks, drain-first (as the scan loop).
                 if runs_bytes >= chunk_target_bytes {
                     if let Some(prev) = staged.take() {
-                        let Ok(src) = prev.ready() else {
+                        let Ok((src, chunk_vis)) = prev.ready() else {
                             return self.execute_relational_select_cpu_pinned(select);
                         };
                         match self.ordered_streaming_chunk(
@@ -1986,6 +2057,7 @@ impl Engine {
                             predicate,
                             copin_s,
                             &src,
+                            chunk_vis,
                             &partial_types,
                             &mut runs_acc,
                             &mut runs_bytes,
@@ -2061,12 +2133,13 @@ impl Engine {
                 };
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                    let Ok(next) =
+                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
                     if let Some(prev) = staged.replace(next) {
-                        let Ok(src) = prev.ready() else {
+                        let Ok((src, chunk_vis)) = prev.ready() else {
                             return self.execute_relational_select_cpu_pinned(select);
                         };
                         match self.ordered_streaming_chunk(
@@ -2076,6 +2149,7 @@ impl Engine {
                             predicate,
                             copin_s,
                             &src,
+                            chunk_vis,
                             &partial_types,
                             &mut runs_acc,
                             &mut runs_bytes,
@@ -2094,27 +2168,28 @@ impl Engine {
                     // Drain the in-flight chunk FIRST so an accumulator sort upload never overlaps it.
                     if runs_bytes >= chunk_target_bytes {
                         if let Some(prev) = staged.take() {
-                            let Ok(src) = prev.ready() else {
-                            return self.execute_relational_select_cpu_pinned(select);
-                        };
-                        match self.ordered_streaming_chunk(
-                            &chunk_select,
-                            table,
-                            &chunk_bound,
-                            predicate,
-                            copin_s,
-                            &src,
-                            &partial_types,
-                            &mut runs_acc,
-                            &mut runs_bytes,
-                        ) {
-                            ChunkOutcome::Ok => {}
-                            ChunkOutcome::Defer => {
-                                return self.execute_relational_select_cpu_pinned(select)
+                            let Ok((src, chunk_vis)) = prev.ready() else {
+                                return self.execute_relational_select_cpu_pinned(select);
+                            };
+                            match self.ordered_streaming_chunk(
+                                &chunk_select,
+                                table,
+                                &chunk_bound,
+                                predicate,
+                                copin_s,
+                                &src,
+                                chunk_vis,
+                                &partial_types,
+                                &mut runs_acc,
+                                &mut runs_bytes,
+                            ) {
+                                ChunkOutcome::Ok => {}
+                                ChunkOutcome::Defer => {
+                                    return self.execute_relational_select_cpu_pinned(select)
+                                }
+                                ChunkOutcome::Hard(err) => return Err(err),
                             }
-                            ChunkOutcome::Hard(err) => return Err(err),
-                        }
-                        chunks_run += 1;
+                            chunks_run += 1;
                         }
                     }
                     if runs_bytes >= chunk_target_bytes {
@@ -2133,8 +2208,7 @@ impl Engine {
                                 ) {
                                     ChunkOutcome::Ok => {}
                                     ChunkOutcome::Defer => {
-                                        return self
-                                            .execute_relational_select_cpu_pinned(select)
+                                        return self.execute_relational_select_cpu_pinned(select)
                                     }
                                     ChunkOutcome::Hard(err) => return Err(err),
                                 }
@@ -2157,29 +2231,34 @@ impl Engine {
             }
         }
         if !chunk_rows.is_empty() {
-            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
+            let Ok(next) =
+                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+            else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             if let Some(prev) = staged.replace(next) {
-                let Ok(src) = prev.ready() else {
-                return self.execute_relational_select_cpu_pinned(select);
-            };
-            match self.ordered_streaming_chunk(
-                &chunk_select,
-                table,
-                &chunk_bound,
-                predicate,
-                copin_s,
-                &src,
-                &partial_types,
-                &mut runs_acc,
-                &mut runs_bytes,
-            ) {
-                ChunkOutcome::Ok => {}
-                ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
-                ChunkOutcome::Hard(err) => return Err(err),
-            }
-            chunks_run += 1;
+                let Ok((src, chunk_vis)) = prev.ready() else {
+                    return self.execute_relational_select_cpu_pinned(select);
+                };
+                match self.ordered_streaming_chunk(
+                    &chunk_select,
+                    table,
+                    &chunk_bound,
+                    predicate,
+                    copin_s,
+                    &src,
+                    chunk_vis,
+                    &partial_types,
+                    &mut runs_acc,
+                    &mut runs_bytes,
+                ) {
+                    ChunkOutcome::Ok => {}
+                    ChunkOutcome::Defer => {
+                        return self.execute_relational_select_cpu_pinned(select)
+                    }
+                    ChunkOutcome::Hard(err) => return Err(err),
+                }
+                chunks_run += 1;
             }
         }
         // Pipeline-lag re-check (mirrors the grouped fold): the tail-block compute lands one chunk's
@@ -2216,7 +2295,7 @@ impl Engine {
         }
         // DRAIN the pipeline before the final sort (no chunk upload alongside the sort upload).
         if let Some(prev) = staged.take() {
-            let Ok(src) = prev.ready() else {
+            let Ok((src, chunk_vis)) = prev.ready() else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             match self.ordered_streaming_chunk(
@@ -2226,6 +2305,7 @@ impl Engine {
                 predicate,
                 copin_s,
                 &src,
+                chunk_vis,
                 &partial_types,
                 &mut runs_acc,
                 &mut runs_bytes,
@@ -2291,6 +2371,7 @@ impl Engine {
         predicate: Option<&ResidentExpr>,
         copin_s: Index,
         src: &ResidentExecSource,
+        visibility: Option<crate::engine_expr::ResidentVisibility>,
         partial_types: &[SqlType],
         runs_acc: &mut Vec<Vec<SqlValue>>,
         runs_bytes: &mut u64,
@@ -2304,7 +2385,7 @@ impl Engine {
             chunk_bound.clone(),
             copin_s,
             predicate,
-            None,
+            visibility,
             &order_by_exprs,
             &order_by_nulls_first,
             None,
@@ -2449,8 +2530,7 @@ impl Engine {
         // column types (Numeric{38,0} for the PG-bigint aggregates); rounds compose with no host
         // work. The single PG-type narrow happens at result materialization.
         for row in result.rows.into_boxed() {
-            merged_bytes =
-                merged_bytes.saturating_add(chunk_row_device_bytes(&row, partial_types));
+            merged_bytes = merged_bytes.saturating_add(chunk_row_device_bytes(&row, partial_types));
             merged.push(row);
         }
         *partials_acc = merged;
@@ -2480,12 +2560,18 @@ impl Engine {
         // into pinned memory; keeping the Vec is zero extra copies). Above the spill threshold the
         // builder streams them to the unlinked spill file instead of holding RAM (S-E.6b).
         if let Some(builder) = capture {
-            builder.push(payload, snapshot.clone(), chunk_rows.len() as u64, chunk_range);
+            builder.push(
+                payload,
+                snapshot.clone(),
+                chunk_rows.len() as u64,
+                chunk_range,
+            );
         }
         Ok(StagedChunk {
             snapshot,
             pending,
             row_count: chunk_rows.len() as u64,
+            visibility: None,
         })
     }
 
@@ -2506,13 +2592,40 @@ impl Engine {
 
     /// S-E.6: stage one COLD chunk — re-upload the cached device payload bytes (async copy stream),
     /// with a fresh proof stamped onto the cached descriptor template. No decode, no assembly.
-    fn stage_cold_chunk(&self, chunk: &ColdChunk) -> Result<StagedChunk, ()> {
+    fn stage_cold_chunk(
+        &self,
+        chunk: &ColdChunk,
+        reader_copin_s: Index,
+    ) -> Result<StagedChunk, ()> {
         let runtime = self.cuda_driver_probe_runtime();
         // RAM chunks borrow; spilled chunks positional-read from the unlinked file (an IO error is
         // a defer, never a wrong answer).
         let payload = chunk.payload.read()?;
+        // P2: a sidecar-bearing chunk uploads payload + 8-aligned deleted_by sidecar as ONE device
+        // buffer (the transient source is one allocation; `ResidentVisibility` addresses the
+        // sidecar by ABSOLUTE offset). The concat is one host memcpy paid ONLY by delete-bearing
+        // chunks — delete-free chunks keep the zero-copy borrow. The mask (`deleted_by >
+        // read_txn_id`, signed s64) is ANDed in-kernel by the executor's mask VM.
+        let (bytes, visibility) = match &chunk.deleted_by {
+            None => (payload, None),
+            Some(sidecar) => {
+                let padded = payload.len().next_multiple_of(8);
+                let mut buf = Vec::with_capacity(padded + sidecar.len());
+                buf.extend_from_slice(&payload);
+                buf.resize(padded, 0);
+                buf.extend_from_slice(sidecar);
+                (
+                    std::borrow::Cow::Owned(buf),
+                    Some(crate::engine_expr::ResidentVisibility {
+                        read_txn_id: reader_copin_s as i64,
+                        deleted_by_offset: Some(padded as u64),
+                        created_by_offset: None,
+                    }),
+                )
+            }
+        };
         let pending = runtime
-            .retain_device_memory_copy_async(chunk.snapshot.gpu_id, &payload)
+            .retain_device_memory_copy_async(chunk.snapshot.gpu_id, &bytes)
             .map_err(|_| ())?;
         self.read_state
             .residency
@@ -2524,6 +2637,7 @@ impl Engine {
             snapshot,
             pending,
             row_count: chunk.row_count,
+            visibility,
         })
     }
 
@@ -2560,8 +2674,8 @@ impl Engine {
         let mut range: Option<(u64, u64)> = None;
         let prefix = relational_key_prefix(&table.name);
         let flush = |rows: &mut Vec<Vec<SqlValue>>,
-                         range: &mut Option<(u64, u64)>,
-                         builder: &mut ColdCacheBuilder|
+                     range: &mut Option<(u64, u64)>,
+                     builder: &mut ColdCacheBuilder|
          -> Result<(), ()> {
             if rows.is_empty() {
                 return Ok(());
@@ -2612,6 +2726,48 @@ impl Engine {
             .map_err(|_| ())
     }
 
+    /// P2: classify one changed chain as a PURE DELETE of a payload-visible row — the only
+    /// change tolerated by the sidecar STAMP downgrade. Returns the deleting commit seq when the
+    /// old and new chains are identical EXCEPT exactly one version (a payload row: `created_by <=
+    /// payload_copin_s`, previously live) gained a `deleted_by` stamp. Anything else — tail
+    /// growth, value edits, same-id version appends, vanished chains, double deletes — returns
+    /// `None` and the chunk keeps the 6c-1 REBUILD arm (correctness backstop; never a wrong
+    /// answer). Control-plane version-METADATA comparison only (charter: no row values computed,
+    /// the equality checks are structural).
+    fn classify_pure_delete(
+        old: &[gpu_db_storage::TupleVersion],
+        new: &[gpu_db_storage::TupleVersion],
+        payload_copin_s: Index,
+    ) -> Option<Index> {
+        if old.len() != new.len() {
+            return None;
+        }
+        let mut stamp: Option<Index> = None;
+        for (o, n) in old.iter().zip(new.iter()) {
+            if o == n {
+                continue;
+            }
+            if stamp.is_some() {
+                return None; // more than one changed version
+            }
+            if o.tuple_id != n.tuple_id
+                || o.key != n.key
+                || o.value != n.value
+                || o.created_by != n.created_by
+            {
+                return None;
+            }
+            if o.deleted_by.is_some() || n.deleted_by.is_none() {
+                return None;
+            }
+            if o.created_by > payload_copin_s {
+                return None; // not a payload row (defensive: interior inserts cannot happen)
+            }
+            stamp = n.deleted_by;
+        }
+        stamp
+    }
+
     /// 6c-1 — CHUNK-GRANULAR DELTA PATCHING (deletes the whole-table invalidation): a stale cold
     /// entry (generation mismatch = a write happened) is PATCHED, not discarded. The changed
     /// TupleIds come from the O(delta) COW-chain diff (`changed_tuple_ids` — untouched subtrees are
@@ -2639,9 +2795,7 @@ impl Engine {
             .iter()
             .map(|c| (c.name.clone(), c.ty))
             .collect();
-        if signature != stale.column_signature
-            || stale.chunk_target_bytes != chunk_target_bytes
-        {
+        if signature != stale.column_signature || stale.chunk_target_bytes != chunk_target_bytes {
             return None;
         }
         let changed = stale.generation.rows.changed_tuple_ids(&current.rows);
@@ -2650,6 +2804,7 @@ impl Engine {
         let his: Vec<u64> = stale.chunks.iter().map(|c| c.tuple_range.1).collect();
         let last_hi = his.last().copied().unwrap_or(0);
         let mut tail_dirty = stale.chunks.is_empty();
+        let mut per_chunk_ids: Vec<Vec<u64>> = vec![Vec::new(); stale.chunks.len()];
         for id in &changed {
             if *id > last_hi {
                 tail_dirty = true;
@@ -2657,6 +2812,58 @@ impl Engine {
             }
             let idx = his.partition_point(|hi| *hi < *id);
             dirty[idx] = true;
+            per_chunk_ids[idx].push(*id);
+        }
+        // P2 — the SIDECAR STAMP DOWNGRADE: a dirty chunk whose every change is a PURE DELETE of
+        // one of its payload rows keeps its bytes and gains tombstone stamps (an O(8B x rows)
+        // sidecar COW) instead of the O(chunk) decode+rebuild. The row's SLOT is its rank among
+        // the ids visible at the chunk's OWN payload boundary within the chunk's effective range
+        // (scan order IS TupleId order; the walk anchors at `payload_copin_s`, never the entry
+        // boundary — a stamped row stays IN the payload, masked in-kernel at replay). Any
+        // classification failure keeps the rebuild arm.
+        let mut stamps: Vec<Option<Vec<(usize, Index)>>> = vec![None; stale.chunks.len()];
+        'downgrade: for i in 0..stale.chunks.len() {
+            if !dirty[i] || per_chunk_ids[i].is_empty() {
+                continue;
+            }
+            let chunk = &stale.chunks[i];
+            if chunk.row_count == 0 {
+                continue;
+            }
+            let eff_lo_i = if i == 0 {
+                0
+            } else {
+                his[i - 1].saturating_add(1)
+            };
+            let payload_vis = StorageVisibility {
+                read_txn_id: chunk.payload_copin_s,
+            };
+            let mut list: Vec<(usize, Index)> = Vec::with_capacity(per_chunk_ids[i].len());
+            for id in &per_chunk_ids[i] {
+                let (Some(old_chain), Some(new_chain)) =
+                    (stale.generation.rows.chain(*id), current.rows.chain(*id))
+                else {
+                    continue 'downgrade;
+                };
+                let Some(stamp) =
+                    Self::classify_pure_delete(old_chain, new_chain, chunk.payload_copin_s)
+                else {
+                    continue 'downgrade;
+                };
+                let Ok(slot) = stale.generation.rows.visible_count_in_range(
+                    payload_vis,
+                    eff_lo_i,
+                    id.saturating_sub(1),
+                ) else {
+                    continue 'downgrade;
+                };
+                if slot >= chunk.row_count as usize {
+                    continue 'downgrade; // rank disagrees with the payload — rebuild (defensive)
+                }
+                list.push((slot, stamp));
+            }
+            stamps[i] = Some(list);
+            dirty[i] = false;
         }
         // F2 (6c-1 audit — fragmentation cap): when the tail grows, COALESCE a trailing RUNT chunk
         // (under half the target) into the tail rebuild — insert/read ping-pong would otherwise
@@ -2670,6 +2877,7 @@ impl Engine {
             };
             if last_bytes < chunk_target_bytes / 2 {
                 dirty[last] = true;
+                stamps[last] = None; // the tail absorption needs the rebuild arm
             }
         }
         // Rebuild dirty ranges through ONE spill-aware builder (F1: rebuilt payloads stream to the
@@ -2686,6 +2894,7 @@ impl Engine {
             poisoned: false,
         };
         let mut reused: Vec<ColdChunk> = Vec::new();
+        let mut stamped_rows: u64 = 0;
         let mut eff_lo: u64 = 0;
         for (i, chunk) in stale.chunks.iter().enumerate() {
             let eff_hi = chunk.tuple_range.1;
@@ -2712,6 +2921,25 @@ impl Engine {
                     .streaming_cold_chunks_rebuilt
                     .fetch_add(1, Ordering::Relaxed);
             } else {
+                // P2: a stamp-downgraded chunk reuses its payload and COWs its sidecar (get-or-
+                // materialize at the 0x7F live fill — a delete-free chunk pays only here, on its
+                // FIRST delete); a plain reuse carries both through unchanged.
+                let deleted_by = match &stamps[i] {
+                    Some(list) if !list.is_empty() => {
+                        let mut bytes = match &chunk.deleted_by {
+                            Some(existing) => existing.as_ref().clone(),
+                            None => {
+                                vec![COLD_DELETED_BY_LIVE_FILL_BYTE; (chunk.row_count as usize) * 8]
+                            }
+                        };
+                        for (slot, stamp) in list {
+                            bytes[slot * 8..slot * 8 + 8].copy_from_slice(&stamp.to_le_bytes());
+                        }
+                        stamped_rows += list.len() as u64;
+                        Some(Arc::new(bytes))
+                    }
+                    _ => chunk.deleted_by.as_ref().map(Arc::clone),
+                };
                 reused.push(ColdChunk {
                     payload: match &chunk.payload {
                         ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
@@ -2724,13 +2952,15 @@ impl Engine {
                     snapshot: chunk.snapshot.clone(),
                     row_count: chunk.row_count,
                     tuple_range: chunk.tuple_range,
+                    // P2: reuse preserves the payload's OWN boundary (stamps do NOT advance it).
+                    payload_copin_s: chunk.payload_copin_s,
+                    deleted_by,
                 });
             }
             eff_lo = eff_hi.saturating_add(1);
         }
         // The tail (unless the runt-coalesce already extended the last rebuild through MAX).
-        let tail_absorbed =
-            tail_dirty && !stale.chunks.is_empty() && dirty[stale.chunks.len() - 1];
+        let tail_absorbed = tail_dirty && !stale.chunks.is_empty() && dirty[stale.chunks.len() - 1];
         if tail_dirty && !tail_absorbed {
             self.build_cold_chunks_for_range(
                 table,
@@ -2765,9 +2995,13 @@ impl Engine {
         }
         let total_payload_bytes: u64 = chunks
             .iter()
-            .map(|c| match &c.payload {
-                ColdPayload::Ram(bytes) => bytes.len() as u64,
-                ColdPayload::Spilled { len, .. } => *len as u64,
+            .map(|c| {
+                let payload = match &c.payload {
+                    ColdPayload::Ram(bytes) => bytes.len() as u64,
+                    ColdPayload::Spilled { len, .. } => *len as u64,
+                };
+                // P2: sidecars count against the cap class too (they are held host bytes).
+                payload + c.deleted_by.as_ref().map_or(0, |b| b.len() as u64)
             })
             .sum();
         let builder = ColdCacheBuilder {
@@ -2787,6 +3021,12 @@ impl Engine {
             .residency
             .streaming_cold_patches
             .fetch_add(1, Ordering::Relaxed);
+        if stamped_rows > 0 {
+            self.read_state
+                .residency
+                .streaming_cold_stamps
+                .fetch_add(stamped_rows, Ordering::Relaxed);
+        }
         self.read_state
             .residency
             .streaming_cold_chunks
@@ -2874,7 +3114,11 @@ impl Engine {
             .load()
             .get(table_name)
             .cloned()?;
-        let current = self.read_state.mvcc.table_rows(table_name).generation_payload();
+        let current = self
+            .read_state
+            .mvcc
+            .table_rows(table_name)
+            .generation_payload();
         if !Arc::ptr_eq(&cold.generation, &current) {
             // 6c-1: the table was written — PATCH the entry (rebuild only the dirty chunks + tail,
             // O(delta)) instead of discarding it. A patch that cannot apply (ALTER'd shape, install
@@ -2981,7 +3225,11 @@ impl Engine {
             }
             Some(self.commit_state())
         };
-        let current = self.read_state.mvcc.table_rows(table_name).generation_payload();
+        let current = self
+            .read_state
+            .mvcc
+            .table_rows(table_name)
+            .generation_payload();
         if !Arc::ptr_eq(&builder.generation, &current)
             || self.committed_seq() != builder.build_copin_s
         {
@@ -3042,6 +3290,7 @@ impl Engine {
         copin_s: Index,
         agg: StreamAgg,
         src: &ResidentExecSource,
+        visibility: Option<crate::engine_expr::ResidentVisibility>,
         count_select: &Select,
         count_bound: &BoundRelationalSelect,
         partials: &mut Vec<Vec<SqlValue>>,
@@ -3056,7 +3305,7 @@ impl Engine {
             count_bound.clone(),
             copin_s,
             predicate,
-            None,
+            visibility,
             &[],
             &[],
             None,
@@ -3086,7 +3335,7 @@ impl Engine {
             bound.clone(),
             copin_s,
             predicate,
-            None,
+            visibility,
             &[],
             &[],
             None,
@@ -3317,8 +3566,9 @@ impl Engine {
         let mut run_chunk = |chunk_rows: &[Vec<SqlValue>],
                              matches: &mut Vec<(u64, String, Vec<SqlValue>)>|
          -> Result<(), ()> {
-            let staged = self.stage_streaming_chunk(&locate_table, chunk_rows, (1, 0), &mut capture)?;
-            let src = staged.ready()?;
+            let staged =
+                self.stage_streaming_chunk(&locate_table, chunk_rows, (1, 0), &mut capture)?;
+            let (src, _) = staged.ready()?; // P3 locate chunks are scan-built (no sidecar)
             let result = self
                 .execute_resident_expr_select_with_binding(
                     &chunk_select,
@@ -3353,7 +3603,8 @@ impl Engine {
             }
             let mut decoded = decode_relational_row(&tuple.value, &table.columns).ok()?;
             decoded.push(SqlValue::Int8(tuple.tuple_id as i64));
-            chunk_bytes = chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+            chunk_bytes =
+                chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
             chunk_rows.push(decoded);
             if chunk_bytes >= chunk_target_bytes {
                 if run_chunk(&chunk_rows, &mut matches).is_err() {
@@ -3372,6 +3623,14 @@ impl Engine {
             .dml_streaming_resolve_hits
             .fetch_add(1, Ordering::Relaxed);
         Some(matches)
+    }
+
+    /// P2 telemetry: cold-chunk rows tombstone-stamped in place of a chunk rebuild.
+    pub fn streaming_cold_stamps(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_cold_stamps
+            .load(Ordering::Relaxed)
     }
 
     /// P3 telemetry: DML WHERE-locates resolved on-device via the streaming fold.
@@ -3493,6 +3752,12 @@ impl Engine {
                     None => continue,
                 }
             };
+            // P2 interim: the v1 artifact has no sidecar sections — a stamped entry declines
+            // the checkpoint (benign: restore skips it, the first read rebuilds). Artifact v2
+            // (persisted sidecars) is the ledgered P2b follow-up.
+            if entry.chunks.iter().any(|c| c.deleted_by.is_some()) {
+                continue;
+            }
             qualified.push((name.clone(), entry));
         }
         if self.committed_seq() != watermark {
@@ -3626,8 +3891,7 @@ impl Engine {
             for _ in 0..table_count {
                 let name = r.take_str()?;
                 let sig_len = r.take_u16()?;
-                let mut signature: Vec<(String, SqlType)> =
-                    Vec::with_capacity(sig_len as usize);
+                let mut signature: Vec<(String, SqlType)> = Vec::with_capacity(sig_len as usize);
                 for _ in 0..sig_len {
                     let col = r.take_str()?;
                     let ty = r.take_sql_type()?;
@@ -3637,10 +3901,14 @@ impl Engine {
                 let chunk_count = r.take_u32()?;
                 // The catalog + signature guards mirror the 6c-1 ALTER guard; a mismatching
                 // table's bytes must still be CONSUMED to keep the stream aligned.
-                let table = self.catalog_snapshot().relational_catalog.get(&name).cloned();
-                let live_signature: Option<Vec<(String, SqlType)>> = table.as_ref().map(|t| {
-                    t.columns.iter().map(|c| (c.name.clone(), c.ty)).collect()
-                });
+                let table = self
+                    .catalog_snapshot()
+                    .relational_catalog
+                    .get(&name)
+                    .cloned();
+                let live_signature: Option<Vec<(String, SqlType)>> = table
+                    .as_ref()
+                    .map(|t| t.columns.iter().map(|c| (c.name.clone(), c.ty)).collect());
                 let usable = live_signature.as_ref() == Some(&signature);
                 let mut builder = usable.then(|| ColdCacheBuilder {
                     generation: self.read_state.mvcc.table_rows(&name).generation_payload(),
@@ -3850,7 +4118,11 @@ impl<R: std::io::Read> ColdCkptReader<R> {
             6 => SqlType::Date,
             7 => SqlType::Timestamp,
             8 => SqlType::Uuid,
-            _ => return Err(std::io::Error::other("cold checkpoint: unknown SqlType tag")),
+            _ => {
+                return Err(std::io::Error::other(
+                    "cold checkpoint: unknown SqlType tag",
+                ))
+            }
         })
     }
 }

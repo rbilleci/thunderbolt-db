@@ -153,7 +153,9 @@ pub(crate) fn dml_filter_groups_to_device_predicate(
                 (Some(SqlType::Text), SqlValue::Text(s))
                     if matches!(op, SelectFilterOp::LikePrefix) =>
                 {
-                    ResidentExpr::TextLiteral(crate::engine_expr::like_pattern_for_literal_prefix(s))
+                    ResidentExpr::TextLiteral(crate::engine_expr::like_pattern_for_literal_prefix(
+                        s,
+                    ))
                 }
                 _ => return None,
             };
@@ -747,11 +749,10 @@ impl Engine {
         // Prefer a COMPOUND unique index whose EVERY key column is Eq-covered by a FOLDABLE value
         // (i32/i64 sections). Fold each column's i32 WORDS (`sql_value_key_words`) in key-column order,
         // byte-matching the device-built index.
-        for (ord, index) in table
-            .indexes
-            .iter()
-            .enumerate()
-            .filter(|(_, index)| index.unique && crate::engine_residency::index_is_compound(index))
+        for (ord, index) in
+            table.indexes.iter().enumerate().filter(|(_, index)| {
+                index.unique && crate::engine_residency::index_is_compound(index)
+            })
         {
             let Some(positions) = crate::engine_residency::index_key_column_positions(table, index)
             else {
@@ -785,7 +786,10 @@ impl Engine {
                 }
             }) {
                 let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)?;
-                return Some((key_id, crate::engine_residency::compound_key_fingerprint(&words)));
+                return Some((
+                    key_id,
+                    crate::engine_residency::compound_key_fingerprint(&words),
+                ));
             }
         }
         // Single-column key fallback: the first i32-section Eq -> `(col_idx, raw i32 needle)` (a
@@ -1254,9 +1258,10 @@ impl Engine {
         // index with the exact section encoding; other types have NO device index and go
         // straight to the elided scan arm below.
         let column_ty = table.columns.get(column_idx)?.ty;
-        let index_hits = crate::engine_residency::i32_section_needle(column_ty, value).and_then(
-            |needle| self.locate_resident_pk_via_shard_index_detailed(table, column_idx, needle),
-        );
+        let index_hits =
+            crate::engine_residency::i32_section_needle(column_ty, value).and_then(|needle| {
+                self.locate_resident_pk_via_shard_index_detailed(table, column_idx, needle)
+            });
         let hits = match index_hits {
             Some(hits) => hits,
             None => {

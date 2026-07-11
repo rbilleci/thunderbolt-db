@@ -1823,8 +1823,7 @@ fn i64_section_leaves_scalar_only(expr: &ResidentExpr, table: &RelationalTable) 
     };
     match expr {
         ResidentExpr::Binary { op, lhs, rhs } if boolean_op_code(*op).is_some() => {
-            i64_section_leaves_scalar_only(lhs, table)
-                && i64_section_leaves_scalar_only(rhs, table)
+            i64_section_leaves_scalar_only(lhs, table) && i64_section_leaves_scalar_only(rhs, table)
         }
         ResidentExpr::Binary { lhs, rhs, .. } => {
             let scalar_side_ok = |col_side: &ResidentExpr, lit_side: &ResidentExpr| {
@@ -1972,8 +1971,10 @@ fn compile_predicate_program(
     // + the per-leaf validity AND. Makes compound timestamp WHEREs (nullable or not) run on the GPU.
     // Timestamp col-vs-col inside AND/OR and arith subtrees stay follow-ons (clean error → decline).
     {
-        let ts_scalar = match (timestamp_column_index(lhs, table), timestamp_column_index(rhs, table))
-        {
+        let ts_scalar = match (
+            timestamp_column_index(lhs, table),
+            timestamp_column_index(rhs, table),
+        ) {
             (Some(col), None)
                 if matches!(
                     rhs.as_ref(),
@@ -2875,7 +2876,8 @@ impl Engine {
         row: &[SqlValue],
         commit_seq: Index,
     ) -> Option<usize> {
-        let fingerprint = crate::engine_residency::compound_index_row_fingerprint(table, index, row)?;
+        let fingerprint =
+            crate::engine_residency::compound_index_row_fingerprint(table, index, row)?;
         let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)?;
         let key_positions = crate::engine_residency::index_key_column_positions(table, index)?;
         let hits = self.locate_resident_pk_via_shard_index_detailed(table, key_id, fingerprint)?;
@@ -2889,12 +2891,9 @@ impl Engine {
             let mrow = match materialized {
                 Some(Some(mrow)) => mrow,
                 Some(None) => continue, // not snapshot-live (already dead / future): not our slot
-                None => return None,    // can't materialize (device err / wider value column) -> re-admit
+                None => return None, // can't materialize (device err / wider value column) -> re-admit
             };
-            if key_positions
-                .iter()
-                .all(|&p| mrow.get(p) == row.get(p))
-            {
+            if key_positions.iter().all(|&p| mrow.get(p) == row.get(p)) {
                 matched.push((hit.shard_id, hit.slot));
             }
         }
@@ -2927,10 +2926,7 @@ impl Engine {
                         .iter()
                         .find(|c| &c.name == name)
                         .is_some_and(|c| {
-                            !matches!(
-                                c.ty,
-                                SqlType::Int4 | SqlType::Date | SqlType::Int2
-                            )
+                            !matches!(c.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2)
                         })
                 })
         })
@@ -3090,7 +3086,8 @@ impl Engine {
         }
         // RETIREMENT A4b: MULTI-ROW — old/new/row_ids must be parallel and identity-complete;
         // ALL tombstones land before ANY append (the locate must run on the pre-append buffer).
-        if old_rows.len() != new_rows.len() || row_ids.is_none_or(|ids| ids.len() != new_rows.len()) {
+        if old_rows.len() != new_rows.len() || row_ids.is_none_or(|ids| ids.len() != new_rows.len())
+        {
             return false;
         }
         // 1. Tombstone every OLD version's slot (locates run on the buffer BEFORE the appends).
@@ -8603,9 +8600,7 @@ impl Engine {
             || expr_mentions_bool_column(rhs, table)
             || expr_mentions_date(lhs, table)
             || expr_mentions_date(rhs, table);
-        if mentions_width_bound
-            || expr_mentions_uuid(lhs, table)
-            || expr_mentions_uuid(rhs, table)
+        if mentions_width_bound || expr_mentions_uuid(lhs, table) || expr_mentions_uuid(rhs, table)
         {
             if mixed_width_i32_elem(predicate, table).is_some() {
                 return Ok(None);
@@ -9317,7 +9312,15 @@ impl Engine {
         if text_column_index(lhs, table).is_some() && text_column_index(rhs, table).is_some() {
             let mut program = Vec::new();
             let mut needles: Vec<Vec<u8>> = Vec::new();
-            compile_text_eq_leaf(compare, lhs, rhs, table, snapshot, &mut program, &mut needles)?;
+            compile_text_eq_leaf(
+                compare,
+                lhs,
+                rhs,
+                table,
+                snapshot,
+                &mut program,
+                &mut needles,
+            )?;
             return device_memory
                 .run_expr_predicate_filter_with_text(
                     &program,
@@ -9377,8 +9380,7 @@ impl Engine {
                         )));
                     }
                 };
-            let cmp = predicate_compare_code(compare)
-                .expect("lt/le/gt/ge have compare codes");
+            let cmp = predicate_compare_code(compare).expect("lt/le/gt/ge have compare codes");
             let layout = resident_device_text_column_layout(snapshot, table, col)?;
             let validity: Vec<u64> = resident_device_null_column_offset(snapshot, table, col)?
                 .into_iter()
@@ -9924,7 +9926,11 @@ impl Engine {
                         let mut program = Vec::new();
                         let mut needles: Vec<Vec<u8>> = Vec::new();
                         compile_predicate_program(
-                            predicate, table, snapshot, &mut program, &mut needles,
+                            predicate,
+                            table,
+                            snapshot,
+                            &mut program,
+                            &mut needles,
                         )?;
                         return device_memory
                             .run_expr_predicate_filter_with_text(
