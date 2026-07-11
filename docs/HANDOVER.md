@@ -207,10 +207,14 @@ first-read scans.
 **REGISTERED DEBT (open rows, each with a named trigger):** (1) the REVERSE GATHER host columnar decoder
 (control-plane de-auth/import only; trigger = the device-index-over-chunks route lifting the no-uniqueness
 class gate); (2) the SCAN-BUILD (build_cold_chunks/first-build staging — still the bootstrap + de-auth
-import path; honestly OPEN, off the steady hot path since 6c-1/6c-3); (3) the FROZEN-STORE RAM (the
-freeze-not-drop C3 closure keeps pre-entry chains resident; trigger = the min-active-read-boundary fence
-above, shared with compaction); (4) the class INSERT's unbounded tail growth between compactions (same
-trigger). **NET:** host RELATIONAL COMPUTATION on the class's steady path = ZERO (writes: statement-row
+import path; honestly OPEN, off the steady hot path since 6c-1/6c-3); (3) ~~the FROZEN-STORE RAM~~ **ROW
+CLOSED: RECLAIMED AT CLASS ENTRY — NO FENCE NEEDED** (the audited soundness: readers only pin
+current-committed at bind, the CPU-pinned guard de-auths BEFORE binding, in-flight readers hold COW
+generation Arcs, auto-admit excludes class tables — every leg adversarially traced; class entry now
+DELETES the table's host chains + value-index entries, de-auth v2 rebuilds chunk-only with base rows
+born@1, and the slot→store-id rank enumeration is DELETED); (4) the class INSERT's unbounded tail growth
+between compactions — trigger now just "the compaction slice" (the fence requirement DISSOLVED by the same
+argument: in-flight folds hold entry Arcs, new binds pin >= the compaction boundary). **NET:** host RELATIONAL COMPUTATION on the class's steady path = ZERO (writes: statement-row
 encode = staging; reads: device folds; DML: device locate + sidecar bookkeeping); the host's remaining
 roles are the charter's own (WAL, orchestration, staging, boundary coercions) plus the four registered
 rows above.

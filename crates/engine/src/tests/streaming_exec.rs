@@ -2903,7 +2903,12 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
         "the table must ENTER the class at this commit"
     );
 
-    // FROZEN: the store's version count stops moving; the chunks carry the tails.
+    // RECLAIMED (P4): class entry DELETED the host chains — the store-deletion payoff; the
+    // chunks are the representation. The count below is 0 and stays 0 through every class write.
+    assert!(
+        e.chunk_class_reclaimed_rows() > 0,
+        "entry must reclaim the host rows"
+    );
     let frozen_versions = e
         .read_state
         .mvcc
@@ -2911,6 +2916,7 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
         .store()
         .all_versions()
         .len();
+    assert_eq!(frozen_versions, 0, "the class table's host chains are GONE");
     for k in 0..5 {
         seq += 1;
         e.execute_text(

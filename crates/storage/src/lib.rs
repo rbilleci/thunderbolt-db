@@ -228,6 +228,19 @@ impl InMemoryTupleStore {
         ids
     }
 
+    /// P4 RECLAMATION (chunk-authoritative tables): drop EVERY version chain and key-index slot
+    /// while PRESERVING the tuple-id allocator (identities must never be reused across a later
+    /// de-authoritization rebuild) and the change-log epoch continuity (a cleared store restarts
+    /// its log; any stray ancestor diff lands in the out-of-window fallback walk — safe). The
+    /// caller owns the invariant that nothing reads these rows afterwards (the class guard
+    /// funnel + COW generation pinning for in-flight readers).
+    pub fn clear_versions_preserving_allocator(&mut self) {
+        self.versions = imbl::OrdMap::new();
+        self.key_to_tuple_ids = imbl::OrdMap::new();
+        self.epoch += 1;
+        self.recent_changes = imbl::Vector::new();
+    }
+
     /// P2 (cold-chunk tombstone sidecars): one chain's versions, for the patch classifier's
     /// old-vs-new comparison. Control-plane addressing only (no row values inspected by the
     /// caller beyond structural equality).

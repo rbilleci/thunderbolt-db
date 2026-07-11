@@ -3776,7 +3776,6 @@ impl Engine {
     ///    the rebuild arm is unreachable — until then this primitive must not run beside live
     ///    store writes to the same table.
     // Production caller = P4-2b (the class write path); the differential gate exercises it now.
-    #[allow(dead_code)]
     pub(crate) fn locate_streaming_cold_slots(
         &self,
         table: &RelationalTable,
@@ -3841,7 +3840,6 @@ impl Engine {
     /// token / single-critical-section rule, and the store-divergence rebuild hazard) apply to
     /// this pair as a unit.
     // Production caller = P4-2b; the isolation gate exercises it now.
-    #[allow(dead_code)]
     pub(crate) fn stamp_streaming_cold_slots(
         &self,
         table_name: &str,
@@ -4034,6 +4032,75 @@ impl Engine {
         residency
             .chunk_class_entries
             .fetch_add(1, Ordering::Relaxed);
+        // P4 RECLAMATION — THE STORE-ROW DELETION (the arc's payoff): the class table's host
+        // chains + value-index entries are DROPPED at entry. Sound without a reader fence:
+        // (a) in-flight readers hold COW generation Arcs — the clear publishes a NEW generation
+        // and cannot touch their pinned rows; (b) every FUTURE reader of a class table either
+        // streams (chunks) or passes the de-auth guard, which re-binds at the CURRENT boundary
+        // (>= the freeze) — no reader can ever need the dropped sub-freeze history; (c) de-auth
+        // v2 rebuilds chunk-only. The allocator is preserved (identities never reuse). The
+        // cleared store publishes a fresh generation, so the entry RE-PINS it (the class
+        // invariants key on generation pointer stability from here on).
+        let reclaimed: u64 = self
+            .read_state
+            .mvcc
+            .table_rows(table_name)
+            .store()
+            .all_versions()
+            .len() as u64;
+        if self
+            .read_state
+            .mvcc
+            .with_table_mut(table_name, |data| {
+                data.rows.clear_versions_preserving_allocator();
+                data.value_index = Default::default();
+                Ok::<(), EngineError>(())
+            })
+            .is_err()
+        {
+            // Audit LOW: never run classed-but-unreclaimed on a swallowed error — exit loudly.
+            let _ = self.deauthoritize_chunk_table(table_name, true);
+            return;
+        }
+        let cleared_generation = self.read_state.mvcc.table_rows(table_name).generation_payload();
+        let repinned = ColdCacheBuilder {
+            generation: cleared_generation,
+            build_copin_s: entry.build_copin_s,
+            chunk_target_bytes: entry.chunk_target_bytes,
+            total_payload_bytes: entry.total_payload_bytes,
+            column_signature: entry.column_signature.clone(),
+            chunks: entry
+                .chunks
+                .iter()
+                .map(|chunk| ColdChunk {
+                    payload: match &chunk.payload {
+                        ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
+                        ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
+                            file: Arc::clone(file),
+                            offset: *offset,
+                            len: *len,
+                        },
+                    },
+                    snapshot: chunk.snapshot.clone(),
+                    row_count: chunk.row_count,
+                    tuple_range: chunk.tuple_range,
+                    payload_copin_s: chunk.payload_copin_s,
+                    deleted_by: chunk.deleted_by.as_ref().map(Arc::clone),
+                })
+                .collect(),
+            spill: None,
+            poisoned: false,
+        };
+        if !self.install_streaming_cold_class(table_name, repinned) {
+            // The re-pin cannot legitimately fail (we hold the commit lock and just published
+            // the cleared generation) — if it ever does, exit the class LOUDLY rather than run
+            // with a mismatched pin.
+            let _ = self.deauthoritize_chunk_table(table_name, true);
+            return;
+        }
+        residency
+            .chunk_class_reclaimed_rows
+            .fetch_add(reclaimed, Ordering::Relaxed);
     }
 
     /// THE CLASS INSERT MATERIALIZATION — called from the applied-commit hook UNDER THE COMMIT
@@ -4216,69 +4283,25 @@ impl Engine {
             }
             if let Some(entry) = entry {
                 for chunk in &entry.chunks {
-                    // P4-2b-ii: the post-freeze delta = TAIL chunks (born above the freeze,
-                    // replayed as inserts + their own stamps) AND post-freeze SIDECAR STAMPS on
-                    // BASE chunks (replayed as tuple_deletes onto the frozen chains — the slot
-                    // maps to its store id by the rank enumeration at the payload boundary).
-                    // Stamps AT-OR-BELOW the freeze predate the class (the store already holds
-                    // them — replaying would double-delete).
-                    if chunk.payload_copin_s <= freeze {
-                        let Some(sidecar) = &chunk.deleted_by else {
-                            continue;
-                        };
-                        let payload_vis = StorageVisibility {
-                            read_txn_id: chunk.payload_copin_s,
-                        };
-                        let visible = engine
-                            .read_state
-                            .mvcc
-                            .table_rows(table_name)
-                            .store()
-                            .visible_versions_in_range(
-                                payload_vis,
-                                chunk.tuple_range.0,
-                                chunk.tuple_range.1,
-                            )
-                            .map_err(|e| {
-                                EngineError::ApplyFailed(format!(
-                                    "de-authoritization slot enumeration failed: {e}"
-                                ))
-                            })?;
-                        let live = i64::from_le_bytes([COLD_DELETED_BY_LIVE_FILL_BYTE; 8]);
-                        let mut deletes: Vec<(gpu_db_storage::TupleId, Index)> = Vec::new();
-                        for slot in 0..chunk.row_count as usize {
-                            let raw = i64::from_le_bytes(
-                                sidecar[slot * 8..slot * 8 + 8].try_into().expect("8"),
-                            );
-                            let stamp = raw as u64;
-                            if raw != live && stamp > freeze {
-                                let id =
-                                    visible.get(slot).map(|v| v.tuple_id).ok_or_else(|| {
-                                        EngineError::ApplyFailed(
-                                            "de-authoritization slot rank out of range".to_string(),
-                                        )
-                                    })?;
-                                deletes.push((id, stamp));
-                            }
-                        }
-                        if !deletes.is_empty() {
-                            engine.read_state.mvcc.with_table_mut(table_name, |data| {
-                                for (id, stamp) in &deletes {
-                                    data.rows
-                                        .tuple_delete(*id, *stamp)
-                                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                                }
-                                Ok::<(), EngineError>(())
-                            })?;
-                        }
-                        continue;
-                    }
-                    // A TAIL chunk: UNMASKED decode is slot-aligned; every row inserts at its
-                    // born boundary, then its own post-freeze stamps replay as deletes.
+                    // P4 DE-AUTH v2 (chunk-only — the store rows were RECLAIMED at class entry,
+                    // so there is nothing to map into): EVERY chunk replays by inserting its
+                    // slot-aligned unmasked rows at FRESH ids — base chunks BORN-VISIBLE
+                    // (created 0: every post-de-auth reader binds at the current boundary,
+                    // which is >= the freeze >= every base row's real birth; in-flight readers
+                    // keep their COW generation pins), tail chunks at their born boundary —
+                    // then replaying every sidecar stamp as a tombstone on the just-inserted
+                    // id. The store is whole for every FUTURE boundary; the old slot->store-id
+                    // rank enumeration is DELETED with the frozen rows it mapped into.
                     let rows = decode_cold_chunk_rows(&table, chunk, 0).map_err(|e| {
                         EngineError::ApplyFailed(format!("de-authoritization decode failed: {e}"))
                     })?;
-                    let born = chunk.payload_copin_s;
+                    let born = if chunk.payload_copin_s <= freeze {
+                        // Base: effectively born-visible — created@1 <= every real boundary
+                        // (commit seqs are positive; the storage API rejects a literal 0).
+                        1
+                    } else {
+                        chunk.payload_copin_s
+                    };
                     // Fresh row ids (the class INSERT advanced the allocator without assigning;
                     // ids are internal-only for a keyless FK-free table — divergence from the
                     // prepare-time ids is unobservable, and WAL replay derives its own).
@@ -4327,8 +4350,9 @@ impl Engine {
                             slot.extend(row_keys.iter().cloned());
                             data.value_index.insert(entry_key.clone(), slot);
                         }
-                        // The tail's own stamps (a row inserted then deleted post-freeze): the
-                        // chain gets created@born + deleted@stamp — exact MVCC at every boundary.
+                        // Every chunk's stamps replay onto the just-inserted ids: the chain
+                        // gets created@born + deleted@stamp (a pre-freeze stamp on a base chunk
+                        // = an already-dead chain — wasteful, MVCC-correct).
                         if let Some(sidecar) = &chunk.deleted_by {
                             for (slot, tuple_id) in tuple_ids.iter().enumerate() {
                                 let raw = i64::from_le_bytes(
@@ -4458,6 +4482,13 @@ impl Engine {
         self.read_state
             .residency
             .chunk_class_deauths
+            .load(Ordering::Relaxed)
+    }
+    /// P4 reclamation telemetry: host store versions deleted at class entry.
+    pub fn chunk_class_reclaimed_rows(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_reclaimed_rows
             .load(Ordering::Relaxed)
     }
 
@@ -4852,7 +4883,6 @@ impl Engine {
 /// and each column's NULL validity bitmap. Layout authority = the chunk's own DESCRIPTOR (the
 /// self-describing text/bool/null offsets + the capacity-derived fixed-width section formulas —
 /// the same helpers the device readers use).
-#[allow(dead_code)] // P4-2b/P4-3 wire the production callers; the round-trip gate exercises it now.
 pub(crate) fn decode_cold_chunk_rows(
     table: &RelationalTable,
     chunk: &ColdChunk,

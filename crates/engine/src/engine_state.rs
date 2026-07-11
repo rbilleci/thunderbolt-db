@@ -688,6 +688,8 @@ pub(crate) struct ResidencyReadState {
     /// P4-2b: sticky exits — a shape the chunks could not serve replayed the post-freeze delta
     /// back into the store (the loud de-authoritization; not the steady state).
     pub(crate) chunk_class_deauths: std::sync::atomic::AtomicU64,
+    /// P4 reclamation: host store versions DELETED at class entry (the store-deletion payoff).
+    pub(crate) chunk_class_reclaimed_rows: std::sync::atomic::AtomicU64,
     /// VACUUM #5: per-table count of incremental tombstone stamps since the last rebuild —
     /// the CHURN signal (each SV4b/SV5/A4b tombstone adds a dead slot; enough of them degrade
     /// the PK index to dup-declines and bloat scans). Reset by vacuum/re-admit. Serialized-path
