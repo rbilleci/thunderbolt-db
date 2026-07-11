@@ -158,7 +158,7 @@ pub(crate) struct ColdTableChunks {
     /// S-E.6b: this table's payloads live in the unlinked spill file (counts against the DISK cap,
     /// not the RAM cap).
     spilled: bool,
-    chunks: Vec<ColdChunk>,
+    pub(crate) chunks: Vec<ColdChunk>,
 }
 
 /// One cached chunk: the exact device payload bytes + the descriptor template the build produced.
@@ -3656,6 +3656,169 @@ impl Engine {
             }
         }
         Some(Ok(rows))
+    }
+
+    /// P4-2a — THE CHUNK-NATIVE LOCATE (design-review C1: the P3 locate derives identity from a
+    /// STORE scan, unusable store-free): evaluate a DML predicate over the table's COLD CHUNKS
+    /// THEMSELVES, returning matching `(chunk_idx, local slots)` coordinates. Each chunk replays
+    /// through the SAME staging the read folds use (payload + sidecar upload) and the SAME
+    /// slot-locate primitive the resident shard DML uses (`lower_resident_predicate` — the mask VM
+    /// with the sidecar visibility ANDed on, so already-tombstoned slots never re-locate). No
+    /// store, no row decode, no projection — the device returns slots natively; the host only
+    /// orchestrates (charter: control plane). `None` = decline (no entry, a reader boundary below
+    /// the entry, any staging/lowering failure) — the caller falls to its store-era arm while one
+    /// exists.
+    /// ## P4-2b CALLER OBLIGATIONS (audit, forward-looking)
+    /// 1. COORDINATE TOKEN (MEDIUM latent): the slots are positions in the entry INSTALLED AT
+    ///    LOCATE TIME. `stamp_streaming_cold_slots` reloads the CURRENT entry — an intervening
+    ///    patch install (eager hook / lazy read patch) re-tiles chunks and the coordinates
+    ///    mis-align (the install guard cannot catch it: the new entry's generation IS current).
+    ///    The caller MUST run locate→stamp inside ONE commit-lock critical section with no
+    ///    intervening patch, or carry an entry-identity token and refuse on mismatch.
+    /// 2. STORE DIVERGENCE (LOW): a store-free stamp hides rows the store still holds; a LATER
+    ///    store-driven patch REBUILD of that chunk rebuilds from the store and RESURRECTS them
+    ///    (sidecar discarded). For chunk-authoritative tables the store must be dropped/frozen so
+    ///    the rebuild arm is unreachable — until then this primitive must not run beside live
+    ///    store writes to the same table.
+    // Production caller = P4-2b (the class write path); the differential gate exercises it now.
+    #[allow(dead_code)]
+    pub(crate) fn locate_streaming_cold_slots(
+        &self,
+        table: &RelationalTable,
+        predicate: &crate::engine_expr::ResidentExpr,
+        rtx: Index,
+    ) -> Option<Vec<(usize, Vec<u32>)>> {
+        let entry = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(&table.name)
+            .cloned()?;
+        if rtx < entry.build_copin_s {
+            return None; // below the entry boundary — the chunks cannot serve this reader
+        }
+        let mut out: Vec<(usize, Vec<u32>)> = Vec::new();
+        for (idx, chunk) in entry.chunks.iter().enumerate() {
+            if chunk.row_count == 0 {
+                continue;
+            }
+            let staged = self.stage_cold_chunk(chunk, rtx).ok()?;
+            let (src, vis) = staged.ready().ok()?;
+            let slots = self
+                .lower_resident_predicate(
+                    predicate,
+                    table,
+                    &src.descriptor,
+                    &src.device_memory,
+                    chunk.row_count,
+                    vis,
+                )
+                .ok()?;
+            if !slots.is_empty() {
+                out.push((idx, slots));
+            }
+        }
+        Some(out)
+    }
+
+    /// P4-2a — THE LOCATE-DRIVEN STAMP (design-review C1: the P2 stamp rides the store-generation
+    /// diff + chain classification, unusable store-free): tombstone the given `(chunk_idx, slot)`
+    /// coordinates directly — sidecar COW (get-or-materialize at the 0x7F live fill), stamp value
+    /// = the deleting commit's boundary, entry re-installed at that boundary under the standard
+    /// strict-equality settled proof (the P4-2b caller stamps under the commit lock right after
+    /// the publish, so equality holds by construction; a racing commit fails the install — a safe
+    /// decline). The entry's pinned generation is UNCHANGED (a store-free write publishes no
+    /// generation). Returns false on any invalid coordinate or a failed install.
+    /// See `locate_streaming_cold_slots` — the two P4-2b caller obligations (the coordinate
+    /// token / single-critical-section rule, and the store-divergence rebuild hazard) apply to
+    /// this pair as a unit.
+    // Production caller = P4-2b; the isolation gate exercises it now.
+    #[allow(dead_code)]
+    pub(crate) fn stamp_streaming_cold_slots(
+        &self,
+        table_name: &str,
+        located: &[(usize, Vec<u32>)],
+        stamp: Index,
+        commit_lock_held: bool,
+    ) -> bool {
+        if located.is_empty() {
+            return true;
+        }
+        let entry = match self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(table_name)
+            .cloned()
+        {
+            Some(entry) => entry,
+            None => return false,
+        };
+        let mut stamped_rows: u64 = 0;
+        let mut chunks: Vec<ColdChunk> = Vec::with_capacity(entry.chunks.len());
+        let mut sidecar_growth: u64 = 0;
+        for (idx, chunk) in entry.chunks.iter().enumerate() {
+            let slots = located
+                .iter()
+                .find(|(chunk_idx, _)| *chunk_idx == idx)
+                .map(|(_, slots)| slots.as_slice())
+                .unwrap_or(&[]);
+            let deleted_by = if slots.is_empty() {
+                chunk.deleted_by.as_ref().map(Arc::clone)
+            } else {
+                let mut bytes = match &chunk.deleted_by {
+                    Some(existing) => existing.as_ref().clone(),
+                    None => {
+                        sidecar_growth += chunk.row_count * 8;
+                        vec![COLD_DELETED_BY_LIVE_FILL_BYTE; (chunk.row_count as usize) * 8]
+                    }
+                };
+                for slot in slots {
+                    let slot = *slot as usize;
+                    if slot >= chunk.row_count as usize {
+                        return false; // an out-of-range coordinate: refuse the whole stamp
+                    }
+                    bytes[slot * 8..slot * 8 + 8].copy_from_slice(&stamp.to_le_bytes());
+                }
+                stamped_rows += slots.len() as u64;
+                Some(Arc::new(bytes))
+            };
+            chunks.push(ColdChunk {
+                payload: match &chunk.payload {
+                    ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
+                    ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
+                        file: Arc::clone(file),
+                        offset: *offset,
+                        len: *len,
+                    },
+                },
+                snapshot: chunk.snapshot.clone(),
+                row_count: chunk.row_count,
+                tuple_range: chunk.tuple_range,
+                payload_copin_s: chunk.payload_copin_s,
+                deleted_by,
+            });
+        }
+        let builder = ColdCacheBuilder {
+            generation: Arc::clone(&entry.generation),
+            build_copin_s: stamp,
+            chunk_target_bytes: entry.chunk_target_bytes,
+            total_payload_bytes: entry.total_payload_bytes + sidecar_growth,
+            column_signature: entry.column_signature.clone(),
+            chunks,
+            spill: None,
+            poisoned: false,
+        };
+        if !self.install_streaming_cold_inner(table_name, builder, true, commit_lock_held) {
+            return false;
+        }
+        self.read_state
+            .residency
+            .streaming_cold_stamps
+            .fetch_add(stamped_rows, Ordering::Relaxed);
+        true
     }
 
     /// P2 telemetry: cold-chunk rows tombstone-stamped in place of a chunk rebuild.

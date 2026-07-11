@@ -9740,7 +9740,7 @@ impl Engine {
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
     }
 
-    fn lower_resident_predicate(
+    pub(crate) fn lower_resident_predicate(
         &self,
         predicate: &ResidentExpr,
         table: &RelationalTable,
