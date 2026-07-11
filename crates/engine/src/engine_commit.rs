@@ -593,6 +593,13 @@ impl Engine {
                 self.auto_admit_resident_tables(&admit);
             }
         }
+        // 6c-3: EAGER streaming cold-tier maintenance — unconditional (self-gating on entry
+        // existence), best-effort, O(delta) per touched table with a cold entry. The commit mutex
+        // is HELD here (this whole apply runs inside the commit critical section), so the patch
+        // installs through the lock-held arm.
+        if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
+            self.maintain_streaming_cold_on_commit(&tables);
+        }
         Ok(())
     }
 
@@ -768,6 +775,11 @@ impl Engine {
             if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
                 self.auto_admit_resident_tables(&tables);
             }
+        }
+        // 6c-3: EAGER streaming cold-tier maintenance (see apply_and_publish_committed_inner's
+        // twin). The commit guard acquired at this fn's top is still held.
+        if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
+            self.maintain_streaming_cold_on_commit(&tables);
         }
         self.metrics.inc_commit();
 

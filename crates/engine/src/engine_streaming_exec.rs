@@ -344,6 +344,11 @@ const STREAMING_COLD_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// S-E.6b: the spilled-class cap (unlinked NVMe/temp files). Engine-internal, not config.
 const STREAMING_COLD_DISK_CAP_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
+/// 6c-3 (audit MEDIUM): the eager commit-hook patches only deltas up to this many changed chains —
+/// larger writes defer to the lazy read-path patch so a bulk insert never stalls the global commit
+/// mutex on decode/build/spill work. Engine-internal, not config.
+const EAGER_PATCH_MAX_DELTA_ROWS: usize = 4096;
+
 /// 6c-0 (charter-drift ruling): the SCALAR combine runs ON THE DEVICE. Per-chunk partials collect as
 /// rows of a synthesized one-column relation and ONE final device aggregate pass folds them — the
 /// S-E.3 synthesized-relation merge shape (`catalog_relation_table` + injected src). The former host
@@ -2600,14 +2605,10 @@ impl Engine {
         table: &RelationalTable,
         rows: &[Vec<SqlValue>],
     ) -> Result<(RelationalResidencySnapshot, Vec<u8>), ()> {
-        let (snapshot, pending, payload) = self
-            .build_transient_relation_residency_async(table, rows)
-            .map_err(|_| ())?;
-        // The transient upload is a byproduct here (the builder uploads); drop it un-used — wait()
-        // completes the DMA so the pinned buffer recycles safely. (A payload-only builder split is
-        // a follow-up; correctness first.)
-        let _ = pending.wait().map_err(|_| ())?;
-        Ok((snapshot, payload))
+        // 6c-3 (audit F4 adopted): payload + descriptor ONLY — no throwaway upload. The replay
+        // (stage_cold_chunk) stamps a fresh proof when it actually uploads.
+        self.build_transient_relation_payload_only(table, rows)
+            .map_err(|_| ())
     }
 
     /// 6c-1 — CHUNK-GRANULAR DELTA PATCHING (deletes the whole-table invalidation): a stale cold
@@ -2619,6 +2620,7 @@ impl Engine {
     /// their visible sets boundary-invariant); dirty ranges + the tail REBUILD at the patching
     /// reader's boundary. The patched entry re-installs under the SAME settled-boundary commit-lock
     /// proof as a fresh build (S-E.6a). Returns the landed entry, or None (caller evicts + scans).
+    #[allow(clippy::too_many_arguments)]
     fn patch_streaming_cold(
         &self,
         table_name: &str,
@@ -2627,6 +2629,7 @@ impl Engine {
         current: &Arc<crate::resident_storage::TableVersionData>,
         copin_s: Index,
         chunk_target_bytes: u64,
+        commit_lock_held: bool,
     ) -> Option<Arc<ColdTableChunks>> {
         // The ALTER guard: a shape-changing DDL republished the store too — cached payload layouts
         // would be reused with the WRONG column shape. Signature inequality -> evict.
@@ -2776,7 +2779,7 @@ impl Engine {
             spill: None,
             poisoned: false,
         };
-        if !self.install_streaming_cold_inner(table_name, builder, true) {
+        if !self.install_streaming_cold_inner(table_name, builder, true, commit_lock_held) {
             return None;
         }
         self.read_state
@@ -2789,6 +2792,63 @@ impl Engine {
             .load()
             .get(table_name)
             .cloned()
+    }
+
+    /// 6c-3 — EAGER COLD-TIER MAINTENANCE AT COMMIT: for each committed table that HAS a cold
+    /// entry, patch it in place (O(delta) via the 6c-1 patcher) so subsequent READS never pay the
+    /// maintenance. Self-gating on entry existence (no flag — the no-flag mandate); entirely
+    /// best-effort (any failure -> the read path patches lazily as before; NEVER fails the
+    /// already-durable commit); runs post-publish under the held commit mutex (committed_seq
+    /// frozen -> the settled proof is trivial). Catalog resolution uses the PUBLISHED snapshot,
+    /// never the latch (the rehydrate lesson). First builds stay LAZY on first read (an eager
+    /// O(table) first build would stall the commit; its deletion is the sealed-shards-primary arc).
+    pub(crate) fn maintain_streaming_cold_on_commit(
+        &self,
+        tables: &std::collections::BTreeSet<String>,
+    ) {
+        if tables.is_empty() {
+            return;
+        }
+        let map = self.read_state.residency.streaming_cold_chunks.load();
+        for table_name in tables {
+            let Some(entry) = map.get(table_name).cloned() else {
+                continue;
+            };
+            let current = self
+                .read_state
+                .mvcc
+                .table_rows(table_name)
+                .generation_payload();
+            if Arc::ptr_eq(&entry.generation, &current) {
+                continue; // already fresh
+            }
+            let Some(table) = self
+                .catalog_snapshot()
+                .relational_catalog
+                .get(table_name)
+                .cloned()
+            else {
+                continue;
+            };
+            // 6c-3 (audit MEDIUM): BOUND the eager work — the hook runs synchronously under the
+            // GLOBAL commit mutex, so a bulk write's tail rebuild (possibly with spill-file IO)
+            // must never head-of-line-block every committer. Oversized deltas defer to the lazy
+            // read-path patch (the unchanged correctness backstop).
+            let changed = entry.generation.rows.changed_tuple_ids(&current.rows);
+            if changed.len() > EAGER_PATCH_MAX_DELTA_ROWS {
+                continue;
+            }
+            let copin_s = self.committed_seq();
+            let _ = self.patch_streaming_cold(
+                table_name,
+                &table,
+                &entry,
+                &current,
+                copin_s,
+                entry.chunk_target_bytes,
+                true,
+            );
+        }
     }
 
     /// S-E.6: the table's valid cold-tier chunks, or `None` (miss -> the caller scans + captures).
@@ -2825,6 +2885,7 @@ impl Engine {
                 &current,
                 copin_s,
                 chunk_target_bytes,
+                false,
             ) {
                 self.read_state
                     .residency
@@ -2870,7 +2931,7 @@ impl Engine {
     /// `rehydrate_elided_serialized` pattern). CAP policy (audit F2): an entry alone over the cap
     /// never installs (rebuild-then-clear thrash); a combined breach evicts the OTHER entries.
     fn install_streaming_cold(&self, table_name: &str, builder: ColdCacheBuilder) -> bool {
-        self.install_streaming_cold_inner(table_name, builder, false)
+        self.install_streaming_cold_inner(table_name, builder, false, false)
     }
 
     /// `is_patch` keeps the BUILD counter honest (a patch re-install is not a fresh build — audit
@@ -2880,6 +2941,15 @@ impl Engine {
         table_name: &str,
         builder: ColdCacheBuilder,
         is_patch: bool,
+        // 6c-3: the caller IS the serialized committer (both engine_commit hook sites hold the
+        // commit mutex — one with the internal-read flag UNSET, so inference would deadlock;
+        // explicit beats inference). NOTE (audit): committed_seq is NOT frozen under this mutex —
+        // intent lanes publish it LOCK-FREE off this path — the actual safety is (a) the STRICT
+        // EQUALITY guard below (a concurrent bump FAILS the install — a safe miss, never a
+        // higher-stamp pass), (b) generation ptr identity (every write COW-publishes a fresh Arc),
+        // and (c) per-read visibility at replay. Never weaken the generation check on a
+        // frozen-seq assumption.
+        commit_lock_held: bool,
     ) -> bool {
         // A spill IO error poisoned the capture: the chunk list is incomplete — never install it.
         if builder.poisoned {
@@ -2900,10 +2970,16 @@ impl Engine {
         if builder.total_payload_bytes > class_cap {
             return false;
         }
-        if self.mvcc_read_skips_leader_check() {
-            return false;
-        }
-        let _commit_guard = self.commit_state();
+        let _commit_guard = if commit_lock_held {
+            None
+        } else {
+            if self.mvcc_read_skips_leader_check() {
+                // Mid-commit INTERNAL READ (not our hook): acquiring the lock would self-deadlock
+                // and the boundary is mid-mutation — skip installing (the read path rebuilds).
+                return false;
+            }
+            Some(self.commit_state())
+        };
         let current = self.read_state.mvcc.table_rows(table_name).generation_payload();
         if !Arc::ptr_eq(&builder.generation, &current)
             || self.committed_seq() != builder.build_copin_s

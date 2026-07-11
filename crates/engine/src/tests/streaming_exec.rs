@@ -1240,3 +1240,68 @@ fn gpu_streaming_cold_tier_patches_deltas_chunk_granular() {
         "insert-into-empty patches (sentinel -> tail) without a panic"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_cold_tier_eager_commit_maintenance() {
+    // 6c-3: a COMMIT eagerly patches the table's cold entry (best-effort, under the held commit
+    // mutex, O(delta)) — the patch counter moves AT COMMIT TIME, before any read; the next read is
+    // a CLEAN HIT (no read-time patch). Reads never pay the maintenance.
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE big (a INT)").unwrap();
+    const N: i32 = 1500;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i})"));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO big (a) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+
+    // First read builds the entry.
+    let count = |e: &Engine| {
+        e.execute_relational_select(&select("SELECT COUNT(*) FROM big"))
+            .unwrap()
+            .rows
+            .clone()
+            .into_boxed()
+    };
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
+    assert_eq!(e.streaming_cold_patches(), 0);
+
+    // THE COMMIT ITSELF patches — no read in between.
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)").unwrap();
+    assert_eq!(
+        e.streaming_cold_patches(),
+        1,
+        "the COMMIT must have eagerly patched the cold entry (before any read)"
+    );
+
+    // The next read is a CLEAN HIT: correct result, no read-time patch.
+    let hits_before = e.streaming_cold_hits();
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N) + 1)]]);
+    assert_eq!(e.streaming_cold_patches(), 1, "no read-time patch — the read was a clean hit");
+    assert!(e.streaming_cold_hits() > hits_before);
+
+    // A DELETE commit patches eagerly too (one dirty chunk).
+    let rebuilt_before = e.streaming_cold_chunks_rebuilt();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM big WHERE a = 3").unwrap();
+    assert_eq!(e.streaming_cold_patches(), 2, "the DELETE commit patched eagerly");
+    assert_eq!(
+        e.streaming_cold_chunks_rebuilt(),
+        rebuilt_before + 1,
+        "exactly one dirty chunk rebuilt at commit"
+    );
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
+}

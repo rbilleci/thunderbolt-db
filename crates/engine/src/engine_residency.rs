@@ -10031,6 +10031,88 @@ impl Engine {
     /// immediately (proof metadata is allocation-time); the allocation must not be kernel-read until
     /// the returned pending copy's `wait()`. Falls back to the synchronous copy transparently when
     /// async staging is unavailable (`wait()` is then a no-op).
+    /// 6c-3 (adopting the 6c-1 audit's F4): the payload + descriptor WITHOUT any upload — the cold
+    /// tier's rebuild/eager-maintenance path constructs chunks for LATER replay (stage_cold_chunk
+    /// stamps a fresh proof per upload), so building here must not spend a throwaway DMA — least of
+    /// all on the COMMIT path. `device_memory_proof` is None until a replay stamps it.
+    pub(crate) fn build_transient_relation_payload_only(
+        &self,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+    ) -> Result<(RelationalResidencySnapshot, Vec<u8>), ExecuteError> {
+        let (snapshot, payload) = self.build_transient_parts(table, rows)?;
+        Ok((snapshot, payload))
+    }
+
+    /// The shared payload+descriptor construction (no device work).
+    fn build_transient_parts(
+        &self,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+    ) -> Result<(RelationalResidencySnapshot, Vec<u8>), ExecuteError> {
+        let gpu_id = self.planner.default_gpu_id();
+        let column_names: Vec<String> = table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
+        let resident_device_int4_columns = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let resident_device_int8_columns = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let resident_device_numeric_columns = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let (
+            device_payload,
+            resident_device_text_columns,
+            resident_device_bool_columns,
+            resident_device_int4_column_stats,
+            _resident_device_b128_columns,
+            resident_device_null_columns,
+        ) = build_relational_device_payload(&column_names, &column_types, rows)?;
+        let snapshot = RelationalResidencySnapshot {
+            gpu_id,
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            generation: 1,
+            row_count: rows.len(),
+            capacity: rows.len(),
+            column_count: table.columns.len(),
+            resident_bytes: device_payload.len() as u64,
+            resident_device_int4_columns,
+            resident_device_int4_column_stats,
+            resident_device_int8_columns,
+            resident_device_numeric_columns,
+            resident_device_bool_columns,
+            resident_device_text_columns,
+            resident_device_null_columns,
+            valid_through_index: self.committed_seq(),
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            invalidated_by_memory_pressure: false,
+            memory_pressure_active: false,
+            last_refresh_cost: None,
+            admission_budget_bytes: None,
+            resident_bytes_after_admission: 0,
+            evicted_tables_on_admission: Vec::new(),
+            device_memory_proof: None,
+        };
+        Ok((snapshot, device_payload))
+    }
+
     pub(crate) fn build_transient_relation_residency_async(
         &self,
         table: &RelationalTable,
