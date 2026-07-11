@@ -4587,8 +4587,6 @@ impl Engine {
         filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
         visibility: StorageVisibility,
     ) -> Option<(ClassDmlMatches, u64)> {
-        let predicate =
-            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)?;
         let entry = self
             .read_state
             .residency
@@ -4597,6 +4595,25 @@ impl Engine {
             .get(&table.name)
             .cloned()?;
         let epoch = entry.entry_epoch;
+        // P5-3: an Eq-on-unique-key WHERE locates via the CHUNK KEY-INDEX PROBE — one device
+        // locate + per-hit slot rechecks — instead of the full fold scan over every chunk, and
+        // its matches materialize from the RECHECKED slots (the reverse-gather decoder stays
+        // off the point-DML hot path). Anything else (range/OR/NULL/no covering key/any probe
+        // failure) falls to the fold path below — never a decline.
+        if let Some(matches) = self.resolve_class_dml_via_key_probe(
+            table,
+            filter_groups,
+            visibility.read_txn_id,
+            &entry,
+        ) {
+            self.read_state
+                .residency
+                .chunk_class_dml_key_locates
+                .fetch_add(1, Ordering::Relaxed);
+            return Some((matches, epoch));
+        }
+        let predicate =
+            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)?;
         let located =
             self.locate_streaming_cold_slots(table, &predicate, visibility.read_txn_id)?;
         let mut matches: ClassDmlMatches = Vec::new();
@@ -4611,6 +4628,99 @@ impl Engine {
             }
         }
         Some((matches, epoch))
+    }
+
+    /// P5-3 — the by-key DML locate: serve a single-group ALL-Eq WHERE that covers some unique
+    /// index's key columns through the chunk key-index probe + the P5-0 slot recheck. Returns
+    /// the FULLY-FILTERED matches (every predicate of the group re-applied host-side on the
+    /// materialized row — `select_filter_matches`, the scan arm's exact twin), with images taken
+    /// from the rechecked slots (live at `rtx`; a dup-tolerant probe can also surface dead or
+    /// colliding slots — the recheck masks/filters them). `None` = NOT ELIGIBLE or any failure —
+    /// the caller falls to the fold locate (never a decline, never a wrong answer).
+    fn resolve_class_dml_via_key_probe(
+        &self,
+        table: &RelationalTable,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        rtx: Index,
+        entry: &Arc<ColdTableChunks>,
+    ) -> Option<ClassDmlMatches> {
+        // Audit MEDIUM (P5-3): mirror the fold locate's `rtx < freeze` DECLINE exactly — a
+        // sub-freeze reader boundary must drive the caller's DE-AUTH (the frozen chains serve
+        // it), never a silent 0-row DML (every class chunk is born at-or-above the freeze, so
+        // the recheck's born gate would mask ALL hits and quietly bypass the safety valve).
+        if let Some(freeze) = self.table_chunk_authoritative(&table.name) {
+            if rtx < freeze {
+                return None;
+            }
+        }
+        let [group] = filter_groups else {
+            return None; // OR groups keep the fold
+        };
+        if group.is_empty()
+            || group
+                .iter()
+                .any(|(_, op, value)| *op != SelectFilterOp::Eq || matches!(value, SqlValue::Null))
+        {
+            return None; // range / NULL-Eq keep the fold (host WHERE-NULL semantics ride it)
+        }
+        let eq_positions: std::collections::BTreeMap<usize, &SqlValue> =
+            group.iter().map(|(idx, _, value)| (*idx, value)).collect();
+        // The FIRST unique index fully covered by the Eq columns carries the probe.
+        let (key_id, positions) =
+            table
+                .indexes
+                .iter()
+                .enumerate()
+                .find_map(|(key_id, index)| {
+                    if !index.unique {
+                        return None;
+                    }
+                    let positions =
+                        crate::engine_residency::index_key_column_positions(table, index)?;
+                    positions
+                        .iter()
+                        .all(|position| eq_positions.contains_key(position))
+                        .then_some((key_id, positions))
+                })?;
+        // Synthesize the needle row: key positions carry the Eq values (chunk_key_needle reads
+        // ONLY the key positions).
+        let mut needle_row: Vec<SqlValue> = vec![SqlValue::Null; table.columns.len()];
+        for &position in &positions {
+            needle_row[position] = (*eq_positions.get(&position)?).clone();
+        }
+        let needle = Self::chunk_key_needle(table, &positions, &needle_row)?;
+        let chunk_indexes = self.ensure_chunk_key_indexes(table, entry, &positions, key_id)?;
+        let hits = self.probe_chunk_key_indexes(&chunk_indexes, &[needle])?;
+        let mut per_chunk: std::collections::BTreeMap<usize, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for (position, slot) in hits.first()? {
+            per_chunk.entry(*position).or_default().push(*slot);
+        }
+        let mut matches: ClassDmlMatches = Vec::new();
+        for (position, slots) in per_chunk {
+            let chunk = entry.chunks.get(position)?;
+            let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
+            let (src, _vis) = staged.ready().ok()?;
+            for slot in slots {
+                let Some(row) =
+                    self.materialize_cold_chunk_slot(table, chunk, &src, slot as usize, rtx)?
+                else {
+                    continue; // dead at rtx — exactly the fold's visibility exclusion
+                };
+                // Re-apply the WHOLE group host-side: fingerprint collisions fail the key Eq,
+                // and non-key residual predicates filter here (parity with the scan arm).
+                if !group
+                    .iter()
+                    .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
+                {
+                    continue;
+                }
+                let pseudo_id = ((position as u64) << 32) | u64::from(slot);
+                let key = crate::rel_exec_helpers::relational_row_key(&table.name, pseudo_id);
+                matches.push((pseudo_id, key, row));
+            }
+        }
+        Some(matches)
     }
 
     /// P4-2b-ii — the commit hook's STAMP arm: verify the COORDINATE TOKEN (the entry installed
@@ -5006,7 +5116,11 @@ impl Engine {
         for n in 0..needles.len() {
             let count = result.count[n];
             if count == u32::MAX {
-                return None; // overflow: more hits than the window — decline (conservative)
+                // Overflow: more same-fingerprint hits than the window. The kernel MUST set the
+                // u32::MAX sentinel (never truncate) — P5-3 made this load-bearing for DML: a
+                // truncated window would be a silently MISSED DML match (data loss), not just a
+                // missed uniqueness conflict. Decline -> the fold path serves the statement.
+                return None;
             }
             let mut hits = Vec::with_capacity(count as usize);
             for h in 0..count as usize {
@@ -5156,6 +5270,15 @@ impl Engine {
         self.read_state
             .residency
             .chunk_class_unique_probe_conflicts
+            .load(Ordering::Relaxed)
+    }
+    /// P5-3 telemetry: class DML statements whose locate RAN through the key-index probe —
+    /// counts probe-eligible executions (including 0-hit misses and residual-filtered-out
+    /// statements), NOT rows located.
+    pub fn chunk_class_dml_key_locates(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_dml_key_locates
             .load(Ordering::Relaxed)
     }
 

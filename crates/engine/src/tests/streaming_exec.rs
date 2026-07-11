@@ -4405,3 +4405,237 @@ fn gpu_chunk_class_keyed_text_key_probe_and_replay() {
     assert_eq!(count, count_live, "replayed cardinality differs (C2)");
     assert_eq!(sum, sum_live, "replayed values differ (C2)");
 }
+
+/// P5-3 — BY-KEY DML LOCATE: an Eq-on-unique-key WHERE resolves through the chunk key-index
+/// probe (one device locate + slot rechecks) instead of the full fold scan, with matches
+/// materialized from the rechecked slots — the reverse-gather decoder stays off the point-DML
+/// hot path. Residual non-key predicates re-filter host-side; misses and dead keys yield 0-row
+/// DML; range WHERE keeps the fold. The differential twin: the same logical history driven
+/// through range predicates (the fold path) must land the identical state.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_keyed_dml_key_locate() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    for table in ["kp", "kf"] {
+        seq += 1;
+        e.execute_text(
+            seq,
+            &format!("CREATE TABLE {table} (a INT PRIMARY KEY, v INT)"),
+        )
+        .unwrap();
+        const N: i32 = 1000;
+        let mut values = String::new();
+        for i in 0..N {
+            if i > 0 {
+                values.push(',');
+            }
+            values.push_str(&format!("({i}, {})", i * 10));
+        }
+        seq += 1;
+        e.execute_text(seq, &format!("INSERT INTO {table} (a, v) VALUES {values}"))
+            .unwrap();
+    }
+    e.set_relational_residency_budget_bytes(0, 8192);
+    for table in ["kp", "kf"] {
+        let _ = e
+            .execute_relational_select(&select(&format!("SELECT COUNT(*) FROM {table}")))
+            .unwrap();
+        seq += 1;
+        e.execute_text(
+            seq,
+            &format!("INSERT INTO {table} (a, v) VALUES (100000, -1)"),
+        )
+        .unwrap();
+    }
+    assert_eq!(e.chunk_class_entries(), 2, "both twins classed");
+
+    // THE PROBE TWIN (kp): point DML by key. THE FOLD TWIN (kf): the same logical ops through
+    // range predicates (`a >= k AND a <= k` is 2 non-Eq filters -> the fold locate).
+    let key_locates_0 = e.chunk_class_dml_key_locates();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kp WHERE a = 500").unwrap();
+    assert!(
+        e.chunk_class_dml_key_locates() > key_locates_0,
+        "the point DELETE rode the key probe"
+    );
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kf WHERE a >= 500 AND a <= 500")
+        .unwrap();
+
+    seq += 1;
+    e.execute_text(seq, "UPDATE kp SET v = 12345 WHERE a = 700")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "UPDATE kf SET v = 12345 WHERE a >= 700 AND a <= 700")
+        .unwrap();
+
+    // Residual predicate: key matches, non-key predicate does NOT -> 0-row DML.
+    let key_locates_1 = e.chunk_class_dml_key_locates();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kp WHERE a = 701 AND v = -999")
+        .unwrap();
+    assert!(
+        e.chunk_class_dml_key_locates() > key_locates_1,
+        "the residual-predicate DELETE still rode the probe"
+    );
+    seq += 1;
+    e.execute_text(
+        seq,
+        "DELETE FROM kf WHERE a >= 701 AND a <= 701 AND v = -999",
+    )
+    .unwrap();
+
+    // A missing key and a DEAD key: 0-row DML, no error, still classed.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kp WHERE a = 987654")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kp WHERE a = 500").unwrap();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kf WHERE a >= 987654 AND a <= 987654")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kf WHERE a >= 500 AND a <= 500")
+        .unwrap();
+    assert_eq!(e.chunk_class_deauths(), 0, "every shape stayed classed");
+
+    // THE DIFFERENTIAL: identical final state on both twins.
+    for q in [
+        "SELECT COUNT(*) FROM {T}",
+        "SELECT SUM(v) FROM {T}",
+        "SELECT SUM(a) FROM {T}",
+        "SELECT COUNT(*) FROM {T} WHERE v = 12345",
+    ] {
+        let probe = e
+            .execute_relational_select(&select(&q.replace("{T}", "kp")))
+            .unwrap()
+            .rows
+            .row(0)
+            .to_vec();
+        let fold = e
+            .execute_relational_select(&select(&q.replace("{T}", "kf")))
+            .unwrap()
+            .rows
+            .row(0)
+            .to_vec();
+        assert_eq!(probe, fold, "probe/fold divergence on {q}");
+    }
+    // And the closed form: 1001 rows - 1 deleted; v updated on one row.
+    let q = select("SELECT COUNT(*) FROM kp");
+    match e.execute_relational_select(&q).unwrap().rows.row(0)[0] {
+        SqlValue::Int8(n) => assert_eq!(n, 1000),
+        ref other => panic!("count: {other:?}"),
+    }
+}
+
+/// P5-3 (audit LOW) — COMPOUND-KEY DML through the probe: the by-key locate on a (a, b) PK
+/// rides the FOLDED fingerprint needle (not the raw-i32 fast path) — a needle/build divergence
+/// here is a silently MISSED DML match (lost delete/update), so the probe twin (Eq on both key
+/// columns) differentials against the fold twin (range predicates) over the identical history.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_keyed_compound_dml_key_locate() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    for table in ["cp", "cf"] {
+        seq += 1;
+        e.execute_text(
+            seq,
+            &format!("CREATE TABLE {table} (a INT, b INT, v INT, PRIMARY KEY (a, b))"),
+        )
+        .unwrap();
+        const N: i32 = 1000;
+        let mut values = String::new();
+        for i in 0..N {
+            if i > 0 {
+                values.push(',');
+            }
+            values.push_str(&format!("({i}, {}, {})", i * 3, i * 10));
+        }
+        seq += 1;
+        e.execute_text(
+            seq,
+            &format!("INSERT INTO {table} (a, b, v) VALUES {values}"),
+        )
+        .unwrap();
+    }
+    e.set_relational_residency_budget_bytes(0, 8192);
+    for table in ["cp", "cf"] {
+        let _ = e
+            .execute_relational_select(&select(&format!("SELECT COUNT(*) FROM {table}")))
+            .unwrap();
+        seq += 1;
+        e.execute_text(
+            seq,
+            &format!("INSERT INTO {table} (a, b, v) VALUES (100000, 0, -1)"),
+        )
+        .unwrap();
+    }
+    assert_eq!(e.chunk_class_entries(), 2, "both compound twins classed");
+
+    // Point DELETE + UPDATE by the FULL compound key (probe twin) vs range (fold twin).
+    let key_locates_0 = e.chunk_class_dml_key_locates();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM cp WHERE a = 500 AND b = 1500")
+        .unwrap();
+    assert!(
+        e.chunk_class_dml_key_locates() > key_locates_0,
+        "the compound point DELETE rode the folded-needle probe"
+    );
+    seq += 1;
+    e.execute_text(
+        seq,
+        "DELETE FROM cf WHERE a >= 500 AND a <= 500 AND b >= 1500 AND b <= 1500",
+    )
+    .unwrap();
+    seq += 1;
+    e.execute_text(seq, "UPDATE cp SET v = 777 WHERE a = 700 AND b = 2100")
+        .unwrap();
+    seq += 1;
+    e.execute_text(
+        seq,
+        "UPDATE cf SET v = 777 WHERE a >= 700 AND a <= 700 AND b >= 2100 AND b <= 2100",
+    )
+    .unwrap();
+    // A partial-key Eq (only `a`) does NOT cover the compound index -> the fold serves it.
+    let key_locates_1 = e.chunk_class_dml_key_locates();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM cp WHERE a = 600").unwrap();
+    assert_eq!(
+        e.chunk_class_dml_key_locates(),
+        key_locates_1,
+        "a partial key must NOT ride the probe"
+    );
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM cf WHERE a >= 600 AND a <= 600")
+        .unwrap();
+    assert_eq!(e.chunk_class_deauths(), 0, "every shape stayed classed");
+
+    for q in [
+        "SELECT COUNT(*) FROM {T}",
+        "SELECT SUM(v) FROM {T}",
+        "SELECT SUM(b) FROM {T}",
+        "SELECT COUNT(*) FROM {T} WHERE v = 777",
+    ] {
+        let probe = e
+            .execute_relational_select(&select(&q.replace("{T}", "cp")))
+            .unwrap()
+            .rows
+            .row(0)
+            .to_vec();
+        let fold = e
+            .execute_relational_select(&select(&q.replace("{T}", "cf")))
+            .unwrap()
+            .rows
+            .row(0)
+            .to_vec();
+        assert_eq!(probe, fold, "compound probe/fold divergence on {q}");
+    }
+}

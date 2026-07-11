@@ -710,6 +710,8 @@ pub(crate) struct ResidencyReadState {
     pub(crate) chunk_class_unique_probes: std::sync::atomic::AtomicU64,
     /// P5-2: duplicates the device probe REJECTED (a recheck-confirmed conflict).
     pub(crate) chunk_class_unique_probe_conflicts: std::sync::atomic::AtomicU64,
+    /// P5-3: class DML locates served by the KEY-INDEX PROBE (vs the full fold scan).
+    pub(crate) chunk_class_dml_key_locates: std::sync::atomic::AtomicU64,
     /// VACUUM #5: per-table count of incremental tombstone stamps since the last rebuild —
     /// the CHURN signal (each SV4b/SV5/A4b tombstone adds a dead slot; enough of them degrade
     /// the PK index to dup-declines and bloat scans). Reset by vacuum/re-admit. Serialized-path
