@@ -96,7 +96,7 @@ enum ChunkOutcome {
 /// the interim MVCC-store decode, ADR-006 deletion debt retired by the raw-shard-bytes cold tier, S-E.6).
 /// Residency invariant: at most TWO chunks are transiently resident (one uploading + one computing),
 /// each <= the chunk target = budget/2, so the total stays <= the budget.
-struct StagedChunk {
+pub(crate) struct StagedChunk {
     snapshot: RelationalResidencySnapshot,
     pending: gpu_db_execution::PendingCudaResidentDeviceCopy,
     row_count: u64,
@@ -110,7 +110,7 @@ impl StagedChunk {
     /// Block until the upload completes and wrap the chunk as an executor source. Returns the
     /// chunk's tombstone mask (if any) beside the source — the caller threads it into the
     /// per-chunk execute.
-    fn ready(
+    pub(crate) fn ready(
         self,
     ) -> Result<
         (
@@ -176,7 +176,7 @@ static COLD_ENTRY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub(crate) struct ColdChunk {
     payload: ColdPayload,
     snapshot: RelationalResidencySnapshot,
-    row_count: u64,
+    pub(crate) row_count: u64,
     /// 6c-1: the INCLUSIVE TupleId range this chunk's rows were scanned from (scan order IS
     /// TupleId order — the S-E.2 determinism fact). `(1, 0)` = the empty chunk (no rows). A write's
     /// changed TupleIds map to dirty chunks through these ranges; untouched ranges REUSE their
@@ -2645,7 +2645,7 @@ impl Engine {
 
     /// S-E.6: stage one COLD chunk — re-upload the cached device payload bytes (async copy stream),
     /// with a fresh proof stamped onto the cached descriptor template. No decode, no assembly.
-    fn stage_cold_chunk(
+    pub(crate) fn stage_cold_chunk(
         &self,
         chunk: &ColdChunk,
         reader_copin_s: Index,
@@ -5048,6 +5048,151 @@ impl Engine {
                 .fetch_add(restored as u64, Ordering::Relaxed);
         }
         restored
+    }
+}
+
+// ---------------- P5-0: THE DEVICE SLOT RECHECK (one slot, from the staged buffer) ----------------
+//
+// The chunk analog of `materialize_resident_row_via_hit` (design review M1): a uniqueness/by-key
+// probe hit rechecks by reading ONLY the hit slot's bytes from the ALREADY-STAGED device chunk
+// buffer — O(1) DtoH per column per hit — honoring the sidecar mask for that slot. NEVER the
+// whole-chunk host decode (O(chunk)/hit, and a hot-path use of the reverse-gather debt). The
+// row values it returns are readback coercions (the charter's single-final-readback carve-out).
+
+impl Engine {
+    /// CALLER CONTRACT (audit LOW): `src` MUST be the staged buffer of THIS `chunk` (layout and
+    /// mask come from `chunk`; values from `src.device_memory`) and the recheck rtx must match
+    /// the snapshot the probe ran at — stage-and-recheck one chunk in one step. The born gate is
+    /// applied per-slot here (defensive; equal to the folds' chunk-level exclusion because the
+    /// boundary is whole-chunk).
+    /// Materialize ONE slot of a staged cold chunk from the DEVICE buffer. Returns:
+    /// `Some(Some(row))` — the slot is live at `rtx` (sidecar honored); `Some(None)` — the slot
+    /// is tombstoned at-or-below `rtx` (a masked probe hit: NOT a conflict); `None` — decline
+    /// (any read failure; the caller treats it as it treats every decline: conservatively).
+    /// The sidecar is read HOST-side from the chunk (it lives beside the payload as host bytes);
+    /// the VALUES read from the device via the descriptor's offset helpers — the same layout
+    /// authority every device reader uses.
+    // Production caller = P5-2 (the uniqueness probe's recheck); the differential gates it now.
+    #[allow(dead_code)]
+    pub(crate) fn materialize_cold_chunk_slot(
+        &self,
+        table: &RelationalTable,
+        chunk: &ColdChunk,
+        src: &crate::engine_expr::ResidentExecSource,
+        slot: usize,
+        rtx: Index,
+    ) -> Option<Option<Vec<SqlValue>>> {
+        use crate::relational_model::{
+            resident_device_bool_column_offset, resident_device_int4_column_offset,
+            resident_device_int8_column_offset, resident_device_numeric_column_offset,
+            resident_device_text_column_layout,
+        };
+        if slot >= chunk.row_count as usize {
+            return None;
+        }
+        // Born gate + sidecar mask (host-side metadata; the values live on the device).
+        if chunk.payload_copin_s > rtx {
+            return Some(None);
+        }
+        if let Some(sidecar) = &chunk.deleted_by {
+            let raw = i64::from_le_bytes(sidecar.get(slot * 8..slot * 8 + 8)?.try_into().ok()?);
+            if raw <= rtx as i64 {
+                return Some(None);
+            }
+        }
+        let d = &chunk.snapshot;
+        let memory = &src.device_memory;
+        let null_bit = |name: &str| -> Option<bool> {
+            // 1 = valid; absent bitmap = all valid.
+            match d.resident_device_null_columns.iter().find(|n| n.name == name) {
+                None => Some(true),
+                Some(layout) => {
+                    let word_off = layout.bitmap_byte_offset + ((slot as u64 / 32) * 4);
+                    let words = memory.read_resident_i32_column(word_off, 1).ok()?;
+                    Some((words.first().copied()? as u32 >> (slot % 32)) & 1 == 1)
+                }
+            }
+        };
+        let mut row: Vec<SqlValue> = Vec::with_capacity(table.columns.len());
+        for (idx, column) in table.columns.iter().enumerate() {
+            if !null_bit(&column.name)? {
+                row.push(SqlValue::Null);
+                continue;
+            }
+            let value = match column.ty {
+                SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
+                    let base = resident_device_int4_column_offset(d, table, idx).ok()?;
+                    let v = *memory
+                        .read_resident_i32_column(base + (slot as u64) * 4, 1)
+                        .ok()?
+                        .first()?;
+                    match column.ty {
+                        SqlType::Date => SqlValue::Date(v),
+                        SqlType::Int2 => SqlValue::Int2(v as i16),
+                        _ => SqlValue::Int4(v),
+                    }
+                }
+                SqlType::Int8 | SqlType::Timestamp => {
+                    let base = resident_device_int8_column_offset(d, table, idx).ok()?;
+                    let halves = memory
+                        .read_resident_i32_column(base + (slot as u64) * 8, 2)
+                        .ok()?;
+                    let v = ((*halves.first()? as u32 as u64)
+                        | ((*halves.get(1)? as u32 as u64) << 32)) as i64;
+                    if column.ty == SqlType::Timestamp {
+                        SqlValue::Timestamp(v)
+                    } else {
+                        SqlValue::Int8(v)
+                    }
+                }
+                SqlType::Numeric { .. } | SqlType::Uuid => {
+                    let base = resident_device_numeric_column_offset(d, table, idx).ok()?;
+                    let words = memory
+                        .read_resident_i32_column(base + (slot as u64) * 16, 4)
+                        .ok()?;
+                    let mut raw = [0u8; 16];
+                    for (w, word) in words.iter().enumerate() {
+                        raw[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                    if column.ty == SqlType::Uuid {
+                        SqlValue::Uuid(raw)
+                    } else {
+                        let SqlType::Numeric { scale, .. } = column.ty else {
+                            unreachable!()
+                        };
+                        SqlValue::Numeric(gpu_db_sql::Decimal128::new(
+                            i128::from_le_bytes(raw),
+                            scale,
+                        ))
+                    }
+                }
+                SqlType::Bool => {
+                    let base = resident_device_bool_column_offset(d, table, idx).ok()?;
+                    let word_off = base + ((slot as u64 / 32) * 4);
+                    let words = memory.read_resident_i32_column(word_off, 1).ok()?;
+                    SqlValue::Bool((*words.first()? as u32 >> (slot % 32)) & 1 == 1)
+                }
+                SqlType::Text => {
+                    let layout = resident_device_text_column_layout(d, table, idx).ok()?;
+                    let bounds = memory
+                        .read_resident_u64_column(
+                            layout.offsets_byte_offset + (slot as u64) * 8,
+                            2,
+                        )
+                        .ok()?;
+                    let (lo, hi) = (*bounds.first()?, *bounds.get(1)?);
+                    // Audit LOW: corrupt bounds (hi < lo) DECLINE like the host decoder — never
+                    // a debug-panic on the subtraction.
+                    let span_len = hi.checked_sub(lo)? as usize;
+                    let span = memory
+                        .read_resident_bytes(layout.bytes_byte_offset + lo, span_len)
+                        .ok()?;
+                    SqlValue::Text(String::from_utf8(span).ok()?)
+                }
+            };
+            row.push(value);
+        }
+        Some(Some(row))
     }
 }
 

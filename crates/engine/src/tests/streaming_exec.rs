@@ -3336,3 +3336,94 @@ fn gpu_chunk_class_compaction_deletes_dead_slots() {
     assert_eq!(e.chunk_class_deauths(), 1);
     assert_eq!(sum_a(&e), expected_sum - 500, "the de-authed store is value-exact");
 }
+
+/// P5-0 — THE DEVICE SLOT RECHECK differential: for every slot of a staged mixed-type
+/// NULL-bearing chunk, the single-slot device materialization must equal the P4-1 host
+/// decoder's row exactly, and the sidecar/born masks must agree (a stamped slot returns
+/// Some(None) at-or-above its stamp and the live row below it).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_device_slot_recheck_matches_host_decoder() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(
+        seq,
+        "CREATE TABLE mix (a INT, s SMALLINT, big BIGINT, d DATE, ts TIMESTAMP, \
+         n NUMERIC(10,2), flag BOOL, t TEXT, u UUID)",
+    )
+    .unwrap();
+    const N: i32 = 300;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        let t = if i % 7 == 0 { "NULL".into() } else { format!("'txt{:04}'", i) };
+        let n = if i % 5 == 0 { "NULL".into() } else { format!("{}.{:02}", i, i % 100) };
+        let big = if i % 11 == 0 { "NULL".into() } else { format!("{}", i64::from(i) * 999_983) };
+        let flag = if i % 17 == 0 { "NULL".into() } else if i % 2 == 0 { "true".into() } else { "false".to_string() };
+        let u = if i % 19 == 0 { "NULL".into() } else { format!("'00000000-0000-0000-0000-{:012x}'", i) };
+        values.push_str(&format!(
+            "({i}, {}, {big}, '2024-{:02}-{:02}', '2024-01-01 00:{:02}:{:02}', {n}, {flag}, {t}, {u})",
+            if i % 13 == 0 { "NULL".to_string() } else { format!("{}", i % 300 - 150) },
+            1 + (i % 12),
+            1 + (i % 28),
+            i % 60,
+            (i * 7) % 60,
+        ));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO mix VALUES {values}")).unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM mix")).unwrap();
+    // Stamp one row so the mask path is exercised (class or store-driven — either stamps).
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM mix WHERE a = 42").unwrap();
+    let rtx = e.committed_seq();
+
+    let table = e.catalog_snapshot().relational_catalog.get("mix").cloned().unwrap();
+    let map = e.read_state.residency.streaming_cold_chunks.load();
+    let entry = map.get("mix").expect("cold entry");
+    let mut checked = 0usize;
+    let mut masked = 0usize;
+    for chunk in &entry.chunks {
+        // Stage once per chunk; recheck every slot against the host decoder.
+        let (staged, _vis) = e
+            .stage_cold_chunk(chunk, rtx)
+            .expect("stage")
+            .ready()
+            .expect("ready");
+        let host_unmasked =
+            crate::engine_streaming_exec::decode_cold_chunk_rows(&table, chunk, 0).unwrap();
+        let host_masked =
+            crate::engine_streaming_exec::decode_cold_chunk_rows(&table, chunk, rtx).unwrap();
+        let mut masked_iter = host_masked.iter();
+        for (slot, expected) in host_unmasked.iter().enumerate() {
+            let got = e
+                .materialize_cold_chunk_slot(&table, chunk, &staged, slot, rtx)
+                .expect("no decline");
+            // Determine liveness from the host sidecar semantics: the unmasked row is always
+            // present; the masked stream skips dead slots.
+            match &got {
+                Some(row) => {
+                    assert_eq!(row, expected, "slot {slot} value mismatch");
+                    assert_eq!(
+                        Some(row),
+                        masked_iter.next(),
+                        "masked-stream alignment at slot {slot}"
+                    );
+                }
+                None => {
+                    masked += 1;
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, N as usize, "every slot rechecked");
+    assert_eq!(masked, 1, "exactly the stamped row masks");
+}
