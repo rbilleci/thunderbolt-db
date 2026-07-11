@@ -6084,6 +6084,8 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn a4c_device_gather_matches_host_store() {
         let e = Engine::new_local();
+        // Host-store oracle premise pinned (see a1_device_row_identity_matches_host_store).
+        e.set_host_install_elision_enabled(false);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
@@ -6147,16 +6149,26 @@ mod capacity_payload_tests {
             "device gather == host store, identity for identity"
         );
 
-        // NULL-bearing table: DECLINE (never NULL-as-0 into a rebuild).
+        // NULL-bearing table: the gather is now NULL-AWARE (the ADR-006 alignment-free
+        // NULL_BITMAP_GATHER work) — it must materialize SqlValue::Null exactly, NEVER decline
+        // (the old decline expectation) and NEVER NULL-as-0.
         e.execute_text(400, "CREATE TABLE n (id INT, v INT)")
             .unwrap();
         e.execute_text(401, "INSERT INTO n (id, v) VALUES (1, NULL), (2, 20)")
             .unwrap();
         let n_table = e.relational_catalog_table("n").unwrap();
+        let gathered = e
+            .gather_resident_table_rows_from_device(&n_table, e.committed_seq())
+            .expect("the NULL-aware gather serves a null-bearing table");
+        let mut rows: Vec<Vec<SqlValue>> = gathered.into_iter().map(|(_, row)| row).collect();
+        rows.sort_by(|a, b| compare_sql_values(&a[0], &b[0]));
         assert_eq!(
-            e.gather_resident_table_rows_from_device(&n_table, e.committed_seq()),
-            None,
-            "a null-bearing table must DECLINE the raw-i32 gather"
+            rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Null],
+                vec![SqlValue::Int4(2), SqlValue::Int4(20)],
+            ],
+            "the gather materializes NULL exactly (never 0, never a decline)"
         );
     }
 
@@ -6841,6 +6853,11 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn a1_device_row_identity_matches_host_store() {
         let e = Engine::new_local();
+        // This differential's ORACLE is the host tuple store — valid only while commits still
+        // install host tuples. Elision (device-authoritative commits, default-eligible for this
+        // shape since the lanes/elision flips) leaves the store intentionally stale, so pin the
+        // oracle's premise OFF for this gate (the elided twin is gated by the A4c device gathers).
+        e.set_host_install_elision_enabled(false);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
