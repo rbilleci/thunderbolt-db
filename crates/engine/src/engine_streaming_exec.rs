@@ -1260,7 +1260,15 @@ impl Engine {
         }
         for (i, aggregate) in aggregates.iter().enumerate() {
             let partial_type = match aggregate.kind {
-                GroupedAggKind::Count => Some(SqlType::Int8),
+                // 6c-0(c) RE-LANDED: Count/Sum-int32 partials are DECLARED Numeric{38,0} so every
+                // merge round's device SUM output matches the column type directly — the per-round
+                // host narrow loop is DELETED; the single PG-type narrow happens once at result
+                // materialization (the readback carve-out). (The first landing exposed the
+                // masked-pass2 phantom-group kernel bug, now fixed + regression-gated.)
+                GroupedAggKind::Count => Some(SqlType::Numeric {
+                    precision: 38,
+                    scale: 0,
+                }),
                 GroupedAggKind::Sum | GroupedAggKind::Min | GroupedAggKind::Max => {
                     let value_type = aggregate.value_column.as_ref().and_then(|name| {
                         table
@@ -1271,7 +1279,10 @@ impl Engine {
                     });
                     match (aggregate.kind, value_type) {
                         (GroupedAggKind::Sum, Some(SqlType::Int2 | SqlType::Int4)) => {
-                            Some(SqlType::Int8)
+                            Some(SqlType::Numeric {
+                                precision: 38,
+                                scale: 0,
+                            })
                         }
                         (GroupedAggKind::Sum, Some(SqlType::Int8)) => Some(SqlType::Numeric {
                             precision: 38,
@@ -1332,20 +1343,26 @@ impl Engine {
         let Ok(merge_bound) = bind_relational_select(&partials_table, &merge_select) else {
             return self.execute_relational_select_cpu_pinned(select);
         };
-        // 6c-0 ATTEMPTED + REVERTED (registered debt, memory `charter-drift-execution-discipline`):
-        // declaring these partials Numeric{38,0} (narrow-once-at-readback) EXPOSED an order-dependent
-        // duplicate-group bug in the grouped merge over b128 partials (uninitialized-scratch class —
-        // see the HANDOVER hazard note). Until that kernel path is fixed, the Int8 partials + the
-        // per-round narrow below stay — the narrow remains REGISTERED host debt, now blocked on the
-        // numeric-grouped-merge hazard, NOT accepted as compliant.
-        let narrow_to_int8: Vec<bool> = aggregates
+        // 6c-0(c): which agg columns are PG-bigint results carried as Numeric{38,0} partials — their
+        // chunk cells (the executor emits Int8 for COUNT / SUM(int2/4)) WRAP to Numeric at the staging
+        // encode, and the merged cells NARROW back to Int8 exactly once, at result materialization
+        // (the readback carve-out; a narrow overflow defers to the CPU path). TYPE-CONSISTENT by
+        // construction: keyed off the DECLARED partial column type.
+        let bigint_as_numeric: Vec<bool> = aggregates
             .iter()
             .zip(partial_types.iter().skip(1))
             .map(|(aggregate, partial_ty)| {
                 matches!(
                     aggregate.kind,
                     GroupedAggKind::Count | GroupedAggKind::Sum
-                ) && matches!(partial_ty, SqlType::Int8)
+                ) && matches!(partial_ty, SqlType::Numeric { .. })
+                    && aggregate.value_column.as_ref().is_none_or(|name| {
+                        table
+                            .columns
+                            .iter()
+                            .find(|c| &c.name == name)
+                            .is_some_and(|c| matches!(c.ty, SqlType::Int2 | SqlType::Int4))
+                    })
             })
             .collect();
 
@@ -1386,6 +1403,7 @@ impl Engine {
                         group_column,
                         &src,
                         &partial_types,
+                        &bigint_as_numeric,
                         &mut partials_acc,
                         &mut partials_bytes,
                     ) {
@@ -1412,6 +1430,7 @@ impl Engine {
                             group_column,
                             &src,
                             &partial_types,
+                            &bigint_as_numeric,
                             &mut partials_acc,
                             &mut partials_bytes,
                         ) {
@@ -1431,7 +1450,6 @@ impl Engine {
                         &merge_bound,
                         copin_s,
                         group_column,
-                        &narrow_to_int8,
                         &mut partials_acc,
                         &mut partials_bytes,
                         &partial_types,
@@ -1486,6 +1504,7 @@ impl Engine {
                             group_column,
                             &src,
                             &partial_types,
+                            &bigint_as_numeric,
                             &mut partials_acc,
                             &mut partials_bytes,
                         ) {
@@ -1517,6 +1536,7 @@ impl Engine {
                             group_column,
                             &src,
                             &partial_types,
+                            &bigint_as_numeric,
                             &mut partials_acc,
                             &mut partials_bytes,
                         ) {
@@ -1536,7 +1556,6 @@ impl Engine {
                             &merge_bound,
                             copin_s,
                             group_column,
-                            &narrow_to_int8,
                             &mut partials_acc,
                             &mut partials_bytes,
                             &partial_types,
@@ -1572,6 +1591,7 @@ impl Engine {
                 group_column,
                 &src,
                 &partial_types,
+                &bigint_as_numeric,
                 &mut partials_acc,
                 &mut partials_bytes,
             ) {
@@ -1593,7 +1613,6 @@ impl Engine {
                 &merge_bound,
                 copin_s,
                 group_column,
-                &narrow_to_int8,
                 &mut partials_acc,
                 &mut partials_bytes,
                 &partial_types,
@@ -1621,6 +1640,7 @@ impl Engine {
                 group_column,
                 &src,
                 &partial_types,
+                &bigint_as_numeric,
                 &mut partials_acc,
                 &mut partials_bytes,
             ) {
@@ -1640,7 +1660,6 @@ impl Engine {
                 &merge_bound,
                 copin_s,
                 group_column,
-                &narrow_to_int8,
                 &mut partials_acc,
                 &mut partials_bytes,
                 &partial_types,
@@ -1656,6 +1675,28 @@ impl Engine {
             self.install_streaming_cold(&select.table, builder);
         }
         let mut rows_out = std::mem::take(&mut partials_acc);
+        // 6c-0(c) readback boundary: the PG-bigint aggregates (COUNT / SUM(int2/4)) rode as
+        // Numeric{38,0} partials; narrow each merged cell to Int8 exactly ONCE, at result
+        // materialization (a narrow overflow defers to the authoritative CPU path — PG's own
+        // "bigint out of range" surface).
+        if !distinct_key_only {
+            for row in &mut rows_out {
+                for (agg_idx, narrow) in bigint_as_numeric.iter().enumerate() {
+                    if !narrow {
+                        continue;
+                    }
+                    let cell = &mut row[agg_idx + 1];
+                    match cell {
+                        SqlValue::Numeric(d) if d.scale == 0 => match i64::try_from(d.mantissa) {
+                            Ok(narrowed) => *cell = SqlValue::Int8(narrowed),
+                            Err(_) => return self.execute_relational_select_cpu_pinned(select),
+                        },
+                        SqlValue::Null | SqlValue::Int8(_) => {}
+                        _ => return self.execute_relational_select_cpu_pinned(select),
+                    }
+                }
+            }
+        }
         // DISTINCT: drop the synthesized COUNT column — the bare distinct keys.
         if distinct_key_only {
             for row in &mut rows_out {
@@ -1702,6 +1743,7 @@ impl Engine {
         group_column: &str,
         src: &ResidentExecSource,
         partial_types: &[SqlType],
+        bigint_as_numeric: &[bool],
         partials_acc: &mut Vec<Vec<SqlValue>>,
         partials_bytes: &mut u64,
     ) -> ChunkOutcome {
@@ -1723,7 +1765,18 @@ impl Engine {
             Err(err) if is_overflow_error(&err) => return ChunkOutcome::Hard(err),
             Err(_) => return ChunkOutcome::Defer,
         };
-        for row in result.rows.into_boxed() {
+        for mut row in result.rows.into_boxed() {
+            // 6c-0(c) staging encode: the executor emits Int8 for COUNT/SUM(int2/4); the partials
+            // relation declares those columns Numeric{38,0} — wrap losslessly (i64 -> i128 mantissa)
+            // so every merge round is type-stable with NO per-round narrow.
+            for (agg_idx, wrap) in bigint_as_numeric.iter().enumerate() {
+                if !wrap {
+                    continue;
+                }
+                if let SqlValue::Int8(n) = row[agg_idx + 1] {
+                    row[agg_idx + 1] = SqlValue::Numeric(Decimal128::new(i128::from(n), 0));
+                }
+            }
             *partials_bytes =
                 partials_bytes.saturating_add(chunk_row_device_bytes(&row, partial_types));
             partials_acc.push(row);
@@ -2274,7 +2327,6 @@ impl Engine {
         merge_bound: &BoundRelationalSelect,
         copin_s: Index,
         group_column: &str,
-        narrow_to_int8: &[bool],
         partials_acc: &mut Vec<Vec<SqlValue>>,
         partials_bytes: &mut u64,
         partial_types: &[SqlType],
@@ -2317,23 +2369,10 @@ impl Engine {
         };
         let mut merged: Vec<Vec<SqlValue>> = Vec::new();
         let mut merged_bytes: u64 = 0;
-        for mut row in result.rows.into_boxed() {
-            // Re-type: merged column i+1 narrows Numeric(_,0) -> Int8 where the partial is Int8-typed
-            // (REGISTERED host debt — see the note at `narrow_to_int8`).
-            for (agg_idx, narrow) in narrow_to_int8.iter().enumerate() {
-                if !narrow {
-                    continue;
-                }
-                let cell = &mut row[agg_idx + 1];
-                match cell {
-                    SqlValue::Numeric(d) if d.scale == 0 => match i64::try_from(d.mantissa) {
-                        Ok(narrowed) => *cell = SqlValue::Int8(narrowed),
-                        Err(_) => return ChunkOutcome::Defer,
-                    },
-                    SqlValue::Null | SqlValue::Int8(_) => {}
-                    _ => return ChunkOutcome::Defer,
-                }
-            }
+        // 6c-0(c): NO per-round re-typing — the merge output's cell types ARE the declared partial
+        // column types (Numeric{38,0} for the PG-bigint aggregates); rounds compose with no host
+        // work. The single PG-type narrow happens at result materialization.
+        for row in result.rows.into_boxed() {
             merged_bytes =
                 merged_bytes.saturating_add(chunk_row_device_bytes(&row, partial_types));
             merged.push(row);

@@ -8729,7 +8729,14 @@ fn launch_cuda_group_by_i32_count_sum(
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
-    let pass2_fn = if value_is_numeric {
+    // PHANTOM-GROUP FIX: pass 2 resolves the numeric MIN/MAX LOW limbs by re-visiting each row's
+    // claimed slot via row_slots -- but pass 1 writes row_slots ONLY inside its min/max block, which
+    // the aggregate mask can skip entirely (mask & 12 == 0, e.g. a grouped SUM(numeric)). Launching
+    // pass 2 then scatters slot_min/slot_max through STALE POOLED row_slots values -- u32 garbage slot
+    // indices = unbounded OOB writes that corrupt adjacent pool allocations (observed: the compactor's
+    // buffers -> phantom groups, order-dependent on pool reuse). Gate pass 2 exactly as pass 1 gates
+    // the block that feeds it: MIN or MAX actually requested.
+    let pass2_fn = if value_is_numeric && (agg_mask & 12) != 0 {
         Some(primary.cached_function(c"gpu_db_group_by_numeric_minmax_lo", &ptx)?)
     } else {
         None
