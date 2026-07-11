@@ -109,6 +109,38 @@ Spec: ARCHITECTURE §7 + §13.
   extended. **EXCLUSIONS:** uniqueness-constrained tables (device-index/fingerprint route later), FK-edged
   tables, elided tables, multi-GPU.
 
+- **S-E.P5 — THE DEVICE INDEX OVER CHUNKS (keyed chunk-authoritative tables; designed 2026-07-11).**
+  Lifts the class's no-PK/UNIQUE exclusion — the gate keeping most real tables in the host engine — and is
+  the named deletion trigger for the reverse-gather decoder. RECON FACTS: the kernels are ALL
+  source-agnostic (`submit_compound_fold_fingerprints` takes a raw base_ptr+offsets; the write-locate /
+  dense-probe kernels take `{index_ptr, mask, shift}` structs; `build_int4_pk_hash_table_host_visible` +
+  `retain_device_memory_copy` build persistent OFF-BUDGET device buffers) — only the cache/lifecycle
+  wrappers are shard-shaped; the dup-tolerant in-place INSERT kernel does NOT apply (chunks are immutable
+  per-epoch; rebuild-not-insert).
+  **DESIGN:**
+  - **CHUNK IDENTITY:** ColdChunk gains a process-monotonic `chunk_id` — assigned at construction,
+    PRESERVED by reuse and sidecar stamps (the payload is untouched; visibility applies at the probe's
+    recheck), ROTATED by rebuild/compaction. The index cache keys `(table, chunk_id, key_id)` — so tail
+    appends build ONE new index (the new chunk's), stamps build none, and compaction invalidates exactly
+    the compacted chunk's.
+  - **THE INDEX:** per chunk, per key: fingerprints via the device fold (compound/text/b128; single-int4
+    reads the column) → `build_int4_pk_hash_table_host_visible` (all-visible build — the sidecar is
+    recheck-time) → one persistent `retain_device_memory_copy` buffer (~8·2·rows bytes), cached like
+    `shard_pk_device_index` but epoch-free. NEW: explicit VRAM accounting for index buffers (none exists
+    today for the shard twin either — add a counter + a cap with LRU eviction, rebuilt on demand).
+  - **INSERT UNIQUENESS (the class-gate lift):** prepare's class arm for keyed tables: in-batch dedup +
+    per-row probe across all chunk indexes (the multi-shard write-locate kernel shape: one launch, all
+    chunks' index ptrs) + the full-tuple recheck via the P4-1 decoder at the hit's (chunk, slot) with the
+    sidecar mask — a masked hit is NOT a conflict (the dup-tolerant advance-past-match discipline).
+  - **BY-KEY DML:** Eq-on-key locates via the index probe instead of the full predicate fold (the fold
+    stays for range WHERE).
+  - **ELIGIBILITY:** `chunk_class_eligible` admits unique-indexed tables once the probe path exists; FK
+    edges stay excluded (their own track).
+  **SLICES:** P5-1 the chunk-index cache + build (counters, cap, eviction); P5-2 the INSERT-uniqueness
+  probe + recheck + the gate lift (differential vs the host validate on a twin); P5-3 by-key DML locate;
+  P5-4 the reverse-gather deletion assessment (its trigger fires when de-auth/DDL exits can run
+  device-side end-to-end — likely still needed for DDL sweeps; re-scope honestly).
+
 **Golden wire tests** (acceptance spec): drive SQL over the real pgwire socket
 (`crates/server/tests/pgwire_roundtrip.rs` pattern), assert exact rows + that the GPU sharded route served them
 (non-vacuous), differential vs 1/N shards/host, **with NULL data**, GPU-guarded.
