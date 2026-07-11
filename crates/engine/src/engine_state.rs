@@ -656,6 +656,11 @@ pub(crate) struct ResidencyReadState {
     pub(crate) streaming_cold_patches: std::sync::atomic::AtomicU64,
     /// STRATA 6c-1: dirty chunks rebuilt across all patches (a one-row write should rebuild ONE).
     pub(crate) streaming_cold_chunks_rebuilt: std::sync::atomic::AtomicU64,
+    /// P1 (sealed-shards-primary): cold-tier tables written into the durable checkpoint artifact.
+    pub(crate) streaming_cold_checkpointed: std::sync::atomic::AtomicU64,
+    /// P1 (sealed-shards-primary): cold-tier tables restored from the checkpoint artifact at reopen
+    /// (the warm-start signal — the first streaming read after recovery replays bytes, no scan).
+    pub(crate) streaming_cold_restored: std::sync::atomic::AtomicU64,
     /// RETIREMENT A4e: tables whose commits ELIDE the host tuple-store + value-index install
     /// (device-authoritative). Entered after first admission when eligible under the default-OFF
     /// flag; LEFT (sticky de-elision) via rehydration when any resolve/gather declines. COW set —

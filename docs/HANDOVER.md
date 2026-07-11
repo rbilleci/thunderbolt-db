@@ -80,9 +80,29 @@ the read path for maintained tables (6c-3, delta-bounded). REMAINING REGISTERED 
 sealed-shards-primary): the cold tier + scan-build machinery (~2.5k LOC — grew this arc but its HOST-RELATIONAL
 content is zero: staging, orchestration cardinality, boundary coercions only); the interim double-residency
 (tuple store + cold bytes). NET: host RELATIONAL computation in the streaming path = ZERO.
-**S-E.6c remaining:** sealed shards as PRIMARY — design BANKED in memory `strata-streaming-executor`
-(P1 checkpoint/manifest recovery via the 6c-1 patcher as WAL-suffix replay; P2 SV2 tombstone sidecars; P3 DML
-resolve via streaming folds; P4 the store deletion for streamed tables). The ADR-006 store deletion follows.
+**>>> ACTIVE ARC (user-ruled 2026-07-11): SEALED-SHARDS-PRIMARY P1..P4 <<<** — design in memory
+`strata-streaming-executor`; P2 SV2 tombstone sidecars; P3 DML resolve via streaming folds; P4 the store
+deletion for streamed tables + the registered cold-tier debt payoff. The ADR-006 store deletion follows.
+**P1 DONE: THE DURABLE COLD CHECKPOINT** — the cold tier survives restarts via the checkpoint model (bulk
+paths are checkpoint-only per the architecture; the WAL stays row-op): `checkpoint_intent_lanes` now also
+writes `<base>.cold-checkpoint.<cut>` (magic + BOUNDARY + per-table signature/chunk-target + per-chunk
+row_count/tuple_range/descriptor/payload bytes + FNV-1a trailer; tmp→fsync→rename→dir-fsync atomic; stale
+cuts swept), and lanes recovery restores it at the SEAM (after checkpoint-records replay, before the lane
+suffix) so the WAL SUFFIX IS THE DELTA STREAM — each suffix record patches the restored entries forward
+through the 6c-1 patcher via the 6c-3 commit hooks. Durable validity = STRICT equality artifact-boundary ==
+seam `committed_seq()` + column-signature guard + recovery determinism (an installed restore is trusted like
+a live build — the store is not re-consulted on hits); every guard failure is a benign skip (first read
+rebuilds). **AUDIT HIGH ADOPTED — THE BOUNDARY CONVENTION:** the live watermark has TWO conventions
+(serial/replay publishes the INCLUSIVE last index; the lane pump publishes the EXCLUSIVE frontier
+`visible_global_cut = base_seq + cut`) — the artifact must always carry the SEAM value `base_seq + cut - 1`,
+accepting EITHER live watermark as the quiescence proof; the pre-audit code stamped the live watermark
+verbatim, leaving production (pump-published) artifacts one high = restore silently inert, masked by
+replay-derived tests (regression: `gpu_cold_checkpoint_restores_under_lane_pump_frontier_watermark`,
+sabotage-verified). Audit MEDIUM adopted (docs state the real trust model: determinism + boundary equality,
+not store re-verification) + LOWs (stale-artifact sweep on non-quiesced skips; the patch arm rides the
+REGISTERED 6c-1 staging debt — no new host relational compute). Mid-capture commit races abort the artifact
+(post-qualification watermark re-check). Gates: 5 GPU tests + CPU descriptor round-trip, FOUR sabotages bite
+(restore-skip, boundary-guard, checksum, boundary-convention), lib 502/502, clippy Δ0.
 **S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy — RESOLVED:
 merged back via S-E.6a above):** the
 copy/compute-overlap pipeline (async pinned-staged uploads on a private copy stream + the stage-N/compute-N-1

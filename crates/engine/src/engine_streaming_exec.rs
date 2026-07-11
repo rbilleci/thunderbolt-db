@@ -3241,4 +3241,648 @@ impl Engine {
             .streaming_cold_spills
             .load(Ordering::Relaxed)
     }
+
+    /// P1 telemetry: cold-tier tables written into the durable checkpoint artifact.
+    pub fn streaming_cold_checkpointed(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_cold_checkpointed
+            .load(Ordering::Relaxed)
+    }
+
+    /// P1 telemetry: cold-tier tables restored from the checkpoint artifact at reopen.
+    pub fn streaming_cold_restored(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_cold_restored
+            .load(Ordering::Relaxed)
+    }
+
+    // ================= P1 (sealed-shards-primary): THE DURABLE COLD CHECKPOINT =================
+    //
+    // The cold tier's device-format chunk bytes become DURABLE via the checkpoint model (the
+    // architecture reserves bulk/GDS-style paths for checkpoints, never the WAL): the lanes
+    // checkpoint (`checkpoint_intent_lanes`) additionally writes a sibling COLD ARTIFACT —
+    // `<base>.cold-checkpoint.<cut>` — holding each qualifying table's chunk payload bytes +
+    // descriptors, stamped with the artifact BOUNDARY (the commit index whose store state the
+    // chunks reflect). Recovery (`open_lanes_durable_wal_segment`) restores the artifact at the
+    // SEAM between checkpoint-records replay and lane-suffix replay: at that point the rebuilt
+    // store IS the boundary state (strict equality `boundary == committed_seq()` is verified, any
+    // mismatch is a benign skip — the cache rebuilds on first read), so the restored entries pin
+    // the current generation Arc and the WAL SUFFIX IS THE DELTA STREAM — each replayed suffix
+    // record patches them forward through the existing 6c-1 patcher via the 6c-3 commit hooks.
+    // The durable validity token is therefore (artifact boundary == replay commit index); the
+    // process-local generation-Arc validity takes over from the seam exactly as a live build.
+    //
+    // WHAT THE SAFETY ACTUALLY IS (audit MEDIUM, adopted): once a restored entry INSTALLS, a hit
+    // replays its bytes verbatim — the store is not re-consulted — so an installed restore is
+    // exactly as load-bearing as a live build's install. The guarantees carrying that trust are
+    // (a) strict boundary equality with the seam's committed_seq, (b) the column-signature guard,
+    // and (c) RECOVERY DETERMINISM: replaying the same records reproduces the same visible set
+    // and the same TupleId space (the engine's standing recovery invariant — by-key records
+    // re-resolve deterministically, the seam asserts the seq space). Every guard failure
+    // degrades to a benign skip and the first read rebuilds from the store.
+    //
+    // CHARTER: durability/staging/IO is control-plane work (CHARTER.md: WAL, checkpointing and
+    // recovery orchestration are host-owned); the artifact stores DEVICE-format bytes produced by
+    // the existing build machinery — no host relational computation is introduced. The artifact
+    // is the cold tier's durable form in P1 beside the still-authoritative store, and becomes the
+    // PRIMARY cold representation when P4 deletes the store for streamed tables.
+
+    /// Write the cold-tier checkpoint artifact beside the lanes checkpoint. `boundary_index` is
+    /// the RECOVERY-SEAM value stamped into the artifact — the INCLUSIVE index of the
+    /// checkpoint's last record, which is what the seam's `committed_seq()` reaches (replay
+    /// publishes each record's own index). The LIVE watermark is accepted in EITHER convention
+    /// (audit HIGH): `boundary_index` (serial/replay-derived engines) or `frontier_index` (the
+    /// lane pump's exclusive `visible_global_cut = base_seq + cut`) — both prove every stamp is
+    /// <= `boundary_index` at a quiesced cut, so a generation-current entry's content IS the
+    /// boundary state. A table qualifies when its entry's pinned generation is ptr-equal current
+    /// (untouched since its settled install), or the 6c-1 patcher brings it current at the
+    /// observed watermark (the patch install re-proves settledness; a concurrent commit fails
+    /// it — a safe exclusion). A watermark moved by a racing commit after qualification ABORTS
+    /// the artifact (post-loop re-check: a fresh entry installed mid-loop could otherwise embed
+    /// a stamp above the boundary). NOTE: the patch arm rides the REGISTERED 6c-1 scan-build
+    /// staging debt (host visibility decode; deletion trigger = P4) — the checkpoint adds no new
+    /// host relational computation. Returns the number of tables written.
+    pub(crate) fn write_streaming_cold_checkpoint(
+        &self,
+        base: &std::path::Path,
+        cut: u64,
+        boundary_index: Index,
+        frontier_index: Index,
+    ) -> Result<usize, EngineError> {
+        use std::io::Write;
+        let path = streaming_cold_checkpoint_path(base, cut);
+        let watermark = self.committed_seq();
+        if watermark != boundary_index && watermark != frontier_index {
+            // Not quiesced at the cut (a commit raced the checkpoint): skip — the artifact would
+            // never match the recovery seam. Stale artifacts from older cuts still get swept.
+            remove_stale_cold_checkpoints(base, cut);
+            return Ok(0);
+        }
+        let map = self.read_state.residency.streaming_cold_chunks.load();
+        let mut qualified: Vec<(String, Arc<ColdTableChunks>)> = Vec::new();
+        for (name, entry) in map.iter() {
+            let current = self.read_state.mvcc.table_rows(name).generation_payload();
+            let entry = if Arc::ptr_eq(&entry.generation, &current) {
+                // Untouched since its settled install: every live stamp is <= boundary (the
+                // watermark guard above), so its content is the boundary state whatever
+                // watermark convention its own build pinned.
+                Arc::clone(entry)
+            } else {
+                // Written since its build: bring it current through the 6c-1 patcher (also lands
+                // in the live map). A failed patch (ALTER, install race, IO) excludes the table.
+                let Some(table) = self
+                    .catalog_snapshot()
+                    .relational_catalog
+                    .get(name)
+                    .cloned()
+                else {
+                    continue;
+                };
+                match self.patch_streaming_cold(
+                    name,
+                    &table,
+                    entry,
+                    &current,
+                    watermark,
+                    entry.chunk_target_bytes,
+                    false,
+                ) {
+                    Some(patched) => patched,
+                    None => continue,
+                }
+            };
+            qualified.push((name.clone(), entry));
+        }
+        if self.committed_seq() != watermark {
+            // A commit landed DURING qualification: a mid-loop fresh install could have embedded
+            // a stamp above the boundary — abort this artifact (a later checkpoint retries).
+            remove_stale_cold_checkpoints(base, cut);
+            return Ok(0);
+        }
+        if qualified.is_empty() {
+            remove_stale_cold_checkpoints(base, cut);
+            return Ok(0);
+        }
+        // Stream-encode to a temp sibling, fsync, then atomically rename into place (the artifact
+        // is all-or-nothing; a crash mid-write leaves the old artifact or none). Payloads stream
+        // chunk-at-a-time (a spilled table's bytes never accumulate in host RAM here).
+        let tmp = streaming_cold_checkpoint_tmp_path(base);
+        let file = std::fs::File::create(&tmp).map_err(|e| {
+            EngineError::Durability(format!(
+                "cold checkpoint: create {} failed: {e}",
+                tmp.display()
+            ))
+        })?;
+        let mut w = ColdCkptWriter {
+            inner: std::io::BufWriter::new(file),
+            hash: FNV_OFFSET,
+        };
+        let write_all = (|| -> std::io::Result<()> {
+            w.put(COLD_CHECKPOINT_MAGIC)?;
+            w.put_u64(boundary_index)?;
+            w.put_u32(qualified.len() as u32)?;
+            for (name, entry) in &qualified {
+                w.put_str(name)?;
+                w.put_u16(entry.column_signature.len() as u16)?;
+                for (col, ty) in &entry.column_signature {
+                    w.put_str(col)?;
+                    w.put_sql_type(*ty)?;
+                }
+                w.put_u64(entry.chunk_target_bytes)?;
+                w.put_u32(entry.chunks.len() as u32)?;
+                for chunk in &entry.chunks {
+                    w.put_u64(chunk.row_count)?;
+                    w.put_u64(chunk.tuple_range.0)?;
+                    w.put_u64(chunk.tuple_range.1)?;
+                    encode_cold_descriptor(&mut w, &chunk.snapshot)?;
+                    let payload = chunk.payload.read().map_err(|_| {
+                        std::io::Error::other("cold checkpoint: spill payload read failed")
+                    })?;
+                    w.put_u64(payload.len() as u64)?;
+                    w.put(&payload)?;
+                }
+            }
+            let hash = w.hash;
+            w.inner.write_all(&hash.to_le_bytes())?;
+            w.inner.flush()?;
+            w.inner.get_ref().sync_all()
+        })();
+        if let Err(e) = write_all {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(EngineError::Durability(format!(
+                "cold checkpoint: writing {} failed: {e}",
+                tmp.display()
+            )));
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            EngineError::Durability(format!(
+                "cold checkpoint: rename into {} failed: {e}",
+                path.display()
+            ))
+        })?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        remove_stale_cold_checkpoints(base, cut);
+        self.read_state
+            .residency
+            .streaming_cold_checkpointed
+            .fetch_add(qualified.len() as u64, Ordering::Relaxed);
+        Ok(qualified.len())
+    }
+
+    /// Restore the cold-tier checkpoint artifact at the recovery SEAM (checkpoint records
+    /// replayed, lane suffix not yet). Every GUARD FAILURE degrades to a benign skip (the cache
+    /// rebuilds on first read): missing/corrupt artifact, boundary != the seam's
+    /// `committed_seq()`, a table gone from the catalog, or a column-signature mismatch. An
+    /// entry that DOES install is trusted like a live build (see the section note above:
+    /// boundary equality + signature + recovery determinism carry it). Restored payloads route through the standard builder, so
+    /// over-threshold tables spill exactly like a live capture. Returns tables restored.
+    pub(crate) fn restore_streaming_cold_checkpoint(
+        &self,
+        base: &std::path::Path,
+        cut: u64,
+    ) -> usize {
+        let path = streaming_cold_checkpoint_path(base, cut);
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return 0;
+        };
+        // PASS 1: verify the FNV trailer over the whole stream (bounded RAM), then re-read and
+        // decode trusting the content. Startup-time sequential IO; two passes beat buffering a
+        // possibly spill-class (over-RAM) artifact.
+        if !cold_checkpoint_checksum_ok(&mut file) {
+            eprintln!(
+                "[gpu-db] cold checkpoint {} failed its checksum; skipping the cold-tier \
+                 restore (streaming reads rebuild the cache)",
+                path.display()
+            );
+            return 0;
+        }
+        use std::io::Seek;
+        if file.seek(std::io::SeekFrom::Start(0)).is_err() {
+            return 0;
+        }
+        let mut r = ColdCkptReader {
+            inner: std::io::BufReader::new(file),
+        };
+        let mut restored = 0usize;
+        let decode_all = (|| -> std::io::Result<()> {
+            let mut magic = [0u8; COLD_CHECKPOINT_MAGIC.len()];
+            r.take(&mut magic)?;
+            if &magic != COLD_CHECKPOINT_MAGIC {
+                return Ok(());
+            }
+            let boundary = r.take_u64()?;
+            if boundary != self.committed_seq() {
+                // Not this replay's seam state (e.g. the WAL gained records the artifact predates
+                // in a way that changed the ordinal) — never install; the cache rebuilds.
+                return Ok(());
+            }
+            let table_count = r.take_u32()?;
+            for _ in 0..table_count {
+                let name = r.take_str()?;
+                let sig_len = r.take_u16()?;
+                let mut signature: Vec<(String, SqlType)> =
+                    Vec::with_capacity(sig_len as usize);
+                for _ in 0..sig_len {
+                    let col = r.take_str()?;
+                    let ty = r.take_sql_type()?;
+                    signature.push((col, ty));
+                }
+                let chunk_target_bytes = r.take_u64()?;
+                let chunk_count = r.take_u32()?;
+                // The catalog + signature guards mirror the 6c-1 ALTER guard; a mismatching
+                // table's bytes must still be CONSUMED to keep the stream aligned.
+                let table = self.catalog_snapshot().relational_catalog.get(&name).cloned();
+                let live_signature: Option<Vec<(String, SqlType)>> = table.as_ref().map(|t| {
+                    t.columns.iter().map(|c| (c.name.clone(), c.ty)).collect()
+                });
+                let usable = live_signature.as_ref() == Some(&signature);
+                let mut builder = usable.then(|| ColdCacheBuilder {
+                    generation: self.read_state.mvcc.table_rows(&name).generation_payload(),
+                    build_copin_s: boundary,
+                    chunk_target_bytes,
+                    total_payload_bytes: 0,
+                    column_signature: signature,
+                    chunks: Vec::new(),
+                    spill: None,
+                    poisoned: false,
+                });
+                for _ in 0..chunk_count {
+                    let row_count = r.take_u64()?;
+                    let lo = r.take_u64()?;
+                    let hi = r.take_u64()?;
+                    let snapshot = decode_cold_descriptor(&mut r)?;
+                    let payload_len = r.take_u64()? as usize;
+                    let mut payload = vec![0u8; payload_len];
+                    r.take(&mut payload)?;
+                    if let Some(builder) = builder.as_mut() {
+                        builder.push(payload, snapshot, row_count, (lo, hi));
+                    }
+                }
+                if let Some(builder) = builder {
+                    // is_patch=true: a restore is not a fresh scan-build (keeps the builds
+                    // counter the out-of-core cost signal it is). The install re-proves the
+                    // settled boundary (strict equality — trivially true at the single-threaded
+                    // seam) and applies the standard cap policy.
+                    if !builder.poisoned
+                        && self.install_streaming_cold_inner(&name, builder, true, false)
+                    {
+                        restored += 1;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if decode_all.is_err() {
+            // Truncated/torn beyond the verified trailer (should be impossible) — keep whatever
+            // installed cleanly; later tables just rebuild.
+            eprintln!(
+                "[gpu-db] cold checkpoint {} ended mid-decode; restored {restored} table(s)",
+                path.display()
+            );
+        }
+        if restored > 0 {
+            self.read_state
+                .residency
+                .streaming_cold_restored
+                .fetch_add(restored as u64, Ordering::Relaxed);
+        }
+        restored
+    }
+}
+
+// ---------------- P1: the cold-checkpoint artifact encoding (control plane, no serde) ----------------
+
+/// Artifact magic — version-suffixed like the WAL magics (`GPUDBWAL1`); bump on layout change.
+const COLD_CHECKPOINT_MAGIC: &[u8; 15] = b"GPUDBCOLDCKPT1\n";
+pub(crate) const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+/// `<base>.cold-checkpoint.<cut>` beside the WAL — mirrors the lanes-checkpoint naming
+/// (`<base>.lanes-checkpoint.seg.<cut>`), keyed by the SAME cut so recovery pairs them.
+fn streaming_cold_checkpoint_path(base: &std::path::Path, cut: u64) -> std::path::PathBuf {
+    let name = base
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    base.with_file_name(format!("{name}.cold-checkpoint.{cut}"))
+}
+
+fn streaming_cold_checkpoint_tmp_path(base: &std::path::Path) -> std::path::PathBuf {
+    let name = base
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    base.with_file_name(format!("{name}.cold-checkpoint.tmp"))
+}
+
+/// Sweep artifacts for OTHER cuts (and the tmp) — the previous checkpoint generation's artifact
+/// is dead once a newer cut committed (its seam can never be replayed again).
+pub(crate) fn remove_stale_cold_checkpoints(base: &std::path::Path, keep_cut: u64) {
+    let Some(parent) = base.parent() else { return };
+    let Some(stem) = base.file_name() else { return };
+    let prefix = format!("{}.cold-checkpoint.", stem.to_string_lossy());
+    let keep = keep_cut.to_string();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(suffix) = name.strip_prefix(&prefix) {
+            if suffix != keep {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// FNV-1a-hashing writer: every byte written folds into the running trailer checksum.
+pub(crate) struct ColdCkptWriter<W: std::io::Write> {
+    pub(crate) inner: W,
+    pub(crate) hash: u64,
+}
+
+impl<W: std::io::Write> ColdCkptWriter<W> {
+    fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        for b in bytes {
+            self.hash = (self.hash ^ u64::from(*b)).wrapping_mul(FNV_PRIME);
+        }
+        self.inner.write_all(bytes)
+    }
+    fn put_u8(&mut self, v: u8) -> std::io::Result<()> {
+        self.put(&[v])
+    }
+    fn put_u16(&mut self, v: u16) -> std::io::Result<()> {
+        self.put(&v.to_le_bytes())
+    }
+    fn put_u32(&mut self, v: u32) -> std::io::Result<()> {
+        self.put(&v.to_le_bytes())
+    }
+    fn put_u64(&mut self, v: u64) -> std::io::Result<()> {
+        self.put(&v.to_le_bytes())
+    }
+    fn put_i32(&mut self, v: i32) -> std::io::Result<()> {
+        self.put(&v.to_le_bytes())
+    }
+    fn put_str(&mut self, s: &str) -> std::io::Result<()> {
+        let bytes = s.as_bytes();
+        if bytes.len() > u16::MAX as usize {
+            return Err(std::io::Error::other("cold checkpoint: string too long"));
+        }
+        self.put_u16(bytes.len() as u16)?;
+        self.put(bytes)
+    }
+    fn put_sql_type(&mut self, ty: SqlType) -> std::io::Result<()> {
+        match ty {
+            SqlType::Int2 => self.put_u8(0),
+            SqlType::Int4 => self.put_u8(1),
+            SqlType::Int8 => self.put_u8(2),
+            SqlType::Numeric { precision, scale } => {
+                self.put_u8(3)?;
+                self.put_u8(precision)?;
+                self.put_u8(scale)
+            }
+            SqlType::Bool => self.put_u8(4),
+            SqlType::Text => self.put_u8(5),
+            SqlType::Date => self.put_u8(6),
+            SqlType::Timestamp => self.put_u8(7),
+            SqlType::Uuid => self.put_u8(8),
+        }
+    }
+}
+
+pub(crate) struct ColdCkptReader<R: std::io::Read> {
+    pub(crate) inner: R,
+}
+
+impl<R: std::io::Read> ColdCkptReader<R> {
+    fn take(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read_exact(buf)
+    }
+    fn take_u8(&mut self) -> std::io::Result<u8> {
+        let mut b = [0u8; 1];
+        self.take(&mut b)?;
+        Ok(b[0])
+    }
+    fn take_u16(&mut self) -> std::io::Result<u16> {
+        let mut b = [0u8; 2];
+        self.take(&mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+    fn take_u32(&mut self) -> std::io::Result<u32> {
+        let mut b = [0u8; 4];
+        self.take(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+    fn take_u64(&mut self) -> std::io::Result<u64> {
+        let mut b = [0u8; 8];
+        self.take(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+    fn take_i32(&mut self) -> std::io::Result<i32> {
+        let mut b = [0u8; 4];
+        self.take(&mut b)?;
+        Ok(i32::from_le_bytes(b))
+    }
+    fn take_str(&mut self) -> std::io::Result<String> {
+        let len = self.take_u16()? as usize;
+        let mut bytes = vec![0u8; len];
+        self.take(&mut bytes)?;
+        String::from_utf8(bytes)
+            .map_err(|_| std::io::Error::other("cold checkpoint: invalid UTF-8"))
+    }
+    fn take_sql_type(&mut self) -> std::io::Result<SqlType> {
+        Ok(match self.take_u8()? {
+            0 => SqlType::Int2,
+            1 => SqlType::Int4,
+            2 => SqlType::Int8,
+            3 => SqlType::Numeric {
+                precision: self.take_u8()?,
+                scale: self.take_u8()?,
+            },
+            4 => SqlType::Bool,
+            5 => SqlType::Text,
+            6 => SqlType::Date,
+            7 => SqlType::Timestamp,
+            8 => SqlType::Uuid,
+            _ => return Err(std::io::Error::other("cold checkpoint: unknown SqlType tag")),
+        })
+    }
+}
+
+/// Verify the trailing FNV-1a checksum over everything before it. Streams in 64KiB blocks
+/// (bounded RAM for spill-class artifacts).
+fn cold_checkpoint_checksum_ok(file: &mut std::fs::File) -> bool {
+    use std::io::{Read, Seek};
+    let Ok(total) = file.seek(std::io::SeekFrom::End(0)) else {
+        return false;
+    };
+    if total < 8 + COLD_CHECKPOINT_MAGIC.len() as u64 {
+        return false;
+    }
+    if file.seek(std::io::SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let body = total - 8;
+    let mut hash = FNV_OFFSET;
+    let mut remaining = body;
+    let mut buf = vec![0u8; 64 << 10];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        if file.read_exact(&mut buf[..want]).is_err() {
+            return false;
+        }
+        for b in &buf[..want] {
+            hash = (hash ^ u64::from(*b)).wrapping_mul(FNV_PRIME);
+        }
+        remaining -= want as u64;
+    }
+    let mut trailer = [0u8; 8];
+    if file.read_exact(&mut trailer).is_err() {
+        return false;
+    }
+    hash == u64::from_le_bytes(trailer)
+}
+
+/// Serialize the chunk DESCRIPTOR ([`RelationalResidencySnapshot`]) — the device-layout contract
+/// the replay staging clones (a fresh memory proof is stamped per upload, so the proof and the
+/// refresh/invalidation bookkeeping are NOT persisted; decode restores them to their transient
+/// defaults, exactly what `build_transient_relation_payload_only` produces).
+pub(crate) fn encode_cold_descriptor<W: std::io::Write>(
+    w: &mut ColdCkptWriter<W>,
+    d: &RelationalResidencySnapshot,
+) -> std::io::Result<()> {
+    w.put_u16(d.gpu_id)?;
+    w.put_str(&d.schema)?;
+    w.put_str(&d.table)?;
+    w.put_u64(d.generation)?;
+    w.put_u64(d.row_count as u64)?;
+    w.put_u64(d.capacity as u64)?;
+    w.put_u64(d.column_count as u64)?;
+    w.put_u64(d.resident_bytes)?;
+    w.put_u32(d.resident_device_int4_columns.len() as u32)?;
+    for name in &d.resident_device_int4_columns {
+        w.put_str(name)?;
+    }
+    w.put_u32(d.resident_device_int4_column_stats.len() as u32)?;
+    for s in &d.resident_device_int4_column_stats {
+        w.put_str(&s.name)?;
+        w.put_i32(s.min)?;
+        w.put_i32(s.max)?;
+    }
+    w.put_u32(d.resident_device_int8_columns.len() as u32)?;
+    for name in &d.resident_device_int8_columns {
+        w.put_str(name)?;
+    }
+    w.put_u32(d.resident_device_numeric_columns.len() as u32)?;
+    for name in &d.resident_device_numeric_columns {
+        w.put_str(name)?;
+    }
+    w.put_u32(d.resident_device_bool_columns.len() as u32)?;
+    for b in &d.resident_device_bool_columns {
+        w.put_str(&b.name)?;
+        w.put_u64(b.bitmap_byte_offset)?;
+    }
+    w.put_u32(d.resident_device_text_columns.len() as u32)?;
+    for t in &d.resident_device_text_columns {
+        w.put_str(&t.name)?;
+        w.put_u64(t.offsets_byte_offset)?;
+        w.put_u64(t.bytes_byte_offset)?;
+        w.put_u64(t.bytes_len)?;
+    }
+    w.put_u32(d.resident_device_null_columns.len() as u32)?;
+    for n in &d.resident_device_null_columns {
+        w.put_str(&n.name)?;
+        w.put_u64(n.bitmap_byte_offset)?;
+    }
+    w.put_u64(d.valid_through_index)
+}
+
+pub(crate) fn decode_cold_descriptor<R: std::io::Read>(
+    r: &mut ColdCkptReader<R>,
+) -> std::io::Result<RelationalResidencySnapshot> {
+    let gpu_id = r.take_u16()?;
+    let schema = r.take_str()?;
+    let table = r.take_str()?;
+    let generation = r.take_u64()?;
+    let row_count = r.take_u64()? as usize;
+    let capacity = r.take_u64()? as usize;
+    let column_count = r.take_u64()? as usize;
+    let resident_bytes = r.take_u64()?;
+    let mut resident_device_int4_columns = Vec::new();
+    for _ in 0..r.take_u32()? {
+        resident_device_int4_columns.push(r.take_str()?);
+    }
+    let mut resident_device_int4_column_stats = Vec::new();
+    for _ in 0..r.take_u32()? {
+        resident_device_int4_column_stats.push(ResidentDeviceInt4ColumnStats {
+            name: r.take_str()?,
+            min: r.take_i32()?,
+            max: r.take_i32()?,
+        });
+    }
+    let mut resident_device_int8_columns = Vec::new();
+    for _ in 0..r.take_u32()? {
+        resident_device_int8_columns.push(r.take_str()?);
+    }
+    let mut resident_device_numeric_columns = Vec::new();
+    for _ in 0..r.take_u32()? {
+        resident_device_numeric_columns.push(r.take_str()?);
+    }
+    let mut resident_device_bool_columns = Vec::new();
+    for _ in 0..r.take_u32()? {
+        resident_device_bool_columns.push(ResidentDeviceBoolColumnLayout {
+            name: r.take_str()?,
+            bitmap_byte_offset: r.take_u64()?,
+        });
+    }
+    let mut resident_device_text_columns = Vec::new();
+    for _ in 0..r.take_u32()? {
+        resident_device_text_columns.push(ResidentDeviceTextColumnLayout {
+            name: r.take_str()?,
+            offsets_byte_offset: r.take_u64()?,
+            bytes_byte_offset: r.take_u64()?,
+            bytes_len: r.take_u64()?,
+        });
+    }
+    let mut resident_device_null_columns = Vec::new();
+    for _ in 0..r.take_u32()? {
+        resident_device_null_columns.push(ResidentDeviceNullBitmapLayout {
+            name: r.take_str()?,
+            bitmap_byte_offset: r.take_u64()?,
+        });
+    }
+    let valid_through_index = r.take_u64()?;
+    Ok(RelationalResidencySnapshot {
+        gpu_id,
+        schema,
+        table,
+        generation,
+        row_count,
+        capacity,
+        column_count,
+        resident_bytes,
+        resident_device_int4_columns,
+        resident_device_int4_column_stats,
+        resident_device_int8_columns,
+        resident_device_numeric_columns,
+        resident_device_bool_columns,
+        resident_device_text_columns,
+        resident_device_null_columns,
+        valid_through_index,
+        invalidated_by_txn_id: None,
+        invalidated_at_index: None,
+        invalidated_by_memory_pressure: false,
+        memory_pressure_active: false,
+        last_refresh_cost: None,
+        admission_budget_bytes: None,
+        resident_bytes_after_admission: resident_bytes,
+        evicted_tables_on_admission: Vec::new(),
+        device_memory_proof: None,
+    })
 }

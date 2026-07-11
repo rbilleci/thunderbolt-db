@@ -291,6 +291,7 @@ impl Engine {
             // committed its checkpoint and then failed the prune leaves below-baseline
             // segments lingering; the retry lands here and must reclaim the space.
             wal_lanes.truncate_segments_below(cut)?;
+            self.maybe_write_streaming_cold_checkpoint(lanes, &base, cut);
             return Ok(cut);
         }
         let mut checkpoint_records = serial_records;
@@ -312,7 +313,52 @@ impl Engine {
         // Prune: retire rolled-away lane segments fully below the new baseline (recycle one per
         // lane, delete the rest).
         wal_lanes.truncate_segments_below(cut)?;
+        self.maybe_write_streaming_cold_checkpoint(lanes, &base, cut);
         Ok(cut)
+    }
+
+    /// P1 (sealed-shards-primary): persist the streaming COLD TIER beside the committed lanes
+    /// checkpoint. Only meaningful when the engine is QUIESCED at the cut (everything durable is
+    /// applied — `applied == cut`); otherwise skip (a boundary-mismatched artifact would never
+    /// install — see `write_streaming_cold_checkpoint`). Best-effort by design: the artifact is a
+    /// warm-start cache in P1, so a failure must not fail the WAL checkpoint.
+    ///
+    /// THE BOUNDARY CONVENTION (audit HIGH, adopted): the artifact must be stamped with the value
+    /// the RECOVERY SEAM's `committed_seq()` reaches after replaying exactly the checkpoint's
+    /// records — the INCLUSIVE index of the last record, `base_seq + cut - 1` — because replay
+    /// publishes each record's own index. The LIVE watermark, however, has TWO conventions:
+    /// serial/replay-derived engines publish the inclusive last index (`base_seq + cut - 1`) while
+    /// the lane pump publishes the EXCLUSIVE frontier (`visible_global_cut = base_seq + cut`).
+    /// Both bound the same visible set at a quiesced cut (no stamp above `base_seq + cut - 1`
+    /// exists), so BOTH are accepted as the quiescence proof — but the artifact always carries the
+    /// seam value. Comparing the live watermark to the seam value directly (the pre-audit code)
+    /// left the artifact one high whenever the pump had published, silently disabling every
+    /// production restore.
+    fn maybe_write_streaming_cold_checkpoint(
+        &self,
+        lanes: &crate::engine_intent_lanes::IntentLaneState,
+        base: &std::path::Path,
+        cut: u64,
+    ) {
+        use std::sync::atomic::Ordering;
+        if lanes.applied_mirror.load(Ordering::Acquire) != cut {
+            // Not quiesced: no artifact — but still sweep older cuts' artifacts (audit LOW: a
+            // never-quiescent workload would otherwise accrete one dead artifact per cut).
+            crate::engine_streaming_exec::remove_stale_cold_checkpoints(base, cut);
+            return;
+        }
+        let base_seq = lanes.base_seq.load(Ordering::Acquire);
+        let seam_index = (base_seq + cut).saturating_sub(1);
+        let frontier_index = base_seq + cut;
+        if let Err(err) =
+            self.write_streaming_cold_checkpoint(base, cut, seam_index, frontier_index)
+        {
+            eprintln!(
+                "[gpu-db] cold checkpoint beside {} (cut {cut}) failed: {err}; streaming reads \
+                 will rebuild the cache after a reopen",
+                base.display()
+            );
+        }
     }
 
     /// AUDIT F5 guard: archive/PITR excludes lane commits in lanes mode (the

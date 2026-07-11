@@ -722,6 +722,15 @@ impl Engine {
                 base_seq + baseline
             )));
         }
+        // P1 (sealed-shards-primary): restore the durable COLD TIER at the SEAM — the store now
+        // holds exactly the checkpoint's records (the artifact's boundary state; strict equality
+        // `boundary == committed_seq()` is verified inside, any mismatch a benign skip), so the
+        // restored entries pin the CURRENT generation Arc and the lane suffix below IS the delta
+        // stream: each replayed record patches them forward through the 6c-1 patcher via the
+        // 6c-3 commit hooks. First streaming reads after reopen replay bytes instead of scanning.
+        if lanes_checkpoint.is_some() {
+            engine.restore_streaming_cold_checkpoint(segment_path, baseline);
+        }
         for record in &lane_records {
             engine.commit_mutation(record.txn_id, record.payload.clone())?;
         }
