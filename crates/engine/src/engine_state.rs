@@ -699,16 +699,17 @@ pub(crate) struct ResidencyReadState {
     /// sidecar applies at the probe's recheck). chunk_id is the validity token (fresh iff the
     /// payload bytes are new), so stamps and tail appends never invalidate existing entries.
     /// VRAM-accounted + capped with LRU (a touch counter; eviction frees; rebuilt on demand).
-    #[allow(dead_code)] // P5-2 wires the production reader.
-    pub(crate) chunk_key_index: Mutex<
-        BTreeMap<(String, u64, usize), crate::engine_streaming_exec::ChunkKeyIndex>,
-    >,
+    pub(crate) chunk_key_index:
+        Mutex<BTreeMap<(String, u64, usize), crate::engine_streaming_exec::ChunkKeyIndex>>,
     /// P5-1: retained chunk-index VRAM bytes (the shard twin has NO accounting — this one does).
-    #[allow(dead_code)] // P5-2.
     pub(crate) chunk_key_index_bytes: std::sync::atomic::AtomicU64,
     /// P5-1: the LRU touch clock.
-    #[allow(dead_code)] // P5-2.
     pub(crate) chunk_key_index_clock: std::sync::atomic::AtomicU64,
+    /// P5-2: keyed-class uniqueness preflights served ON-DEVICE (probe + slot recheck) — the
+    /// non-vacuity signal for the keyed eligibility lift.
+    pub(crate) chunk_class_unique_probes: std::sync::atomic::AtomicU64,
+    /// P5-2: duplicates the device probe REJECTED (a recheck-confirmed conflict).
+    pub(crate) chunk_class_unique_probe_conflicts: std::sync::atomic::AtomicU64,
     /// VACUUM #5: per-table count of incremental tombstone stamps since the last rebuild —
     /// the CHURN signal (each SV4b/SV5/A4b tombstone adds a dead slot; enough of them degrade
     /// the PK index to dup-declines and bloat scans). Reset by vacuum/re-admit. Serialized-path

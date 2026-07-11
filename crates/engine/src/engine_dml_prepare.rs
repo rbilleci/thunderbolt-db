@@ -378,6 +378,21 @@ impl Engine {
         let wave_deferred = validation == InsertPrepareValidation::Full
             && insert.rows.len() == 1
             && self.insert_unique_wave_batchable(&catalog, table);
+        // P5-2 (S-E.P5, the KEYED-CLASS lift): a CHUNK-AUTHORITATIVE keyed table validates
+        // uniqueness ON-DEVICE — every host arm below sees the RECLAIMED (empty) store and
+        // passes VACUOUSLY (the C2 hazard: a vacuously-acked duplicate is WAL-durable and
+        // recovery's host-path replay REJECTS it). Probe the per-chunk key indexes and
+        // device-recheck each hit at this statement's snapshot; a decline (NULL key, unfoldable
+        // shape, any failure) DE-AUTHORITIZES so the ladder below validates against the
+        // then-whole store.
+        if self.table_chunk_authoritative(&table.name).is_some()
+            && table.indexes.iter().any(|index| index.unique)
+        {
+            match self.validate_class_insert_uniqueness(table, &new_rows, txn_id, None) {
+                Some(verdict) => verdict?,
+                None => self.deauthoritize_chunk_table(&table.name, false)?,
+            }
+        }
         if ledger_covered || wave_deferred {
             // fall through to encode: PK not-null ran; unique covered by the ledger (#18) or
             // deferred to the wave batch (B).
@@ -1921,15 +1936,43 @@ impl Engine {
         let mut class_epoch: Option<u64> = None;
         let mut class_resolved: Option<Vec<DmlResolvedMatch>> = None;
         if self.table_chunk_authoritative(&table.name).is_some() {
+            let mut declined = false;
             match self.resolve_class_dml_matches(table, &filter_groups, visibility) {
                 Some((matches, epoch)) => {
-                    class_epoch = Some(epoch);
-                    class_resolved = Some(matches);
+                    // P5-2: the KEYED-class NEW-IMAGE uniqueness probe (the index-arm validator
+                    // below is value-index-driven — vacuous against the reclaimed store). C1:
+                    // the update's own located coordinates are SELF, not conflicts — their old
+                    // versions are live at probe time (stamps land in the commit hook).
+                    if table.indexes.iter().any(|index| index.unique) {
+                        let mut new_images: Vec<Vec<SqlValue>> = Vec::with_capacity(matches.len());
+                        for (_, _, row) in &matches {
+                            let mut image = row.clone();
+                            for (idx, value) in &assignments {
+                                image[*idx] = value.clone();
+                            }
+                            new_images.push(image);
+                        }
+                        let own: BTreeSet<u64> = matches.iter().map(|(id, _, _)| *id).collect();
+                        match self.validate_class_insert_uniqueness(
+                            table,
+                            &new_images,
+                            visibility.read_txn_id,
+                            Some((&own, epoch)),
+                        ) {
+                            Some(verdict) => verdict?,
+                            None => declined = true,
+                        }
+                    }
+                    if !declined {
+                        class_epoch = Some(epoch);
+                        class_resolved = Some(matches);
+                    }
                 }
-                None => {
-                    self.deauthoritize_chunk_table(&table.name, false)?;
-                    table_rows = self.read_state.mvcc.table_rows(&table.name);
-                }
+                None => declined = true,
+            }
+            if declined {
+                self.deauthoritize_chunk_table(&table.name, false)?;
+                table_rows = self.read_state.mvcc.table_rows(&table.name);
             }
         }
         let index_resolved: Option<Vec<DmlResolvedMatch>> = if class_resolved.is_some() {

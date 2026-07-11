@@ -1578,6 +1578,20 @@ impl Engine {
                 {
                     return Ok(());
                 }
+                // P5-2 (S-E.P5): a CHUNK-AUTHORITATIVE keyed table validates uniqueness
+                // ON-DEVICE — both arms below see the RECLAIMED (empty) store and pass
+                // vacuously. This preflight is the ONLY unique guard on the transaction path
+                // (the commit-time de-auth runs AFTER it), so a vacuous pass here would commit
+                // a WAL-durable duplicate that recovery's host-path replay rejects (C2). A
+                // decline DE-AUTHORITIZES so the arms below validate against the whole store.
+                if self.table_chunk_authoritative(&table.name).is_some()
+                    && table.indexes.iter().any(|index| index.unique)
+                {
+                    match self.validate_class_insert_uniqueness(table, &new_rows, txn_id, None) {
+                        Some(verdict) => verdict?,
+                        None => self.deauthoritize_chunk_table(&table.name, false)?,
+                    }
+                }
                 // PHASE C slice 1b: index-driven validation over the NEW rows only — the
                 // survivors were valid before this statement and an INSERT removes nothing.
                 // Self-referencing-FK tables keep the scan (a new row may provide for another
@@ -1666,46 +1680,94 @@ impl Engine {
                     .iter()
                     .any(|foreign_key| foreign_key.referenced_table == table.name);
                 let was_elided = self.table_install_elided(&table.name);
-                let index_resolved =
-                    if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
-                        None
-                    } else {
-                        // RETIREMENT A2: device resolve first; declines fall to the value index.
-                        match self.resolve_dml_matches_via_device(
-                            table,
-                            &filter_groups,
-                            visibility,
-                            &table_rows,
-                        )? {
-                            Some(matches) => Some(matches),
-                            None => {
-                                // A5 FLIP SI FIX + ADR-006 (CHECK-elided tables, audit HIGH fix):
-                                // the decline may have REHYDRATED (a fresh COW generation) — with
-                                // CHECK tables now ELIGIBLE to elide, this preflight ladder CAN see
-                                // a mid-preflight rehydrate (the old "constrained ⇒ non-elided"
-                                // premise is gone). Re-pin the OUTER binding (the prepare ladders'
-                                // pattern) so the else-scan below reads the post-rehydrate
-                                // generation — a stale scan would see ZERO elided-era rows and pass
-                                // the CHECK/unique validators VACUOUSLY (a constraint bypass). If
-                                // the table de-elided here, also RAISE the read boundary to the
-                                // committed seq (the DDL-validator seam): the reconcile stamps
-                                // elided-era rows at committed_seq, which a facade txn id below it
-                                // (post-recovery) would silently miss.
-                                table_rows = self.read_state.mvcc.table_rows(&table.name);
-                                if was_elided && !self.table_install_elided(&table.name) {
-                                    visibility.read_txn_id =
-                                        visibility.read_txn_id.max(self.committed_seq());
+                // P5-2 (S-E.P5): a CHUNK-AUTHORITATIVE table's preflight resolves FROM THE
+                // CHUNKS (the store below is reclaimed — both resolve arms and the validators
+                // are vacuous against it) and probes NEW-IMAGE uniqueness on-device with the C1
+                // self-exclusion. The matches then feed the SAME index-driven validation as any
+                // other resolve (not-null/CHECK run host-side over the images; the unique
+                // dimension is the probe). A decline DE-AUTHORITIZES and re-pins so the ladder
+                // below validates against the rebuilt store. The apply-time resolve re-runs
+                // independently under its epoch token — this is validation only, exactly like
+                // the host preflight.
+                let mut class_preflight: Option<Vec<(u64, String, Vec<SqlValue>)>> = None;
+                if self.table_chunk_authoritative(&table.name).is_some() {
+                    let mut declined = false;
+                    match self.resolve_class_dml_matches(table, &filter_groups, visibility) {
+                        Some((matches, epoch)) => {
+                            if table.indexes.iter().any(|index| index.unique) {
+                                let mut new_images: Vec<Vec<SqlValue>> =
+                                    Vec::with_capacity(matches.len());
+                                for (_, _, row) in &matches {
+                                    let mut image = row.clone();
+                                    for (idx, value) in &assignments {
+                                        image[*idx] = value.clone();
+                                    }
+                                    new_images.push(image);
                                 }
-                                Self::resolve_dml_matches_via_value_index(
+                                let own: BTreeSet<u64> =
+                                    matches.iter().map(|(id, _, _)| *id).collect();
+                                match self.validate_class_insert_uniqueness(
                                     table,
-                                    &table_rows,
-                                    &filter_groups,
-                                    visibility,
-                                    &prefix,
-                                )?
+                                    &new_images,
+                                    visibility.read_txn_id,
+                                    Some((&own, epoch)),
+                                ) {
+                                    Some(verdict) => verdict?,
+                                    None => declined = true,
+                                }
+                            }
+                            if !declined {
+                                class_preflight = Some(matches);
                             }
                         }
-                    };
+                        None => declined = true,
+                    }
+                    if declined {
+                        self.deauthoritize_chunk_table(&table.name, false)?;
+                        table_rows = self.read_state.mvcc.table_rows(&table.name);
+                    }
+                }
+                let index_resolved = if class_preflight.is_some() {
+                    class_preflight
+                } else if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
+                    None
+                } else {
+                    // RETIREMENT A2: device resolve first; declines fall to the value index.
+                    match self.resolve_dml_matches_via_device(
+                        table,
+                        &filter_groups,
+                        visibility,
+                        &table_rows,
+                    )? {
+                        Some(matches) => Some(matches),
+                        None => {
+                            // A5 FLIP SI FIX + ADR-006 (CHECK-elided tables, audit HIGH fix):
+                            // the decline may have REHYDRATED (a fresh COW generation) — with
+                            // CHECK tables now ELIGIBLE to elide, this preflight ladder CAN see
+                            // a mid-preflight rehydrate (the old "constrained ⇒ non-elided"
+                            // premise is gone). Re-pin the OUTER binding (the prepare ladders'
+                            // pattern) so the else-scan below reads the post-rehydrate
+                            // generation — a stale scan would see ZERO elided-era rows and pass
+                            // the CHECK/unique validators VACUOUSLY (a constraint bypass). If
+                            // the table de-elided here, also RAISE the read boundary to the
+                            // committed seq (the DDL-validator seam): the reconcile stamps
+                            // elided-era rows at committed_seq, which a facade txn id below it
+                            // (post-recovery) would silently miss.
+                            table_rows = self.read_state.mvcc.table_rows(&table.name);
+                            if was_elided && !self.table_install_elided(&table.name) {
+                                visibility.read_txn_id =
+                                    visibility.read_txn_id.max(self.committed_seq());
+                            }
+                            Self::resolve_dml_matches_via_value_index(
+                                table,
+                                &table_rows,
+                                &filter_groups,
+                                visibility,
+                                &prefix,
+                            )?
+                        }
+                    }
+                };
                 if let Some(matches) = index_resolved {
                     let touched_keys: BTreeSet<String> =
                         matches.iter().map(|(_, key, _)| key.clone()).collect();

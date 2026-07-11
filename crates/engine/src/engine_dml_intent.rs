@@ -209,6 +209,15 @@ impl Engine {
                 "relation \"{table_name}\" does not exist"
             )))
         })?;
+        // P5-2 (S-E.P5, the L5 lesson made load-bearing by the keyed-class lift): a
+        // CHUNK-AUTHORITATIVE table must NEVER take the lane route — its writes materialize on
+        // the SERIALIZED chunk path only (the lane apply has no class arm = lost writes).
+        if self.table_chunk_authoritative(table_name).is_some() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "table \"{table_name}\" is not covered-INSERT routable: chunk-authoritative \
+                 (class writes ride the serialized chunk path)"
+            ))));
+        }
         let route_err = |reason: &str| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "table \"{table_name}\" is not covered-INSERT routable: {reason}"

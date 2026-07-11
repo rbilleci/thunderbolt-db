@@ -3170,7 +3170,8 @@ fn gpu_chunk_class_born_gate_serves_old_boundaries() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT)")
+        .unwrap();
     const N: i32 = 900;
     let mut values = String::new();
     for i in 0..N {
@@ -3180,20 +3181,26 @@ fn gpu_chunk_class_born_gate_serves_old_boundaries() {
         values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
     }
     seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES {values}")).unwrap();
+    e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES {values}"))
+        .unwrap();
     e.set_relational_residency_budget_bytes(0, 8192);
-    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM facts")).unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM facts"))
+        .unwrap();
     seq += 1;
-    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')").unwrap();
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')")
+        .unwrap();
     assert_eq!(e.chunk_class_entries(), 1);
     let freeze = e.table_chunk_authoritative("facts").expect("classed");
 
     // Two post-freeze commits: a tail INSERT, then a class DELETE (a sidecar stamp).
     seq += 1;
-    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (200000, 'tail')").unwrap();
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (200000, 'tail')")
+        .unwrap();
     let after_insert = e.committed_seq();
     seq += 1;
-    e.execute_text(seq, "DELETE FROM facts WHERE a = 5").unwrap();
+    e.execute_text(seq, "DELETE FROM facts WHERE a = 5")
+        .unwrap();
     let after_delete = e.committed_seq();
 
     // The reverse gather AT THE FREEZE: no tails, no post-freeze stamps applied (a=5 visible).
@@ -3201,7 +3208,11 @@ fn gpu_chunk_class_born_gate_serves_old_boundaries() {
         .reverse_gather_streamed_rows("facts", freeze)
         .unwrap()
         .unwrap();
-    assert_eq!(at_freeze.len(), (N + 1) as usize, "the freeze boundary sees base + enter only");
+    assert_eq!(
+        at_freeze.len(),
+        (N + 1) as usize,
+        "the freeze boundary sees base + enter only"
+    );
     assert!(
         at_freeze.iter().any(|r| r[0] == SqlValue::Int4(5)),
         "the pre-delete boundary still sees a=5"
@@ -3226,7 +3237,12 @@ fn gpu_chunk_class_born_gate_serves_old_boundaries() {
 
     // The chunk-native LOCATE born gate: a predicate matching ONLY the tail row finds it at the
     // current boundary and NOTHING at the freeze boundary.
-    let table = e.catalog_snapshot().relational_catalog.get("facts").cloned().unwrap();
+    let table = e
+        .catalog_snapshot()
+        .relational_catalog
+        .get("facts")
+        .cloned()
+        .unwrap();
     let groups: Vec<Vec<(usize, SelectFilterOp, SqlValue)>> =
         vec![vec![(0, SelectFilterOp::Eq, SqlValue::Int4(200000))]];
     let predicate =
@@ -3238,7 +3254,10 @@ fn gpu_chunk_class_born_gate_serves_old_boundaries() {
     let frozen_hits = e
         .locate_streaming_cold_slots(&table, &predicate, freeze)
         .expect("locate serves");
-    assert!(frozen_hits.is_empty(), "a tail row is invisible to the freeze boundary");
+    assert!(
+        frozen_hits.is_empty(),
+        "a tail row is invisible to the freeze boundary"
+    );
 }
 
 /// P4 COMPACTION: a class DELETE that kills most of a chunk triggers the in-install survivor
@@ -3255,18 +3274,24 @@ fn gpu_chunk_class_compaction_deletes_dead_slots() {
     seq += 1;
     // Audit note adopted: a NULLABLE b128 column rides the compaction round-trip (the survivor
     // gather + re-encode must preserve NULL validity and numeric mantissas, not just int/text).
-    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT, n NUMERIC(10,2))").unwrap();
+    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT, n NUMERIC(10,2))")
+        .unwrap();
     const N: i32 = 900;
     let mut values = String::new();
     for i in 0..N {
         if i > 0 {
             values.push(',');
         }
-        let n = if i % 5 == 0 { "NULL".to_string() } else { format!("{i}.25") };
+        let n = if i % 5 == 0 {
+            "NULL".to_string()
+        } else {
+            format!("{i}.25")
+        };
         values.push_str(&format!("({i}, 'txt{:04}', {n})", i % 500));
     }
     seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO facts (a, t, n) VALUES {values}")).unwrap();
+    e.execute_text(seq, &format!("INSERT INTO facts (a, t, n) VALUES {values}"))
+        .unwrap();
     e.set_relational_residency_budget_bytes(0, 8192);
     let q_count = select("SELECT COUNT(*) FROM facts");
     let count = |e: &Engine| -> i64 {
@@ -3288,12 +3313,17 @@ fn gpu_chunk_class_compaction_deletes_dead_slots() {
     };
     let _ = count(&e);
     seq += 1;
-    e.execute_text(seq, "INSERT INTO facts (a, t, n) VALUES (100000, 'enter', 7.75)").unwrap();
+    e.execute_text(
+        seq,
+        "INSERT INTO facts (a, t, n) VALUES (100000, 'enter', 7.75)",
+    )
+    .unwrap();
     assert_eq!(e.chunk_class_entries(), 1);
 
     // Kill MOST of the first chunk's rows (a < 200 spans it): the stamp install must COMPACT.
     seq += 1;
-    e.execute_text(seq, "DELETE FROM facts WHERE a < 200").unwrap();
+    e.execute_text(seq, "DELETE FROM facts WHERE a < 200")
+        .unwrap();
     assert_eq!(e.chunk_class_deauths(), 0, "stays classed");
     assert!(
         e.chunk_class_compactions() >= 1,
@@ -3308,7 +3338,11 @@ fn gpu_chunk_class_compaction_deletes_dead_slots() {
     // Value-exact through the compacted chunk.
     assert_eq!(count(&e), i64::from(N) - 200 + 1);
     let expected_sum: i64 = (200..i64::from(N)).sum::<i64>() + 100000;
-    assert_eq!(sum_a(&e), expected_sum, "SUM through the compacted chunk is exact");
+    assert_eq!(
+        sum_a(&e),
+        expected_sum,
+        "SUM through the compacted chunk is exact"
+    );
     // The nullable numeric column survived compaction value-exactly: SUM(n) over survivors
     // (i.25 for i in 200..900 where i % 5 != 0) + the enter row's 7.75.
     let mantissa_sum: i128 = (200..i128::from(N))
@@ -3321,20 +3355,28 @@ fn gpu_chunk_class_compaction_deletes_dead_slots() {
         .unwrap();
     assert_eq!(
         sum_n.rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
-        vec![vec![SqlValue::Numeric(gpu_db_sql::Decimal128::new(mantissa_sum, 2))]],
+        vec![vec![SqlValue::Numeric(gpu_db_sql::Decimal128::new(
+            mantissa_sum,
+            2
+        ))]],
         "the NULL-bearing numeric column round-tripped compaction exactly"
     );
 
     // Post-compaction DML + the exit both stay correct (coordinates re-slotted: the NEXT delete
     // locates against the fresh epoch).
     seq += 1;
-    e.execute_text(seq, "DELETE FROM facts WHERE a = 500").unwrap();
+    e.execute_text(seq, "DELETE FROM facts WHERE a = 500")
+        .unwrap();
     assert_eq!(e.chunk_class_deauths(), 0);
     assert_eq!(sum_a(&e), expected_sum - 500);
     seq += 1;
     e.execute_text(seq, "CREATE TABLE zzz2 (x INT)").unwrap(); // the DDL-sweep exit
     assert_eq!(e.chunk_class_deauths(), 1);
-    assert_eq!(sum_a(&e), expected_sum - 500, "the de-authed store is value-exact");
+    assert_eq!(
+        sum_a(&e),
+        expected_sum - 500,
+        "the de-authed store is value-exact"
+    );
 }
 
 /// P5-0 — THE DEVICE SLOT RECHECK differential: for every slot of a staged mixed-type
@@ -3362,11 +3404,33 @@ fn gpu_device_slot_recheck_matches_host_decoder() {
         if i > 0 {
             values.push(',');
         }
-        let t = if i % 7 == 0 { "NULL".into() } else { format!("'txt{:04}'", i) };
-        let n = if i % 5 == 0 { "NULL".into() } else { format!("{}.{:02}", i, i % 100) };
-        let big = if i % 11 == 0 { "NULL".into() } else { format!("{}", i64::from(i) * 999_983) };
-        let flag = if i % 17 == 0 { "NULL".into() } else if i % 2 == 0 { "true".into() } else { "false".to_string() };
-        let u = if i % 19 == 0 { "NULL".into() } else { format!("'00000000-0000-0000-0000-{:012x}'", i) };
+        let t = if i % 7 == 0 {
+            "NULL".into()
+        } else {
+            format!("'txt{:04}'", i)
+        };
+        let n = if i % 5 == 0 {
+            "NULL".into()
+        } else {
+            format!("{}.{:02}", i, i % 100)
+        };
+        let big = if i % 11 == 0 {
+            "NULL".into()
+        } else {
+            format!("{}", i64::from(i) * 999_983)
+        };
+        let flag = if i % 17 == 0 {
+            "NULL".into()
+        } else if i % 2 == 0 {
+            "true".into()
+        } else {
+            "false".to_string()
+        };
+        let u = if i % 19 == 0 {
+            "NULL".into()
+        } else {
+            format!("'00000000-0000-0000-0000-{:012x}'", i)
+        };
         values.push_str(&format!(
             "({i}, {}, {big}, '2024-{:02}-{:02}', '2024-01-01 00:{:02}:{:02}', {n}, {flag}, {t}, {u})",
             if i % 13 == 0 { "NULL".to_string() } else { format!("{}", i % 300 - 150) },
@@ -3377,15 +3441,23 @@ fn gpu_device_slot_recheck_matches_host_decoder() {
         ));
     }
     seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO mix VALUES {values}")).unwrap();
+    e.execute_text(seq, &format!("INSERT INTO mix VALUES {values}"))
+        .unwrap();
     e.set_relational_residency_budget_bytes(0, 4096);
-    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM mix")).unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM mix"))
+        .unwrap();
     // Stamp one row so the mask path is exercised (class or store-driven — either stamps).
     seq += 1;
     e.execute_text(seq, "DELETE FROM mix WHERE a = 42").unwrap();
     let rtx = e.committed_seq();
 
-    let table = e.catalog_snapshot().relational_catalog.get("mix").cloned().unwrap();
+    let table = e
+        .catalog_snapshot()
+        .relational_catalog
+        .get("mix")
+        .cloned()
+        .unwrap();
     let map = e.read_state.residency.streaming_cold_chunks.load();
     let entry = map.get("mix").expect("cold entry");
     let mut checked = 0usize;
@@ -3441,7 +3513,8 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT)")
+        .unwrap();
     const N: i32 = 900;
     let mut values = String::new();
     for i in 0..N {
@@ -3451,19 +3524,29 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
         values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
     }
     seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES {values}")).unwrap();
+    e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES {values}"))
+        .unwrap();
     e.set_relational_residency_budget_bytes(0, 8192);
-    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM facts")).unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM facts"))
+        .unwrap();
     seq += 1;
-    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')").unwrap();
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')")
+        .unwrap();
     assert_eq!(e.chunk_class_entries(), 1);
     // A stamped delete: the index is ALL-VISIBLE, so the probe must still hit and the P5-0
     // recheck must mask.
     seq += 1;
-    e.execute_text(seq, "DELETE FROM facts WHERE a = 7").unwrap();
+    e.execute_text(seq, "DELETE FROM facts WHERE a = 7")
+        .unwrap();
     let rtx = e.committed_seq();
 
-    let table = e.catalog_snapshot().relational_catalog.get("facts").cloned().unwrap();
+    let table = e
+        .catalog_snapshot()
+        .relational_catalog
+        .get("facts")
+        .cloned()
+        .unwrap();
     let entry = e
         .read_state
         .residency
@@ -3487,7 +3570,9 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
 
     // Needles: three present (5, 500, 100000 — the tail row), the stamped one (7), one absent.
     let needles: Vec<i32> = vec![5, 500, 100000, 7, 424242];
-    let hits = e.probe_chunk_key_indexes(&indexes, &needles).expect("probe");
+    let hits = e
+        .probe_chunk_key_indexes(&indexes, &needles)
+        .expect("probe");
     assert_eq!(hits.len(), 5);
     // Present keys: exactly one live hit each whose recheck yields the key value.
     for (n, expect_a) in [(0usize, 5i32), (1, 500), (2, 100000)] {
@@ -3499,14 +3584,21 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
                 .materialize_cold_chunk_slot(&table, chunk, &staged, *slot as usize, rtx)
                 .expect("no decline")
             {
-                assert_eq!(row[0], SqlValue::Int4(expect_a), "hit rechecks to the needle");
+                assert_eq!(
+                    row[0],
+                    SqlValue::Int4(expect_a),
+                    "hit rechecks to the needle"
+                );
                 live += 1;
             }
         }
         assert_eq!(live, 1, "needle {n}: exactly one live hit");
     }
     // The STAMPED key: the index hits, the recheck masks — no live hit (the P5-2 not-a-conflict).
-    assert!(!hits[3].is_empty(), "the all-visible index still hits the stamped key");
+    assert!(
+        !hits[3].is_empty(),
+        "the all-visible index still hits the stamped key"
+    );
     let mut live = 0;
     for (pos, slot) in &hits[3] {
         let chunk = &entry.chunks[*pos];
@@ -3526,7 +3618,8 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
     // folds on-device; the needle is the host fingerprint via the shared helper): build indexes
     // over a BIGINT column and probe present/absent keys through fingerprints.
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE keyed8 (k BIGINT, v INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE keyed8 (k BIGINT, v INT)")
+        .unwrap();
     let mut v8 = String::new();
     for i in 0..600i64 {
         if i > 0 {
@@ -3535,11 +3628,17 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
         v8.push_str(&format!("({}, {})", i * 1_000_000_007, i));
     }
     seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO keyed8 (k, v) VALUES {v8}")).unwrap();
+    e.execute_text(seq, &format!("INSERT INTO keyed8 (k, v) VALUES {v8}"))
+        .unwrap();
     let _ = e
         .execute_relational_select(&select("SELECT COUNT(*) FROM keyed8"))
         .unwrap();
-    let table8 = e.catalog_snapshot().relational_catalog.get("keyed8").cloned().unwrap();
+    let table8 = e
+        .catalog_snapshot()
+        .relational_catalog
+        .get("keyed8")
+        .cloned()
+        .unwrap();
     let entry8 = e
         .read_state
         .residency
@@ -3589,7 +3688,720 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
             .materialize_cold_chunk_slot(&table8, chunk, &staged, *slot as usize, rtx8)
             .expect("no decline")
         {
-            assert_ne!(row[0], SqlValue::Int8(999_999_999_999), "collision resolved by recheck");
+            assert_ne!(
+                row[0],
+                SqlValue::Int8(999_999_999_999),
+                "collision resolved by recheck"
+            );
         }
     }
+}
+
+/// P5-2 — THE KEYED-CLASS LIFT (INSERT): a PK'd over-budget table ENTERS the class (eligibility
+/// no longer refuses unique indexes); its host rows are RECLAIMED; INSERT uniqueness is then
+/// validated ON-DEVICE (per-chunk key-index probe + P5-0 slot recheck at the statement
+/// snapshot): a genuine dup rejects WITHOUT de-auth, an in-batch dup rejects host-exact, a
+/// tombstoned key re-inserts (a masked hit is NOT a conflict), and fresh keys append as tails.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE ku (a INT PRIMARY KEY, t TEXT)")
+        .unwrap();
+    const N: i32 = 1200;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO ku (a, t) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let q_count = select("SELECT COUNT(*) FROM ku");
+    let count = |e: &Engine| -> i64 {
+        match e.execute_relational_select(&q_count).unwrap().rows.row(0)[0] {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("count: {other:?}"),
+        }
+    };
+    let _ = count(&e);
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO ku (a, t) VALUES (100000, 'enter')")
+        .unwrap();
+    assert_eq!(
+        e.chunk_class_entries(),
+        1,
+        "the KEYED table must ENTER the class (the P5-2 lift)"
+    );
+    assert!(
+        e.chunk_class_reclaimed_rows() > 0,
+        "entry reclaims the host rows"
+    );
+
+    // A genuine duplicate vs a BASE chunk: rejected on-device, class INTACT.
+    seq += 1;
+    let err = e
+        .execute_text(seq, "INSERT INTO ku (a, t) VALUES (500, 'dup')")
+        .expect_err("dup key 500 must reject");
+    assert!(
+        format!("{err:?}").contains("duplicate key value"),
+        "unique violation, got {err:?}"
+    );
+    assert_eq!(
+        e.chunk_class_deauths(),
+        0,
+        "a dup rejection must NOT de-auth"
+    );
+    assert!(
+        e.chunk_class_unique_probe_conflicts() >= 1,
+        "the conflict came from the device probe's recheck"
+    );
+
+    // A duplicate vs a TAIL chunk (the enter row): the tail's index builds lazily and probes.
+    seq += 1;
+    let err = e
+        .execute_text(seq, "INSERT INTO ku (a, t) VALUES (100000, 'dup-tail')")
+        .expect_err("dup key 100000 must reject");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert_eq!(e.chunk_class_deauths(), 0);
+
+    // An IN-BATCH duplicate: host-exact structural check inside the class preflight.
+    seq += 1;
+    let err = e
+        .execute_text(
+            seq,
+            "INSERT INTO ku (a, t) VALUES (777001, 'x'), (777001, 'y')",
+        )
+        .expect_err("in-batch dup must reject");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert_eq!(e.chunk_class_deauths(), 0);
+    assert_eq!(count(&e), i64::from(N) + 1, "no rejected row ever landed");
+
+    // Fresh keys append as tails; the probe VALIDATED (non-vacuity) and the class held.
+    let probes_before = e.chunk_class_unique_probes();
+    let skipped_before = e.chunk_class_skipped_installs();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO ku (a, t) VALUES (600000, 'fresh')")
+        .unwrap();
+    assert!(
+        e.chunk_class_unique_probes() > probes_before,
+        "the accept path went through the device probe"
+    );
+    assert!(
+        e.chunk_class_skipped_installs() > skipped_before,
+        "still classed"
+    );
+    assert_eq!(count(&e), i64::from(N) + 2);
+
+    // Tombstone-then-reinsert: the probe HITS the dead slot, the recheck masks it at the
+    // statement snapshot — NOT a conflict.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM ku WHERE a = 500").unwrap();
+    assert_eq!(e.chunk_class_deauths(), 0, "class DELETE stays classed");
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO ku (a, t) VALUES (500, 'reborn')")
+        .unwrap();
+    assert_eq!(e.chunk_class_deauths(), 0, "a masked hit is NOT a conflict");
+    assert_eq!(count(&e), i64::from(N) + 2);
+}
+
+/// P5-2 — C1 SELF-EXCLUSION: an UPDATE's own located coordinates are SELF, not conflicts (the
+/// old versions are live at probe time — stamps land in the commit hook). Key-preserving
+/// multi-row updates pass; a key change INTO an existing key rejects; a key change to a fresh
+/// key frees the old key for re-insert.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_keyed_update_self_exclusion() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE kv (a INT PRIMARY KEY, t TEXT)")
+        .unwrap();
+    const N: i32 = 1000;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO kv (a, t) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM kv"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO kv (a, t) VALUES (100000, 'enter')")
+        .unwrap();
+    assert_eq!(e.chunk_class_entries(), 1);
+
+    // Key-preserving multi-row UPDATE: every new image's key HITS its own located slot — all
+    // self-excluded, zero conflicts, class intact.
+    let conflicts_before = e.chunk_class_unique_probe_conflicts();
+    seq += 1;
+    e.execute_text(seq, "UPDATE kv SET t = 'self' WHERE a < 50")
+        .unwrap();
+    assert_eq!(
+        e.chunk_class_unique_probe_conflicts(),
+        conflicts_before,
+        "C1: self-hits are NOT conflicts"
+    );
+    assert_eq!(
+        e.chunk_class_deauths(),
+        0,
+        "key-preserving UPDATE stays classed"
+    );
+
+    // A key change INTO an existing key: a genuine conflict (the hit is NOT self).
+    seq += 1;
+    let err = e
+        .execute_text(seq, "UPDATE kv SET a = 43 WHERE a = 44")
+        .expect_err("44 -> 43 collides with the live 43");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert_eq!(e.chunk_class_deauths(), 0);
+
+    // A key change to a FRESH key: passes; the old key is then free for re-insert and the new
+    // key is taken.
+    seq += 1;
+    e.execute_text(seq, "UPDATE kv SET a = 999999 WHERE a = 45")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO kv (a, t) VALUES (45, 'reused')")
+        .unwrap();
+    seq += 1;
+    let err = e
+        .execute_text(seq, "INSERT INTO kv (a, t) VALUES (999999, 'taken')")
+        .expect_err("the moved-to key is live");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert_eq!(e.chunk_class_deauths(), 0, "the whole arc stayed classed");
+}
+
+/// P5-2 — FOLD-PATH NEEDLE PARITY + FINGERPRINT COLLISION: a COMPOUND key (two int4 columns)
+/// builds its chunk indexes over device-folded fingerprints and probes with the HOST-derived
+/// twin (`chunk_key_needle`) — a derivation mismatch is a silent all-miss (dup accepted), so the
+/// dup rejection here IS the parity proof. Then the adversarial case: two DISTINCT keys with
+/// COLLIDING 32-bit fingerprints — the colliding insert must be ACCEPTED (the full-tuple
+/// recheck distinguishes), the true dup still rejects.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_keyed_compound_fold_parity_and_collision() {
+    // Host-side birthday search for a fingerprint collision on (5, j): two j values whose key
+    // word-vectors [w(5), w(j)] fold to the SAME fingerprint.
+    let word = |v: i32| {
+        crate::engine_residency::sql_value_key_words(SqlType::Int4, &SqlValue::Int4(v)).unwrap()
+    };
+    let fp = |a: i32, b: i32| {
+        let mut words = word(a);
+        words.extend(word(b));
+        crate::engine_residency::compound_key_fingerprint(&words)
+    };
+    // CONSTRUCT the collision (a birthday search cannot find one here: the fingerprint's final
+    // per-word round is a BIJECTION of the last word, so fp(a1,b1) == fp(a2,b2) reduces to
+    // h1(a1) ^ h1(a2) == b1 ^ b2 — vanishingly rare over a small grid). Bucket first-word
+    // states by their TOP 12 BITS; two same-bucket states differ by x < 2^20, and b2 = b1 ^ x
+    // completes the pair. `step` replicates the fingerprint's per-word round FOR THE SEARCH
+    // ONLY — the REAL `compound_key_fingerprint` verifies the constructed pair below (drift in
+    // the round fails that assert loudly, never a silent mis-gate).
+    let step = |h: u32, w: i32| -> u32 {
+        let h = (h ^ (w as u32)).wrapping_mul(0x0100_0193);
+        h.rotate_left(13).wrapping_add(0x9E37_79B1)
+    };
+    let mut buckets: std::collections::HashMap<u32, (i32, u32)> = std::collections::HashMap::new();
+    let mut found: Option<((i32, i32), (i32, i32))> = None;
+    // Outside the filler key space (filler a < 1000, b = 3i < 3000; skip the enter row's
+    // a = 100000; b values sit at 2^20 +- x, far above every filler b).
+    let mut a: i32 = 10_000;
+    while found.is_none() {
+        assert!(a < 2_000_000, "no same-bucket first-word pair found");
+        if a != 100_000 {
+            let h1 = step(0x811C_9DC5, word(a)[0]);
+            if let Some((a_prev, h_prev)) = buckets.insert(h1 >> 20, (a, h1)) {
+                let x = (h_prev ^ h1) as i32;
+                let b1 = 1_i32 << 20;
+                found = Some(((a_prev, b1), (a, b1 ^ x)));
+            }
+        }
+        a += 1;
+    }
+    let ((a1, b1), (a2, b2)) = found.unwrap();
+    assert_eq!(
+        fp(a1, b1),
+        fp(a2, b2),
+        "the constructed pair must collide under the REAL fingerprint"
+    );
+    assert!((a1, b1) != (a2, b2), "distinct tuples");
+
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(
+        seq,
+        "CREATE TABLE kc (a INT, b INT, t TEXT, PRIMARY KEY (a, b))",
+    )
+    .unwrap();
+    const N: i32 = 1000;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {}, 'txt{:04}')", i * 3, i % 500));
+    }
+    // The first collision twin rides the base data.
+    values.push_str(&format!(",({a1}, {b1}, 'twin1')"));
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO kc (a, b, t) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM kc"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO kc (a, b, t) VALUES (100000, 0, 'enter')")
+        .unwrap();
+    assert_eq!(e.chunk_class_entries(), 1, "compound-keyed table enters");
+
+    // Parity: a true compound dup (10, 30) rejects via the folded probe.
+    seq += 1;
+    let err = e
+        .execute_text(seq, "INSERT INTO kc (a, b, t) VALUES (10, 30, 'dup')")
+        .expect_err("compound dup must reject (needle parity)");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert_eq!(e.chunk_class_deauths(), 0);
+
+    // Same first column, different second: NOT a dup.
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO kc (a, b, t) VALUES (10, 31, 'ok')")
+        .unwrap();
+
+    // The COLLIDING key: same fingerprint as (5, j1), different tuple — the recheck must ACCEPT.
+    let conflicts_before = e.chunk_class_unique_probe_conflicts();
+    seq += 1;
+    e.execute_text(
+        seq,
+        &format!("INSERT INTO kc (a, b, t) VALUES ({a2}, {b2}, 'twin2')"),
+    )
+    .unwrap_or_else(|err| panic!("fingerprint collision must NOT reject a distinct key: {err:?}"));
+    assert_eq!(
+        e.chunk_class_unique_probe_conflicts(),
+        conflicts_before,
+        "no conflict was recorded for the collision"
+    );
+    // And the true dup of the twin still rejects.
+    seq += 1;
+    let err = e
+        .execute_text(
+            seq,
+            &format!("INSERT INTO kc (a, b, t) VALUES ({a1}, {b1}, 'dup-twin')"),
+        )
+        .expect_err("the twin's true dup must reject");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert_eq!(e.chunk_class_deauths(), 0, "the whole arc stayed classed");
+}
+
+/// P5-2 — NULL KEY DECLINE: host unique semantics are STRUCTURAL (NULL == NULL conflicts), but
+/// the chunk fold reads raw payload bytes under the null bitmap — a NULL key can be neither
+/// built nor probed faithfully, so the class preflight DECLINES to host (de-auth). The first
+/// NULL insert succeeds on the rebuilt store; the second rejects host-side (structural dup).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_keyed_null_unique_declines_to_host() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE kn (a INT, u INT UNIQUE, t TEXT)")
+        .unwrap();
+    const N: i32 = 1000;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {}, 'txt{:04}')", i + 50_000, i % 500));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO kn (a, u, t) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM kn"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(
+        seq,
+        "INSERT INTO kn (a, u, t) VALUES (100000, 99000, 'enter')",
+    )
+    .unwrap();
+    assert_eq!(e.chunk_class_entries(), 1, "UNIQUE-column table enters");
+
+    // Sanity: the device probe is live for non-NULL keys.
+    seq += 1;
+    let err = e
+        .execute_text(seq, "INSERT INTO kn (a, u, t) VALUES (1, 50001, 'dup')")
+        .expect_err("dup u must reject");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert_eq!(e.chunk_class_deauths(), 0);
+
+    // A NULL key: DECLINE -> de-auth -> the host validates against the rebuilt store (a single
+    // NULL passes).
+    seq += 1;
+    e.execute_text(
+        seq,
+        "INSERT INTO kn (a, u, t) VALUES (2000000, NULL, 'null1')",
+    )
+    .unwrap();
+    assert_eq!(
+        e.chunk_class_deauths(),
+        1,
+        "the NULL key must decline the class (host semantics are structural)"
+    );
+    // The SECOND NULL: the host's structural check (NULL == NULL) rejects — the exact semantics
+    // the device probe cannot reproduce, proving the decline was the right call.
+    seq += 1;
+    let err = e
+        .execute_text(
+            seq,
+            "INSERT INTO kn (a, u, t) VALUES (2000001, NULL, 'null2')",
+        )
+        .expect_err("the second NULL is a structural dup");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+}
+
+/// P5-2 — THE C2 REPLAY DIFFERENTIAL: every keyed-class verdict must MATCH what recovery's
+/// host-path replay would decide — a probe false-accept is a WAL-durable duplicate the replay
+/// then REJECTS, i.e. an UNREPLAYABLE acked commit (an RPO violation, strictly worse than a
+/// wrong answer). Drive the full keyed history through the class (accepts + rejects +
+/// tombstone-reinsert + a key-moving update), crash WITHOUT a checkpoint, reopen: recovery must
+/// succeed and the replayed state must be value-identical.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_keyed_replay_differential() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-p52-replay-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("db.wal");
+    const N: i32 = 1000;
+    let (count_live, sum_live) = {
+        let mut e = Engine::new_local();
+        e.commit_state_mut().wal = WalBuffer::with_durable_segment(&base);
+        let mut seq = 0u64;
+        if !gpu_available(&mut e, &mut seq) {
+            return;
+        }
+        seq += 1;
+        e.execute_text(seq, "CREATE TABLE kr (a INT PRIMARY KEY, t TEXT)")
+            .unwrap();
+        let mut values = String::new();
+        for i in 0..N {
+            if i > 0 {
+                values.push(',');
+            }
+            values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
+        }
+        seq += 1;
+        e.execute_text(seq, &format!("INSERT INTO kr (a, t) VALUES {values}"))
+            .unwrap();
+        e.set_relational_residency_budget_bytes(0, 8192);
+        let _ = e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM kr"))
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO kr (a, t) VALUES (100000, 'enter')")
+            .unwrap();
+        assert_eq!(e.chunk_class_entries(), 1, "premise: classed");
+
+        // The adversarial history: device-accepted commits interleaved with device-rejected
+        // statements (the rejects must NOT be in the WAL), a tombstone re-insert, and a
+        // key-moving update.
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO kr (a, t) VALUES (600000, 'fresh')")
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO kr (a, t) VALUES (500, 'dup')")
+            .expect_err("dup rejected live");
+        seq += 1;
+        e.execute_text(seq, "DELETE FROM kr WHERE a = 500").unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO kr (a, t) VALUES (500, 'reborn')")
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "UPDATE kr SET a = 999999 WHERE a = 45")
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO kr (a, t) VALUES (45, 'reused')")
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO kr (a, t) VALUES (999999, 'taken')")
+            .expect_err("moved-to key rejected live");
+        assert_eq!(
+            e.chunk_class_deauths(),
+            0,
+            "the whole history stayed classed"
+        );
+
+        let count = match e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM kr"))
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("count: {other:?}"),
+        };
+        let sum = match e
+            .execute_relational_select(&select("SELECT SUM(a) FROM kr"))
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("sum: {other:?}"),
+        };
+        (count, sum)
+        // DROP = the crash: no checkpoint, the WAL is the only truth.
+    };
+
+    // Recovery replays the acked history through the HOST path — it must accept every acked
+    // commit (C2) and land value-identical.
+    let e = Engine::open_durable_wal_segment(&base).expect("recovery must replay cleanly (C2)");
+    let count = match e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM kr"))
+        .unwrap()
+        .rows
+        .row(0)[0]
+    {
+        SqlValue::Int8(n) => n,
+        ref other => panic!("count: {other:?}"),
+    };
+    let sum = match e
+        .execute_relational_select(&select("SELECT SUM(a) FROM kr"))
+        .unwrap()
+        .rows
+        .row(0)[0]
+    {
+        SqlValue::Int8(n) => n,
+        ref other => panic!("sum: {other:?}"),
+    };
+    assert_eq!(count, count_live, "replayed cardinality differs (C2)");
+    assert_eq!(sum, sum_live, "replayed values differ (C2)");
+    // Spot checks on the interesting keys.
+    for (key, expect) in [(500, 1i64), (45, 1), (999999, 1), (600000, 1), (44, 1)] {
+        let q = select(&format!("SELECT COUNT(*) FROM kr WHERE a = {key}"));
+        let got = match e.execute_relational_select(&q).unwrap().rows.row(0)[0] {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("spot: {other:?}"),
+        };
+        assert_eq!(got, expect, "key {key}");
+    }
+}
+
+/// P5-2 — THE TRANSACTION PATH: an explicit-txn INSERT's ONLY unique guard is the preflight
+/// (the commit-time de-auth runs AFTER it), so the class probe must reject a dup at statement
+/// time inside BEGIN/COMMIT, and accept fresh keys.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_keyed_txn_insert_dup_rejected() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE kt (a INT PRIMARY KEY, t TEXT)")
+        .unwrap();
+    const N: i32 = 1000;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO kt (a, t) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM kt"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO kt (a, t) VALUES (100000, 'enter')")
+        .unwrap();
+    assert_eq!(e.chunk_class_entries(), 1);
+
+    // The dup rejects INSIDE the transaction (the preflight probe). A txn's statements all
+    // carry the BEGIN's seq — the txn id.
+    seq += 1;
+    e.execute_text(seq, "BEGIN").unwrap();
+    let err = e
+        .execute_text(seq, "INSERT INTO kt (a, t) VALUES (500, 'dup')")
+        .expect_err("txn dup must reject at preflight");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    e.execute_text(seq, "ROLLBACK").unwrap();
+
+    // A fresh key commits through the txn path.
+    seq += 1;
+    e.execute_text(seq, "BEGIN").unwrap();
+    e.execute_text(seq, "INSERT INTO kt (a, t) VALUES (700000, 'fresh')")
+        .unwrap();
+    e.execute_text(seq, "COMMIT").unwrap();
+    let q = select("SELECT COUNT(*) FROM kt WHERE a = 700000");
+    let got = match e.execute_relational_select(&q).unwrap().rows.row(0)[0] {
+        SqlValue::Int8(n) => n,
+        ref other => panic!("count: {other:?}"),
+    };
+    assert_eq!(got, 1, "the txn insert landed");
+}
+
+/// P5-2 (audit MEDIUM) — TEXT UNIQUE KEY through the class probe: a text key folds to ONE
+/// FNV-1a word over its UTF-8 bytes via the fold kernel's TEXT SENTINEL branch (widths[k]==0,
+/// blob span read), and the host needle derives the SAME word — a divergence is a silent
+/// all-miss dup accept, so the dup rejection is the parity proof. The tombstone re-insert and
+/// the C2 replay differential ride the same history.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_keyed_text_key_probe_and_replay() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-p52-text-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("db.wal");
+    const N: i32 = 1000;
+    let (count_live, sum_live) = {
+        let mut e = Engine::new_local();
+        e.commit_state_mut().wal = WalBuffer::with_durable_segment(&base);
+        let mut seq = 0u64;
+        if !gpu_available(&mut e, &mut seq) {
+            return;
+        }
+        seq += 1;
+        e.execute_text(seq, "CREATE TABLE kx (k TEXT PRIMARY KEY, v INT)")
+            .unwrap();
+        let mut values = String::new();
+        for i in 0..N {
+            if i > 0 {
+                values.push(',');
+            }
+            values.push_str(&format!("('key-{i:05}', {i})"));
+        }
+        seq += 1;
+        e.execute_text(seq, &format!("INSERT INTO kx (k, v) VALUES {values}"))
+            .unwrap();
+        e.set_relational_residency_budget_bytes(0, 8192);
+        let _ = e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM kx"))
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO kx (k, v) VALUES ('enter', -1)")
+            .unwrap();
+        assert_eq!(e.chunk_class_entries(), 1, "the TEXT-keyed table enters");
+
+        // Parity: the true text dup rejects via the folded probe (base chunk + tail chunk).
+        seq += 1;
+        let err = e
+            .execute_text(seq, "INSERT INTO kx (k, v) VALUES ('key-00500', 0)")
+            .expect_err("text dup must reject (fold/needle parity)");
+        assert!(format!("{err:?}").contains("duplicate key value"));
+        seq += 1;
+        let err = e
+            .execute_text(seq, "INSERT INTO kx (k, v) VALUES ('enter', 0)")
+            .expect_err("tail text dup must reject");
+        assert!(format!("{err:?}").contains("duplicate key value"));
+        assert_eq!(e.chunk_class_deauths(), 0, "rejections stay classed");
+
+        // Near-miss shapes: prefix / suffix / case variants are DISTINCT keys and must accept.
+        seq += 1;
+        e.execute_text(
+            seq,
+            "INSERT INTO kx (k, v) VALUES ('key-0050', 1), ('key-005000', 2), ('KEY-00500', 3)",
+        )
+        .unwrap();
+
+        // Tombstone re-insert: masked hit is not a conflict.
+        seq += 1;
+        e.execute_text(seq, "DELETE FROM kx WHERE k = 'key-00007'")
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO kx (k, v) VALUES ('key-00007', 700)")
+            .unwrap();
+        assert_eq!(
+            e.chunk_class_deauths(),
+            0,
+            "the whole history stayed classed"
+        );
+
+        let count = match e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM kx"))
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("count: {other:?}"),
+        };
+        let sum = match e
+            .execute_relational_select(&select("SELECT SUM(v) FROM kx"))
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("sum: {other:?}"),
+        };
+        (count, sum)
+        // DROP = the crash.
+    };
+
+    // C2: the acked text-key history must replay cleanly through the host path.
+    let e = Engine::open_durable_wal_segment(&base).expect("recovery must replay cleanly (C2)");
+    let count = match e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM kx"))
+        .unwrap()
+        .rows
+        .row(0)[0]
+    {
+        SqlValue::Int8(n) => n,
+        ref other => panic!("count: {other:?}"),
+    };
+    let sum = match e
+        .execute_relational_select(&select("SELECT SUM(v) FROM kx"))
+        .unwrap()
+        .rows
+        .row(0)[0]
+    {
+        SqlValue::Int8(n) => n,
+        ref other => panic!("sum: {other:?}"),
+    };
+    assert_eq!(count, count_live, "replayed cardinality differs (C2)");
+    assert_eq!(sum, sum_live, "replayed values differ (C2)");
 }

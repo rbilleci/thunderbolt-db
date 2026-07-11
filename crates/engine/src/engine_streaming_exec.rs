@@ -3915,8 +3915,7 @@ impl Engine {
                 &[],
             )
             .ok()?;
-        let survivors: Vec<Vec<SqlValue>> =
-            result.rows.iter().map(|r| r.to_vec()).collect();
+        let survivors: Vec<Vec<SqlValue>> = result.rows.iter().map(|r| r.to_vec()).collect();
         let (snapshot, payload) = self
             .build_transient_relation_payload_only(table, &survivors)
             .ok()?;
@@ -4067,8 +4066,21 @@ impl Engine {
         let Some(table) = catalog.relational_catalog.get(table_name) else {
             return false;
         };
-        if table.indexes.iter().any(|index| index.unique) {
-            return false;
+        // P5-2 (the KEYED LIFT): a unique index no longer refuses the class WHEN it is
+        // chunk-probe SERVABLE — its key positions resolve and no key column is Bool (the fold
+        // kernel has no bool arm). The entry hook enforces the REST of the contract (H1: the
+        // whole index set must fit the retained cap; H2: the indexes must BUILD at entry).
+        for index in table.indexes.iter().filter(|index| index.unique) {
+            let Some(positions) = crate::engine_residency::index_key_column_positions(table, index)
+            else {
+                return false;
+            };
+            if positions
+                .iter()
+                .any(|&position| matches!(table.columns[position].ty, SqlType::Bool))
+            {
+                return false;
+            }
         }
         if !table.foreign_keys.is_empty() {
             return false;
@@ -4124,6 +4136,50 @@ impl Engine {
         {
             return; // not fresh at THIS commit — a later commit's hook will retry
         }
+        // P5-2 H1+H2 (the KEYED LIFT's entry contract): every unique index's chunk indexes
+        // must BUILD NOW — entry time, under this commit lock, while the chunks are RAM-fresh —
+        // never a lazy NVMe read later (H2); and the ESTIMATED set must fit the retained cap
+        // (H1: a set that cannot co-reside would LRU-thrash on every preflight). Any decline =
+        // no entry; the table simply stays store-authoritative.
+        let Some(table) = catalog.relational_catalog.get(table_name) else {
+            return;
+        };
+        let unique_key_ids: Vec<(usize, Vec<usize>)> = table
+            .indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| index.unique)
+            .filter_map(|(key_id, index)| {
+                crate::engine_residency::index_key_column_positions(table, index)
+                    .map(|positions| (key_id, positions))
+            })
+            .collect();
+        if !unique_key_ids.is_empty() {
+            let per_index_bytes: u64 = entry
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.row_count > 0)
+                .map(|chunk| {
+                    (chunk.row_count * 2)
+                        .checked_next_power_of_two()
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(8)
+                })
+                .fold(0u64, u64::saturating_add);
+            if per_index_bytes.saturating_mul(unique_key_ids.len() as u64)
+                > CHUNK_KEY_INDEX_CAP_BYTES
+            {
+                return;
+            }
+            for (key_id, positions) in &unique_key_ids {
+                if self
+                    .ensure_chunk_key_indexes(table, &entry, positions, *key_id)
+                    .is_none()
+                {
+                    return;
+                }
+            }
+        }
         let boundary = entry.build_copin_s;
         let mut map =
             std::collections::BTreeMap::clone(&residency.chunk_authoritative_tables.load());
@@ -4162,7 +4218,11 @@ impl Engine {
             let _ = self.deauthoritize_chunk_table(table_name, true);
             return;
         }
-        let cleared_generation = self.read_state.mvcc.table_rows(table_name).generation_payload();
+        let cleared_generation = self
+            .read_state
+            .mvcc
+            .table_rows(table_name)
+            .generation_payload();
         let repinned = ColdCacheBuilder {
             generation: cleared_generation,
             build_copin_s: entry.build_copin_s,
@@ -4479,6 +4539,27 @@ impl Engine {
             map.remove(table_name);
             residency.chunk_authoritative_tables.store(Arc::new(map));
             engine.evict_streaming_cold(table_name);
+            // P5-2 audit LOW: purge the table's chunk KEY-INDEX cache entries too — chunk ids
+            // are monotonic, so post-de-auth entries can never be re-hit; leaving them inflates
+            // `chunk_key_index_bytes` (VRAM retention + premature LRU eviction of live tables).
+            {
+                let mut cache = residency
+                    .chunk_key_index
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let stale: Vec<_> = cache
+                    .keys()
+                    .filter(|(name, _, _)| name == table_name)
+                    .cloned()
+                    .collect();
+                for key in stale {
+                    if let Some(evicted) = cache.remove(&key) {
+                        residency
+                            .chunk_key_index_bytes
+                            .fetch_sub(evicted.bytes, Ordering::Relaxed);
+                    }
+                }
+            }
             residency
                 .chunk_class_deauths
                 .fetch_add(1, Ordering::Relaxed);
@@ -4580,7 +4661,11 @@ impl Engine {
             return;
         }
         let residency = &self.read_state.residency;
-        let Some(entry) = residency.streaming_cold_chunks.load().get(table_name).cloned()
+        let Some(entry) = residency
+            .streaming_cold_chunks
+            .load()
+            .get(table_name)
+            .cloned()
         else {
             return;
         };
@@ -4598,9 +4683,8 @@ impl Engine {
                 }
                 let dead = (0..chunk.row_count as usize)
                     .filter(|slot| {
-                        i64::from_le_bytes(
-                            sidecar[slot * 8..slot * 8 + 8].try_into().expect("8"),
-                        ) != live
+                        i64::from_le_bytes(sidecar[slot * 8..slot * 8 + 8].try_into().expect("8"))
+                            != live
                     })
                     .count() as u64;
                 dead * 4 >= chunk.row_count
@@ -4623,16 +4707,14 @@ impl Engine {
         let mut total = entry.total_payload_bytes;
         for (idx, chunk) in entry.chunks.iter().enumerate() {
             if needs.contains(&idx) {
-                if let Some(compacted) =
-                    self.compact_streaming_cold_chunk(&table, chunk, boundary)
+                if let Some(compacted) = self.compact_streaming_cold_chunk(&table, chunk, boundary)
                 {
                     // Cap accounting: subtract the replaced payload + sidecar, add the new.
                     let old_payload = match &chunk.payload {
                         ColdPayload::Ram(b) => b.len() as u64,
                         ColdPayload::Spilled { len, .. } => *len as u64,
                     };
-                    let old_sidecar =
-                        chunk.deleted_by.as_ref().map_or(0, |b| b.len() as u64);
+                    let old_sidecar = chunk.deleted_by.as_ref().map_or(0, |b| b.len() as u64);
                     let new_payload = match &compacted.payload {
                         ColdPayload::Ram(b) => b.len() as u64,
                         ColdPayload::Spilled { len, .. } => *len as u64,
@@ -4772,9 +4854,7 @@ impl Engine {
             )?;
         let bytes: Vec<u8> = hash_table.iter().flat_map(|w| w.to_le_bytes()).collect();
         let runtime = self.cuda_driver_probe_runtime();
-        let device = runtime
-            .retain_device_memory_copy(d.gpu_id, &bytes)
-            .ok()?;
+        let device = runtime.retain_device_memory_copy(d.gpu_id, &bytes).ok()?;
         Some(ChunkKeyIndex {
             device: Arc::new(device),
             table_mask,
@@ -4788,7 +4868,6 @@ impl Engine {
     /// direct-call gate uses it now). Returns per-chunk (chunk_id, index) in entry order, or
     /// `None` if any chunk declines. Cap policy: evict the least-recently-used entries of OTHER
     /// chunks until the new total fits (class-agnostic — index buffers are small).
-    #[allow(dead_code)] // P5-2 wires the production caller.
     pub(crate) fn ensure_chunk_key_indexes(
         &self,
         table: &RelationalTable,
@@ -4870,7 +4949,6 @@ impl Engine {
     /// int4-class key, the host `compound_key_fingerprint` over `sql_value_key_words` for every
     /// other shape (byte-identical to the device fold). A mismatch is a silent all-miss = a
     /// false-negative duplicate = the C2 RPO hazard.
-    #[allow(dead_code)] // P5-2 wires the production caller.
     pub(crate) fn chunk_key_needle(
         table: &RelationalTable,
         key_positions: &[usize],
@@ -4900,7 +4978,6 @@ impl Engine {
         Some(crate::engine_residency::compound_key_fingerprint(&words))
     }
 
-    #[allow(dead_code)] // P5-2 wires the production caller.
     pub(crate) fn probe_chunk_key_indexes(
         &self,
         indexes: &[(usize, ChunkKeyIndex)],
@@ -4940,6 +5017,146 @@ impl Engine {
             out.push(hits);
         }
         Some(out)
+    }
+
+    /// P5-2 (S-E.P5) — the KEYED-CLASS uniqueness preflight: validate a statement's NEW key
+    /// images against a chunk-authoritative table ON-DEVICE. Every host validator at the call
+    /// sites sees the RECLAIMED (empty) store and passes VACUOUSLY — and a vacuous accept is the
+    /// C2 hazard: a WAL-durable duplicate that recovery's host-path replay then REJECTS, i.e. an
+    /// unreplayable acked commit. In-batch dups are checked host-side first (`new_rows`-only,
+    /// the exact structural semantics of `validate_unique_values_tuple`); existing-row conflicts
+    /// probe the per-chunk key indexes (ONE multi-chunk device locate per unique index) and every
+    /// hit is DEVICE-RECHECKED at `rtx` via `materialize_cold_chunk_slot` — a tombstoned slot is
+    /// NOT a conflict, and a fingerprint collision fails the full key-tuple equality.
+    ///
+    /// `exclude` — the C1 UPDATE self-exclusion: (the update's own located PACKED coordinates,
+    /// the resolve-time entry epoch). An update's old version is LIVE at probe time (stamps land
+    /// in the commit hook), so its own coordinates are SELF, not conflicts; the epoch must still
+    /// match the probed entry or the coordinates may be misaligned (decline, never guess).
+    ///
+    /// `Some(Ok)` = validated; `Some(Err)` = duplicate (a statement error — the class stays);
+    /// `None` = DECLINE, the caller must DE-AUTHORITIZE and fall through to host validation.
+    /// Declines: a NULL key value (host semantics are STRUCTURAL — NULL == NULL conflicts — but
+    /// the chunk fold reads raw payload bytes under the null bitmap, so a NULL key can be
+    /// neither built nor probed faithfully), an unfoldable needle, epoch drift, and any
+    /// build/probe/stage/read failure.
+    pub(crate) fn validate_class_insert_uniqueness(
+        &self,
+        table: &RelationalTable,
+        new_rows: &[Vec<SqlValue>],
+        rtx: Index,
+        exclude: Option<(&std::collections::BTreeSet<u64>, u64)>,
+    ) -> Option<Result<(), EngineError>> {
+        if new_rows.is_empty() {
+            return Some(Ok(()));
+        }
+        let mut keyed: Vec<(usize, String, Vec<usize>)> = Vec::new();
+        for (key_id, index) in table.indexes.iter().enumerate() {
+            if !index.unique {
+                continue;
+            }
+            // The host validator SKIPS an index whose key positions do not resolve
+            // (`validate_unique_indexes_for_rows`) — mirror it exactly: parity, not strictness.
+            let Some(positions) = crate::engine_residency::index_key_column_positions(table, index)
+            else {
+                continue;
+            };
+            keyed.push((key_id, index.name.clone(), positions));
+        }
+        if keyed.is_empty() {
+            return Some(Ok(()));
+        }
+        // In-batch duplicates: host-exact (structural, NULL == NULL) over the NEW rows only.
+        if let Err(err) = Self::validate_unique_indexes_for_rows(table, new_rows) {
+            return Some(Err(err));
+        }
+        let entry = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(&table.name)
+            .cloned()?;
+        if let Some((_, epoch)) = exclude {
+            if entry.entry_epoch != epoch {
+                return None;
+            }
+        }
+        let excluded = exclude.map(|(set, _)| set);
+        for (key_id, index_name, positions) in &keyed {
+            let mut needles: Vec<i32> = Vec::with_capacity(new_rows.len());
+            for row in new_rows {
+                if positions
+                    .iter()
+                    .any(|&position| matches!(row.get(position), None | Some(SqlValue::Null)))
+                {
+                    return None; // a NULL key cannot ride the fold — decline to host
+                }
+                needles.push(Self::chunk_key_needle(table, positions, row)?);
+            }
+            let chunk_indexes = self.ensure_chunk_key_indexes(table, &entry, positions, *key_id)?;
+            let hits = self.probe_chunk_key_indexes(&chunk_indexes, &needles)?;
+            // Group the recheck by chunk so each hit-bearing chunk stages ONCE.
+            let mut per_chunk: std::collections::BTreeMap<usize, Vec<(usize, u32)>> =
+                std::collections::BTreeMap::new();
+            for (needle_idx, needle_hits) in hits.iter().enumerate() {
+                for (position, slot) in needle_hits {
+                    let packed = ((*position as u64) << 32) | u64::from(*slot);
+                    if excluded.is_some_and(|set| set.contains(&packed)) {
+                        continue; // C1: the update's own row
+                    }
+                    per_chunk
+                        .entry(*position)
+                        .or_default()
+                        .push((needle_idx, *slot));
+                }
+            }
+            for (position, slot_hits) in per_chunk {
+                let chunk = entry.chunks.get(position)?;
+                let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
+                let (src, _vis) = staged.ready().ok()?;
+                for (needle_idx, slot) in slot_hits {
+                    let row =
+                        self.materialize_cold_chunk_slot(table, chunk, &src, slot as usize, rtx)?;
+                    let Some(row) = row else {
+                        continue; // tombstoned at rtx: a masked hit is NOT a conflict
+                    };
+                    let new_row = new_rows.get(needle_idx)?;
+                    if positions
+                        .iter()
+                        .all(|&position| row.get(position) == new_row.get(position))
+                    {
+                        self.read_state
+                            .residency
+                            .chunk_class_unique_probe_conflicts
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Some(Err(EngineError::ApplyFailed(format!(
+                            "duplicate key value violates unique index \"{index_name}\""
+                        ))));
+                    }
+                }
+            }
+        }
+        self.read_state
+            .residency
+            .chunk_class_unique_probes
+            .fetch_add(1, Ordering::Relaxed);
+        Some(Ok(()))
+    }
+
+    /// P5-2 telemetry: keyed-class uniqueness preflights served on-device (non-vacuity).
+    pub fn chunk_class_unique_probes(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_unique_probes
+            .load(Ordering::Relaxed)
+    }
+    /// P5-2 telemetry: probe-rejected duplicates (recheck-confirmed conflicts).
+    pub fn chunk_class_unique_probe_conflicts(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_unique_probe_conflicts
+            .load(Ordering::Relaxed)
     }
 
     /// P4-2b telemetry.
@@ -5375,8 +5592,6 @@ impl Engine {
     /// The sidecar is read HOST-side from the chunk (it lives beside the payload as host bytes);
     /// the VALUES read from the device via the descriptor's offset helpers — the same layout
     /// authority every device reader uses.
-    // Production caller = P5-2 (the uniqueness probe's recheck); the differential gates it now.
-    #[allow(dead_code)]
     pub(crate) fn materialize_cold_chunk_slot(
         &self,
         table: &RelationalTable,
@@ -5407,7 +5622,11 @@ impl Engine {
         let memory = &src.device_memory;
         let null_bit = |name: &str| -> Option<bool> {
             // 1 = valid; absent bitmap = all valid.
-            match d.resident_device_null_columns.iter().find(|n| n.name == name) {
+            match d
+                .resident_device_null_columns
+                .iter()
+                .find(|n| n.name == name)
+            {
                 None => Some(true),
                 Some(layout) => {
                     let word_off = layout.bitmap_byte_offset + ((slot as u64 / 32) * 4);
@@ -5441,7 +5660,8 @@ impl Engine {
                         .read_resident_i32_column(base + (slot as u64) * 8, 2)
                         .ok()?;
                     let v = ((*halves.first()? as u32 as u64)
-                        | ((*halves.get(1)? as u32 as u64) << 32)) as i64;
+                        | ((*halves.get(1)? as u32 as u64) << 32))
+                        as i64;
                     if column.ty == SqlType::Timestamp {
                         SqlValue::Timestamp(v)
                     } else {
@@ -5478,10 +5698,7 @@ impl Engine {
                 SqlType::Text => {
                     let layout = resident_device_text_column_layout(d, table, idx).ok()?;
                     let bounds = memory
-                        .read_resident_u64_column(
-                            layout.offsets_byte_offset + (slot as u64) * 8,
-                            2,
-                        )
+                        .read_resident_u64_column(layout.offsets_byte_offset + (slot as u64) * 8, 2)
                         .ok()?;
                     let (lo, hi) = (*bounds.first()?, *bounds.get(1)?);
                     // Audit LOW: corrupt bounds (hi < lo) DECLINE like the host decoder — never
