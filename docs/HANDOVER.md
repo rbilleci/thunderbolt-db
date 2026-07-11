@@ -64,6 +64,14 @@ on a frozen-seq assumption.
 ORACLE premise died when the plain-int4 shape became elision-eligible (device-authoritative commits leave the
 store stale BY DESIGN); pinned with the sibling-gate pattern + a4c's obsolete "gather must decline NULLs"
 modernized to positively gate the NULL-aware gather. Audited MERGE-SAFE.
+**FULL WORKSPACE SUITE GREEN (2026-07-11):** `cargo test --workspace` exit 0 — all 25 test binaries ok
+(196 host-side tests) on top of the 438/438 GPU sweep; the arc's storage-crate (changed_tuple_ids /
+visible_versions_in_range) and execution-crate (async copy transport, masked-pass2 fix) surfaces verified.
+NOTE: wider-type (int8-bearing) tables DO NOT elide under defaults — shard ADMISSION is on
+(shard_int8_section_enabled=true, test-lever setter only) but elision ELIGIBILITY is int4-scoped (int8
+sections decline in-place appends), so the "versioned wider-type elided reads de-elide" residue is
+UNREACHABLE today; the real gap is wider-type elision eligibility (i64-section append kernels), a full
+slice for a future session.
 **HOST-DEBT BALANCE SHEET (the charter-drift ruling's boundary accounting, 2026-07-11):**
 DELETED this arc: the host scalar combine (~130 LOC incl. all value comparisons/arithmetic), the host
 LIMIT/OFFSET windowing (~30 LOC), the per-round grouped narrow loop (~25 LOC), the throwaway upload per rebuilt
