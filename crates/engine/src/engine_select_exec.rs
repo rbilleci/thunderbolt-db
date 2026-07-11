@@ -377,6 +377,14 @@ impl Engine {
             self.rehydrate_elided_serialized(&select.table)
                 .map_err(ExecuteError::Engine)?;
         }
+        // P4-2b (S-E.P4): the CPU-pinned path on a CHUNK-AUTHORITATIVE table would scan the
+        // FROZEN store (post-freeze writes live only in the chunks) — DE-AUTHORITIZE first (the
+        // sticky exit replays the post-freeze delta into the store; loud + counted), exactly the
+        // elided-rehydrate discipline above.
+        if self.table_chunk_authoritative(&select.table).is_some() {
+            self.deauthoritize_chunk_table(&select.table, false)
+                .map_err(ExecuteError::Engine)?;
+        }
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         on_bound_before_pin();
         let pin = self.pin_relational_read_at(&select.table, copin_s);

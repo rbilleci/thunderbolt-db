@@ -3508,6 +3508,17 @@ impl Engine {
     /// fallback mirrors flush_wave_pending_appends' rehydrate/invalidate arm
     /// using only request-carried data (no CommitWaveItem).
     fn lane_apply_merged(&self, batch: &mut [crate::engine_intent_lanes::ApplyRequest]) {
+        // P4-2b (audit L5): a CHUNK-AUTHORITATIVE table must be unreachable here — lane ingress
+        // needs a covered/keyed route a keyless class table cannot build. Assert the invariant a
+        // future keyless-lane path would otherwise silently break (lost writes).
+        #[cfg(debug_assertions)]
+        for request in batch.iter() {
+            debug_assert!(
+                self.table_chunk_authoritative(&request.table).is_none(),
+                "a chunk-authoritative table reached the lane apply — the class write path only \
+                 exists on the serialized commit"
+            );
+        }
         use std::collections::BTreeMap;
         // group request indexes per table (usually exactly one table)
         let mut tables: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -4331,6 +4342,26 @@ impl Engine {
                 .collect();
             for table_name in elided {
                 self.rehydrate_elided_serialized(&table_name)
+                    .map_err(ExecuteError::Engine)?;
+            }
+        }
+        // P4-2b (S-E.P4, design review H2): the SAME sweep for CHUNK-AUTHORITATIVE tables — a
+        // DDL preflight (ADD PK/UNIQUE/CHECK/FK) reading visible_relational_rows against a
+        // FROZEN store would validate vacuously; de-authoritize every class table first.
+        if !matches!(
+            cmd,
+            Command::Insert(_) | Command::Update(_) | Command::Delete(_) | Command::Select(_)
+        ) {
+            let class_tables: Vec<String> = self
+                .read_state
+                .residency
+                .chunk_authoritative_tables
+                .load()
+                .keys()
+                .cloned()
+                .collect();
+            for table_name in class_tables {
+                self.deauthoritize_chunk_table(&table_name, false)
                     .map_err(ExecuteError::Engine)?;
             }
         }

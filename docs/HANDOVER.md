@@ -137,9 +137,26 @@ exclusion; 2 sabotages bite (validity inverted, mask dropped). **P4-2a SHIPPED (
 staged chunks (sidecar vis composed; slots native, no __slot column) + coordinate-driven sidecar stamps at
 the deleting boundary with the generation unchanged. TWO P4-2b OBLIGATIONS doc-contracted on the pair: the
 coordinate token / single commit-lock critical section, and the store-divergence rebuild hazard (store must
-be dropped/frozen for class tables first). ACTIVE SLICE: P4-2b (the class + write path per PLAN §2 —
-recon the commit-hook/elision-enter sites, honor the two obligations + H1 mutual exclusion + M1 serial
-route + M2 commit-lock bound + M3 RYW de-auth).
+be dropped/frozen for class tables first). **P4-2b-i SHIPPED: THE CHUNK-AUTHORITATIVE CLASS (the store deletion's pivot).** FREEZE-NOT-DROP closes
+review-C3 without a reader tracker: class entry (commit hook, elision-arm ELSE = H1 mutual exclusion;
+eligible = keyless + FK-free + budget + FRESH cold entry) FREEZES the store — the apply's Insert arm skips
+the install (allocator advances), the commit hook appends the statement's rows as TAIL chunks
+(payload_copin_s = the commit; install_streaming_cold_class — settledness from the HELD COMMIT LOCK +
+serial-only class + frozen-generation ptr-check, because the general strict-equality proof cannot hold
+pre-publish); below-boundary readers keep the frozen chains (exact MVCC). DE-AUTH (sticky exit) replays
+tails into the store (SHARED-allocator tuple ids — the store-LOCAL next_tuple_id COLLIDED and replaced
+live chains, found+fixed; born = chunk payload boundary) at: the CPU-pinned read seam, DML prepare, the
+DDL sweep, multi-entry commits, the COPY path, append failure. AUDIT MERGE-BLOCKED→ALL SIX ADOPTED:
+C1 the COPY-path de-auth RE-LOCKED the held commit mutex (explicit commit_lock_held param — the 6c-3
+lesson again); H2 fold-failure evict DESTROYED the record-of-truth (evict is now a class no-op + the
+de-auth None-entry arm HARD-ERRORS); M3 a None residency scope now de-auths ALL class tables
+(conservative); M4 auto-admit skips class tables (a budget raise would publish a STALE resident snapshot
+served BEFORE streaming dispatch); L5 lane-apply debug_assert; L6 tails build as DIRECT RAM chunks (the
+builder retro-spill would poison on a spilled base; unbounded entry growth accepted-by-design + ledgered,
+VACUUM compaction = P4-5). #[cfg(test)] CHUNK_CLASS_ENTRY_ENABLED_TEST keeps three store-driven gates on
+their machinery. COVERAGE GAP (next slice): a live COPY-into-class-table test (the C1 scenario is fixed
+structurally, untested end-to-end). ACTIVE SLICE: P4-2b-ii (DELETE/UPDATE via the P4-2a locate+stamp
+under the commit lock, honoring the coordinate-token obligation).
 **>>> NEXT ARC: P4 — DELETE THE HOST TUPLE STORE FOR STREAMED TABLES <<<** (the ADR-006 endgame for the
 streaming class; fresh-session-sized, decompose into audited slices):
 (P4a) DURABLE VALIDITY: the runtime generation-Arc validity dies with the store — the (artifact boundary,

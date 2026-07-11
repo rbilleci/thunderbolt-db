@@ -557,6 +557,13 @@ impl Engine {
             .foreign_keys
             .iter()
             .any(|foreign_key| foreign_key.referenced_table == table.name);
+        // P4-2b (S-E.P4): DELETE/UPDATE on a CHUNK-AUTHORITATIVE table DE-AUTHORITIZES first
+        // (the sticky exit; the write path for stamps is P4-2b-ii) — the ladder below then
+        // resolves against a WHOLE store, never the frozen one.
+        if self.table_chunk_authoritative(&table.name).is_some() {
+            self.deauthoritize_chunk_table(&table.name, false)?;
+            table_rows = self.read_state.mvcc.table_rows(&table.name);
+        }
         let index_resolved: Option<Vec<DmlResolvedMatch>> =
             if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
                 // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
@@ -1892,6 +1899,13 @@ impl Engine {
             .foreign_keys
             .iter()
             .any(|foreign_key| foreign_key.referenced_table == table.name);
+        // P4-2b (S-E.P4): DELETE/UPDATE on a CHUNK-AUTHORITATIVE table DE-AUTHORITIZES first
+        // (the sticky exit; the write path for stamps is P4-2b-ii) — the ladder below then
+        // resolves against a WHOLE store, never the frozen one.
+        if self.table_chunk_authoritative(&table.name).is_some() {
+            self.deauthoritize_chunk_table(&table.name, false)?;
+            table_rows = self.read_state.mvcc.table_rows(&table.name);
+        }
         let index_resolved: Option<Vec<DmlResolvedMatch>> =
             if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
                 // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before

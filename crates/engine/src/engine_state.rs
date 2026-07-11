@@ -675,6 +675,20 @@ pub(crate) struct ResidencyReadState {
     pub(crate) elided_tables: ArcSwap<std::collections::BTreeSet<String>>,
     /// RETIREMENT A4e: commits that skipped the host install (the non-vacuity signal).
     pub(crate) host_install_elisions: std::sync::atomic::AtomicU64,
+    /// P4-2b (S-E.P4): CHUNK-AUTHORITATIVE tables — name -> the FREEZE boundary (the commit index
+    /// at class entry). A class table's host store is FROZEN at that boundary (writes skip the
+    /// install; the cold chunks are the materialization); readers pinned BELOW it are served by
+    /// the frozen chains (exact MVCC), everything at-or-above streams. COW map, publishers
+    /// serialize on the commit path (entry/exit run under the commit lock).
+    pub(crate) chunk_authoritative_tables:
+        ArcSwap<std::collections::BTreeMap<String, Index>>,
+    /// P4-2b: class entries (the non-vacuity signal for the store deletion).
+    pub(crate) chunk_class_entries: std::sync::atomic::AtomicU64,
+    /// P4-2b: commits that skipped the host install for a class table.
+    pub(crate) chunk_class_skipped_installs: std::sync::atomic::AtomicU64,
+    /// P4-2b: sticky exits — a shape the chunks could not serve replayed the post-freeze delta
+    /// back into the store (the loud de-authoritization; not the steady state).
+    pub(crate) chunk_class_deauths: std::sync::atomic::AtomicU64,
     /// VACUUM #5: per-table count of incremental tombstone stamps since the last rebuild —
     /// the CHURN signal (each SV4b/SV5/A4b tombstone adds a dead slot; enough of them degrade
     /// the PK index to dup-declines and bloat scans). Reset by vacuum/re-admit. Serialized-path

@@ -479,6 +479,23 @@ fn gpu_streaming_projection_limit_offset_windows_and_early_exits() {
 
 /// Sort grouped result rows by their key cell (grouped output order is arbitrary per SQL without
 /// ORDER BY, so the differentials compare SORTED row sets).
+/// Disable chunk-class ENTRY for a store-driven gate test (6c-1/6c-3/P2 machinery), restoring
+/// on drop (the GPU suite is --test-threads=1, so set/restore is race-free).
+struct ClassEntryDisabled;
+impl ClassEntryDisabled {
+    fn new() -> Self {
+        crate::engine_streaming_exec::CHUNK_CLASS_ENTRY_ENABLED_TEST
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        ClassEntryDisabled
+    }
+}
+impl Drop for ClassEntryDisabled {
+    fn drop(&mut self) {
+        crate::engine_streaming_exec::CHUNK_CLASS_ENTRY_ENABLED_TEST
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn sorted_rows(result: &RelationalSelectResult) -> Vec<Vec<SqlValue>> {
     let mut rows = result.rows.clone().into_boxed();
     rows.sort_by(|a, b| crate::rel_exec_helpers::compare_sql_values(&a[0], &b[0]));
@@ -1264,6 +1281,9 @@ fn gpu_streaming_grouped_bigint_sum_repro() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_cold_tier_patches_deltas_chunk_granular() {
+    // These gates exercise the STORE-DRIVEN patch/stamp machinery (live for non-class tables);
+    // without this the table class-enters mid-test and the semantics legitimately change.
+    let _class_off = ClassEntryDisabled::new();
     // 6c-1: a write PATCHES the cold entry at CHUNK granularity instead of discarding it — the
     // O(delta) maintenance win. INSERT = a pure tail append (zero dirty chunks rebuilt); a one-row
     // DELETE rebuilds EXACTLY ONE dirty chunk (of several); every aggregate stays exact through
@@ -1381,6 +1401,9 @@ fn gpu_streaming_cold_tier_patches_deltas_chunk_granular() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_cold_tier_eager_commit_maintenance() {
+    // These gates exercise the STORE-DRIVEN patch/stamp machinery (live for non-class tables);
+    // without this the table class-enters mid-test and the semantics legitimately change.
+    let _class_off = ClassEntryDisabled::new();
     // 6c-3: a COMMIT eagerly patches the table's cold entry (best-effort, under the held commit
     // mutex, O(delta)) — the patch counter moves AT COMMIT TIME, before any read; the next read is
     // a CLEAN HIT (no read-time patch). Reads never pay the maintenance.
@@ -2193,6 +2216,9 @@ fn gpu_streaming_dml_locate_type_matrix_differential() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_cold_sidecar_stamps_mask_rows_across_chunks() {
+    // These gates exercise the STORE-DRIVEN patch/stamp machinery (live for non-class tables);
+    // without this the table class-enters mid-test and the semantics legitimately change.
+    let _class_off = ClassEntryDisabled::new();
     let mut e = Engine::new_local();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
@@ -2678,4 +2704,151 @@ fn gpu_locate_driven_stamp_masks_rows_without_store() {
         relocated.is_empty(),
         "already-stamped slots must not re-locate (got {relocated:?})"
     );
+}
+
+// ========== P4-2b-i (S-E.P4): the CHUNK-AUTHORITATIVE class — enter, freeze, stream, exit ==========
+
+/// THE CLASS LIFECYCLE GATE: an over-budget, elision-INeligible (text-bearing), keyless FK-free
+/// table ENTERS the class at a commit; subsequent INSERTs skip the host store (FROZEN — proven by
+/// the store's version count) while the streamed reads see every row (the tail appends are the
+/// materialization); an unstreamable read DE-AUTHORITIZES (the post-freeze delta replays into the
+/// store) and the host path serves exactly the full data. Differential twin throughout.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    let mut twin = Engine::new_local();
+    let mut twin_seq = 0u64;
+
+    const N: i32 = 1200;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
+    }
+    for (engine, s) in [(&mut e, &mut seq), (&mut twin, &mut twin_seq)] {
+        *s += 1;
+        engine.execute_text(*s, "CREATE TABLE facts (a INT, t TEXT)").unwrap();
+        *s += 1;
+        engine
+            .execute_text(*s, &format!("INSERT INTO facts (a, t) VALUES {values}"))
+            .unwrap();
+    }
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let q_count = select("SELECT COUNT(*) FROM facts");
+    let count = |e: &Engine| -> i64 {
+        match e.execute_relational_select(&q_count).unwrap().rows.row(0)[0] {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("count: {other:?}"),
+        }
+    };
+    // Build the cold entry, then the ENTER commit (the eager patch makes the entry fresh at it).
+    assert_eq!(count(&e), i64::from(N));
+    assert_eq!(e.chunk_class_entries(), 0);
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')").unwrap();
+    twin_seq += 1;
+    twin.execute_text(twin_seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')").unwrap();
+    assert_eq!(e.chunk_class_entries(), 1, "the table must ENTER the class at this commit");
+
+    // FROZEN: the store's version count stops moving; the chunks carry the tails.
+    let frozen_versions = e.read_state.mvcc.table_rows("facts").store().all_versions().len();
+    for k in 0..5 {
+        seq += 1;
+        e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES ({}, 'tail{k}')", 200000 + k))
+            .unwrap();
+        twin_seq += 1;
+        twin.execute_text(twin_seq, &format!("INSERT INTO facts (a, t) VALUES ({}, 'tail{k}')", 200000 + k))
+            .unwrap();
+    }
+    assert_eq!(e.chunk_class_skipped_installs(), 5, "five commits skipped the host install");
+    assert_eq!(
+        e.read_state.mvcc.table_rows("facts").store().all_versions().len(),
+        frozen_versions,
+        "the store is FROZEN at the class boundary"
+    );
+    assert_eq!(count(&e), i64::from(N) + 6, "the streamed read sees every tail row");
+    assert_eq!(e.chunk_class_deauths(), 0, "no exit yet");
+
+    // A value-sensitive streamed read through the tails (SUM over a).
+    let expected_sum: i64 = (0..i64::from(N)).sum::<i64>()
+        + 100000
+        + (0..5).map(|k| 200000 + k).sum::<i64>();
+    let sum = e.execute_relational_select(&select("SELECT SUM(a) FROM facts")).unwrap();
+    assert_eq!(
+        sum.rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        vec![vec![SqlValue::Int8(expected_sum)]]
+    );
+
+    // DE-AUTH: clear the budget — streaming deactivates, the CPU-pinned guard replays the
+    // post-freeze delta into the store, the class exits, and the host path serves EVERYTHING.
+    e.clear_relational_residency_budget_bytes(0);
+    let q_rows = select("SELECT a, t FROM facts ORDER BY a");
+    let got = e.execute_relational_select(&q_rows).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+    assert_eq!(e.chunk_class_deauths(), 1, "the unstreamable read exited the class LOUDLY");
+    let want = twin.execute_relational_select(&q_rows).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+    assert_eq!(got.len(), (N + 6) as usize);
+    assert_eq!(got, want, "post-de-auth host reads == the never-classed twin");
+    assert!(
+        e.read_state.mvcc.table_rows("facts").store().all_versions().len() > frozen_versions,
+        "the delta replayed into the store"
+    );
+
+    // Post-exit writes are plain store writes again.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM facts WHERE a = 100000").unwrap();
+    twin_seq += 1;
+    twin.execute_text(twin_seq, "DELETE FROM facts WHERE a = 100000").unwrap();
+    let got = e.execute_relational_select(&q_rows).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+    let want = twin.execute_relational_select(&q_rows).unwrap().rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+    assert_eq!(got, want);
+}
+
+/// DML on a class table exits FIRST (the prepare guard), then resolves against a whole store —
+/// and an ELIGIBLE-but-elision-ELIGIBLE table must take ELISION, never the class (H1 mutual
+/// exclusion; an int4-only keyless heap IS elision-eligible).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_dml_deauths_and_elision_takes_precedence() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT)").unwrap();
+    const N: i32 = 1200;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES {values}")).unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let q_count = select("SELECT COUNT(*) FROM facts");
+    let _ = e.execute_relational_select(&q_count).unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')").unwrap();
+    assert_eq!(e.chunk_class_entries(), 1);
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100001, 'tail')").unwrap();
+
+    // A range DELETE: the prepare guard de-authoritizes, then the host arm deletes correctly.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM facts WHERE a > 99999").unwrap();
+    assert_eq!(e.chunk_class_deauths(), 1, "DML exits the class first");
+    let count = match e.execute_relational_select(&q_count).unwrap().rows.row(0)[0] {
+        SqlValue::Int8(n) => n,
+        ref other => panic!("count: {other:?}"),
+    };
+    assert_eq!(count, i64::from(N), "both tail rows deleted; the base intact");
 }

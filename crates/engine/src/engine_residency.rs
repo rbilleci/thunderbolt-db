@@ -9939,6 +9939,20 @@ impl Engine {
     /// dropped-table simply leaves the table non-resident (reads fall back to the host path). N=1
     /// unified buffer per table (single-GPU); shard/spill is S-C/S-E.
     pub(crate) fn auto_admit_resident_tables(&self, tables: &std::collections::BTreeSet<String>) {
+        // P4-2b (audit M4): NEVER admit a CHUNK-AUTHORITATIVE table — its store is FROZEN
+        // (post-freeze writes live only in the chunks), so an admission (e.g. after a budget
+        // raise) would publish a STALE resident snapshot that the resident route serves BEFORE
+        // the streaming dispatch, with no de-auth guard in between.
+        let class_map = self.read_state.residency.chunk_authoritative_tables.load();
+        let tables: std::collections::BTreeSet<String> = tables
+            .iter()
+            .filter(|t| !class_map.contains_key(*t))
+            .cloned()
+            .collect();
+        let tables = &tables;
+        if tables.is_empty() {
+            return;
+        }
         // VACUUM #5: any rebuild resets the churn signal (the new generation is dense all-live).
         for table in tables {
             self.reset_tombstone_churn(table);

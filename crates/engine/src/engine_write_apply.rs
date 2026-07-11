@@ -77,6 +77,20 @@ impl Engine {
                     debug_assert_eq!(inserted_rows.len() as u64, delta.rows_consumed);
                     return Ok(());
                 }
+                // P4-2b (S-E.P4): a CHUNK-AUTHORITATIVE table's store is FROZEN — the commit
+                // hook's tail append is the materialization (WAL = durability). The allocator
+                // still advances (identity discipline, the elision precedent above).
+                if self.table_chunk_authoritative(&table).is_some() {
+                    self.read_state
+                        .mvcc
+                        .advance_row_id(inserted_rows.len() as u64);
+                    self.read_state
+                        .residency
+                        .chunk_class_skipped_installs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    debug_assert_eq!(inserted_rows.len() as u64, delta.rows_consumed);
+                    return Ok(());
+                }
                 // Non-elided install: recover any value-index entries deferred by the elided-skip
                 // (this table de-elided between prepare and now); a no-op on the common path.
                 let value_index_entries = self.value_index_entries_for_deferred_apply(

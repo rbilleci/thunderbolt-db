@@ -363,6 +363,14 @@ fn streaming_cold_spill_threshold() -> u64 {
 /// Captures above this stay out of host RAM (spilled). Engine-internal, not config.
 const STREAMING_COLD_SPILL_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 
+/// TEST-ONLY (the no-flag-compliant internal-policy override, the spill-threshold pattern):
+/// disable chunk-class ENTRY so the store-driven patch/stamp gates (6c-1/6c-3/P2) keep
+/// exercising their machinery on tables that would otherwise class-enter mid-test. Production
+/// behavior is unconditional.
+#[cfg(test)]
+pub(crate) static CHUNK_CLASS_ENTRY_ENABLED_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 #[cfg(test)]
 pub(crate) static STREAMING_COLD_SPILL_THRESHOLD_TEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -613,6 +621,18 @@ impl Engine {
         // Bind + lower the WHERE to a device predicate exactly as the sharded bridge does. A bind failure
         // or an un-lowerable predicate falls through to the host path (never a wrong answer).
         let (table, mut bound, copin_s) = self.bind_relational_select_for_execution(select).ok()?;
+        // P4-2b: a CLASS table's fold must NEVER scan the (frozen) store — a cold MISS (budget
+        // re-chunk, below-boundary reader, eviction) routes to the CPU-pinned path, whose guard
+        // de-authoritizes first. The probe load here is the folds' own load (a hit is reused).
+        if self.table_chunk_authoritative(&select.table).is_some() {
+            let chunk_target = (budget / 2).max(1);
+            if self
+                .load_streaming_cold(&select.table, &table, chunk_target, copin_s)
+                .is_none()
+            {
+                return Some(self.execute_relational_select_cpu_pinned(select));
+            }
+        }
         let predicate = resident_predicate_from_bound_filters(&bound).ok()?;
         // The executor filters SOLELY via the predicate (the SQL->Expr contract) — clear the bound filters.
         bound.filter = None;
@@ -2579,6 +2599,12 @@ impl Engine {
     /// (disk fault) would otherwise defer-thrash every future streaming read on the table; dropping
     /// the entry lets the next read rebuild it.
     fn evict_streaming_cold(&self, table_name: &str) {
+        // Audit H2: a CHUNK-AUTHORITATIVE table's entry is the record-of-truth for post-freeze
+        // writes — fold-failure eviction must never remove it (the fold falls to the CPU-pinned
+        // path whose guard de-authoritizes WITH the entry present, replaying the delta).
+        if self.table_chunk_authoritative(table_name).is_some() {
+            return;
+        }
         let residency = &self.read_state.residency;
         let _publish = residency
             .streaming_cold_lock
@@ -3259,7 +3285,10 @@ impl Engine {
             .sum();
         if class_total > class_cap {
             let kept = map.remove(table_name).expect("just inserted");
-            map.retain(|_, c| c.spilled != spilled);
+            // P4-2b: a CHUNK-AUTHORITATIVE table's entry is its representation-of-record — cap
+            // pressure must never evict it (the frozen store lacks the post-freeze writes).
+            let protected = self.read_state.residency.chunk_authoritative_tables.load();
+            map.retain(|name, c| c.spilled != spilled || protected.contains_key(name));
             map.insert(table_name.to_string(), kept);
         }
         if !is_patch {
@@ -3819,6 +3848,382 @@ impl Engine {
             .streaming_cold_stamps
             .fetch_add(stamped_rows, Ordering::Relaxed);
         true
+    }
+
+    // ================= P4-2b-i (S-E.P4): THE CHUNK-AUTHORITATIVE CLASS =================
+    //
+    // A table whose ONLY representation-of-record for post-entry writes is its cold chunks. The
+    // host store FREEZES at the entry boundary (writes skip the install; the frozen chains keep
+    // serving readers pinned BELOW the boundary — exact MVCC time travel); everything at-or-above
+    // streams from the chunks. The class is INTRINSIC (no flag): entered at the commit hook when
+    // eligible, exited LOUDLY (de-authoritization) on any shape the chunks cannot serve. The
+    // freeze — not a drop — closes the design-review C3 below-boundary-reader hole without a
+    // reader tracker, and makes the P4-2a store-divergence rebuild hazard structurally
+    // unreachable: a class table's writes publish NO store generation, so the entry's pinned
+    // generation stays pointer-current forever (always a HIT; the patcher never fires). RAM
+    // reclamation of the frozen rows is P4-5 (behind a reader fence).
+
+    /// The class check: `Some(freeze boundary)` when `table` is chunk-authoritative.
+    pub(crate) fn table_chunk_authoritative(&self, table: &str) -> Option<Index> {
+        self.read_state
+            .residency
+            .chunk_authoritative_tables
+            .load()
+            .get(table)
+            .copied()
+    }
+
+    /// Catalog eligibility (design review H1: RUNTIME state does the rest): NO unique index
+    /// (per-insert uniqueness over chunks would be an O(table) fold scan) and NO FK edge in
+    /// either direction (inbound-FK validation scans the provider host-side). Every scalar type
+    /// is chunk-encodable, so types never gate — the cold entry's existence is the real
+    /// structural gate.
+    fn chunk_class_eligible(catalog: &crate::CatalogSnapshot, table_name: &str) -> bool {
+        let Some(table) = catalog.relational_catalog.get(table_name) else {
+            return false;
+        };
+        if table.indexes.iter().any(|index| index.unique) {
+            return false;
+        }
+        if !table.foreign_keys.is_empty() {
+            return false;
+        }
+        // Inbound FK: any OTHER table referencing this one.
+        !catalog.relational_catalog.values().any(|other| {
+            other
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.referenced_table == table_name)
+        })
+    }
+
+    /// CLASS ENTRY — called from the applied-commit hook UNDER THE COMMIT LOCK, strictly in the
+    /// `else` of the elision ENTER (mutual exclusion by construction, review H1). Enters when the
+    /// table is eligible, NOT elided, has a FRESH cold entry (generation pointer-current AND
+    /// boundary == committed_seq — the eager patch for this very commit just ran), and streaming
+    /// is active (a budget is configured). The freeze boundary = the current commit index.
+    pub(crate) fn maybe_enter_chunk_class(&self, table_name: &str) {
+        #[cfg(test)]
+        if !CHUNK_CLASS_ENTRY_ENABLED_TEST.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.table_chunk_authoritative(table_name).is_some()
+            || self.table_install_elided(table_name)
+        {
+            return;
+        }
+        let gpu_id = self.planner.default_gpu_id();
+        match self.relational_residency_budget_bytes(gpu_id) {
+            Some(budget) if budget > 0 => {}
+            _ => return,
+        }
+        let catalog = self.catalog_snapshot();
+        if !Self::chunk_class_eligible(&catalog, table_name) {
+            return;
+        }
+        let residency = &self.read_state.residency;
+        let Some(entry) = residency.streaming_cold_chunks.load().get(table_name).cloned() else {
+            return;
+        };
+        let current = self.read_state.mvcc.table_rows(table_name).generation_payload();
+        if !Arc::ptr_eq(&entry.generation, &current)
+            || entry.build_copin_s != self.committed_seq()
+        {
+            return; // not fresh at THIS commit — a later commit's hook will retry
+        }
+        let boundary = entry.build_copin_s;
+        let mut map = std::collections::BTreeMap::clone(
+            &residency.chunk_authoritative_tables.load(),
+        );
+        map.insert(table_name.to_string(), boundary);
+        residency.chunk_authoritative_tables.store(Arc::new(map));
+        residency
+            .chunk_class_entries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// THE CLASS INSERT MATERIALIZATION — called from the applied-commit hook UNDER THE COMMIT
+    /// LOCK (obligation 1: one critical section, no intervening patch — the class entry's
+    /// generation never changes so no patch can interpose). Appends the statement's OWN rows as
+    /// fresh TAIL chunks (payload boundary = this commit — the born gate + de-auth read it) and
+    /// re-installs at the commit boundary. `false` = the caller must DE-AUTHORITIZE (the commit
+    /// is already durable in the WAL; the chunks just could not absorb it).
+    pub(crate) fn append_streaming_cold_tail(
+        &self,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+        commit_seq: Index,
+    ) -> bool {
+        if rows.is_empty() {
+            return true;
+        }
+        let residency = &self.read_state.residency;
+        let Some(entry) = residency.streaming_cold_chunks.load().get(&table.name).cloned()
+        else {
+            return false;
+        };
+        let column_types: Vec<SqlType> = table.columns.iter().map(|c| c.ty).collect();
+        let mut builder = ColdCacheBuilder {
+            generation: Arc::clone(&entry.generation),
+            build_copin_s: commit_seq,
+            chunk_target_bytes: entry.chunk_target_bytes,
+            total_payload_bytes: entry.total_payload_bytes,
+            column_signature: entry.column_signature.clone(),
+            chunks: entry
+                .chunks
+                .iter()
+                .map(|chunk| ColdChunk {
+                    payload: match &chunk.payload {
+                        ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
+                        ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
+                            file: Arc::clone(file),
+                            offset: *offset,
+                            len: *len,
+                        },
+                    },
+                    snapshot: chunk.snapshot.clone(),
+                    row_count: chunk.row_count,
+                    tuple_range: chunk.tuple_range,
+                    payload_copin_s: chunk.payload_copin_s,
+                    deleted_by: chunk.deleted_by.as_ref().map(Arc::clone),
+                })
+                .collect(),
+            spill: None,
+            poisoned: false,
+        };
+        // Chunk the statement rows by device bytes (the fold's own sizing); each tail chunk's
+        // payload boundary = this commit. Class tables have no store TupleIds — the tuple_range
+        // is the documented empty sentinel (the patcher never runs on a class table). Tail
+        // chunks are built DIRECTLY as RAM chunks (audit L6: the builder's retro-spill would
+        // POISON on a pre-spilled base; a mixed Spilled-base/Ram-tail entry is legal — P2). The
+        // entry's unbounded growth is accepted BY DESIGN (record-of-truth; VACUUM compaction is
+        // P4-5) and ledgered.
+        let mut start = 0usize;
+        while start < rows.len() {
+            let mut bytes: u64 = 0;
+            let mut end = start;
+            while end < rows.len() {
+                bytes = bytes.saturating_add(chunk_row_device_bytes(&rows[end], &column_types));
+                end += 1;
+                if bytes >= builder.chunk_target_bytes {
+                    break;
+                }
+            }
+            let Ok((snapshot, payload)) =
+                self.build_transient_relation_payload_only(table, &rows[start..end])
+            else {
+                return false;
+            };
+            builder.total_payload_bytes += payload.len() as u64;
+            builder.chunks.push(ColdChunk {
+                payload: ColdPayload::Ram(Arc::new(payload)),
+                snapshot,
+                row_count: (end - start) as u64,
+                tuple_range: (1, 0),
+                payload_copin_s: commit_seq,
+                deleted_by: None,
+            });
+            start = end;
+        }
+        self.install_streaming_cold_class(&table.name, builder)
+    }
+
+    /// The CLASS-PATH install: the general install's strict `committed_seq == build` proof cannot
+    /// hold here — the tail append runs INSIDE the apply, BEFORE `publish_committed_seq` (the
+    /// boundary is the commit being applied). Settledness comes from the structure instead: the
+    /// caller holds the COMMIT LOCK, class tables are serial-path-only (no lock-free lane
+    /// publishes touch them), and the FROZEN generation is verified pointer-current (a class
+    /// table's store never republishes — inequality means the class was exited mid-flight and
+    /// the append must fail into the de-auth backstop).
+    fn install_streaming_cold_class(&self, table_name: &str, builder: ColdCacheBuilder) -> bool {
+        if builder.poisoned {
+            return false;
+        }
+        let current = self.read_state.mvcc.table_rows(table_name).generation_payload();
+        if !Arc::ptr_eq(&builder.generation, &current) {
+            return false;
+        }
+        let spilled = builder.spill.is_some()
+            || builder
+                .chunks
+                .iter()
+                .any(|c| matches!(c.payload, ColdPayload::Spilled { .. }));
+        let entry = Arc::new(ColdTableChunks {
+            generation: builder.generation,
+            column_signature: builder.column_signature,
+            build_copin_s: builder.build_copin_s,
+            chunk_target_bytes: builder.chunk_target_bytes,
+            total_payload_bytes: builder.total_payload_bytes,
+            spilled,
+            chunks: builder.chunks,
+        });
+        let residency = &self.read_state.residency;
+        let _publish = residency
+            .streaming_cold_lock
+            .lock()
+            .expect("streaming cold-tier lock poisoned");
+        let mut map = std::collections::BTreeMap::clone(&residency.streaming_cold_chunks.load());
+        map.insert(table_name.to_string(), entry);
+        residency.streaming_cold_chunks.store(Arc::new(map));
+        true
+    }
+
+    /// DE-AUTHORITIZATION — the STICKY EXIT (the class twin of `rehydrate_elided_serialized`):
+    /// replay the POST-FREEZE DELTA back into the FROZEN store as normal chain mutations, so the
+    /// store becomes whole again at EVERY boundary (tail rows insert with `created_by = their
+    /// chunk's payload boundary` — readers below it keep not seeing them; the frozen chains
+    /// below the boundary were never touched). Runs under the commit lock; the cold entry is
+    /// EVICTED (its pinned generation is superseded by the replay's COW publishes; the next
+    /// streaming read rebuilds a clean cache). Any read/DML shape the chunks cannot serve exits
+    /// through here — loud, counted, correct.
+    pub(crate) fn deauthoritize_chunk_table(
+        &self,
+        table_name: &str,
+        // Audit C1 (the COPY-path deadlock): the commit mutex is NOT re-entrant and the
+        // internal-read flag is NOT set on every locked path — the caller states lock ownership
+        // EXPLICITLY (the install_streaming_cold_inner precedent).
+        commit_lock_held: bool,
+    ) -> Result<(), EngineError> {
+        let exit = |engine: &Self| -> Result<(), EngineError> {
+            let residency = &engine.read_state.residency;
+            let Some(freeze) = engine.table_chunk_authoritative(table_name) else {
+                return Ok(()); // another exiter won the race
+            };
+            let Some(table) = engine
+                .catalog_snapshot()
+                .relational_catalog
+                .get(table_name)
+                .cloned()
+            else {
+                return Ok(());
+            };
+            let entry = residency
+                .streaming_cold_chunks
+                .load()
+                .get(table_name)
+                .cloned();
+            // Audit H2: a class table WITHOUT its cold entry has LOST post-freeze writes — a
+            // silent freeze-only exit would serve wrong results. Fail LOUDLY (recovery = WAL
+            // replay); the eviction guards below make this unreachable.
+            if entry.is_none() {
+                return Err(EngineError::ApplyFailed(format!(
+                    "chunk-authoritative table \"{table_name}\" lost its cold entry — refusing \
+                     a freeze-only de-authoritization (post-freeze writes live only in chunks)"
+                )));
+            }
+            if let Some(entry) = entry {
+                for chunk in &entry.chunks {
+                    // P4-2b-i is INSERT-only: the post-freeze delta = tail chunks born above the
+                    // freeze (sidecar stamps above the freeze arrive with P4-2b-ii).
+                    if chunk.payload_copin_s <= freeze {
+                        continue;
+                    }
+                    let rows =
+                        decode_cold_chunk_rows(&table, chunk, chunk.payload_copin_s)
+                            .map_err(|e| {
+                                EngineError::ApplyFailed(format!(
+                                    "de-authoritization decode failed: {e}"
+                                ))
+                            })?;
+                    let born = chunk.payload_copin_s;
+                    // Fresh row ids (the class INSERT advanced the allocator without assigning;
+                    // ids are internal-only for a keyless FK-free table — divergence from the
+                    // prepare-time ids is unobservable, and WAL replay derives its own).
+                    let keyed: Vec<(String, Vec<SqlValue>)> = rows
+                        .into_iter()
+                        .map(|row| {
+                            let row_id = engine
+                                .read_state
+                                .mvcc
+                                .next_row_id
+                                .fetch_add(1, Ordering::Relaxed);
+                            (
+                                crate::rel_exec_helpers::relational_row_key(
+                                    table_name, row_id,
+                                ),
+                                row,
+                            )
+                        })
+                        .collect();
+                    let index_entries =
+                        crate::rel_exec_helpers::relational_value_index_entries_for_rows(
+                            &table.columns,
+                            &keyed,
+                        );
+                    // Tuple ids come from the SHARED MvccData allocator (the store-local
+                    // counter is NOT the authority — partition stores share one id space via
+                    // reserve_tuple_id; a local allocation would COLLIDE and replace live chains).
+                    let tuple_ids: Vec<gpu_db_storage::TupleId> = keyed
+                        .iter()
+                        .map(|_| engine.read_state.mvcc.reserve_tuple_id())
+                        .collect();
+                    engine.read_state.mvcc.with_table_mut(table_name, |data| {
+                        for (tuple_id, (key, row)) in tuple_ids.iter().zip(keyed.iter()) {
+                            data.rows
+                                .tuple_insert_reserved_key_with_id(
+                                    *tuple_id,
+                                    gpu_db_storage::NewTuple {
+                                        key: key.clone(),
+                                        value: crate::rel_exec_helpers::encode_relational_row(
+                                            row,
+                                        ),
+                                    },
+                                    born,
+                                )
+                                .map_err(|err| {
+                                    EngineError::ApplyFailed(err.to_string())
+                                })?;
+                        }
+                        for (entry_key, row_keys) in &index_entries {
+                            let mut slot = data
+                                .value_index
+                                .get(entry_key)
+                                .cloned()
+                                .unwrap_or_default();
+                            slot.extend(row_keys.iter().cloned());
+                            data.value_index.insert(entry_key.clone(), slot);
+                        }
+                        Ok::<(), EngineError>(())
+                    })?;
+                }
+            }
+            // Leave the class + evict the (now superseded-generation) cache entry.
+            let mut map = std::collections::BTreeMap::clone(
+                &residency.chunk_authoritative_tables.load(),
+            );
+            map.remove(table_name);
+            residency.chunk_authoritative_tables.store(Arc::new(map));
+            engine.evict_streaming_cold(table_name);
+            residency
+                .chunk_class_deauths
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        if commit_lock_held || self.mvcc_read_skips_leader_check() {
+            return exit(self);
+        }
+        let _commit_guard = self.commit_state();
+        exit(self)
+    }
+
+    /// P4-2b telemetry.
+    pub fn chunk_class_entries(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_entries
+            .load(Ordering::Relaxed)
+    }
+    pub fn chunk_class_skipped_installs(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_skipped_installs
+            .load(Ordering::Relaxed)
+    }
+    pub fn chunk_class_deauths(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_deauths
+            .load(Ordering::Relaxed)
     }
 
     /// P2 telemetry: cold-chunk rows tombstone-stamped in place of a chunk rebuild.

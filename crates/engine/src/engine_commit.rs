@@ -304,6 +304,36 @@ impl Engine {
                 }
             }
         }
+        // P4-2b (S-E.P4): the SAME multi-entry discipline for CHUNK-AUTHORITATIVE tables — the
+        // single-mutation tail-append hook below sees only the LAST entry's rows, so a
+        // multi-entry batch touching a class table would lose the earlier entries' tails.
+        // De-authoritize them FIRST (under this commit lock); the applies then install normally.
+        if to_apply.len() > 1 {
+            match Self::residency_invalidation_scope(&to_apply) {
+                Some(scope) => {
+                    for table_name in &scope {
+                        if self.table_chunk_authoritative(table_name).is_some() {
+                            self.deauthoritize_chunk_table(table_name, true)?;
+                        }
+                    }
+                }
+                // Audit M3: an undecodable/imprecise scope must be CONSERVATIVE — de-auth every
+                // class table (the invalidate-globally precedent) rather than risk a lost tail.
+                None => {
+                    let class_tables: Vec<String> = self
+                        .read_state
+                        .residency
+                        .chunk_authoritative_tables
+                        .load()
+                        .keys()
+                        .cloned()
+                        .collect();
+                    for table_name in class_tables {
+                        self.deauthoritize_chunk_table(&table_name, true)?;
+                    }
+                }
+            }
+        }
 
         // Hold the catalog latch across the WHOLE apply loop AND the catalog publish (PART B), so a
         // DDL's working-map mutation + the published-snapshot push are atomic w.r.t. another DDL. Lock
@@ -495,6 +525,39 @@ impl Engine {
                         )?;
                     }
                 }
+                // P4-2b (S-E.P4): the CHUNK-AUTHORITATIVE lifecycle — strictly the elision arm's
+                // ELSE (mutual exclusion, design review H1). A class INSERT materializes as a
+                // TAIL APPEND from the statement's own rows (the store install was skipped; the
+                // WAL is durability, this is the representation). A failed append — or any
+                // DELETE/UPDATE that somehow reached apply with the flag still set (the prepare
+                // guard de-authoritizes first; this is the backstop) — exits the class LOUDLY.
+                // Class ENTRY happens after the cold maintenance below (the entry must be fresh).
+                if !self.table_install_elided(table_name)
+                    && self.table_chunk_authoritative(table_name).is_some()
+                {
+                    match applied_ref {
+                        AppliedRowMutation::Insert { rows, .. } if !rows.is_empty() => {
+                            let appended = cat
+                                .relational_catalog
+                                .get(table_name)
+                                .map(|table| {
+                                    self.append_streaming_cold_tail(
+                                        table,
+                                        rows,
+                                        publish_index,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if !appended {
+                                self.deauthoritize_chunk_table(table_name, true)?;
+                            }
+                        }
+                        AppliedRowMutation::Insert { .. } => {}
+                        _ => {
+                            self.deauthoritize_chunk_table(table_name, true)?;
+                        }
+                    }
+                }
             }
             // ADR-006 (multi-statement elision): drain the accumulated INSERTs for the keep-elided
             // tables. ONE incremental device append per table (all the batch's rows, PER-ROW birth
@@ -599,6 +662,11 @@ impl Engine {
         // installs through the lock-held arm.
         if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
             self.maintain_streaming_cold_on_commit(&tables);
+            // P4-2b: class ENTRY — the maintenance above just brought each table's cold entry
+            // current at THIS commit (the freshness proof maybe_enter requires).
+            for table_name in &tables {
+                self.maybe_enter_chunk_class(table_name);
+            }
         }
         Ok(())
     }
@@ -739,6 +807,34 @@ impl Engine {
             }
         }
 
+        // P4-2b (S-E.P4): this path has NO applied-rows hook for the class tail append (the
+        // current-apply closure installs directly) — de-authoritize any CHUNK-AUTHORITATIVE table
+        // in scope FIRST (COPY-scale ingest exits the class; it re-enters on its next incremental
+        // commit with a fresh capture).
+        match Self::residency_invalidation_scope(&to_apply) {
+            Some(scope) => {
+                for table_name in &scope {
+                    if self.table_chunk_authoritative(table_name).is_some() {
+                        // Audit C1: this path HOLDS the commit mutex without the internal-read
+                        // flag — the explicit lock statement prevents the re-lock deadlock.
+                        self.deauthoritize_chunk_table(table_name, true)?;
+                    }
+                }
+            }
+            None => {
+                let class_tables: Vec<String> = self
+                    .read_state
+                    .residency
+                    .chunk_authoritative_tables
+                    .load()
+                    .keys()
+                    .cloned()
+                    .collect();
+                for table_name in class_tables {
+                    self.deauthoritize_chunk_table(&table_name, true)?;
+                }
+            }
+        }
         // Hold the catalog latch across the apply loop AND the catalog publish (PART B; lock order:
         // commit_mutex FIRST, then this latch).
         let residency_invalidation_micros;
@@ -780,6 +876,11 @@ impl Engine {
         // twin). The commit guard acquired at this fn's top is still held.
         if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
             self.maintain_streaming_cold_on_commit(&tables);
+            // P4-2b: class ENTRY — the maintenance above just brought each table's cold entry
+            // current at THIS commit (the freshness proof maybe_enter requires).
+            for table_name in &tables {
+                self.maybe_enter_chunk_class(table_name);
+            }
         }
         self.metrics.inc_commit();
 
