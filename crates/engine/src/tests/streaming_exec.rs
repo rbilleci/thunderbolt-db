@@ -973,10 +973,13 @@ fn gpu_streaming_cold_tier_invalidates_on_write() {
         vec![vec![SqlValue::Int8(i64::from(N) + 1)]],
         "a write must invalidate the cold tier (stale replay would return the OLD count)"
     );
-    assert!(
-        e.streaming_cold_builds() > builds_after_first,
-        "the post-write read must REBUILD (not hit)"
+    // 6c-1: the post-write read PATCHES the entry (O(delta)) instead of rebuilding it.
+    assert_eq!(
+        e.streaming_cold_builds(),
+        builds_after_first,
+        "the post-write read PATCHES — no fresh build"
     );
+    assert!(e.streaming_cold_patches() >= 1, "the write was served by a PATCH");
     // The rebuilt cache serves hits again...
     let hits_before = e.streaming_cold_hits();
     assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N) + 1)]]);
@@ -1142,4 +1145,98 @@ fn gpu_streaming_grouped_bigint_sum_repro() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_cold_tier_patches_deltas_chunk_granular() {
+    // 6c-1: a write PATCHES the cold entry at CHUNK granularity instead of discarding it — the
+    // O(delta) maintenance win. INSERT = a pure tail append (zero dirty chunks rebuilt); a one-row
+    // DELETE rebuilds EXACTLY ONE dirty chunk (of several); every aggregate stays exact through
+    // the patches. Composes: COW chain identity (imbl diff), effective-range tiling, the rollover
+    // tail, the S-E.6a settled-boundary install.
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE big (a INT)").unwrap();
+    const N: i32 = 1500;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i})"));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO big (a) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+
+    let count = |e: &Engine| {
+        e.execute_relational_select(&select("SELECT COUNT(*) FROM big"))
+            .unwrap()
+            .rows
+            .clone()
+            .into_boxed()
+    };
+    // Build (~3 chunks of 512 rows).
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
+    assert_eq!(e.streaming_cold_patches(), 0, "first read is a build, not a patch");
+
+    // INSERT -> tail-append patch: zero dirty chunks rebuilt.
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO big (a) VALUES (100000)").unwrap();
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N) + 1)]]);
+    assert_eq!(e.streaming_cold_patches(), 1, "the write PATCHED the entry");
+    assert_eq!(
+        e.streaming_cold_chunks_rebuilt(),
+        0,
+        "an INSERT is a pure TAIL append — no existing chunk rebuilds"
+    );
+
+    // One-row DELETE inside the FIRST chunk -> exactly ONE dirty chunk rebuilds.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM big WHERE a = 3").unwrap();
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
+    assert_eq!(e.streaming_cold_patches(), 2);
+    assert_eq!(
+        e.streaming_cold_chunks_rebuilt(),
+        1,
+        "a one-row DELETE rebuilds EXACTLY its one chunk (of several)"
+    );
+
+    // Aggregate exactness through the patched chunks (SUM over the survivors + the tail row).
+    let expected_sum: i64 = (0..i64::from(N)).sum::<i64>() - 3 + 100000;
+    let sum = e
+        .execute_relational_select(&select("SELECT SUM(a) FROM big"))
+        .unwrap();
+    assert_eq!(sum.rows.clone().into_boxed(), vec![vec![SqlValue::Int8(expected_sum)]]);
+
+    // The patched entry serves plain hits again (no further patches).
+    let patches = e.streaming_cold_patches();
+    assert_eq!(count(&e), vec![vec![SqlValue::Int8(i64::from(N))]]);
+    assert_eq!(e.streaming_cold_patches(), patches, "clean hit after the patch");
+
+    // F6 (audit): the EMPTY-table sentinel -> INSERT patch path (the (1,0) sentinel chunk's hi=0
+    // routes every new id to the tail; no panic, exact results).
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE hollow (a INT)").unwrap();
+    let hollow_count = |e: &Engine| {
+        e.execute_relational_select(&select("SELECT COUNT(*) FROM hollow"))
+            .unwrap()
+            .rows
+            .clone()
+            .into_boxed()
+    };
+    assert_eq!(hollow_count(&e), vec![vec![SqlValue::Int8(0)]], "empty build");
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO hollow (a) VALUES (1), (2)").unwrap();
+    assert_eq!(
+        hollow_count(&e),
+        vec![vec![SqlValue::Int8(2)]],
+        "insert-into-empty patches (sentinel -> tail) without a panic"
+    );
 }

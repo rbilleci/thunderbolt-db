@@ -130,6 +130,44 @@ impl InMemoryTupleStore {
         }
     }
 
+    /// STRATA 6c-1 (chunk-granular cold-tier patching): the TupleIds whose version CHAINS differ
+    /// between two store generations. Every write COW-publishes fresh chain Arcs along its path
+    /// while untouched subtrees stay POINTER-EQUAL, so `imbl::OrdMap::diff` visits only the changed
+    /// paths — O(delta), not O(table). Control-plane addressing only (no row values inspected).
+    pub fn changed_tuple_ids(&self, newer: &Self) -> Vec<TupleId> {
+        self.versions
+            .diff(&newer.versions)
+            .map(|item| match item {
+                imbl::ordmap::DiffItem::Add(id, _) => *id,
+                imbl::ordmap::DiffItem::Update { new: (id, _), .. } => *id,
+                imbl::ordmap::DiffItem::Remove(id, _) => *id,
+            })
+            .collect()
+    }
+
+    /// STRATA 6c-1: the newest VISIBLE version per chain within an INCLUSIVE TupleId range — the
+    /// bounded rebuild scan for ONE dirty cold chunk. Byte-identical visibility semantics to
+    /// `visible_versions` (same `is_visible`, same newest-first resolution), restricted by range.
+    pub fn visible_versions_in_range(
+        &self,
+        visibility: Visibility,
+        lo: TupleId,
+        hi: TupleId,
+    ) -> Result<Vec<TupleVersion>, StorageError> {
+        Self::validate_visibility(visibility)?;
+        Ok(self
+            .versions
+            .range(lo..=hi)
+            .filter_map(|(_, versions)| {
+                versions
+                    .iter()
+                    .rev()
+                    .find(|version| Self::is_visible(version, visibility))
+                    .cloned()
+            })
+            .collect())
+    }
+
     pub fn all_versions(&self) -> Vec<TupleVersion> {
         self.versions
             .values()

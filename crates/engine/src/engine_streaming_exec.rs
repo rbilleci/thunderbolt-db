@@ -125,6 +125,10 @@ impl StagedChunk {
 /// budget change re-chunks).
 pub(crate) struct ColdTableChunks {
     generation: Arc<crate::resident_storage::TableVersionData>,
+    /// 6c-1 (the ALTER guard): the catalog column layout the payloads were built with. A patch
+    /// REUSES cached chunk bytes, so a shape-changing DDL (which also republishes the store) must
+    /// evict rather than patch — layout inequality forces the evict arm.
+    column_signature: Vec<(String, SqlType)>,
     /// The build's pinned boundary, PROVEN SETTLED at install (under the commit lock,
     /// `committed_seq == build_copin_s` with the generation unchanged — so the generation contains
     /// NO stamp above it). A hit additionally requires `reader_copin_s >= build_copin_s`: every
@@ -144,6 +148,12 @@ pub(crate) struct ColdChunk {
     payload: ColdPayload,
     snapshot: RelationalResidencySnapshot,
     row_count: u64,
+    /// 6c-1: the INCLUSIVE TupleId range this chunk's rows were scanned from (scan order IS
+    /// TupleId order — the S-E.2 determinism fact). `(1, 0)` = the empty chunk (no rows). A write's
+    /// changed TupleIds map to dirty chunks through these ranges; untouched ranges REUSE their
+    /// bytes verbatim (chain identity: an untouched range's version chains are pointer-identical
+    /// across the COW generations, so its visible set at any settled boundary is unchanged).
+    tuple_range: (u64, u64),
 }
 
 /// S-E.6b: where a cached chunk's payload bytes live — host RAM below the spill threshold, or an
@@ -186,6 +196,7 @@ struct ColdCacheBuilder {
     build_copin_s: Index,
     chunk_target_bytes: u64,
     total_payload_bytes: u64,
+    column_signature: Vec<(String, SqlType)>,
     chunks: Vec<ColdChunk>,
     /// The open spill file + its append offset once the threshold tripped (`None` = all-RAM).
     spill: Option<(Arc<std::fs::File>, u64)>,
@@ -196,7 +207,13 @@ struct ColdCacheBuilder {
 impl ColdCacheBuilder {
     /// Append one captured chunk, spilling at the threshold. On any IO error the builder poisons
     /// itself (no install) — the fold's own compute path is unaffected.
-    fn push(&mut self, payload: Vec<u8>, snapshot: RelationalResidencySnapshot, row_count: u64) {
+    fn push(
+        &mut self,
+        payload: Vec<u8>,
+        snapshot: RelationalResidencySnapshot,
+        row_count: u64,
+        tuple_range: (u64, u64),
+    ) {
         use std::io::Write;
         if self.poisoned {
             return;
@@ -251,6 +268,7 @@ impl ColdCacheBuilder {
             payload: cold_payload,
             snapshot,
             row_count,
+            tuple_range,
         });
     }
 }
@@ -631,12 +649,14 @@ impl Engine {
         let mut total_matched: i64 = 0;
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
+        // 6c-1: the current chunk's inclusive TupleId range ((1,0) = empty sentinel).
+        let mut chunk_range: (u64, u64) = (1, 0);
         let mut chunks_run: u64 = 0;
         // S-E.5: the ONE-chunk lookahead — the staged chunk's upload is in flight while the previous
         // chunk computes and the next chunk's rows stage on the host.
         let mut staged: Option<StagedChunk> = None;
         // S-E.6: cold-tier replay (no MVCC decode) on a hit; a miss scans + CAPTURES for next time.
-        let cold = self.load_streaming_cold(&select.table, chunk_target_bytes, copin_s);
+        let cold = self.load_streaming_cold(&select.table, table, chunk_target_bytes, copin_s);
         let mut capture: Option<ColdCacheBuilder> = None;
 
         let prefix = relational_key_prefix(&select.table);
@@ -683,6 +703,11 @@ impl Engine {
             capture = Some(ColdCacheBuilder {
                 generation: table_rows.generation_payload(),
                 build_copin_s: copin_s,
+                column_signature: table
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.ty))
+                    .collect(),
                 chunk_target_bytes,
                 total_payload_bytes: 0,
                 chunks: Vec::new(),
@@ -701,10 +726,15 @@ impl Engine {
                 // out-of-core bound would break; audit Finding 1).
                 chunk_bytes =
                     chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+                chunk_range = if chunk_rows.is_empty() {
+                    (tuple.tuple_id, tuple.tuple_id)
+                } else {
+                    (chunk_range.0, tuple.tuple_id)
+                };
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
                     // S-E.5 lookahead: stage this chunk (its upload overlaps), compute the PREVIOUS.
-                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, &mut capture) else {
+                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
                     if let Some(prev) = staged.replace(next) {
@@ -734,6 +764,7 @@ impl Engine {
                     }
                     chunk_rows.clear();
                     chunk_bytes = 0;
+                    chunk_range = (1, 0);
                 }
             }
         }
@@ -741,7 +772,7 @@ impl Engine {
         // chunk so the aggregate gets its PG empty-set semantics (COUNT -> 0, SUM/MIN/MAX -> NULL). Then
         // DRAIN the pipeline (the last staged chunk still needs its compute).
         if !chunk_rows.is_empty() || (chunks_run == 0 && staged.is_none()) {
-            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, &mut capture) else {
+            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             if let Some(prev) = staged.replace(next) {
@@ -901,6 +932,8 @@ impl Engine {
         let mut rows_out: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
+        // 6c-1: the current chunk's inclusive TupleId range ((1,0) = empty sentinel).
+        let mut chunk_range: (u64, u64) = (1, 0);
         let mut chunks_run: u64 = 0;
         // S-E.5 lookahead — for the UNBOUNDED scan only: with a LIMIT the early-exit decision needs
         // THIS chunk's contribution before scanning further, so limited queries compute eagerly
@@ -908,7 +941,7 @@ impl Engine {
         let mut staged: Option<StagedChunk> = None;
         // S-E.6: cold-tier replay on a hit; a miss scans + captures (discarded on a LIMIT early-exit
         // — only a COMPLETE scan installs).
-        let cold = self.load_streaming_cold(&select.table, chunk_target_bytes, copin_s);
+        let cold = self.load_streaming_cold(&select.table, table, chunk_target_bytes, copin_s);
         let mut capture: Option<ColdCacheBuilder> = None;
 
         let prefix = relational_key_prefix(&select.table);
@@ -958,6 +991,11 @@ impl Engine {
             capture = Some(ColdCacheBuilder {
                 generation: table_rows.generation_payload(),
                 build_copin_s: copin_s,
+                column_signature: table
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.ty))
+                    .collect(),
                 chunk_target_bytes,
                 total_payload_bytes: 0,
                 chunks: Vec::new(),
@@ -978,9 +1016,14 @@ impl Engine {
                 let decoded = decode_relational_row(&tuple.value, &table.columns)?;
                 chunk_bytes =
                     chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+                chunk_range = if chunk_rows.is_empty() {
+                    (tuple.tuple_id, tuple.tuple_id)
+                } else {
+                    (chunk_range.0, tuple.tuple_id)
+                };
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, &mut capture)
+                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
@@ -1012,6 +1055,7 @@ impl Engine {
                     }
                     chunk_rows.clear();
                     chunk_bytes = 0;
+                    chunk_range = (1, 0);
                 }
             }
         }
@@ -1019,7 +1063,7 @@ impl Engine {
         // early-exit tripped would be dropped by the window anyway; don't upload them). Then DRAIN the
         // unbounded pipeline (the last staged chunk still needs its compute).
         if !chunk_rows.is_empty() && window_bound.is_none_or(|bound| rows_out.len() < bound) {
-            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, &mut capture) else {
+            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             let to_compute = if window_bound.is_some() {
@@ -1370,12 +1414,14 @@ impl Engine {
         let mut partials_bytes: u64 = 0;
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
+        // 6c-1: the current chunk's inclusive TupleId range ((1,0) = empty sentinel).
+        let mut chunk_range: (u64, u64) = (1, 0);
         let mut chunks_run: u64 = 0;
         // S-E.5: the one-chunk lookahead (drained BEFORE any accumulator merge so a chunk upload never
         // rides alongside the merge upload — the residency invariant stays two-chunks-max).
         let mut staged: Option<StagedChunk> = None;
         // S-E.6: cold-tier replay on a hit; a miss scans + captures for later reads.
-        let cold = self.load_streaming_cold(&select.table, chunk_target_bytes, copin_s);
+        let cold = self.load_streaming_cold(&select.table, table, chunk_target_bytes, copin_s);
         let mut capture: Option<ColdCacheBuilder> = None;
 
         let prefix = relational_key_prefix(&select.table);
@@ -1471,6 +1517,11 @@ impl Engine {
             capture = Some(ColdCacheBuilder {
                 generation: table_rows.generation_payload(),
                 build_copin_s: copin_s,
+                column_signature: table
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.ty))
+                    .collect(),
                 chunk_target_bytes,
                 total_payload_bytes: 0,
                 chunks: Vec::new(),
@@ -1485,9 +1536,14 @@ impl Engine {
                 let decoded = decode_relational_row(&tuple.value, &table.columns)?;
                 chunk_bytes =
                     chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+                chunk_range = if chunk_rows.is_empty() {
+                    (tuple.tuple_id, tuple.tuple_id)
+                } else {
+                    (chunk_range.0, tuple.tuple_id)
+                };
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, &mut capture)
+                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
@@ -1518,6 +1574,7 @@ impl Engine {
                     }
                     chunk_rows.clear();
                     chunk_bytes = 0;
+                    chunk_range = (1, 0);
                     // COMPACTION: the accumulator outgrew the chunk budget — device-merge it down to
                     // one row per true group. If even the compacted form exceeds the budget, the group
                     // cardinality itself is over-budget: defer (S-E.4+ may spill; v1 is honest).
@@ -1575,7 +1632,7 @@ impl Engine {
             }
         }
         if !chunk_rows.is_empty() {
-            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, &mut capture) else {
+            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             if let Some(prev) = staged.replace(next) {
@@ -1866,11 +1923,13 @@ impl Engine {
         let mut runs_bytes: u64 = 0;
         let mut chunk_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut chunk_bytes: u64 = 0;
+        // 6c-1: the current chunk's inclusive TupleId range ((1,0) = empty sentinel).
+        let mut chunk_range: (u64, u64) = (1, 0);
         let mut chunks_run: u64 = 0;
         // S-E.5: the one-chunk lookahead (drained BEFORE any accumulator sort upload).
         let mut staged: Option<StagedChunk> = None;
         // S-E.6: cold-tier replay on a hit; a miss scans + captures for later reads.
-        let cold = self.load_streaming_cold(&select.table, chunk_target_bytes, copin_s);
+        let cold = self.load_streaming_cold(&select.table, table, chunk_target_bytes, copin_s);
         let mut capture: Option<ColdCacheBuilder> = None;
 
         let prefix = relational_key_prefix(&select.table);
@@ -1970,6 +2029,11 @@ impl Engine {
             capture = Some(ColdCacheBuilder {
                 generation: table_rows.generation_payload(),
                 build_copin_s: copin_s,
+                column_signature: table
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.ty))
+                    .collect(),
                 chunk_target_bytes,
                 total_payload_bytes: 0,
                 chunks: Vec::new(),
@@ -1984,9 +2048,14 @@ impl Engine {
                 let decoded = decode_relational_row(&tuple.value, &table.columns)?;
                 chunk_bytes =
                     chunk_bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+                chunk_range = if chunk_rows.is_empty() {
+                    (tuple.tuple_id, tuple.tuple_id)
+                } else {
+                    (chunk_range.0, tuple.tuple_id)
+                };
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
-                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, &mut capture)
+                    let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
@@ -2015,6 +2084,7 @@ impl Engine {
                     }
                     chunk_rows.clear();
                     chunk_bytes = 0;
+                    chunk_range = (1, 0);
                     // Drain the in-flight chunk FIRST so an accumulator sort upload never overlaps it.
                     if runs_bytes >= chunk_target_bytes {
                         if let Some(prev) = staged.take() {
@@ -2081,7 +2151,7 @@ impl Engine {
             }
         }
         if !chunk_rows.is_empty() {
-            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, &mut capture) else {
+            let Ok(next) = self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture) else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
             if let Some(prev) = staged.replace(next) {
@@ -2389,6 +2459,7 @@ impl Engine {
         &self,
         table: &RelationalTable,
         chunk_rows: &[Vec<SqlValue>],
+        chunk_range: (u64, u64),
         capture: &mut Option<ColdCacheBuilder>,
     ) -> Result<StagedChunk, ()> {
         let (snapshot, pending, payload) = self
@@ -2403,7 +2474,7 @@ impl Engine {
         // into pinned memory; keeping the Vec is zero extra copies). Above the spill threshold the
         // builder streams them to the unlinked spill file instead of holding RAM (S-E.6b).
         if let Some(builder) = capture {
-            builder.push(payload, snapshot.clone(), chunk_rows.len() as u64);
+            builder.push(payload, snapshot.clone(), chunk_rows.len() as u64, chunk_range);
         }
         Ok(StagedChunk {
             snapshot,
@@ -2450,6 +2521,276 @@ impl Engine {
         })
     }
 
+    /// 6c-1: rebuild the visible rows of ONE effective TupleId range into cold chunks (payload +
+    /// descriptor, NO upload — replays stamp a fresh proof). Splits at the chunk byte target. The
+    /// decode/build here is the SAME staging the scan path performs, bounded to the dirty range —
+    /// the O(delta) win (charter: the staging upload carve-out; the registered scan-build debt
+    /// shrinks from O(table)/write to O(delta)/write).
+    #[allow(clippy::too_many_arguments)]
+    fn build_cold_chunks_for_range(
+        &self,
+        table: &RelationalTable,
+        store: &crate::resident_storage::TableVersionData,
+        copin_s: Index,
+        eff_lo: u64,
+        eff_hi: u64,
+        chunk_target_bytes: u64,
+        // F1 (6c-1 audit): rebuilt chunks accumulate through this SPILL-AWARE builder — a big
+        // tail / wide dirty range streams to the unlinked spill file above the threshold instead
+        // of materializing all payloads in host RAM (the same out-of-core bound the scan-build
+        // has). The builder's chunks stay in ascending range order across calls.
+        builder: &mut ColdCacheBuilder,
+    ) -> Result<(), ()> {
+        let visibility = StorageVisibility {
+            read_txn_id: copin_s,
+        };
+        let versions = store
+            .rows
+            .visible_versions_in_range(visibility, eff_lo, eff_hi)
+            .map_err(|_| ())?;
+        let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
+        let mut rows: Vec<Vec<SqlValue>> = Vec::new();
+        let mut bytes: u64 = 0;
+        let mut range: Option<(u64, u64)> = None;
+        let prefix = relational_key_prefix(&table.name);
+        let flush = |rows: &mut Vec<Vec<SqlValue>>,
+                         range: &mut Option<(u64, u64)>,
+                         builder: &mut ColdCacheBuilder|
+         -> Result<(), ()> {
+            if rows.is_empty() {
+                return Ok(());
+            }
+            let (snapshot, payload) = self.build_cold_payload(table, rows)?;
+            builder.push(
+                payload,
+                snapshot,
+                rows.len() as u64,
+                range.take().expect("non-empty chunk has a range"),
+            );
+            rows.clear();
+            Ok(())
+        };
+        for version in versions {
+            if !version.key.starts_with(&prefix) {
+                continue;
+            }
+            let decoded = decode_relational_row(&version.value, &table.columns).map_err(|_| ())?;
+            bytes = bytes.saturating_add(chunk_row_device_bytes(&decoded, &column_types));
+            range = Some(match range {
+                None => (version.tuple_id, version.tuple_id),
+                Some((lo, _)) => (lo, version.tuple_id),
+            });
+            rows.push(decoded);
+            if bytes >= chunk_target_bytes {
+                flush(&mut rows, &mut range, builder)?;
+                bytes = 0;
+            }
+        }
+        flush(&mut rows, &mut range, builder)?;
+        if builder.poisoned {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// The payload + descriptor for a cold chunk WITHOUT uploading (proof = None; stage_cold_chunk
+    /// stamps a fresh proof per replay). Mirrors `build_transient_relation_residency`'s descriptor.
+    fn build_cold_payload(
+        &self,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+    ) -> Result<(RelationalResidencySnapshot, Vec<u8>), ()> {
+        let (snapshot, pending, payload) = self
+            .build_transient_relation_residency_async(table, rows)
+            .map_err(|_| ())?;
+        // The transient upload is a byproduct here (the builder uploads); drop it un-used — wait()
+        // completes the DMA so the pinned buffer recycles safely. (A payload-only builder split is
+        // a follow-up; correctness first.)
+        let _ = pending.wait().map_err(|_| ())?;
+        Ok((snapshot, payload))
+    }
+
+    /// 6c-1 — CHUNK-GRANULAR DELTA PATCHING (deletes the whole-table invalidation): a stale cold
+    /// entry (generation mismatch = a write happened) is PATCHED, not discarded. The changed
+    /// TupleIds come from the O(delta) COW-chain diff (`changed_tuple_ids` — untouched subtrees are
+    /// pointer-equal); each maps to its chunk through the EFFECTIVE range tiling (chunk i owns
+    /// (prev.hi, hi]; ids beyond the last chunk are the TAIL — the rollover pattern). Untouched
+    /// chunks REUSE their bytes verbatim (chain identity + the old entry's settled boundary make
+    /// their visible sets boundary-invariant); dirty ranges + the tail REBUILD at the patching
+    /// reader's boundary. The patched entry re-installs under the SAME settled-boundary commit-lock
+    /// proof as a fresh build (S-E.6a). Returns the landed entry, or None (caller evicts + scans).
+    fn patch_streaming_cold(
+        &self,
+        table_name: &str,
+        table: &RelationalTable,
+        stale: &Arc<ColdTableChunks>,
+        current: &Arc<crate::resident_storage::TableVersionData>,
+        copin_s: Index,
+        chunk_target_bytes: u64,
+    ) -> Option<Arc<ColdTableChunks>> {
+        // The ALTER guard: a shape-changing DDL republished the store too — cached payload layouts
+        // would be reused with the WRONG column shape. Signature inequality -> evict.
+        let signature: Vec<(String, SqlType)> = table
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.ty))
+            .collect();
+        if signature != stale.column_signature
+            || stale.chunk_target_bytes != chunk_target_bytes
+        {
+            return None;
+        }
+        let changed = stale.generation.rows.changed_tuple_ids(&current.rows);
+        // Map changed ids to dirty chunks via the effective tiling; ids past the last hi = tail.
+        let mut dirty = vec![false; stale.chunks.len()];
+        let his: Vec<u64> = stale.chunks.iter().map(|c| c.tuple_range.1).collect();
+        let last_hi = his.last().copied().unwrap_or(0);
+        let mut tail_dirty = stale.chunks.is_empty();
+        for id in &changed {
+            if *id > last_hi {
+                tail_dirty = true;
+                continue;
+            }
+            let idx = his.partition_point(|hi| *hi < *id);
+            dirty[idx] = true;
+        }
+        // F2 (6c-1 audit — fragmentation cap): when the tail grows, COALESCE a trailing RUNT chunk
+        // (under half the target) into the tail rebuild — insert/read ping-pong would otherwise
+        // accrete one tiny chunk per write, degrading every later replay. Each patch absorbs the
+        // runt, so at most one lives at any time.
+        if tail_dirty && !stale.chunks.is_empty() {
+            let last = stale.chunks.len() - 1;
+            let last_bytes = match &stale.chunks[last].payload {
+                ColdPayload::Ram(bytes) => bytes.len() as u64,
+                ColdPayload::Spilled { len, .. } => *len as u64,
+            };
+            if last_bytes < chunk_target_bytes / 2 {
+                dirty[last] = true;
+            }
+        }
+        // Rebuild dirty ranges through ONE spill-aware builder (F1: rebuilt payloads stream to the
+        // spill file above the threshold — never unbounded host RAM), then MERGE with the reused
+        // chunks by ascending range (both sequences are ascending; control-plane assembly).
+        let mut rebuild = ColdCacheBuilder {
+            generation: Arc::clone(current),
+            build_copin_s: copin_s,
+            chunk_target_bytes,
+            total_payload_bytes: 0,
+            column_signature: signature.clone(),
+            chunks: Vec::new(),
+            spill: None,
+            poisoned: false,
+        };
+        let mut reused: Vec<ColdChunk> = Vec::new();
+        let mut eff_lo: u64 = 0;
+        for (i, chunk) in stale.chunks.iter().enumerate() {
+            let eff_hi = chunk.tuple_range.1;
+            // A dirty chunk's range REBUILDS; when the runt-coalesce marked the LAST chunk dirty,
+            // extend its rebuild into the tail in one scan (eff_hi = MAX below handles it).
+            let rebuild_hi = if dirty[i] && i == stale.chunks.len() - 1 && tail_dirty {
+                u64::MAX
+            } else {
+                eff_hi
+            };
+            if dirty[i] {
+                self.build_cold_chunks_for_range(
+                    table,
+                    current,
+                    copin_s,
+                    eff_lo,
+                    rebuild_hi,
+                    chunk_target_bytes,
+                    &mut rebuild,
+                )
+                .ok()?;
+                self.read_state
+                    .residency
+                    .streaming_cold_chunks_rebuilt
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                reused.push(ColdChunk {
+                    payload: match &chunk.payload {
+                        ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
+                        ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
+                            file: Arc::clone(file),
+                            offset: *offset,
+                            len: *len,
+                        },
+                    },
+                    snapshot: chunk.snapshot.clone(),
+                    row_count: chunk.row_count,
+                    tuple_range: chunk.tuple_range,
+                });
+            }
+            eff_lo = eff_hi.saturating_add(1);
+        }
+        // The tail (unless the runt-coalesce already extended the last rebuild through MAX).
+        let tail_absorbed =
+            tail_dirty && !stale.chunks.is_empty() && dirty[stale.chunks.len() - 1];
+        if tail_dirty && !tail_absorbed {
+            self.build_cold_chunks_for_range(
+                table,
+                current,
+                copin_s,
+                last_hi.saturating_add(1),
+                u64::MAX,
+                chunk_target_bytes,
+                &mut rebuild,
+            )
+            .ok()?;
+        }
+        // Merge reused + rebuilt by ascending range start (both already ascending).
+        let mut chunks: Vec<ColdChunk> = Vec::with_capacity(reused.len() + rebuild.chunks.len());
+        {
+            let mut a = reused.into_iter().peekable();
+            let mut b = rebuild.chunks.into_iter().peekable();
+            loop {
+                match (a.peek(), b.peek()) {
+                    (Some(x), Some(y)) => {
+                        if x.tuple_range.0 <= y.tuple_range.0 {
+                            chunks.push(a.next().expect("peeked"));
+                        } else {
+                            chunks.push(b.next().expect("peeked"));
+                        }
+                    }
+                    (Some(_), None) => chunks.push(a.next().expect("peeked")),
+                    (None, Some(_)) => chunks.push(b.next().expect("peeked")),
+                    (None, None) => break,
+                }
+            }
+        }
+        let total_payload_bytes: u64 = chunks
+            .iter()
+            .map(|c| match &c.payload {
+                ColdPayload::Ram(bytes) => bytes.len() as u64,
+                ColdPayload::Spilled { len, .. } => *len as u64,
+            })
+            .sum();
+        let builder = ColdCacheBuilder {
+            generation: Arc::clone(current),
+            build_copin_s: copin_s,
+            chunk_target_bytes,
+            total_payload_bytes,
+            column_signature: signature,
+            chunks,
+            spill: None,
+            poisoned: false,
+        };
+        if !self.install_streaming_cold_inner(table_name, builder, true) {
+            return None;
+        }
+        self.read_state
+            .residency
+            .streaming_cold_patches
+            .fetch_add(1, Ordering::Relaxed);
+        self.read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(table_name)
+            .cloned()
+    }
+
     /// S-E.6: the table's valid cold-tier chunks, or `None` (miss -> the caller scans + captures).
     /// A hit requires the SAME tuple-store generation (pointer equality — see [`ColdTableChunks`]),
     /// the same chunk target, AND `copin_s >= build_copin_s` (the boundary-invariance condition:
@@ -2461,6 +2802,7 @@ impl Engine {
     fn load_streaming_cold(
         &self,
         table_name: &str,
+        table: &RelationalTable,
         chunk_target_bytes: u64,
         copin_s: Index,
     ) -> Option<Arc<ColdTableChunks>> {
@@ -2473,6 +2815,23 @@ impl Engine {
             .cloned()?;
         let current = self.read_state.mvcc.table_rows(table_name).generation_payload();
         if !Arc::ptr_eq(&cold.generation, &current) {
+            // 6c-1: the table was written — PATCH the entry (rebuild only the dirty chunks + tail,
+            // O(delta)) instead of discarding it. A patch that cannot apply (ALTER'd shape, install
+            // race, IO error) falls through to the evict arm; the next read scans + rebuilds.
+            if let Some(patched) = self.patch_streaming_cold(
+                table_name,
+                table,
+                &cold,
+                &current,
+                copin_s,
+                chunk_target_bytes,
+            ) {
+                self.read_state
+                    .residency
+                    .streaming_cold_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Some(patched);
+            }
             // The table was written: drop the stale entry (and its pinned old generation) now.
             let residency = &self.read_state.residency;
             let _publish = residency
@@ -2510,32 +2869,50 @@ impl Engine {
     /// internal read skips installing entirely (the lock is already held by this thread — the
     /// `rehydrate_elided_serialized` pattern). CAP policy (audit F2): an entry alone over the cap
     /// never installs (rebuild-then-clear thrash); a combined breach evicts the OTHER entries.
-    fn install_streaming_cold(&self, table_name: &str, builder: ColdCacheBuilder) {
+    fn install_streaming_cold(&self, table_name: &str, builder: ColdCacheBuilder) -> bool {
+        self.install_streaming_cold_inner(table_name, builder, false)
+    }
+
+    /// `is_patch` keeps the BUILD counter honest (a patch re-install is not a fresh build — audit
+    /// 6c-1 F3); everything else is identical.
+    fn install_streaming_cold_inner(
+        &self,
+        table_name: &str,
+        builder: ColdCacheBuilder,
+        is_patch: bool,
+    ) -> bool {
         // A spill IO error poisoned the capture: the chunk list is incomplete — never install it.
         if builder.poisoned {
-            return;
+            return false;
         }
-        let spilled = builder.spill.is_some();
+        // 6c-1: a PATCHED entry can mix reused Spilled chunks with rebuilt Ram ones — class by the
+        // chunks themselves, not the builder's own spill stream.
+        let spilled = builder.spill.is_some()
+            || builder
+                .chunks
+                .iter()
+                .any(|c| matches!(c.payload, ColdPayload::Spilled { .. }));
         let class_cap = if spilled {
             STREAMING_COLD_DISK_CAP_BYTES
         } else {
             STREAMING_COLD_CAP_BYTES
         };
         if builder.total_payload_bytes > class_cap {
-            return;
+            return false;
         }
         if self.mvcc_read_skips_leader_check() {
-            return;
+            return false;
         }
         let _commit_guard = self.commit_state();
         let current = self.read_state.mvcc.table_rows(table_name).generation_payload();
         if !Arc::ptr_eq(&builder.generation, &current)
             || self.committed_seq() != builder.build_copin_s
         {
-            return;
+            return false;
         }
         let entry = Arc::new(ColdTableChunks {
             generation: builder.generation,
+            column_signature: builder.column_signature,
             build_copin_s: builder.build_copin_s,
             chunk_target_bytes: builder.chunk_target_bytes,
             total_payload_bytes: builder.total_payload_bytes,
@@ -2560,15 +2937,18 @@ impl Engine {
             map.retain(|_, c| c.spilled != spilled);
             map.insert(table_name.to_string(), kept);
         }
-        residency
-            .streaming_cold_builds
-            .fetch_add(1, Ordering::Relaxed);
+        if !is_patch {
+            residency
+                .streaming_cold_builds
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if spilled {
             residency
                 .streaming_cold_spills
                 .fetch_add(1, Ordering::Relaxed);
         }
         residency.streaming_cold_chunks.store(Arc::new(map));
+        true
     }
 
     /// Upload one chunk as a transient resident source, reduce it on the device, and fold the partial in.
@@ -2759,6 +3139,22 @@ impl Engine {
         self.read_state
             .residency
             .streaming_cold_builds
+            .load(Ordering::Relaxed)
+    }
+
+    /// 6c-1 telemetry: cold entries PATCHED after a write (O(delta) maintenance, not O(table)).
+    pub fn streaming_cold_patches(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_cold_patches
+            .load(Ordering::Relaxed)
+    }
+
+    /// 6c-1 telemetry: dirty chunks rebuilt across all patches.
+    pub fn streaming_cold_chunks_rebuilt(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_cold_chunks_rebuilt
             .load(Ordering::Relaxed)
     }
 
