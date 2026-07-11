@@ -24,9 +24,18 @@ write-invalidation gate, generation-sabotage-verified), sweep 432/434 (same 2 pr
 (create+unlink, OS-reclaimed, crash-safe; TMPDIR-honoring; positional read_exact_at replay into the async pinned
 upload; IO errors poison-or-defer, never wrong; 128GiB disk-class cap beside the 4GiB RAM cap). Over-RAM tables —
 previously refused installs — now cache. Audit MERGE-SAFE zero C/H/M (offset bookkeeping cursor-exact; async buffer
-lifetime safe); both LOWs adopted (replay-failure eviction; nanos in spill names). REMAINING S-E.6c+: shard-granular
-evict/prefetch API; admission laying down sealed shards for over-VRAM tables (the cache then stops shadowing and
-becomes the primary representation).
+lifetime safe); both LOWs adopted (replay-failure eviction; nanos in spill names). **⛔ CHARTER-DRIFT RULING (user, BINDING 2026-07-11, memory `charter-drift-execution-discipline`):** past agents
+built host engines via PRECEDENT-CHAINING + hallucinated charter glosses. ONLY charter text or a USER ruling
+justifies host-side work; every interim host piece needs a ledger row with a NAMED deletion trigger; the deletion
+ships in the SAME MERGE as its device replacement; audits judge drift against CHARTER.md TEXT only; host-debt
+balance sheet at track boundaries. REGISTERED DEBT (deletion trigger = the S-E.6c arc, user-ruled sequencing):
+the S-E.1 host scalar partial-combine, the S-E.2 LIMIT/OFFSET drain/truncate windowing, the S-E.3 renorm casts,
+and the ~2k-LOC cold tier + scan-build. **S-E.6c (ACTIVE, device-first, deletion-gated):** (1) sealed shards WITH
+on-device version stamps (SV3b/SV6) as the PRIMARY over-VRAM representation, fold consumes shard bytes directly →
+DELETE the cold cache + scan-build in that merge; (2) writes: INSERT appends a sealed cold shard (no rebuild),
+DELETE/UPDATE via per-shard tombstone regions interpreted ON-DEVICE; (3) combines onto the device via the S-E.3
+synthesized-relation pass → DELETE the host accumulator/windowing; end state: host = wire/plan/orchestrate/WAL/
+staging/readback ONLY.
 **S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy — RESOLVED:
 merged back via S-E.6a above):** the
 copy/compute-overlap pipeline (async pinned-staged uploads on a private copy stream + the stage-N/compute-N-1
