@@ -121,6 +121,20 @@ restart. Focused audit MERGE-SAFE; both LOWs adopted (restore adds sidecar bytes
 copies the builder total verbatim, no recompute; a POST-RESTORE delete gates `payload_copin_s` persistence —
 a seam-defaulted boundary shifts the stamp's rank and masks the WRONG row, caught by the closed-form SUM,
 sabotage-verified). Gates: round-trip + post-restore-stamp test, sweep 450/450.
+**P4 DESIGN ADVERSARIALLY REVIEWED + REVISED (`84e76bd6`) — the AUTHORITATIVE program is PLAN.md §2
+S-E.P4** (this HANDOVER sketch below is superseded where they differ). Review verdict NEEDS-REVISION, all
+adopted; headline kills: the P3 locate + P2 stamp are STORE-DRIVEN (P4-2a builds chunk-native twins), the
+reverse gather is a GREENFIELD host columnar decoder (new registered debt), the below-boundary reader needs
+the per-chunk born gate + entry quiesce + a never-read-the-empty-store dispatch guard, plus the elision
+mutual-exclusion, DDL-sweep, and WAL-truncation interlocks. **P4-1 SHIPPED: THE REVERSE GATHER** — the greenfield host columnar decoder (chunk device-format bytes ->
+catalog-order rows: i32/i64/b128 sections via the capacity-derived offset helpers, bool + NULL-validity
+bitmaps, text (n+1)-u64-offsets+blob, sidecar mask kernel-identical `deleted_by > rtx`, mis-sized sidecar =
+loud error) + `reverse_gather_streamed_rows` (whole-entry, scan order). REGISTERED HOST DEBT (control-plane
+de-auth only; deletion trigger = device-index-over-chunks); #[allow(dead_code)] until the P4-2b/P4-3
+callers land. Focused audit MERGE-SAFE (field-for-field encoder symmetry confirmed; both LOWs adopted:
+full NULL matrix in the gate, loud sidecar error). Gate: all-types round-trip differential + stamped-delete
+exclusion; 2 sabotages bite (validity inverted, mask dropped). ACTIVE SLICE: P4-2a (chunk-native
+locate+stamp per PLAN §2).
 **>>> NEXT ARC: P4 — DELETE THE HOST TUPLE STORE FOR STREAMED TABLES <<<** (the ADR-006 endgame for the
 streaming class; fresh-session-sized, decompose into audited slices):
 (P4a) DURABLE VALIDITY: the runtime generation-Arc validity dies with the store — the (artifact boundary,

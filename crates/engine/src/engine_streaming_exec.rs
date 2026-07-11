@@ -3625,6 +3625,39 @@ impl Engine {
         Some(matches)
     }
 
+    /// P4-1: the REVERSE GATHER driver — decode a table's ENTIRE cold entry into catalog-order
+    /// rows visible at `rtx` (chunk order = TupleId scan order, so concatenation preserves the
+    /// store's iteration order). The de-authoritization building block; `None` = no cold entry.
+    // Production callers arrive with P4-2b (patch-failure de-auth) and P4-3 (the read-
+    // completeness sticky exit); until then only the round-trip gate exercises it.
+    #[allow(dead_code)]
+    pub(crate) fn reverse_gather_streamed_rows(
+        &self,
+        table_name: &str,
+        rtx: Index,
+    ) -> Option<Result<Vec<Vec<SqlValue>>, EngineError>> {
+        let entry = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(table_name)
+            .cloned()?;
+        let table = self
+            .catalog_snapshot()
+            .relational_catalog
+            .get(table_name)
+            .cloned()?;
+        let mut rows: Vec<Vec<SqlValue>> = Vec::new();
+        for chunk in &entry.chunks {
+            match decode_cold_chunk_rows(&table, chunk, rtx) {
+                Ok(mut decoded) => rows.append(&mut decoded),
+                Err(err) => return Some(Err(err)),
+            }
+        }
+        Some(Ok(rows))
+    }
+
     /// P2 telemetry: cold-chunk rows tombstone-stamped in place of a chunk rebuild.
     pub fn streaming_cold_stamps(&self) -> u64 {
         self.read_state
@@ -3995,6 +4028,169 @@ impl Engine {
         }
         restored
     }
+}
+
+// ---------------- P4-1: THE REVERSE GATHER (chunk bytes -> host rows) ----------------
+//
+// The DE-AUTHORITIZATION primitive of the chunk-authoritative class (PLAN §2 S-E.P4): host-decode a
+// cold chunk's DEVICE-FORMAT payload back into catalog-order rows — the exit that rebuilds a store
+// representation for any shape the streaming folds cannot serve (over-budget unbounded ORDER BY,
+// JOINs, windows), for DDL preflights, and for patch failures. GREENFIELD BY NECESSITY (design
+// review C2): the elision rehydrate reads resident device SHARDS, which an over-budget streamed
+// table does not have — its only representation is these host-side chunk bytes.
+//
+// CHARTER / LEDGER (design review M4): this is a HOST MATERIALIZATION — registered debt, control
+// plane only (a de-auth/import action, never the steady-state data path; the live path stays
+// device-executed). Deletion trigger: the device-index-over-chunks route that lifts the class's
+// no-uniqueness restriction (the locate/gather then runs on-device end to end).
+
+/// Decode ONE cold chunk's payload into rows visible at `rtx`, honoring the deleted_by sidecar
+/// with EXACTLY the kernel's semantics (visible ⟺ `deleted_by > rtx`; absent sidecar = all live)
+/// and each column's NULL validity bitmap. Layout authority = the chunk's own DESCRIPTOR (the
+/// self-describing text/bool/null offsets + the capacity-derived fixed-width section formulas —
+/// the same helpers the device readers use).
+#[allow(dead_code)] // P4-2b/P4-3 wire the production callers; the round-trip gate exercises it now.
+pub(crate) fn decode_cold_chunk_rows(
+    table: &RelationalTable,
+    chunk: &ColdChunk,
+    rtx: Index,
+) -> Result<Vec<Vec<SqlValue>>, EngineError> {
+    use crate::relational_model::{
+        resident_device_bool_column_offset, resident_device_int4_column_offset,
+        resident_device_int8_column_offset, resident_device_numeric_column_offset,
+        resident_device_text_column_layout,
+    };
+    let map_err = |what: &str| EngineError::ApplyFailed(format!("reverse gather: {what}"));
+    let bytes = chunk
+        .payload
+        .read()
+        .map_err(|_| map_err("chunk payload read failed"))?;
+    let bytes: &[u8] = &bytes;
+    let d = &chunk.snapshot;
+    let rows_n = chunk.row_count as usize;
+    let read_u32 = |off: usize| -> Result<u32, EngineError> {
+        bytes
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+            .ok_or_else(|| map_err("payload truncated (u32)"))
+    };
+    let read_u64 = |off: usize| -> Result<u64, EngineError> {
+        bytes
+            .get(off..off + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+            .ok_or_else(|| map_err("payload truncated (u64)"))
+    };
+    // Per-column NULL validity: name -> bitmap offset (absent = all valid). 1 = valid, LSB-first
+    // u32 words (doc 21).
+    let null_offset = |name: &str| -> Option<u64> {
+        d.resident_device_null_columns
+            .iter()
+            .find(|n| n.name == name)
+            .map(|n| n.bitmap_byte_offset)
+    };
+    let bit_is_set = |bitmap_offset: u64, slot: usize| -> Result<bool, EngineError> {
+        let word = read_u32(bitmap_offset as usize + (slot / 32) * 4)?;
+        Ok((word >> (slot % 32)) & 1 == 1)
+    };
+    // The sidecar mask, kernel-identical: visible ⟺ deleted_by > rtx (0x7F.. live fill is a large
+    // positive i64, always > any real boundary). A mis-sized sidecar is impossible under the P2b
+    // sizing invariant (row_count*8, decode-validated) — but if it ever regresses, ERROR loudly
+    // rather than silently resurrect a deleted row (audit LOW).
+    let slot_visible = |slot: usize| -> Result<bool, EngineError> {
+        match &chunk.deleted_by {
+            None => Ok(true),
+            Some(sidecar) => {
+                let raw = sidecar
+                    .get(slot * 8..slot * 8 + 8)
+                    .map(|b| i64::from_le_bytes(b.try_into().expect("8 bytes")))
+                    .ok_or_else(|| map_err("sidecar shorter than row_count*8"))?;
+                Ok(raw > rtx as i64)
+            }
+        }
+    };
+
+    let mut out: Vec<Vec<SqlValue>> = Vec::new();
+    for slot in 0..rows_n {
+        if !slot_visible(slot)? {
+            continue;
+        }
+        let mut row: Vec<SqlValue> = Vec::with_capacity(table.columns.len());
+        for (idx, column) in table.columns.iter().enumerate() {
+            if let Some(offset) = null_offset(&column.name) {
+                if !bit_is_set(offset, slot)? {
+                    row.push(SqlValue::Null);
+                    continue;
+                }
+            }
+            let value = match column.ty {
+                SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
+                    let base = resident_device_int4_column_offset(d, table, idx)
+                        .map_err(|_| map_err("int4 offset"))?;
+                    let v = read_u32(base as usize + slot * 4)? as i32;
+                    match column.ty {
+                        SqlType::Date => SqlValue::Date(v),
+                        SqlType::Int2 => SqlValue::Int2(v as i16),
+                        _ => SqlValue::Int4(v),
+                    }
+                }
+                SqlType::Int8 | SqlType::Timestamp => {
+                    let base = resident_device_int8_column_offset(d, table, idx)
+                        .map_err(|_| map_err("int8 offset"))?;
+                    let v = read_u64(base as usize + slot * 8)? as i64;
+                    if column.ty == SqlType::Timestamp {
+                        SqlValue::Timestamp(v)
+                    } else {
+                        SqlValue::Int8(v)
+                    }
+                }
+                SqlType::Numeric { .. } | SqlType::Uuid => {
+                    let base = resident_device_numeric_column_offset(d, table, idx)
+                        .map_err(|_| map_err("b128 offset"))?;
+                    let off = base as usize + slot * 16;
+                    let raw: [u8; 16] = bytes
+                        .get(off..off + 16)
+                        .and_then(|b| b.try_into().ok())
+                        .ok_or_else(|| map_err("payload truncated (b128)"))?;
+                    if column.ty == SqlType::Uuid {
+                        SqlValue::Uuid(raw)
+                    } else {
+                        let SqlType::Numeric { scale, .. } = column.ty else {
+                            unreachable!()
+                        };
+                        SqlValue::Numeric(gpu_db_sql::Decimal128::new(
+                            i128::from_le_bytes(raw),
+                            scale,
+                        ))
+                    }
+                }
+                SqlType::Bool => {
+                    let base = resident_device_bool_column_offset(d, table, idx)
+                        .map_err(|_| map_err("bool offset"))?;
+                    SqlValue::Bool(bit_is_set(base, slot)?)
+                }
+                SqlType::Text => {
+                    let layout = resident_device_text_column_layout(d, table, idx)
+                        .map_err(|_| map_err("text layout"))?;
+                    let lo =
+                        read_u64(layout.offsets_byte_offset as usize + slot * 8)? as usize;
+                    let hi =
+                        read_u64(layout.offsets_byte_offset as usize + (slot + 1) * 8)? as usize;
+                    let span = bytes
+                        .get(layout.bytes_byte_offset as usize + lo
+                            ..layout.bytes_byte_offset as usize + hi)
+                        .ok_or_else(|| map_err("payload truncated (text)"))?;
+                    SqlValue::Text(
+                        std::str::from_utf8(span)
+                            .map_err(|_| map_err("text not UTF-8"))?
+                            .to_string(),
+                    )
+                }
+            };
+            row.push(value);
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 // ---------------- P1: the cold-checkpoint artifact encoding (control plane, no serde) ----------------
