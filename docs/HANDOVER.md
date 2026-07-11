@@ -53,10 +53,15 @@ tail-runt coalescing caps ping-pong fragmentation (F2, remaining O(chunks)/patch
 excluded from the builds counter (F3), empty→insert covered (F6). The scan-build debt: O(table)/write →
 O(delta)/write. **6c-2 (tombstone sidecars) DEFERRED as low-leverage post-6c-1** (deletes are already O(one-chunk);
 sidecars pay off when cold bytes become PRIMARY — folded into the 6c-3+ arc).
-**S-E.6c remaining:** 6c-3 = EAGER cold-tier maintenance at the auto-admit commit hook (over-VRAM tables
-build/patch at commit, best-effort off the ack path — deletes the lazy first-read O(table) scan from the READ
-path); then sealed shards as PRIMARY (cold bytes stop shadowing the tuple store; on-device tombstone regions
-SV2-style; the ADR-006 store deletion follows).
+**6c-3 DONE (`7fe0277e`): EAGER COMMIT-TIME MAINTENANCE + the F4 payload-only builder** — commits patch cold entries
+in place (self-gating, best-effort, DELTA-BOUNDED at 4096 chains so bulk writes never stall the commit mutex;
+oversized deltas defer to the lazy read-path patch = the correctness backstop); reads on maintained tables are
+pure hits. Rebuilds no longer spend a throwaway DMA (payload-only builder). AUDIT LESSON (adopted into comments):
+committed_seq is NOT frozen under the commit mutex (lanes publish lock-free) — the invariant is the
+STRICT-EQUALITY install guard + generation ptr identity + per-read visibility; never weaken the generation check
+on a frozen-seq assumption.
+**S-E.6c remaining:** sealed shards as PRIMARY (cold bytes stop shadowing the tuple store; on-device tombstone
+regions SV2-style; the ADR-006 store deletion follows).
 **S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy — RESOLVED:
 merged back via S-E.6a above):** the
 copy/compute-overlap pipeline (async pinned-staged uploads on a private copy stream + the stage-N/compute-N-1
