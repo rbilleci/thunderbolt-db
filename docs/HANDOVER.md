@@ -30,12 +30,23 @@ justifies host-side work; every interim host piece needs a ledger row with a NAM
 ships in the SAME MERGE as its device replacement; audits judge drift against CHARTER.md TEXT only; host-debt
 balance sheet at track boundaries. REGISTERED DEBT (deletion trigger = the S-E.6c arc, user-ruled sequencing):
 the S-E.1 host scalar partial-combine, the S-E.2 LIMIT/OFFSET drain/truncate windowing, the S-E.3 renorm casts,
-and the ~2k-LOC cold tier + scan-build. **S-E.6c (ACTIVE, device-first, deletion-gated):** (1) sealed shards WITH
+and the ~2k-LOC cold tier + scan-build. **6c-0 DONE (`34a00c8f`): the host scalar combine + windowing are DELETED** — one device aggregate pass folds
+scalar partials (StreamAccum/compare_sql_values gone); the cross-chunk OFFSET/LIMIT window is one device pass;
+the streaming module's host relational computation is ZERO outside two registered items (the grouped per-round
+narrow — see the hazard below — and the cold tier/scan-build, deletion trigger 6c-1..3). Audit MERGE-SAFE zero
+C/H with the standing charter-drift section; three LOWs adopted.
+**⚠ OPEN HAZARD (found by 6c-0's renorm attempt, honestly reverted): the grouped merge over b128 (numeric)
+partials produces ORDER-DEPENDENT DUPLICATE GROUPS** — latent in shipped S-E.3 (reachable: SUM(bigint/numeric)
+GROUP BY over a streamed table; never test-exercised). REPRO: run `gpu_streaming_cold_tier_spills_and_replays_
+from_disk` then `gpu_streaming_distinct_over_budget_set_union` in one process WITH Count partials declared
+Numeric{38,0} (the reverted 6c-0(c) diff) — a duplicate Int4(0) group appears; isolation passes (fresh driver
+pages ARE zero; pool-recycled scratch is not). PRIME SUSPECT: un-memset accumulator slots (slot_count/slot_sum/
+slot_sum_hi) in `launch_cuda_group_by_i32_count_sum`'s leased buffers (execution/lib.rs ~8481-8560 — the key
+slots get fill kernels, those don't visibly). NEXT SLICE = pin + fix this kernel, then re-land 6c-0(c).
+**S-E.6c remaining (device-first, deletion-gated):** (1) sealed shards WITH
 on-device version stamps (SV3b/SV6) as the PRIMARY over-VRAM representation, fold consumes shard bytes directly →
 DELETE the cold cache + scan-build in that merge; (2) writes: INSERT appends a sealed cold shard (no rebuild),
-DELETE/UPDATE via per-shard tombstone regions interpreted ON-DEVICE; (3) combines onto the device via the S-E.3
-synthesized-relation pass → DELETE the host accumulator/windowing; end state: host = wire/plan/orchestrate/WAL/
-staging/readback ONLY.
+DELETE/UPDATE via per-shard tombstone regions interpreted ON-DEVICE.
 **S-E.5 EXECUTED + REVERTED TO `feature/streaming-copy-overlap` (2026-07-10, no-losing-paths policy — RESOLVED:
 merged back via S-E.6a above):** the
 copy/compute-overlap pipeline (async pinned-staged uploads on a private copy stream + the stage-N/compute-N-1
