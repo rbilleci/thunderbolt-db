@@ -3427,3 +3427,169 @@ fn gpu_device_slot_recheck_matches_host_decoder() {
     assert_eq!(checked, N as usize, "every slot rechecked");
     assert_eq!(masked, 1, "exactly the stamped row masks");
 }
+
+/// P5-1 — THE CHUNK KEY-INDEX CACHE: build per-chunk device hash indexes over a key column,
+/// probe present/absent needles in ONE multi-chunk launch, recheck each hit's value via the
+/// P5-0 device slot read, and verify the all-visible-index + recheck-mask contract (a stamped
+/// row still HITS the index; the recheck masks it — the P5-2 uniqueness semantics).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_key_index_builds_probes_and_rechecks() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT)").unwrap();
+    const N: i32 = 900;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES {values}")).unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let _ = e.execute_relational_select(&select("SELECT COUNT(*) FROM facts")).unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')").unwrap();
+    assert_eq!(e.chunk_class_entries(), 1);
+    // A stamped delete: the index is ALL-VISIBLE, so the probe must still hit and the P5-0
+    // recheck must mask.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM facts WHERE a = 7").unwrap();
+    let rtx = e.committed_seq();
+
+    let table = e.catalog_snapshot().relational_catalog.get("facts").cloned().unwrap();
+    let entry = e
+        .read_state
+        .residency
+        .streaming_cold_chunks
+        .load()
+        .get("facts")
+        .cloned()
+        .unwrap();
+    let indexes = e
+        .ensure_chunk_key_indexes(&table, &entry, &[0], 0)
+        .expect("indexes build");
+    assert!(!indexes.is_empty());
+    assert!(
+        e.read_state
+            .residency
+            .chunk_key_index_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "the retained buffers are accounted"
+    );
+
+    // Needles: three present (5, 500, 100000 — the tail row), the stamped one (7), one absent.
+    let needles: Vec<i32> = vec![5, 500, 100000, 7, 424242];
+    let hits = e.probe_chunk_key_indexes(&indexes, &needles).expect("probe");
+    assert_eq!(hits.len(), 5);
+    // Present keys: exactly one live hit each whose recheck yields the key value.
+    for (n, expect_a) in [(0usize, 5i32), (1, 500), (2, 100000)] {
+        let mut live = 0;
+        for (pos, slot) in &hits[n] {
+            let chunk = &entry.chunks[*pos];
+            let (staged, _) = e.stage_cold_chunk(chunk, rtx).unwrap().ready().unwrap();
+            if let Some(row) = e
+                .materialize_cold_chunk_slot(&table, chunk, &staged, *slot as usize, rtx)
+                .expect("no decline")
+            {
+                assert_eq!(row[0], SqlValue::Int4(expect_a), "hit rechecks to the needle");
+                live += 1;
+            }
+        }
+        assert_eq!(live, 1, "needle {n}: exactly one live hit");
+    }
+    // The STAMPED key: the index hits, the recheck masks — no live hit (the P5-2 not-a-conflict).
+    assert!(!hits[3].is_empty(), "the all-visible index still hits the stamped key");
+    let mut live = 0;
+    for (pos, slot) in &hits[3] {
+        let chunk = &entry.chunks[*pos];
+        let (staged, _) = e.stage_cold_chunk(chunk, rtx).unwrap().ready().unwrap();
+        if e.materialize_cold_chunk_slot(&table, chunk, &staged, *slot as usize, rtx)
+            .expect("no decline")
+            .is_some()
+        {
+            live += 1;
+        }
+    }
+    assert_eq!(live, 0, "the stamped hit is masked at the recheck");
+    // The absent key: no hits at all.
+    assert!(hits[4].is_empty(), "an absent key misses every chunk index");
+
+    // THE FOLD PATH (audit HIGH regression: per-column-parallel blob_offsets — a single int8 key
+    // folds on-device; the needle is the host fingerprint via the shared helper): build indexes
+    // over a BIGINT column and probe present/absent keys through fingerprints.
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE keyed8 (k BIGINT, v INT)").unwrap();
+    let mut v8 = String::new();
+    for i in 0..600i64 {
+        if i > 0 {
+            v8.push(',');
+        }
+        v8.push_str(&format!("({}, {})", i * 1_000_000_007, i));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO keyed8 (k, v) VALUES {v8}")).unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM keyed8"))
+        .unwrap();
+    let table8 = e.catalog_snapshot().relational_catalog.get("keyed8").cloned().unwrap();
+    let entry8 = e
+        .read_state
+        .residency
+        .streaming_cold_chunks
+        .load()
+        .get("keyed8")
+        .cloned()
+        .expect("keyed8 cold entry");
+    let indexes8 = e
+        .ensure_chunk_key_indexes(&table8, &entry8, &[0], 0)
+        .expect("int8-key indexes build (the fold path)");
+    let present = Engine::chunk_key_needle(
+        &table8,
+        &[0],
+        &[SqlValue::Int8(5 * 1_000_000_007), SqlValue::Int4(5)],
+    )
+    .expect("needle");
+    let absent = Engine::chunk_key_needle(
+        &table8,
+        &[0],
+        &[SqlValue::Int8(999_999_999_999), SqlValue::Int4(0)],
+    )
+    .expect("needle");
+    let hits8 = e
+        .probe_chunk_key_indexes(&indexes8, &[present, absent])
+        .expect("probe");
+    let rtx8 = e.committed_seq();
+    let mut live = 0;
+    for (pos, slot) in &hits8[0] {
+        let chunk = &entry8.chunks[*pos];
+        let (staged, _) = e.stage_cold_chunk(chunk, rtx8).unwrap().ready().unwrap();
+        if let Some(row) = e
+            .materialize_cold_chunk_slot(&table8, chunk, &staged, *slot as usize, rtx8)
+            .expect("no decline")
+        {
+            if row[0] == SqlValue::Int8(5 * 1_000_000_007) {
+                live += 1;
+            }
+        }
+    }
+    assert_eq!(live, 1, "the folded int8 key locates its exact row");
+    // The absent fingerprint may collide (32-bit) — every hit must FAIL the recheck.
+    for (pos, slot) in &hits8[1] {
+        let chunk = &entry8.chunks[*pos];
+        let (staged, _) = e.stage_cold_chunk(chunk, rtx8).unwrap().ready().unwrap();
+        if let Some(row) = e
+            .materialize_cold_chunk_slot(&table8, chunk, &staged, *slot as usize, rtx8)
+            .expect("no decline")
+        {
+            assert_ne!(row[0], SqlValue::Int8(999_999_999_999), "collision resolved by recheck");
+        }
+    }
+}

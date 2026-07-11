@@ -169,6 +169,25 @@ pub(crate) struct ColdTableChunks {
 /// P4-2b-ii: a class DML resolve's matches — the standard (pseudo_id, row_key, image) triples.
 pub(crate) type ClassDmlMatches = Vec<(u64, String, Vec<SqlValue>)>;
 
+/// P5-1: one chunk's retained device key index (fingerprint hash table).
+// Production callers arrive with P5-2 (the uniqueness probe); the gate exercises it now.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct ChunkKeyIndex {
+    pub(crate) device: Arc<gpu_db_execution::CudaResidentDeviceMemory>,
+    pub(crate) table_mask: u32,
+    pub(crate) hash_shift: u32,
+    pub(crate) bytes: u64,
+    pub(crate) last_used: u64,
+}
+
+/// P5-1: the retained chunk-index VRAM cap (explicit accounting — the shard twin has none).
+#[allow(dead_code)] // P5-2 wires the production path.
+const CHUNK_KEY_INDEX_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// P5-1: the chunk CONTENT-identity allocator (fresh iff the payload bytes are new).
+static COLD_CHUNK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// P4-2b-ii: the global entry-epoch allocator (never reused; process-local like the class map).
 static COLD_ENTRY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -177,6 +196,14 @@ pub(crate) struct ColdChunk {
     payload: ColdPayload,
     snapshot: RelationalResidencySnapshot,
     pub(crate) row_count: u64,
+    /// P5-1 — CONTENT IDENTITY (design review H3): a process-monotonic id allocated ONLY where
+    /// the payload bytes are GENUINELY NEW (the builder's push, the tail constructor, the
+    /// compaction survivor build) and PRESERVED by every verbatim clone. The chunk-index cache
+    /// keys on it: a rebuilt payload inheriting its source's id would serve the OLD index over
+    /// NEW bytes (probe-slot misalignment = a silent false-negative duplicate). COEXISTS with
+    /// positional chunk_idx + entry_epoch (the stamp token) — never conflate; never cache a
+    /// chunk_idx across entry Arcs.
+    pub(crate) chunk_id: u64,
     /// 6c-1: the INCLUSIVE TupleId range this chunk's rows were scanned from (scan order IS
     /// TupleId order — the S-E.2 determinism fact). `(1, 0)` = the empty chunk (no rows). A write's
     /// changed TupleIds map to dirty chunks through these ranges; untouched ranges REUSE their
@@ -315,6 +342,7 @@ impl ColdCacheBuilder {
             }
         };
         self.chunks.push(ColdChunk {
+            chunk_id: COLD_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
             payload: cold_payload,
             snapshot,
             row_count,
@@ -2994,6 +3022,7 @@ impl Engine {
                     _ => chunk.deleted_by.as_ref().map(Arc::clone),
                 };
                 reused.push(ColdChunk {
+                    chunk_id: chunk.chunk_id,
                     payload: match &chunk.payload {
                         ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
                         ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
@@ -3900,6 +3929,7 @@ impl Engine {
             .chunk_class_compacted_slots
             .fetch_add(chunk.row_count - survivors.len() as u64, Ordering::Relaxed);
         Some(ColdChunk {
+            chunk_id: COLD_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
             payload: ColdPayload::Ram(Arc::new(payload)),
             snapshot,
             row_count: survivors.len() as u64,
@@ -3960,6 +3990,7 @@ impl Engine {
                 Some(Arc::new(bytes))
             };
             chunks.push(ColdChunk {
+                chunk_id: chunk.chunk_id,
                 payload: match &chunk.payload {
                     ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
                     ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
@@ -4142,6 +4173,7 @@ impl Engine {
                 .chunks
                 .iter()
                 .map(|chunk| ColdChunk {
+                    chunk_id: chunk.chunk_id,
                     payload: match &chunk.payload {
                         ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
                         ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
@@ -4207,6 +4239,7 @@ impl Engine {
                 .chunks
                 .iter()
                 .map(|chunk| ColdChunk {
+                    chunk_id: chunk.chunk_id,
                     payload: match &chunk.payload {
                         ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
                         ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
@@ -4250,6 +4283,7 @@ impl Engine {
             };
             builder.total_payload_bytes += payload.len() as u64;
             builder.chunks.push(ColdChunk {
+                chunk_id: COLD_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
                 payload: ColdPayload::Ram(Arc::new(payload)),
                 snapshot,
                 row_count: (end - start) as u64,
@@ -4611,6 +4645,7 @@ impl Engine {
                 }
             }
             chunks.push(ColdChunk {
+                chunk_id: chunk.chunk_id,
                 payload: match &chunk.payload {
                     ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
                     ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
@@ -4637,6 +4672,274 @@ impl Engine {
             poisoned: false,
         };
         let _ = self.install_streaming_cold_class(table_name, builder);
+    }
+
+    // ================= P5-1: THE PER-CHUNK DEVICE KEY-INDEX CACHE =================
+
+    /// Build ONE chunk's key index: stage the payload, derive per-row KEY FINGERPRINTS (a single
+    /// int4 key reads its column verbatim; every other shape folds ON-DEVICE via
+    /// `submit_compound_fold_fingerprints` — raw key bytes never reach the host), build the
+    /// hash table host-side from the fingerprints (ALL-VISIBLE: the sidecar applies at the
+    /// probe's recheck), and RETAIN it as a persistent device buffer. `None` = decline (an
+    /// in-chunk duplicate fingerprint under the non-dup-tolerant build, a stage/read failure) —
+    /// the caller treats the table as probe-unservable (P5-2 de-auths).
+    #[allow(dead_code)] // P5-2 wires the production caller.
+    fn build_chunk_key_index(
+        &self,
+        table: &RelationalTable,
+        chunk: &ColdChunk,
+        key_positions: &[usize],
+    ) -> Option<ChunkKeyIndex> {
+        use crate::relational_model::{
+            resident_device_int4_column_offset, resident_device_int8_column_offset,
+            resident_device_numeric_column_offset, resident_device_text_column_layout,
+        };
+        if chunk.row_count == 0 {
+            return None;
+        }
+        let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
+        let (src, _vis) = staged.ready().ok()?;
+        let d = &chunk.snapshot;
+        let row_count = chunk.row_count as usize;
+        // blob_offsets is PER-COLUMN PARALLEL to offsets (audit HIGH: the fold wrapper errors on
+        // a length mismatch and the kernel reads blob_offsets[k] only where widths[k]==0 — the
+        // text sentinel; every non-text column carries a 0 placeholder, mirroring the shard
+        // caller's construction).
+        let mut offsets: Vec<u64> = Vec::with_capacity(key_positions.len());
+        let mut blob_offsets: Vec<u64> = Vec::with_capacity(key_positions.len());
+        for &pos in key_positions {
+            let column = table.columns.get(pos)?;
+            match column.ty {
+                SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
+                    offsets.push(resident_device_int4_column_offset(d, table, pos).ok()?);
+                    blob_offsets.push(0);
+                }
+                SqlType::Int8 | SqlType::Timestamp => {
+                    offsets.push(resident_device_int8_column_offset(d, table, pos).ok()?);
+                    blob_offsets.push(0);
+                }
+                SqlType::Numeric { .. } | SqlType::Uuid => {
+                    offsets.push(resident_device_numeric_column_offset(d, table, pos).ok()?);
+                    blob_offsets.push(0);
+                }
+                SqlType::Text => {
+                    let layout = resident_device_text_column_layout(d, table, pos).ok()?;
+                    offsets.push(layout.offsets_byte_offset);
+                    blob_offsets.push(layout.bytes_byte_offset);
+                }
+                SqlType::Bool => return None, // a bool key is not a real-world unique key
+            }
+        }
+        let keys: Vec<i32> = if key_positions.len() == 1
+            && matches!(
+                table.columns[key_positions[0]].ty,
+                SqlType::Int4 | SqlType::Date | SqlType::Int2
+            ) {
+            src.device_memory
+                .read_resident_i32_column(offsets[0], row_count)
+                .ok()?
+        } else {
+            let widths = key_positions
+                .iter()
+                .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
+                .collect::<Option<Vec<u32>>>()?;
+            src.device_memory
+                .submit_compound_fold_fingerprints(
+                    src.device_memory.device_ptr(),
+                    &offsets,
+                    &widths,
+                    &blob_offsets,
+                    row_count,
+                )
+                .ok()?
+        };
+        if keys.len() != row_count {
+            return None;
+        }
+        // All-visible, non-dup-tolerant: a keyed class chunk's fingerprints are unique unless a
+        // genuine fingerprint COLLISION exists in-chunk — decline then (probe-unservable).
+        let (hash_table, table_mask, hash_shift) =
+            crate::engine_retained_read::build_int4_pk_hash_table_host_visible(
+                &keys,
+                chunk.row_count,
+                None,
+                0,
+                // DUP-TOLERANT (audit availability finding): a 32-bit fingerprint birthday
+                // collision between DISTINCT keys must not decline the chunk (at 50k+ rows the
+                // decline rate is material) — colliding entries chain to the next probe slot,
+                // the write-locate walks ALL matches, and the full-tuple recheck resolves.
+                true,
+            )?;
+        let bytes: Vec<u8> = hash_table.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let runtime = self.cuda_driver_probe_runtime();
+        let device = runtime
+            .retain_device_memory_copy(d.gpu_id, &bytes)
+            .ok()?;
+        Some(ChunkKeyIndex {
+            device: Arc::new(device),
+            table_mask,
+            hash_shift,
+            bytes: bytes.len() as u64,
+            last_used: 0,
+        })
+    }
+
+    /// Get-or-build the key indexes for EVERY chunk of a class entry (entry-time in P5-2; the
+    /// direct-call gate uses it now). Returns per-chunk (chunk_id, index) in entry order, or
+    /// `None` if any chunk declines. Cap policy: evict the least-recently-used entries of OTHER
+    /// chunks until the new total fits (class-agnostic — index buffers are small).
+    #[allow(dead_code)] // P5-2 wires the production caller.
+    pub(crate) fn ensure_chunk_key_indexes(
+        &self,
+        table: &RelationalTable,
+        entry: &Arc<ColdTableChunks>,
+        key_positions: &[usize],
+        key_id: usize,
+    ) -> Option<Vec<(usize, ChunkKeyIndex)>> {
+        // Each element pairs the index with its ENTRY POSITION — empty (fully-compacted) chunks
+        // are skipped, so the probe's shard_idx indexes THIS vec, and the caller translates back
+        // through the position (never `entry.chunks[shard_idx]` directly: position drift).
+        let residency = &self.read_state.residency;
+        let mut out: Vec<(usize, ChunkKeyIndex)> = Vec::with_capacity(entry.chunks.len());
+        for (position, chunk) in entry.chunks.iter().enumerate() {
+            if chunk.row_count == 0 {
+                continue;
+            }
+            let cache_key = (table.name.clone(), chunk.chunk_id, key_id);
+            let cached = {
+                let mut map = residency
+                    .chunk_key_index
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                map.get_mut(&cache_key).map(|e| {
+                    e.last_used = residency
+                        .chunk_key_index_clock
+                        .fetch_add(1, Ordering::Relaxed);
+                    e.clone()
+                })
+            };
+            let index = match cached {
+                Some(index) => index,
+                None => {
+                    let built = self.build_chunk_key_index(table, chunk, key_positions)?;
+                    let mut map = residency
+                        .chunk_key_index
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    // Recheck under the lock (the double-build race: keep the first).
+                    let entry_ref = map.entry(cache_key).or_insert_with(|| {
+                        residency
+                            .chunk_key_index_bytes
+                            .fetch_add(built.bytes, Ordering::Relaxed);
+                        built
+                    });
+                    entry_ref.last_used = residency
+                        .chunk_key_index_clock
+                        .fetch_add(1, Ordering::Relaxed);
+                    let got = entry_ref.clone();
+                    // Cap: evict LRU entries (never the just-inserted key) until under the cap.
+                    let just_inserted = (table.name.clone(), chunk.chunk_id, key_id);
+                    let mut total = residency.chunk_key_index_bytes.load(Ordering::Relaxed);
+                    while total > CHUNK_KEY_INDEX_CAP_BYTES {
+                        let victim = map
+                            .iter()
+                            .filter(|(k, _)| **k != just_inserted)
+                            .min_by_key(|(_, e)| e.last_used)
+                            .map(|(k, _)| k.clone());
+                        let Some(victim) = victim else { break };
+                        if let Some(evicted) = map.remove(&victim) {
+                            total = residency
+                                .chunk_key_index_bytes
+                                .fetch_sub(evicted.bytes, Ordering::Relaxed)
+                                .saturating_sub(evicted.bytes);
+                        }
+                    }
+                    got
+                }
+            };
+            out.push((position, index));
+        }
+        Some(out)
+    }
+
+    /// Probe every chunk index with the needle fingerprints — ONE multi-chunk write-locate
+    /// launch. Returns per-needle (position-in-entry, slot) hits (the caller translates through
+    /// ITS entry Arc; never cache positions across entries).
+    /// The SHARED needle derivation (audit LOW — the build/probe parity contract): a probe
+    /// needle MUST be derived exactly as the build derived its keys — the RAW i32 for a single
+    /// int4-class key, the host `compound_key_fingerprint` over `sql_value_key_words` for every
+    /// other shape (byte-identical to the device fold). A mismatch is a silent all-miss = a
+    /// false-negative duplicate = the C2 RPO hazard.
+    #[allow(dead_code)] // P5-2 wires the production caller.
+    pub(crate) fn chunk_key_needle(
+        table: &RelationalTable,
+        key_positions: &[usize],
+        values: &[SqlValue],
+    ) -> Option<i32> {
+        if key_positions.len() == 1
+            && matches!(
+                table.columns[key_positions[0]].ty,
+                SqlType::Int4 | SqlType::Date | SqlType::Int2
+            )
+        {
+            return match values.get(key_positions[0])? {
+                SqlValue::Int4(v) => Some(*v),
+                SqlValue::Date(v) => Some(*v),
+                SqlValue::Int2(v) => Some(i32::from(*v)),
+                _ => None,
+            };
+        }
+        let mut words: Vec<i32> = Vec::new();
+        for &pos in key_positions {
+            let column = table.columns.get(pos)?;
+            words.extend(crate::engine_residency::sql_value_key_words(
+                column.ty,
+                values.get(pos)?,
+            )?);
+        }
+        Some(crate::engine_residency::compound_key_fingerprint(&words))
+    }
+
+    #[allow(dead_code)] // P5-2 wires the production caller.
+    pub(crate) fn probe_chunk_key_indexes(
+        &self,
+        indexes: &[(usize, ChunkKeyIndex)],
+        needles: &[i32],
+    ) -> Option<Vec<Vec<(usize, u32)>>> {
+        // Hits translate shard_idx -> the paired ENTRY position before returning.
+        if indexes.is_empty() || needles.is_empty() {
+            return Some(vec![Vec::new(); needles.len()]);
+        }
+        let shards: Vec<gpu_db_execution::WriteLocateShard> = indexes
+            .iter()
+            .map(|(_, index)| gpu_db_execution::WriteLocateShard {
+                index: Arc::clone(&index.device),
+                table_mask: index.table_mask,
+                hash_shift: index.hash_shift,
+            })
+            .collect();
+        let ctx = Arc::clone(&shards[0].index);
+        let result = ctx
+            .submit_multi_shard_i32_write_locate(&shards, needles, 8)
+            .ok()?;
+        if result.count.len() != needles.len() {
+            return None;
+        }
+        let mut out: Vec<Vec<(usize, u32)>> = Vec::with_capacity(needles.len());
+        for n in 0..needles.len() {
+            let count = result.count[n];
+            if count == u32::MAX {
+                return None; // overflow: more hits than the window — decline (conservative)
+            }
+            let mut hits = Vec::with_capacity(count as usize);
+            for h in 0..count as usize {
+                let flat = n * result.max_hits as usize + h;
+                let filtered = *result.shard_idx.get(flat)? as usize;
+                hits.push((indexes.get(filtered)?.0, *result.slot.get(flat)?));
+            }
+            out.push(hits);
+        }
+        Some(out)
     }
 
     /// P4-2b telemetry.
