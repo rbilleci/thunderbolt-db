@@ -3240,3 +3240,99 @@ fn gpu_chunk_class_born_gate_serves_old_boundaries() {
         .expect("locate serves");
     assert!(frozen_hits.is_empty(), "a tail row is invisible to the freeze boundary");
 }
+
+/// P4 COMPACTION: a class DELETE that kills most of a chunk triggers the in-install survivor
+/// rebuild — the sidecar and dead slots are physically deleted, and every read stays
+/// value-exact through the compacted chunk (closed-form SUM + the de-auth exit differential).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_compaction_deletes_dead_slots() {
+    let mut e = Engine::new_local();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    // Audit note adopted: a NULLABLE b128 column rides the compaction round-trip (the survivor
+    // gather + re-encode must preserve NULL validity and numeric mantissas, not just int/text).
+    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT, n NUMERIC(10,2))").unwrap();
+    const N: i32 = 900;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        let n = if i % 5 == 0 { "NULL".to_string() } else { format!("{i}.25") };
+        values.push_str(&format!("({i}, 'txt{:04}', {n})", i % 500));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO facts (a, t, n) VALUES {values}")).unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let q_count = select("SELECT COUNT(*) FROM facts");
+    let count = |e: &Engine| -> i64 {
+        match e.execute_relational_select(&q_count).unwrap().rows.row(0)[0] {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("count: {other:?}"),
+        }
+    };
+    let sum_a = |e: &Engine| -> i64 {
+        match e
+            .execute_relational_select(&select("SELECT SUM(a) FROM facts"))
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("sum: {other:?}"),
+        }
+    };
+    let _ = count(&e);
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO facts (a, t, n) VALUES (100000, 'enter', 7.75)").unwrap();
+    assert_eq!(e.chunk_class_entries(), 1);
+
+    // Kill MOST of the first chunk's rows (a < 200 spans it): the stamp install must COMPACT.
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM facts WHERE a < 200").unwrap();
+    assert_eq!(e.chunk_class_deauths(), 0, "stays classed");
+    assert!(
+        e.chunk_class_compactions() >= 1,
+        "the heavily-stamped chunk must compact in the same install"
+    );
+    assert!(
+        e.chunk_class_compacted_slots() >= 150,
+        "the dead slots are physically deleted (got {})",
+        e.chunk_class_compacted_slots()
+    );
+
+    // Value-exact through the compacted chunk.
+    assert_eq!(count(&e), i64::from(N) - 200 + 1);
+    let expected_sum: i64 = (200..i64::from(N)).sum::<i64>() + 100000;
+    assert_eq!(sum_a(&e), expected_sum, "SUM through the compacted chunk is exact");
+    // The nullable numeric column survived compaction value-exactly: SUM(n) over survivors
+    // (i.25 for i in 200..900 where i % 5 != 0) + the enter row's 7.75.
+    let mantissa_sum: i128 = (200..i128::from(N))
+        .filter(|i| i % 5 != 0)
+        .map(|i| i * 100 + 25)
+        .sum::<i128>()
+        + 775;
+    let sum_n = e
+        .execute_relational_select(&select("SELECT SUM(n) FROM facts"))
+        .unwrap();
+    assert_eq!(
+        sum_n.rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        vec![vec![SqlValue::Numeric(gpu_db_sql::Decimal128::new(mantissa_sum, 2))]],
+        "the NULL-bearing numeric column round-tripped compaction exactly"
+    );
+
+    // Post-compaction DML + the exit both stay correct (coordinates re-slotted: the NEXT delete
+    // locates against the fresh epoch).
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM facts WHERE a = 500").unwrap();
+    assert_eq!(e.chunk_class_deauths(), 0);
+    assert_eq!(sum_a(&e), expected_sum - 500);
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE zzz2 (x INT)").unwrap(); // the DDL-sweep exit
+    assert_eq!(e.chunk_class_deauths(), 1);
+    assert_eq!(sum_a(&e), expected_sum - 500, "the de-authed store is value-exact");
+}

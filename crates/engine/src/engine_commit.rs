@@ -732,6 +732,9 @@ impl Engine {
             // current at THIS commit (the freshness proof maybe_enter requires).
             for table_name in &tables {
                 self.maybe_enter_chunk_class(table_name);
+                // P4 compaction: post-publish by design (a pre-publish install would let a
+                // boundary-minus-one bind born-skip the compacted survivors).
+                self.maybe_compact_chunk_class(table_name);
             }
         }
         Ok(())
@@ -946,6 +949,9 @@ impl Engine {
             // current at THIS commit (the freshness proof maybe_enter requires).
             for table_name in &tables {
                 self.maybe_enter_chunk_class(table_name);
+                // P4 compaction: post-publish by design (a pre-publish install would let a
+                // boundary-minus-one bind born-skip the compacted survivors).
+                self.maybe_compact_chunk_class(table_name);
             }
         }
         self.metrics.inc_commit();

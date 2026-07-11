@@ -212,9 +212,14 @@ CLOSED: RECLAIMED AT CLASS ENTRY — NO FENCE NEEDED** (the audited soundness: r
 current-committed at bind, the CPU-pinned guard de-auths BEFORE binding, in-flight readers hold COW
 generation Arcs, auto-admit excludes class tables — every leg adversarially traced; class entry now
 DELETES the table's host chains + value-index entries, de-auth v2 rebuilds chunk-only with base rows
-born@1, and the slot→store-id rank enumeration is DELETED); (4) the class INSERT's unbounded tail growth
-between compactions — trigger now just "the compaction slice" (the fence requirement DISSOLVED by the same
-argument: in-flight folds hold entry Arcs, new binds pin >= the compaction boundary). **NET:** host RELATIONAL COMPUTATION on the class's steady path = ZERO (writes: statement-row
+born@1, and the slot→store-id rank enumeration is DELETED); (4) ~~the class tail growth~~ **ROW CLOSED: COMPACTION SHIPPED** — a chunk past the
+dead-fraction threshold (>=1/4, >=8 rows) rebuilds from its SURVIVORS via the device projection gather
+(sidecar + dead slots physically deleted; NULL/numeric round-trip gated). TIMING IS LOAD-BEARING (audit
+HIGH, found+fixed in-flight): compaction runs at the commit hook AFTER `publish_committed_seq` — a
+PRE-publish install would let a concurrent boundary-minus-one bind load the new entry and born-skip the
+compacted chunk's still-visible SURVIVORS (compaction is the FIRST operation that born-gates
+previously-visible rows; tail appends and stamps were safe pre-publish). Cap accounting subtracts the
+replaced payload+sidecar (the audit LOW). **NET:** host RELATIONAL COMPUTATION on the class's steady path = ZERO (writes: statement-row
 encode = staging; reads: device folds; DML: device locate + sidecar bookkeeping); the host's remaining
 roles are the charter's own (WAL, orchestration, staging, boundary coercions) plus the four registered
 rows above.

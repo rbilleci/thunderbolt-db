@@ -3840,6 +3840,75 @@ impl Engine {
     /// token / single-critical-section rule, and the store-divergence rebuild hazard) apply to
     /// this pair as a unit.
     // Production caller = P4-2b; the isolation gate exercises it now.
+    /// P4 COMPACTION (fence-free, the deletion directive): rebuild ONE heavily-stamped chunk
+    /// from its SURVIVORS — a device projection gather (predicate=None + the sidecar mask over
+    /// the staged chunk), re-encoded as a fresh sidecar-free payload born at the compacting
+    /// boundary. SOUND without a fence by the reclamation argument: in-flight folds hold the OLD
+    /// entry Arc; every later bind pins >= the current boundary >= `boundary`, so nobody can
+    /// observe the re-slotting (the born gate would hide the chunk from a sub-boundary reader,
+    /// but no such reader can bind). DELETES: the dead slots' payload bytes + the whole sidecar.
+    /// `None` = the gather declined (device error) — the caller keeps the stamped, uncompacted
+    /// chunk (compaction is an optimization, never load-bearing).
+    fn compact_streaming_cold_chunk(
+        &self,
+        table: &RelationalTable,
+        chunk: &ColdChunk,
+        boundary: Index,
+    ) -> Option<ColdChunk> {
+        let select_all = Select {
+            table: table.name.clone(),
+            distinct: false,
+            projection: SelectProjection::All,
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let bound = bind_relational_select(table, &select_all).ok()?;
+        let staged = self.stage_cold_chunk(chunk, boundary).ok()?;
+        let (src, vis) = staged.ready().ok()?;
+        let result = self
+            .execute_resident_expr_select_with_binding(
+                &select_all,
+                table,
+                Some(&src),
+                bound,
+                boundary,
+                None,
+                vis,
+                &[],
+                &[],
+                None,
+                &[],
+            )
+            .ok()?;
+        let survivors: Vec<Vec<SqlValue>> =
+            result.rows.iter().map(|r| r.to_vec()).collect();
+        let (snapshot, payload) = self
+            .build_transient_relation_payload_only(table, &survivors)
+            .ok()?;
+        self.read_state
+            .residency
+            .chunk_class_compactions
+            .fetch_add(1, Ordering::Relaxed);
+        self.read_state
+            .residency
+            .chunk_class_compacted_slots
+            .fetch_add(chunk.row_count - survivors.len() as u64, Ordering::Relaxed);
+        Some(ColdChunk {
+            payload: ColdPayload::Ram(Arc::new(payload)),
+            snapshot,
+            row_count: survivors.len() as u64,
+            tuple_range: (1, 0), // class chunks carry no store ids (the sentinel)
+            payload_copin_s: boundary,
+            deleted_by: None,
+        })
+    }
+
     pub(crate) fn stamp_streaming_cold_slots(
         &self,
         table_name: &str,
@@ -4465,6 +4534,111 @@ impl Engine {
         self.stamp_streaming_cold_slots(table_name, &located, stamp, true)
     }
 
+    /// P4 COMPACTION driver — runs at the commit hook AFTER `publish_committed_seq` (the timing
+    /// is load-bearing: the compacted chunk is born at the CURRENT PUBLISHED boundary, so every
+    /// later bind pins at-or-above it and sees it; a PRE-publish install would let a concurrent
+    /// boundary-minus-one bind load the new entry and born-skip the chunk — its SURVIVORS would
+    /// vanish for that read. In-flight readers hold the old entry Arc either way). Scans the
+    /// class entry's sidecars; every chunk past the dead-fraction threshold rebuilds from its
+    /// survivors in ONE fresh install.
+    pub(crate) fn maybe_compact_chunk_class(&self, table_name: &str) {
+        if self.table_chunk_authoritative(table_name).is_none() {
+            return;
+        }
+        let residency = &self.read_state.residency;
+        let Some(entry) = residency.streaming_cold_chunks.load().get(table_name).cloned()
+        else {
+            return;
+        };
+        let live = i64::from_le_bytes([COLD_DELETED_BY_LIVE_FILL_BYTE; 8]);
+        let needs: Vec<usize> = entry
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, chunk)| {
+                let Some(sidecar) = &chunk.deleted_by else {
+                    return false;
+                };
+                if chunk.row_count < 8 {
+                    return false;
+                }
+                let dead = (0..chunk.row_count as usize)
+                    .filter(|slot| {
+                        i64::from_le_bytes(
+                            sidecar[slot * 8..slot * 8 + 8].try_into().expect("8"),
+                        ) != live
+                    })
+                    .count() as u64;
+                dead * 4 >= chunk.row_count
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        if needs.is_empty() {
+            return;
+        }
+        let Some(table) = self
+            .catalog_snapshot()
+            .relational_catalog
+            .get(table_name)
+            .cloned()
+        else {
+            return;
+        };
+        let boundary = self.committed_seq();
+        let mut chunks: Vec<ColdChunk> = Vec::with_capacity(entry.chunks.len());
+        let mut total = entry.total_payload_bytes;
+        for (idx, chunk) in entry.chunks.iter().enumerate() {
+            if needs.contains(&idx) {
+                if let Some(compacted) =
+                    self.compact_streaming_cold_chunk(&table, chunk, boundary)
+                {
+                    // Cap accounting: subtract the replaced payload + sidecar, add the new.
+                    let old_payload = match &chunk.payload {
+                        ColdPayload::Ram(b) => b.len() as u64,
+                        ColdPayload::Spilled { len, .. } => *len as u64,
+                    };
+                    let old_sidecar =
+                        chunk.deleted_by.as_ref().map_or(0, |b| b.len() as u64);
+                    let new_payload = match &compacted.payload {
+                        ColdPayload::Ram(b) => b.len() as u64,
+                        ColdPayload::Spilled { len, .. } => *len as u64,
+                    };
+                    total = total
+                        .saturating_sub(old_payload + old_sidecar)
+                        .saturating_add(new_payload);
+                    chunks.push(compacted);
+                    continue;
+                }
+            }
+            chunks.push(ColdChunk {
+                payload: match &chunk.payload {
+                    ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
+                    ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
+                        file: Arc::clone(file),
+                        offset: *offset,
+                        len: *len,
+                    },
+                },
+                snapshot: chunk.snapshot.clone(),
+                row_count: chunk.row_count,
+                tuple_range: chunk.tuple_range,
+                payload_copin_s: chunk.payload_copin_s,
+                deleted_by: chunk.deleted_by.as_ref().map(Arc::clone),
+            });
+        }
+        let builder = ColdCacheBuilder {
+            generation: Arc::clone(&entry.generation),
+            build_copin_s: entry.build_copin_s.max(boundary),
+            chunk_target_bytes: entry.chunk_target_bytes,
+            total_payload_bytes: total,
+            column_signature: entry.column_signature.clone(),
+            chunks,
+            spill: None,
+            poisoned: false,
+        };
+        let _ = self.install_streaming_cold_class(table_name, builder);
+    }
+
     /// P4-2b telemetry.
     pub fn chunk_class_entries(&self) -> u64 {
         self.read_state
@@ -4489,6 +4663,19 @@ impl Engine {
         self.read_state
             .residency
             .chunk_class_reclaimed_rows
+            .load(Ordering::Relaxed)
+    }
+    /// P4 compaction telemetry.
+    pub fn chunk_class_compactions(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_compactions
+            .load(Ordering::Relaxed)
+    }
+    pub fn chunk_class_compacted_slots(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_compacted_slots
             .load(Ordering::Relaxed)
     }
 
