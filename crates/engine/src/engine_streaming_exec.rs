@@ -3752,12 +3752,6 @@ impl Engine {
                     None => continue,
                 }
             };
-            // P2 interim: the v1 artifact has no sidecar sections — a stamped entry declines
-            // the checkpoint (benign: restore skips it, the first read rebuilds). Artifact v2
-            // (persisted sidecars) is the ledgered P2b follow-up.
-            if entry.chunks.iter().any(|c| c.deleted_by.is_some()) {
-                continue;
-            }
             qualified.push((name.clone(), entry));
         }
         if self.committed_seq() != watermark {
@@ -3801,6 +3795,17 @@ impl Engine {
                     w.put_u64(chunk.row_count)?;
                     w.put_u64(chunk.tuple_range.0)?;
                     w.put_u64(chunk.tuple_range.1)?;
+                    // v2 (P2b): the payload's OWN boundary + the optional tombstone sidecar —
+                    // stamped rows must stay masked across a restart.
+                    w.put_u64(chunk.payload_copin_s)?;
+                    match &chunk.deleted_by {
+                        None => w.put_u8(0)?,
+                        Some(sidecar) => {
+                            w.put_u8(1)?;
+                            w.put_u64(sidecar.len() as u64)?;
+                            w.put(sidecar)?;
+                        }
+                    }
                     encode_cold_descriptor(&mut w, &chunk.snapshot)?;
                     let payload = chunk.payload.read().map_err(|_| {
                         std::io::Error::other("cold checkpoint: spill payload read failed")
@@ -3924,12 +3929,40 @@ impl Engine {
                     let row_count = r.take_u64()?;
                     let lo = r.take_u64()?;
                     let hi = r.take_u64()?;
+                    // v2 (P2b): the persisted payload boundary + tombstone sidecar.
+                    let payload_copin_s = r.take_u64()?;
+                    let deleted_by = match r.take_u8()? {
+                        0 => None,
+                        _ => {
+                            let len = r.take_u64()? as usize;
+                            if len != (row_count as usize) * 8 {
+                                return Err(std::io::Error::other(
+                                    "cold checkpoint: sidecar length != 8 * row_count",
+                                ));
+                            }
+                            let mut sidecar = vec![0u8; len];
+                            r.take(&mut sidecar)?;
+                            Some(Arc::new(sidecar))
+                        }
+                    };
                     let snapshot = decode_cold_descriptor(&mut r)?;
                     let payload_len = r.take_u64()? as usize;
                     let mut payload = vec![0u8; payload_len];
                     r.take(&mut payload)?;
                     if let Some(builder) = builder.as_mut() {
                         builder.push(payload, snapshot, row_count, (lo, hi));
+                        // push() built the chunk with fresh-scan defaults; restore the persisted
+                        // identity. The sidecar's bytes are ADDED to the builder total here
+                        // (audit LOW: install copies the builder total verbatim — no
+                        // recomputation — and the live patch path counts sidecars, so the cap
+                        // class must see them on the restore path too).
+                        if let Some(sidecar) = &deleted_by {
+                            builder.total_payload_bytes += sidecar.len() as u64;
+                        }
+                        if let Some(chunk) = builder.chunks.last_mut() {
+                            chunk.payload_copin_s = payload_copin_s;
+                            chunk.deleted_by = deleted_by;
+                        }
                     }
                 }
                 if let Some(builder) = builder {
@@ -3967,7 +4000,7 @@ impl Engine {
 // ---------------- P1: the cold-checkpoint artifact encoding (control plane, no serde) ----------------
 
 /// Artifact magic — version-suffixed like the WAL magics (`GPUDBWAL1`); bump on layout change.
-const COLD_CHECKPOINT_MAGIC: &[u8; 15] = b"GPUDBCOLDCKPT1\n";
+const COLD_CHECKPOINT_MAGIC: &[u8; 15] = b"GPUDBCOLDCKPT2\n";
 pub(crate) const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 

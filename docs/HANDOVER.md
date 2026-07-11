@@ -114,6 +114,29 @@ Gates: 2 new GPU tests (value-sensitive SUM + bounded-window projection — a pl
 ORDER-BY differential CANNOT catch a wrong-slot mask: the former is slot-blind, the latter honestly defers
 to the CPU), 6c-1/6c-3 tests updated to stamp semantics, 3 sabotages bite (mask dropped, slot off-by-one,
 capture-decline removed), sweep 450/450, workspace green, clippy Δ0.
+**P2b DONE: COLD-CHECKPOINT ARTIFACT v2 (sidecar persistence)** — magic `GPUDBCOLDCKPT2`; per chunk the
+artifact carries `payload_copin_s` + the optional deleted_by sidecar (v1 artifacts fail the magic = benign
+skip, no migration); stamped entries now QUALIFY for the checkpoint and masked rows STAY MASKED across a
+restart. Focused audit MERGE-SAFE; both LOWs adopted (restore adds sidecar bytes to the cap total — install
+copies the builder total verbatim, no recompute; a POST-RESTORE delete gates `payload_copin_s` persistence —
+a seam-defaulted boundary shifts the stamp's rank and masks the WRONG row, caught by the closed-form SUM,
+sabotage-verified). Gates: round-trip + post-restore-stamp test, sweep 450/450.
+**>>> NEXT ARC: P4 — DELETE THE HOST TUPLE STORE FOR STREAMED TABLES <<<** (the ADR-006 endgame for the
+streaming class; fresh-session-sized, decompose into audited slices):
+(P4a) DURABLE VALIDITY: the runtime generation-Arc validity dies with the store — the (artifact boundary,
+WAL position) token from P1 becomes the entry's identity; spill files become checkpoint artifacts with a
+real lifecycle (no longer unlinked). (P4b) WRITE PATH: INSERT = tail chunk build from the statement's OWN
+rows (no store roundtrip); DELETE/UPDATE = P3 locate → P2 sidecar stamp + tail append; the WAL record is
+the durability, the chunk patch is the materialization. (P4c) Eq-LOCATE off the value index (a host
+structure that dies with the store): the P3 fold already lowers Eq; measure, then route. (P4d) CONSTRAINT
+validation via device scans (the ADR-006 elision machinery's patterns — uniqueness needs the compound-
+fingerprint/device-index route, NOT a host index). (P4e) RECOVERY FLIP: for streamed tables the artifact
+becomes LOAD-BEARING (mandatory, not benign-skip) + WAL-suffix replay patches chunks directly (no store
+rebuild); the artifact needs retention/rotation discipline. (P4f) THE DELETION SWEEP: table_rows() loses
+its role for streamed tables; the registered cold-tier/scan-build debt DELETES in the same merges (chunks
+become the primary representation, the scan-build becomes the bootstrap-only import path). Interlocks:
+P4a BEFORE P4e; P4b/P4c/P4d before P4f; VACUUM must learn sidecar compaction (rewrite a heavily-stamped
+chunk) somewhere before P4f.
 **HOST-DEBT BALANCE SHEET (the charter-drift ruling's boundary accounting, 2026-07-11):**
 DELETED this arc: the host scalar combine (~130 LOC incl. all value comparisons/arithmetic), the host
 LIMIT/OFFSET windowing (~30 LOC), the per-round grouped narrow loop (~25 LOC), the throwaway upload per rebuilt

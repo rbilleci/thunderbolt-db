@@ -2275,7 +2275,7 @@ fn gpu_cold_sidecar_stamps_mask_rows_across_chunks() {
 /// artifact has no sidecar sections; benign skip, ledgered as P2b).
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_cold_sidecar_mixed_workload_and_checkpoint_decline() {
+fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
     let mut e = Engine::new_local();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
@@ -2333,14 +2333,14 @@ fn gpu_cold_sidecar_mixed_workload_and_checkpoint_decline() {
         "the updated value must be visible through the streaming read"
     );
 
-    // P1 interop: re-stamp a fresh delete so the entry is sidecar-bearing, then a direct capture
-    // must DECLINE it (0 tables written) — the v1 artifact cannot carry sidecars.
+    // P2b: a sidecar-bearing entry now QUALIFIES for the v2 artifact — and the sidecar
+    // ROUND-TRIPS: a twin engine at the same commit boundary restores the entry and the
+    // stamped rows STAY MASKED (no store consultation, no rebuild).
     seq += 1;
     e.execute_text(seq, "DELETE FROM big WHERE a = 30").unwrap();
-    let map_has_sidecar = e.streaming_cold_stamps() >= 2;
-    assert!(map_has_sidecar, "premise: the entry carries a sidecar");
+    assert!(e.streaming_cold_stamps() >= 2, "premise: the entry carries a sidecar");
     let dir = std::env::temp_dir().join(format!(
-        "gpu-db-p2-ckpt-decline-{}-{}",
+        "gpu-db-p2b-ckpt-roundtrip-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2353,7 +2353,59 @@ fn gpu_cold_sidecar_mixed_workload_and_checkpoint_decline() {
     let written = e
         .write_streaming_cold_checkpoint(&base, 1, boundary, boundary + 1)
         .expect("capture runs");
-    assert_eq!(written, 0, "a sidecar-bearing entry must DECLINE the v1 artifact");
+    assert_eq!(written, 1, "the v2 artifact must carry the sidecar-bearing entry");
+
+    // The twin replays the identical statement history (same commit boundary), restores the
+    // artifact directly, and its FIRST streaming read replays the stamped bytes.
+    let mut twin = Engine::new_local();
+    let mut twin_seq = 0u64;
+    if !gpu_available(&mut twin, &mut twin_seq) {
+        return;
+    }
+    twin_seq += 1;
+    twin.execute_text(twin_seq, "CREATE TABLE big (a INT, b INT)").unwrap();
+    twin_seq += 1;
+    twin
+        .execute_text(twin_seq, &format!("INSERT INTO big (a, b) VALUES {values}"))
+        .unwrap();
+    for statement in [
+        "DELETE FROM big WHERE a = 10",
+        "INSERT INTO big (a, b) VALUES (100000, 1)",
+        "UPDATE big SET b = -7 WHERE a = 20",
+        "DELETE FROM big WHERE a = 30",
+    ] {
+        twin_seq += 1;
+        twin.execute_text(twin_seq, statement).unwrap();
+    }
+    assert_eq!(
+        twin.committed_seq(),
+        boundary,
+        "premise: the twin reached the artifact boundary"
+    );
+    let restored = twin.restore_streaming_cold_checkpoint(&base, 1);
+    assert_eq!(restored, 1, "the twin must restore the sidecar-bearing entry");
+    twin.set_relational_residency_budget_bytes(0, 4096);
+    assert_eq!(count(&twin), i64::from(N) - 1, "restored stamps still mask (a=10, a=30 gone; tail row present)");
+    assert_eq!(twin.streaming_cold_builds(), 0, "the restore IS the build — no scan");
+    assert!(twin.streaming_cold_hits() >= 1);
+
+    // AUDIT LOW (adopted): a POST-RESTORE delete pins the persisted `payload_copin_s` — the
+    // stamp's slot is the id's rank among ids visible at the PAYLOAD boundary; a restore that
+    // defaulted the boundary to the seam would exclude the already-stamped rows from the rank,
+    // shift the slot, and mask the WRONG row. COUNT is slot-blind; the closed-form SUM bites.
+    twin_seq += 1;
+    twin.execute_text(twin_seq, "DELETE FROM big WHERE a = 40").unwrap();
+    assert!(twin.streaming_cold_stamps() >= 1, "the post-restore delete must STAMP");
+    assert_eq!(count(&twin), i64::from(N) - 2);
+    let expected_sum: i64 = (0..i64::from(N)).sum::<i64>() - 10 - 30 - 40 + 100000;
+    let sum = twin
+        .execute_relational_select(&select("SELECT SUM(a) FROM big"))
+        .unwrap();
+    assert_eq!(
+        sum.rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        vec![vec![SqlValue::Int8(expected_sum)]],
+        "the post-restore stamp must mask EXACTLY a=40 (payload-boundary rank)"
+    );
 }
 
 /// THE CHANGE-LOG REGRESSION (found by P2's stamp counter, but 6c-1-era): `imbl::OrdMap::diff`
