@@ -788,65 +788,59 @@ fn composite_group_count_reps(
     }
     let comp_w = dst_off;
     let derived_ptr = derived.map_or(0, |(ptr, _)| ptr);
-    let _kbuf;
-    let key_base_override = if comp_w > 0 {
+    let _kbuf = if comp_w > 0 {
         let buf = device_memory
             // COUNT(DISTINCT) reps are over non-NULL keys (a nullable group key with COUNT(DISTINCT)
             // clean-errors upstream), so no per-member validity here.
             .build_wide_key_device(&descriptors, comp_w, row_count, derived_ptr, &[])
             .map_err(map_err)?;
-        let ptr = buf.device_ptr();
-        _kbuf = Some(buf);
-        ptr
+        Some(buf)
     } else {
-        _kbuf = None;
-        0
+        None
     };
-    let mut flat: Vec<u64> = Vec::new();
+    let mut text_sources = Vec::new();
     for &(idx, ty) in members {
         if matches!(ty, SqlType::Text) {
             let layout = resident_device_text_column_layout(snapshot, table, idx)?;
-            flat.push(layout.offsets_byte_offset);
-            flat.push(layout.bytes_byte_offset);
+            text_sources.push(gpu_db_execution::CudaGroupTextSource {
+                offsets_byte_offset: layout.offsets_byte_offset,
+                bytes_byte_offset: layout.bytes_byte_offset,
+                bytes_len: layout.bytes_len,
+                row_count,
+            });
         }
     }
     let _tdesc;
-    let (n_text, text_desc_ptr) = if flat.is_empty() {
+    if text_sources.is_empty() {
         _tdesc = None;
-        (0, 0)
     } else {
-        let n = (flat.len() / 2) as u64;
-        let buf = device_memory.upload_u64_device(&flat).map_err(map_err)?;
-        let ptr = buf.device_ptr();
-        _tdesc = Some(buf);
-        (n, ptr)
+        _tdesc = Some(
+            device_memory
+                .upload_group_text_descriptors(&text_sources)
+                .map_err(map_err)?,
+        );
+    }
+    let key = gpu_db_execution::CudaGroupKeySource::Composite {
+        fixed: _kbuf.as_ref().map(|buf| gpu_db_execution::CudaGroupWideSource {
+            buffer: buf.group_view(),
+            row_width: comp_w,
+            row_count,
+        }),
+        text: _tdesc.as_ref().map(|buf| buf.descriptors()),
+        row_count,
     };
     let groups = device_memory
         .group_by_i32_count_sum_minmax_from_payload(
-            0,
-            0,
+            gpu_db_execution::CudaGroupByInput {
+                key,
+                value: gpu_db_execution::CudaGroupValueSource::Unused { row_count },
+                key_validity_bitmap_offset: None,
+                value_validity_bitmap_offset: None,
+            },
             indices,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            0,
-            0,
-            false,
-            0,
-            0,
-            key_base_override,
-            0,
-            comp_w,
-            n_text,
-            text_desc_ptr,
-            None,
-            None,
             // COUNT(DISTINCT) representative pass: reads only g.key_i128 (no stat field), so the mask is
             // immaterial -- pass ALL (no prune, fully behavior-preserving for this internal pass).
-            gpu_db_execution::grouped_agg_mask::ALL,
+            gpu_db_execution::grouped_agg_mask::COUNT,
         )
         .map_err(map_err)?;
     Ok(groups.iter().map(|g| g.key_i128 as u64 as u32).collect())
@@ -4317,7 +4311,15 @@ impl Engine {
         })?;
         let indices: Vec<u32> = (0..n).collect();
         device_memory
-            .group_by_i32_count_sum_bench(key_off, val_off, &indices, two_level)
+            .group_by_i32_count_sum_bench(
+                gpu_db_execution::CudaGroupByInput::resident_i32(
+                    key_off,
+                    val_off,
+                    u64::from(n),
+                ),
+                &indices,
+                two_level,
+            )
             .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))
     }
 
@@ -4369,7 +4371,15 @@ impl Engine {
         let indices: Vec<u32> = (0..m).collect();
         device_memory
             .group_by_i32_count_sum_kernel_timed(
-                key_off, val_off, &indices, two_level, runs, agg_mask,
+                gpu_db_execution::CudaGroupByInput::resident_i32(
+                    key_off,
+                    val_off,
+                    u64::from(n),
+                ),
+                &indices,
+                two_level,
+                runs,
+                agg_mask,
             )
             .map(|(_, ms)| ms)
             .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))
@@ -6692,27 +6702,25 @@ impl Engine {
             let scan_indices: Vec<u32> = (0..n as u32).collect();
             let cd_groups = device_memory
                 .group_by_i32_count_sum_minmax_from_payload(
-                    0,
-                    0,
+                    gpu_db_execution::CudaGroupByInput {
+                        key: gpu_db_execution::CudaGroupKeySource::Fixed(
+                            gpu_db_execution::CudaGroupFixedSource::Derived {
+                                buffer: g_sorted.group_view(),
+                                width: 8,
+                                row_count: n as u64,
+                            },
+                        ),
+                        value: gpu_db_execution::CudaGroupValueSource::Fixed(
+                            gpu_db_execution::CudaGroupFixedSource::Derived {
+                                buffer: new_distinct.group_view(),
+                                width: 8,
+                                row_count: n as u64,
+                            },
+                        ),
+                        key_validity_bitmap_offset: None,
+                        value_validity_bitmap_offset: None,
+                    },
                     &scan_indices,
-                    true,  // value_is_int8 (new_distinct is i64)
-                    true,  // key_is_int8 (g_sorted is i64)
-                    false, // value not numeric
-                    false, // value not uuid
-                    false, // key not i128
-                    false, // key not text
-                    0,
-                    0,
-                    false, // value not text
-                    0,
-                    0,
-                    g_sorted.device_ptr(),
-                    new_distinct.device_ptr(),
-                    0,    // comp_w (not a wide-key composite)
-                    0,    // n_text (no text members)
-                    0,    // text_desc_ptr
-                    None, // value_null_off (COUNT(DISTINCT) over the marked tuple matrix)
-                    None, // key_null_off (the marked-tuple matrix key is non-null by construction)
                     // COUNT(DISTINCT) SUM-of-new-distinct pass: the result builder reads this pass's
                     // `.sum`, so it must compute SUM (and COUNT). ALL is correct + behavior-preserving.
                     gpu_db_execution::grouped_agg_mask::ALL,
@@ -7124,17 +7132,17 @@ impl Engine {
             // A bool key is materialized bool->int4 (0/1) into a derived buffer + grouped via
             // key_base_override (like an expression key); int4-width, never i128/text.
             let key_is_bool = !is_expr_key && matches!(key_ty, SqlType::Bool);
-            let (key_offsets_off, key_bytes_off) = if composite_is_text {
+            let (key_offsets_off, key_bytes_off, key_bytes_len) = if composite_is_text {
                 // The text member's varlen column (the other member rides key_base_override).
                 let (c0, t0, c1, _) = composite_cols.unwrap();
                 let text_col = if matches!(t0, SqlType::Text) { c0 } else { c1 };
                 let layout = resident_device_text_column_layout(&snapshot, table, text_col)?;
-                (layout.offsets_byte_offset, layout.bytes_byte_offset)
+                (layout.offsets_byte_offset, layout.bytes_byte_offset, layout.bytes_len)
             } else if key_is_text {
                 let layout = resident_device_text_column_layout(&snapshot, table, group_idx)?;
-                (layout.offsets_byte_offset, layout.bytes_byte_offset)
+                (layout.offsets_byte_offset, layout.bytes_byte_offset, layout.bytes_len)
             } else {
-                (0, 0)
+                (0, 0, 0)
             };
             let key_scale: u8 = match key_ty {
                 SqlType::Numeric { scale, .. } => scale,
@@ -7348,36 +7356,31 @@ impl Engine {
                 _derived_key_buf = None;
                 0
             };
-            // General composite TEXT members: each text member's (offsets_off, bytes_off) -> a small
-            // device descriptor the wide-key claim folds into the hash AND byte-verifies (row vs rep),
+            // General composite TEXT members: each text member's (offsets_off, bytes_off, bytes_len) ->
+            // a small device descriptor the wide-key claim bounds, hashes, and verifies (row vs rep),
             // in DECLARED-relative order. Built once + held alive across the pass. No text members
             // (all-fixed wide key) -> n_text = 0, byte-identical to the prior wide-key path.
-            let _widekey_text_desc;
-            let (widekey_n_text, widekey_text_desc_ptr): (u64, u64) = match &widekey_cols {
+            let _widekey_text_desc = match &widekey_cols {
                 Some(members) if row_count > 0 => {
-                    let mut flat: Vec<u64> = Vec::new();
+                    let mut sources = Vec::new();
                     for &(idx, ty) in members {
                         if matches!(ty, SqlType::Text) {
                             let layout = resident_device_text_column_layout(&snapshot, table, idx)?;
-                            flat.push(layout.offsets_byte_offset);
-                            flat.push(layout.bytes_byte_offset);
+                            sources.push(gpu_db_execution::CudaGroupTextSource {
+                                offsets_byte_offset: layout.offsets_byte_offset,
+                                bytes_byte_offset: layout.bytes_byte_offset,
+                                bytes_len: layout.bytes_len,
+                                row_count,
+                            });
                         }
                     }
-                    if flat.is_empty() {
-                        _widekey_text_desc = None;
-                        (0, 0)
+                    if sources.is_empty() {
+                        None
                     } else {
-                        let n_text = (flat.len() / 2) as u64;
-                        let buf = device_memory.upload_u64_device(&flat).map_err(map_err)?;
-                        let ptr = buf.device_ptr();
-                        _widekey_text_desc = Some(buf);
-                        (n_text, ptr)
+                        Some(device_memory.upload_group_text_descriptors(&sources).map_err(map_err)?)
                     }
                 }
-                _ => {
-                    _widekey_text_desc = None;
-                    (0, 0)
-                }
+                _ => None,
             };
             // One grouping PASS per distinct value column. The kernel yields count+sum+min+max for one
             // value column; each aggregate projects from its column's pass. Every pass groups the SAME
@@ -7545,24 +7548,20 @@ impl Engine {
                 };
                 // MIN/MAX over a bool VALUE: materialize bool->int4 (0/1) into a derived buffer + read
                 // it via value_base_override. Held alive across the kernel call (closure-local lease).
-                let _derived_value_buf;
-                let value_base_override: u64 = if value_is_bool && row_count > 0 {
+                let _derived_value_buf = if value_is_bool && row_count > 0 {
                     let offset = resident_device_bool_column_offset(&snapshot, table, value_idx)?;
                     let buf = device_memory
                         .bool_to_int4_column_device(offset, row_count)
                         .map_err(map_err)?;
-                    let ptr = buf.device_ptr();
-                    _derived_value_buf = Some(buf);
-                    ptr
+                    Some(buf)
                 } else {
-                    _derived_value_buf = None;
-                    0
+                    None
                 };
-                let (value_offsets_off, value_bytes_off) = if value_is_text {
+                let (value_offsets_off, value_bytes_off, value_bytes_len) = if value_is_text {
                     let layout = resident_device_text_column_layout(&snapshot, table, value_idx)?;
-                    (layout.offsets_byte_offset, layout.bytes_byte_offset)
+                    (layout.offsets_byte_offset, layout.bytes_byte_offset, layout.bytes_len)
                 } else {
-                    (0, 0)
+                    (0, 0, 0)
                 };
                 let use_single_level = has_minmax
                     || value_is_int8
@@ -7577,36 +7576,100 @@ impl Engine {
                     || composite_is_widekey
                     || force_single;
                 let groups = if use_single_level {
+                    let key = if composite_is_widekey {
+                        gpu_db_execution::CudaGroupKeySource::Composite {
+                            fixed: _derived_key_buf.as_ref().map(|buf| {
+                                gpu_db_execution::CudaGroupWideSource {
+                                    buffer: buf.group_view(),
+                                    row_width: widekey_w,
+                                    row_count,
+                                }
+                            }),
+                            text: _widekey_text_desc.as_ref().map(|buf| buf.descriptors()),
+                            row_count,
+                        }
+                    } else if key_is_text {
+                        gpu_db_execution::CudaGroupKeySource::Text {
+                            text: gpu_db_execution::CudaGroupTextSource {
+                                offsets_byte_offset: key_offsets_off,
+                                bytes_byte_offset: key_bytes_off,
+                                bytes_len: key_bytes_len,
+                                row_count,
+                            },
+                            fixed_component: if composite_is_text {
+                                Some(gpu_db_execution::CudaGroupFixedSource::Derived {
+                                    buffer: _derived_key_buf.as_ref().expect("fixed text component").group_view(),
+                                    width: 8,
+                                    row_count,
+                                })
+                            } else {
+                                None
+                            },
+                        }
+                    } else {
+                        let width = if key_is_i128 { 16 } else if key_is_int8 { 8 } else { 4 };
+                        let source = if let Some(buf) = &_derived_key_buf {
+                            gpu_db_execution::CudaGroupFixedSource::Derived {
+                                buffer: buf.group_view(), width, row_count,
+                            }
+                        } else {
+                            gpu_db_execution::CudaGroupFixedSource::Resident {
+                                byte_offset: key_offset, width, row_count,
+                            }
+                        };
+                        gpu_db_execution::CudaGroupKeySource::Fixed(source)
+                    };
+                    let value = if value_idx_opt.is_none() {
+                        gpu_db_execution::CudaGroupValueSource::Unused { row_count }
+                    } else if value_is_text {
+                        gpu_db_execution::CudaGroupValueSource::Text(
+                            gpu_db_execution::CudaGroupTextSource {
+                                offsets_byte_offset: value_offsets_off,
+                                bytes_byte_offset: value_bytes_off,
+                                bytes_len: value_bytes_len,
+                                row_count,
+                            },
+                        )
+                    } else {
+                        let width = if value_is_numeric || value_is_uuid { 16 } else if value_is_int8 { 8 } else { 4 };
+                        let source = if let Some(buf) = &_derived_value_buf {
+                            gpu_db_execution::CudaGroupFixedSource::Derived {
+                                buffer: buf.group_view(), width, row_count,
+                            }
+                        } else {
+                            gpu_db_execution::CudaGroupFixedSource::Resident {
+                                byte_offset: value_offset, width, row_count,
+                            }
+                        };
+                        if value_is_numeric {
+                            gpu_db_execution::CudaGroupValueSource::Numeric(source)
+                        } else if value_is_uuid {
+                            gpu_db_execution::CudaGroupValueSource::Uuid(source)
+                        } else {
+                            gpu_db_execution::CudaGroupValueSource::Fixed(source)
+                        }
+                    };
                     device_memory.group_by_i32_count_sum_minmax_from_payload(
-                        key_offset,
-                        value_offset,
+                        gpu_db_execution::CudaGroupByInput {
+                            key,
+                            value,
+                            key_validity_bitmap_offset: pass_key_null_off,
+                            value_validity_bitmap_offset: pass_value_null_off,
+                        },
                         &indices,
-                        value_is_int8,
-                        key_is_int8,
-                        value_is_numeric,
-                        value_is_uuid,
-                        key_is_i128,
-                        key_is_text,
-                        key_offsets_off,
-                        key_bytes_off,
-                        value_is_text,
-                        value_offsets_off,
-                        value_bytes_off,
-                        key_base_override,
-                        value_base_override,
-                        widekey_w,
-                        widekey_n_text,
-                        widekey_text_desc_ptr,
-                        pass_value_null_off,
-                        pass_key_null_off,
                         // The query-wide pruning mask: this pass computes a superset of what its column
                         // needs; the executor reads only the masked-in field(s) it requested.
-                        agg_mask,
+                        if value_idx_opt.is_none() {
+                            gpu_db_execution::grouped_agg_mask::COUNT
+                        } else {
+                            agg_mask
+                        },
                     )
                 } else {
                     device_memory.group_by_i32_count_sum_from_payload(
-                        key_offset,
-                        value_offset,
+                        gpu_db_execution::CudaGroupByInput::resident_i32(
+                            key_offset, value_offset, row_count,
+                        ),
                         &indices,
                         agg_mask,
                     )
@@ -7716,30 +7779,53 @@ impl Engine {
                             } else {
                                 device_memory
                                     .group_by_i32_count_sum_minmax_from_payload(
-                                        key_offset,
-                                        0,
+                                        gpu_db_execution::CudaGroupByInput {
+                                            key: if composite_is_widekey {
+                                                gpu_db_execution::CudaGroupKeySource::Composite {
+                                                    fixed: _derived_key_buf.as_ref().map(|buf| gpu_db_execution::CudaGroupWideSource {
+                                                        buffer: buf.group_view(), row_width: widekey_w, row_count,
+                                                    }),
+                                                    text: _widekey_text_desc.as_ref().map(|buf| buf.descriptors()),
+                                                    row_count,
+                                                }
+                                            } else if key_is_text {
+                                                gpu_db_execution::CudaGroupKeySource::Text {
+                                                    text: gpu_db_execution::CudaGroupTextSource {
+                                                        offsets_byte_offset: key_offsets_off,
+                                                        bytes_byte_offset: key_bytes_off,
+                                                        bytes_len: key_bytes_len,
+                                                        row_count,
+                                                    },
+                                                    fixed_component: if composite_is_text {
+                                                        Some(gpu_db_execution::CudaGroupFixedSource::Derived {
+                                                            buffer: _derived_key_buf.as_ref().expect("fixed text component").group_view(),
+                                                            width: 8,
+                                                            row_count,
+                                                        })
+                                                    } else { None },
+                                                }
+                                            } else {
+                                                let width = if key_is_i128 { 16 } else if key_is_int8 { 8 } else { 4 };
+                                                gpu_db_execution::CudaGroupKeySource::Fixed(
+                                                    if let Some(buf) = &_derived_key_buf {
+                                                        gpu_db_execution::CudaGroupFixedSource::Derived {
+                                                            buffer: buf.group_view(), width, row_count,
+                                                        }
+                                                    } else {
+                                                        gpu_db_execution::CudaGroupFixedSource::Resident {
+                                                            byte_offset: key_offset, width, row_count,
+                                                        }
+                                                    },
+                                                )
+                                            },
+                                            value: gpu_db_execution::CudaGroupValueSource::Unused { row_count },
+                                            key_validity_bitmap_offset: None,
+                                            value_validity_bitmap_offset: None,
+                                        },
                                         &reps,
-                                        false,
-                                        key_is_int8,
-                                        false,
-                                        false,
-                                        key_is_i128,
-                                        key_is_text,
-                                        key_offsets_off,
-                                        key_bytes_off,
-                                        false,
-                                        0,
-                                        0,
-                                        key_base_override,
-                                        0,
-                                        widekey_w,
-                                        widekey_n_text,
-                                        widekey_text_desc_ptr,
-                                        None, // value_null_off (COUNT(DISTINCT) marked-tuple pass)
-                                        None, // key_null_off (marked-tuple key non-null by construction)
                                         // Step-2 GROUP BY g over reps, COUNT(*): the result builder reads
                                         // `.count` (-> `.sum`). ALL is correct + behavior-preserving.
-                                        gpu_db_execution::grouped_agg_mask::ALL,
+                                        gpu_db_execution::grouped_agg_mask::COUNT,
                                     )
                                     .map_err(map_err)?
                             };

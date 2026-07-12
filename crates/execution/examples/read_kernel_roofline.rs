@@ -515,8 +515,7 @@ fn main() {
         // Honest KERNEL: CUDA-event timed, two-level kernel, 10 runs, full-compute mask.
         let (_rows, kernel_ms) = resident
             .group_by_i32_count_sum_kernel_timed(
-                off_a,
-                off_b,
+                gpu_db_execution::CudaGroupByInput::resident_i32(off_a, off_b, rows),
                 gi,
                 true,
                 10,
@@ -536,8 +535,7 @@ fn main() {
             Box::new(|| {
                 resident
                     .group_by_i32_count_sum_from_payload(
-                        off_a,
-                        off_b,
+                        gpu_db_execution::CudaGroupByInput::resident_i32(off_a, off_b, rows),
                         gi,
                         gpu_db_execution::grouped_agg_mask::ALL,
                     )

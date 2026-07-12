@@ -209,8 +209,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   concurrent invocations without CUDA 700/716/717. The final card measured grouped aggregation at 1,677.7 M
   elements/s, count at 0.87x/1.00x roofline, and 65,536-batch point reads at 251.1M/257.5M lookups/s with p50
   136/127us in-L2/out-of-L2. Independent audit found no extraction regression and exposed pre-existing unchecked
-  grouped fixed/text/derived/composite windows plus timed-launcher lifecycle gaps, now owned by **STRUCT-001X**.
-  The execution root is 20,618 lines; further extraction remains **STRUCT-001**.
+  grouped fixed/text/derived/composite windows plus timed-launcher lifecycle gaps. Those gaps are now closed:
+  every safe grouped entry accepts typed resident/derived/text/composite descriptors with exact logical extents,
+  owner lifetimes, and originating CUDA-context identity; raw kernel pointers and flags remain private. Checked
+  host preflight precedes context binding and covers indexed fixed windows, text sections, bitmaps, descriptor
+  triples, row agreement, initialized derived bytes, mode coherence, and timed-run arithmetic. Direct and
+  representative varlen spans are bounded on-device and report through a fail-closed error flag; numeric pass two
+  is suppressed after malformed input. Timed events are RAII-owned and error exits drain the default stream before
+  event/buffer destruction while preserving empty zero-work and kernel-only timing semantics. Six pure grouped
+  boundary/mode tests plus a retained-GPU malformed/reuse regression raise the exact execution inventory to 116,
+  with 42 passing and 74 ignored. Ten grouped safety/type/NULL/overflow/two-level gates passed 30 sequential and
+  20 concurrent invocations without CUDA 700/716/717; the final focused safety gate additionally passed three
+  sequential invocations. Independent audit is clean. The final canonical card measured grouped aggregation at
+  1,678.0 M elements/s, count at 0.88x/1.01x same-run roofline, gather at 349.5/155.3 GB/s, and 65,536-batch point
+  reads at 247.4M/251.4M lookups/s with p50 138/132us in-L2/out-of-L2. The execution root is 20,589 lines;
+  `group_input.rs` is 639 lines and `resident_group.rs` is 1,282 lines. Further extraction remains **STRUCT-001**.
 
 ## Known boundaries
 

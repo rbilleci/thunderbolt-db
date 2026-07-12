@@ -85,6 +85,13 @@ use resident_aggregate::{
 mod resident_group;
 use resident_group::{launch_cuda_group_by_i32_count_sum, launch_cuda_group_by_kernel_timed};
 pub use resident_group::GroupByI32Row;
+mod group_input;
+use group_input::{ValidatedGroupInput, validate_group_input};
+pub use group_input::{
+    CudaGroupByInput, CudaGroupDeviceView, CudaGroupFixedSource, CudaGroupKeySource,
+    CudaGroupTextDescriptorBuffer, CudaGroupTextDescriptors, CudaGroupTextSource,
+    CudaGroupValueSource, CudaGroupWideSource,
+};
 mod point_read_submit;
 use point_read_submit::{
     launch_cuda_resident_i32_equal_project, submit_cuda_resident_i32_equal_any_project,
@@ -175,6 +182,42 @@ impl CudaResidentDeviceMemoryReadView {
             row_count,
         )
     }
+}
+
+fn launch_validated_group_by(
+    resident: &CudaResidentDeviceMemory,
+    input: CudaGroupByInput<'_>,
+    indices: &[u32],
+    two_level: bool,
+    agg_mask: u32,
+) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ValidatedGroupInput {
+        key_byte_offset, value_byte_offset, value_is_int8, key_is_int8, value_is_numeric,
+        value_is_uuid, key_is_i128, key_is_text, key_offsets_off, key_bytes_off, key_bytes_len,
+        value_is_text, value_offsets_off, value_bytes_off, value_bytes_len, key_base_override,
+        value_base_override, comp_w, n_text, text_desc_ptr, value_null_off, key_null_off,
+    } = validate_group_input(resident, input, indices)?;
+    if matches!(input.value, CudaGroupValueSource::Unused { .. }) && (agg_mask & !grouped_agg_mask::COUNT) != 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(agg_mask as usize));
+    }
+    if two_level
+        && (value_is_int8 || key_is_int8 || value_is_numeric || value_is_uuid || key_is_i128
+            || key_is_text || value_is_text || key_base_override != 0 || value_base_override != 0
+            || comp_w != 0 || n_text != 0 || value_null_off.is_some() || key_null_off.is_some())
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    launch_cuda_group_by_i32_count_sum(
+        resident, key_byte_offset, value_byte_offset, indices,
+        if two_level { c"gpu_db_group_by_i32_count_sum_twolevel" } else { c"gpu_db_group_by_i32_count_sum" },
+        value_is_int8, key_is_int8, value_is_numeric, value_is_uuid, key_is_i128, key_is_text,
+        key_offsets_off, key_bytes_off, key_bytes_len, value_is_text, value_offsets_off,
+        value_bytes_off, value_bytes_len, key_base_override, value_base_override, comp_w, n_text,
+        text_desc_ptr, value_null_off, key_null_off, agg_mask,
+    )
 }
 
 impl CudaResidentDeviceMemory {
@@ -443,15 +486,36 @@ impl CudaResidentDeviceMemory {
         )
     }
 
-    /// Upload a small u64 array to device for the general-composite GROUP BY claim's TEXT-member
-    /// descriptor: `data` is `n_text` pairs of (offsets_off, bytes_off) into the resident payload.
-    /// Returns a leased buffer the caller holds alive + passes as `text_desc_ptr` (n_text = len/2) to
-    /// [`Self::group_by_i32_count_sum_minmax_from_payload`]. Blocking H2D (data is on-device on return).
+    /// Upload a small generic u64 array to device. Grouped TEXT descriptors must instead use
+    /// [`Self::upload_group_text_descriptors`], which owns their typed sources and byte limits.
+    /// Blocking H2D: `data` is fully on-device when this method returns.
     pub fn upload_u64_device(
         &self,
         data: &[u64],
     ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
         launch_cuda_upload_u64_device(self, data)
+    }
+
+    /// Upload owned `(offsets, bytes, bytes_len)` descriptors for composite text group keys.
+    pub fn upload_group_text_descriptors(
+        &self,
+        sources: &[CudaGroupTextSource],
+    ) -> Result<CudaGroupTextDescriptorBuffer<'_>, CudaRuntimeProbeError> {
+        if sources.is_empty() {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let mut flat = Vec::with_capacity(sources.len() * 3);
+        for source in sources {
+            flat.extend_from_slice(&[
+                source.offsets_byte_offset,
+                source.bytes_byte_offset,
+                source.bytes_len,
+            ]);
+        }
+        Ok(CudaGroupTextDescriptorBuffer {
+            buffer: launch_cuda_upload_u64_device(self, &flat)?,
+            sources: sources.to_vec(),
+        })
     }
 
     /// GPU inner equi-join (M5) on an int key with a UNIQUE build-side key. `build_keys`/`probe_keys`
@@ -884,40 +948,14 @@ impl CudaResidentDeviceMemory {
     /// key_byte_offset`. `indices` may be empty (-> no groups).
     pub fn group_by_i32_count_sum_from_payload(
         &self,
-        key_byte_offset: u64,
-        sum_byte_offset: u64,
+        input: CudaGroupByInput<'_>,
         indices: &[u32],
         // Query-aware aggregate-selection mask (`grouped_agg_mask`). The two-level kernel serves only
         // COUNT/SUM (its MIN/MAX bits are no-ops); the executor passes the query-wide mask so a
         // COUNT(*)-only query prunes the SUM atomics.
         agg_mask: u32,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
-        launch_cuda_group_by_i32_count_sum(
-            self,
-            key_byte_offset,
-            sum_byte_offset,
-            indices,
-            c"gpu_db_group_by_i32_count_sum_twolevel",
-            false, // two-level path serves COUNT/SUM/AVG over an int4 value
-            false, // ...and an int4 key
-            false, // ...not numeric
-            false, // ...not uuid
-            false, // ...not an i128 key (i128 keys force the single-level kernel)
-            false, // ...not a text key
-            0,     // key_offsets_off (unused off the text-key path)
-            0,     // key_bytes_off
-            false, // ...not a text value
-            0,     // value_offsets_off
-            0,     // value_bytes_off
-            0,     // key_base_override (column key path -> no derived-buffer override)
-            0,     // value_base_override (column value path)
-            0,     // comp_w (not a wide-key composite)
-            0,     // n_text (no text members)
-            0,     // text_desc_ptr
-            None,  // value_null_off (bench: non-nullable)
-            None,  // key_null_off (bench: non-nullable)
-            agg_mask,
-        )
+        launch_validated_group_by(self, input, indices, true, agg_mask)
     }
 
     /// GROUP BY with per-group MIN/MAX of the value (the returned [`GroupByI32Row`] carries
@@ -925,68 +963,15 @@ impl CudaResidentDeviceMemory {
     /// not); count/sum are also valid. A two-level min/max kernel is a perf follow-on for low
     /// cardinality. `value_is_int8` selects the int8 (8-byte) vs int4 (4-byte) value read;
     /// `sum_byte_offset` = the value column (= key column for shapes that ignore it).
-    #[allow(clippy::too_many_arguments)] // value-type layout flags (int8 / numeric / uuid) + offsets
     pub fn group_by_i32_count_sum_minmax_from_payload(
         &self,
-        key_byte_offset: u64,
-        sum_byte_offset: u64,
+        input: CudaGroupByInput<'_>,
         indices: &[u32],
-        value_is_int8: bool,
-        key_is_int8: bool,
-        value_is_numeric: bool,
-        value_is_uuid: bool,
-        key_is_i128: bool,
-        key_is_text: bool,
-        key_offsets_off: u64,
-        key_bytes_off: u64,
-        value_is_text: bool,
-        value_offsets_off: u64,
-        value_bytes_off: u64,
-        key_base_override: u64,
-        value_base_override: u64,
-        // General all-fixed COMPOSITE key: comp_w > 0 -> the `comp_w`-byte wide key per row lives in
-        // key_base_override (built by [`Self::build_wide_key_device`]); 0 = every other path.
-        comp_w: u64,
-        // General COMPOSITE with TEXT members: n_text members, each (offsets_off, bytes_off) [16 bytes]
-        // in text_desc_ptr (a device buffer the caller holds alive). 0 = no text members.
-        n_text: u64,
-        text_desc_ptr: u64,
-        // M3 (doc 21): `Some(off)` = the VALUE column's NULL validity bitmap — a NULL value is skipped
-        // from count/sum/min/max (3VL); `None` = every value valid. Uses the single-level kernel.
-        value_null_off: Option<u64>,
-        // M3 (doc 21): `Some(off)` = the KEY column's NULL validity bitmap — a NULL key forms its own
-        // NULL-KEY group (rendered SqlValue::Null); `None` = every key valid.
-        key_null_off: Option<u64>,
         // Query-aware aggregate-selection mask (`grouped_agg_mask`): only the masked-in count/sum/min/max
         // fields' per-row atomics run; the executor reads only what it requested.
         agg_mask: u32,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
-        launch_cuda_group_by_i32_count_sum(
-            self,
-            key_byte_offset,
-            sum_byte_offset,
-            indices,
-            c"gpu_db_group_by_i32_count_sum",
-            value_is_int8,
-            key_is_int8,
-            value_is_numeric,
-            value_is_uuid,
-            key_is_i128,
-            key_is_text,
-            key_offsets_off,
-            key_bytes_off,
-            value_is_text,
-            value_offsets_off,
-            value_bytes_off,
-            key_base_override,
-            value_base_override,
-            comp_w,
-            n_text,
-            text_desc_ptr,
-            value_null_off,
-            key_null_off,
-            agg_mask,
-        )
+        launch_validated_group_by(self, input, indices, false, agg_mask)
     }
 
     /// Benchmark entry: run GROUP BY with the chosen kernel (`two_level` selects the shared-mem
@@ -994,42 +979,11 @@ impl CudaResidentDeviceMemory {
     /// always uses the two-level kernel via [`Self::group_by_i32_count_sum_from_payload`].
     pub fn group_by_i32_count_sum_bench(
         &self,
-        key_byte_offset: u64,
-        sum_byte_offset: u64,
+        input: CudaGroupByInput<'_>,
         indices: &[u32],
         two_level: bool,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
-        let kernel = if two_level {
-            c"gpu_db_group_by_i32_count_sum_twolevel"
-        } else {
-            c"gpu_db_group_by_i32_count_sum"
-        };
-        launch_cuda_group_by_i32_count_sum(
-            self,
-            key_byte_offset,
-            sum_byte_offset,
-            indices,
-            kernel,
-            false, // the bench aggregates an int4 value
-            false, // ...and groups by an int4 key
-            false, // ...not numeric
-            false, // ...not uuid
-            false, // ...not an i128 key
-            false, // ...not a text key
-            0,
-            0,
-            false, // ...not a text value
-            0,
-            0,
-            0,                     // key_base_override (bench uses column keys)
-            0,                     // value_base_override
-            0,                     // comp_w (not a wide-key composite)
-            0,                     // n_text (no text members)
-            0,                     // text_desc_ptr
-            None,                  // value_null_off (bench: non-nullable)
-            None,                  // key_null_off (bench: non-nullable)
-            grouped_agg_mask::ALL, // bench computes every field
-        )
+        launch_validated_group_by(self, input, indices, two_level, grouped_agg_mask::ALL)
     }
 
     /// Benchmark entry: time JUST the GROUP BY kernel (CUDA events, min of `runs`), returning the
@@ -1037,8 +991,7 @@ impl CudaResidentDeviceMemory {
     /// overhead, so the two-level vs single-level difference is visible. Perf comparison only.
     pub fn group_by_i32_count_sum_kernel_timed(
         &self,
-        key_byte_offset: u64,
-        sum_byte_offset: u64,
+        input: CudaGroupByInput<'_>,
         indices: &[u32],
         two_level: bool,
         runs: u32,
@@ -1046,6 +999,24 @@ impl CudaResidentDeviceMemory {
         // path vs `ALL` for the full-compute path, isolating the per-row atomic savings.
         agg_mask: u32,
     ) -> Result<(Vec<GroupByI32Row>, f32), CudaRuntimeProbeError> {
+        if runs == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(runs as usize));
+        }
+        if indices.is_empty() {
+            return Ok((Vec::new(), 0.0));
+        }
+        if matches!(input.value, CudaGroupValueSource::Unused { .. }) {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(agg_mask as usize));
+        }
+        let validated = validate_group_input(self, input, indices)?;
+        if validated.value_is_int8 || validated.key_is_int8 || validated.value_is_numeric
+            || validated.value_is_uuid || validated.key_is_i128 || validated.key_is_text
+            || validated.value_is_text || validated.key_base_override != 0
+            || validated.value_base_override != 0 || validated.comp_w != 0 || validated.n_text != 0
+            || validated.value_null_off.is_some() || validated.key_null_off.is_some()
+        {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
         let kernel = if two_level {
             c"gpu_db_group_by_i32_count_sum_twolevel"
         } else {
@@ -1053,8 +1024,8 @@ impl CudaResidentDeviceMemory {
         };
         launch_cuda_group_by_kernel_timed(
             self,
-            key_byte_offset,
-            sum_byte_offset,
+            validated.key_byte_offset,
+            validated.value_byte_offset,
             indices,
             kernel,
             runs,
@@ -12108,12 +12079,32 @@ fn launch_cuda_resident_expr_arith_filter(
 pub struct DeviceArithBuffer<'a> {
     _lease: PooledBufferLease<'a>,
     ptr: u64,
+    initialized_bytes: u64,
 }
 
 impl DeviceArithBuffer<'_> {
+    fn new(lease: PooledBufferLease<'_>, initialized_bytes: usize) -> DeviceArithBuffer<'_> {
+        debug_assert!(initialized_bytes <= lease.capacity);
+        let ptr = lease.ptr;
+        DeviceArithBuffer {
+            _lease: lease,
+            ptr,
+            initialized_bytes: initialized_bytes as u64,
+        }
+    }
+
     /// Device address of the value buffer (one element per row; width = the program's element type).
     pub fn device_ptr(&self) -> u64 {
         self.ptr
+    }
+
+    /// Borrow this allocation with its exact initialized extent and originating CUDA context.
+    pub fn group_view(&self) -> CudaGroupDeviceView<'_> {
+        CudaGroupDeviceView::new(
+            self.ptr,
+            self.initialized_bytes,
+            self._lease.primary_identity(),
+        )
     }
 }
 
@@ -12148,8 +12139,10 @@ fn launch_cuda_arith_value_column_device<'r>(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     check_cuda(unsafe { cu_ctx_synchronize() })?;
-    let ptr = value.ptr;
-    Ok(DeviceArithBuffer { _lease: value, ptr })
+    let initialized_bytes = n
+        .checked_mul(elem.elem_size())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+    Ok(DeviceArithBuffer::new(value, initialized_bytes))
 }
 
 /// Run `gpu_db_resident_bool_to_mask` (negate=0) into a leased int4 buffer (it writes 0/1 per row) and
@@ -12232,8 +12225,7 @@ fn launch_cuda_bool_to_int4_column_device<'r>(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     check_cuda(unsafe { cu_ctx_synchronize() })?;
-    let ptr = out.ptr;
-    Ok(DeviceArithBuffer { _lease: out, ptr })
+    Ok(DeviceArithBuffer::new(out, out_bytes))
 }
 
 /// Run `gpu_db_pack_two_int4_cols` into a leased i64 buffer (col0<<32 | col1 per row) and return it as a
@@ -12316,8 +12308,7 @@ fn launch_cuda_pack_two_int4_cols_device<'r>(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     check_cuda(unsafe { cu_ctx_synchronize() })?;
-    let ptr = out.ptr;
-    Ok(DeviceArithBuffer { _lease: out, ptr })
+    Ok(DeviceArithBuffer::new(out, out_bytes))
 }
 
 /// Run `gpu_db_pack_two_cols_i128` into a leased [i128; n] buffer (col0 high 64 bits, col1 low 64) and
@@ -12410,8 +12401,7 @@ fn launch_cuda_pack_two_cols_i128_device<'r>(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     check_cuda(unsafe { cu_ctx_synchronize() })?;
-    let ptr = out.ptr;
-    Ok(DeviceArithBuffer { _lease: out, ptr })
+    Ok(DeviceArithBuffer::new(out, out_bytes))
 }
 
 /// Run `gpu_db_widen_col_to_i64` into a leased [i64; n] buffer (the column sign-extended to i64) for the
@@ -12497,8 +12487,7 @@ fn launch_cuda_widen_col_to_i64_device<'r>(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     check_cuda(unsafe { cu_ctx_synchronize() })?;
-    let ptr = out.ptr;
-    Ok(DeviceArithBuffer { _lease: out, ptr })
+    Ok(DeviceArithBuffer::new(out, out_bytes))
 }
 
 /// Run `gpu_db_build_wide_key` into a leased [u8; wbytes*n] buffer (the all-fixed composite wide key per
@@ -12526,8 +12515,7 @@ fn launch_cuda_upload_u64_device<'r>(
     // cuMemcpyHtoD is host-synchronous: the data is fully on device when it returns, so the GROUP BY
     // kernel (on the pooled stream) sees it without a further sync.
     check_cuda(unsafe { cu_memcpy_htod(buf.ptr, data.as_ptr().cast::<c_void>(), bytes) })?;
-    let ptr = buf.ptr;
-    Ok(DeviceArithBuffer { _lease: buf, ptr })
+    Ok(DeviceArithBuffer::new(buf, bytes))
 }
 
 fn launch_cuda_build_wide_key_device<'r>(
@@ -12668,8 +12656,7 @@ fn launch_cuda_build_wide_key_device<'r>(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     check_cuda(unsafe { cu_ctx_synchronize() })?;
-    let ptr = out.ptr;
-    Ok(DeviceArithBuffer { _lease: out, ptr })
+    Ok(DeviceArithBuffer::new(out, out_bytes))
 }
 
 /// GPU inner equi-join (M5), int key, UNIQUE build key (see
@@ -14064,17 +14051,9 @@ fn launch_cuda_mark_new_distinct_device<'r>(
         }
     })?;
     check_cuda(unsafe { cu_ctx_synchronize() })?;
-    let g_ptr = g_out.ptr;
-    let nd_ptr = nd_out.ptr;
     Ok((
-        DeviceArithBuffer {
-            _lease: g_out,
-            ptr: g_ptr,
-        },
-        DeviceArithBuffer {
-            _lease: nd_out,
-            ptr: nd_ptr,
-        },
+        DeviceArithBuffer::new(g_out, out_bytes),
+        DeviceArithBuffer::new(nd_out, out_bytes),
     ))
 }
 
@@ -14232,17 +14211,9 @@ fn launch_cuda_mark_new_distinct_text_device<'r>(
         }
     })?;
     check_cuda(unsafe { cu_ctx_synchronize() })?;
-    let g_ptr = g_out.ptr;
-    let nd_ptr = nd_out.ptr;
     Ok((
-        DeviceArithBuffer {
-            _lease: g_out,
-            ptr: g_ptr,
-        },
-        DeviceArithBuffer {
-            _lease: nd_out,
-            ptr: nd_ptr,
-        },
+        DeviceArithBuffer::new(g_out, out_bytes),
+        DeviceArithBuffer::new(nd_out, out_bytes),
     ))
 }
 

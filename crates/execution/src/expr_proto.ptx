@@ -8108,7 +8108,7 @@ het_done:
     // key_base_override (built by gpu_db_build_wide_key) -- grouped via a (rep_idx, hash) b128 claim
     // that hashes + memcmps the comp_w bytes. 0 = not a wide-key composite (every existing path).
     .param .u64 comp_w,
-    // General COMPOSITE with TEXT members: n_text text members, each (offsets_off, bytes_off) [16 bytes]
+    // General COMPOSITE with TEXT members: n_text members, each (offsets_off, bytes_off, bytes_len)
     // in text_desc_ptr. The wide-key claim ALSO folds every text member's bytes into the hash AND
     // byte-verifies it (row idx vs the representative olo). 0 = no text members (the all-fixed wide key,
     // byte-identical). comp_w may be 0 here (a pure all-text composite, e.g. two-text), so the wide-key
@@ -8128,8 +8128,12 @@ het_done:
     // Only the SELECTED fields' per-row update atomics run; the slot CLAIM + GROUP-KEY emit ALWAYS run
     // (group identity is mask-independent). Masked-out fields stay at their init sentinels (count/sum=0,
     // min=INT_MAX, max=INT_MIN); the host reads only the masked-in field(s) -> byte-identical for them.
-    // Appended LAST so the twolevel kernel (fewer params) ignores it.
-    .param .u64 agg_mask
+    .param .u64 agg_mask,
+    // Exact resident text byte extents plus a device error flag. Fixed-width windows and offsets arrays
+    // are checked on the host; every varlen span is checked here before any byte read.
+    .param .u64 key_bytes_limit,
+    .param .u64 value_bytes_limit,
+    .param .u64 input_error_flag
 )
 {
     .reg .u32 %aggm;
@@ -8158,6 +8162,10 @@ het_done:
     .reg .u64 %vtext;
     .reg .u64 %voffoff;
     .reg .u64 %vbytesoff;
+    .reg .u64 %klimit;
+    .reg .u64 %vlimit;
+    .reg .u64 %inerr;
+    .reg .u64 %errone;
     .reg .u64 %vstart;
     .reg .u64 %vend;
     .reg .u64 %vlen;
@@ -8329,6 +8337,10 @@ het_done:
     ld.param.u64 %vtext, [value_is_text];
     ld.param.u64 %voffoff, [value_offsets_off];
     ld.param.u64 %vbytesoff, [value_bytes_off];
+    ld.param.u64 %klimit, [key_bytes_limit];
+    ld.param.u64 %vlimit, [value_bytes_limit];
+    ld.param.u64 %inerr, [input_error_flag];
+    mov.u64 %errone, 1;
     .reg .u64 %kbov;
     .reg .pred %pkbov;
     ld.param.u64 %kbov, [key_base_override];
@@ -8350,6 +8362,7 @@ het_done:
     .reg .u64 %tdbase;
     .reg .u64 %tdooff;
     .reg .u64 %tdboff;
+    .reg .u64 %tdlim;
     .reg .u64 %mstart;
     .reg .u64 %mend;
     .reg .u64 %mlen;
@@ -8438,6 +8451,10 @@ gb_ktext:
     ld.global.u32 %klo, [%addr+8];
     ld.global.u32 %khi, [%addr+12];
     mov.b64 %tend, {%klo, %khi};
+    setp.gt.u64 %p, %tstart, %tend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %tend, %klimit;
+    @%p bra group_input_invalid;
     sub.u64 %tlen, %tend, %tstart;
     add.u64 %taddr, %base, %kbytesoff;
     add.u64 %taddr, %taddr, %tstart;
@@ -8502,10 +8519,11 @@ wkey_hash_text:
 wkey_htext_member:
     setp.ge.u64 %p, %tmem, %ntext;
     @%p bra wkey_hash_done;
-    mul.lo.u64 %o8, %tmem, 16;
+    mul.lo.u64 %o8, %tmem, 24;
     add.u64 %tdbase, %tdesc, %o8;
     ld.global.u64 %tdooff, [%tdbase];
     ld.global.u64 %tdboff, [%tdbase+8];
+    ld.global.u64 %tdlim, [%tdbase+16];
     cvt.u64.u32 %o8, %idx;
     mul.lo.u64 %o8, %o8, 8;
     add.u64 %addr, %base, %tdooff;
@@ -8516,6 +8534,10 @@ wkey_htext_member:
     ld.global.u32 %klo, [%addr+8];
     ld.global.u32 %khi, [%addr+12];
     mov.b64 %mend, {%klo, %khi};
+    setp.gt.u64 %p, %mstart, %mend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %mend, %tdlim;
+    @%p bra group_input_invalid;
     sub.u64 %mlen, %mend, %mstart;
     add.u64 %mbaddr, %base, %tdboff;
     add.u64 %mbaddr, %mbaddr, %mstart;
@@ -8572,6 +8594,10 @@ gb_vtext:
     ld.global.u32 %vlo, [%addr+8];
     ld.global.u32 %vhi, [%addr+12];
     mov.b64 %vend, {%vlo, %vhi};
+    setp.gt.u64 %p, %vstart, %vend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %vend, %vlimit;
+    @%p bra group_input_invalid;
     sub.u64 %vlen, %vend, %vstart;
     add.u64 %vbaddr, %base, %vbytesoff;
     add.u64 %vbaddr, %vbaddr, %vstart;
@@ -8786,6 +8812,10 @@ ktext_skip_fixed:
     ld.global.u32 %klo, [%vaddr+8];
     ld.global.u32 %khi, [%vaddr+12];
     mov.b64 %send, {%klo, %khi};
+    setp.gt.u64 %p, %sstart, %send;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %send, %klimit;
+    @%p bra group_input_invalid;
     sub.u64 %slen, %send, %sstart;
     setp.ne.u64 %pf, %slen, %tlen;
     @%pf bra ktext_probe_next;
@@ -8862,10 +8892,11 @@ wkey_vtext:
 wkey_vtext_member:
     setp.ge.u64 %p, %tmem, %ntext;
     @%p bra do_agg;
-    mul.lo.u64 %o8, %tmem, 16;
+    mul.lo.u64 %o8, %tmem, 24;
     add.u64 %tdbase, %tdesc, %o8;
     ld.global.u64 %tdooff, [%tdbase];
     ld.global.u64 %tdboff, [%tdbase+8];
+    ld.global.u64 %tdlim, [%tdbase+16];
     cvt.u64.u32 %o8, %idx;
     mul.lo.u64 %o8, %o8, 8;
     add.u64 %addr, %base, %tdooff;
@@ -8876,6 +8907,10 @@ wkey_vtext_member:
     ld.global.u32 %klo, [%addr+8];
     ld.global.u32 %khi, [%addr+12];
     mov.b64 %mend, {%klo, %khi};
+    setp.gt.u64 %p, %mstart, %mend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %mend, %tdlim;
+    @%p bra group_input_invalid;
     sub.u64 %mlen, %mend, %mstart;
     mul.lo.u64 %o8, %olo, 8;
     add.u64 %addr, %base, %tdooff;
@@ -8886,6 +8921,10 @@ wkey_vtext_member:
     ld.global.u32 %klo, [%addr+8];
     ld.global.u32 %khi, [%addr+12];
     mov.b64 %rend, {%klo, %khi};
+    setp.gt.u64 %p, %rstart, %rend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %rend, %tdlim;
+    @%p bra group_input_invalid;
     sub.u64 %rlen, %rend, %rstart;
     setp.ne.u64 %p, %mlen, %rlen;
     @%p bra wkey_probe_next;
@@ -9080,6 +9119,10 @@ tmin_loop:
     ld.global.u32 %klo, [%caddr+8];
     ld.global.u32 %khi, [%caddr+12];
     mov.b64 %cend, {%klo, %khi};
+    setp.gt.u64 %p, %cstart, %cend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %cend, %vlimit;
+    @%p bra group_input_invalid;
     sub.u64 %clen, %cend, %cstart;
     add.u64 %caddr, %base, %vbytesoff;
     add.u64 %caddr, %caddr, %cstart;
@@ -9123,6 +9166,10 @@ tmax_loop:
     ld.global.u32 %klo, [%caddr+8];
     ld.global.u32 %khi, [%caddr+12];
     mov.b64 %cend, {%klo, %khi};
+    setp.gt.u64 %p, %cstart, %cend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %cend, %vlimit;
+    @%p bra group_input_invalid;
     sub.u64 %clen, %cend, %cstart;
     add.u64 %caddr, %base, %vbytesoff;
     add.u64 %caddr, %caddr, %cstart;
@@ -9150,6 +9197,9 @@ tmax_cas:
     setp.eq.u64 %p, %oldidx, %curidx;
     @%p bra gb_mmdone;
     bra tmax_loop;
+group_input_invalid:
+    atom.global.exch.b64 %oldlo, [%inerr], %errone;
+    bra gb_mmdone;
 gb_mmdone:
     add.u64 %i, %i, %stride;
     bra row_loop;
@@ -9174,7 +9224,8 @@ row_done:
     // sentinel u64::MAX = no bitmap => every value valid. A NULL row is SKIPPED here (its low/high limb is
     // a 0 placeholder and pass 1 skipped it from the high-limb min/max + left its pooled row_slots slot
     // STALE) -- so folding it would corrupt an unrelated group / OOB. Must match pass 1's value_null_off.
-    .param .u64 value_null_off
+    .param .u64 value_null_off,
+    .param .u64 input_error_flag
 )
 {
     .reg .pred %p;
@@ -9185,6 +9236,9 @@ row_done:
     .reg .u64 %vnsent;
     .reg .u64 %vwd;
     .reg .u64 %vaddr;
+    .reg .u64 %inerr;
+    .reg .u64 %inerrval;
+    .reg .pred %pinerr;
     .reg .u32 %vbw;
     .reg .u32 %vbp;
     .reg .u32 %vbt;
@@ -9227,6 +9281,10 @@ row_done:
     ld.param.u64 %mnhiptr, [slot_min_hi_ptr];
     ld.param.u64 %mxhiptr, [slot_max_hi_ptr];
     ld.param.u64 %vnoff, [value_null_off];
+    ld.param.u64 %inerr, [input_error_flag];
+    ld.global.u64 %inerrval, [%inerr];
+    setp.ne.u64 %pinerr, %inerrval, 0;
+    @%pinerr ret;
     mov.u64 %vnsent, 0xFFFFFFFFFFFFFFFF;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -9342,10 +9400,13 @@ lo_done:
     .param .u64 key_null_off_unused,
     // Query-aware aggregate-selection MASK (grouped_agg_mask: 1=COUNT, 2=SUM, 4=MIN, 8=MAX). The two-
     // level kernel serves only COUNT/SUM (MIN/MAX bits are irrelevant here -- it never computes them).
-    // Index 37 (LAST), matching the single-level signature. Guards BOTH the shared-mem partial atomics
+    // Index 37, matching the single-level signature. Guards BOTH the shared-mem partial atomics
     // AND the per-block global merge of each field, so a masked-out field is neither aggregated in
     // shared NOR merged to global (stays 0 init).
-    .param .u64 agg_mask
+    .param .u64 agg_mask,
+    .param .u64 key_bytes_limit_unused,
+    .param .u64 value_bytes_limit_unused,
+    .param .u64 input_error_flag_unused
 )
 {
     // slot_min_ptr / slot_max_ptr are accepted for a uniform launch signature but UNUSED here: the

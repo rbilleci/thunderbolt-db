@@ -198,8 +198,7 @@ fn main() {
         // ---- TWO-LEVEL kernel (CUDA-event, kernel-only) ----
         let (twolevel_rows, twolevel_ms) = resident
             .group_by_i32_count_sum_kernel_timed(
-                goff32,
-                off_value,
+                gpu_db_execution::CudaGroupByInput::resident_i32(goff32, off_value, rows),
                 &indices,
                 true,
                 kruns,

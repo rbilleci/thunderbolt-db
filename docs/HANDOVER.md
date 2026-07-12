@@ -21,9 +21,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001X:** replace grouped raw-pointer/flag inputs with typed borrowed descriptors carrying logical row
-   and exact fixed/text/derived/composite extents; validate before CUDA, bound text spans on-device, and make the
-   timed benchmark lifecycle error-safe without changing its event scope.
+1. **STRUCT-001Y:** extract the cohesive device write/visible-locate contracts, PTX, and launchers into a private
+   execution module while preserving stable root APIs, byte-identical kernels, MVCC visibility, and GPU-only
+   addressing. Promote any audit safety finding before continuing decomposition.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.

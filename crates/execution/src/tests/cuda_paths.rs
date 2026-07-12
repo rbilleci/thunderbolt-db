@@ -2034,6 +2034,169 @@
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_grouped_inputs_reject_or_fail_closed_then_reuse_context() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let row_count = 3u64;
+        let key_off = 0u64;
+        let value_off = 12u64;
+        let offsets_off = 24u64;
+        let bytes_off = offsets_off + 4 * 8;
+        let numeric_off = bytes_off + 3;
+        let mut payload = Vec::new();
+        for value in [1i32, 1, 2, 10, 20, 30] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for offset in [0u64, 100, 100, 100] {
+            payload.extend_from_slice(&offset.to_le_bytes());
+        }
+        payload.extend_from_slice(b"abc");
+        for value in [1i128, 2, 3] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                payload.len() as u64,
+                &[CudaDeviceMemoryChunk { byte_offset: 0, bytes: &payload }],
+            )
+            .expect("resident grouped safety payload");
+        let indices = [0u32, 1, 2];
+
+        let fixed_oob = CudaGroupByInput {
+            key: CudaGroupKeySource::Fixed(CudaGroupFixedSource::Resident {
+                byte_offset: payload.len() as u64 - 1,
+                width: 4,
+                row_count,
+            }),
+            value: CudaGroupValueSource::Unused { row_count },
+            key_validity_bitmap_offset: None,
+            value_validity_bitmap_offset: None,
+        };
+        assert!(resident
+            .group_by_i32_count_sum_minmax_from_payload(
+                fixed_oob,
+                &indices,
+                grouped_agg_mask::COUNT,
+            )
+            .is_err());
+
+        let bad_text = CudaGroupTextSource {
+            offsets_byte_offset: offsets_off,
+            bytes_byte_offset: bytes_off,
+            bytes_len: 3,
+            row_count,
+        };
+        let numeric_value = CudaGroupValueSource::Numeric(CudaGroupFixedSource::Resident {
+            byte_offset: numeric_off,
+            width: 16,
+            row_count,
+        });
+        let bad_text_key = CudaGroupByInput {
+            key: CudaGroupKeySource::Text { text: bad_text, fixed_component: None },
+            value: numeric_value,
+            key_validity_bitmap_offset: None,
+            value_validity_bitmap_offset: None,
+        };
+        assert!(resident
+            .group_by_i32_count_sum_minmax_from_payload(
+                bad_text_key,
+                &indices,
+                grouped_agg_mask::ALL,
+            )
+            .is_err(), "malformed text key must suppress numeric pass two and fail closed");
+
+        let bad_text_value = CudaGroupByInput {
+            key: CudaGroupKeySource::Fixed(CudaGroupFixedSource::Resident {
+                byte_offset: key_off,
+                width: 4,
+                row_count,
+            }),
+            value: CudaGroupValueSource::Text(bad_text),
+            key_validity_bitmap_offset: None,
+            value_validity_bitmap_offset: None,
+        };
+        assert!(resident
+            .group_by_i32_count_sum_minmax_from_payload(
+                bad_text_value,
+                &indices,
+                grouped_agg_mask::ALL,
+            )
+            .is_err());
+
+        let descriptors = resident
+            .upload_group_text_descriptors(&[bad_text])
+            .expect("descriptor owner");
+        let bad_composite = CudaGroupByInput {
+            key: CudaGroupKeySource::Composite {
+                fixed: None,
+                text: Some(descriptors.descriptors()),
+                row_count,
+            },
+            value: CudaGroupValueSource::Unused { row_count },
+            key_validity_bitmap_offset: None,
+            value_validity_bitmap_offset: None,
+        };
+        assert!(resident
+            .group_by_i32_count_sum_minmax_from_payload(
+                bad_composite,
+                &indices,
+                grouped_agg_mask::COUNT,
+            )
+            .is_err());
+        assert!(resident
+            .group_by_i32_count_sum_kernel_timed(
+                CudaGroupByInput::resident_i32(key_off, value_off, row_count),
+                &indices,
+                true,
+                0,
+                grouped_agg_mask::ALL,
+            )
+            .is_err());
+        assert_eq!(
+            resident
+                .group_by_i32_count_sum_kernel_timed(
+                    CudaGroupByInput::resident_i32(key_off, value_off, row_count),
+                    &[],
+                    true,
+                    1,
+                    grouped_agg_mask::ALL,
+                )
+                .expect("empty timed input preserves zero-work semantics"),
+            (Vec::new(), 0.0),
+        );
+        assert!(resident
+            .group_by_i32_count_sum_kernel_timed(
+                CudaGroupByInput {
+                    key: CudaGroupKeySource::Fixed(CudaGroupFixedSource::Resident {
+                        byte_offset: key_off,
+                        width: 4,
+                        row_count,
+                    }),
+                    value: CudaGroupValueSource::Unused { row_count },
+                    key_validity_bitmap_offset: None,
+                    value_validity_bitmap_offset: None,
+                },
+                &indices,
+                true,
+                1,
+                grouped_agg_mask::ALL,
+            )
+            .is_err());
+
+        let mut groups = resident
+            .group_by_i32_count_sum_from_payload(
+                CudaGroupByInput::resident_i32(key_off, value_off, row_count),
+                &indices,
+                grouped_agg_mask::ALL,
+            )
+            .expect("valid grouped launch after rejected inputs");
+        groups.sort_unstable_by_key(|group| group.key);
+        assert_eq!((groups[0].key, groups[0].count, groups[0].sum), (1, 2, 30));
+        assert_eq!((groups[1].key, groups[1].count, groups[1].sum), (2, 1, 30));
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_resident_i32_equal_row_indices_multi_warp_returns_ascending_indices() {
         // Coverage gap closer for the host-sort fix. The kernel appends matching row indices via
         // `atom.global.add`, so the physical order in the output buffer is the atomic SCHEDULE

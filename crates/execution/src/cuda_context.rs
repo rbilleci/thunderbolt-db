@@ -720,6 +720,12 @@ pub(super) struct PooledBufferLease<'a> {
     pub(super) tracker: Option<Arc<CudaAllocationTracker>>,
 }
 
+impl PooledBufferLease<'_> {
+    pub(super) fn primary_identity(&self) -> usize {
+        std::ptr::from_ref(self.primary).addr()
+    }
+}
+
 impl Drop for PooledBufferLease<'_> {
     fn drop(&mut self) {
         self.primary.release_device_buffer(self.ptr, self.capacity);
@@ -928,16 +934,12 @@ impl Drop for CudaModuleGuard {
     }
 }
 
-// Only the `#[cfg(test)]` serial-reference kernels use the legacy whole-context event timing now
-// (every production resident route runs on the pooled stream with `launch_on_pooled_stream`'s event
-// timing), so this helper + its event guard are test-only.
-#[cfg(test)]
+// Owns an event across every success/error exit of benchmark and serial-reference timing paths.
 pub(super) struct CudaEventGuard {
     pub(super) event: *mut c_void,
     pub(super) destroy: unsafe extern "C" fn(*mut c_void) -> i32,
 }
 
-#[cfg(test)]
 impl Drop for CudaEventGuard {
     fn drop(&mut self) {
         unsafe {

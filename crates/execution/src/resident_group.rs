@@ -2,6 +2,7 @@ use std::ffi::CStr;
 use std::os::raw::c_void;
 
 use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError, check_cuda, launch_on_pooled_stream};
+use super::cuda_context::CudaEventGuard;
 
 /// One GROUP BY output group: the int4 key, the row COUNT, and the SUM of the value column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,16 +63,18 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
     key_is_text: bool,
     key_offsets_off: u64,
     key_bytes_off: u64,
+    key_bytes_len: u64,
     value_is_text: bool,
     value_offsets_off: u64,
     value_bytes_off: u64,
+    value_bytes_len: u64,
     key_base_override: u64,
     value_base_override: u64,
     // General all-fixed COMPOSITE key: comp_w > 0 -> the key is a `comp_w`-byte wide key per row in
     // key_base_override (built by gpu_db_build_wide_key); grouped via a (rep_idx, hash) b128 claim.
     comp_w: u64,
-    // General COMPOSITE with TEXT members: n_text members, each (offsets_off, bytes_off) [16 bytes] in
-    // text_desc_ptr (a device buffer the CALLER holds alive). 0 = no text members.
+    // General COMPOSITE with TEXT members: n_text members, each
+    // (offsets_off, bytes_off, bytes_len) [24 bytes] in an owner-pinned descriptor buffer.
     n_text: u64,
     text_desc_ptr: u64,
     // M3 (doc 21) 3VL: `Some(off)` = the VALUE column's NULL validity bitmap byte offset (1 = valid) —
@@ -128,7 +131,9 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
     // is the M3 (doc 21) dedicated NULL-KEY group slot (the single-level kernel routes a NULL key here via
     // `key_null_off`, forming one group). Both stay empty when unused (int4 keys / no key bitmap). Always
     // allocated so the init/D2H cover them.
-    let alloc_slots = nslots + 2;
+    let alloc_slots = nslots
+        .checked_add(2)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(nslots))?;
     let alloc_slots_u64 = alloc_slots as u64;
     let slot_bytes = alloc_slots
         .checked_mul(std::mem::size_of::<i64>())
@@ -179,6 +184,7 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
     // A single global flag the kernel `red.global.or`s when a numeric SUM overflows i128 (PG numeric
     // field overflow). Zeroed before launch; only the numeric path ever writes it.
     let overflow_flag = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
+    let input_error = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
     // Numeric MIN/MAX i128 high limbs (pass 1) + a row_slots scratch: row_slots[i] = the slot the
     // i-th row claimed, written by pass 1's numeric branch so the lock-free pass-2 kernel can resolve
     // the i128 LOW limb among the high-limb ties. int4/int8/two-level paths leave these unused.
@@ -344,6 +350,9 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
     // Query-aware aggregate-selection mask (grouped_agg_mask). Passed as the LAST kernel arg (a37) to
     // BOTH the single-level and two-level kernels; widened to u64 for the uniform u64 launch-arg array.
     let mut a37 = u64::from(agg_mask);
+    let mut a38 = key_bytes_len;
+    let mut a39 = value_bytes_len;
+    let mut a40 = input_error.ptr;
     // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
     let mut g0 = slot_keys_i128.ptr;
     let mut g1 = alloc_slots_u64;
@@ -394,6 +403,9 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
         (&mut a35 as *mut u64).cast::<c_void>(),
         (&mut a36 as *mut u64).cast::<c_void>(),
         (&mut a37 as *mut u64).cast::<c_void>(),
+        (&mut a38 as *mut u64).cast::<c_void>(),
+        (&mut a39 as *mut u64).cast::<c_void>(),
+        (&mut a40 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -421,6 +433,7 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
     // M3 (doc 21) 3VL: pass 2 reads the SAME value validity bitmap as pass 1 (a35, already bounds-checked)
     // and skips NULL rows -- so it never folds a stale pooled row_slots slot for a NULL value.
     let mut q9 = a35;
+    let mut q10 = input_error.ptr;
     let mut pass2_args = [
         (&mut q0 as *mut u64).cast::<c_void>(),
         (&mut q1 as *mut u64).cast::<c_void>(),
@@ -432,6 +445,7 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
         (&mut q7 as *mut u64).cast::<c_void>(),
         (&mut q8 as *mut u64).cast::<c_void>(),
         (&mut q9 as *mut u64).cast::<c_void>(),
+        (&mut q10 as *mut u64).cast::<c_void>(),
     ];
     // Compaction-kernel args. `use_i128` mirrors the host hash-range occupancy condition (i128/text/
     // composite keys live in slot_keys_i128); `key_is_i128_strict` mirrors the dedicated i64::MIN slot's
@@ -522,6 +536,11 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
         }
         let rc =
             unsafe { cu_memset_d8_async(overflow_flag.ptr, 0, std::mem::size_of::<u64>(), stream) };
+        if rc != 0 {
+            return rc;
+        }
+        let rc =
+            unsafe { cu_memset_d8_async(input_error.ptr, 0, std::mem::size_of::<u64>(), stream) };
         if rc != 0 {
             return rc;
         }
@@ -723,6 +742,18 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
             )
         }
     })?;
+
+    let mut invalid_input = 0u64;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut invalid_input as *mut u64).cast::<c_void>(),
+            input_error.ptr,
+            std::mem::size_of::<u64>(),
+        )
+    })?;
+    if invalid_input != 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(indices.len()));
+    }
 
     // RESULT PATH (O(groups), not O(row_count)): the compaction kernel above already scanned the slot
     // table and wrote the occupied groups DENSELY in ascending-slot order + the group count. D2H only
@@ -936,14 +967,24 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
     const EMPTY: i64 = i64::MIN;
 
+    if runs == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
     if indices.is_empty() {
         return Ok((Vec::new(), 0.0));
     }
     let count = indices.len();
     let idx_bytes = std::mem::size_of_val(indices);
-    let count_u64 = count as u64;
-    let nslots = (count * 2).next_power_of_two().max(16);
-    let slot_bytes = nslots * std::mem::size_of::<i64>();
+    let count_u64 = u64::try_from(count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(count))?;
+    let nslots = count
+        .checked_mul(2)
+        .and_then(usize::checked_next_power_of_two)
+        .map(|n| n.max(16))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(count))?;
+    let slot_bytes = nslots
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(nslots))?;
     let mask = (nslots - 1) as u64;
     let nslots_u64 = nslots as u64;
 
@@ -1002,15 +1043,23 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
     let overflow_flag = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
     let slot_min_hi = primary.lease_device_buffer(slot_bytes)?;
     let slot_max_hi = primary.lease_device_buffer(slot_bytes)?;
-    let row_slots = primary.lease_device_buffer(count.max(1) * std::mem::size_of::<u32>())?;
+    let row_slots_bytes = count
+        .max(1)
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(count))?;
+    let row_slots = primary.lease_device_buffer(row_slots_bytes)?;
     // UUID MIN/MAX slots (b128, 16 bytes/slot): valid pointers so the 27-param kernel has no stray arg.
     // The int4 bench never takes the uuid branch (value_is_uuid = 0), so they are never dereferenced.
-    let slot_min_uuid = primary.lease_device_buffer(nslots * 16)?;
-    let slot_max_uuid = primary.lease_device_buffer(nslots * 16)?;
+    let b128_bytes = nslots
+        .checked_mul(16)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(nslots))?;
+    let slot_min_uuid = primary.lease_device_buffer(b128_bytes)?;
+    let slot_max_uuid = primary.lease_device_buffer(b128_bytes)?;
     // i128 / text GROUP BY key slots (b128): a valid pointer so the 27-param kernel has no stray arg.
     // The int4 bench never takes the i128/text-key branch (key_is_i128 = key_is_text = 0), so it is
     // never dereferenced.
-    let slot_keys_i128 = primary.lease_device_buffer(nslots * 16)?;
+    let slot_keys_i128 = primary.lease_device_buffer(b128_bytes)?;
+    let input_error = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
     check_cuda(unsafe {
         cu_htod(
             indices_dev.ptr,
@@ -1020,10 +1069,22 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
     })?;
 
     let null = std::ptr::null_mut::<c_void>();
+    struct DefaultStreamDrain {
+        sync: CuStreamSync,
+    }
+    impl Drop for DefaultStreamDrain {
+        fn drop(&mut self) {
+            unsafe { (self.sync)(std::ptr::null_mut()) };
+        }
+    }
     let mut start = std::ptr::null_mut::<c_void>();
-    let mut stop = std::ptr::null_mut::<c_void>();
     check_cuda(unsafe { (primary.cu_event_create)(&mut start, 0) })?;
+    let start = CudaEventGuard { event: start, destroy: primary.cu_event_destroy };
+    let mut stop = std::ptr::null_mut::<c_void>();
     check_cuda(unsafe { (primary.cu_event_create)(&mut stop, 0) })?;
+    let stop = CudaEventGuard { event: stop, destroy: primary.cu_event_destroy };
+    // Declared after the events so reverse drop order drains the stream before destroying either.
+    let _stream_drain = DefaultStreamDrain { sync: cu_stream_sync };
 
     const BLOCK: u32 = 256;
     let fill_grid = nslots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
@@ -1075,6 +1136,9 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
         u64::MAX, // M3 value_null_off = sentinel (the timed bench is non-nullable -> no value skip)
         u64::MAX, // M3 key_null_off = sentinel (the timed bench is non-nullable -> no NULL-key group)
         u64::from(agg_mask), // query-aware aggregate-selection mask (a37, LAST kernel arg)
+        0, // key_bytes_limit (unused by fixed-width timed input)
+        0, // value_bytes_limit (unused by fixed-width timed input)
+        input_error.ptr,
     ];
     let mut group_args: Vec<*mut c_void> = a
         .iter_mut()
@@ -1083,6 +1147,7 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
 
     let mut best = f32::MAX;
     for _ in 0..runs {
+        check_cuda(unsafe { cu_memset(input_error.ptr, 0, std::mem::size_of::<u64>()) })?;
         check_cuda(unsafe { cu_memset(slot_count.ptr, 0, slot_bytes) })?;
         check_cuda(unsafe { cu_memset(slot_sum.ptr, 0, slot_bytes) })?;
         // fill keys=EMPTY, min=i64::MAX, max=i64::MIN (reset f0/f2 each iteration).
@@ -1137,7 +1202,7 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
                 null.cast(),
             )
         })?;
-        check_cuda(unsafe { (primary.cu_event_record)(start, null) })?;
+        check_cuda(unsafe { (primary.cu_event_record)(start.event, null) })?;
         check_cuda(unsafe {
             cu_launch(
                 group_fn,
@@ -1153,11 +1218,25 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
                 null.cast(),
             )
         })?;
-        check_cuda(unsafe { (primary.cu_event_record)(stop, null) })?;
+        check_cuda(unsafe { (primary.cu_event_record)(stop.event, null) })?;
         check_cuda(unsafe { cu_stream_sync(null) })?;
         let mut ms = 0f32;
-        check_cuda(unsafe { (primary.cu_event_elapsed_time)(&mut ms, start, stop) })?;
+        check_cuda(unsafe {
+            (primary.cu_event_elapsed_time)(&mut ms, start.event, stop.event)
+        })?;
         best = best.min(ms);
+    }
+
+    let mut invalid_input = 0u64;
+    check_cuda(unsafe {
+        cu_dtoh(
+            (&mut invalid_input as *mut u64).cast::<c_void>(),
+            input_error.ptr,
+            std::mem::size_of::<u64>(),
+        )
+    })?;
+    if invalid_input != 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(indices.len()));
     }
 
     let mut keys = vec![0i64; nslots];
@@ -1178,10 +1257,6 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
         )
     })?;
     check_cuda(unsafe { cu_dtoh(sums.as_mut_ptr().cast::<c_void>(), slot_sum.ptr, slot_bytes) })?;
-    unsafe {
-        (primary.cu_event_destroy)(start);
-        (primary.cu_event_destroy)(stop);
-    }
     let mut groups = Vec::new();
     for i in 0..nslots {
         if keys[i] != EMPTY {
