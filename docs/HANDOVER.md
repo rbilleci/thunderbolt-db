@@ -21,8 +21,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001I:** extract equal-project/equal-any/index-probe point-read submit kernels and PTX, preserving
-   symbols, guard/fence behavior, root wrappers, GPU HAZARD gates, and the canonical report card.
+1. **STRUCT-001J:** isolate single- and multi-shard dense unique-index submission, shard descriptors, completion,
+   and drop fencing in the point-read layer while preserving root APIs, device routing, GPU HAZARD gates, and the
+   canonical report card.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.

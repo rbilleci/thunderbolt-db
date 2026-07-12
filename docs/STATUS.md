@@ -86,8 +86,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   The 441-line `execution::point_read_submission` module now owns batched projection result contracts, owned
   pooled guards, detached completion, pinned final readback, error drains, and drop-without-complete fencing. Its
   submit/drop/pool/NULL matrix passed 3× sequential and 2× concurrent; independent audit found the single-sync
-  and field-drop behavior unchanged and its documentation-placement finding was adopted. The execution root is
-  29,647 lines. Further extraction is owned by **STRUCT-001I/STRUCT-001**.
+  and field-drop behavior unchanged and its documentation-placement finding was adopted. The 1,308-line
+  `execution::point_read_submit` module now owns equal-project launch and equal-any scan/unique-index atomic
+  submission/PTX. Its all-target/downstream checks, exact 94-test inventory, 25 non-ignored tests, and NULL,
+  scan, index, and drop HAZARD matrix passed 3× sequential and 2× concurrent with zero CUDA 700/716/717 errors;
+  independent byte-level audit found PTX, launch parameters, bounds, fallbacks, guards, fences, and index pinning
+  unchanged. The canonical report card stayed green in both layers and cache regimes: in-L2/out-of-L2 `sum_i32`
+  measured 1,471/1,453 GB/s, `count_i32_compare` measured 0.89x/1.00x roofline, and 65,536-batch point reads
+  measured 246.1M/253.3M lookups/s at p50 138/132us. The execution root is 28,353 lines. Further extraction is
+  owned by **STRUCT-001J/STRUCT-001**.
 
 ## Known boundaries
 
