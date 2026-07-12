@@ -200,8 +200,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   gates passed 18 sequential and 24 concurrent invocations without CUDA 700/716/717; independent audit found
   no issue. The final card measured count at 0.93x/1.00x same-run roofline, gather at 349.5/155.3 GB/s, grouped
   aggregation at 1,678.0 M elements/s, and 65,536-batch point reads at 249.4M/255.4M lookups/s with p50 136/127us
-  in-L2/out-of-L2. `resident_aggregate` is 866 lines and the execution root is 21,816 lines; further extraction
-  remains **STRUCT-001**.
+  in-L2/out-of-L2. The grouped public result contract, production launcher, and benchmark-only event-timed
+  launcher now live in the private 1,207-line `execution::resident_group` module. Their normalized source is
+  byte-identical: the four public root methods and `GroupByI32Row` re-export, PTX ABI/grids, all int4/int8/i128/
+  UUID/text/composite modes, aggregate masks, NULL slots, one/two-pass behavior, numeric overflow, pooled
+  lifetimes, dense result order/readback, and event brackets are unchanged. The exact 109-test inventory and
+  36/73 suite remain stable. Nine grouped type/NULL/overflow/two-level gates passed 27 sequential and 36
+  concurrent invocations without CUDA 700/716/717. The final card measured grouped aggregation at 1,677.7 M
+  elements/s, count at 0.87x/1.00x roofline, and 65,536-batch point reads at 251.1M/257.5M lookups/s with p50
+  136/127us in-L2/out-of-L2. Independent audit found no extraction regression and exposed pre-existing unchecked
+  grouped fixed/text/derived/composite windows plus timed-launcher lifecycle gaps, now owned by **STRUCT-001X**.
+  The execution root is 20,618 lines; further extraction remains **STRUCT-001**.
 
 ## Known boundaries
 
