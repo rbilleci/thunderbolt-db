@@ -133,7 +133,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   with zero CUDA 700/716/717 errors; independent audit found no remaining issue after two stale comment counts
   were removed. The final card stayed green: `count_i32_compare` measured 0.91x/1.01x same-run roofline in-L2/
   out-of-L2, while 65,536-batch point reads measured 245.4M/253.9M lookups/s at p50 139/131us. The focused GPU
-  regression module is 122 lines. The execution root is 26,246 lines; further extraction remains **STRUCT-001**.
+  regression module is 122 lines. The resident int4 equality row selector now lives in the private 475-line
+  `execution::point_read_rows` module. The move is byte-identical apart from parent-private visibility: PTX,
+  validation, 128-thread grid, device-buffer/stream pooling, async pinned and blocking readback, timing, error
+  draining, final deterministic ordering, and the public method remain unchanged. The adjacent CPU range selector
+  remains in the root and the equality selector's host ordering remains **RETIRE-003** debt. The exact 101-test
+  inventory and 31 passing non-ignored tests are unchanged; equality/multi-warp/pinned-pool gates passed 3×
+  sequential and 2× concurrent with no CUDA safety errors. Independent audit and all target/feature checks passed.
+  The final card stayed green: `count_i32_compare` measured 0.97x/1.02x roofline in-L2/out-of-L2 and 65,536-batch
+  point reads measured 247.5M/252.9M lookups/s at p50 140/132us. The execution root is 25,780 lines; further
+  extraction remains **STRUCT-001**.
 
 ## Known boundaries
 
