@@ -39,7 +39,7 @@
         // INSERT the tail (rows 6..10) via the kernel.
         let tail = &all[6..];
         let dup = index
-            .submit_i32_index_insert(&index, table_mask, hash_shift, tail, 6)
+            .submit_i32_index_insert(table_mask, hash_shift, tail, 6)
             .expect("index insert");
         assert!(!dup, "no dup inserting fresh keys");
         // Probe ALL keys via the write-locate kernel: each must resolve to its row.
@@ -63,7 +63,7 @@
         // Same-key MVCC twin: insert a newer physical version in the next logical row. It must
         // advance beyond the old key, remain indexed, and expose both candidate coordinates.
         let dup2 = index
-            .submit_i32_index_insert(&index, table_mask, hash_shift, &[30], 10)
+            .submit_i32_index_insert(table_mask, hash_shift, &[30], 10)
             .expect("version-twin insert");
         assert!(!dup2, "same-key version twin must not decline the index");
         let twin_shards = [WriteLocateShard {
@@ -328,4 +328,165 @@
             .expect("valid visible locate after rejected inputs");
         assert_eq!(result.count, vec![1]);
         assert_eq!(result.slot, vec![0]);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn write_apply_inputs_fail_closed_and_leave_context_reusable() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let owner = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &[0_u8; 64])
+                .expect("write owner"),
+        );
+
+        assert!(owner.submit_i32_index_insert(2, 30, &[7], 0).is_err());
+        assert!(owner
+            .submit_i32_index_insert(7, 29, &[7], u32::MAX)
+            .is_err());
+        assert!(owner.submit_i32_index_insert(7, 29, &[7], 4).is_err());
+
+        let invalid_column = [CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 63,
+        }];
+        let invalid_request = FusedApplyRequest {
+            columns: &invalid_column,
+            values: &[7],
+            stamps: &[1],
+            created_by: CudaWriteDestination {
+                memory: std::sync::Arc::clone(&owner),
+                byte_offset: 8,
+            },
+            row_ids: None,
+            index: None,
+            base_row: 0,
+            header: CudaWriteDestination {
+                memory: std::sync::Arc::clone(&owner),
+                byte_offset: 0,
+            },
+        };
+        assert!(owner.submit_i32_fused_apply(&invalid_request).is_err());
+        let misaligned_column = [CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 1,
+        }];
+        let misaligned_request = FusedApplyRequest {
+            columns: &misaligned_column,
+            values: &[7],
+            stamps: &[1],
+            created_by: CudaWriteDestination {
+                memory: std::sync::Arc::clone(&owner),
+                byte_offset: 24,
+            },
+            row_ids: None,
+            index: None,
+            base_row: 0,
+            header: CudaWriteDestination {
+                memory: std::sync::Arc::clone(&owner),
+                byte_offset: 0,
+            },
+        };
+        assert!(owner.submit_i32_fused_apply(&misaligned_request).is_err());
+
+        if runtime.snapshot().device_count > 1 {
+            let foreign = std::sync::Arc::new(
+                runtime
+                    .retain_device_memory_copy(1, &[0_u8; 64])
+                    .expect("foreign write owner"),
+            );
+            let foreign_column = [CudaWriteDestination {
+                memory: foreign,
+                byte_offset: 0,
+            }];
+            let foreign_request = FusedApplyRequest {
+                columns: &foreign_column,
+                values: &[7],
+                stamps: &[1],
+                created_by: CudaWriteDestination {
+                    memory: std::sync::Arc::clone(&owner),
+                    byte_offset: 8,
+                },
+                row_ids: None,
+                index: None,
+                base_row: 0,
+                header: CudaWriteDestination {
+                    memory: std::sync::Arc::clone(&owner),
+                    byte_offset: 0,
+                },
+            };
+            assert!(owner.submit_i32_fused_apply(&foreign_request).is_err());
+        }
+
+        let mut malformed_text = Vec::new();
+        malformed_text.extend_from_slice(&0_u64.to_le_bytes());
+        malformed_text.extend_from_slice(&2_u64.to_le_bytes());
+        malformed_text.push(b'x');
+        let text_owner = runtime
+            .retain_device_memory_copy(0, &malformed_text)
+            .expect("malformed text owner");
+        let malformed = [CudaCompoundFoldColumn::Text {
+            offsets_byte_offset: 0,
+            bytes_byte_offset: 16,
+            bytes_len: 1,
+        }];
+        assert!(text_owner
+            .submit_compound_fold_fingerprints(&malformed, 1)
+            .is_err());
+
+        let out_of_bounds = [CudaCompoundFoldColumn::Fixed {
+            byte_offset: 63,
+            width_words: 1,
+        }];
+        assert!(owner
+            .submit_compound_fold_fingerprints(&out_of_bounds, 1)
+            .is_err());
+        let misaligned = [CudaCompoundFoldColumn::Fixed {
+            byte_offset: 1,
+            width_words: 1,
+        }];
+        assert!(owner
+            .submit_compound_fold_fingerprints(&misaligned, 1)
+            .is_err());
+        let misaligned_text = [CudaCompoundFoldColumn::Text {
+            offsets_byte_offset: 1,
+            bytes_byte_offset: 32,
+            bytes_len: 1,
+        }];
+        assert!(owner
+            .submit_compound_fold_fingerprints(&misaligned_text, 1)
+            .is_err());
+
+        let valid_column = [CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 16,
+        }];
+        let valid_request = FusedApplyRequest {
+            columns: &valid_column,
+            values: &[7],
+            stamps: &[1],
+            created_by: CudaWriteDestination {
+                memory: std::sync::Arc::clone(&owner),
+                byte_offset: 24,
+            },
+            row_ids: None,
+            index: None,
+            base_row: 0,
+            header: CudaWriteDestination {
+                memory: std::sync::Arc::clone(&owner),
+                byte_offset: 0,
+            },
+        };
+        assert!(!owner
+            .submit_i32_fused_apply(&valid_request)
+            .expect("valid fused apply after rejected inputs"));
+
+        let valid = [CudaCompoundFoldColumn::Fixed {
+            byte_offset: 0,
+            width_words: 1,
+        }];
+        let fingerprints = owner
+            .submit_compound_fold_fingerprints(&valid, 1)
+            .expect("context reusable after rejected and device-reported inputs");
+        assert_eq!(fingerprints.len(), 1);
     }

@@ -9249,7 +9249,7 @@ impl Engine {
                     crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
                         .then(std::time::Instant::now);
                 // Per-COLUMN offsets only: the encoder's FINAL chunk is the device
-                // row-count header (offset 0), which the fused kernel publishes itself.
+                // row-count header (offset 0), which the fused submit publishes after fencing the kernel.
                 let chunk_offsets: Vec<u64> = chunks
                     .iter()
                     .take(column_count)
@@ -9895,9 +9895,9 @@ impl Engine {
     }
 
     /// E2.5c 2M+ push (b): the FUSED merged-apply device pass — column scatter + created_by /
-    /// row-id stamps + PK hash-index insert in ONE staging HtoD + ONE launch + ONE decline DtoH
-    /// (which also completes the launch, so the caller's row_count publish keeps the SV6
-    /// stamp-before-publish order). Returns:
+    /// row-id stamps + PK hash-index insert in one staging HtoD + one launch + one decline DtoH,
+    /// followed by the ordered device-header HtoD. The decline read completes every kernel block
+    /// before that header publishes, preserving the SV6 stamp-before-publish order. Returns:
     /// - `None`  -> not eligible; the caller runs the unfused sequence (byte-identical);
     /// - `Some(true)`  -> the pass covered append + stamps + index maintenance;
     /// - `Some(false)` -> device failure mid-pass; bytes live only in invisible headroom, the
@@ -9928,8 +9928,6 @@ impl Engine {
         // created_by region (get-or-allocate — same semantics as the unfused stamp path).
         let created_by_region =
             self.get_or_alloc_created_by_region(table, shard_id, capacity, gpu_id)?;
-        let created_by_dest =
-            created_by_region.device_ptr() + (row_count as u64) * std::mem::size_of::<u64>() as u64;
         // Row-id region: get-or-skip, exactly like `stamp_row_id_resident_shard_slots` (a
         // region-less lineage stamps nothing).
         let row_ids_arg = row_ids.and_then(|ids| {
@@ -9943,8 +9941,11 @@ impl Engine {
                 .map(|region| {
                     (
                         ids,
-                        region.device_ptr()
-                            + (row_count as u64) * std::mem::size_of::<u64>() as u64,
+                        gpu_db_execution::CudaWriteDestination {
+                            memory: Arc::clone(&region),
+                            byte_offset: (row_count as u64)
+                                * std::mem::size_of::<u64>() as u64,
+                        },
                     )
                 })
         });
@@ -9958,9 +9959,8 @@ impl Engine {
         // PK device-index snapshot: mirror `extend_shard_pk_device_index_on_append`'s basis
         // validation + load rule for the (at most one) column with a LIVE cached device index.
         // More than one live entry -> not eligible (the fused kernel inserts into one index).
-        let mut index_arg: Option<(u64, u32, u32, u32, u32)> = None;
+        let mut index_arg: Option<gpu_db_execution::CudaWriteIndex> = None;
         let mut index_col: Option<usize> = None;
-        let mut index_guard: Option<Arc<CudaResidentDeviceMemory>> = None;
         if self.device_write_locate_enabled() {
             let new_count = row_count + k;
             let device_ptr = shard_device_memory.device_ptr();
@@ -10001,38 +10001,43 @@ impl Engine {
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .remove(&(table.to_string(), shard_id, col_idx));
                     } else {
-                        index_arg = Some((
-                            index.device_ptr(),
+                        index_arg = Some(gpu_db_execution::CudaWriteIndex {
+                            memory: index,
                             table_mask,
                             hash_shift,
-                            col_idx as u32,
-                            base_row_u32,
-                        ));
+                            key_column: col_idx as u32,
+                        });
                         index_col = Some(col_idx);
-                        index_guard = Some(index);
                     }
                 }
                 _ => return None, // multi-index shard: the unfused per-column loop handles it
             }
         }
-        let _hold_index_alive = index_guard; // the launch reads the index buffer
-
-        // Flatten col-major values + absolute per-column dest addresses.
+        // Flatten col-major values + owned per-column destinations.
         let values: Vec<i32> = column_values.iter().flatten().copied().collect();
-        let col_dests: Vec<u64> = chunk_offsets
+        let columns: Vec<gpu_db_execution::CudaWriteDestination> = chunk_offsets
             .iter()
-            .map(|offset| shard_device_memory.device_ptr() + offset)
+            .map(|&byte_offset| gpu_db_execution::CudaWriteDestination {
+                memory: Arc::clone(shard_device_memory),
+                byte_offset,
+            })
             .collect();
         let request = gpu_db_execution::FusedApplyRequest {
-            col_dests: &col_dests,
+            columns: &columns,
             values: &values,
             stamps,
-            created_by_dest,
+            created_by: gpu_db_execution::CudaWriteDestination {
+                memory: created_by_region,
+                byte_offset: (row_count as u64) * std::mem::size_of::<u64>() as u64,
+            },
             row_ids: row_ids_arg,
             index: index_arg,
+            base_row: base_row_u32,
             // The device row-count header word (the unfused path's FINAL append chunk).
-            header_dest: shard_device_memory.device_ptr(),
-            header_value: (row_count + k) as u64,
+            header: gpu_db_execution::CudaWriteDestination {
+                memory: Arc::clone(shard_device_memory),
+                byte_offset: 0,
+            },
         };
         match shard_device_memory.submit_i32_fused_apply(&request) {
             Ok(dup) => {

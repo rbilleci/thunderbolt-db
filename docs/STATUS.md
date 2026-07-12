@@ -262,10 +262,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   same-key MVCC versions advance to distinct slots rather than declining. The exact 118-test inventory and
   43/75 suite remain stable. Seven fused/index/fixed/wide/UUID/text/streaming GPU gates passed 21 sequential and
   14 concurrent invocations without CUDA 700/716/717. Workspace all-target/all-feature check and execution
-  clippy are green. The execution root is 19,020 lines. Independent extraction audit is clean and exposed
-  pre-existing raw address/context/extent/geometry and launched-error-drain gaps in the safe APIs;
-  **STRUCT-001AB** owns them ahead
-  of further decomposition without changing the broader **R3-001** design.
+  clippy are green. The execution root is 19,020 lines. Independent extraction audit was clean and exposed
+  pre-existing raw address/context/extent/geometry and launched-error-drain gaps in the safe APIs, closed by
+  the following **STRUCT-001AB** hardening without changing the broader **R3-001** design.
+  That write-apply hardening is complete. `CudaWriteDestination`, `CudaWriteIndex`, and
+  `CudaCompoundFoldColumn` replace arbitrary device addresses; same-context identity, 4/8-byte alignment,
+  allocation extents, staging/u32 arithmetic, exact power-of-two index geometry, append load capacity, and
+  fixed/text source spans are checked before CUDA mutation. Text offsets are bounded in PTX before byte loads;
+  fingerprints plus one status word use a single `4*rows+4` readback. Fused row-count publication was removed
+  from the multi-block kernel: its blocking decline read now fences every value/stamp/index write before one
+  ordered 8-byte header HtoD, closing the prior cross-block publication race. Every launcher arms an RAII
+  default-stream drain before launch, including DtoH failure paths. The under-lock device-index cache recheck
+  now also verifies resident generation pointer identity. Same-key MVCC twin advancement, 256-probe decline,
+  compound hash parity, and GPU-only derivation remain unchanged. One pure boundary test and one retained-GPU
+  malformed/misaligned/load/cross-owner/fail-closed/reuse test raise the execution inventory to 120 tests, with
+  44 active and 76 GPU-ignored. Eight safety/index/fused/fixed/wide/UUID/text/streaming gates passed 24
+  sequential and 16 concurrent invocations without CUDA 700/716/717; workspace check, execution clippy, and
+  independent audit are clean. `write_apply.rs` is 1,256 lines and the execution root is 19,022 lines. The
+  physical cross-context branch remains necessarily vacuous on this one-GPU host; **MULTI-002** owns the
+  non-vacuous multi-device gate.
 
 ## Known boundaries
 

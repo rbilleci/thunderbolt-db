@@ -1,12 +1,160 @@
 use crate::{CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, check_cuda};
 use std::{ffi::c_void, sync::Arc};
 
+#[derive(Debug, Clone)]
+pub struct CudaWriteDestination {
+    pub memory: Arc<CudaResidentDeviceMemory>,
+    pub byte_offset: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CudaWriteIndex {
+    pub memory: Arc<CudaResidentDeviceMemory>,
+    pub table_mask: u32,
+    pub hash_shift: u32,
+    pub key_column: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaCompoundFoldColumn {
+    Fixed {
+        byte_offset: u64,
+        width_words: u32,
+    },
+    Text {
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        bytes_len: u64,
+    },
+}
+
+fn checked_destination(
+    primary: &Arc<crate::GpuPrimaryContext>,
+    destination: &CudaWriteDestination,
+    byte_len: u64,
+    alignment: u64,
+) -> Result<u64, CudaRuntimeProbeError> {
+    if !Arc::ptr_eq(primary, &destination.memory.primary_arc()) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    if alignment == 0 || !destination.byte_offset.is_multiple_of(alignment) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            destination.byte_offset as usize,
+        ));
+    }
+    let end = checked_span_end(
+        destination.memory.metadata().allocated_bytes,
+        destination.byte_offset,
+        byte_len,
+    )?;
+    if destination.memory.device_ptr() == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(end).unwrap_or(usize::MAX),
+        ));
+    }
+    destination
+        .memory
+        .device_ptr()
+        .checked_add(destination.byte_offset)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))
+}
+
+fn checked_span_end(
+    allocated_bytes: u64,
+    byte_offset: u64,
+    byte_len: u64,
+) -> Result<u64, CudaRuntimeProbeError> {
+    let end = byte_offset
+        .checked_add(byte_len)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if end > allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(end).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(end)
+}
+
+fn validate_index_geometry(
+    index: &CudaResidentDeviceMemory,
+    table_mask: u32,
+    hash_shift: u32,
+) -> Result<(), CudaRuntimeProbeError> {
+    let table_slots =
+        u64::from(table_mask)
+            .checked_add(1)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(
+                table_mask as usize,
+            ))?;
+    if table_slots < 2 || !table_slots.is_power_of_two() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            table_mask as usize,
+        ));
+    }
+    let required_bytes = table_slots
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let expected_shift = 32 - table_slots.trailing_zeros();
+    if index.device_ptr() == 0
+        || hash_shift != expected_shift
+        || required_bytes > index.metadata().allocated_bytes
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(required_bytes).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_index_append(
+    index: &CudaResidentDeviceMemory,
+    table_mask: u32,
+    hash_shift: u32,
+    base_row: u32,
+    key_count: u32,
+) -> Result<u32, CudaRuntimeProbeError> {
+    validate_index_geometry(index, table_mask, hash_shift)?;
+    let row_count =
+        base_row
+            .checked_add(key_count)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(
+                key_count as usize,
+            ))?;
+    let required_slots =
+        u64::from(row_count)
+            .checked_mul(2)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(
+                row_count as usize,
+            ))?;
+    if required_slots > u64::from(table_mask) + 1 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            row_count as usize,
+        ));
+    }
+    Ok(row_count)
+}
+
+type CuStreamSync = unsafe extern "C" fn(*mut c_void) -> i32;
+
+struct DefaultStreamDrain {
+    sync: CuStreamSync,
+    armed: bool,
+}
+
+impl Drop for DefaultStreamDrain {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe { (self.sync)(std::ptr::null_mut()) };
+        }
+    }
+}
+
 /// E2.5c FUSED APPLY (2M+ push (b)): ONE kernel for the whole merged-apply device pass —
 /// column scatter (each appended row's i32 values into every column section's headroom slots)
 /// + created_by stamps + row-id stamps + the incremental PK hash-index CAS insert — replacing
 ///   the ~8 driver calls of the unfused chain (C column HtoDs + 2 stamp HtoDs + the 4-call index
-///   insert) with 1 staging HtoD + 1 launch + 1 decline DtoH (which also serializes the stamps
-///   ahead of the host's row_count publish, preserving the SV6 stamp-before-publish order).
+///   insert) with 1 staging HtoD + 1 launch + 1 decline DtoH + one ordered header HtoD. The
+///   blocking decline read fences every scatter/stamp before the header publishes the new extent.
 ///
 /// Everything travels in ONE staging buffer read by the kernel (fixed 80B header + a per-column
 /// dest-pointer table + col-major values + stamps + optional row ids); the decline flag lives
@@ -19,8 +167,7 @@ use std::{ffi::c_void, sync::Arc};
 ///   0: u32 k             4: u32 num_cols     8: u32 pk_col      12: u32 base_row
 ///  16: u32 index_mask   20: u32 index_shift 24: u32 has_row_ids 28: u32 decline (kernel-set)
 ///  32: u64 index_ptr    40: u64 created_by_dest                48: u64 row_id_dest
-///  56: u64 header_dest (the shard's device row-count word)     64: u64 header_value
-///  72: u64 reserved
+///  56..80: reserved (the host publishes row count after the kernel-completing readback)
 ///  80: u64 col_dest[num_cols]
 ///  80 + num_cols*8:                     i32 values[num_cols][k] (col-major)
 ///  ^ + round8(num_cols*k*4):            u64 stamps[k]
@@ -48,15 +195,6 @@ const FUSED_APPLY_PTX: &[u8] = br#"
     mad.lo.u32 %r8, %r6, %r7, %r5;    // j
     setp.ge.u32 %p1, %r8, %r1;
     @%p1 bra DONE;
-
-    // thread 0 publishes the shard's DEVICE row-count header (the unfused path's final
-    // append_owned_chunks chunk) -- same launch, completed before the caller's sync DtoH.
-    setp.ne.u32 %p2, %r8, 0;
-    @%p2 bra HDRDONE;
-    ld.global.u64 %rd6, [%rd1+56];
-    ld.global.u64 %rd7, [%rd1+64];
-    st.global.u64 [%rd6], %rd7;
-HDRDONE:
 
     // values base = staging + 80 + num_cols*8
     cvt.u64.u32 %rd2, %r2;
@@ -282,19 +420,21 @@ const COMPOUND_FOLD_PTX: &[u8] = br#"
     .param .u64 offsets_ptr,
     .param .u64 widths_ptr,
     .param .u64 blob_offsets_ptr,
+    .param .u64 blob_lens_ptr,
     .param .u32 ncols,
     .param .u32 row_count,
     .param .u64 out_ptr
 )
 {
-    .reg .pred %p<8>;
+    .reg .pred %p<10>;
     .reg .b32 %r<32>;
-    .reg .b64 %rd<40>;
+    .reg .b64 %rd<44>;
 
     ld.param.u64 %rd1, [base_ptr];
     ld.param.u64 %rd2, [offsets_ptr];
     ld.param.u64 %rd3, [widths_ptr];
     ld.param.u64 %rd20, [blob_offsets_ptr];
+    ld.param.u64 %rd31, [blob_lens_ptr];
     ld.param.u32 %r1, [ncols];
     ld.param.u32 %r2, [row_count];
     ld.param.u64 %rd4, [out_ptr];
@@ -348,6 +488,12 @@ TEXTCOL:
     add.u64 %rd23, %rd21, %rd22;        // &offsets[row]
     ld.global.u64 %rd24, [%rd23];       // start = offsets[row]
     ld.global.u64 %rd25, [%rd23+8];     // end   = offsets[row+1]
+    add.u64 %rd33, %rd31, %rd5;         // &blob_lens[k]
+    ld.global.u64 %rd34, [%rd33];       // exact blob byte extent
+    setp.gt.u64 %p8, %rd24, %rd25;
+    @%p8 bra BADTEXT;
+    setp.gt.u64 %p9, %rd25, %rd34;
+    @%p9 bra BADTEXT;
     // blob base = base + blob_offsets[k]
     add.u64 %rd26, %rd20, %rd5;         // &blob_offsets[k] (rd5 = k*8 from above)
     ld.global.u64 %rd27, [%rd26];       // blob_off = blob_offsets[k]
@@ -371,6 +517,14 @@ BYTEDONE:
     shr.b32 %r14, %r7, 19;
     or.b32 %r7, %r13, %r14;
     add.u32 %r7, %r7, 2654435761;
+    bra NEXTCOL;
+
+BADTEXT:
+    mul.wide.u32 %rd36, %r2, 4;         // status tail = out[row_count]
+    add.u64 %rd37, %rd4, %rd36;
+    mov.u32 %r17, 1;
+    atom.global.exch.b32 %r18, [%rd37], %r17;
+    bra DONE;
 
 NEXTCOL:
     add.u32 %r8, %r8, 1;
@@ -390,23 +544,19 @@ DONE:
 /// One fused merged-apply pass (see [`FUSED_APPLY_PTX`]): everything the kernel needs, staged
 /// into one buffer by [`CudaResidentDeviceMemory::submit_i32_fused_apply`].
 pub struct FusedApplyRequest<'a> {
-    /// Absolute device address of each column's FIRST new slot (shard base + section offset +
-    /// row_count * 4), catalog order. `values` is col-major over exactly these columns.
-    pub col_dests: &'a [u64],
+    /// Owned destination of each column's first new slot, in catalog order.
+    pub columns: &'a [CudaWriteDestination],
     /// Col-major i32 values: `values[c * k + j]` = row j's value for column c.
     pub values: &'a [i32],
     /// One created_by birth stamp per appended row (k of them).
     pub stamps: &'a [u64],
-    /// Absolute device address of `created_by[first_slot]`.
-    pub created_by_dest: u64,
-    /// Optional row-id stamps + the absolute device address of `row_id[first_slot]`.
-    pub row_ids: Option<(&'a [u64], u64)>,
-    /// Optional PK hash-index insert: (index_ptr, table_mask, hash_shift, pk_col, base_row).
-    pub index: Option<(u64, u32, u32, u32, u32)>,
-    /// The shard's device row-count header word (absolute address) and the value to publish
-    /// there (`row_count + k`) — the unfused path's final append chunk, written by thread 0.
-    pub header_dest: u64,
-    pub header_value: u64,
+    pub created_by: CudaWriteDestination,
+    pub row_ids: Option<(&'a [u64], CudaWriteDestination)>,
+    pub index: Option<CudaWriteIndex>,
+    pub base_row: u32,
+    /// The shard's device row-count header word. The host publishes checked `base_row + k` only
+    /// after the kernel-completing readback, preserving stamp-before-publication across blocks.
+    pub header: CudaWriteDestination,
 }
 
 impl CudaResidentDeviceMemory {
@@ -438,17 +588,20 @@ impl CudaResidentDeviceMemory {
             *mut *mut c_void,
         ) -> i32;
 
-        let num_cols = request.col_dests.len();
+        let num_cols = request.columns.len();
         let k = request.stamps.len();
         if k == 0 || num_cols == 0 {
             return Ok(false);
         }
-        if request.values.len() != num_cols * k {
+        let expected_values = num_cols
+            .checked_mul(k)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if request.values.len() != expected_values {
             return Err(CudaRuntimeProbeError::InvalidInputLength(
                 request.values.len(),
             ));
         }
-        if let Some((row_ids, _)) = request.row_ids {
+        if let Some((row_ids, _)) = request.row_ids.as_ref() {
             if row_ids.len() != k {
                 return Err(CudaRuntimeProbeError::InvalidInputLength(row_ids.len()));
             }
@@ -456,20 +609,110 @@ impl CudaResidentDeviceMemory {
         let k_u32 = u32::try_from(k).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(k))?;
         let cols_u32 = u32::try_from(num_cols)
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(num_cols))?;
+        let value_count_u32 = cols_u32
+            .checked_mul(k_u32)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(expected_values))?;
+        if value_count_u32 as usize != expected_values {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(expected_values));
+        }
+        let new_row_count = request
+            .base_row
+            .checked_add(k_u32)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(k))?;
+
+        let value_bytes_per_column = k
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let stamp_bytes = k
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let primary = self.primary_arc();
+        let mut column_destinations = Vec::with_capacity(num_cols);
+        for destination in request.columns {
+            column_destinations.push(checked_destination(
+                &primary,
+                destination,
+                value_bytes_per_column as u64,
+                std::mem::align_of::<i32>() as u64,
+            )?);
+        }
+        let created_by_dest = checked_destination(
+            &primary,
+            &request.created_by,
+            stamp_bytes as u64,
+            std::mem::align_of::<u64>() as u64,
+        )?;
+        let row_id_dest = request
+            .row_ids
+            .as_ref()
+            .map(|(_, destination)| {
+                checked_destination(
+                    &primary,
+                    destination,
+                    stamp_bytes as u64,
+                    std::mem::align_of::<u64>() as u64,
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let header_dest = checked_destination(
+            &primary,
+            &request.header,
+            std::mem::size_of::<u64>() as u64,
+            std::mem::align_of::<u64>() as u64,
+        )?;
+
+        let (pk_col, base_row, index_ptr, index_mask, index_shift) = if let Some(index) =
+            request.index.as_ref()
+        {
+            if !Arc::ptr_eq(&primary, &index.memory.primary_arc()) || index.key_column >= cols_u32 {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(
+                    index.key_column as usize,
+                ));
+            }
+            validate_index_append(
+                &index.memory,
+                index.table_mask,
+                index.hash_shift,
+                request.base_row,
+                k_u32,
+            )?;
+            (
+                index.key_column,
+                request.base_row,
+                index.memory.device_ptr(),
+                index.table_mask,
+                index.hash_shift,
+            )
+        } else {
+            (u32::MAX, 0, 0, 0, 0)
+        };
 
         // Assemble the staging image (header layout documented at FUSED_APPLY_PTX).
-        let values_bytes = num_cols * k * 4;
-        let values_padded = values_bytes.div_ceil(8) * 8;
-        let header_bytes = 80 + num_cols * 8;
+        let values_bytes = expected_values
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let values_padded = values_bytes
+            .checked_add(7)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?
+            / 8
+            * 8;
+        let header_bytes = num_cols
+            .checked_mul(std::mem::size_of::<u64>())
+            .and_then(|bytes| bytes.checked_add(80))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let total = header_bytes
-            + values_padded
-            + k * 8
-            + if request.row_ids.is_some() { k * 8 } else { 0 };
+            .checked_add(values_padded)
+            .and_then(|bytes| bytes.checked_add(stamp_bytes))
+            .and_then(|bytes| {
+                bytes.checked_add(if request.row_ids.is_some() {
+                    stamp_bytes
+                } else {
+                    0
+                })
+            })
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let mut staging = vec![0_u8; total];
-        let (pk_col, base_row, index_ptr, index_mask, index_shift) = match request.index {
-            Some((ptr, mask, shift, pk_col, base_row)) => (pk_col, base_row, ptr, mask, shift),
-            None => (u32::MAX, 0, 0, 0, 0),
-        };
         staging[0..4].copy_from_slice(&k_u32.to_le_bytes());
         staging[4..8].copy_from_slice(&cols_u32.to_le_bytes());
         staging[8..12].copy_from_slice(&pk_col.to_le_bytes());
@@ -479,13 +722,10 @@ impl CudaResidentDeviceMemory {
         staging[24..28].copy_from_slice(&u32::from(request.row_ids.is_some()).to_le_bytes());
         // 28..32 = decline flag, zeroed by this very upload (no separate memset).
         staging[32..40].copy_from_slice(&index_ptr.to_le_bytes());
-        staging[40..48].copy_from_slice(&request.created_by_dest.to_le_bytes());
-        let row_id_dest = request.row_ids.map(|(_, dest)| dest).unwrap_or(0);
+        staging[40..48].copy_from_slice(&created_by_dest.to_le_bytes());
         staging[48..56].copy_from_slice(&row_id_dest.to_le_bytes());
-        staging[56..64].copy_from_slice(&request.header_dest.to_le_bytes());
-        staging[64..72].copy_from_slice(&request.header_value.to_le_bytes());
-        // 72..80 reserved (zero).
-        for (c, dest) in request.col_dests.iter().enumerate() {
+        // 56..80 reserved (zero): header publication follows the kernel-completing readback.
+        for (c, dest) in column_destinations.iter().enumerate() {
             staging[80 + c * 8..80 + c * 8 + 8].copy_from_slice(&dest.to_le_bytes());
         }
         let values_off = header_bytes;
@@ -498,15 +738,14 @@ impl CudaResidentDeviceMemory {
             staging[stamps_off + i * 8..stamps_off + i * 8 + 8]
                 .copy_from_slice(&stamp.to_le_bytes());
         }
-        if let Some((row_ids, _)) = request.row_ids {
-            let row_ids_off = stamps_off + k * 8;
+        if let Some((row_ids, _)) = request.row_ids.as_ref() {
+            let row_ids_off = stamps_off + stamp_bytes;
             for (i, row_id) in row_ids.iter().enumerate() {
                 staging[row_ids_off + i * 8..row_ids_off + i * 8 + 8]
                     .copy_from_slice(&row_id.to_le_bytes());
             }
         }
 
-        let primary = self.primary_arc();
         primary.set_current()?;
         let cu_memcpy_htod = unsafe {
             primary
@@ -528,6 +767,12 @@ impl CudaResidentDeviceMemory {
                 .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
                 .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
         };
+        let cu_stream_sync = unsafe {
+            *primary
+                .lib()
+                .get::<CuStreamSync>(b"cuStreamSynchronize\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
 
         let staging_guard = primary.lease_device_buffer_owned(total)?;
         let mut ptx = Vec::with_capacity(FUSED_APPLY_PTX.len() + 1);
@@ -542,6 +787,10 @@ impl CudaResidentDeviceMemory {
         let mut args = [(&mut staging_arg as *mut u64).cast::<c_void>()];
         let threads_per_block: u32 = 128;
         let blocks = k_u32.div_ceil(threads_per_block);
+        let mut stream_drain = DefaultStreamDrain {
+            sync: cu_stream_sync,
+            armed: true,
+        };
         check_cuda(unsafe {
             cu_launch_kernel(
                 function,
@@ -567,6 +816,15 @@ impl CudaResidentDeviceMemory {
                 std::mem::size_of::<u32>(),
             )
         })?;
+        let header_value = u64::from(new_row_count).to_le_bytes();
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                header_dest,
+                header_value.as_ptr().cast::<c_void>(),
+                header_value.len(),
+            )
+        })?;
+        stream_drain.armed = false;
         Ok(decline != 0)
     }
 
@@ -578,7 +836,6 @@ impl CudaResidentDeviceMemory {
     /// (`2*(base_row+keys.len()) <= table_size`) BEFORE calling (else drop + rebuild). Synchronous.
     pub fn submit_i32_index_insert(
         &self,
-        index: &Arc<CudaResidentDeviceMemory>,
         table_mask: u32,
         hash_shift: u32,
         keys: &[i32],
@@ -605,11 +862,9 @@ impl CudaResidentDeviceMemory {
         if keys.is_empty() {
             return Ok(false);
         }
-        if index.device_ptr() == 0 {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
-        }
         let key_count = u32::try_from(keys.len())
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(keys.len()))?;
+        validate_index_append(self, table_mask, hash_shift, base_row, key_count)?;
         let keys_bytes = keys
             .len()
             .checked_mul(std::mem::size_of::<i32>())
@@ -644,6 +899,12 @@ impl CudaResidentDeviceMemory {
                 .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
                 .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
         };
+        let cu_stream_sync = unsafe {
+            *primary
+                .lib()
+                .get::<CuStreamSync>(b"cuStreamSynchronize\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
 
         let keys_guard = primary.lease_device_buffer_owned(keys_bytes)?;
         let decline_guard = primary.lease_device_buffer_owned(std::mem::size_of::<u32>())?;
@@ -658,7 +919,7 @@ impl CudaResidentDeviceMemory {
         })?;
         check_cuda(unsafe { cu_memset_d8(decline_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
 
-        let mut index_arg = index.device_ptr();
+        let mut index_arg = self.device_ptr();
         let mut mask_arg = table_mask;
         let mut shift_arg = hash_shift;
         let mut keys_arg = keys_guard.ptr;
@@ -676,6 +937,10 @@ impl CudaResidentDeviceMemory {
         ];
         let threads_per_block: u32 = 128;
         let blocks = key_count.div_ceil(threads_per_block);
+        let mut stream_drain = DefaultStreamDrain {
+            sync: cu_stream_sync,
+            armed: true,
+        };
         check_cuda(unsafe {
             cu_launch_kernel(
                 function,
@@ -706,29 +971,21 @@ impl CudaResidentDeviceMemory {
                 std::mem::size_of::<u32>(),
             )
         })?;
+        stream_drain.armed = false;
         Ok(decline[0] != 0)
     }
 
-    /// COMPOUND KEYS (charter close + wider types): fold a compound key's columns of the shard buffer at
-    /// `base_ptr` into per-row 32-bit fingerprints ON THE DEVICE (`COMPOUND_FOLD_PTX`), returning the
-    /// `row_count` fingerprints. Each key column `k` contributes `widths[k]` consecutive i32 words at its
-    /// capacity-strided section `offsets[k]` (1 for i32-section, 2 for the i64 section). This lets the
-    /// PK-index rebuild derive the compound key on the GPU instead of reading the raw resident key columns
-    /// back to the host to hash them — the host then reads only this derived fingerprint column, exactly
-    /// as the single-column build reads its one key column. Byte-identical to the host
-    /// `compound_key_fingerprint` / `sql_value_key_words`. `offsets.len() == widths.len() ==
-    /// blob_offsets.len()`. A TEXT key column sets `widths[k] == 0` (the sentinel); `offsets[k]` is then
-    /// the byte offset of its OFFSETS array and `blob_offsets[k]` the byte offset of its blob (ignored,
-    /// pass 0, for fixed-width columns). Synchronous (the blocking output DtoH on the null stream fences
-    /// the launch).
+    /// Fold typed fixed/text columns owned by `self` into per-row 32-bit fingerprints on-device.
+    /// Host preflight checks every aligned fixed window and text offsets/blob section; PTX checks each
+    /// text row's `start <= end <= bytes_len` before byte access. A four-byte status tail shares the
+    /// single bounded result readback, so malformed device offsets fail closed without doubling output.
+    /// Fingerprints remain byte-identical to `compound_key_fingerprint` / `sql_value_key_words`.
     pub fn submit_compound_fold_fingerprints(
         &self,
-        base_ptr: u64,
-        offsets: &[u64],
-        widths: &[u32],
-        blob_offsets: &[u64],
+        columns: &[CudaCompoundFoldColumn],
         row_count: usize,
     ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
+        type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
         type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
         type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
         #[allow(clippy::type_complexity)]
@@ -749,17 +1006,82 @@ impl CudaResidentDeviceMemory {
         if row_count == 0 {
             return Ok(Vec::new());
         }
-        if offsets.is_empty()
-            || base_ptr == 0
-            || offsets.len() != widths.len()
-            || offsets.len() != blob_offsets.len()
-        {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(offsets.len()));
+        if columns.is_empty() || self.device_ptr() == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(columns.len()));
         }
-        let ncols = u32::try_from(offsets.len())
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(offsets.len()))?;
+        let ncols = u32::try_from(columns.len())
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(columns.len()))?;
         let row_count_u32 = u32::try_from(row_count)
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(row_count))?;
+        let mut offsets = Vec::with_capacity(columns.len());
+        let mut widths = Vec::with_capacity(columns.len());
+        let mut blob_offsets = Vec::with_capacity(columns.len());
+        let mut blob_lens = Vec::with_capacity(columns.len());
+        for column in columns {
+            match *column {
+                CudaCompoundFoldColumn::Fixed {
+                    byte_offset,
+                    width_words,
+                } => {
+                    if width_words == 0
+                        || !byte_offset.is_multiple_of(std::mem::align_of::<i32>() as u64)
+                    {
+                        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+                    }
+                    row_count_u32
+                        .checked_mul(width_words)
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(row_count))?;
+                    let byte_len = (row_count as u64)
+                        .checked_mul(u64::from(width_words))
+                        .and_then(|words| words.checked_mul(std::mem::size_of::<i32>() as u64))
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                    let end = byte_offset
+                        .checked_add(byte_len)
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                    if end > self.metadata().allocated_bytes {
+                        return Err(CudaRuntimeProbeError::InvalidInputLength(
+                            usize::try_from(end).unwrap_or(usize::MAX),
+                        ));
+                    }
+                    offsets.push(byte_offset);
+                    widths.push(width_words);
+                    blob_offsets.push(0);
+                    blob_lens.push(0);
+                }
+                CudaCompoundFoldColumn::Text {
+                    offsets_byte_offset,
+                    bytes_byte_offset,
+                    bytes_len,
+                } => {
+                    if !offsets_byte_offset.is_multiple_of(std::mem::align_of::<u64>() as u64) {
+                        return Err(CudaRuntimeProbeError::InvalidInputLength(
+                            offsets_byte_offset as usize,
+                        ));
+                    }
+                    let offsets_len = (row_count as u64)
+                        .checked_add(1)
+                        .and_then(|rows| rows.checked_mul(std::mem::size_of::<u64>() as u64))
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                    let offsets_end = offsets_byte_offset
+                        .checked_add(offsets_len)
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                    let bytes_end = bytes_byte_offset
+                        .checked_add(bytes_len)
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                    if offsets_end > self.metadata().allocated_bytes
+                        || bytes_end > self.metadata().allocated_bytes
+                    {
+                        return Err(CudaRuntimeProbeError::InvalidInputLength(
+                            usize::try_from(offsets_end.max(bytes_end)).unwrap_or(usize::MAX),
+                        ));
+                    }
+                    offsets.push(offsets_byte_offset);
+                    widths.push(0);
+                    blob_offsets.push(bytes_byte_offset);
+                    blob_lens.push(bytes_len);
+                }
+            }
+        }
         let offsets_bytes = offsets
             .len()
             .checked_mul(std::mem::size_of::<u64>())
@@ -772,12 +1094,23 @@ impl CudaResidentDeviceMemory {
             .len()
             .checked_mul(std::mem::size_of::<u64>())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let blob_lens_bytes = std::mem::size_of_val(blob_lens.as_slice());
         let out_bytes = row_count
-            .checked_mul(std::mem::size_of::<i32>())
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let result_bytes = out_bytes
+            .checked_add(std::mem::size_of::<u32>())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
 
         let primary = self.primary_arc();
         primary.set_current()?;
+        let cu_memset_d8 = unsafe {
+            primary
+                .lib()
+                .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
         let cu_memcpy_htod = unsafe {
             primary
                 .lib()
@@ -798,11 +1131,18 @@ impl CudaResidentDeviceMemory {
                 .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
                 .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
         };
+        let cu_stream_sync = unsafe {
+            *primary
+                .lib()
+                .get::<CuStreamSync>(b"cuStreamSynchronize\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
 
         let offsets_guard = primary.lease_device_buffer_owned(offsets_bytes)?;
         let widths_guard = primary.lease_device_buffer_owned(widths_bytes)?;
         let blob_offsets_guard = primary.lease_device_buffer_owned(blob_offsets_bytes)?;
-        let out_guard = primary.lease_device_buffer_owned(out_bytes)?;
+        let blob_lens_guard = primary.lease_device_buffer_owned(blob_lens_bytes)?;
+        let out_guard = primary.lease_device_buffer_owned(result_bytes)?;
 
         let mut ptx = Vec::with_capacity(COMPOUND_FOLD_PTX.len() + 1);
         ptx.extend_from_slice(COMPOUND_FOLD_PTX);
@@ -830,11 +1170,26 @@ impl CudaResidentDeviceMemory {
                 blob_offsets_bytes,
             )
         })?;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                blob_lens_guard.ptr,
+                blob_lens.as_ptr().cast::<c_void>(),
+                blob_lens_bytes,
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memset_d8(
+                out_guard.ptr + out_bytes as u64,
+                0,
+                std::mem::size_of::<u32>(),
+            )
+        })?;
 
-        let mut base_arg = base_ptr;
+        let mut base_arg = self.device_ptr();
         let mut offsets_arg = offsets_guard.ptr;
         let mut widths_arg = widths_guard.ptr;
         let mut blob_offsets_arg = blob_offsets_guard.ptr;
+        let mut blob_lens_arg = blob_lens_guard.ptr;
         let mut ncols_arg = ncols;
         let mut rows_arg = row_count_u32;
         let mut out_arg = out_guard.ptr;
@@ -843,12 +1198,17 @@ impl CudaResidentDeviceMemory {
             (&mut offsets_arg as *mut u64).cast::<c_void>(),
             (&mut widths_arg as *mut u64).cast::<c_void>(),
             (&mut blob_offsets_arg as *mut u64).cast::<c_void>(),
+            (&mut blob_lens_arg as *mut u64).cast::<c_void>(),
             (&mut ncols_arg as *mut u32).cast::<c_void>(),
             (&mut rows_arg as *mut u32).cast::<c_void>(),
             (&mut out_arg as *mut u64).cast::<c_void>(),
         ];
         let threads_per_block: u32 = 128;
         let blocks = row_count_u32.div_ceil(threads_per_block);
+        let mut stream_drain = DefaultStreamDrain {
+            sync: cu_stream_sync,
+            armed: true,
+        };
         check_cuda(unsafe {
             cu_launch_kernel(
                 function,
@@ -866,10 +1226,31 @@ impl CudaResidentDeviceMemory {
         })?;
         // The blocking output DtoH on the null stream fences the kernel (same discipline as
         // `submit_i32_index_insert`'s decline read); out_bytes > 0 here, so it always transfers.
-        let mut out = vec![0_i32; row_count];
+        let mut out = vec![0_u32; row_count + 1];
         check_cuda(unsafe {
-            cu_memcpy_dtoh(out.as_mut_ptr().cast::<c_void>(), out_guard.ptr, out_bytes)
+            cu_memcpy_dtoh(
+                out.as_mut_ptr().cast::<c_void>(),
+                out_guard.ptr,
+                result_bytes,
+            )
         })?;
-        Ok(out)
+        let input_error = out.pop().unwrap_or(1);
+        if input_error != 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
+        stream_drain.armed = false;
+        Ok(out.into_iter().map(|word| word as i32).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_span_end;
+
+    #[test]
+    fn write_apply_span_arithmetic_is_exact_and_overflow_safe() {
+        assert_eq!(checked_span_end(16, 8, 8).unwrap(), 16);
+        assert!(checked_span_end(16, 9, 8).is_err());
+        assert!(checked_span_end(u64::MAX, u64::MAX, 1).is_err());
     }
 }

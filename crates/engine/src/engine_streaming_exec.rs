@@ -7226,25 +7226,30 @@ impl Engine {
         // caller's construction).
         let mut offsets: Vec<u64> = Vec::with_capacity(key_positions.len());
         let mut blob_offsets: Vec<u64> = Vec::with_capacity(key_positions.len());
+        let mut blob_lens: Vec<u64> = Vec::with_capacity(key_positions.len());
         for &pos in key_positions {
             let column = table.columns.get(pos)?;
             match column.ty {
                 SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
                     offsets.push(resident_device_int4_column_offset(d, table, pos).ok()?);
                     blob_offsets.push(0);
+                    blob_lens.push(0);
                 }
                 SqlType::Int8 | SqlType::Timestamp => {
                     offsets.push(resident_device_int8_column_offset(d, table, pos).ok()?);
                     blob_offsets.push(0);
+                    blob_lens.push(0);
                 }
                 SqlType::Numeric { .. } | SqlType::Uuid => {
                     offsets.push(resident_device_numeric_column_offset(d, table, pos).ok()?);
                     blob_offsets.push(0);
+                    blob_lens.push(0);
                 }
                 SqlType::Text => {
                     let layout = resident_device_text_column_layout(d, table, pos).ok()?;
                     offsets.push(layout.offsets_byte_offset);
                     blob_offsets.push(layout.bytes_byte_offset);
+                    blob_lens.push(layout.bytes_len);
                 }
                 SqlType::Bool => return None, // a bool key is not a real-world unique key
             }
@@ -7262,14 +7267,26 @@ impl Engine {
                 .iter()
                 .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
                 .collect::<Option<Vec<u32>>>()?;
+            let fold_columns = widths
+                .iter()
+                .enumerate()
+                .map(|(idx, &width_words)| {
+                    if width_words == 0 {
+                        CudaCompoundFoldColumn::Text {
+                            offsets_byte_offset: offsets[idx],
+                            bytes_byte_offset: blob_offsets[idx],
+                            bytes_len: blob_lens[idx],
+                        }
+                    } else {
+                        CudaCompoundFoldColumn::Fixed {
+                            byte_offset: offsets[idx],
+                            width_words,
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
             src.device_memory
-                .submit_compound_fold_fingerprints(
-                    src.device_memory.device_ptr(),
-                    &offsets,
-                    &widths,
-                    &blob_offsets,
-                    row_count,
-                )
+                .submit_compound_fold_fingerprints(&fold_columns, row_count)
                 .ok()?
         };
         if keys.len() != row_count {
@@ -7319,24 +7336,29 @@ impl Engine {
         let (src, _vis) = staged.ready().ok()?;
         let mut offsets = Vec::with_capacity(key_positions.len());
         let mut blob_offsets = Vec::with_capacity(key_positions.len());
+        let mut blob_lens = Vec::with_capacity(key_positions.len());
         for &pos in key_positions {
             match table.columns.get(pos)?.ty {
                 SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
                     offsets.push(resident_device_int4_column_offset(&chunk.snapshot, table, pos).ok()?);
                     blob_offsets.push(0);
+                    blob_lens.push(0);
                 }
                 SqlType::Int8 | SqlType::Timestamp => {
                     offsets.push(resident_device_int8_column_offset(&chunk.snapshot, table, pos).ok()?);
                     blob_offsets.push(0);
+                    blob_lens.push(0);
                 }
                 SqlType::Numeric { .. } | SqlType::Uuid => {
                     offsets.push(resident_device_numeric_column_offset(&chunk.snapshot, table, pos).ok()?);
                     blob_offsets.push(0);
+                    blob_lens.push(0);
                 }
                 SqlType::Text => {
                     let layout = resident_device_text_column_layout(&chunk.snapshot, table, pos).ok()?;
                     offsets.push(layout.offsets_byte_offset);
                     blob_offsets.push(layout.bytes_byte_offset);
+                    blob_lens.push(layout.bytes_len);
                 }
                 SqlType::Bool => return None,
             }
@@ -7352,14 +7374,26 @@ impl Engine {
                 .iter()
                 .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
                 .collect::<Option<Vec<_>>>()?;
+            let fold_columns = widths
+                .iter()
+                .enumerate()
+                .map(|(idx, &width_words)| {
+                    if width_words == 0 {
+                        CudaCompoundFoldColumn::Text {
+                            offsets_byte_offset: offsets[idx],
+                            bytes_byte_offset: blob_offsets[idx],
+                            bytes_len: blob_lens[idx],
+                        }
+                    } else {
+                        CudaCompoundFoldColumn::Fixed {
+                            byte_offset: offsets[idx],
+                            width_words,
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
             src.device_memory
-                .submit_compound_fold_fingerprints(
-                    src.device_memory.device_ptr(),
-                    &offsets,
-                    &widths,
-                    &blob_offsets,
-                    chunk.row_count as usize,
-                )
+                .submit_compound_fold_fingerprints(&fold_columns, chunk.row_count as usize)
                 .ok()?
         };
         if keys.len() != chunk.row_count as usize {

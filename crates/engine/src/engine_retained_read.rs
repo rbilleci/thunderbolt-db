@@ -1037,7 +1037,7 @@ impl Engine {
             };
             // The kernel mutates the device index buffer IN PLACE (atom.cas). A launch failure ->
             // drop the entry (rebuild next probe); never a wrong index.
-            match index.submit_i32_index_insert(&index, table_mask, hash_shift, tail, base_row_u32)
+            match index.submit_i32_index_insert(table_mask, hash_shift, tail, base_row_u32)
             {
                 Ok(dup) => {
                     let mut cache = self
@@ -1248,6 +1248,10 @@ impl Engine {
                 .iter()
                 .map(|&p| shard_key_column_blob_offset(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
+            let blob_lens = positions
+                .iter()
+                .map(|&p| shard_key_column_blob_len(shard, table, p))
+                .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
             // concurrent invalidations); a stale shard declines the whole wave-batch probe.
@@ -1264,6 +1268,7 @@ impl Engine {
                     &device_memory,
                     &offsets,
                     &blob_offsets,
+                    &blob_lens,
                     shard.row_count,
                 )?;
             descs.push(WriteLocateShard {
@@ -1351,6 +1356,10 @@ impl Engine {
                 .iter()
                 .map(|&p| shard_key_column_blob_offset(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
+            let blob_lens = positions
+                .iter()
+                .map(|&p| shard_key_column_blob_len(shard, table, p))
+                .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
@@ -1365,6 +1374,7 @@ impl Engine {
                     &device_memory,
                     &offsets,
                     &blob_offsets,
+                    &blob_lens,
                     shard.row_count,
                 )?;
             let (bound_memory, created_by, deleted_by) = if index_row_count == shard.row_count {
@@ -1528,6 +1538,10 @@ impl Engine {
                     _ => Some(0),
                 })
                 .collect::<Option<Vec<u64>>>()?;
+            let blob_lens = positions
+                .iter()
+                .map(|&p| shard_key_column_blob_len(shard, table, p))
+                .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
             // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
             // concurrent invalidations); a stale shard declines the device locate to the ladder.
@@ -1547,6 +1561,7 @@ impl Engine {
                     &device_memory,
                     &offsets,
                     &blob_offsets,
+                    &blob_lens,
                     shard.row_count,
                 )?;
             descs.push(WriteLocateShard {
@@ -2319,8 +2334,15 @@ impl Engine {
         // COMPOUND KEYS (text): the per-key-column BLOB byte offsets, parallel to `offsets` — nonzero only
         // for a TEXT column (its blob), 0 for fixed-width columns. Recomputed from the live shard under lanes.
         blob_offsets: &[u64],
+        blob_lens: &[u64],
         row_count: usize,
     ) -> Option<(Arc<CudaResidentDeviceMemory>, u32, u32, usize)> {
+        if positions.len() != offsets.len()
+            || positions.len() != blob_offsets.len()
+            || positions.len() != blob_lens.len()
+        {
+            return None;
+        }
         let device_ptr = device_memory.device_ptr();
         let cache_key = (table_name.to_string(), shard_id, key_id);
         // Fast path: a valid cached device index -> return it (or None if it declined at build).
@@ -2370,7 +2392,14 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             })
         };
-        let (build_memory, build_offsets, build_blob_offsets, build_row_count, build_capacity_rows) =
+        let (
+            build_memory,
+            build_offsets,
+            build_blob_offsets,
+            build_blob_lens,
+            build_row_count,
+            build_capacity_rows,
+        ) =
             if self.intent_lanes.is_some() {
                 // Re-check under the guard: another prober may have rebuilt already.
                 {
@@ -2381,7 +2410,7 @@ impl Engine {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Some(entry) = cache.get(&cache_key) {
-                        if entry.row_count >= row_count {
+                        if entry.resident_device_ptr == device_ptr && entry.row_count >= row_count {
                             return entry
                                 .device_index
                                 .clone()
@@ -2413,6 +2442,10 @@ impl Engine {
                     .iter()
                     .map(|&p| shard_key_column_blob_offset(&live, table, p))
                     .collect::<Option<Vec<u64>>>()?;
+                let live_blob_lens = positions
+                    .iter()
+                    .map(|&p| shard_key_column_blob_len(&live, table, p))
+                    .collect::<Option<Vec<u64>>>()?;
                 // CAPACITY-SIZED INDEX: size the hash table once for the shard's
                 // full capacity (clamped to the builder's 2^30 slot limit via the
                 // sizing_rows argument), so capacity-exhaustion rebuilds are
@@ -2423,6 +2456,7 @@ impl Engine {
                     live_memory,
                     live_offsets,
                     live_blob_offsets,
+                    live_blob_lens,
                     live_rows,
                     capacity_rows,
                 )
@@ -2433,6 +2467,7 @@ impl Engine {
                     Arc::clone(device_memory),
                     offsets.to_vec(),
                     blob_offsets.to_vec(),
+                    blob_lens.to_vec(),
                     row_count,
                     0_u64,
                 )
@@ -2468,14 +2503,26 @@ impl Engine {
                 .iter()
                 .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
                 .collect::<Option<Vec<u32>>>()?;
+            let fold_columns = widths
+                .iter()
+                .enumerate()
+                .map(|(idx, &width_words)| {
+                    if width_words == 0 {
+                        CudaCompoundFoldColumn::Text {
+                            offsets_byte_offset: build_offsets[idx],
+                            bytes_byte_offset: build_blob_offsets[idx],
+                            bytes_len: build_blob_lens[idx],
+                        }
+                    } else {
+                        CudaCompoundFoldColumn::Fixed {
+                            byte_offset: build_offsets[idx],
+                            width_words,
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
             let fps = build_memory
-                .submit_compound_fold_fingerprints(
-                    device_ptr,
-                    &build_offsets,
-                    &widths,
-                    &build_blob_offsets,
-                    row_count,
-                )
+                .submit_compound_fold_fingerprints(&fold_columns, row_count)
                 .ok()?;
             if fps.len() != row_count {
                 return None;
@@ -2674,6 +2721,7 @@ impl Engine {
                     &device_memory,
                     &[filter_offset],
                     &[0], // single-column key -> blob offsets unused (fixed-width fold path)
+                    &[0], // single-column key -> blob lengths unused
                     shard.row_count,
                 )?;
             let mut projection_offsets: Vec<u64> = Vec::with_capacity(ncols);
@@ -3573,6 +3621,22 @@ fn shard_key_column_blob_offset(
             .iter()
             .find(|layout| layout.name == column.name)
             .map(|layout| layout.bytes_byte_offset),
+        _ => Some(0),
+    }
+}
+
+fn shard_key_column_blob_len(
+    shard: &RelationalResidentShard,
+    table: &RelationalTable,
+    col_idx: usize,
+) -> Option<u64> {
+    let column = table.columns.get(col_idx)?;
+    match column.ty {
+        SqlType::Text => shard
+            .resident_device_text_columns
+            .iter()
+            .find(|layout| layout.name == column.name)
+            .map(|layout| layout.bytes_len),
         _ => Some(0),
     }
 }
