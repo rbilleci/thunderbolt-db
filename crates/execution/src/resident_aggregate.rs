@@ -2,10 +2,34 @@ use std::ffi::c_void;
 
 use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError, check_cuda, launch_on_pooled_stream};
 
+fn validate_index_window(
+    allocated_bytes: u64,
+    byte_offset: u64,
+    indices: &[u32],
+    element_width: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    let max_index = indices
+        .iter()
+        .copied()
+        .max()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let end = u64::from(max_index)
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(element_width))
+        .and_then(|bytes| byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if end > allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(end).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
+}
+
 /// SUM(int4) over a filtered set of row indices (the operator axis, doc 19): H2D the surviving u32
 /// indices, zero a single i64 accumulator, run the gather-reduce kernel (local sum per thread + one
-/// `atom.add.u64`), and D2H the bigint sum. `indices` must be non-empty (an empty aggregate is NULL,
-/// hard-errored upstream until M3).
+/// `atom.add.u64`), and D2H the bigint sum. `indices` must be non-empty; the engine maps an empty SQL
+/// aggregate to NULL before calling this low-level API.
 pub(super) fn launch_cuda_resident_i32_sum_at_indices(
     resident: &CudaResidentDeviceMemory,
     byte_offset: u64,
@@ -28,9 +52,12 @@ pub(super) fn launch_cuda_resident_i32_sum_at_indices(
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
-    if indices.is_empty() {
-        return Ok(0);
-    }
+    validate_index_window(
+        resident.metadata().allocated_bytes,
+        byte_offset,
+        indices,
+        std::mem::size_of::<i32>() as u64,
+    )?;
     let count = indices.len();
     let idx_bytes = count
         .checked_mul(std::mem::size_of::<u32>())
@@ -128,7 +155,7 @@ pub(super) fn launch_cuda_resident_i32_sum_at_indices(
 /// SUM(int8) over a filtered set of row indices, as i128 (the operator axis, doc 19): H2D the u32
 /// indices, zero a 16-byte (two-limb i128) accumulator, run the i128 gather-reduce kernel (local i128
 /// sum per thread + a two-64-bit-atomic carry add), and D2H the 16 bytes as a little-endian i128.
-/// `indices` must be non-empty (an empty SUM is NULL, hard-errored upstream until M3).
+/// `indices` must be non-empty; the engine maps an empty SQL SUM to NULL before this layer.
 pub(super) fn launch_cuda_resident_i64_sum_at_indices_i128(
     resident: &CudaResidentDeviceMemory,
     byte_offset: u64,
@@ -151,9 +178,12 @@ pub(super) fn launch_cuda_resident_i64_sum_at_indices_i128(
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
-    if indices.is_empty() {
-        return Ok(0);
-    }
+    validate_index_window(
+        resident.metadata().allocated_bytes,
+        byte_offset,
+        indices,
+        std::mem::size_of::<i64>() as u64,
+    )?;
     let count = indices.len();
     let idx_bytes = count
         .checked_mul(std::mem::size_of::<u32>())
@@ -252,7 +282,7 @@ pub(super) fn launch_cuda_resident_i64_sum_at_indices_i128(
 /// indices (the operator axis, doc 19): H2D the surviving u32 indices, H2D the accumulator's identity
 /// (i32::MAX for min / i32::MIN for max -- not a memset byte pattern), run the reduction kernel (local
 /// min/max per thread + one predicated `atom.min/max.s32`), and D2H the i32. `indices` must be
-/// non-empty (an empty MIN/MAX is NULL, hard-errored upstream until M3).
+/// non-empty; the engine maps an empty SQL MIN/MAX to NULL before this layer.
 pub(super) fn launch_cuda_resident_i32_minmax_at_indices(
     resident: &CudaResidentDeviceMemory,
     byte_offset: u64,
@@ -275,9 +305,12 @@ pub(super) fn launch_cuda_resident_i32_minmax_at_indices(
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
-    if indices.is_empty() {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
-    }
+    validate_index_window(
+        resident.metadata().allocated_bytes,
+        byte_offset,
+        indices,
+        std::mem::size_of::<i32>() as u64,
+    )?;
     let count = indices.len();
     let idx_bytes = count
         .checked_mul(std::mem::size_of::<u32>())
@@ -405,9 +438,12 @@ pub(super) fn launch_cuda_resident_i64_minmax_at_indices(
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
-    if indices.is_empty() {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
-    }
+    validate_index_window(
+        resident.metadata().allocated_bytes,
+        byte_offset,
+        indices,
+        std::mem::size_of::<i64>() as u64,
+    )?;
     let count = indices.len();
     let idx_bytes = count
         .checked_mul(std::mem::size_of::<u32>())
@@ -535,9 +571,12 @@ pub(super) fn launch_cuda_resident_i128_minmax_partials_at_indices(
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
-    if indices.is_empty() {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
-    }
+    validate_index_window(
+        resident.metadata().allocated_bytes,
+        byte_offset,
+        indices,
+        std::mem::size_of::<i128>() as u64,
+    )?;
     let count = indices.len();
     let idx_bytes = count
         .checked_mul(std::mem::size_of::<u32>())
@@ -673,9 +712,12 @@ pub(super) fn launch_cuda_resident_i128_sum_partials_at_indices(
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
-    if indices.is_empty() {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
-    }
+    validate_index_window(
+        resident.metadata().allocated_bytes,
+        byte_offset,
+        indices,
+        std::mem::size_of::<i128>() as u64,
+    )?;
     let count = indices.len();
     let idx_bytes = count
         .checked_mul(std::mem::size_of::<u32>())
@@ -800,4 +842,25 @@ pub(super) fn launch_cuda_resident_i128_sum_partials_at_indices(
             .ok_or(CudaRuntimeProbeError::NumericFieldOverflow)?;
     }
     Ok(sum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_index_window;
+
+    #[test]
+    fn aggregate_index_window_accepts_exact_fixed_width_boundary() {
+        validate_index_window(32, 8, &[5, 0, 3], 4).unwrap();
+        validate_index_window(32, 0, &[3], 8).unwrap();
+        validate_index_window(32, 16, &[0], 16).unwrap();
+    }
+
+    #[test]
+    fn aggregate_index_window_rejects_empty_overflow_and_out_of_bounds_inputs() {
+        assert!(validate_index_window(32, 0, &[], 4).is_err());
+        assert!(validate_index_window(31, 8, &[5], 4).is_err());
+        assert!(validate_index_window(32, 0, &[4], 8).is_err());
+        assert!(validate_index_window(32, 17, &[0], 16).is_err());
+        assert!(validate_index_window(u64::MAX, u64::MAX, &[0], 4).is_err());
+    }
 }

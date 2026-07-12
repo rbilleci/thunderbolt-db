@@ -784,7 +784,7 @@ impl CudaResidentDeviceMemory {
     /// `SUM` of a resident int4 column over a FILTERED set of row indices (the operator axis, doc 19):
     /// gather `col[indices[k]]` and reduce on the GPU (each thread sums its strided slice locally, then
     /// one `atom.add.u64` -> a single i64), returned as bigint. The caller must pass a NON-empty
-    /// `indices` (an empty aggregate is NULL -- not representable until M3 -- and hard-errors upstream).
+    /// `indices`; the engine maps an empty SQL aggregate to NULL before this low-level API.
     pub fn sum_i32_at_indices_from_payload(
         &self,
         byte_offset: u64,
@@ -806,7 +806,7 @@ impl CudaResidentDeviceMemory {
 
     /// `MIN` (the type matrix / operator axis, doc 19) of a resident int4 column over a FILTERED set
     /// of row indices: a GPU reduction (local min per thread + one `atom.min.s32`). `indices` must be
-    /// non-empty (an empty MIN is NULL, hard-errored upstream until M3).
+    /// non-empty; the engine maps an empty SQL MIN to NULL before this low-level API.
     pub fn min_i32_at_indices_from_payload(
         &self,
         byte_offset: u64,
@@ -827,7 +827,7 @@ impl CudaResidentDeviceMemory {
 
     /// `MIN`/`MAX` of a resident INT8 column over a FILTERED set of row indices (the operator axis,
     /// doc 19); a GPU reduction (each thread reads its i64 as 2x4-byte loads, local min/max, then one
-    /// `atom.min/max.s64`). `indices` must be non-empty (empty MIN/MAX is NULL, hard-errored upstream).
+    /// `atom.min/max.s64`). `indices` must be non-empty; empty SQL MIN/MAX maps to NULL upstream.
     pub fn min_i64_at_indices_from_payload(
         &self,
         byte_offset: u64,

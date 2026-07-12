@@ -1263,6 +1263,47 @@
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_filtered_aggregates_reject_invalid_windows_before_launch() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let bytes = [0_u8; 64];
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                bytes.len() as u64,
+                &[CudaDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes: &bytes,
+                }],
+            )
+            .expect("retain resident device memory");
+
+        assert!(resident.sum_i32_at_indices_from_payload(60, &[1]).is_err());
+        assert!(resident
+            .sum_i64_at_indices_i128_from_payload(56, &[1])
+            .is_err());
+        assert!(resident.min_i32_at_indices_from_payload(60, &[1]).is_err());
+        assert!(resident.max_i32_at_indices_from_payload(60, &[1]).is_err());
+        assert!(resident.min_i64_at_indices_from_payload(56, &[1]).is_err());
+        assert!(resident.max_i64_at_indices_from_payload(56, &[1]).is_err());
+        assert!(resident.min_i128_at_indices_from_payload(48, &[1]).is_err());
+        assert!(resident.max_i128_at_indices_from_payload(48, &[1]).is_err());
+        assert!(resident.sum_i128_at_indices_from_payload(48, &[1]).is_err());
+        assert!(resident.sum_i32_at_indices_from_payload(0, &[]).is_err());
+        assert!(resident
+            .sum_i64_at_indices_i128_from_payload(0, &[])
+            .is_err());
+
+        assert_eq!(
+            resident
+                .sum_i32_at_indices_from_payload(0, &[0, 1])
+                .expect("valid aggregate after rejected windows"),
+            0,
+            "rejected safe-API windows must not poison the CUDA context"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_text_filters_fail_closed_on_malformed_resident_spans() {
         let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
         const N: u64 = 2;

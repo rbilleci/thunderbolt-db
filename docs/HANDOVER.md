@@ -21,9 +21,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001V:** harden every safe filtered aggregate API with checked 4/8/16-byte max-index resident windows
-   and uniform empty-input rejection before CUDA mutation; preserve engine-level SQL NULL handling and device
-   reduction semantics.
+1. **STRUCT-001W:** isolate the grouped aggregate row contract plus production and benchmark launchers in a
+   focused private module while preserving the public root facade, all type/NULL/overflow semantics, device
+   lifetimes, bounded readback, and event-timing scope.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.

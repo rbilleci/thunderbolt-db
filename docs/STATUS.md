@@ -191,8 +191,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   concurrent invocations without CUDA 700/716/717. Independent audit found no extraction regression and exposed
   a pre-existing unchecked resident-window boundary now owned by **STRUCT-001V**. The canonical card measured
   count at 0.88x/1.01x same-run roofline, gather at 349.5/155.3 GB/s, grouped aggregation at 1,678.3 M elements/s,
-  and 65,536-batch point reads at 246.2M/232.4M lookups/s with p50 140/141us in-L2/out-of-L2. The execution root
-  is 21,816 lines; further extraction remains **STRUCT-001**.
+  and 65,536-batch point reads at 246.2M/232.4M lookups/s with p50 140/141us in-L2/out-of-L2. All nine safe
+  filtered aggregate APIs now reject empty inputs and check the maximum host index using overflow-safe 4/8/16-
+  byte extent arithmetic before context selection, module lookup, buffer leasing, or device access. The engine
+  continues to map empty SQL SUM/AVG/MIN/MAX to typed NULL before this layer; no host relational fallback or
+  device-value scan was added. Two pure boundary/overflow tests and one real-GPU malformed-window/reuse test
+  raise the exact inventory to 109 tests, with 36 passing and 73 ignored. Six safety/aggregate/NULL/overflow
+  gates passed 18 sequential and 24 concurrent invocations without CUDA 700/716/717; independent audit found
+  no issue. The final card measured count at 0.93x/1.00x same-run roofline, gather at 349.5/155.3 GB/s, grouped
+  aggregation at 1,678.0 M elements/s, and 65,536-batch point reads at 249.4M/255.4M lookups/s with p50 136/127us
+  in-L2/out-of-L2. `resident_aggregate` is 866 lines and the execution root is 21,816 lines; further extraction
+  remains **STRUCT-001**.
 
 ## Known boundaries
 
