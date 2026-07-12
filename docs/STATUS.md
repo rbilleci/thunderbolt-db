@@ -108,8 +108,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   CUDA 700/716/717 errors; independent audit found no remaining issue after its formatting finding was adopted.
   Its canonical report card stayed green: in-L2/out-of-L2 `sum_i32` measured 1,479/1,444 GB/s,
   `count_i32_compare` measured 0.89x/1.00x roofline, and 65,536-batch point reads measured 246.3M/253.5M
-  lookups/s at p50 139/131us. The execution root is 27,128 lines. Further extraction is owned by
-  **STRUCT-001L/STRUCT-001**.
+  lookups/s at p50 139/131us. The 901-line `execution::point_read_text` module now owns equal-any int4-filter/
+  text projection and bounded row assembly. PTX, compaction, bounds, pooled buffers/streams, async pinned and
+  blocking readback, event timing, ordering, UTF-8 validation, and root APIs remain unchanged. The exact 95-test
+  inventory, 25 non-ignored tests, and text multi-warp/NULL/pinned-pool GPU gates passed 3× sequential and 2×
+  concurrent with zero CUDA 700/716/717 errors; independent audit found no extraction issue. Its canonical card
+  stayed green: in-L2/out-of-L2 `sum_i32` measured 1,485/1,443 GB/s, `count_i32_compare` measured 0.88x/1.01x
+  roofline, and 65,536-batch point reads measured 248.2M/252.7M lookups/s at p50 138/132us. The audit confirmed a
+  pre-existing TEXT-only zero-int4-projection framing panic; the fact is owned here and its immediate fix is
+  **STRUCT-001M**. The execution root is 26,238 lines; further structural extraction remains **STRUCT-001**.
 
 ## Known boundaries
 
