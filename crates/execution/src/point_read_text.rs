@@ -16,6 +16,7 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     text_offsets_byte_offset: u64,
     text_bytes_byte_offset: u64,
     text_bytes_len: u64,
+    text_validity_bitmap_offset: Option<u64>,
     row_count: u64,
 ) -> Result<Vec<CudaI32TextBatchProjectionRow>, CudaRuntimeProbeError> {
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
@@ -56,6 +57,8 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     .param .u64 text_offsets_offset,
     .param .u64 text_bytes_offset,
     .param .u32 text_bytes_len,
+    .param .u64 text_validity_offset,
+    .param .u32 has_text_validity,
     .param .u64 needles_ptr,
     .param .u64 out_values_ptr,
     .param .u64 out_needle_indices_ptr,
@@ -63,6 +66,7 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     .param .u64 out_text_starts_ptr,
     .param .u64 out_text_lens_ptr,
     .param .u64 out_text_bytes_ptr,
+    .param .u64 out_text_validity_ptr,
     .param .u64 out_count_ptr,
     .param .u64 out_text_count_ptr
 )
@@ -79,6 +83,7 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     .reg .u32 %needle_count;
     .reg .u32 %projection_count;
     .reg .u32 %has_filter_validity;
+    .reg .u32 %has_text_validity;
     .reg .u32 %validity_word_idx;
     .reg .u32 %validity_bit_idx;
     .reg .u32 %validity_word;
@@ -88,6 +93,7 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     .reg .u32 %text_start32;
     .reg .u32 %text_end32;
     .reg .u32 %text_len;
+    .reg .u32 %text_valid;
     .reg .u32 %text_slot;
     .reg .u32 %copy_idx;
     .reg .u32 %one;
@@ -103,6 +109,7 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     .reg .u64 %projection_offset3;
     .reg .u64 %text_offsets_offset;
     .reg .u64 %text_bytes_offset;
+    .reg .u64 %text_validity_offset;
     .reg .u64 %needles;
     .reg .u64 %out_values;
     .reg .u64 %out_needle_indices;
@@ -110,6 +117,7 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     .reg .u64 %out_text_starts;
     .reg .u64 %out_text_lens;
     .reg .u64 %out_text_bytes;
+    .reg .u64 %out_text_validity;
     .reg .u64 %out_count;
     .reg .u64 %out_text_count;
     .reg .u64 %row_byte;
@@ -142,6 +150,8 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     ld.param.u64 %projection_offset3, [projection_offset3];
     ld.param.u64 %text_offsets_offset, [text_offsets_offset];
     ld.param.u64 %text_bytes_offset, [text_bytes_offset];
+    ld.param.u64 %text_validity_offset, [text_validity_offset];
+    ld.param.u32 %has_text_validity, [has_text_validity];
     ld.param.u64 %needles, [needles_ptr];
     ld.param.u64 %out_values, [out_values_ptr];
     ld.param.u64 %out_needle_indices, [out_needle_indices_ptr];
@@ -149,6 +159,7 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     ld.param.u64 %out_text_starts, [out_text_starts_ptr];
     ld.param.u64 %out_text_lens, [out_text_lens_ptr];
     ld.param.u64 %out_text_bytes, [out_text_bytes_ptr];
+    ld.param.u64 %out_text_validity, [out_text_validity_ptr];
     ld.param.u64 %out_count, [out_count_ptr];
     ld.param.u64 %out_text_count, [out_text_count_ptr];
 
@@ -208,6 +219,25 @@ MATCHED:
     cvt.u64.u32 %text_end64, %text_end32;
     sub.u32 %text_len, %text_end32, %text_start32;
 
+    mov.u32 %text_valid, 1;
+    setp.eq.u32 %p_done, %has_text_validity, 0;
+    @%p_done bra TEXT_VALIDITY_READY;
+    shr.u32 %validity_word_idx, %idx32, 5;
+    and.b32 %validity_bit_idx, %idx32, 31;
+    mul.wide.u32 %validity_word_byte, %validity_word_idx, 4;
+    add.u64 %addr, %resident, %text_validity_offset;
+    add.u64 %addr, %addr, %validity_word_byte;
+    ld.global.u32 %validity_word, [%addr];
+    mov.u32 %validity_mask, 1;
+    shl.b32 %validity_mask, %validity_mask, %validity_bit_idx;
+    and.b32 %validity_word, %validity_word, %validity_mask;
+    setp.ne.u32 %p_done, %validity_word, 0;
+    @%p_done bra TEXT_VALIDITY_READY;
+    mov.u32 %text_valid, 0;
+    mov.u32 %text_len, 0;
+
+TEXT_VALIDITY_READY:
+
     mov.u32 %one, 1;
     atom.global.add.u32 %slot, [%out_count], %one;
     cvt.u64.u32 %slot64, %slot;
@@ -221,6 +251,9 @@ MATCHED:
     mul.lo.u64 %out_addr, %slot64, 8;
     add.u64 %out_addr, %out_row_indices, %out_addr;
     st.global.u64 [%out_addr], %idx;
+
+    add.u64 %out_addr, %out_text_validity, %slot64;
+    st.global.u8 [%out_addr], %text_valid;
 
     mul.lo.u64 %out_addr, %slot64, 4;
     add.u64 %addr, %out_text_starts, %out_addr;
@@ -333,6 +366,18 @@ DONE:
             ));
         }
     }
+    if let Some(validity_offset) = text_validity_bitmap_offset {
+        let validity_end = row_count
+            .div_ceil(32)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .and_then(|bytes| validity_offset.checked_add(bytes))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if validity_end > resident.metadata().allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                validity_end as usize,
+            ));
+        }
+    }
     for byte_offset in projection_offsets {
         let bytes = row_count
             .checked_mul(std::mem::size_of::<i32>() as u64)
@@ -368,6 +413,8 @@ DONE:
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
     )
     .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output_text_validity_bytes = usize::try_from(row_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     let output_text_bytes = usize::try_from(text_bytes_len)
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?
         .max(1);
@@ -404,9 +451,9 @@ DONE:
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
-    // P2-M2 (text-route async lever): the c64 wall of this route was its 11 synchronous,
-    // default/NULL-stream memory ops (1 HtoD + 2 memset + 8 D2H) — the driver serializes those
-    // context-wide across concurrent readers, so 64 threads × 11 ops queued behind one barrier
+    // P2-M2 (text-route async lever): the c64 wall of this route was its repeated synchronous
+    // default/NULL-stream HtoD, memset, and D2H operations — the driver serializes those
+    // context-wide across concurrent readers, so 64 threads queued behind the same barriers
     // (measured 99.7 % of a 12.8 ms c64 wall; the kernel + its private-stream sync were < 0.5 %).
     // The fix moves every one of those ops onto the route's **already-pooled private stream**
     // via the `*Async` variants behind exactly TWO `cuStreamSynchronize` (one after the kernel
@@ -451,6 +498,9 @@ DONE:
         .primary()
         .lease_device_buffer(output_indices_bytes)?;
     let text_bytes_guard = resident.primary().lease_device_buffer(output_text_bytes)?;
+    let text_validity_guard = resident
+        .primary()
+        .lease_device_buffer(output_text_validity_bytes)?;
     // Fused counters: `count` at +0, `text_count` at +4 of one 8-byte device buffer, so both
     // are zeroed by one memset and read back by one D2H. The kernel still receives two distinct
     // pointers (it does `atom.add` into each independently), so no kernel change is required.
@@ -486,6 +536,8 @@ DONE:
     let mut text_offsets_arg = text_offsets_byte_offset;
     let mut text_bytes_arg = text_bytes_byte_offset;
     let mut text_bytes_len_arg = _text_bytes_len_u32;
+    let mut text_validity_offset_arg = text_validity_bitmap_offset.unwrap_or(0);
+    let mut has_text_validity_arg = u32::from(text_validity_bitmap_offset.is_some());
     let mut needles_arg = needles_guard.ptr;
     let mut output_arg = values_guard.ptr;
     let mut indices_arg = indices_guard.ptr;
@@ -493,6 +545,7 @@ DONE:
     let mut text_starts_arg = text_starts_guard.ptr;
     let mut text_lens_arg = text_lens_guard.ptr;
     let mut text_output_arg = text_bytes_guard.ptr;
+    let mut text_validity_output_arg = text_validity_guard.ptr;
     let mut count_arg = count_ptr;
     let mut text_count_arg = text_count_ptr;
     let mut args = [
@@ -510,6 +563,8 @@ DONE:
         (&mut text_offsets_arg as *mut u64).cast::<c_void>(),
         (&mut text_bytes_arg as *mut u64).cast::<c_void>(),
         (&mut text_bytes_len_arg as *mut u32).cast::<c_void>(),
+        (&mut text_validity_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut has_text_validity_arg as *mut u32).cast::<c_void>(),
         (&mut needles_arg as *mut u64).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
         (&mut indices_arg as *mut u64).cast::<c_void>(),
@@ -517,6 +572,7 @@ DONE:
         (&mut text_starts_arg as *mut u64).cast::<c_void>(),
         (&mut text_lens_arg as *mut u64).cast::<c_void>(),
         (&mut text_output_arg as *mut u64).cast::<c_void>(),
+        (&mut text_validity_output_arg as *mut u64).cast::<c_void>(),
         (&mut count_arg as *mut u64).cast::<c_void>(),
         (&mut text_count_arg as *mut u64).cast::<c_void>(),
     ];
@@ -672,14 +728,15 @@ DONE:
 
         // (3) Stream-ordered result D2H into pooled pinned host buffers (one queued copy per
         // result array, each reading back only the populated [0, count) prefix of its worst-
-        // case device buffer), then ONE sync #2 — so the six copies overlap on the copy engine
-        // instead of serializing as six blocking default-stream barriers. After the sync, the
+        // case device buffer), then ONE sync #2 — so the copies overlap on the copy engine
+        // instead of serializing as blocking default-stream barriers. After the sync, the
         // pinned bytes are copied into owned Vecs (pinned buffers return to the pool on drop).
         let mut values = vec![0_i32; match_count_usize.saturating_mul(projection_count)];
         let mut needle_indices = vec![0_u32; match_count_usize];
         let mut row_indices = vec![0_u64; match_count_usize];
         let mut text_starts = vec![0_u32; match_count_usize];
         let mut text_lens = vec![0_u32; match_count_usize];
+        let mut text_validity = vec![0_u8; match_count_usize];
         let mut text_bytes = vec![0_u8; compact_text_usize];
 
         // Each staged D2H enqueues an async copy before it can return `Err`, so its error path
@@ -727,6 +784,14 @@ DONE:
             &mut text_lens,
         )
         .map_err(drain_err)?;
+        let text_validity_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            text_validity_guard.ptr,
+            &mut text_validity,
+        )
+        .map_err(drain_err)?;
         let text_bytes_pinned = stage_result_dtoh_async(
             resident.primary(),
             dtoh_async,
@@ -735,7 +800,7 @@ DONE:
             &mut text_bytes,
         )
         .map_err(drain_err)?;
-        // Covering sync #2: drains on its own error too (six result D2H still enqueued).
+        // Covering sync #2: drains on its own error too (seven result D2H still enqueued).
         check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
             .map_err(drain_err)?;
 
@@ -744,6 +809,7 @@ DONE:
         copy_pinned_into(&row_indices_pinned, &mut row_indices);
         copy_pinned_into(&text_starts_pinned, &mut text_starts);
         copy_pinned_into(&text_lens_pinned, &mut text_lens);
+        copy_pinned_into(&text_validity_pinned, &mut text_validity);
         copy_pinned_into(&text_bytes_pinned, &mut text_bytes);
         drop(lease);
 
@@ -757,6 +823,7 @@ DONE:
             &row_indices,
             &text_starts,
             &text_lens,
+            &text_validity,
             &text_bytes,
         );
     } else {
@@ -853,6 +920,16 @@ DONE:
             )
         })?;
     }
+    let mut text_validity = vec![0_u8; match_count_usize];
+    if !text_validity.is_empty() {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                text_validity.as_mut_ptr().cast::<c_void>(),
+                text_validity_guard.ptr,
+                text_validity.len(),
+            )
+        })?;
+    }
     let mut text_bytes = vec![
         0_u8;
         usize::try_from(compact_text_len).map_err(|_| {
@@ -870,6 +947,7 @@ DONE:
     }
 
     drop(counters_guard);
+    drop(text_validity_guard);
     drop(text_bytes_guard);
     drop(text_lens_guard);
     drop(text_starts_guard);
@@ -887,6 +965,7 @@ DONE:
         &row_indices,
         &text_starts,
         &text_lens,
+        &text_validity,
         &text_bytes,
     )
 }
@@ -905,6 +984,7 @@ fn assemble_i32_text_batch_projection_rows(
     row_indices: &[u64],
     text_starts: &[u32],
     text_lens: &[u32],
+    text_validity: &[u8],
     text_bytes: &[u8],
 ) -> Result<Vec<CudaI32TextBatchProjectionRow>, CudaRuntimeProbeError> {
     if needle_indices.len() != expected_match_count {
@@ -919,7 +999,12 @@ fn assemble_i32_text_batch_projection_rows(
     if values.len() != expected_values {
         return Err(CudaRuntimeProbeError::InvalidInputLength(values.len()));
     }
-    for result_len in [row_indices.len(), text_starts.len(), text_lens.len()] {
+    for result_len in [
+        row_indices.len(),
+        text_starts.len(),
+        text_lens.len(),
+        text_validity.len(),
+    ] {
         if result_len != match_count {
             return Err(CudaRuntimeProbeError::InvalidInputLength(result_len));
         }
@@ -938,6 +1023,12 @@ fn assemble_i32_text_batch_projection_rows(
             let row_index = row_indices[match_idx];
             let text_start = text_starts[match_idx];
             let text_len = text_lens[match_idx];
+            let text_valid = text_validity[match_idx];
+            if text_valid > 1 {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(usize::from(
+                    text_valid,
+                )));
+            }
             let needle_index = usize::try_from(needle_index)
                 .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
             if needle_index >= needles.len() {
@@ -964,6 +1055,7 @@ fn assemble_i32_text_batch_projection_rows(
                 row_index,
                 values: row.to_vec(),
                 text,
+                text_is_null: text_valid == 0,
             })
         })
         .collect()
@@ -985,6 +1077,7 @@ mod tests {
             &[0, 2],
             &[0, 3],
             &[3, 0],
+            &[1, 1],
             b"abc",
         )
         .unwrap();
@@ -997,12 +1090,14 @@ mod tests {
                     row_index: 0,
                     values: Vec::new(),
                     text: "abc".to_string(),
+                    text_is_null: false,
                 },
                 CudaI32TextBatchProjectionRow {
                     needle_index: 1,
                     row_index: 2,
                     values: Vec::new(),
                     text: String::new(),
+                    text_is_null: false,
                 },
             ]
         );
@@ -1019,6 +1114,7 @@ mod tests {
             &[0],
             &[],
             &[0],
+            &[1],
             &[1],
             b"x",
         )
@@ -1037,6 +1133,7 @@ mod tests {
             &[0],
             &[0],
             &[0],
+            &[1],
             &[1],
             b"x",
         )
@@ -1057,10 +1154,52 @@ mod tests {
                 &[0],
                 &[0],
                 &[1],
+                &[1],
                 b"x",
             )
             .unwrap_err();
             assert!(matches!(err, CudaRuntimeProbeError::InvalidInputLength(_)));
         }
+    }
+
+    #[test]
+    fn text_row_assembly_preserves_null_and_empty_identity() {
+        let rows = assemble_i32_text_batch_projection_rows(
+            &[7],
+            2,
+            0,
+            2,
+            &[],
+            &[0, 0],
+            &[0, 1],
+            &[0, 0],
+            &[0, 0],
+            &[0, 1],
+            b"",
+        )
+        .unwrap();
+        assert!(rows[0].text_is_null);
+        assert_eq!(rows[0].text, "");
+        assert!(!rows[1].text_is_null);
+        assert_eq!(rows[1].text, "");
+    }
+
+    #[test]
+    fn text_row_assembly_rejects_invalid_validity_status() {
+        let err = assemble_i32_text_batch_projection_rows(
+            &[7],
+            1,
+            0,
+            1,
+            &[],
+            &[0],
+            &[0],
+            &[0],
+            &[0],
+            &[2],
+            b"",
+        )
+        .unwrap_err();
+        assert!(matches!(err, CudaRuntimeProbeError::InvalidInputLength(2)));
     }
 }

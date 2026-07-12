@@ -1321,6 +1321,8 @@ impl Engine {
                     )))
                 })?;
             let layout = resident_device_text_column_layout(&snapshot, &table, text_idx)?;
+            let text_validity_bitmap_offset =
+                resident_device_null_column_offset(&snapshot, &table, text_idx)?;
             Some(
                 device_memory
                     .match_project_i32_equal_any_text_from_payload(
@@ -1331,6 +1333,7 @@ impl Engine {
                         layout.offsets_byte_offset,
                         layout.bytes_byte_offset,
                         layout.bytes_len,
+                        text_validity_bitmap_offset,
                         row_count,
                     )
                     .map_err(|err| {
@@ -1416,6 +1419,9 @@ impl Engine {
                     .iter()
                     .map(|idx| {
                         if *idx == text_idx {
+                            if projected.text_is_null {
+                                return Ok(SqlValue::Null);
+                            }
                             return Ok(SqlValue::Text(projected.text.clone()));
                         }
                         if let Some(position) = int4_positions.get(idx) {

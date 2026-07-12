@@ -72,3 +72,51 @@ fn text_only_point_projection_runs_on_gpu_without_numeric_projection_slots() {
     assert_eq!(batched[1].executed_target, DeviceTarget::Gpu(0));
     assert_eq!(batched[1].rows, zero_result.rows);
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn nullable_text_point_projection_keeps_null_distinct_from_empty_on_gpu() {
+    let mut e = Engine::new_local_cpu_oracle();
+    e.execute_text(1, "CREATE TABLE nullable_labels (k INT, label TEXT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO nullable_labels (k, label) VALUES (1, NULL), (1, ''), (1, 'value'), (2, 'skip')",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("nullable_labels")
+        .unwrap();
+
+    let Command::Select(select) =
+        parse_command("SELECT label FROM nullable_labels WHERE k = 1").unwrap()
+    else {
+        unreachable!()
+    };
+    let route = e.plan_relational_resident_route(&select);
+    assert!(
+        route.accepted,
+        "nullable TEXT route must remain GPU-eligible"
+    );
+
+    let oracle = e.execute_relational_select(&select).unwrap();
+    assert_eq!(oracle.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        oracle.rows,
+        vec![
+            vec![SqlValue::Null],
+            vec![SqlValue::Text(String::new())],
+            vec![SqlValue::Text("value".to_string())],
+        ]
+    );
+
+    let job = e.prepare_relational_retained_read_job(&select).unwrap();
+    let submission = e
+        .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[job])
+        .unwrap();
+    let retained = e
+        .complete_relational_retained_read_submission(submission)
+        .unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(retained[0].rows, oracle.rows);
+}

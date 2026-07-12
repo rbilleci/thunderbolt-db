@@ -21,9 +21,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001N:** carry projected text validity through the compact GPU point-read result so SQL NULL stays
-   distinct from `''`; update execution/engine/example contracts without a CPU relational fallback and rerun
-   NULL/empty/non-empty HAZARD gates plus the canonical report card.
+1. **STRUCT-001O:** isolate the resident int4 equality row-selector PTX and result lifecycle in a focused private
+   module while preserving the public facade, exact behavior, GPU safety, and performance. Leave its existing
+   host ordering explicitly owned by **RETIRE-003**, and do not move the CPU `between` selector into the module.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.

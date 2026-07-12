@@ -124,8 +124,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   zero CUDA 700/716/717 errors. Independent audit passed after its correctness, exact-count, and test non-vacuity
   findings were adopted. The final card stayed green: `count_i32_compare` measured 0.96x/1.01x same-run roofline
   in-L2/out-of-L2, while 65,536-batch point reads measured 247.3M/252.2M lookups/s at p50 139/132us. The focused
-  GPU regression is isolated in a new 74-line test module. Projected nullable text identity remains **STRUCT-001N**.
-  The execution root is 26,242 lines; further structural extraction remains **STRUCT-001**.
+  GPU regression is isolated in a focused test module. Projected nullable text validity now travels from the
+  resident bitmap through PTX compaction and the execution result contract; NULL text receives a distinct status
+  byte and both engine/example consumers map it to `SqlValue::Null`, while `''` remains a valid empty string. The
+  retained GPU differential covers NULL, empty, and nonempty text on both ordinary and retained-job routes with
+  no host fallback. The exact execution inventory is 101 tests, 31 non-ignored tests pass, and the engine
+  inventory is 992 tests. Nullable-text/TEXT-only/pinned-pool HAZARD gates passed 3× sequential and 2× concurrent
+  with zero CUDA 700/716/717 errors; independent audit found no remaining issue after two stale comment counts
+  were removed. The final card stayed green: `count_i32_compare` measured 0.91x/1.01x same-run roofline in-L2/
+  out-of-L2, while 65,536-batch point reads measured 245.4M/253.9M lookups/s at p50 139/131us. The focused GPU
+  regression module is 122 lines. The execution root is 26,246 lines; further extraction remains **STRUCT-001**.
 
 ## Known boundaries
 

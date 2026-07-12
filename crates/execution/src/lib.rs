@@ -115,6 +115,7 @@ impl CudaResidentDeviceMemoryReadView {
         text_offsets_byte_offset: u64,
         text_bytes_byte_offset: u64,
         text_bytes_len: u64,
+        text_validity_bitmap_offset: Option<u64>,
         row_count: u64,
     ) -> Result<Vec<CudaI32TextBatchProjectionRow>, CudaRuntimeProbeError> {
         launch_cuda_resident_i32_equal_any_project_text(
@@ -126,6 +127,7 @@ impl CudaResidentDeviceMemoryReadView {
             text_offsets_byte_offset,
             text_bytes_byte_offset,
             text_bytes_len,
+            text_validity_bitmap_offset,
             row_count,
         )
     }
@@ -1690,6 +1692,7 @@ impl CudaResidentDeviceMemory {
         text_offsets_byte_offset: u64,
         text_bytes_byte_offset: u64,
         text_bytes_len: u64,
+        text_validity_bitmap_offset: Option<u64>,
         row_count: u64,
     ) -> Result<Vec<CudaI32TextBatchProjectionRow>, CudaRuntimeProbeError> {
         launch_cuda_resident_i32_equal_any_project_text(
@@ -1701,6 +1704,7 @@ impl CudaResidentDeviceMemory {
             text_offsets_byte_offset,
             text_bytes_byte_offset,
             text_bytes_len,
+            text_validity_bitmap_offset,
             row_count,
         )
     }

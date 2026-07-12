@@ -657,6 +657,11 @@ fn execute_retained_read_runtime_text_batch(
             text_layout.offsets_byte_offset,
             text_layout.bytes_byte_offset,
             text_layout.bytes_len,
+            route
+                .null_columns
+                .iter()
+                .find(|layout| layout.name == text_layout.name)
+                .map(|layout| layout.bitmap_byte_offset),
             route.row_count,
         )
         .map_err(|err| err.to_string())?;
@@ -671,6 +676,10 @@ fn execute_retained_read_runtime_text_batch(
             let mut values = Vec::with_capacity(batch_key.projection_columns.len());
             for column in &batch_key.projection_columns {
                 if column == &text_layout.name {
+                    if row.text_is_null {
+                        values.push(SqlValue::Null);
+                        continue;
+                    }
                     values.push(SqlValue::Text(row.text.clone()));
                 } else {
                     let value_idx =

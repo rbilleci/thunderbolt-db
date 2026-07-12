@@ -438,4 +438,5 @@ pub struct CudaI32TextBatchProjectionRow {
     pub row_index: u64,
     pub values: Vec<i32>,
     pub text: String,
+    pub text_is_null: bool,
 }
