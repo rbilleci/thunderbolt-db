@@ -83,7 +83,11 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   now owns resident allocation/read-view/chunk contracts, bounded copies, append, telemetry, the read-source
   trait, Debug, and context-bound Drop. Its append/generation/submit-complete/NULL GPU matrix passed 3×
   sequential and 2× concurrent; independent audit found bounds, Arc lifetime, and field-drop behavior unchanged.
-  The execution root is 30,076 lines. Further extraction is owned by **STRUCT-001H/STRUCT-001**.
+  The 441-line `execution::point_read_submission` module now owns batched projection result contracts, owned
+  pooled guards, detached completion, pinned final readback, error drains, and drop-without-complete fencing. Its
+  submit/drop/pool/NULL matrix passed 3× sequential and 2× concurrent; independent audit found the single-sync
+  and field-drop behavior unchanged and its documentation-placement finding was adopted. The execution root is
+  29,647 lines. Further extraction is owned by **STRUCT-001I/STRUCT-001**.
 
 ## Known boundaries
 
