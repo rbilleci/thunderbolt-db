@@ -21,8 +21,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001P:** isolate the five GPU ORDER BY sort launchers in a focused private module while preserving all
-   public methods, PTX and launch behavior, NULL/direction semantics, device lifetimes, ordering, and performance.
+1. **STRUCT-001Q:** isolate nullable int4 scalar-count reductions, their serial parity kernels, and shared bitmap
+   validation in a focused private module while preserving public methods, test access, later stats callers,
+   device lifetimes, NULL semantics, reduction behavior, and performance.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.

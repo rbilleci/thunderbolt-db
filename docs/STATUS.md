@@ -141,8 +141,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inventory and 31 passing non-ignored tests are unchanged; equality/multi-warp/pinned-pool gates passed 3×
   sequential and 2× concurrent with no CUDA safety errors. Independent audit and all target/feature checks passed.
   The final card stayed green: `count_i32_compare` measured 0.97x/1.02x roofline in-L2/out-of-L2 and 65,536-batch
-  point reads measured 247.5M/252.9M lookups/s at p50 140/132us. The execution root is 25,780 lines; further
-  extraction remains **STRUCT-001**.
+  point reads measured 247.5M/252.9M lookups/s at p50 140/132us. The five GPU ORDER BY launchers now live in
+  the private 846-line `execution::resident_sort` module. Their normalized source is byte-identical: public
+  wrappers, PTX paths/symbols/arguments/grids, device and uploaded-payload lifetimes, stream synchronization,
+  NULL/direction/text/multikey semantics, and padding filtering are unchanged. The exact 101-test inventory and
+  31 passing non-ignored tests remain stable. Six i64/radix/multikey/heterogeneous/dedicated-text gates passed 3×
+  sequential and 2× concurrent (18/24 invocations) without CUDA safety errors; independent audit's missing
+  dedicated-text evidence finding was adopted. The final card kept bitonic sort at 346.6 Melem/s, count at
+  0.91x/1.00x same-run roofline, and 65,536-batch point reads at 247.7M/251.5M lookups/s with p50 137/132us.
+  The execution root is 24,946 lines; further extraction remains **STRUCT-001**.
 
 ## Known boundaries
 
