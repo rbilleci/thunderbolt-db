@@ -21,9 +21,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001R:** isolate the shared fixed-width resident gather lifecycle and int4/bool/int8/i128 wrappers in
-   a focused private module while preserving public methods, bounded final readback, row-index upload, bitmap
-   addressing, output layout, device lifetimes, and performance.
+1. **STRUCT-001S:** isolate int8/i128/text/UUID/bool resident predicate launchers and nullable-mask compaction in
+   a focused private module while preserving public methods, typed/NULL semantics, device compaction, bounded
+   result readback, device lifetimes, and performance.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.

@@ -157,7 +157,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   compare/NULL/concurrency/later-stats gates passed 3× sequential and 2× concurrent (15/20 invocations) without
   CUDA safety errors. Independent audit's two low-severity extraction-seam blank findings were adopted. The final
   card kept count at 0.86x/1.02x same-run roofline and 65,536-batch point reads at 247.3M/253.1M lookups/s with
-  p50 140/131us. The execution root is 23,898 lines; further extraction remains **STRUCT-001**.
+  p50 140/131us. The shared fixed-width gather lifecycle and int4/bool/int8/i128 projection wrappers now live
+  in the private 258-line `execution::resident_gather` module. Their normalized source is byte-identical: bounds
+  precede every device access; PTX entries/arguments/grids, row-index H2D, pooled stream/scratch, synchronization,
+  one bounded result D2H, bool bitmap addressing, i128 endian layout, and public methods are unchanged. The exact
+  101-test inventory and 31 passing non-ignored tests remain stable. Five width/bool/pool gates passed 3×
+  sequential and 2× concurrent (15/20 invocations) without CUDA safety errors. Independent audit's low-severity
+  seam and stale public bool-documentation findings were adopted; the public docs now describe the actual one-
+  kernel/one-readback path. The final card kept gather at 349.5/155.3 GB/s in-L2/out-of-L2, count at 0.85x/1.01x
+  roofline, and 65,536-batch point reads at 246.1M/251.1M lookups/s with p50 140/131us. The execution root is
+  23,648 lines; further extraction remains **STRUCT-001**.
 
 ## Known boundaries
 
