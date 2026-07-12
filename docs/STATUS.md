@@ -149,7 +149,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   sequential and 2× concurrent (18/24 invocations) without CUDA safety errors; independent audit's missing
   dedicated-text evidence finding was adopted. The final card kept bitonic sort at 346.6 Melem/s, count at
   0.91x/1.00x same-run roofline, and 65,536-batch point reads at 247.7M/251.5M lookups/s with p50 137/132us.
-  The execution root is 24,946 lines; further extraction remains **STRUCT-001**.
+  The nullable int4 equality/comparison reductions and both test-only GPU serial parity kernels now live in the
+  private 1,066-line `execution::resident_count` module. Their normalized source is byte-identical: bitmap bounds
+  and NULL semantics, PTX/symbols/arguments/grids, serial allocation/module guards, parallel cached-module and
+  pooled-stream reduction, public methods, test access, and parent-private bitmap validation for later scalar
+  stats are unchanged. The exact 101-test inventory and 31 passing non-ignored tests remain stable. Five equal/
+  compare/NULL/concurrency/later-stats gates passed 3× sequential and 2× concurrent (15/20 invocations) without
+  CUDA safety errors. Independent audit's two low-severity extraction-seam blank findings were adopted. The final
+  card kept count at 0.86x/1.02x same-run roofline and 65,536-batch point reads at 247.3M/253.1M lookups/s with
+  p50 140/131us. The execution root is 23,898 lines; further extraction remains **STRUCT-001**.
 
 ## Known boundaries
 
