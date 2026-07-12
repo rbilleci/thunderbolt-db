@@ -12,6 +12,8 @@ pub struct WriteLocateShard {
     pub index: Arc<CudaResidentDeviceMemory>,
     pub table_mask: u32,
     pub hash_shift: u32,
+    /// Logical number of rows whose packed slots are valid in this index.
+    pub row_count: u32,
 }
 
 /// Per-needle device-locate result: a fixed `max_hits` window of `(shard_idx, slot)` pairs +
@@ -29,19 +31,72 @@ pub struct WriteLocateResult {
 
 /// U1 (lane DELETE intents): one shard's device hash index + its VERSION regions for the
 /// VISIBLE-LOCATE kernel — visibility (`created_by <= snap && deleted_by > snap`) is evaluated
-/// ON THE DEVICE per hit, so the host never rechecks. A zero region pointer means the region was
-/// never allocated: `created_by == 0` = born-visible (fill 0x00), `deleted_by == 0` = all-live
-/// (fill 0x7F). The caller must PIN the regions (hold their Arcs) across the submit call — this
-/// struct carries raw pointers for the descriptor image.
+/// ON THE DEVICE per hit, so the host never rechecks. An absent region means it was never allocated:
+/// absent `created_by` = born-visible and absent `deleted_by` = all-live. Owners remain pinned by
+/// this descriptor through the synchronous launch.
 pub struct VisibleLocateShard {
     /// The shard's DEVICE hash index (`(key<<32)|(row+1)`, 0 = empty), pinned until the kernel completes.
     pub index: Arc<CudaResidentDeviceMemory>,
     pub table_mask: u32,
     pub hash_shift: u32,
-    /// `created_by[row]` u64 region base, or 0 (absent = every row born-visible).
-    pub created_by_ptr: u64,
-    /// `deleted_by[row]` u64 region base, or 0 (absent = every row live).
-    pub deleted_by_ptr: u64,
+    pub row_count: u32,
+    /// `created_by[row]` u64 region owner; absent means every row was born visible.
+    pub created_by: Option<Arc<CudaResidentDeviceMemory>>,
+    /// `deleted_by[row]` u64 region owner; absent means every row remains live.
+    pub deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
+}
+
+fn validate_index_geometry(
+    allocated_bytes: u64,
+    table_mask: u32,
+    hash_shift: u32,
+) -> Result<(), CudaRuntimeProbeError> {
+    let table_slots = u64::from(table_mask)
+        .checked_add(1)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if table_slots < 2 || !table_slots.is_power_of_two() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(table_mask as usize));
+    }
+    let expected_shift = 32 - table_slots.trailing_zeros();
+    let required_bytes = table_slots
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if hash_shift != expected_shift || required_bytes > allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(required_bytes).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_version_region(
+    region: &CudaResidentDeviceMemory,
+    row_count: u32,
+) -> Result<(), CudaRuntimeProbeError> {
+    let required_bytes = u64::from(row_count)
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if required_bytes > region.metadata().allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(required_bytes).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
+}
+
+type CuStreamSync = unsafe extern "C" fn(*mut c_void) -> i32;
+
+struct DefaultStreamDrain {
+    sync: CuStreamSync,
+    armed: bool,
+}
+
+impl Drop for DefaultStreamDrain {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe { (self.sync)(std::ptr::null_mut()) };
+        }
+    }
 }
 
 /// Per-needle VISIBLE-locate result: the count of VISIBLE matches at the needle's snapshot
@@ -77,9 +132,9 @@ const VISIBLE_LOCATE_PTX: &[u8] = br#"
     .param .u64 out_count_ptr
 )
 {
-    .reg .pred %p<8>;
-    .reg .b32 %r<20>;
-    .reg .b64 %rd<32>;
+    .reg .pred %p<9>;
+    .reg .b32 %r<21>;
+    .reg .b64 %rd<33>;
 
     ld.param.u64 %rd1, [desc_array_ptr];
     ld.param.u32 %r1, [shard_count];
@@ -112,7 +167,7 @@ const VISIBLE_LOCATE_PTX: &[u8] = br#"
 SHARD:
     setp.ge.u32 %p1, %r11, %r1;
     @%p1 bra WRITEOUT;
-    mul.wide.u32 %rd12, %r11, 32;
+    mul.wide.u32 %rd12, %r11, 40;
     add.u64 %rd13, %rd1, %rd12;
     ld.global.u64 %rd14, [%rd13];
     ld.global.u64 %rd15, [%rd13+8];
@@ -121,6 +176,7 @@ SHARD:
     cvt.u32.u64 %r13, %rd16;
     ld.global.u64 %rd17, [%rd13+16];
     ld.global.u64 %rd18, [%rd13+24];
+    ld.global.u32 %r19, [%rd13+32];
 
     mul.lo.u32 %r14, %r7, 2654435761;
     shr.u32 %r15, %r14, %r13;
@@ -139,6 +195,8 @@ PROBE:
     @%p2 bra ADVANCE;
     cvt.u32.u64 %r18, %rd21;
     sub.u32 %r18, %r18, 1;
+    setp.ge.u32 %p8, %r18, %r19;
+    @%p8 bra BADINDEX;
     setp.eq.u64 %p3, %rd17, 0;
     @%p3 bra CBOK;
     mul.wide.u32 %rd23, %r18, 8;
@@ -161,6 +219,10 @@ VISHIT:
     mov.u32 %r10, %r18;
 VCOUNT:
     add.u32 %r8, %r8, 1;
+    bra ADVANCE;
+BADINDEX:
+    mov.u32 %r8, 4294967295;
+    bra WRITEOUT;
 ADVANCE:
     add.u32 %r15, %r15, 1;
     and.b32 %r15, %r15, %r12;
@@ -210,7 +272,7 @@ const WRITE_LOCATE_PTX: &[u8] = br#"
     .param .u64 out_count_ptr
 )
 {
-    .reg .pred %p<6>;
+    .reg .pred %p<7>;
     .reg .b32 %r<24>;
     .reg .b64 %rd<24>;
 
@@ -240,13 +302,14 @@ const WRITE_LOCATE_PTX: &[u8] = br#"
 SHARD:
     setp.ge.u32 %p1, %r10, %r1;
     @%p1 bra WRITECOUNT;
-    mul.wide.u32 %rd8, %r10, 16;
+    mul.wide.u32 %rd8, %r10, 24;
     add.u64 %rd9, %rd1, %rd8;
     ld.global.u64 %rd10, [%rd9];
     ld.global.u64 %rd11, [%rd9+8];
     cvt.u32.u64 %r11, %rd11;
     shr.u64 %rd12, %rd11, 32;
     cvt.u32.u64 %r12, %rd12;
+    ld.global.u32 %r20, [%rd9+16];
 
     mul.lo.u32 %r13, %r8, 2654435761;
     shr.u32 %r14, %r13, %r12;
@@ -273,6 +336,8 @@ PROBE:
 FOUND:
     cvt.u32.u64 %r17, %rd15;
     sub.u32 %r17, %r17, 1;
+    setp.ge.u32 %p6, %r17, %r20;
+    @%p6 bra BADINDEX;
     setp.ge.u32 %p4, %r9, %r3;
     @%p4 bra INCCOUNT;
     mad.lo.u32 %r18, %r7, %r3, %r9;
@@ -293,6 +358,9 @@ INCCOUNT:
     setp.ge.u32 %p3, %r15, 256;
     @%p3 bra NEXTSHARD;
     bra PROBE;
+BADINDEX:
+    mov.u32 %r9, 4294967294;
+    bra WRITECOUNT;
 NEXTSHARD:
     add.u32 %r10, %r10, 1;
     bra SHARD;
@@ -300,6 +368,8 @@ NEXTSHARD:
 WRITECOUNT:
     mul.wide.u32 %rd21, %r7, 4;
     add.u64 %rd22, %rd5, %rd21;
+    setp.eq.u32 %p6, %r9, 4294967294;
+    @%p6 bra WINVALID;
     setp.gt.u32 %p5, %r9, %r3;
     @%p5 bra WOVER;
     st.global.u32 [%rd22], %r9;
@@ -307,6 +377,9 @@ WRITECOUNT:
 WOVER:
     mov.u32 %r19, 4294967295;
     st.global.u32 [%rd22], %r19;
+    bra DONE;
+WINVALID:
+    st.global.u32 [%rd22], %r9;
 
 DONE:
     ret;
@@ -327,7 +400,6 @@ impl CudaResidentDeviceMemory {
         needles: &[i32],
         max_hits: u32,
     ) -> Result<WriteLocateResult, CudaRuntimeProbeError> {
-        type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
         type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
         type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
         #[allow(clippy::type_complexity)]
@@ -348,28 +420,52 @@ impl CudaResidentDeviceMemory {
         if shards.is_empty() || needles.is_empty() {
             return Err(CudaRuntimeProbeError::InvalidInputLength(0));
         }
+        const MAX_PROBES_PER_SHARD: usize = 256;
+        const INVALID_COUNT: u32 = u32::MAX - 1;
+        let max_count = shards
+            .len()
+            .checked_mul(MAX_PROBES_PER_SHARD)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let max_count_u32 = u32::try_from(max_count)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(max_count))?;
+        if max_count_u32 >= INVALID_COUNT {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(max_count));
+        }
+        let shard_count_u32 = u32::try_from(shards.len())
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(shards.len()))?;
+        let needle_count_u32 = u32::try_from(needles.len())
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
         // COUNT-ONLY fast path (`max_hits == 0`): the kernel emits only per-needle counts (any hit
         // -> u32::MAX), NO shard/slot output — so wave-batch validation skips 2 device buffers +
         // 2 DtoH reads per wave (the shard/slot outputs it never consumes). The FOUND arm takes
         // INCCOUNT (count >= max_hits == 0 always), so the shard/slot pointers are never
         // dereferenced; a valid dummy (the count buffer) is passed for them.
         let count_only = max_hits == 0;
-        const DESC_U64_PER_SHARD: usize = 2; // index_ptr, mask|shift
-        let mut desc: Vec<u64> = Vec::with_capacity(shards.len() * DESC_U64_PER_SHARD);
+        const DESC_U64_PER_SHARD: usize = 3; // index_ptr, mask|shift, logical row_count
+        let desc_capacity = shards
+            .len()
+            .checked_mul(DESC_U64_PER_SHARD)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let mut desc: Vec<u64> = Vec::with_capacity(desc_capacity);
         let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> = Vec::with_capacity(shards.len());
+        let primary = self.primary_arc();
         for shard in shards {
             if shard.index.device_ptr() == 0 {
                 return Err(CudaRuntimeProbeError::InvalidInputLength(0));
             }
+            if !Arc::ptr_eq(&primary, &shard.index.primary_arc()) {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+            }
+            validate_index_geometry(
+                shard.index.metadata().allocated_bytes,
+                shard.table_mask,
+                shard.hash_shift,
+            )?;
             desc.push(shard.index.device_ptr());
             desc.push((shard.table_mask as u64) | ((shard.hash_shift as u64) << 32));
+            desc.push(u64::from(shard.row_count));
             index_guards.push(Arc::clone(&shard.index));
         }
-        let shard_count_u32 = u32::try_from(shards.len())
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(shards.len()))?;
-        let needle_count_u32 = u32::try_from(needles.len())
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
-
         let window = (needles.len() as u64)
             .checked_mul(max_hits as u64)
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
@@ -392,15 +488,7 @@ impl CudaResidentDeviceMemory {
             .checked_mul(std::mem::size_of::<u64>())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
 
-        let primary = self.primary_arc();
         primary.set_current()?;
-        let cu_memset_d8 = unsafe {
-            primary
-                .lib()
-                .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
-                .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
-                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-        };
         let cu_memcpy_htod = unsafe {
             primary
                 .lib()
@@ -419,6 +507,12 @@ impl CudaResidentDeviceMemory {
             primary
                 .lib()
                 .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_stream_sync = unsafe {
+            *primary
+                .lib()
+                .get::<CuStreamSync>(b"cuStreamSynchronize\0")
                 .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
         };
 
@@ -446,7 +540,7 @@ impl CudaResidentDeviceMemory {
         let function =
             primary.cached_function(c"gpu_db_resident_multi_shard_i32_write_locate", &ptx)?;
 
-        // HtoD needles + descriptor (the count buffer's zero-init was dropped — see below).
+        // HtoD needles + the typed, preflighted descriptor image.
         check_cuda(unsafe {
             cu_memcpy_htod(
                 needles_guard.ptr,
@@ -457,11 +551,6 @@ impl CudaResidentDeviceMemory {
         check_cuda(unsafe {
             cu_memcpy_htod(desc_guard.ptr, desc.as_ptr().cast::<c_void>(), desc_bytes)
         })?;
-        // FUSE (driver-call trim): the count-buffer zero-init is DEAD — every needle-thread
-        // (tid < needle_count) stores its own final count at WRITECOUNT/overflow, so no slot is
-        // ever read stale. (Threads tid >= needle_count early-return but own no count slot.)
-        // Dropping the memset removes one driver call per wave; `_` binds the unused fn ptr.
-        let _ = cu_memset_d8;
 
         let mut desc_arg = desc_guard.ptr;
         let mut shard_count_arg = shard_count_u32;
@@ -483,6 +572,10 @@ impl CudaResidentDeviceMemory {
         ];
         let threads_per_block: u32 = 128;
         let blocks = needle_count_u32.div_ceil(threads_per_block);
+        let mut stream_drain = DefaultStreamDrain {
+            sync: cu_stream_sync,
+            armed: true,
+        };
         check_cuda(unsafe {
             cu_launch_kernel(
                 function,
@@ -498,15 +591,6 @@ impl CudaResidentDeviceMemory {
                 std::ptr::null_mut(),
             )
         })?;
-        // FUSE (driver-call trim): the explicit stream-synchronize is REDUNDANT — the count DtoH
-        // below (and, on the full path, the shard/slot DtoH) is a BLOCKING `cuMemcpyDtoH` on the
-        // null stream, which already waits for this kernel before copying. Dropping the sync
-        // removes one driver call per wave with zero semantic change (the readback still blocks).
-        // FENCE INVARIANT (do not break): this only fences the kernel — so the pooled guards below
-        // are not recycled mid-flight — because (a) the kernel launches on the NULL stream and (b) a
-        // NON-ZERO-length blocking DtoH runs on that same null stream on EVERY path before return.
-        // If you move the launch to a pooled/non-blocking stream or make the readback conditional,
-        // restore an explicit synchronize.
         let mut shard_idx = vec![0u32; window as usize];
         let mut slot = vec![0u32; window as usize];
         let mut count = vec![0u32; needles.len()];
@@ -529,6 +613,10 @@ impl CudaResidentDeviceMemory {
                 count_bytes,
             )
         })?;
+        if count.contains(&INVALID_COUNT) {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
+        stream_drain.armed = false;
         // The guards (device buffers + pinned indexes) drop here — after the sync, so the kernel is done.
         drop(index_guards);
         Ok(WriteLocateResult {
@@ -541,8 +629,7 @@ impl CudaResidentDeviceMemory {
 
     /// U1 VISIBLE-LOCATE submit (see [`VISIBLE_LOCATE_PTX`]): one coalesced launch resolving
     /// every needle to its VISIBLE match count + first visible (shard_idx, slot) at the needle's
-    /// OWN snapshot. `needles` and `snapshots` are parallel. The caller must hold the version
-    /// regions' Arcs across this call (the descriptor carries raw pointers).
+    /// OWN snapshot. `needles` and `snapshots` are parallel; typed shard owners pin every region.
     pub fn submit_multi_shard_i32_visible_locate(
         &self,
         shards: &[VisibleLocateShard],
@@ -569,24 +656,57 @@ impl CudaResidentDeviceMemory {
         if shards.is_empty() || needles.is_empty() || needles.len() != snapshots.len() {
             return Err(CudaRuntimeProbeError::InvalidInputLength(needles.len()));
         }
-        const DESC_U64_PER_SHARD: usize = 4; // index_ptr, mask|shift, created_by, deleted_by
-        let mut desc: Vec<u64> = Vec::with_capacity(shards.len() * DESC_U64_PER_SHARD);
-        let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> = Vec::with_capacity(shards.len());
-        for shard in shards {
-            if shard.index.device_ptr() == 0 {
-                return Err(CudaRuntimeProbeError::InvalidInputLength(0));
-            }
-            desc.push(shard.index.device_ptr());
-            desc.push((shard.table_mask as u64) | ((shard.hash_shift as u64) << 32));
-            desc.push(shard.created_by_ptr);
-            desc.push(shard.deleted_by_ptr);
-            index_guards.push(Arc::clone(&shard.index));
+        const MAX_PROBES_PER_SHARD: usize = 256;
+        const INVALID_COUNT: u32 = u32::MAX;
+        let max_count = shards
+            .len()
+            .checked_mul(MAX_PROBES_PER_SHARD)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let max_count_u32 = u32::try_from(max_count)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(max_count))?;
+        if max_count_u32 == INVALID_COUNT {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(max_count));
         }
         let shard_count_u32 = u32::try_from(shards.len())
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(shards.len()))?;
         let needle_count_u32 = u32::try_from(needles.len())
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
-
+        const DESC_U64_PER_SHARD: usize = 5; // index, geometry, created, deleted, row_count
+        let desc_capacity = shards
+            .len()
+            .checked_mul(DESC_U64_PER_SHARD)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let mut desc: Vec<u64> = Vec::with_capacity(desc_capacity);
+        let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> = Vec::with_capacity(shards.len());
+        let primary = self.primary_arc();
+        for shard in shards {
+            if shard.index.device_ptr() == 0 {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+            }
+            if !Arc::ptr_eq(&primary, &shard.index.primary_arc()) {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+            }
+            validate_index_geometry(
+                shard.index.metadata().allocated_bytes,
+                shard.table_mask,
+                shard.hash_shift,
+            )?;
+            for region in [shard.created_by.as_ref(), shard.deleted_by.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if !Arc::ptr_eq(&primary, &region.primary_arc()) {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+                }
+                validate_version_region(region, shard.row_count)?;
+            }
+            desc.push(shard.index.device_ptr());
+            desc.push((shard.table_mask as u64) | ((shard.hash_shift as u64) << 32));
+            desc.push(shard.created_by.as_ref().map_or(0, |region| region.device_ptr()));
+            desc.push(shard.deleted_by.as_ref().map_or(0, |region| region.device_ptr()));
+            desc.push(u64::from(shard.row_count));
+            index_guards.push(Arc::clone(&shard.index));
+        }
         let out_bytes = needles
             .len()
             .checked_mul(std::mem::size_of::<u32>())
@@ -595,7 +715,6 @@ impl CudaResidentDeviceMemory {
         let snapshot_bytes = std::mem::size_of_val(snapshots);
         let desc_bytes = std::mem::size_of_val(desc.as_slice());
 
-        let primary = self.primary_arc();
         primary.set_current()?;
         let cu_memcpy_htod = unsafe {
             primary
@@ -615,6 +734,12 @@ impl CudaResidentDeviceMemory {
             primary
                 .lib()
                 .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_stream_sync = unsafe {
+            *primary
+                .lib()
+                .get::<CuStreamSync>(b"cuStreamSynchronize\0")
                 .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
         };
 
@@ -648,7 +773,6 @@ impl CudaResidentDeviceMemory {
         check_cuda(unsafe {
             cu_memcpy_htod(desc_guard.ptr, desc.as_ptr().cast::<c_void>(), desc_bytes)
         })?;
-        // No output memset: every needle-thread stores its own shard/slot/count at WRITEOUT.
 
         let mut desc_arg = desc_guard.ptr;
         let mut shard_count_arg = shard_count_u32;
@@ -670,6 +794,10 @@ impl CudaResidentDeviceMemory {
         ];
         let threads_per_block: u32 = 128;
         let blocks = needle_count_u32.div_ceil(threads_per_block);
+        let mut stream_drain = DefaultStreamDrain {
+            sync: cu_stream_sync,
+            armed: true,
+        };
         check_cuda(unsafe {
             cu_launch_kernel(
                 function,
@@ -685,8 +813,6 @@ impl CudaResidentDeviceMemory {
                 std::ptr::null_mut(),
             )
         })?;
-        // Same FENCE INVARIANT as write-locate: null-stream launch + blocking non-zero DtoH
-        // below fences the kernel before the pooled guards recycle.
         let mut shard_idx = vec![0u32; needles.len()];
         let mut slot = vec![0u32; needles.len()];
         let mut count = vec![0u32; needles.len()];
@@ -711,11 +837,29 @@ impl CudaResidentDeviceMemory {
                 out_bytes,
             )
         })?;
+        if count.contains(&INVALID_COUNT) {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
+        stream_drain.armed = false;
         drop(index_guards);
         Ok(VisibleLocateResult {
             shard_idx,
             slot,
             count,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_index_geometry;
+
+    #[test]
+    fn write_locate_geometry_requires_exact_power_of_two_addressing() {
+        validate_index_geometry(128, 15, 28).unwrap();
+        assert!(validate_index_geometry(127, 15, 28).is_err());
+        assert!(validate_index_geometry(128, 14, 28).is_err());
+        assert!(validate_index_geometry(128, 15, 27).is_err());
+        assert!(validate_index_geometry(u64::MAX, 0, 32).is_err());
     }
 }

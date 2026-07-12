@@ -193,6 +193,7 @@ pub(crate) struct ChunkKeyIndex {
     pub(crate) device: Arc<gpu_db_execution::CudaResidentDeviceMemory>,
     pub(crate) table_mask: u32,
     pub(crate) hash_shift: u32,
+    pub(crate) row_count: u32,
     pub(crate) bytes: u64,
     pub(crate) last_used: u64,
 }
@@ -7295,6 +7296,7 @@ impl Engine {
             device: Arc::new(device),
             table_mask,
             hash_shift,
+            row_count: u32::try_from(row_count).ok()?,
             bytes: bytes.len() as u64,
             last_used: 0,
         })
@@ -7980,6 +7982,7 @@ impl Engine {
                 index: Arc::clone(&index.device),
                 table_mask: index.table_mask,
                 hash_shift: index.hash_shift,
+                row_count: index.row_count,
             })
             .collect();
         let ctx = Arc::clone(&shards[0].index);

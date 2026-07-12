@@ -16,15 +16,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   logs are under `docs/archive/` and are never actionable.
 - Source-size governance is now explicit in `CODE_SIZE.md`; the full 29-file baseline and ordered disposition
   method are owned by **STRUCT-001**.
+- Device write/visible-locate now has typed same-context owners, exact extents, device slot bounds, bounded
+  fail-closed errors, and launched-error drains. Its physical cross-context partition/merge gate is
+  **MULTI-002**, promoted ahead of further work and blocked on a two-GPU host.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001Z:** make the newly isolated write/visible-locate safe API total: typed same-context owners, exact
-   index/version geometry, device slot bounds, bounded error reporting, and post-launch error drains. Keep all key
-   addressing and visibility decisions on-device; do not add host probing or choose the broader R3 design here.
-2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
+1. **MULTI-002:** when a physical two-GPU host is available, partition write/visible-locate submissions by
+   primary context and deterministically merge bounded metadata; never move lookup or visibility to the host.
+2. **STRUCT-001:** continue disposition of the 29 source-size outliers by analyzing the next cohesive execution
+   root leaf. Do not let structural ownership extraction choose the broader write architecture.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

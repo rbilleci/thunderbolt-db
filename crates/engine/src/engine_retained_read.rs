@@ -1254,21 +1254,23 @@ impl Engine {
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
             }
-            let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
-                table,
-                &table.name,
-                shard.shard_id,
-                key_id,
-                &positions,
-                &device_memory,
-                &offsets,
-                &blob_offsets,
-                shard.row_count,
-            )?;
+            let (device_index, table_mask, hash_shift, index_row_count) = self
+                .ensure_shard_pk_device_index(
+                    table,
+                    &table.name,
+                    shard.shard_id,
+                    key_id,
+                    &positions,
+                    &device_memory,
+                    &offsets,
+                    &blob_offsets,
+                    shard.row_count,
+                )?;
             descs.push(WriteLocateShard {
                 index: device_index,
                 table_mask,
                 hash_shift,
+                row_count: u32::try_from(index_row_count).ok()?,
             });
         }
         if descs.is_empty() {
@@ -1327,7 +1329,6 @@ impl Engine {
         // Parallel to `descs`: the probed shard's id + its MAIN device region (the W0 cell-
         // liveness identity) — plus pins for the version regions the kernel dereferences.
         let mut probed: Vec<(u32, Arc<CudaResidentDeviceMemory>)> = Vec::new();
-        let mut region_pins: Vec<Arc<CudaResidentDeviceMemory>> = Vec::new();
         for shard in table_shards.iter() {
             if shard.schema != table.schema || shard.table != table.name {
                 return None;
@@ -1354,41 +1355,54 @@ impl Engine {
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
             }
-            let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
-                table,
-                &table.name,
-                shard.shard_id,
-                key_id,
-                &positions,
-                &device_memory,
-                &offsets,
-                &blob_offsets,
-                shard.row_count,
-            )?;
-            let created_by_ptr = shard
-                .created_by_region
-                .as_ref()
-                .map(|region| {
-                    region_pins.push(Arc::clone(region));
-                    region.device_ptr()
-                })
-                .unwrap_or(0);
-            let deleted_by_ptr = shard
-                .deleted_by_region
-                .as_ref()
-                .map(|region| {
-                    region_pins.push(Arc::clone(region));
-                    region.device_ptr()
-                })
-                .unwrap_or(0);
+            let (device_index, table_mask, hash_shift, index_row_count) = self
+                .ensure_shard_pk_device_index(
+                    table,
+                    &table.name,
+                    shard.shard_id,
+                    key_id,
+                    &positions,
+                    &device_memory,
+                    &offsets,
+                    &blob_offsets,
+                    shard.row_count,
+                )?;
+            let (bound_memory, created_by, deleted_by) = if index_row_count == shard.row_count {
+                (
+                    Arc::clone(&device_memory),
+                    shard.created_by_region.clone(),
+                    shard.deleted_by_region.clone(),
+                )
+            } else {
+                // The index cache intentionally accepts a newer in-place extension. Rebind the
+                // visibility owners to that exact published row extent before device dereference.
+                let current = self.read_state.residency.shards.load();
+                let live = current
+                    .get(&table.name)?
+                    .iter()
+                    .find(|candidate| {
+                        candidate.shard_id == shard.shard_id
+                            && candidate.row_count == index_row_count
+                            && candidate
+                                .device_memory
+                                .as_ref()
+                                .is_some_and(|memory| Arc::ptr_eq(memory, &device_memory))
+                    })?;
+                (
+                    live.device_memory.clone()?,
+                    live.created_by_region.clone(),
+                    live.deleted_by_region.clone(),
+                )
+            };
             descs.push(VisibleLocateShard {
                 index: device_index,
                 table_mask,
                 hash_shift,
-                created_by_ptr,
-                deleted_by_ptr,
+                row_count: u32::try_from(index_row_count).ok()?,
+                created_by,
+                deleted_by,
             });
-            probed.push((shard.shard_id, device_memory));
+            probed.push((shard.shard_id, bound_memory));
         }
         if descs.is_empty() {
             // No probed shards: every needle has zero visible matches.
@@ -1403,7 +1417,6 @@ impl Engine {
         let result = ctx
             .submit_multi_shard_i32_visible_locate(&descs, needles, snapshots)
             .ok()?;
-        drop(region_pins); // kernel fenced by the blocking DtoH inside the submit
         if result.count.len() != needles.len() {
             return None;
         }
@@ -1524,21 +1537,23 @@ impl Engine {
             // Build/reuse the shard's DEVICE hash index (uploaded once per generation,
             // (ptr,row_count)-validated). None = the shard has DUP keys -> decline the whole
             // locate to the scan, exactly like the host `ShardPkProbe::Declined`.
-            let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
-                table,
-                &table.name,
-                shard.shard_id,
-                key_id,
-                &positions,
-                &device_memory,
-                &offsets,
-                &blob_offsets,
-                shard.row_count,
-            )?;
+            let (device_index, table_mask, hash_shift, index_row_count) = self
+                .ensure_shard_pk_device_index(
+                    table,
+                    &table.name,
+                    shard.shard_id,
+                    key_id,
+                    &positions,
+                    &device_memory,
+                    &offsets,
+                    &blob_offsets,
+                    shard.row_count,
+                )?;
             descs.push(WriteLocateShard {
                 index: device_index,
                 table_mask,
                 hash_shift,
+                row_count: u32::try_from(index_row_count).ok()?,
             });
             ctxs.push(ShardCtx {
                 shard_id: shard.shard_id,
@@ -2305,7 +2320,7 @@ impl Engine {
         // for a TEXT column (its blob), 0 for fixed-width columns. Recomputed from the live shard under lanes.
         blob_offsets: &[u64],
         row_count: usize,
-    ) -> Option<(Arc<CudaResidentDeviceMemory>, u32, u32)> {
+    ) -> Option<(Arc<CudaResidentDeviceMemory>, u32, u32, usize)> {
         let device_ptr = device_memory.device_ptr();
         let cache_key = (table_name.to_string(), shard_id, key_id);
         // Fast path: a valid cached device index -> return it (or None if it declined at build).
@@ -2329,7 +2344,7 @@ impl Engine {
                     return entry
                         .device_index
                         .clone()
-                        .map(|di| (di, entry.table_mask, entry.hash_shift));
+                        .map(|di| (di, entry.table_mask, entry.hash_shift, entry.row_count));
                 }
             }
         }
@@ -2370,7 +2385,9 @@ impl Engine {
                             return entry
                                 .device_index
                                 .clone()
-                                .map(|di| (di, entry.table_mask, entry.hash_shift));
+                                .map(|di| {
+                                    (di, entry.table_mask, entry.hash_shift, entry.row_count)
+                                });
                         }
                     }
                 }
@@ -2558,7 +2575,9 @@ impl Engine {
             // Duplicate / oversize key column -> declined; CACHE `None` so it is not rebuilt every batch.
             None => (None, 0, 0),
         };
-        let result = device_index.clone().map(|di| (di, table_mask, hash_shift));
+        let result = device_index
+            .clone()
+            .map(|di| (di, table_mask, hash_shift, row_count));
         let entry = CachedShardPkDeviceIndex {
             resident_device_ptr: device_ptr,
             row_count,
@@ -2645,17 +2664,18 @@ impl Engine {
                 resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
             // D4: the buffer rides the loaded descriptor (one-snapshot capture).
             let device_memory = shard.device_memory.clone()?;
-            let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
-                table,
-                &table.name,
-                shard.shard_id,
-                filter_idx,
-                std::slice::from_ref(&filter_idx),
-                &device_memory,
-                &[filter_offset],
-                &[0], // single-column key -> blob offsets unused (fixed-width fold path)
-                shard.row_count,
-            )?;
+            let (device_index, table_mask, hash_shift, _index_row_count) = self
+                .ensure_shard_pk_device_index(
+                    table,
+                    &table.name,
+                    shard.shard_id,
+                    filter_idx,
+                    std::slice::from_ref(&filter_idx),
+                    &device_memory,
+                    &[filter_offset],
+                    &[0], // single-column key -> blob offsets unused (fixed-width fold path)
+                    shard.row_count,
+                )?;
             let mut projection_offsets: Vec<u64> = Vec::with_capacity(ncols);
             for &idx in selected_indexes {
                 projection_offsets

@@ -47,6 +47,7 @@
             index: std::sync::Arc::clone(&index),
             table_mask,
             hash_shift,
+            row_count: all.len() as u32,
         }];
         let result = index
             .submit_multi_shard_i32_write_locate(&shards, &all, 2)
@@ -98,6 +99,7 @@
                 index: std::sync::Arc::new(mem),
                 table_mask,
                 hash_shift,
+                row_count: PER_SHARD as u32,
             });
         }
         let ctx = std::sync::Arc::clone(&shards[0].index);
@@ -160,6 +162,7 @@
                 index: std::sync::Arc::new(mem),
                 table_mask,
                 hash_shift,
+                row_count: keys.len() as u32,
             });
         }
         let needles = [130, 20, 999, 300, 10];
@@ -197,3 +200,120 @@
         }
     }
 
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn write_locate_inputs_fail_closed_and_leave_context_reusable() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let (valid_words, table_mask, hash_shift) = build_pk_hash(&[10]);
+        let valid_bytes: Vec<u8> = valid_words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let valid_index = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &valid_bytes)
+                .expect("valid device index"),
+        );
+        let ctx = std::sync::Arc::clone(&valid_index);
+
+        let bad_geometry = [WriteLocateShard {
+            index: std::sync::Arc::clone(&valid_index),
+            table_mask: table_mask + 2,
+            hash_shift,
+            row_count: 1,
+        }];
+        assert!(ctx
+            .submit_multi_shard_i32_write_locate(&bad_geometry, &[10], 1)
+            .is_err());
+
+        let mut corrupt_words = valid_words.clone();
+        let packed = corrupt_words.iter_mut().find(|word| **word != 0).unwrap();
+        *packed = (*packed & 0xffff_ffff_0000_0000) | 100;
+        let corrupt_bytes: Vec<u8> = corrupt_words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let corrupt_index = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &corrupt_bytes)
+                .expect("corrupt-slot device index"),
+        );
+        let corrupt = [WriteLocateShard {
+            index: std::sync::Arc::clone(&corrupt_index),
+            table_mask,
+            hash_shift,
+            row_count: 1,
+        }];
+        assert!(ctx
+            .submit_multi_shard_i32_write_locate(&corrupt, &[10], 1)
+            .is_err(), "packed slot beyond logical rows must fail closed");
+
+        let short_region = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &0u64.to_le_bytes())
+                .expect("short version region"),
+        );
+        let short_visible = [VisibleLocateShard {
+            index: std::sync::Arc::clone(&valid_index),
+            table_mask,
+            hash_shift,
+            row_count: 2,
+            created_by: Some(short_region),
+            deleted_by: None,
+        }];
+        assert!(ctx
+            .submit_multi_shard_i32_visible_locate(&short_visible, &[10], &[1])
+            .is_err());
+
+        let corrupt_visible = [VisibleLocateShard {
+            index: corrupt_index,
+            table_mask,
+            hash_shift,
+            row_count: 1,
+            created_by: None,
+            deleted_by: None,
+        }];
+        assert!(ctx
+            .submit_multi_shard_i32_visible_locate(&corrupt_visible, &[10], &[1])
+            .is_err());
+
+        if runtime.snapshot().device_count > 1 {
+            let foreign = std::sync::Arc::new(
+                runtime
+                    .retain_device_memory_copy(1, &valid_bytes)
+                    .expect("foreign-context index"),
+            );
+            let foreign_shard = [WriteLocateShard {
+                index: foreign,
+                table_mask,
+                hash_shift,
+                row_count: 1,
+            }];
+            assert!(ctx
+                .submit_multi_shard_i32_write_locate(&foreign_shard, &[10], 1)
+                .is_err());
+        }
+
+        let valid = [WriteLocateShard {
+            index: std::sync::Arc::clone(&valid_index),
+            table_mask,
+            hash_shift,
+            row_count: 1,
+        }];
+        let result = ctx
+            .submit_multi_shard_i32_write_locate(&valid, &[10], 1)
+            .expect("valid write locate after rejected inputs");
+        assert_eq!(result.count, vec![1]);
+        assert_eq!(result.slot, vec![0]);
+
+        let valid_visible = [VisibleLocateShard {
+            index: valid_index,
+            table_mask,
+            hash_shift,
+            row_count: 1,
+            created_by: None,
+            deleted_by: None,
+        }];
+        let result = ctx
+            .submit_multi_shard_i32_visible_locate(&valid_visible, &[10], &[1])
+            .expect("valid visible locate after rejected inputs");
+        assert_eq!(result.count, vec![1]);
+        assert_eq!(result.slot, vec![0]);
+    }

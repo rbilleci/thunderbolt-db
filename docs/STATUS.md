@@ -234,6 +234,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   geometrically incoherent indexes, unowned/unbounded version pointers, packed slots beyond version extents, and
   post-launch DtoH errors without a best-effort drain. Those gaps are now owned by **STRUCT-001Z** ahead of further
   decomposition. The execution root is 19,881 lines.
+  That safe-boundary hardening is complete. `WriteLocateShard` and `VisibleLocateShard` now carry exact logical
+  row extents and owned device allocations; every index/version owner is checked against the submission primary
+  context, and table masks, hash shifts, allocated index bytes, version-region capacity, descriptor/output
+  arithmetic, and reserved count ranges are validated before descriptor allocation or CUDA work. Cached indexes
+  return their exact row extent, and visible locate rebinds a newer in-place index to the matching currently
+  published payload/version generation. The 24/40-byte PTX descriptors bound every decoded packed slot before
+  output or MVCC loads and propagate per-needle reserved count sentinels without adding an allocation, memset,
+  ABI argument, or extra count-only readback. A default-stream RAII drain fences launch and readback failures
+  before pooled buffers or owners drop. Duplicate advancement, ordinary overflow, unsigned visibility, output
+  order, and GPU-only key addressing remain intact. One pure geometry test and one retained-GPU malformed/reuse
+  differential raise the execution inventory to 118 tests, with 43 active and 75 GPU-ignored. Five write-locate,
+  safety, visible DELETE/UPDATE, and sharded-duplicate gates passed 15 sequential and 10 concurrent invocations
+  without CUDA 700/716/717; workspace all-target/all-feature check, execution clippy, and independent audit are
+  clean. `write_locate.rs` is 865 lines and the execution root remains 19,881 lines. The single-GPU host cannot
+  make the cross-context test non-vacuous, so per-context partition/merge is explicitly owned by **MULTI-002**.
+  The final canonical report card is green in both layers and cache regimes: in-L2/out-of-L2 `sum_i32` measured
+  1,475.5/1,453.3 GB/s, `count_i32_compare` measured 0.89x/1.00x same-run roofline, grouped aggregation measured
+  1,678.3 M elements/s, and 65,536-batch point reads measured 245.6M/253.1M lookups/s at p50 138/132us.
 
 ## Known boundaries
 
@@ -250,7 +268,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Generic CUDA-MVCC host compaction, ordering, projection, and result assembly | **RETIRE-003** |
 | Host `CachedShardPkIndex` and DML/constraint probe fallback | **R3-002**, **R3-004** |
 | Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |
-| Two physical GPUs have not executed the existing multi-device gate | **MULTI-001** |
+| Two physical GPUs have not executed the existing scheduler or device-locate context gates | **MULTI-001**, **MULTI-002** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |
 | Lane DELETE residuals and empty-aggregate pgwire NULL seam require focused disposition | **R3-005**, **READ-003** |
 | Lanes auto-checkpoint/PITR and full crash campaign | **DUR-001**, **DUR-002** |
