@@ -21,11 +21,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001:** analyze and disposition the 29 source-size outliers, beginning with the six production files
-   over 10,000 lines; preserve behavior and stable facades during extraction.
-2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
+1. **STRUCT-001B:** continue the audited execution-facade decomposition with the independent MVCC device-batch
+   encoding leaf; preserve byte layout, stable crate-root exports, and CUDA consumers.
+2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
+3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
-3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 

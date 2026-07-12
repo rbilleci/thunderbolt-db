@@ -18,12 +18,15 @@ task ID here or be explicitly historical.
 
 ## Current focus
 
-1. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
+1. **STRUCT-001B — extract the execution crate's MVCC device-batch encoding contract.** Move the cohesive
+   `CudaMvccRowBatch` layout/validation domain and its closest tests behind a stable crate-root re-export without
+   changing transfer layout or CUDA launch consumers.
+2. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
    reduce the highest context risks before broad implementation work expands them further.
-2. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
+3. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
    architecture decision needed before wider write work or host-store deletion; structural extraction may
    precede it, but must not make the decision implicitly.
-3. **BENCH-001 — complete the open-loop OLTP comparison.** Run in parallel when benchmark capacity is
+4. **BENCH-001 — complete the open-loop OLTP comparison.** Run in parallel when benchmark capacity is
    available; it remains the evidence gate for ordering performance work.
 
 ## STRUCT-001 — oversized-file remediation method
@@ -59,7 +62,7 @@ first so extraction preserves crate APIs and GPU/kernel ownership.
 
 | Lines | File | Disposition / evidence |
 |---:|---|---|
-| 40,308 | `crates/execution/src/lib.rs` | QUEUED |
+| 40,308 | `crates/execution/src/lib.rs` | **DECOMPOSE — STRUCT-001B active.** Handwritten production facade with distinct routing policy, CUDA context/allocation, resident-memory API, MVCC batch encoding, write locate/apply, scan/aggregate/join/sort/expression kernel, host-reference operator, and test domains. Public root symbols are consumed by engine, planner, metrics, observability, examples, and server tests; CUDA domains share primary-context, pool, lease, error, PTX-symbol, and launch boundaries. History shows operator-family growth rather than one cohesive unit. Stable crate-root re-exports are the facade. **Completed:** routing policy moved to `routing.rs` (241 lines) and RETIRE-001 host-reference operators to `reference_operators.rs` (391 lines), including closest tests; execution tests and downstream engine/planner/metrics/observability checks pass, definitions are unique, and no kernel/runtime code changed. **Next:** extract the independently versioned `CudaMvccRowBatch` layout/validation contract and its two encoding tests to `mvcc_batch.rs`; preserve serde/wire layout and all root imports. Re-inventory shared CUDA domains after the leaf move. |
 | 31,858 | `crates/protocol/src/bin/gpu-db-server.rs` | QUEUED |
 | 20,164 | `crates/replication/src/lib.rs` | QUEUED |
 | 12,958 | `crates/engine/src/engine_residency.rs` | QUEUED |
@@ -123,6 +126,7 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
+| **STRUCT-001B** | NOW | P0 | Extract `CudaMvccRowBatch`, offset validation, and the closest encoding tests into `mvcc_batch.rs` behind the existing crate-root path. Preserve serialized fields, byte accounting, error values, and CUDA/engine consumers; pass execution tests plus downstream engine check and prove the old definitions are gone. | STRUCT-001 execution-facade packet | `docs/CODE_SIZE.md`; Wave 1 inventory packet above |
 | **STRUCT-001** | NOW | P0 | Analyze and disposition every source-size outlier through the method and ordered inventory above. Decompose by ownership, register a bounded exception, or prove generated/archive/delete status; update all references and pass targeted gates. Close only when a fresh inventory has no unowned outlier. | None | `docs/CODE_SIZE.md` |
 | **R3-001** | NOW | P0 | Audit the current lane, chunk-authoritative, MVCC-sidecar, and recovery implementations against the target write model; choose the surviving version-storage/index/CC design in an ADR. Explicitly disposition the retired mega-fuse idea rather than reviving it from archived handovers. No implementation begins from an unaccepted proposal. | None | `docs/design/write-path-design-inputs.md` |
 | **BENCH-001** | NOW | P0 | Open-loop offered-rate harness reports p50/p99/p99.9/p99.99 and saturation TPS against tuned PostgreSQL on the same host, split by deterministic-fast and interactive-slow transaction classes. Exclude warm-up from sustained metrics and publish the exact Postgres/host configuration. Results identify whether the residual is GPU-architectural or host-serial. | Quiet benchmark window and reproducible Postgres config | ADR-008; ARCHITECTURE §9 |

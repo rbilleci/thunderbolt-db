@@ -61,6 +61,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   indexed single-flight route **3.23x** the scan.
 - Production release check, engine/facade examples, static host-row-removal guard, and diff whitespace check pass.
 
+## Structural decomposition
+
+- **STRUCT-001** began with the execution facade. Device-routing policy now lives in `execution::routing`, and
+  the RETIRE-001-owned host-reference iterator operators live in `execution::reference_operators`; stable
+  crate-root re-exports preserve downstream APIs. The first pure-move slice passed all 24 non-ignored execution
+  tests and downstream engine/planner/metrics/observability checks. Further execution-facade extraction remains
+  owned by **STRUCT-001B** and **STRUCT-001**.
+
 ## Known boundaries
 
 | Boundary | Work ID |
