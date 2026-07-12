@@ -1,7 +1,7 @@
     /// M1 (ledger #24): the INCREMENTAL index-insert kernel == a full rebuild. Build an index for
     /// a prefix of keys, INSERT the appended tail via the kernel, and verify the extended index
     /// probes IDENTICALLY to a from-scratch build over all keys (via the write-locate kernel).
-    /// Also verifies DUP detection (re-inserting an existing key sets the decline flag).
+    /// Also verifies same-key MVCC twins advance to distinct slots without declining the index.
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn index_insert_kernel_extends_like_a_rebuild() {
@@ -60,11 +60,23 @@
             let slot = result.slot[i * result.max_hits as usize];
             assert_eq!(slot as usize, i, "key {key}: row {i} preserved");
         }
-        // DUP: re-inserting an existing key sets the decline flag.
+        // Same-key MVCC twin: insert a newer physical version in the next logical row. It must
+        // advance beyond the old key, remain indexed, and expose both candidate coordinates.
         let dup2 = index
-            .submit_i32_index_insert(&index, table_mask, hash_shift, &[30], 99)
-            .expect("dup insert");
-        assert!(dup2, "re-inserting key 30 must flag a dup");
+            .submit_i32_index_insert(&index, table_mask, hash_shift, &[30], 10)
+            .expect("version-twin insert");
+        assert!(!dup2, "same-key version twin must not decline the index");
+        let twin_shards = [WriteLocateShard {
+            index: std::sync::Arc::clone(&index),
+            table_mask,
+            hash_shift,
+            row_count: 11,
+        }];
+        let twin = index
+            .submit_multi_shard_i32_write_locate(&twin_shards, &[30], 2)
+            .expect("locate version twins");
+        assert_eq!(twin.count, vec![2]);
+        assert_eq!(twin.slot, vec![2, 10]);
     }
 
     /// M1 BAKEOFF micro-bench: the write-locate kernel's AMORTIZATION curve — us/needle at batch

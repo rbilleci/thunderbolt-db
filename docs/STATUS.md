@@ -252,6 +252,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   The final canonical report card is green in both layers and cache regimes: in-L2/out-of-L2 `sum_i32` measured
   1,475.5/1,453.3 GB/s, `count_i32_compare` measured 0.89x/1.00x same-run roofline, grouped aggregation measured
   1,678.3 M elements/s, and 65,536-batch point reads measured 245.6M/253.1M lookups/s at p50 138/132us.
+  Fused append publication, incremental int4 index insertion, compound fixed/wide/UUID/text fingerprint folding,
+  `FusedApplyRequest`, and their three ASCII PTX programs now live in the private 873-line
+  `execution::write_apply` module. The root type re-export and inherent method APIs remain stable; all three PTX
+  byte images hash exactly to their prior definitions, and moved launcher bodies differ only by module imports
+  and one rustfmt trailing comma. Staging layout, cached symbols, arguments/grids, default-stream blocking
+  readbacks, pool/index ownership, partial-failure and 256-probe decline behavior, and compound hash parity are
+  unchanged. An obsolete index-insert test/doc expectation was corrected to the established F3/U4 contract:
+  same-key MVCC versions advance to distinct slots rather than declining. The exact 118-test inventory and
+  43/75 suite remain stable. Seven fused/index/fixed/wide/UUID/text/streaming GPU gates passed 21 sequential and
+  14 concurrent invocations without CUDA 700/716/717. Workspace all-target/all-feature check and execution
+  clippy are green. The execution root is 19,020 lines. Independent extraction audit is clean and exposed
+  pre-existing raw address/context/extent/geometry and launched-error-drain gaps in the safe APIs;
+  **STRUCT-001AB** owns them ahead
+  of further decomposition without changing the broader **R3-001** design.
 
 ## Known boundaries
 
