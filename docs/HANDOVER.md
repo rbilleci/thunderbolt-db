@@ -7,8 +7,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 - STRATA and the production GPU read-path flip are complete. Production SELECT/MVCC execution has no host
   relational fallback; catalog, materialized-view, and bounded-function results use transient GPU relations.
-- Published residency retains no decoded host-row shadow. The remaining host relational code is either a
-  test-only parity oracle, the R3 write/store path, or RPO-preserving DDL/recovery repair debt.
+- Published residency retains no decoded host-row shadow. Remaining host relational debt is explicitly owned:
+  test oracle (**RETIRE-001**), DDL/recovery repair (**RETIRE-002**), generic CUDA-MVCC result post-processing
+  (**RETIRE-003**), and the R3 write/store/index path (**R3-002/R3-004**).
 - Canonical correctness and performance gates are green. Current measurements and built scope live in
   `STATUS.md`, not here.
 - Documentation was consolidated on 2026-07-12. Historical plans, handovers, proposals, reviews, and research

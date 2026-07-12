@@ -56,8 +56,9 @@ Server consolidation and dependency inversion are **PRODUCT-001**.
 - Prepared routes carry typed parameters, resident snapshot handles, and device-ready projection plans.
 - DDL publishes a new catalog generation and invalidates dependent physical plans atomically.
 
-Catalog/type/protocol breadth is **PRODUCT-002**. Host catalog relational execution is forbidden; metadata
-synthesis for upload is control-plane staging.
+Catalog/type/protocol breadth is **PRODUCT-002**. Host catalog relational execution is forbidden. Host work may
+retain DDL bookkeeping and deterministic row encoding/upload, but catalog filtering, joining, sorting, validation,
+and result-value decisions execute on-device.
 
 ## 4. GPU execution
 
@@ -77,7 +78,8 @@ scratch/result budget. It returns a device result or a typed failure. No operato
 relational work.
 
 Measured result/scan improvements are admitted only through **PERF-001** and the report-card gate. Wider point
-indexes are **READ-002**.
+indexes are **READ-002**. The generic CUDA-MVCC path's remaining host compaction/order/projection is
+**RETIRE-003**.
 
 ## 5. Residency and STRATA
 
@@ -130,7 +132,8 @@ The open-loop evidence gate is **BENCH-001**. Product route classes beyond PK mi
 - Readers capture published generations; device visibility uses created/deleted boundaries and side metadata.
 - Eligible int4-PK INSERT/UPDATE/DELETE intents use FUA lanes and device apply/locate/index machinery.
 - Chunk-authoritative tables can maintain device-format state without steady-state host relational reads.
-- The host tuple store, host write/constraint paths for uncovered shapes, and repair reconstruction still exist.
+- The host tuple store, `CachedShardPkIndex`, host write/constraint probes for uncovered shapes, and repair
+  reconstruction still exist.
 
 ### Binding target properties
 
@@ -144,7 +147,7 @@ The open-loop evidence gate is **BENCH-001**. Product route classes beyond PK mi
 
 The unresolved write/version/index choice is deliberately not made here. **R3-001** owns the ADR using
 [`design/write-path-design-inputs.md`](design/write-path-design-inputs.md); coverage and CC are **R3-002** and
-**R3-003**; host-store deletion is **R3-004**.
+**R3-003**; host-store/index/probe deletion is **R3-004**.
 
 ## 8. Durability and recovery
 

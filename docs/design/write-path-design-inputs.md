@@ -10,7 +10,8 @@ structure in `../ARCHITECTURE.md`, and work only in `../PLAN.md`.
 - Eligible int4-PK INSERT/UPDATE/DELETE intents use FUA lanes, device locate/apply, created/deleted visibility, and
   version-aware device indexes.
 - GPU shards and chunk-authoritative cold artifacts can be maintained incrementally for supported classes.
-- The host tuple store and host validation/apply paths still serve uncovered write shapes and recovery/DDL repair.
+- The host tuple store, `CachedShardPkIndex`, and host validation/apply probes still serve uncovered write shapes
+  and recovery/DDL repair.
 - Recovery replays durable state and then rebuilds/adopts GPU state; reverse gather/deauthorization remains an RPO
   repair mechanism.
 
@@ -34,7 +35,7 @@ Any accepted design must satisfy all of the following:
 7. **RPO-preserving recovery:** device state is reconstructible without relying on an acknowledged value that exists
    only in volatile GPU memory.
 8. **Deletion path:** the chosen model provides a credible route to deleting the host relational tuple store and
-   reverse-gather repair after their PLAN gates close.
+   `CachedShardPkIndex`/host-probe fallback, then reverse-gather repair after their PLAN gates close.
 
 ## Model alternatives to decide
 
@@ -73,6 +74,7 @@ R3-001 closes only when one ADR specifies:
 - latest and old-snapshot read algorithms;
 - created/deleted/undo metadata layout and zone summaries;
 - equality/composite index visibility and maintenance;
+- device-native DML locate and constraint validation for every supported shape, with no host index/probe fallback;
 - concurrency-control and publication boundary;
 - VACUUM/GC horizon and compaction trigger;
 - checkpoint, WAL replay, and GPU reconstruction format;

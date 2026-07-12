@@ -10,8 +10,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Production relational reads execute through resident, streaming, transient-relation, or CUDA-native MVCC
   GPU paths. A decline or device fault fails loudly; it never executes relational work on the host.
 - Test-only CPU semantic infrastructure remains under `cfg(test)` pending **RETIRE-001**.
-- The host write/commit/MVCC tuple-store path and recovery repair operators remain pending **R3-001**,
-  **R3-002**, **R3-003**, **R3-004**, and **RETIRE-002**.
+- The host write/commit/MVCC tuple-store path, host DML indexes/probes, generic CUDA-MVCC host result
+  post-processing, and recovery repair operators remain pending **R3-001**, **R3-002**, **R3-003**,
+  **R3-004**, **RETIRE-002**, and **RETIRE-003**.
 
 ## Read path and STRATA
 
@@ -71,6 +72,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Host write/store deletion | **R3-004** |
 | Test-only CPU semantic oracle | **RETIRE-001** |
 | Reverse-gather/deauthorization/scan-build DDL and recovery repair | **RETIRE-002** |
+| Generic CUDA-MVCC host compaction, ordering, projection, and result assembly | **RETIRE-003** |
+| Host `CachedShardPkIndex` and DML/constraint probe fallback | **R3-002**, **R3-004** |
+| Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |
 | Two physical GPUs have not executed the existing multi-device gate | **MULTI-001** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |
 | Lane DELETE residuals and empty-aggregate pgwire NULL seam require focused disposition | **R3-005**, **READ-003** |
