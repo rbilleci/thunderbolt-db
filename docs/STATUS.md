@@ -165,8 +165,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   sequential and 2× concurrent (15/20 invocations) without CUDA safety errors. Independent audit's low-severity
   seam and stale public bool-documentation findings were adopted; the public docs now describe the actual one-
   kernel/one-readback path. The final card kept gather at 349.5/155.3 GB/s in-L2/out-of-L2, count at 0.85x/1.01x
-  roofline, and 65,536-batch point reads at 246.1M/251.1M lookups/s with p50 140/131us. The execution root is
-  23,648 lines; further extraction remains **STRUCT-001**.
+  roofline, and 65,536-batch point reads at 246.1M/251.1M lookups/s with p50 140/131us. The int8/i128/text/UUID/
+  bool predicate launchers and
+  nullable-mask compactor now live in the private 1,064-line `execution::resident_filter` module. Their normalized
+  source is byte-identical: PTX, scalar limbs/signedness, text/UUID ordering, LIKE token lifetime, bool bitmap
+  expansion, validity AND, device compaction, bounded index readback, and public methods are unchanged. The exact
+  101-test inventory and 31 passing non-ignored tests remain stable. Seven scalar/column/text/LIKE/nullable-UUID/
+  bool gates passed 3× sequential and 2× concurrent (21/28 invocations) without CUDA safety errors. The final card
+  kept i64/i128 1%-selectivity filters at 165.6/286.0 GB/s in-L2 and 363.7/594.6 GB/s out-of-L2, count at
+  0.87x/1.00x roofline, and point reads at 248.0M/250.9M lookups/s with p50 138/131us. Independent audit found a
+  pre-existing safe-API device-window validation defect; its fix is **STRUCT-001T**. The execution root is 22,601
+  lines; further extraction remains **STRUCT-001**.
 
 ## Known boundaries
 
