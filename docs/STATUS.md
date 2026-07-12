@@ -182,7 +182,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   invocations) without CUDA errors. Independent audit's malformed-inequality HIGH and indentation LOW findings
   were adopted. The final card kept i64/i128 filters at 165.6/285.6 GB/s in-L2 and 362.4/591.9 GB/s out-of-L2,
   count at 0.86x/1.00x roofline, and point reads at 247.8M/251.9M lookups/s with p50 138/132us. The execution root
-  is 22,608 lines and `resident_filter` is 1,221 lines; further extraction remains **STRUCT-001**.
+  was 22,608 lines and `resident_filter` is 1,221 lines. The six filtered fixed-width SUM/MIN/MAX and i128
+  partial-reduction launchers now live in the private 803-line `execution::resident_aggregate` module. Their
+  normalized bodies are byte-identical: the nine public root methods, PTX symbols and arguments, bounded grids,
+  index H2D lifetime, pooled synchronization, output initialization and readback, signed i128 low/high partials,
+  atomic carry/min/max behavior, checked host combine, and overflow result are unchanged. The exact 106-test
+  inventory remains 34 active and 72 ignored. Five aggregate/type/overflow gates passed 15 sequential and 20
+  concurrent invocations without CUDA 700/716/717. Independent audit found no extraction regression and exposed
+  a pre-existing unchecked resident-window boundary now owned by **STRUCT-001V**. The canonical card measured
+  count at 0.88x/1.01x same-run roofline, gather at 349.5/155.3 GB/s, grouped aggregation at 1,678.3 M elements/s,
+  and 65,536-batch point reads at 246.2M/232.4M lookups/s with p50 140/141us in-L2/out-of-L2. The execution root
+  is 21,816 lines; further extraction remains **STRUCT-001**.
 
 ## Known boundaries
 
