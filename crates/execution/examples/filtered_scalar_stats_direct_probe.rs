@@ -52,7 +52,7 @@ fn main() {
         let scrambled = (row as u32).wrapping_mul(2_654_435_761) as i32;
         value.extend_from_slice(&scrambled.to_le_bytes());
     }
-    let is_null = |i: u64| i % 9 == 0;
+    let is_null = |i: u64| i.is_multiple_of(9);
     let mut bitmap = vec![0u32; bitmap_words];
     for i in 0..n {
         if !is_null(i as u64) {
@@ -97,7 +97,7 @@ fn main() {
                 continue;
             }
             let v = (row as u32).wrapping_mul(2_654_435_761) as i32;
-            if apply_filter && !(v < needle) {
+            if apply_filter && v >= needle {
                 continue;
             }
             count += 1;

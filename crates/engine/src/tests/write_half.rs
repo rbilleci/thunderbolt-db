@@ -152,7 +152,7 @@ fn active_snapshots_track_oldest_boundary() {
 fn concurrent_dml_classification_routes_sequence_inserts_to_serialized_path() {
     // `is_concurrent_dml` gates which statements take the off-lock concurrent path vs the
     // serialized catalog-latch path (write-half MVCC, Stage 4).
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE plain (id INT, v INT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE serial_t (id SERIAL, v TEXT)")
@@ -197,7 +197,7 @@ fn execute_dml_concurrent_matches_the_serialized_path_single_threaded() {
             .collect()
     };
 
-    let concurrent = Engine::new_local();
+    let concurrent = Engine::new_local_cpu_oracle();
     concurrent
         .execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
@@ -211,7 +211,7 @@ fn execute_dml_concurrent_matches_the_serialized_path_single_threaded() {
         .execute_dml_concurrent(4, "DELETE FROM t WHERE id = 1")
         .unwrap();
 
-    let serialized = Engine::new_local();
+    let serialized = Engine::new_local_cpu_oracle();
     serialized
         .execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
@@ -233,7 +233,7 @@ fn execute_dml_concurrent_matches_the_serialized_path_single_threaded() {
 
 #[test]
 fn relational_index_access_path_survives_wal_recovery() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -251,8 +251,8 @@ fn relational_index_access_path_survives_wal_recovery() {
     };
     let result = recovered.execute_relational_select(&select).unwrap();
 
-    assert_eq!(
-        *result.access_path,
+    assert_recovered_relational_access_path(
+        &result,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("name".to_string()),
@@ -260,7 +260,7 @@ fn relational_index_access_path_survives_wal_recovery() {
             order_column: "id".to_string(),
             descending: false,
             matched_keys: 2,
-        }
+        },
     );
     assert_eq!(
         result.rows,
@@ -281,7 +281,7 @@ fn relational_index_access_path_survives_wal_recovery() {
 /// version comparison below would fail.
 #[test]
 fn stage0_wal_replay_reproduces_byte_identical_version_stamps() {
-    let live = Engine::new_local();
+    let live = Engine::new_local_cpu_oracle();
     // Mix of DDL + DML, including UPDATE and DELETE so both `created_by` and `deleted_by`
     // are exercised. Sparse, non-monotonic-relative-to-commit txn_ids on purpose.
     live.execute_text(100, "CREATE TABLE acct (id INT, bal INT)")
@@ -367,7 +367,7 @@ fn stage0_wal_replay_reproduces_byte_identical_version_stamps() {
 /// reads thread through `visible_up_to`.
 #[test]
 fn stage0_read_boundary_equals_stamp_sequence() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     // commit 1: CREATE TABLE (no row versions)
     e.execute_text(500, "CREATE TABLE t (id INT)").unwrap();
     // commit 2: INSERT id=1  -> row version stamped created_by = 2
@@ -648,7 +648,7 @@ fn dml_value_index_resolve_matches_seq_scan_oracle() {
     ];
     for (i, statements) in scenarios.iter().enumerate() {
         let build = |index_on: bool| -> Vec<Vec<SqlValue>> {
-            let e = Engine::new_local();
+            let e = Engine::new_local_cpu_oracle();
             e.set_dml_value_index_resolve_enabled(index_on);
             e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
             // v = (id % 5) * 10 -> deliberate duplicates in v.
@@ -683,7 +683,7 @@ fn dml_value_index_resolve_matches_seq_scan_oracle() {
 #[test]
 fn dml_value_index_resolve_constrained_tables_fall_back_correctly() {
     let build = |index_on: bool| -> (Vec<Vec<SqlValue>>, String) {
-        let e = Engine::new_local();
+        let e = Engine::new_local_cpu_oracle();
         e.set_dml_value_index_resolve_enabled(index_on);
         e.execute_text(1, "CREATE TABLE p (id INT UNIQUE, v INT)")
             .unwrap();
@@ -826,7 +826,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                setup: &[&str],
                stmt: &str|
      -> (Result<(), String>, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>) {
-        let e = Engine::new_local();
+        let e = Engine::new_local_cpu_oracle();
         e.set_dml_value_index_resolve_enabled(index_on);
         for (i, sql) in setup.iter().enumerate() {
             e.execute_text(1 + i as u64, sql).unwrap();
@@ -969,7 +969,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
 /// granting the skip on a stamp mismatch lets the violating row COMMIT silently.
 #[test]
 fn wave_insert_prepared_before_add_check_is_revalidated() {
-    let e = std::sync::Arc::new(Engine::new_local());
+    let e = std::sync::Arc::new(Engine::new_local_cpu_oracle());
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10)")
         .unwrap();

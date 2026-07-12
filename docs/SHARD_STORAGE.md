@@ -134,8 +134,8 @@ binds its boundary in the sub-microsecond window between an append's descriptor 
 `publish_committed_seq` sees `s < hwm` and clean-errors ("VERSIONED sharded table") rather than
 serving — pre-D3 the same window served WITH the phantom insert; error > silent wrong result. Scans,
 counts, and point routes gate correctly in that window instead of erroring. `deleted_by` has no high-water shortcut: a tombstone hides rows at
-every later boundary. Reclaiming regions (and re-clustering) is VACUUM — ledgered #5, the open
-follow-up; the dense route's deleted_by decline is load-bearing under any future independent region
+every later boundary. Reclaiming regions and re-clustering are part of **R3-003**; the dense route's
+deleted_by decline is load-bearing under any future independent region
 reclaim (do not remove it).
 
 ## 5. Publication protocol (D4, ADR-013 pre2)
@@ -209,22 +209,19 @@ Immutable per-shard PK indexes (billions-rows: maintenance is never O(table)):
   monotone under appends, so a decline is not rebuilt per statement.
 - **Device index** (`CachedShardPkDeviceIndex`): the same table uploaded once per generation for the
   dense kernel; same validation + pinning.
-- Sealed shards never rebuild; the OPEN shard rebuilds on every `(ptr,row_count)` change — an
-  O(shard) DtoH+build+HtoD per write→read cycle that incremental index maintenance (ledgered) will
-  remove.
+- Sealed shards never rebuild. Any remaining open-shard index rebuild cost must be re-measured under
+  **PERF-001** before an optimization is scheduled.
 - Purge: `purge_shard_pk_index_for_table` at all retire sites, 1:1 with the region purges.
 
-## 8. Budget, limits & open gaps (ledgered)
+## 8. Budget and limits
 
-| Concern | Today | Ledger/plan |
-|---|---|---|
-| Eviction candidates | single-buffer `snapshots` only — shard tables invisible to eviction; rollover unbudgeted | read-path assessment R-1 |
-| Region/tombstone reclaim | none (regions live until invalidate/re-admit/drop) | VACUUM #5 — also re-enables fast paths after DELETEs |
-| Recompaction | O(kept rows) DtoD per query, unified buffer on `shards[0].gpu_id` | #4: push-down + combine (ADR-012) |
-| Open-shard index rebuild | O(shard) per write→read cycle | incremental maintenance slice |
-| Caps | ≤ 2^29 rows/shard (hash-slot packing); ≥ 2^29-row tables admit as a single dense shard (no chunked admission) | chunked admission follow-up |
-| Type coverage | purely-int4 tables only | type-coverage ledger item |
-| created_by region cost | 8B/slot on the appended-to (open) lineage; bulk-admitted shards region-free | reclaimed by VACUUM once hwm < oldest reader |
+Current implementation facts and measurements live in `STATUS.md`. Work involving version-region reclamation,
+VACUUM/GC, wider types, non-int4 indexes, multi-GPU execution, or measured recompaction/result-path costs is owned
+only by **R3-003**, **R3-002**, **READ-002**, **MULTI-001**, and **PERF-001** in `PLAN.md`.
+
+The durable layout constraints are: per-allocation byte accounting, allocate-before-evict replacement, bounded
+slot/index representations, generation-consistent resource publication, and fail-safe decline when an optional
+index cannot fit. Do not infer current limitations or future sequencing from historical review tables.
 
 ## 9. Load-bearing invariants (each with its enforcing gate)
 

@@ -2,8 +2,8 @@
 //!
 //! A query whose working set exceeds the GPU byte budget must still run ON THE DEVICE: the charter
 //! forbids the host from being an execution tier, and ADR-006 deletes the CPU relational engine. The
-//! streaming executor closes the over-VRAM gap for the SIMPLEST foldable operator class — the SCALAR
-//! REDUCTIONS (`COUNT(*)` / `SUM` / `MIN` / `MAX`) — by folding over the table in bounded chunks:
+//! streaming executor closes the over-VRAM gap with byte-bounded scalar reductions, filter/project,
+//! GROUP/DISTINCT, ordered top-N, device window functions, and two-/N-way INNER/OUTER joins:
 //!
 //!   admit chunk -> push the reduction down (device kernel) -> combine the partial -> evict chunk -> next
 //!
@@ -14,12 +14,9 @@
 //! (`build + upload the next device generation`), and the associative partial COMBINE (COUNT = sum of
 //! counts, SUM = checked sum, MIN/MAX = the extreme) — never the reduction itself.
 //!
-//! This reuses the whole predicate + aggregate executor: each chunk is a transient
-//! [`ResidentExecSource`] (`build_transient_relation_residency`) run through
-//! `execute_resident_expr_select_with_binding`, exactly as a resident shard slice is. The only new logic
-//! is the cross-chunk combine. Any executor error on a chunk defers to the authoritative CPU pinned path
-//! (streaming only ever ADDS on-device reach — it can never return a wrong answer), mirroring the
-//! general-executor read fallback (engine_select_exec.rs). Activation gates on a CONFIGURED per-GPU
+//! Scalar folds reuse the whole predicate + aggregate executor. Relational operators retain opaque
+//! device masks, coordinates, materialized runs, hash chains, rank lanes, and partial accumulators;
+//! only final result framing crosses D2H. Activation gates on a CONFIGURED per-GPU
 //! residency budget (the operator's VRAM-management signal); with no budget there is no notion of
 //! "over-VRAM" and the read stays on the interim host path — so default behavior is byte-identical.
 //!
@@ -29,9 +26,9 @@
 //! executor's own "LIMIT/OFFSET as control-plane WINDOWING" precedent) and a satisfied LIMIT stopping the
 //! scan early — the table tail is never staged.
 //!
-//! Follow-ons (see PLAN S-E): GROUP BY / DISTINCT with a persistent device accumulator (S-E.3), ORDER BY
-//! via k-way run merge (S-E.4), and copy/compute overlap (S-E.5). AVG is deferred (it needs the
-//! (sum, count) pair combined, not the divided per-chunk average).
+//! Byte-replay, bounded LRU/spill eviction, async copy/compute lookahead, keyed chunk admission,
+//! and round-robin multi-GPU scalar/group partial execution are built. Remaining follow-ons are
+//! tracked in PLAN S-E rather than implied by this module header.
 
 use super::*;
 
@@ -44,6 +41,12 @@ use crate::rel_exec_helpers::{
     relational_row_key,
 };
 use std::sync::atomic::Ordering;
+
+type JoinCoordinateEmitter<'a> = dyn FnMut(
+        &mut Vec<crate::engine_expr::JoinExecSide>,
+        &gpu_db_execution::CudaJoinCoordinatesU32,
+    ) -> Result<bool, ExecuteError>
+    + 'a;
 
 /// The DEVICE payload bytes one row contributes to a transient chunk. Unlike the logical
 /// `relational_resident_value_bytes` (which is 0 for `NULL` and 0 for empty text), this counts the FIXED
@@ -70,6 +73,19 @@ fn chunk_row_device_bytes(row: &[SqlValue], column_types: &[SqlType]) -> u64 {
             }
         })
         .sum()
+}
+
+/// Advance a mixed-radix Cartesian-product cursor. This is scheduler metadata only; it never
+/// inspects relation values or decides relational membership.
+fn advance_product_cursor(cursor: &mut [usize], extents: &[usize]) -> bool {
+    for idx in (0..cursor.len()).rev() {
+        cursor[idx] += 1;
+        if cursor[idx] < extents[idx] {
+            return true;
+        }
+        cursor[idx] = 0;
+    }
+    false
 }
 
 /// The foldable scalar reduction a streaming fold serves. AVG is intentionally absent (deferred).
@@ -181,9 +197,103 @@ pub(crate) struct ChunkKeyIndex {
     pub(crate) last_used: u64,
 }
 
+/// P5-later: compact candidate filter retained for every chunk when the full index set exceeds its cap.
+#[derive(Clone, Debug)]
+pub(crate) struct ChunkKeyBloom {
+    pub(crate) device: Arc<gpu_db_execution::CudaResidentDeviceMemory>,
+    pub(crate) bit_mask: u32,
+    pub(crate) bytes: u64,
+}
+
 /// P5-1: the retained chunk-index VRAM cap (explicit accounting — the shard twin has none).
 #[allow(dead_code)] // P5-2 wires the production path.
 const CHUNK_KEY_INDEX_CAP_BYTES: u64 = 256 * 1024 * 1024;
+const CHUNK_KEY_BLOOM_CAP_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(test)]
+pub(crate) static CHUNK_KEY_INDEX_CAP_BYTES_TEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn chunk_key_index_cap_bytes() -> u64 {
+    #[cfg(test)]
+    {
+        let forced = CHUNK_KEY_INDEX_CAP_BYTES_TEST.load(Ordering::Relaxed);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    CHUNK_KEY_INDEX_CAP_BYTES
+}
+
+#[cfg(test)]
+pub(crate) static CHUNK_KEY_BLOOM_CAP_BYTES_TEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static CHUNK_KEY_BLOOM_ALL_POSITIVE_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn chunk_key_bloom_cap_bytes() -> u64 {
+    #[cfg(test)]
+    {
+        let forced = CHUNK_KEY_BLOOM_CAP_BYTES_TEST.load(Ordering::Relaxed);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    CHUNK_KEY_BLOOM_CAP_BYTES
+}
+/// Until the device tuple-hash/group operator lands, exact within-statement uniqueness is a
+/// bounded set of device predicate passes. The bound prevents an unscalable O(B^2) hot path;
+/// larger SQL batches take the existing conservative de-authorize path. Normal OLTP waves are
+/// single-row/small-batch. Deletion trigger: the device exact tuple-hash/group operator.
+const CLASS_DEVICE_UNIQUE_BATCH_MAX_ROWS: usize = 256;
+
+#[cfg(test)]
+type ClassResolvePinHook = (
+    Arc<std::sync::Barrier>,
+    Arc<std::sync::Barrier>,
+);
+
+#[cfg(test)]
+fn class_resolve_pin_hook() -> &'static std::sync::Mutex<Option<ClassResolvePinHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ClassResolvePinHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_class_resolve_pin_hook() -> ClassResolvePinHook {
+    let pinned = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    *class_resolve_pin_hook()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((Arc::clone(&pinned), Arc::clone(&resume)));
+    (pinned, resume)
+}
+
+#[cfg(test)]
+type ChunkKeyPrimePinHook = (
+    Arc<std::sync::Barrier>,
+    Arc<std::sync::Barrier>,
+);
+
+#[cfg(test)]
+fn chunk_key_prime_pin_hook() -> &'static std::sync::Mutex<Option<ChunkKeyPrimePinHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ChunkKeyPrimePinHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_chunk_key_prime_pin_hook() -> ChunkKeyPrimePinHook {
+    let pinned = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    *chunk_key_prime_pin_hook()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((Arc::clone(&pinned), Arc::clone(&resume)));
+    (pinned, resume)
+}
 
 /// P5-1: the chunk CONTENT-identity allocator (fresh iff the payload bytes are new).
 static COLD_CHUNK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -194,7 +304,7 @@ static COLD_ENTRY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// One cached chunk: the exact device payload bytes + the descriptor template the build produced.
 pub(crate) struct ColdChunk {
     payload: ColdPayload,
-    snapshot: RelationalResidencySnapshot,
+    pub(crate) snapshot: RelationalResidencySnapshot,
     pub(crate) row_count: u64,
     /// P5-1 — CONTENT IDENTITY (design review H3): a process-monotonic id allocated ONLY where
     /// the payload bytes are GENUINELY NEW (the builder's push, the tail constructor, the
@@ -215,7 +325,7 @@ pub(crate) struct ColdChunk {
     /// boundary, which advances with every patch). A deleted TupleId's SLOT is its rank among the
     /// ids visible at THIS boundary within the chunk's range (scan order IS TupleId order), so the
     /// rank walk must anchor here, never at the entry boundary.
-    payload_copin_s: Index,
+    pub(crate) payload_copin_s: Index,
     /// P2 (SV2 sparse versioning): the on-demand `deleted_by` tombstone SIDECAR — dense i64/slot,
     /// `0x7F`-live fill (a large POSITIVE signed i64: the mask compare is the SIGNED s64 kernel),
     /// COW-stamped host bytes. ABSENT for a delete-free chunk (it pays nothing — the SV2/HyPer
@@ -529,27 +639,24 @@ fn streaming_shape(select: &Select) -> Option<StreamShape> {
     if !select.having_groups.is_empty() {
         return None;
     }
-    // S-E.4 ORDER BY: a single-key ordered `All`/`Columns` projection streams — the sort key must ride
-    // the partials (be among the projected columns) so the FINAL device sort can re-order them. Ordered
-    // DISTINCT / grouped / multi-key stay declined (multi-key is hard-rejected upstream anyway).
+    // S-E.4 ORDER BY: ordered `All`/`Columns` projections stream when every sort key rides the
+    // partials, so the FINAL device multi-key sort can re-order them. Ordered DISTINCT/grouped decline.
     if !select.order_by.is_empty() {
-        if select.distinct || select.group_by.is_some() || select.order_by.len() != 1 {
+        if select.distinct || select.group_by.is_some() {
             return None;
         }
-        let key = &select.order_by[0].column;
-        // An ORDER BY EXPRESSION parses to the empty-string sentinel column (the expression rides a
-        // separate order_by_exprs vector this path never receives) — decline it up front instead of
-        // burning chunk uploads before the executor's "column does not exist" defer (audit LOW; the
-        // grouped bridge guards the same sentinel).
-        if key.is_empty() {
+        if select.order_by.iter().any(|order| order.column.is_empty()) {
             return None;
         }
-        let key_projected = match &select.projection {
+        let keys_projected = match &select.projection {
             SelectProjection::All => true,
-            SelectProjection::Columns(columns) => columns.contains(key),
+            SelectProjection::Columns(columns) => select
+                .order_by
+                .iter()
+                .all(|order| columns.contains(&order.column)),
             _ => return None,
         };
-        if !key_projected {
+        if !keys_projected {
             return None;
         }
         // The window bound: OFFSET-without-LIMIT has no top-N bound -> treat as unbounded.
@@ -634,6 +741,1978 @@ fn streaming_shape(select: &Select) -> Option<StreamShape> {
 }
 
 impl Engine {
+    /// GPUs eligible to execute one query's byte-bounded chunks. The default GPU leads for stable
+    /// single-device behavior; additional physical devices participate only when they have an equal
+    /// or larger effective query budget and are not unavailable/memory-pressured. Cross-device
+    /// traffic therefore consists only of the small associative partials returned to the final
+    /// default-GPU combine—never full relation payloads or host relational execution.
+    fn streaming_execution_gpus(&self, default_gpu: u16, query_budget: u64) -> Vec<u16> {
+        let hardware = self.cuda_driver_probe_runtime().snapshot();
+        let health = self.router.runtime().snapshot();
+        let physical: Vec<u16> = hardware.devices.iter().map(|device| device.id).collect();
+        // Use EFFECTIVE budgets, not only the explicit lock-free overrides. In production an
+        // unconfigured device receives the 80%-of-physical-memory default; consulting only the
+        // override map made every secondary GPU silently ineligible in the default configuration.
+        let budgets: std::collections::BTreeMap<u16, u64> = physical
+            .iter()
+            .filter_map(|&gpu_id| {
+                self.relational_residency_budget_bytes(gpu_id)
+                    .map(|budget| (gpu_id, budget))
+            })
+            .collect();
+        select_streaming_execution_gpus(
+            default_gpu,
+            query_budget,
+            &physical,
+            &health.unavailable_gpu_ids,
+            &health.memory_pressured_gpu_ids,
+            &budgets,
+        )
+    }
+
+    fn record_streaming_chunk_gpu(&self, source: &ResidentExecSource, coordinator_gpu: u16) {
+        if source.descriptor.gpu_id != coordinator_gpu {
+            self.read_state
+                .residency
+                .streaming_fold_secondary_gpu_chunks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn materialized_join_run_specs<'a>(
+        run: &'a gpu_db_execution::CudaMaterializedRelation,
+    ) -> Vec<gpu_db_execution::CudaMaterializeJoinColumn<'a>> {
+        use gpu_db_execution::{CudaMaterializeJoinColumn, CudaMaterializedColumnKind};
+
+        run.columns()
+            .iter()
+            .map(|layout| match layout.kind {
+                CudaMaterializedColumnKind::Fixed { width } => {
+                    CudaMaterializeJoinColumn::Fixed {
+                        relation: 0,
+                        payload: run.memory(),
+                        byte_offset: layout.value_byte_offset,
+                        validity_bitmap_offset: Some(layout.validity_bitmap_offset),
+                        width,
+                    }
+                }
+                CudaMaterializedColumnKind::Text => CudaMaterializeJoinColumn::Text {
+                    relation: 0,
+                    payload: run.memory(),
+                    offsets_byte_offset: layout.value_byte_offset,
+                    bytes_byte_offset: layout.text_bytes_byte_offset.expect("text bytes layout"),
+                    bytes_len: layout.text_bytes_len,
+                    validity_bitmap_offset: Some(layout.validity_bitmap_offset),
+                },
+            })
+            .collect()
+    }
+
+    fn materialized_join_run_order<'a>(
+        &self,
+        plan: &crate::engine_expr::JoinPlan,
+        tables: &[RelationalTable],
+        columns: &[RelationalColumn],
+        run: &'a gpu_db_execution::CudaMaterializedRelation,
+    ) -> Result<Vec<gpu_db_execution::CudaJoinOrderKey<'a>>, ExecuteError> {
+        let sources = self.join_projection_sources(plan, tables)?;
+        let aliases = self.join_projection_output_aliases(plan, tables)?;
+        plan.order_by
+            .iter()
+            .enumerate()
+            .map(|(order_index, (key, descending))| {
+                let alias_matches = key
+                    .qualifier
+                    .is_none()
+                    .then(|| {
+                        aliases
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, alias)| {
+                                (alias.as_deref() == Some(&key.column)).then_some(index)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let alias_column = match alias_matches.as_slice() {
+                    [column] => Some(*column),
+                    [] => None,
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "ORDER BY \"{}\" is ambiguous",
+                            key.column
+                        ))))
+                    }
+                };
+                let resolved_relation = if alias_column.is_some() {
+                    None
+                } else if let Some(qualifier) = &key.qualifier {
+                    Some(
+                        plan.relations
+                            .iter()
+                            .position(|relation| relation.alias == *qualifier)
+                            .ok_or_else(|| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                    "missing FROM-clause entry for table \"{qualifier}\""
+                                )))
+                            })?,
+                    )
+                } else {
+                    let relations = tables
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(relation, table)| {
+                            relational_column_index(table, &key.column)
+                                .ok()
+                                .map(|_| relation)
+                        })
+                        .collect::<Vec<_>>();
+                    match relations.as_slice() {
+                        [relation] => Some(*relation),
+                        [] => None,
+                        _ => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "column reference \"{}\" is ambiguous",
+                                key.column
+                            ))))
+                        }
+                    }
+                };
+                let source_matches = sources
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, &(relation, column))| {
+                        (Some(relation) == resolved_relation
+                            && tables[relation].columns[column].name == key.column)
+                            .then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                let column = if let Some(column) = alias_column {
+                    column
+                } else if let [column] = source_matches.as_slice() {
+                    *column
+                } else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "streaming JOIN ORDER BY column `{}` must identify exactly one projected result column",
+                        key.column
+                    ))));
+                };
+                Ok(gpu_db_execution::CudaJoinOrderKey {
+                    relation: 0,
+                    key: run.payload_key(column).ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "streaming JOIN run column layout is missing".to_string(),
+                        ))
+                    })?,
+                    descending: *descending,
+                    nulls_first: plan
+                        .order_by_nulls_first
+                        .get(order_index)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(*descending),
+                    lexicographic_16: columns[column].ty == SqlType::Uuid,
+                })
+            })
+            .collect()
+    }
+
+    fn join_run_plan(
+        &self,
+        plan: &crate::engine_expr::JoinPlan,
+        tables: &[RelationalTable],
+    ) -> Result<(crate::engine_expr::JoinPlan, usize), ExecuteError> {
+        let mut run_plan = plan.clone();
+        let visible = self.join_projection_sources(plan, tables)?.len();
+        let mut sources = self.join_projection_sources(&run_plan, tables)?;
+        let visible_aliases = self.join_projection_output_aliases(plan, tables)?;
+        for (key, _) in &plan.order_by {
+            let alias_matches = key
+                .qualifier
+                .is_none()
+                .then(|| {
+                    visible_aliases
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, alias)| {
+                            (alias.as_deref() == Some(&key.column)).then_some(index)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let source = match alias_matches.as_slice() {
+                [index] => sources[*index],
+                [] => {
+                    let mut key_plan = plan.clone();
+                    key_plan.projection = vec![crate::engine_expr::JoinProjItem::Column(key.clone())];
+                    key_plan.projection_aliases = vec![None];
+                    self.join_projection_sources(&key_plan, tables)?
+                        .into_iter()
+                        .next()
+                        .expect("one ORDER BY source")
+                }
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "ORDER BY \"{}\" is ambiguous",
+                        key.column
+                    ))))
+                }
+            };
+            if !sources.contains(&source) {
+                run_plan
+                    .projection
+                    .push(crate::engine_expr::JoinProjItem::Column(key.clone()));
+                run_plan.projection_aliases.push(None);
+                sources.push(source);
+            }
+        }
+        Ok((run_plan, visible))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn merge_materialized_join_run(
+        &self,
+        accumulator: &mut Option<gpu_db_execution::CudaMaterializedRelation>,
+        next: gpu_db_execution::CudaMaterializedRelation,
+        plan: &crate::engine_expr::JoinPlan,
+        tables: &[RelationalTable],
+        columns: &[RelationalColumn],
+        top_n: Option<u32>,
+        budget: u64,
+        peak: &mut u64,
+    ) -> Result<(), ExecuteError> {
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        let Some(previous) = accumulator.take() else {
+            *peak = (*peak).max(next.allocated_bytes());
+            if *peak > budget {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "streaming JOIN allocator high-water ({peak}) exceeds the query budget ({budget})"
+                ))));
+            }
+            *accumulator = Some(next);
+            return Ok(());
+        };
+        let live_before = previous
+            .allocated_bytes()
+            .saturating_add(next.allocated_bytes());
+        budget.checked_sub(live_before).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "streaming JOIN allocator live set ({live_before}) exceeds the query budget ({budget})"
+            )))
+        })?;
+        let combined = previous
+            .memory()
+            .concat_materialized_relations(&previous, &next)
+            .map_err(map_err)?;
+        drop(previous);
+        drop(next);
+        let identity = combined
+            .memory()
+            .identity_join_coordinates(combined.row_count(), None)
+            .map_err(map_err)?;
+        let keys = self.materialized_join_run_order(plan, tables, columns, &combined)?;
+        let ordered = combined
+            .memory()
+            .sort_join_coordinates(&identity, &keys)
+            .map_err(map_err)?;
+        let retained = if let Some(limit) = top_n {
+            let window = combined
+                .memory()
+                .window_join_coordinates(&ordered, 0, Some(limit))
+                .map_err(map_err)?;
+            combined
+                .memory()
+                .synchronize_default_stream()
+                .map_err(map_err)?;
+            drop(ordered);
+            window
+        } else {
+            combined
+                .memory()
+                .synchronize_default_stream()
+                .map_err(map_err)?;
+            ordered
+        };
+        let specs = Self::materialized_join_run_specs(&combined);
+        let compacted = combined
+            .memory()
+            .materialize_join_coordinates(&retained, &specs)
+            .map_err(map_err)?;
+        *peak = (*peak).max(live_before.saturating_add(compacted.allocated_bytes()));
+        if *peak > budget {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "streaming JOIN allocator high-water ({peak}) exceeds the query budget ({budget})"
+            ))));
+        }
+        *accumulator = Some(compacted);
+        Ok(())
+    }
+
+    fn merge_unordered_materialized_join_run(
+        &self,
+        accumulator: &mut Option<gpu_db_execution::CudaMaterializedRelation>,
+        next: gpu_db_execution::CudaMaterializedRelation,
+        retain: u32,
+        budget: u64,
+        peak: &mut u64,
+    ) -> Result<(), ExecuteError> {
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        let previous = accumulator.take();
+        let live_before = previous.as_ref().map_or(next.allocated_bytes(), |previous| {
+            previous
+                .allocated_bytes()
+                .saturating_add(next.allocated_bytes())
+        });
+        budget.checked_sub(live_before).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "streaming JOIN allocator live set ({live_before}) exceeds the query budget ({budget})"
+            )))
+        })?;
+        let combined = if let Some(previous) = previous {
+            let combined = previous
+                .memory()
+                .concat_materialized_relations(&previous, &next)
+                .map_err(map_err)?;
+            combined
+        } else {
+            next
+        };
+        let retained = if combined.row_count() > retain {
+            let identity = combined
+                .memory()
+                .identity_join_coordinates(combined.row_count(), None)
+                .map_err(map_err)?;
+            let window = combined
+                .memory()
+                .window_join_coordinates(&identity, 0, Some(retain))
+                .map_err(map_err)?;
+            let specs = Self::materialized_join_run_specs(&combined);
+            let compacted = combined
+                .memory()
+                .materialize_join_coordinates(&window, &specs)
+                .map_err(map_err)?;
+            compacted
+        } else {
+            combined
+        };
+        *peak = (*peak).max(live_before.saturating_add(retained.allocated_bytes()));
+        if *peak > budget {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "streaming JOIN allocator high-water ({peak}) exceeds the query budget ({budget})"
+            ))));
+        }
+        *accumulator = Some(retained);
+        Ok(())
+    }
+
+    fn decode_materialized_join_run(
+        &self,
+        run: &gpu_db_execution::CudaMaterializedRelation,
+        columns: &[RelationalColumn],
+        offset: u32,
+        limit: Option<u32>,
+    ) -> Result<Vec<Vec<SqlValue>>, ExecuteError> {
+        use gpu_db_execution::CudaMaterializedColumnKind;
+
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        let identity = run
+            .memory()
+            .identity_join_coordinates(run.row_count(), None)
+            .map_err(map_err)?;
+        let window = run
+            .memory()
+            .window_join_coordinates(&identity, offset, limit)
+            .map_err(map_err)?;
+        let row_count = window.row_count() as usize;
+        let mut rows = vec![Vec::with_capacity(columns.len()); row_count];
+        for (column_index, column) in columns.iter().enumerate() {
+            let layout = run.columns().get(column_index).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "streaming JOIN run schema does not match its result columns".to_string(),
+                ))
+            })?;
+            let values = match layout.kind {
+                CudaMaterializedColumnKind::Text => run
+                    .memory()
+                    .project_text_from_join_coordinates(
+                        &window,
+                        0,
+                        run.memory(),
+                        layout.value_byte_offset,
+                        layout.text_bytes_byte_offset.expect("text bytes layout"),
+                        layout.text_bytes_len,
+                        Some(layout.validity_bitmap_offset),
+                    )
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|value| value.map_or(SqlValue::Null, SqlValue::Text))
+                    .collect::<Vec<_>>(),
+                CudaMaterializedColumnKind::Fixed { width } => {
+                    let (raw, valid) = run
+                        .memory()
+                        .project_fixed_from_join_coordinates(
+                            &window,
+                            0,
+                            run.memory(),
+                            layout.value_byte_offset,
+                            Some(layout.validity_bitmap_offset),
+                            width,
+                        )
+                        .map_err(map_err)?;
+                    raw.chunks_exact(width as usize)
+                        .zip(valid)
+                        .map(|(bytes, valid)| {
+                            if !valid {
+                                return SqlValue::Null;
+                            }
+                            match column.ty {
+                                SqlType::Bool => SqlValue::Bool(
+                                    i32::from_le_bytes(bytes.try_into().expect("bool width")) != 0,
+                                ),
+                                SqlType::Int2 => SqlValue::Int2(
+                                    i32::from_le_bytes(bytes.try_into().expect("int2 width")) as i16,
+                                ),
+                                SqlType::Int4 => SqlValue::Int4(i32::from_le_bytes(
+                                    bytes.try_into().expect("int4 width"),
+                                )),
+                                SqlType::Date => SqlValue::Date(i32::from_le_bytes(
+                                    bytes.try_into().expect("date width"),
+                                )),
+                                SqlType::Int8 => SqlValue::Int8(i64::from_le_bytes(
+                                    bytes.try_into().expect("int8 width"),
+                                )),
+                                SqlType::Timestamp => SqlValue::Timestamp(i64::from_le_bytes(
+                                    bytes.try_into().expect("timestamp width"),
+                                )),
+                                SqlType::Numeric { scale, .. } => SqlValue::Numeric(
+                                    gpu_db_sql::Decimal128::new(
+                                        i128::from_le_bytes(
+                                            bytes.try_into().expect("numeric width"),
+                                        ),
+                                        scale,
+                                    ),
+                                ),
+                                SqlType::Uuid => {
+                                    SqlValue::Uuid(bytes.try_into().expect("uuid width"))
+                                }
+                                SqlType::Text => unreachable!(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                }
+            };
+            for (row, value) in rows.iter_mut().zip(values) {
+                row.push(value);
+            }
+        }
+        Ok(rows)
+    }
+
+    pub(crate) fn decode_materialized_column(
+        &self,
+        run: &gpu_db_execution::CudaMaterializedRelation,
+        column_index: usize,
+        ty: SqlType,
+        coordinates: &gpu_db_execution::CudaJoinCoordinatesU32,
+    ) -> Result<Vec<SqlValue>, ExecuteError> {
+        use gpu_db_execution::CudaMaterializedColumnKind;
+
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        let layout = *run.columns().get(column_index).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "materialized column index is outside the run schema".to_string(),
+            ))
+        })?;
+        Ok(match layout.kind {
+            CudaMaterializedColumnKind::Text => run
+                .memory()
+                .project_text_from_join_coordinates(
+                    coordinates,
+                    0,
+                    run.memory(),
+                    layout.value_byte_offset,
+                    layout.text_bytes_byte_offset.expect("text bytes layout"),
+                    layout.text_bytes_len,
+                    Some(layout.validity_bitmap_offset),
+                )
+                .map_err(map_err)?
+                .into_iter()
+                .map(|value| value.map_or(SqlValue::Null, SqlValue::Text))
+                .collect(),
+            CudaMaterializedColumnKind::Fixed { width } => {
+                let (raw, valid) = run
+                    .memory()
+                    .project_fixed_from_join_coordinates(
+                        coordinates,
+                        0,
+                        run.memory(),
+                        layout.value_byte_offset,
+                        Some(layout.validity_bitmap_offset),
+                        width,
+                    )
+                    .map_err(map_err)?;
+                raw.chunks_exact(width as usize)
+                    .zip(valid)
+                    .map(|(bytes, valid)| {
+                        if !valid {
+                            return SqlValue::Null;
+                        }
+                        match ty {
+                            SqlType::Bool => SqlValue::Bool(
+                                i32::from_le_bytes(bytes.try_into().expect("bool width")) != 0,
+                            ),
+                            SqlType::Int2 => SqlValue::Int2(
+                                i32::from_le_bytes(bytes.try_into().expect("int2 width")) as i16,
+                            ),
+                            SqlType::Int4 => SqlValue::Int4(i32::from_le_bytes(
+                                bytes.try_into().expect("int4 width"),
+                            )),
+                            SqlType::Date => SqlValue::Date(i32::from_le_bytes(
+                                bytes.try_into().expect("date width"),
+                            )),
+                            SqlType::Int8 => SqlValue::Int8(i64::from_le_bytes(
+                                bytes.try_into().expect("int8 width"),
+                            )),
+                            SqlType::Timestamp => SqlValue::Timestamp(i64::from_le_bytes(
+                                bytes.try_into().expect("timestamp width"),
+                            )),
+                            SqlType::Numeric { scale, .. } => SqlValue::Numeric(
+                                gpu_db_sql::Decimal128::new(
+                                    i128::from_le_bytes(bytes.try_into().expect("numeric width")),
+                                    scale,
+                                ),
+                            ),
+                            SqlType::Uuid => {
+                                SqlValue::Uuid(bytes.try_into().expect("uuid width"))
+                            }
+                            SqlType::Text => unreachable!(),
+                        }
+                    })
+                    .collect()
+            }
+        })
+    }
+
+    pub(crate) fn ensure_streaming_join_cold(
+        &self,
+        table: &RelationalTable,
+        copin_s: Index,
+        gpu_id: u16,
+        input_cap: u64,
+    ) -> Option<Arc<ColdTableChunks>> {
+        // Row-byte target is intentionally half the payload reservation: headers, text offset
+        // arrays, validity, and section alignment also occupy the retained descriptor bytes.
+        let chunk_target = (input_cap / 2).max(1);
+        if let Some(cold) = self.load_streaming_cold(
+            &table.name,
+            table,
+            chunk_target,
+            copin_s,
+        ) {
+            return Some(cold);
+        }
+        // A class entry is the record of truth and cannot be rescanned/re-tiled from its frozen
+        // store. It joins only when its existing chunks already satisfy the two-input target.
+        if self.table_chunk_authoritative(&table.name).is_some() {
+            let cold = self
+                .read_state
+                .residency
+                .streaming_cold_chunks
+                .load()
+                .get(&table.name)
+                .cloned()?;
+            return (cold.chunk_target_bytes <= chunk_target).then_some(cold);
+        }
+        let count_select = Select {
+            table: table.name.clone(),
+            distinct: false,
+            projection: SelectProjection::CountAll,
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let bound = bind_relational_select(table, &count_select).ok()?;
+        // The reduction fold halves its supplied budget for the row-byte target. Descriptor overhead
+        // must still fit `input_cap`; the caller validates the completed retained bytes before launch.
+        self.run_streaming_reduction_fold(
+            &count_select,
+            table,
+            &bound,
+            None,
+            copin_s,
+            StreamAgg::Count,
+            gpu_id,
+            input_cap.max(1),
+        )
+        .ok()?;
+        self.load_streaming_cold(&table.name, table, chunk_target, copin_s)
+    }
+
+    /// Enumerate one complete left-deep prefix without materializing host tuples. RIGHT/FULL
+    /// completion replays the preceding prefix once per bounded right chunk while that chunk's
+    /// match bitmap is resident. Recursive replay is deliberate: it lets an earlier RIGHT/FULL
+    /// complement participate in every later join step while retaining only one bitmap per active
+    /// recursion level.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_nway_prefix(
+        &self,
+        plan: &crate::engine_expr::JoinPlan,
+        tables: &[RelationalTable],
+        chunks: &[Vec<&ColdChunk>],
+        copin_s: Index,
+        block_rows: usize,
+        relation_count: usize,
+        budget_base: u64,
+        budget: u64,
+        live_bitmap_bytes: &std::cell::Cell<u64>,
+        allocator_peak: &std::cell::Cell<u64>,
+        blocks_run: &std::cell::Cell<u64>,
+        emit: &mut JoinCoordinateEmitter<'_>,
+    ) -> Result<bool, ExecuteError> {
+        let account_bitmap = |bytes: u64,
+                              live: &std::cell::Cell<u64>,
+                              peak: &std::cell::Cell<u64>|
+         -> Result<(), ExecuteError> {
+            live.set(live.get().saturating_add(bytes));
+            let total = budget_base.saturating_add(live.get());
+            if total > budget {
+                live.set(live.get().saturating_sub(bytes));
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "N-way streaming OUTER bitmap state ({total}) exceeds budget ({budget})"
+                ))));
+            }
+            peak.set(peak.get().max(total));
+            Ok(())
+        };
+        if relation_count == 1 {
+            for chunk in &chunks[0] {
+                let (source, visibility) = self
+                    .stage_cold_chunk(chunk, copin_s)
+                    .and_then(StagedChunk::ready)
+                    .map_err(|_| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "failed to stage the first relation of an N-way OUTER join".to_string(),
+                        ))
+                    })?;
+                for start in (0..source.row_count as usize).step_by(block_rows) {
+                    let end = (start + block_rows).min(source.row_count as usize);
+                    let first_side = (
+                        RelationalResidencyEntry::new(Arc::clone(&source.descriptor)),
+                        crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                            &source.device_memory,
+                        )),
+                        source.row_count as usize,
+                        visibility,
+                    );
+                    let identity = self.resident_join_identity_coordinates(
+                        &tables[0],
+                        &first_side,
+                        Some((start as u32, end as u32)),
+                    )?;
+                    let mut sides = vec![first_side];
+                    if identity.row_count() > 0 && emit(&mut sides, &identity)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
+        let step_index = relation_count - 2;
+        let right_relation = relation_count - 1;
+        {
+            let mut emit_matches = |
+                sides: &mut Vec<crate::engine_expr::JoinExecSide>,
+                accumulated: &gpu_db_execution::CudaJoinCoordinatesU32,
+            | -> Result<bool, ExecuteError> {
+                let bitmap = sides[0]
+                    .1
+                    .mem()
+                    .create_match_bitmap_u32(accumulated.row_count())
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?;
+                let bitmap_bytes = bitmap.allocated_bytes();
+                account_bitmap(bitmap_bytes, live_bitmap_bytes, allocator_peak)?;
+                let result = (|| {
+                    for chunk in &chunks[right_relation] {
+                        let (source, visibility) = self
+                            .stage_cold_chunk(chunk, copin_s)
+                            .and_then(StagedChunk::ready)
+                            .map_err(|_| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                    "failed to stage relation {right_relation} for a streaming OUTER join"
+                                )))
+                            })?;
+                        for start in (0..source.row_count as usize).step_by(block_rows) {
+                            let end = (start + block_rows).min(source.row_count as usize);
+                            sides.push((
+                                RelationalResidencyEntry::new(Arc::clone(&source.descriptor)),
+                                crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                                    &source.device_memory,
+                                )),
+                                source.row_count as usize,
+                                visibility,
+                            ));
+                            let matches = self.execute_resident_join_coordinate_matches(
+                                plan,
+                                tables,
+                                sides,
+                                step_index,
+                                accumulated,
+                                &bitmap,
+                                None,
+                                Some((start as u32, end as u32)),
+                            )?;
+                            blocks_run.set(blocks_run.get().saturating_add(1));
+                            let stop = matches.row_count() > 0 && emit(sides, &matches)?;
+                            sides.pop();
+                            if stop {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    if plan.steps[step_index].outer_left {
+                        let unmatched = bitmap
+                            .unmatched_extended_coordinates(accumulated)
+                            .map_err(|err| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                            })?;
+                        if unmatched.row_count() > 0 {
+                            sides.push(self.resolve_join_side(
+                                &tables[right_relation].name,
+                                &tables[right_relation],
+                                Some(Vec::new()),
+                                copin_s,
+                            )?);
+                            let stop = emit(sides, &unmatched)?;
+                            sides.pop();
+                            if stop {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    Ok(false)
+                })();
+                live_bitmap_bytes.set(live_bitmap_bytes.get().saturating_sub(bitmap_bytes));
+                result
+            };
+            if self.stream_nway_prefix(
+                plan,
+                tables,
+                chunks,
+                copin_s,
+                block_rows,
+                relation_count - 1,
+                budget_base,
+                budget,
+                live_bitmap_bytes,
+                allocator_peak,
+                blocks_run,
+                &mut emit_matches,
+            )? {
+                return Ok(true);
+            }
+        }
+
+        if !plan.steps[step_index].outer_right {
+            return Ok(false);
+        }
+        for chunk in &chunks[right_relation] {
+            let (source, visibility) = self
+                .stage_cold_chunk(chunk, copin_s)
+                .and_then(StagedChunk::ready)
+                .map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "failed to restage relation {right_relation} for RIGHT completion"
+                    )))
+                })?;
+            let bitmap = source
+                .device_memory
+                .create_match_bitmap_u32(source.row_count as u32)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+            let bitmap_bytes = bitmap.allocated_bytes();
+            account_bitmap(bitmap_bytes, live_bitmap_bytes, allocator_peak)?;
+            let replay = (|| {
+                let mut mark_matches = |
+                    sides: &mut Vec<crate::engine_expr::JoinExecSide>,
+                    accumulated: &gpu_db_execution::CudaJoinCoordinatesU32,
+                | -> Result<bool, ExecuteError> {
+                    let left_bitmap = sides[0]
+                        .1
+                        .mem()
+                        .create_match_bitmap_u32(accumulated.row_count())
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    let left_bytes = left_bitmap.allocated_bytes();
+                    account_bitmap(left_bytes, live_bitmap_bytes, allocator_peak)?;
+                    let result = (|| {
+                        for start in (0..source.row_count as usize).step_by(block_rows) {
+                            let end = (start + block_rows).min(source.row_count as usize);
+                            sides.push((
+                                RelationalResidencyEntry::new(Arc::clone(&source.descriptor)),
+                                crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                                    &source.device_memory,
+                                )),
+                                source.row_count as usize,
+                                visibility,
+                            ));
+                            let matches = self.execute_resident_join_coordinate_matches(
+                                plan,
+                                tables,
+                                sides,
+                                step_index,
+                                accumulated,
+                                &left_bitmap,
+                                Some(&bitmap),
+                                Some((start as u32, end as u32)),
+                            );
+                            sides.pop();
+                            matches?;
+                            blocks_run.set(blocks_run.get().saturating_add(1));
+                        }
+                        Ok(false)
+                    })();
+                    live_bitmap_bytes.set(live_bitmap_bytes.get().saturating_sub(left_bytes));
+                    result
+                };
+                self.stream_nway_prefix(
+                    plan,
+                    tables,
+                    chunks,
+                    copin_s,
+                    block_rows,
+                    relation_count - 1,
+                    budget_base,
+                    budget,
+                    live_bitmap_bytes,
+                    allocator_peak,
+                    blocks_run,
+                    &mut mark_matches,
+                )?;
+                Ok::<(), ExecuteError>(())
+            })();
+            if let Err(err) = replay {
+                live_bitmap_bytes.set(live_bitmap_bytes.get().saturating_sub(bitmap_bytes));
+                return Err(err);
+            }
+            let coordinates = bitmap
+                .unmatched_coordinates(relation_count as u32, right_relation as u32)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+            live_bitmap_bytes.set(live_bitmap_bytes.get().saturating_sub(bitmap_bytes));
+            if coordinates.row_count() == 0 { continue; }
+            let mut sides = Vec::with_capacity(relation_count);
+            for table in tables.iter().take(right_relation) {
+                sides.push(self.resolve_join_side(
+                    &table.name,
+                    table,
+                    Some(Vec::new()),
+                    copin_s,
+                )?);
+            }
+            sides.push((
+                RelationalResidencyEntry::new(Arc::clone(&source.descriptor)),
+                crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                    &source.device_memory,
+                )),
+                source.row_count as usize,
+                visibility,
+            ));
+            let coordinates = self.filter_join_visibility_coordinates(
+                &tables[..=right_relation],
+                &sides,
+                &coordinates,
+            )?;
+            if coordinates.row_count() > 0 && emit(&mut sides, &coordinates)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn try_streaming_nway_join(
+        &self,
+        plan: &crate::engine_expr::JoinPlan,
+        tables: &[RelationalTable],
+        predicates: &[Option<crate::engine_expr::ResidentExpr>],
+        copin_s: Index,
+    ) -> Option<Result<RelationalSelectResult, ExecuteError>> {
+        let n = plan.relations.len();
+        if n < 3
+            || plan.steps.len() + 1 != n
+            || tables.len() != n
+            || predicates.len() != n
+            || plan.relations.iter().any(|r| self.table_install_elided(&r.table))
+        {
+            return None;
+        }
+        let gpu_id = self.planner.default_gpu_id();
+        let budget = self.relational_residency_budget_bytes(gpu_id)?;
+        if budget < 256 {
+            return None;
+        }
+        let all_resident = plan.relations.iter().all(|relation| {
+            self.relational_residency_entry(&relation.table).is_some()
+                || self
+                    .read_state
+                    .residency
+                    .shards
+                    .load()
+                    .get(&relation.table)
+                    .is_some_and(|shards| !shards.is_empty())
+        });
+        if all_resident {
+            return None;
+        }
+        // All resident inputs together consume <=1/4 budget; a packed variable-width key copy may
+        // consume another <=1/4, leaving half for the worst intermediate pair/index state.
+        let input_cap = (budget / (4 * n as u64)).max(1);
+        let cold: Vec<Arc<ColdTableChunks>> = tables
+            .iter()
+            .map(|table| {
+                self.ensure_streaming_join_cold(table, copin_s, gpu_id, input_cap)
+            })
+            .collect::<Option<_>>()?;
+        let chunks: Vec<Vec<&ColdChunk>> = cold
+            .iter()
+            .map(|entry| {
+                entry
+                    .chunks
+                    .iter()
+                    .filter(|chunk| chunk.payload_copin_s <= copin_s && chunk.row_count > 0)
+                    .collect()
+            })
+            .collect();
+        if chunks.iter().flatten().any(|chunk| {
+            chunk.row_count > u64::from(u32::MAX)
+                || chunk.snapshot.resident_bytes > input_cap
+        }) {
+            return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "an N-way streaming join input exceeds its device slice".to_string(),
+            ))));
+        }
+
+        // Choose the largest B whose worst N-way result and penultimate-key/hash state fit half
+        // the query budget: 16B/final tuple (widest fixed gather) + 96B/penultimate tuple/key state.
+        let mut block_rows = 1_usize;
+        loop {
+            let candidate = block_rows.saturating_add(1);
+            let final_tuples = candidate.saturating_pow(n as u32);
+            let prior_tuples = candidate.saturating_pow((n - 1) as u32);
+            let scratch = final_tuples
+                .saturating_mul(16)
+                .saturating_add(prior_tuples.saturating_add(candidate).saturating_mul(96));
+            if scratch as u64 > budget / 2 || candidate == usize::MAX {
+                break;
+            }
+            block_rows = candidate;
+        }
+        let final_tuples = block_rows.saturating_pow(n as u32);
+        let prior_tuples = block_rows.saturating_pow((n - 1) as u32);
+        let scratch_peak = final_tuples
+            .saturating_mul(16)
+            .saturating_add(prior_tuples.saturating_add(block_rows).saturating_mul(96))
+            as u64;
+        let input_peak: u64 = chunks
+            .iter()
+            .map(|relation| {
+                relation
+                    .iter()
+                    .map(|chunk| chunk.snapshot.resident_bytes)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum();
+        let planned_peak = input_peak.saturating_mul(2).saturating_add(scratch_peak);
+        if planned_peak > budget {
+            return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "N-way streaming join live device bytes ({planned_peak}) exceed budget ({budget})"
+            )))));
+        }
+        let scratch_budget = match budget.checked_sub(input_peak) {
+            Some(bytes) => bytes,
+            None => {
+                return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "N-way streaming join inputs ({input_peak}) exceed budget ({budget})"
+                )))))
+            }
+        };
+        let allocation_scope = gpu_db_execution::CudaAllocationScope::with_budget(scratch_budget);
+        self.read_state
+            .residency
+            .streaming_join_peak_device_bytes
+            .fetch_max(planned_peak, Ordering::Relaxed);
+
+        let (run_plan, visible_columns) = match self.join_run_plan(plan, tables) {
+            Ok(value) => value,
+            Err(err) => return Some(Err(err)),
+        };
+        let mut chunk_plan = run_plan.clone();
+        chunk_plan.limit = None;
+        chunk_plan.offset = None;
+        chunk_plan.order_by.clear();
+        chunk_plan.order_by_nulls_first.clear();
+        let collect_bound = plan
+            .limit
+            .map(|limit| plan.offset.unwrap_or(0).saturating_add(limit));
+        let top_n = match collect_bound.map(u32::try_from).transpose() {
+            Ok(value) => value,
+            Err(_) => {
+                return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "N-way streaming JOIN LIMIT/OFFSET exceeds u32".to_string(),
+                ))))
+            }
+        };
+        let needs_device_window = plan.order_by.is_empty()
+            && (plan.limit.is_some() || plan.offset.unwrap_or(0) > 0);
+        let mut output_rows = Vec::new();
+        let mut output_columns: Option<Arc<Vec<RelationalColumn>>> = None;
+        let mut run_columns: Option<Arc<Vec<RelationalColumn>>> = None;
+        let mut accumulator = None;
+        let allocator_peak = std::cell::Cell::new(planned_peak);
+        let blocks_run = std::cell::Cell::new(0_u64);
+        let has_outer = plan
+            .steps
+            .iter()
+            .any(|step| step.outer_left || step.outer_right);
+        let chunk_extents: Vec<usize> = chunks.iter().map(Vec::len).collect();
+        let have_data = chunk_extents.iter().all(|&extent| extent > 0);
+        let mut stop = false;
+        if has_outer {
+            let mut emit = |
+                result_columns: Arc<Vec<RelationalColumn>>,
+                run: gpu_db_execution::CudaMaterializedRelation,
+            | -> Result<bool, ExecuteError> {
+                if output_columns.is_none() {
+                    output_columns = Some(Arc::new(
+                        result_columns[..visible_columns].to_vec(),
+                    ));
+                    run_columns = Some(Arc::clone(&result_columns));
+                }
+                if plan.order_by.is_empty() && !needs_device_window {
+                    let remaining = top_n.map(|bound| {
+                        bound.saturating_sub(output_rows.len() as u32)
+                    });
+                    output_rows.extend(self.decode_materialized_join_run(
+                        &run,
+                        &result_columns[..visible_columns],
+                        0,
+                        remaining,
+                    )?);
+                    Ok(top_n.is_some_and(|bound| output_rows.len() >= bound as usize))
+                } else if plan.order_by.is_empty() {
+                    let mut peak = allocator_peak.get();
+                    self.merge_unordered_materialized_join_run(
+                        &mut accumulator,
+                        run,
+                        top_n.unwrap_or(0),
+                        budget,
+                        &mut peak,
+                    )?;
+                    allocator_peak.set(peak);
+                    Ok(top_n.is_some_and(|bound| {
+                        accumulator
+                            .as_ref()
+                            .is_some_and(|run| run.row_count() >= bound)
+                    }))
+                } else {
+                    let mut peak = allocator_peak.get();
+                    self.merge_materialized_join_run(
+                        &mut accumulator,
+                        run,
+                        &run_plan,
+                        tables,
+                        result_columns.as_slice(),
+                        top_n,
+                        budget,
+                        &mut peak,
+                    )?;
+                    allocator_peak.set(peak);
+                    Ok(false)
+                }
+            };
+            let live_bitmap_bytes = std::cell::Cell::new(0_u64);
+            let mut emit_coordinates = |
+                sides: &mut Vec<crate::engine_expr::JoinExecSide>,
+                coordinates: &gpu_db_execution::CudaJoinCoordinatesU32,
+            | -> Result<bool, ExecuteError> {
+                let filtered = self.filter_outer_join_projection_coordinates(
+                    tables,
+                    sides,
+                    predicates,
+                    coordinates,
+                )?;
+                if filtered.row_count() == 0 {
+                    return Ok(false);
+                }
+                let (columns, run) = self.materialize_join_projection_coordinates(
+                    &run_plan,
+                    tables,
+                    sides,
+                    &filtered,
+                )?;
+                emit(columns, run)
+            };
+            let outer_early_satisfied = match self.stream_nway_prefix(
+                plan,
+                tables,
+                &chunks,
+                copin_s,
+                block_rows,
+                n,
+                planned_peak,
+                budget,
+                &live_bitmap_bytes,
+                &allocator_peak,
+                &blocks_run,
+                &mut emit_coordinates,
+            ) {
+                Ok(value) => value,
+                Err(err) => return Some(Err(err)),
+            };
+            let _ = outer_early_satisfied;
+        } else if have_data {
+            let mut chunk_cursor = vec![0_usize; n];
+            loop {
+                let mut sources = Vec::with_capacity(n);
+                for relation in 0..n {
+                    let ready = match self
+                        .stage_cold_chunk(chunks[relation][chunk_cursor[relation]], copin_s)
+                        .and_then(StagedChunk::ready)
+                    {
+                        Ok(ready) => ready,
+                        Err(_) => {
+                            return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "failed to stage an N-way streaming join chunk".to_string(),
+                            ))))
+                        }
+                    };
+                    sources.push(ready);
+                }
+                let block_extents: Vec<usize> = sources
+                    .iter()
+                    .map(|(src, _)| (src.row_count as usize).div_ceil(block_rows))
+                    .collect();
+                let mut block_cursor = vec![0_usize; n];
+                loop {
+                    let mut ranges = Vec::with_capacity(n);
+                    let mut sides = Vec::with_capacity(n);
+                    for relation in 0..n {
+                        let (src, visibility) = &sources[relation];
+                        let start = block_cursor[relation] * block_rows;
+                        let end = (start + block_rows).min(src.row_count as usize);
+                        ranges.push((start as u32, end as u32));
+                        sides.push((
+                            RelationalResidencyEntry::new(Arc::clone(&src.descriptor)),
+                            crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                                &src.device_memory,
+                            )),
+                            src.row_count as usize,
+                            *visibility,
+                        ));
+                    }
+                    let mut run = None;
+                    let result = match self.execute_resident_expr_join_with_device_ranges(
+                        &chunk_plan,
+                        tables.to_vec(),
+                        vec![None; n],
+                        predicates.to_vec(),
+                        copin_s,
+                        Some(sides),
+                        ranges,
+                        None,
+                        Some(&mut run),
+                        false,
+                    ) {
+                        Ok(result) => result,
+                        Err(err) => return Some(Err(err)),
+                    };
+                    if output_columns.is_none() {
+                        output_columns = Some(Arc::new(
+                            result.columns[..visible_columns].to_vec(),
+                        ));
+                        run_columns = Some(Arc::clone(&result.columns));
+                    }
+                    let Some(run) = run else {
+                        return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "N-way device JOIN did not return its materialized run".to_string(),
+                        ))));
+                    };
+                    if plan.order_by.is_empty() && !needs_device_window {
+                        let remaining = top_n.map(|bound| {
+                            bound.saturating_sub(output_rows.len() as u32)
+                        });
+                        match self.decode_materialized_join_run(
+                            &run,
+                            &result.columns[..visible_columns],
+                            0,
+                            remaining,
+                        ) {
+                            Ok(rows) => output_rows.extend(rows),
+                            Err(err) => return Some(Err(err)),
+                        }
+                    } else if plan.order_by.is_empty() {
+                        let mut peak = allocator_peak.get();
+                        if let Err(err) = self.merge_unordered_materialized_join_run(
+                            &mut accumulator,
+                            run,
+                            top_n.unwrap_or(0),
+                            budget,
+                            &mut peak,
+                        ) {
+                            return Some(Err(err));
+                        }
+                        allocator_peak.set(peak);
+                    } else {
+                        let mut peak = allocator_peak.get();
+                        if let Err(err) = self.merge_materialized_join_run(
+                            &mut accumulator,
+                            run,
+                            &run_plan,
+                            tables,
+                            result.columns.as_slice(),
+                            top_n,
+                            budget,
+                            &mut peak,
+                        ) {
+                            return Some(Err(err));
+                        }
+                        allocator_peak.set(peak);
+                    }
+                    blocks_run.set(blocks_run.get().saturating_add(1));
+                    if needs_device_window
+                        && top_n.is_some_and(|bound| {
+                            accumulator
+                                .as_ref()
+                                .is_some_and(|run| run.row_count() >= bound)
+                        })
+                    {
+                        stop = true;
+                        break;
+                    }
+                    if !advance_product_cursor(&mut block_cursor, &block_extents) {
+                        break;
+                    }
+                }
+                if stop || !advance_product_cursor(&mut chunk_cursor, &chunk_extents) {
+                    break;
+                }
+            }
+        }
+        if output_columns.is_none() {
+            let sides = tables
+                .iter()
+                .map(|table| self.resolve_join_side(&table.name, table, Some(Vec::new()), copin_s))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            let mut run = None;
+            let result = match self.execute_resident_expr_join_with_device_run(
+                &chunk_plan,
+                tables.to_vec(),
+                vec![None; n],
+                predicates.to_vec(),
+                copin_s,
+                Some(sides),
+                None,
+                Some(&mut run),
+                false,
+            ) {
+                Ok(result) => result,
+                Err(err) => return Some(Err(err)),
+            };
+            output_columns = Some(Arc::new(result.columns[..visible_columns].to_vec()));
+            run_columns = Some(result.columns);
+        }
+        let columns = output_columns.expect("N-way join schema resolved");
+        let materialized_columns = run_columns.expect("N-way materialized schema resolved");
+        if !plan.order_by.is_empty() {
+            if let Some(run) = accumulator {
+                let identity = match run.memory().identity_join_coordinates(run.row_count(), None) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                };
+                let keys = match self.materialized_join_run_order(
+                    &run_plan,
+                    tables,
+                    materialized_columns.as_slice(),
+                    &run,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                let ordered = match run.memory().sort_join_coordinates(&identity, &keys) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                };
+                let specs = Self::materialized_join_run_specs(&run);
+                let sorted = match run.memory().materialize_join_coordinates(&ordered, &specs) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                };
+                output_rows = match self.decode_materialized_join_run(
+                    &sorted,
+                    columns.as_slice(),
+                    u32::try_from(plan.offset.unwrap_or(0)).unwrap_or(u32::MAX),
+                    plan.limit.and_then(|value| u32::try_from(value).ok()),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+            }
+        } else if needs_device_window {
+            if let Some(run) = accumulator {
+                output_rows = match self.decode_materialized_join_run(
+                    &run,
+                    columns.as_slice(),
+                    u32::try_from(plan.offset.unwrap_or(0)).unwrap_or(u32::MAX),
+                    plan.limit.and_then(|value| u32::try_from(value).ok()),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+            }
+        }
+        let allocator_high_water = input_peak.saturating_add(allocation_scope.peak_bytes());
+        self.read_state
+            .residency
+            .streaming_join_peak_device_bytes
+            .fetch_max(allocator_high_water, Ordering::Relaxed);
+        self.read_state
+            .residency
+            .streaming_join_hits
+            .fetch_add(1, Ordering::Relaxed);
+        self.read_state
+            .residency
+            .streaming_join_block_pairs
+            .fetch_add(blocks_run.get(), Ordering::Relaxed);
+        Some(Ok(RelationalSelectResult {
+            columns,
+            rows: output_rows.into(),
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            fallback_reason: None,
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
+        }))
+    }
+
+    /// ADR-012 two-relation join: stage one cold chunk from each side, then split each pair
+    /// into bounded logical row blocks before invoking the existing GPU hash join. CONCAT across
+    /// disjoint block pairs is control-plane combine; predicate, MVCC visibility, key equality,
+    /// NULL handling, and result gathers remain device-executed. OUTER joins run the match phase as
+    /// INNER while recording device-approved coordinates, then device-gather unmatched rows once.
+    pub(crate) fn try_streaming_inner_join(
+        &self,
+        plan: &crate::engine_expr::JoinPlan,
+        tables: &[RelationalTable],
+        predicates: &[Option<crate::engine_expr::ResidentExpr>],
+        copin_s: Index,
+    ) -> Option<Result<RelationalSelectResult, ExecuteError>> {
+        if plan.relations.len() > 2 {
+            return self.try_streaming_nway_join(plan, tables, predicates, copin_s);
+        }
+        if plan.relations.len() != 2
+            || plan.steps.len() != 1
+            || tables.len() != 2
+            || predicates.len() != 2
+        {
+            return None;
+        }
+        let gpu_id = self.planner.default_gpu_id();
+        let budget = self.relational_residency_budget_bytes(gpu_id)?;
+        if budget < 128 {
+            return None;
+        }
+        let all_resident = plan.relations.iter().all(|relation| {
+            self.relational_residency_entry(&relation.table).is_some()
+                || self
+                    .read_state
+                    .residency
+                    .shards
+                    .load()
+                    .get(&relation.table)
+                    .is_some_and(|shards| !shards.is_empty())
+        });
+        if all_resident || plan.relations.iter().any(|r| self.table_install_elided(&r.table)) {
+            return None;
+        }
+        let input_cap = (budget / 8).max(1);
+        let left = self.ensure_streaming_join_cold(&tables[0], copin_s, gpu_id, input_cap)?;
+        let right = self.ensure_streaming_join_cold(&tables[1], copin_s, gpu_id, input_cap)?;
+        let left_chunks = left
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.payload_copin_s <= copin_s && chunk.row_count > 0)
+            .collect::<Vec<_>>();
+        let right_chunks = right
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.payload_copin_s <= copin_s && chunk.row_count > 0)
+            .collect::<Vec<_>>();
+        if left_chunks
+            .iter()
+            .chain(right_chunks.iter())
+            .any(|chunk| {
+                chunk.row_count > u64::from(u32::MAX)
+                    || chunk.snapshot.resident_bytes > input_cap
+            })
+        {
+            return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a streaming JOIN input chunk exceeds its device slice or u32 row range"
+                    .to_string(),
+            ))));
+        }
+
+        let is_outer = plan.steps[0].outer_left || plan.steps[0].outer_right;
+        let (run_plan, visible_columns) = match self.join_run_plan(plan, tables) {
+            Ok(value) => value,
+            Err(err) => return Some(Err(err)),
+        };
+        let mut pair_plan = run_plan.clone();
+        pair_plan.limit = None;
+        pair_plan.offset = None;
+        pair_plan.order_by.clear();
+        pair_plan.order_by_nulls_first.clear();
+        pair_plan.steps[0].outer_left = false;
+        pair_plan.steps[0].outer_right = false;
+
+        let max_pairs = usize::try_from((budget / 4 / 8).max(1)).ok()?;
+        let mut block_rows = (max_pairs as f64).sqrt() as usize;
+        block_rows = block_rows.max(1);
+        while block_rows.saturating_mul(block_rows) > max_pairs {
+            block_rows -= 1;
+        }
+        while block_rows > 1
+            && (block_rows
+                .saturating_mul(block_rows)
+                .saturating_mul(8)
+                .saturating_add(block_rows.saturating_mul(96)) as u64)
+                > budget.saturating_mul(3) / 8
+        {
+            block_rows -= 1;
+        }
+        let input_peak = left_chunks
+            .iter()
+            .map(|chunk| chunk.snapshot.resident_bytes)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(
+                right_chunks
+                    .iter()
+                    .map(|chunk| chunk.snapshot.resident_bytes)
+                    .max()
+                    .unwrap_or(0),
+            );
+        let bitmap_peak = if is_outer {
+            left_chunks
+                .iter()
+                .chain(right_chunks.iter())
+                .map(|chunk| chunk.row_count.saturating_mul(4))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let scratch_peak = (block_rows
+            .saturating_mul(block_rows)
+            .saturating_mul(8)
+            .saturating_add(block_rows.saturating_mul(96))) as u64;
+        let planned_peak = input_peak
+            .saturating_mul(2)
+            .saturating_add(bitmap_peak)
+            .saturating_add(scratch_peak);
+        if planned_peak > budget {
+            return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "streaming JOIN live device bytes ({planned_peak}) exceed the query budget ({budget})"
+            )))));
+        }
+        let scratch_budget = match budget.checked_sub(input_peak) {
+            Some(bytes) => bytes,
+            None => {
+                return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "streaming JOIN inputs ({input_peak}) exceed budget ({budget})"
+                )))))
+            }
+        };
+        let allocation_scope = gpu_db_execution::CudaAllocationScope::with_budget(scratch_budget);
+        let collect_bound = plan
+            .limit
+            .map(|limit| plan.offset.unwrap_or(0).saturating_add(limit));
+        let top_n = match collect_bound.map(u32::try_from).transpose() {
+            Ok(value) => value,
+            Err(_) => {
+                return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "streaming JOIN LIMIT/OFFSET exceeds the device coordinate range".to_string(),
+                ))))
+            }
+        };
+        let needs_device_window = plan.order_by.is_empty()
+            && (plan.limit.is_some() || plan.offset.unwrap_or(0) > 0);
+        let mut output_rows = Vec::<Vec<SqlValue>>::new();
+        let mut output_columns: Option<Arc<Vec<RelationalColumn>>> = None;
+        let mut run_columns: Option<Arc<Vec<RelationalColumn>>> = None;
+        let mut accumulator = None;
+        let mut allocator_peak = planned_peak;
+        let mut blocks_run = 0_u64;
+        let mut satisfied = top_n == Some(0) && plan.order_by.is_empty();
+
+        let mut consume = |
+            columns: Arc<Vec<RelationalColumn>>,
+            run: gpu_db_execution::CudaMaterializedRelation,
+        | -> Result<bool, ExecuteError> {
+            if output_columns.is_none() {
+                output_columns = Some(Arc::new(columns[..visible_columns].to_vec()));
+                run_columns = Some(Arc::clone(&columns));
+            }
+            if !plan.order_by.is_empty() {
+                self.merge_materialized_join_run(
+                    &mut accumulator,
+                    run,
+                    &run_plan,
+                    tables,
+                    columns.as_slice(),
+                    top_n,
+                    budget,
+                    &mut allocator_peak,
+                )?;
+                return Ok(false);
+            }
+            if needs_device_window {
+                self.merge_unordered_materialized_join_run(
+                    &mut accumulator,
+                    run,
+                    top_n.unwrap_or(0),
+                    budget,
+                    &mut allocator_peak,
+                )?;
+                return Ok(top_n.is_some_and(|bound| {
+                    accumulator
+                        .as_ref()
+                        .is_some_and(|run| run.row_count() >= bound)
+                }));
+            }
+            let decoded = self.decode_materialized_join_run(
+                &run,
+                &columns[..visible_columns],
+                0,
+                top_n.map(|bound| bound.saturating_sub(output_rows.len() as u32)),
+            )?;
+            output_rows.extend(decoded);
+            if let Some(bound) = top_n {
+                output_rows.truncate(bound as usize);
+                return Ok(output_rows.len() >= bound as usize);
+            }
+            Ok(false)
+        };
+
+        'left_chunks: for left_chunk in &left_chunks {
+            if satisfied {
+                break;
+            }
+            let (left_src, left_vis) = match self
+                .stage_cold_chunk(left_chunk, copin_s)
+                .and_then(StagedChunk::ready)
+            {
+                Ok(value) => value,
+                Err(_) => return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "failed to stage the left streaming JOIN chunk".to_string(),
+                )))),
+            };
+            let left_bitmap = if plan.steps[0].outer_left {
+                match left_src
+                    .device_memory
+                    .create_match_bitmap_u32(left_src.row_count as u32)
+                {
+                    Ok(value) => Some(value),
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                }
+            } else {
+                None
+            };
+            for right_chunk in &right_chunks {
+                let (right_src, right_vis) = match self
+                    .stage_cold_chunk(right_chunk, copin_s)
+                    .and_then(StagedChunk::ready)
+                {
+                    Ok(value) => value,
+                    Err(_) => return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "failed to stage the right streaming JOIN chunk".to_string(),
+                    )))),
+                };
+                for left_start in (0..left_src.row_count as usize).step_by(block_rows) {
+                    let left_end = (left_start + block_rows).min(left_src.row_count as usize);
+                    for right_start in (0..right_src.row_count as usize).step_by(block_rows) {
+                        let right_end =
+                            (right_start + block_rows).min(right_src.row_count as usize);
+                        let sides = vec![
+                            (
+                                RelationalResidencyEntry::new(Arc::clone(&left_src.descriptor)),
+                                crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                                    &left_src.device_memory,
+                                )),
+                                left_src.row_count as usize,
+                                left_vis,
+                            ),
+                            (
+                                RelationalResidencyEntry::new(Arc::clone(&right_src.descriptor)),
+                                crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                                    &right_src.device_memory,
+                                )),
+                                right_src.row_count as usize,
+                                right_vis,
+                            ),
+                        ];
+                        let mut coordinates = None;
+                        let mut run = None;
+                        let result = match self.execute_resident_expr_join_with_device_ranges(
+                            &pair_plan,
+                            tables.to_vec(),
+                            vec![None, None],
+                            predicates.to_vec(),
+                            copin_s,
+                            Some(sides),
+                            vec![
+                                (left_start as u32, left_end as u32),
+                                (right_start as u32, right_end as u32),
+                            ],
+                            Some(&mut coordinates),
+                            Some(&mut run),
+                            is_outer,
+                        ) {
+                            Ok(value) => value,
+                            Err(err) => return Some(Err(err)),
+                        };
+                        if let (Some(bitmap), Some(coordinates)) =
+                            (left_bitmap.as_ref(), coordinates.as_ref())
+                        {
+                            if let Err(err) = bitmap.mark_coordinates(coordinates, 0) {
+                                return Some(Err(ExecuteError::Engine(
+                                    EngineError::ApplyFailed(err.to_string()),
+                                )));
+                            }
+                        }
+                        blocks_run += 1;
+                        let Some(run) = run else {
+                            return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "device JOIN did not return its materialized run".to_string(),
+                            ))));
+                        };
+                        match consume(result.columns, run) {
+                            Ok(done) => satisfied = done,
+                            Err(err) => return Some(Err(err)),
+                        }
+                        if satisfied {
+                            break 'left_chunks;
+                        }
+                    }
+                }
+            }
+            if let Some(bitmap) = left_bitmap {
+                let coordinates = match bitmap.unmatched_coordinates(2, 0) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                };
+                let empty_right = self
+                    .resolve_join_side(&tables[1].name, &tables[1], Some(Vec::new()), copin_s)
+                    .ok()?;
+                let sides = vec![
+                    (
+                        RelationalResidencyEntry::new(Arc::clone(&left_src.descriptor)),
+                        crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                            &left_src.device_memory,
+                        )),
+                        left_src.row_count as usize,
+                        left_vis,
+                    ),
+                    empty_right,
+                ];
+                let coordinates = match self.filter_outer_join_projection_coordinates(
+                    tables,
+                    &sides,
+                    predicates,
+                    &coordinates,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                let (columns, run) = match self.materialize_join_projection_coordinates(
+                    &run_plan,
+                    tables,
+                    &sides,
+                    &coordinates,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                match consume(columns, run) {
+                    Ok(done) => satisfied = done,
+                    Err(err) => return Some(Err(err)),
+                }
+            }
+        }
+
+        if plan.steps[0].outer_right && !satisfied {
+            'right_chunks: for right_chunk in &right_chunks {
+                let (right_src, right_vis) = match self
+                    .stage_cold_chunk(right_chunk, copin_s)
+                    .and_then(StagedChunk::ready)
+                {
+                    Ok(value) => value,
+                    Err(_) => return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "failed to stage a right OUTER JOIN chunk".to_string(),
+                    )))),
+                };
+                let bitmap = match right_src
+                    .device_memory
+                    .create_match_bitmap_u32(right_src.row_count as u32)
+                {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                };
+                for left_chunk in &left_chunks {
+                    let (left_src, left_vis) = match self
+                        .stage_cold_chunk(left_chunk, copin_s)
+                        .and_then(StagedChunk::ready)
+                    {
+                        Ok(value) => value,
+                        Err(_) => return Some(Err(ExecuteError::Engine(
+                            EngineError::ApplyFailed(
+                                "failed to stage a left OUTER match chunk".to_string(),
+                            ),
+                        ))),
+                    };
+                    for left_start in (0..left_src.row_count as usize).step_by(block_rows) {
+                        let left_end =
+                            (left_start + block_rows).min(left_src.row_count as usize);
+                        for right_start in (0..right_src.row_count as usize).step_by(block_rows) {
+                            let right_end =
+                                (right_start + block_rows).min(right_src.row_count as usize);
+                            let sides = vec![
+                                (
+                                    RelationalResidencyEntry::new(Arc::clone(&left_src.descriptor)),
+                                    crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                                        &left_src.device_memory,
+                                    )),
+                                    left_src.row_count as usize,
+                                    left_vis,
+                                ),
+                                (
+                                    RelationalResidencyEntry::new(Arc::clone(&right_src.descriptor)),
+                                    crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                                        &right_src.device_memory,
+                                    )),
+                                    right_src.row_count as usize,
+                                    right_vis,
+                                ),
+                            ];
+                            let mut coordinates = None;
+                            if let Err(err) = self.execute_resident_expr_join_with_device_ranges(
+                                &pair_plan,
+                                tables.to_vec(),
+                                vec![None, None],
+                                predicates.to_vec(),
+                                copin_s,
+                                Some(sides),
+                                vec![
+                                    (left_start as u32, left_end as u32),
+                                    (right_start as u32, right_end as u32),
+                                ],
+                                Some(&mut coordinates),
+                                None,
+                                is_outer,
+                            ) {
+                                return Some(Err(err));
+                            }
+                            if let Some(coordinates) = coordinates.as_ref() {
+                                if let Err(err) = bitmap.mark_coordinates(coordinates, 1) {
+                                    return Some(Err(ExecuteError::Engine(
+                                        EngineError::ApplyFailed(err.to_string()),
+                                    )));
+                                }
+                            }
+                            blocks_run += 1;
+                        }
+                    }
+                }
+                let coordinates = match bitmap.unmatched_coordinates(2, 1) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                };
+                let empty_left = self
+                    .resolve_join_side(&tables[0].name, &tables[0], Some(Vec::new()), copin_s)
+                    .ok()?;
+                let sides = vec![
+                    empty_left,
+                    (
+                        RelationalResidencyEntry::new(Arc::clone(&right_src.descriptor)),
+                        crate::engine_expr::JoinDeviceMemory::Resident(Arc::clone(
+                            &right_src.device_memory,
+                        )),
+                        right_src.row_count as usize,
+                        right_vis,
+                    ),
+                ];
+                let coordinates = match self.filter_outer_join_projection_coordinates(
+                    tables,
+                    &sides,
+                    predicates,
+                    &coordinates,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                let (columns, run) = match self.materialize_join_projection_coordinates(
+                    &run_plan,
+                    tables,
+                    &sides,
+                    &coordinates,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                match consume(columns, run) {
+                    Ok(done) => satisfied = done,
+                    Err(err) => return Some(Err(err)),
+                }
+                if satisfied {
+                    break 'right_chunks;
+                }
+            }
+        }
+
+        if output_columns.is_none() {
+            let sides = vec![
+                self.resolve_join_side(&tables[0].name, &tables[0], Some(Vec::new()), copin_s)
+                    .ok()?,
+                self.resolve_join_side(&tables[1].name, &tables[1], Some(Vec::new()), copin_s)
+                    .ok()?,
+            ];
+            let mut run = None;
+            let result = match self.execute_resident_expr_join_with_device_run(
+                &pair_plan,
+                tables.to_vec(),
+                vec![None, None],
+                predicates.to_vec(),
+                copin_s,
+                Some(sides),
+                None,
+                Some(&mut run),
+                false,
+            ) {
+                Ok(value) => value,
+                Err(err) => return Some(Err(err)),
+            };
+            output_columns = Some(Arc::new(result.columns[..visible_columns].to_vec()));
+            run_columns = Some(result.columns);
+        }
+        let columns = output_columns.expect("streaming JOIN schema resolved");
+        let materialized_columns = run_columns.expect("streaming JOIN materialized schema resolved");
+        if !plan.order_by.is_empty() {
+            if let Some(run) = accumulator {
+                let identity = match run
+                    .memory()
+                    .identity_join_coordinates(run.row_count(), None)
+                {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                };
+                let keys = match self.materialized_join_run_order(
+                    &run_plan,
+                    tables,
+                    materialized_columns.as_slice(),
+                    &run,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                let ordered = match run.memory().sort_join_coordinates(&identity, &keys) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                };
+                let specs = Self::materialized_join_run_specs(&run);
+                let sorted_run = match run.memory().materialize_join_coordinates(&ordered, &specs) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(ExecuteError::Engine(
+                        EngineError::ApplyFailed(err.to_string()),
+                    ))),
+                };
+                output_rows = match self.decode_materialized_join_run(
+                    &sorted_run,
+                    columns.as_slice(),
+                    u32::try_from(plan.offset.unwrap_or(0)).unwrap_or(u32::MAX),
+                    plan.limit.and_then(|value| u32::try_from(value).ok()),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+            }
+        } else if needs_device_window {
+            if let Some(run) = accumulator {
+                output_rows = match self.decode_materialized_join_run(
+                    &run,
+                    columns.as_slice(),
+                    u32::try_from(plan.offset.unwrap_or(0)).unwrap_or(u32::MAX),
+                    plan.limit.and_then(|value| u32::try_from(value).ok()),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+            }
+        }
+        let allocator_high_water = input_peak.saturating_add(allocation_scope.peak_bytes());
+        self.read_state
+            .residency
+            .streaming_join_peak_device_bytes
+            .fetch_max(allocator_high_water, Ordering::Relaxed);
+        self.read_state
+            .residency
+            .streaming_join_hits
+            .fetch_add(1, Ordering::Relaxed);
+        self.read_state
+            .residency
+            .streaming_join_block_pairs
+            .fetch_add(blocks_run, Ordering::Relaxed);
+        Some(Ok(RelationalSelectResult {
+            columns,
+            rows: output_rows.into(),
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            fallback_reason: None,
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
+        }))
+    }
+
     /// STRATA S-E.1/S-E.2: try to serve a SELECT OUT-OF-CORE via a streaming fold — a scalar reduction
     /// (combine partials) or a filter/project (concat + windowing). Returns `Some(result)` when the
     /// streaming path handled the read (`Ok`) or must surface a genuine SQL error (`Err`); `None` to fall
@@ -642,6 +2721,14 @@ impl Engine {
     pub(crate) fn try_streaming_select(
         &self,
         select: &Select,
+    ) -> Option<Result<RelationalSelectResult, ExecuteError>> {
+        self.try_streaming_select_at(select, self.committed_seq())
+    }
+
+    pub(crate) fn try_streaming_select_at(
+        &self,
+        select: &Select,
+        statement_copin_s: Index,
     ) -> Option<Result<RelationalSelectResult, ExecuteError>> {
         let shape = streaming_shape(select)?;
         let gpu_id = self.planner.default_gpu_id();
@@ -659,7 +2746,9 @@ impl Engine {
         }
         // Bind + lower the WHERE to a device predicate exactly as the sharded bridge does. A bind failure
         // or an un-lowerable predicate falls through to the host path (never a wrong answer).
-        let (table, mut bound, copin_s) = self.bind_relational_select_for_execution(select).ok()?;
+        let (table, mut bound, copin_s) = self
+            .bind_relational_select_at(select, statement_copin_s)
+            .ok()?;
         // P4-2b: a CLASS table's fold must NEVER scan the (frozen) store — a cold MISS (budget
         // re-chunk, below-boundary reader, eviction) routes to the CPU-pinned path, whose guard
         // de-authoritizes first. The probe load here is the folds' own load (a hit is reused).
@@ -743,6 +2832,8 @@ impl Engine {
         // Chunk to HALF the budget so the transient device payload + the executor's scratch/output buffers
         // stay within the budget together (the out-of-core invariant the peak-bytes gauge proves).
         let chunk_target_bytes = (budget / 2).max(1);
+        let execution_gpus = self.streaming_execution_gpus(gpu_id, budget);
+        let mut gpu_cursor = 0_usize;
         let count_select = {
             let mut s = select.clone();
             s.projection = SelectProjection::CountAll;
@@ -780,7 +2871,9 @@ impl Engine {
                 if chunk.payload_copin_s > copin_s {
                     continue;
                 }
-                let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
+                let target_gpu = execution_gpus[gpu_cursor % execution_gpus.len()];
+                gpu_cursor = gpu_cursor.wrapping_add(1);
+                let Ok(next) = self.stage_cold_chunk_on_gpu(chunk, copin_s, target_gpu) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
                     self.evict_streaming_cold(&select.table);
@@ -810,6 +2903,7 @@ impl Engine {
                         }
                         ChunkOutcome::Hard(err) => return Err(err),
                     }
+                    self.record_streaming_chunk_gpu(&src, gpu_id);
                     chunks_run += 1;
                 }
             }
@@ -849,8 +2943,10 @@ impl Engine {
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
                     // S-E.5 lookahead: stage this chunk (its upload overlaps), compute the PREVIOUS.
+                    let target_gpu = execution_gpus[gpu_cursor % execution_gpus.len()];
+                    gpu_cursor = gpu_cursor.wrapping_add(1);
                     let Ok(next) =
-                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture, target_gpu)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
@@ -878,6 +2974,7 @@ impl Engine {
                             }
                             ChunkOutcome::Hard(err) => return Err(err),
                         }
+                        self.record_streaming_chunk_gpu(&src, gpu_id);
                         chunks_run += 1;
                     }
                     chunk_rows.clear();
@@ -890,8 +2987,9 @@ impl Engine {
         // chunk so the aggregate gets its PG empty-set semantics (COUNT -> 0, SUM/MIN/MAX -> NULL). Then
         // DRAIN the pipeline (the last staged chunk still needs its compute).
         if !chunk_rows.is_empty() || (chunks_run == 0 && staged.is_none()) {
+            let target_gpu = execution_gpus[gpu_cursor % execution_gpus.len()];
             let Ok(next) =
-                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture, target_gpu)
             else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
@@ -919,6 +3017,7 @@ impl Engine {
                     }
                     ChunkOutcome::Hard(err) => return Err(err),
                 }
+                self.record_streaming_chunk_gpu(&src, gpu_id);
                 chunks_run += 1;
             }
         }
@@ -944,6 +3043,7 @@ impl Engine {
                 ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
                 ChunkOutcome::Hard(err) => return Err(err),
             }
+            self.record_streaming_chunk_gpu(&src, gpu_id);
             chunks_run += 1;
         }
 
@@ -1036,6 +3136,8 @@ impl Engine {
         budget: u64,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let chunk_target_bytes = (budget / 2).max(1);
+        let execution_gpus = self.streaming_execution_gpus(gpu_id, budget);
+        let mut gpu_cursor = 0_usize;
         let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
         // 6c-0: the WINDOW BOUND = offset+limit. Per chunk the DEVICE limit is this constant (a
         // chunk's first `bound` survivors are its only possible global-window contribution); the
@@ -1079,7 +3181,9 @@ impl Engine {
                 if window_bound.is_some_and(|bound| rows_out.len() >= bound) {
                     break;
                 }
-                let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
+                let target_gpu = execution_gpus[gpu_cursor % execution_gpus.len()];
+                gpu_cursor = gpu_cursor.wrapping_add(1);
+                let Ok(next) = self.stage_cold_chunk_on_gpu(chunk, copin_s, target_gpu) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
                     self.evict_streaming_cold(&select.table);
@@ -1110,6 +3214,7 @@ impl Engine {
                         }
                         ChunkOutcome::Hard(err) => return Err(err),
                     }
+                    self.record_streaming_chunk_gpu(&src, gpu_id);
                     chunks_run += 1;
                 }
             }
@@ -1150,8 +3255,10 @@ impl Engine {
                 };
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
+                    let target_gpu = execution_gpus[gpu_cursor % execution_gpus.len()];
+                    gpu_cursor = gpu_cursor.wrapping_add(1);
                     let Ok(next) =
-                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture, target_gpu)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
@@ -1180,6 +3287,7 @@ impl Engine {
                             }
                             ChunkOutcome::Hard(err) => return Err(err),
                         }
+                        self.record_streaming_chunk_gpu(&src, gpu_id);
                         chunks_run += 1;
                     }
                     chunk_rows.clear();
@@ -1192,8 +3300,9 @@ impl Engine {
         // early-exit tripped would be dropped by the window anyway; don't upload them). Then DRAIN the
         // unbounded pipeline (the last staged chunk still needs its compute).
         if !chunk_rows.is_empty() && window_bound.is_none_or(|bound| rows_out.len() < bound) {
+            let target_gpu = execution_gpus[gpu_cursor % execution_gpus.len()];
             let Ok(next) =
-                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture, target_gpu)
             else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
@@ -1222,6 +3331,7 @@ impl Engine {
                     }
                     ChunkOutcome::Hard(err) => return Err(err),
                 }
+                self.record_streaming_chunk_gpu(&src, gpu_id);
                 chunks_run += 1;
             }
         }
@@ -1243,6 +3353,7 @@ impl Engine {
                 ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
                 ChunkOutcome::Hard(err) => return Err(err),
             }
+            self.record_streaming_chunk_gpu(&src, gpu_id);
             chunks_run += 1;
         }
 
@@ -1321,7 +3432,7 @@ impl Engine {
     /// 6c-0: the cross-chunk OFFSET/LIMIT window as ONE device pass — the collected survivors upload
     /// as a synthesized relation and the executor applies `[OFFSET, OFFSET+LIMIT)` on its own window
     /// path (`sort_streaming_runs` with an EMPTY ORDER BY — the S-E.4 machinery minus the sort).
-    fn window_streaming_rows(
+    pub(crate) fn window_streaming_rows(
         &self,
         select: &Select,
         bound: &BoundRelationalSelect,
@@ -1369,6 +3480,7 @@ impl Engine {
             rows_out,
             &mut rows_bytes,
             budget,
+            None,
         ) {
             ChunkOutcome::Ok => Ok(()),
             _ => Err(()),
@@ -1399,6 +3511,8 @@ impl Engine {
         budget: u64,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let chunk_target_bytes = (budget / 2).max(1);
+        let execution_gpus = self.streaming_execution_gpus(gpu_id, budget);
+        let mut gpu_cursor = 0_usize;
         let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
         let SelectProjection::GroupedAggregates {
             group_column,
@@ -1565,7 +3679,9 @@ impl Engine {
                 if chunk.payload_copin_s > copin_s {
                     continue;
                 }
-                let Ok(next) = self.stage_cold_chunk(chunk, copin_s) else {
+                let target_gpu = execution_gpus[gpu_cursor % execution_gpus.len()];
+                gpu_cursor = gpu_cursor.wrapping_add(1);
+                let Ok(next) = self.stage_cold_chunk_on_gpu(chunk, copin_s, target_gpu) else {
                     // A failed replay (e.g. a bad spill read) evicts the entry so the next read
                     // rebuilds instead of defer-thrashing (audit LOW).
                     self.evict_streaming_cold(&select.table);
@@ -1595,6 +3711,7 @@ impl Engine {
                         }
                         ChunkOutcome::Hard(err) => return Err(err),
                     }
+                    self.record_streaming_chunk_gpu(&src, gpu_id);
                     chunks_run += 1;
                 }
                 // The loop's compaction, with the same drain-first discipline.
@@ -1623,6 +3740,7 @@ impl Engine {
                             }
                             ChunkOutcome::Hard(err) => return Err(err),
                         }
+                        self.record_streaming_chunk_gpu(&src, gpu_id);
                         chunks_run += 1;
                     }
                 }
@@ -1680,8 +3798,10 @@ impl Engine {
                 };
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
+                    let target_gpu = execution_gpus[gpu_cursor % execution_gpus.len()];
+                    gpu_cursor = gpu_cursor.wrapping_add(1);
                     let Ok(next) =
-                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture, target_gpu)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
@@ -1709,6 +3829,7 @@ impl Engine {
                             }
                             ChunkOutcome::Hard(err) => return Err(err),
                         }
+                        self.record_streaming_chunk_gpu(&src, gpu_id);
                         chunks_run += 1;
                     }
                     chunk_rows.clear();
@@ -1743,6 +3864,7 @@ impl Engine {
                                 }
                                 ChunkOutcome::Hard(err) => return Err(err),
                             }
+                            self.record_streaming_chunk_gpu(&src, gpu_id);
                             chunks_run += 1;
                         }
                     }
@@ -1772,8 +3894,9 @@ impl Engine {
             }
         }
         if !chunk_rows.is_empty() {
+            let target_gpu = execution_gpus[gpu_cursor % execution_gpus.len()];
             let Ok(next) =
-                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture, target_gpu)
             else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
@@ -1801,6 +3924,7 @@ impl Engine {
                     }
                     ChunkOutcome::Hard(err) => return Err(err),
                 }
+                self.record_streaming_chunk_gpu(&src, gpu_id);
                 chunks_run += 1;
             }
         }
@@ -1851,6 +3975,7 @@ impl Engine {
                 ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
                 ChunkOutcome::Hard(err) => return Err(err),
             }
+            self.record_streaming_chunk_gpu(&src, gpu_id);
             chunks_run += 1;
         }
 
@@ -2158,6 +4283,7 @@ impl Engine {
                                 &mut runs_acc,
                                 &mut runs_bytes,
                                 budget,
+                                None,
                             ) {
                                 ChunkOutcome::Ok => {}
                                 ChunkOutcome::Defer => {
@@ -2209,7 +4335,7 @@ impl Engine {
                 chunk_rows.push(decoded);
                 if chunk_bytes >= chunk_target_bytes {
                     let Ok(next) =
-                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                        self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture, gpu_id)
                     else {
                         return self.execute_relational_select_cpu_pinned(select);
                     };
@@ -2280,6 +4406,7 @@ impl Engine {
                                     &mut runs_acc,
                                     &mut runs_bytes,
                                     budget,
+                                    None,
                                 ) {
                                     ChunkOutcome::Ok => {}
                                     ChunkOutcome::Defer => {
@@ -2307,7 +4434,7 @@ impl Engine {
         }
         if !chunk_rows.is_empty() {
             let Ok(next) =
-                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture)
+                self.stage_streaming_chunk(table, &chunk_rows, chunk_range, &mut capture, gpu_id)
             else {
                 return self.execute_relational_select_cpu_pinned(select);
             };
@@ -2350,6 +4477,7 @@ impl Engine {
                         &mut runs_acc,
                         &mut runs_bytes,
                         budget,
+                        None,
                     ) {
                         ChunkOutcome::Ok => {}
                         ChunkOutcome::Defer => {
@@ -2404,6 +4532,7 @@ impl Engine {
                 &mut runs_acc,
                 &mut runs_bytes,
                 budget,
+                None,
             ) {
                 ChunkOutcome::Ok => {}
                 ChunkOutcome::Defer => return self.execute_relational_select_cpu_pinned(select),
@@ -2491,6 +4620,7 @@ impl Engine {
         runs_acc: &mut Vec<Vec<SqlValue>>,
         runs_bytes: &mut u64,
         budget: u64,
+        order_by_nulls_first: Option<&[Option<bool>]>,
     ) -> ChunkOutcome {
         if *runs_bytes > budget {
             return ChunkOutcome::Defer;
@@ -2510,7 +4640,9 @@ impl Engine {
             row_count: runs_acc.len() as u64,
         };
         let order_by_exprs: Vec<Option<ResidentExpr>> = vec![None; sort_select.order_by.len()];
-        let order_by_nulls_first: Vec<Option<bool>> = vec![None; sort_select.order_by.len()];
+        let order_by_nulls_first: Vec<Option<bool>> = order_by_nulls_first
+            .map(<[Option<bool>]>::to_vec)
+            .unwrap_or_else(|| vec![None; sort_select.order_by.len()]);
         let result = match self.execute_resident_expr_select_with_binding(
             sort_select,
             runs_table,
@@ -2622,9 +4754,10 @@ impl Engine {
         chunk_rows: &[Vec<SqlValue>],
         chunk_range: (u64, u64),
         capture: &mut Option<ColdCacheBuilder>,
+        gpu_id: u16,
     ) -> Result<StagedChunk, ()> {
         let (snapshot, pending, payload) = self
-            .build_transient_relation_residency_async(table, chunk_rows)
+            .build_transient_relation_residency_async(table, chunk_rows, gpu_id)
             .map_err(|_| ())?;
         // The out-of-core proof: the ACTUAL transient device bytes for this chunk (fetch_max monotonic).
         self.read_state
@@ -2668,6 +4801,8 @@ impl Engine {
         let mut map = std::collections::BTreeMap::clone(&residency.streaming_cold_chunks.load());
         if map.remove(table_name).is_some() {
             residency.streaming_cold_chunks.store(Arc::new(map));
+            self.purge_chunk_key_indexes_for_table(table_name);
+            self.purge_chunk_key_blooms_for_table(table_name);
         }
     }
 
@@ -2677,6 +4812,15 @@ impl Engine {
         &self,
         chunk: &ColdChunk,
         reader_copin_s: Index,
+    ) -> Result<StagedChunk, ()> {
+        self.stage_cold_chunk_on_gpu(chunk, reader_copin_s, chunk.snapshot.gpu_id)
+    }
+
+    fn stage_cold_chunk_on_gpu(
+        &self,
+        chunk: &ColdChunk,
+        reader_copin_s: Index,
+        gpu_id: u16,
     ) -> Result<StagedChunk, ()> {
         let runtime = self.cuda_driver_probe_runtime();
         // RAM chunks borrow; spilled chunks positional-read from the unlinked file (an IO error is
@@ -2706,13 +4850,14 @@ impl Engine {
             }
         };
         let pending = runtime
-            .retain_device_memory_copy_async(chunk.snapshot.gpu_id, &bytes)
+            .retain_device_memory_copy_async(gpu_id, &bytes)
             .map_err(|_| ())?;
         self.read_state
             .residency
             .streaming_fold_peak_chunk_bytes
             .fetch_max(chunk.snapshot.resident_bytes, Ordering::Relaxed);
         let mut snapshot = chunk.snapshot.clone();
+        snapshot.gpu_id = gpu_id;
         snapshot.device_memory_proof = Some(pending.metadata().clone());
         Ok(StagedChunk {
             snapshot,
@@ -3346,13 +5491,15 @@ impl Engine {
             entry_epoch: COLD_ENTRY_EPOCH.fetch_add(1, Ordering::Relaxed),
             chunks: builder.chunks,
         });
+        let live_chunk_ids: std::collections::BTreeSet<u64> =
+            entry.chunks.iter().map(|chunk| chunk.chunk_id).collect();
         let residency = &self.read_state.residency;
         let _publish = residency
             .streaming_cold_lock
             .lock()
             .expect("streaming cold-tier lock poisoned");
         let mut map = std::collections::BTreeMap::clone(&residency.streaming_cold_chunks.load());
-        map.insert(table_name.to_string(), entry);
+        map.insert(table_name.to_string(), Arc::clone(&entry));
         // Per-class caps (RAM vs spilled/DISK): a breach evicts the OTHER entries of that class.
         let class_total: u64 = map
             .values()
@@ -3378,6 +5525,15 @@ impl Engine {
                 .fetch_add(1, Ordering::Relaxed);
         }
         residency.streaming_cold_chunks.store(Arc::new(map));
+        drop(_publish);
+        self.purge_stale_chunk_key_candidates(table_name, &live_chunk_ids);
+        drop(_commit_guard);
+        // Key candidate structures are primed only after releasing the global commit mutex. This
+        // is load-bearing for spilled captures: staging may perform positional NVMe reads, which
+        // must never occur in the later class-entry hook under the commit lock.
+        if !commit_lock_held {
+            self.prime_chunk_key_candidates(table_name, &entry);
+        }
         true
     }
 
@@ -3550,10 +5706,45 @@ impl Engine {
             .load(Ordering::Relaxed)
     }
 
+    pub fn streaming_fold_secondary_gpu_chunks(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_fold_secondary_gpu_chunks
+            .load(Ordering::Relaxed)
+    }
+
     pub fn streaming_fold_peak_chunk_bytes(&self) -> u64 {
         self.read_state
             .residency
             .streaming_fold_peak_chunk_bytes
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn streaming_join_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_join_hits
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn streaming_join_block_pairs(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_join_block_pairs
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn streaming_join_peak_device_bytes(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_join_peak_device_bytes
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn streaming_window_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .streaming_window_hits
             .load(Ordering::Relaxed)
     }
 
@@ -3672,7 +5863,7 @@ impl Engine {
                              matches: &mut Vec<(u64, String, Vec<SqlValue>)>|
          -> Result<(), ()> {
             let staged =
-                self.stage_streaming_chunk(&locate_table, chunk_rows, (1, 0), &mut capture)?;
+                self.stage_streaming_chunk(&locate_table, chunk_rows, (1, 0), &mut capture, gpu_id)?;
             let (src, _) = staged.ready()?; // P3 locate chunks are scan-built (no sidecar)
             let result = self
                 .execute_resident_expr_select_with_binding(
@@ -3805,6 +5996,7 @@ impl Engine {
     ///    the rebuild arm is unreachable — until then this primitive must not run beside live
     ///    store writes to the same table.
     // Production caller = P4-2b (the class write path); the differential gate exercises it now.
+    #[cfg(test)]
     pub(crate) fn locate_streaming_cold_slots(
         &self,
         table: &RelationalTable,
@@ -3818,6 +6010,23 @@ impl Engine {
             .load()
             .get(&table.name)
             .cloned()?;
+        self.locate_streaming_cold_slots_in_entry(table, predicate, rtx, &entry, None)
+    }
+
+    /// P5 charter closure: run an EXACT predicate over only the chunks selected by the
+    /// fingerprint index. The index is an addressing accelerator, never the relational
+    /// authority: visibility, full-key equality (including collision resolution), residual
+    /// predicates, and NULL/3VL all run through `lower_resident_predicate` on the device.
+    /// `positions=None` is the ordinary full fold; `Some` is an over-approximating candidate
+    /// set and therefore may add work but can never remove an exact match.
+    fn locate_streaming_cold_slots_in_entry(
+        &self,
+        table: &RelationalTable,
+        predicate: &crate::engine_expr::ResidentExpr,
+        rtx: Index,
+        entry: &Arc<ColdTableChunks>,
+        positions: Option<&std::collections::BTreeSet<usize>>,
+    ) -> Option<Vec<(usize, Vec<u32>)>> {
         // P4-3: class entries serve any boundary at-or-above the FREEZE (the born gate skips
         // later-born chunks below); non-class entries keep the strict entry-boundary rule.
         match self.table_chunk_authoritative(&table.name) {
@@ -3834,6 +6043,9 @@ impl Engine {
         }
         let mut out: Vec<(usize, Vec<u32>)> = Vec::new();
         for (idx, chunk) in entry.chunks.iter().enumerate() {
+            if positions.is_some_and(|selected| !selected.contains(&idx)) {
+                continue;
+            }
             if chunk.row_count == 0 || chunk.payload_copin_s > rtx {
                 // Empty, or born after this boundary (the P4-3 born gate).
                 continue;
@@ -3854,7 +6066,69 @@ impl Engine {
                 out.push((idx, slots));
             }
         }
+        if positions.is_some() {
+            self.read_state
+                .residency
+                .chunk_class_device_exact_rechecks
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Some(out)
+    }
+
+    /// Exact constraint probe over a chunk-authoritative table. The device predicate and sidecar
+    /// visibility decide membership; the host receives only bounded approved coordinates so it can
+    /// apply the statement's self-exclusion set and reduce them to one boolean verdict.
+    pub(crate) fn chunk_class_visible_row_with_value(
+        &self,
+        table: &RelationalTable,
+        rtx: Index,
+        column_idx: usize,
+        value: &SqlValue,
+        exclude_keys: Option<&std::collections::BTreeSet<String>>,
+    ) -> Option<bool> {
+        let entry = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(&table.name)
+            .cloned()?;
+        let predicate = if matches!(value, SqlValue::Null) {
+            crate::engine_expr::ResidentExpr::IsNull {
+                col: column_idx,
+                is_not_null: false,
+            }
+        } else {
+            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(
+                table,
+                &[vec![(column_idx, SelectFilterOp::Eq, value.clone())]],
+            )?
+        };
+        let located = self.locate_streaming_cold_slots_in_entry(
+            table,
+            &predicate,
+            rtx,
+            &entry,
+            None,
+        )?;
+        for (chunk_idx, slots) in located {
+            for slot in slots {
+                let pseudo_id = ((chunk_idx as u64) << 32) | u64::from(slot);
+                let key = relational_row_key(&table.name, pseudo_id);
+                if exclude_keys.is_none_or(|excluded| !excluded.contains(&key)) {
+                    self.read_state
+                        .residency
+                        .chunk_class_device_exact_rechecks
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(true);
+                }
+            }
+        }
+        self.read_state
+            .residency
+            .chunk_class_device_exact_rechecks
+            .fetch_add(1, Ordering::Relaxed);
+        Some(false)
     }
 
     /// P4-2a — THE LOCATE-DRIVEN STAMP (design-review C1: the P2 stamp rides the store-generation
@@ -4057,11 +6331,11 @@ impl Engine {
             .copied()
     }
 
-    /// Catalog eligibility (design review H1: RUNTIME state does the rest): NO unique index
-    /// (per-insert uniqueness over chunks would be an O(table) fold scan) and NO FK edge in
-    /// either direction (inbound-FK validation scans the provider host-side). Every scalar type
-    /// is chunk-encodable, so types never gate — the cold entry's existence is the real
-    /// structural gate.
+    /// Catalog eligibility (design review H1: RUNTIME state does the rest). Unique keys are served
+    /// by P5's exact/Bloom candidate index. CHECK is row-local. Non-self foreign keys are served by
+    /// exact device predicates over the parent/child chunks; a device decline de-authoritizes before
+    /// the host validator runs. Self-FKs remain excluded because one statement's provider/consumer
+    /// images interleave. Every scalar type is chunk-encodable, so types never gate.
     fn chunk_class_eligible(catalog: &crate::CatalogSnapshot, table_name: &str) -> bool {
         let Some(table) = catalog.relational_catalog.get(table_name) else {
             return false;
@@ -4082,16 +6356,14 @@ impl Engine {
                 return false;
             }
         }
-        if !table.foreign_keys.is_empty() {
+        if table
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| foreign_key.referenced_table == table_name)
+        {
             return false;
         }
-        // Inbound FK: any OTHER table referencing this one.
-        !catalog.relational_catalog.values().any(|other| {
-            other
-                .foreign_keys
-                .iter()
-                .any(|fk| fk.referenced_table == table_name)
-        })
+        true
     }
 
     /// CLASS ENTRY — called from the applied-commit hook UNDER THE COMMIT LOCK, strictly in the
@@ -4167,16 +6439,51 @@ impl Engine {
                 })
                 .fold(0u64, u64::saturating_add);
             if per_index_bytes.saturating_mul(unique_key_ids.len() as u64)
-                > CHUNK_KEY_INDEX_CAP_BYTES
+                <= chunk_key_index_cap_bytes()
             {
-                return;
-            }
-            for (key_id, positions) in &unique_key_ids {
-                if self
-                    .ensure_chunk_key_indexes(table, &entry, positions, *key_id)
-                    .is_none()
+                if self.missing_chunk_key_candidates_require_spill(table, &entry, true) {
+                    // Never stage spill payloads while this hook holds the global commit lock.
+                    // The ordinary cold-capture install primes complete sets after releasing it.
+                    return;
+                }
+                for (key_id, positions) in &unique_key_ids {
+                    if self
+                        .ensure_chunk_key_indexes(table, &entry, positions, *key_id)
+                        .is_none()
+                    {
+                        return;
+                    }
+                }
+            } else {
+                let per_bloom_bytes: u64 = entry
+                    .chunks
+                    .iter()
+                    .filter(|chunk| chunk.row_count > 0)
+                    .map(|chunk| {
+                        (chunk.row_count.saturating_mul(8).max(256))
+                            .checked_next_power_of_two()
+                            .unwrap_or(u64::MAX)
+                            / 8
+                    })
+                    .fold(0u64, u64::saturating_add);
+                if per_bloom_bytes.saturating_mul(unique_key_ids.len() as u64)
+                    > chunk_key_bloom_cap_bytes()
                 {
                     return;
+                }
+                if self.missing_chunk_key_candidates_require_spill(table, &entry, false) {
+                    return;
+                }
+                for (key_id, positions) in &unique_key_ids {
+                    if self
+                        .ensure_chunk_key_blooms(table, &entry, positions, *key_id)
+                        .is_none()
+                    {
+                        // No class was published, so discard any partial reservation from this
+                        // attempt. A complete pre-primed set remains untouched on the success path.
+                        self.purge_chunk_key_blooms_for_table(table_name);
+                        return;
+                    }
                 }
             }
         }
@@ -4396,8 +6703,12 @@ impl Engine {
             .lock()
             .expect("streaming cold-tier lock poisoned");
         let mut map = std::collections::BTreeMap::clone(&residency.streaming_cold_chunks.load());
+        let live_chunk_ids: std::collections::BTreeSet<u64> =
+            entry.chunks.iter().map(|chunk| chunk.chunk_id).collect();
         map.insert(table_name.to_string(), entry);
         residency.streaming_cold_chunks.store(Arc::new(map));
+        drop(_publish);
+        self.purge_stale_chunk_key_candidates(table_name, &live_chunk_ids);
         true
     }
 
@@ -4542,24 +6853,8 @@ impl Engine {
             // P5-2 audit LOW: purge the table's chunk KEY-INDEX cache entries too — chunk ids
             // are monotonic, so post-de-auth entries can never be re-hit; leaving them inflates
             // `chunk_key_index_bytes` (VRAM retention + premature LRU eviction of live tables).
-            {
-                let mut cache = residency
-                    .chunk_key_index
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                let stale: Vec<_> = cache
-                    .keys()
-                    .filter(|(name, _, _)| name == table_name)
-                    .cloned()
-                    .collect();
-                for key in stale {
-                    if let Some(evicted) = cache.remove(&key) {
-                        residency
-                            .chunk_key_index_bytes
-                            .fetch_sub(evicted.bytes, Ordering::Relaxed);
-                    }
-                }
-            }
+            engine.purge_chunk_key_indexes_for_table(table_name);
+            engine.purge_chunk_key_blooms_for_table(table_name);
             residency
                 .chunk_class_deauths
                 .fetch_add(1, Ordering::Relaxed);
@@ -4594,6 +6889,18 @@ impl Engine {
             .load()
             .get(&table.name)
             .cloned()?;
+        #[cfg(test)]
+        let resolve_pin_hook = {
+            class_resolve_pin_hook()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        };
+        #[cfg(test)]
+        if let Some((pinned, resume)) = resolve_pin_hook {
+            pinned.wait();
+            resume.wait();
+        }
         let epoch = entry.entry_epoch;
         // P5-3: an Eq-on-unique-key WHERE locates via the CHUNK KEY-INDEX PROBE — one device
         // locate + per-hit slot rechecks — instead of the full fold scan over every chunk, and
@@ -4614,14 +6921,27 @@ impl Engine {
         }
         let predicate =
             crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)?;
-        let located =
-            self.locate_streaming_cold_slots(table, &predicate, visibility.read_txn_id)?;
+        // Keep coordinates, row images, and the returned epoch on ONE pinned entry Arc. This
+        // resolver can run off-lock; reloading inside locate would let a concurrent tail/stamp/
+        // compaction publish E2, then interpret E2 coordinates against E1 below and poison the
+        // prepare-time write-set used by SI conflict detection.
+        let located = self.locate_streaming_cold_slots_in_entry(
+            table,
+            &predicate,
+            visibility.read_txn_id,
+            &entry,
+            None,
+        )?;
         let mut matches: ClassDmlMatches = Vec::new();
         for (chunk_idx, slots) in &located {
             let chunk = entry.chunks.get(*chunk_idx)?;
-            let unmasked = decode_cold_chunk_rows(table, chunk, 0).ok()?;
+            let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
+            let (src, _vis) = staged.ready().ok()?;
             for slot in slots {
-                let image = unmasked.get(*slot as usize)?.clone();
+                // The device locate already decided the exact predicate + visibility. Read
+                // back only the approved row image; never decode the host cold payload here.
+                let image =
+                    self.read_cold_chunk_slot_values(table, chunk, &src, *slot as usize)?;
                 let pseudo_id = ((*chunk_idx as u64) << 32) | u64::from(*slot);
                 let key = crate::rel_exec_helpers::relational_row_key(&table.name, pseudo_id);
                 matches.push((pseudo_id, key, image));
@@ -4631,12 +6951,11 @@ impl Engine {
     }
 
     /// P5-3 — the by-key DML locate: serve a single-group ALL-Eq WHERE that covers some unique
-    /// index's key columns through the chunk key-index probe + the P5-0 slot recheck. Returns
-    /// the FULLY-FILTERED matches (every predicate of the group re-applied host-side on the
-    /// materialized row — `select_filter_matches`, the scan arm's exact twin), with images taken
-    /// from the rechecked slots (live at `rtx`; a dup-tolerant probe can also surface dead or
-    /// colliding slots — the recheck masks/filters them). `None` = NOT ELIGIBLE or any failure —
-    /// the caller falls to the fold locate (never a decline, never a wrong answer).
+    /// index's key columns through the chunk key-index probe. The probe only chooses candidate
+    /// chunks; the complete predicate and visibility mask then run on-device over those chunks.
+    /// This exact device pass resolves fingerprint collisions and residual predicates before the
+    /// host receives final survivor coordinates or row values. `None` = NOT ELIGIBLE or any
+    /// failure — the caller falls to the full device fold (never a host relational recheck).
     fn resolve_class_dml_via_key_probe(
         &self,
         table: &RelationalTable,
@@ -4689,32 +7008,39 @@ impl Engine {
             needle_row[position] = (*eq_positions.get(&position)?).clone();
         }
         let needle = Self::chunk_key_needle(table, &positions, &needle_row)?;
-        let chunk_indexes = self.ensure_chunk_key_indexes(table, entry, &positions, key_id)?;
-        let hits = self.probe_chunk_key_indexes(&chunk_indexes, &[needle])?;
-        let mut per_chunk: std::collections::BTreeMap<usize, Vec<u32>> =
-            std::collections::BTreeMap::new();
-        for (position, slot) in hits.first()? {
-            per_chunk.entry(*position).or_default().push(*slot);
+        let (hits, _) = self.chunk_key_candidate_positions(
+            table,
+            entry,
+            &positions,
+            key_id,
+            &[needle],
+        )?;
+        let candidate_positions: std::collections::BTreeSet<usize> = hits
+            .first()?
+            .iter()
+            .copied()
+            .collect();
+        if candidate_positions.is_empty() {
+            return Some(Vec::new());
         }
+        let exact_predicate =
+            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)?;
+        let exact = self.locate_streaming_cold_slots_in_entry(
+            table,
+            &exact_predicate,
+            rtx,
+            entry,
+            Some(&candidate_positions),
+        )?;
         let mut matches: ClassDmlMatches = Vec::new();
-        for (position, slots) in per_chunk {
+        for (position, slots) in exact {
             let chunk = entry.chunks.get(position)?;
             let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
             let (src, _vis) = staged.ready().ok()?;
             for slot in slots {
-                let Some(row) =
-                    self.materialize_cold_chunk_slot(table, chunk, &src, slot as usize, rtx)?
-                else {
-                    continue; // dead at rtx — exactly the fold's visibility exclusion
-                };
-                // Re-apply the WHOLE group host-side: fingerprint collisions fail the key Eq,
-                // and non-key residual predicates filter here (parity with the scan arm).
-                if !group
-                    .iter()
-                    .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
-                {
-                    continue;
-                }
+                // The exact device pass above already decided visibility + the complete
+                // predicate. This is the one final value readback needed to stage the DML image.
+                let row = self.read_cold_chunk_slot_values(table, chunk, &src, slot as usize)?;
                 let pseudo_id = ((position as u64) << 32) | u64::from(slot);
                 let key = crate::rel_exec_helpers::relational_row_key(&table.name, pseudo_id);
                 matches.push((pseudo_id, key, row));
@@ -4974,6 +7300,512 @@ impl Engine {
         })
     }
 
+    /// Build the compact Bloom twin of a chunk key index. Fingerprints are derived with the same device fold as
+    /// the exact index; the host only packs the staging bitset. Candidate membership is decided by the GPU and
+    /// every positive is rechecked by the exact device predicate, so Bloom false positives are harmless.
+    fn build_chunk_key_bloom(
+        &self,
+        table: &RelationalTable,
+        chunk: &ColdChunk,
+        key_positions: &[usize],
+    ) -> Option<ChunkKeyBloom> {
+        use crate::relational_model::{
+            resident_device_int4_column_offset, resident_device_int8_column_offset,
+            resident_device_numeric_column_offset, resident_device_text_column_layout,
+        };
+        let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
+        let (src, _vis) = staged.ready().ok()?;
+        let mut offsets = Vec::with_capacity(key_positions.len());
+        let mut blob_offsets = Vec::with_capacity(key_positions.len());
+        for &pos in key_positions {
+            match table.columns.get(pos)?.ty {
+                SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
+                    offsets.push(resident_device_int4_column_offset(&chunk.snapshot, table, pos).ok()?);
+                    blob_offsets.push(0);
+                }
+                SqlType::Int8 | SqlType::Timestamp => {
+                    offsets.push(resident_device_int8_column_offset(&chunk.snapshot, table, pos).ok()?);
+                    blob_offsets.push(0);
+                }
+                SqlType::Numeric { .. } | SqlType::Uuid => {
+                    offsets.push(resident_device_numeric_column_offset(&chunk.snapshot, table, pos).ok()?);
+                    blob_offsets.push(0);
+                }
+                SqlType::Text => {
+                    let layout = resident_device_text_column_layout(&chunk.snapshot, table, pos).ok()?;
+                    offsets.push(layout.offsets_byte_offset);
+                    blob_offsets.push(layout.bytes_byte_offset);
+                }
+                SqlType::Bool => return None,
+            }
+        }
+        let keys = if key_positions.len() == 1
+            && matches!(table.columns[key_positions[0]].ty, SqlType::Int4 | SqlType::Date | SqlType::Int2)
+        {
+            src.device_memory
+                .read_resident_i32_column(offsets[0], chunk.row_count as usize)
+                .ok()?
+        } else {
+            let widths = key_positions
+                .iter()
+                .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
+                .collect::<Option<Vec<_>>>()?;
+            src.device_memory
+                .submit_compound_fold_fingerprints(
+                    src.device_memory.device_ptr(),
+                    &offsets,
+                    &widths,
+                    &blob_offsets,
+                    chunk.row_count as usize,
+                )
+                .ok()?
+        };
+        if keys.len() != chunk.row_count as usize {
+            return None;
+        }
+        let bit_count = (chunk.row_count.saturating_mul(8).max(256))
+            .checked_next_power_of_two()?
+            .min(1u64 << 31);
+        let bit_mask = u32::try_from(bit_count - 1).ok()?;
+        let mut words = vec![0u32; (bit_count / 32) as usize];
+        for key in keys {
+            let key = key as u32;
+            let h1 = key.wrapping_mul(2_654_435_761);
+            let h2 = (key ^ (key >> 16)).wrapping_mul(2_246_822_519) | 1;
+            for i in 0..3u32 {
+                let bit = h1.wrapping_add(i.wrapping_mul(h2)) & bit_mask;
+                words[(bit >> 5) as usize] |= 1u32 << (bit & 31);
+            }
+        }
+        #[cfg(test)]
+        if CHUNK_KEY_BLOOM_ALL_POSITIVE_TEST.load(Ordering::Relaxed) {
+            words.fill(u32::MAX);
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let device = self
+            .cuda_driver_probe_runtime()
+            .retain_device_memory_copy(chunk.snapshot.gpu_id, &bytes)
+            .ok()?;
+        Some(ChunkKeyBloom {
+            device: Arc::new(device),
+            bit_mask,
+            bytes: bytes.len() as u64,
+        })
+    }
+
+    fn ensure_chunk_key_blooms(
+        &self,
+        table: &RelationalTable,
+        entry: &Arc<ColdTableChunks>,
+        key_positions: &[usize],
+        key_id: usize,
+    ) -> Option<Vec<(usize, ChunkKeyBloom)>> {
+        let residency = &self.read_state.residency;
+        if residency.chunk_key_bloom_bytes.load(Ordering::Relaxed)
+            > chunk_key_bloom_cap_bytes()
+        {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (position, chunk) in entry.chunks.iter().enumerate().filter(|(_, c)| c.row_count > 0) {
+            let key = (table.name.clone(), chunk.chunk_id, key_id);
+            let cached = {
+                residency
+                    .chunk_key_bloom
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&key)
+                    .cloned()
+            };
+            let bloom = if let Some(hit) = cached {
+                hit
+            } else {
+                let built = self.build_chunk_key_bloom(table, chunk, key_positions)?;
+                let mut cache = residency.chunk_key_bloom.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(hit) = cache.get(&key).cloned() {
+                    hit
+                } else {
+                    let current = residency.chunk_key_bloom_bytes.load(Ordering::Relaxed);
+                    if current.saturating_add(built.bytes) > chunk_key_bloom_cap_bytes() {
+                        return None;
+                    }
+                    residency
+                        .chunk_key_bloom_bytes
+                        .fetch_add(built.bytes, Ordering::Relaxed);
+                    cache.insert(key, built.clone());
+                    built
+                }
+            };
+            out.push((position, bloom));
+        }
+        Some(out)
+    }
+
+    fn probe_chunk_key_blooms(
+        &self,
+        blooms: &[(usize, ChunkKeyBloom)],
+        needles: &[i32],
+    ) -> Option<Vec<Vec<usize>>> {
+        if blooms.is_empty() {
+            return Some(vec![Vec::new(); needles.len()]);
+        }
+        let device_blooms: Vec<_> = blooms
+            .iter()
+            .map(|(_, bloom)| gpu_db_execution::ChunkBloomProbeShard {
+                bloom: Arc::clone(&bloom.device),
+                bit_mask: bloom.bit_mask,
+            })
+            .collect();
+        let candidates = device_blooms[0]
+            .bloom
+            .probe_chunk_blooms(&device_blooms, needles)
+            .ok()?;
+        self.read_state.residency.chunk_key_bloom_probes.fetch_add(1, Ordering::Relaxed);
+        candidates
+            .into_iter()
+            .map(|chunks| {
+                chunks
+                    .into_iter()
+                    .map(|filtered| blooms.get(filtered as usize).map(|pair| pair.0))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect()
+    }
+
+    fn chunk_key_exact_set_bytes(table: &RelationalTable, entry: &ColdTableChunks) -> u64 {
+        let unique_keys = table.indexes.iter().filter(|index| index.unique).count() as u64;
+        entry
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.row_count > 0)
+            .map(|chunk| {
+                (chunk.row_count.saturating_mul(2))
+                    .checked_next_power_of_two()
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(8)
+            })
+            .fold(0u64, u64::saturating_add)
+            .saturating_mul(unique_keys)
+    }
+
+    fn chunk_key_unique_positions(table: &RelationalTable) -> Vec<(usize, Vec<usize>)> {
+        table
+            .indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| index.unique)
+            .filter_map(|(key_id, index)| {
+                crate::engine_residency::index_key_column_positions(table, index)
+                    .map(|positions| (key_id, positions))
+            })
+            .collect()
+    }
+
+    fn purge_chunk_key_indexes_for_table(&self, table_name: &str) {
+        let residency = &self.read_state.residency;
+        let mut cache = residency
+            .chunk_key_index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let stale: Vec<_> = cache
+            .keys()
+            .filter(|(name, _, _)| name == table_name)
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(evicted) = cache.remove(&key) {
+                residency
+                    .chunk_key_index_bytes
+                    .fetch_sub(evicted.bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn purge_chunk_key_blooms_for_table(&self, table_name: &str) {
+        let residency = &self.read_state.residency;
+        let mut cache = residency
+            .chunk_key_bloom
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let stale: Vec<_> = cache
+            .keys()
+            .filter(|(name, _, _)| name == table_name)
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(evicted) = cache.remove(&key) {
+                residency
+                    .chunk_key_bloom_bytes
+                    .fetch_sub(evicted.bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn purge_stale_chunk_key_candidates(
+        &self,
+        table_name: &str,
+        live_chunk_ids: &std::collections::BTreeSet<u64>,
+    ) {
+        let residency = &self.read_state.residency;
+        {
+            let mut cache = residency
+                .chunk_key_index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let stale: Vec<_> = cache
+                .keys()
+                .filter(|(name, chunk_id, _)| {
+                    name == table_name && !live_chunk_ids.contains(chunk_id)
+                })
+                .cloned()
+                .collect();
+            for key in stale {
+                if let Some(evicted) = cache.remove(&key) {
+                    residency
+                        .chunk_key_index_bytes
+                        .fetch_sub(evicted.bytes, Ordering::Relaxed);
+                }
+            }
+        }
+        {
+            let mut cache = residency
+                .chunk_key_bloom
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let stale: Vec<_> = cache
+                .keys()
+                .filter(|(name, chunk_id, _)| {
+                    name == table_name && !live_chunk_ids.contains(chunk_id)
+                })
+                .cloned()
+                .collect();
+            for key in stale {
+                if let Some(evicted) = cache.remove(&key) {
+                    residency
+                        .chunk_key_bloom_bytes
+                        .fetch_sub(evicted.bytes, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn purge_chunk_key_candidates_for_ids(
+        &self,
+        table_name: &str,
+        chunk_ids: &std::collections::BTreeSet<u64>,
+    ) {
+        if chunk_ids.is_empty() {
+            return;
+        }
+        let residency = &self.read_state.residency;
+        {
+            let mut cache = residency
+                .chunk_key_index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let stale: Vec<_> = cache
+                .keys()
+                .filter(|(name, chunk_id, _)| {
+                    name == table_name && chunk_ids.contains(chunk_id)
+                })
+                .cloned()
+                .collect();
+            for key in stale {
+                if let Some(evicted) = cache.remove(&key) {
+                    residency
+                        .chunk_key_index_bytes
+                        .fetch_sub(evicted.bytes, Ordering::Relaxed);
+                }
+            }
+        }
+        {
+            let mut cache = residency
+                .chunk_key_bloom
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let stale: Vec<_> = cache
+                .keys()
+                .filter(|(name, chunk_id, _)| {
+                    name == table_name && chunk_ids.contains(chunk_id)
+                })
+                .cloned()
+                .collect();
+            for key in stale {
+                if let Some(evicted) = cache.remove(&key) {
+                    residency
+                        .chunk_key_bloom_bytes
+                        .fetch_sub(evicted.bytes, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn missing_chunk_key_candidates_require_spill(
+        &self,
+        table: &RelationalTable,
+        entry: &ColdTableChunks,
+        exact: bool,
+    ) -> bool {
+        let keys = Self::chunk_key_unique_positions(table);
+        if keys.is_empty() {
+            return false;
+        }
+        let residency = &self.read_state.residency;
+        if exact {
+            let cache = residency
+                .chunk_key_index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            entry
+                .chunks
+                .iter()
+                .filter(|chunk| {
+                    chunk.row_count > 0 && matches!(chunk.payload, ColdPayload::Spilled { .. })
+                })
+                .any(|chunk| {
+                    keys.iter().any(|(key_id, _)| {
+                        !cache.contains_key(&(table.name.clone(), chunk.chunk_id, *key_id))
+                    })
+                })
+        } else {
+            let cache = residency
+                .chunk_key_bloom
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            entry
+                .chunks
+                .iter()
+                .filter(|chunk| {
+                    chunk.row_count > 0 && matches!(chunk.payload, ColdPayload::Spilled { .. })
+                })
+                .any(|chunk| {
+                    keys.iter().any(|(key_id, _)| {
+                        !cache.contains_key(&(table.name.clone(), chunk.chunk_id, *key_id))
+                    })
+                })
+        }
+    }
+
+    /// Build the complete candidate set after an ordinary cold capture has released the commit
+    /// mutex. Spilled chunks may read NVMe here. Class entry later only verifies/reuses this set.
+    fn prime_chunk_key_candidates(&self, table_name: &str, entry: &Arc<ColdTableChunks>) {
+        let catalog = self.catalog_snapshot();
+        let Some(table) = catalog.relational_catalog.get(table_name) else {
+            return;
+        };
+        if !Self::chunk_class_eligible(&catalog, table_name) {
+            return;
+        }
+        let keys = Self::chunk_key_unique_positions(table);
+        if keys.is_empty() {
+            return;
+        }
+        let entry_chunk_ids: std::collections::BTreeSet<u64> =
+            entry.chunks.iter().map(|chunk| chunk.chunk_id).collect();
+        #[cfg(test)]
+        if let Some((pinned, resume)) = chunk_key_prime_pin_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            pinned.wait();
+            resume.wait();
+        }
+        let mut complete = true;
+        if Self::chunk_key_exact_set_bytes(table, entry) <= chunk_key_index_cap_bytes() {
+            for (key_id, positions) in keys {
+                if self
+                    .ensure_chunk_key_indexes(table, entry, &positions, key_id)
+                    .is_none()
+                {
+                    complete = false;
+                    break;
+                }
+            }
+        } else {
+            for (key_id, positions) in keys {
+                if self
+                    .ensure_chunk_key_blooms(table, entry, &positions, key_id)
+                    .is_none()
+                {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        // Publication may have advanced while the off-lock GPU/NVMe work ran. Remove only IDs
+        // belonging to this primed entry that are no longer live; never table-wide purge here,
+        // because a newer entry may already have installed/built its own tail candidates. If this
+        // exact entry is still current but priming was partial, roll the whole partial reservation
+        // back so a retry cannot accumulate toward the global cap.
+        let current = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(table_name)
+            .cloned();
+        let obsolete = match current {
+            Some(current) if Arc::ptr_eq(&current, entry) => {
+                if complete {
+                    std::collections::BTreeSet::new()
+                } else {
+                    entry_chunk_ids
+                }
+            }
+            Some(current) => {
+                let live: std::collections::BTreeSet<u64> =
+                    current.chunks.iter().map(|chunk| chunk.chunk_id).collect();
+                entry_chunk_ids.difference(&live).copied().collect()
+            }
+            None => entry_chunk_ids,
+        };
+        self.purge_chunk_key_candidates_for_ids(table_name, &obsolete);
+    }
+
+    /// Select candidate chunks without ever making a host membership decision. The retained
+    /// exact hash set is preferred while the complete class set fits its cap; otherwise the
+    /// compact all-chunk Bloom set runs on the GPU. Both are candidate-only: callers must run
+    /// the authoritative device predicate/visibility pass over every returned chunk.
+    fn chunk_key_candidate_positions(
+        &self,
+        table: &RelationalTable,
+        entry: &Arc<ColdTableChunks>,
+        key_positions: &[usize],
+        key_id: usize,
+        needles: &[i32],
+    ) -> Option<(
+        Vec<Vec<usize>>,
+        Option<Arc<gpu_db_execution::CudaResidentDeviceMemory>>,
+    )> {
+        if Self::chunk_key_exact_set_bytes(table, entry) <= chunk_key_index_cap_bytes() {
+            if self.missing_chunk_key_candidates_require_spill(table, entry, true) {
+                return None;
+            }
+            self.purge_chunk_key_blooms_for_table(&table.name);
+            let indexes = self.ensure_chunk_key_indexes(table, entry, key_positions, key_id)?;
+            let candidates = self
+                .probe_chunk_key_indexes(&indexes, needles)?
+                .into_iter()
+                .map(|hits| hits.into_iter().map(|(position, _)| position).collect())
+                .collect();
+            return Some((
+                candidates,
+                indexes.first().map(|(_, index)| Arc::clone(&index.device)),
+            ));
+        }
+        if self.missing_chunk_key_candidates_require_spill(table, entry, false) {
+            return None;
+        }
+        self.purge_chunk_key_indexes_for_table(&table.name);
+        let blooms = self.ensure_chunk_key_blooms(table, entry, key_positions, key_id)?;
+        let candidates = self.probe_chunk_key_blooms(&blooms, needles)?;
+        Some((
+            candidates,
+            blooms.first().map(|(_, bloom)| Arc::clone(&bloom.device)),
+        ))
+    }
+
     /// Get-or-build the key indexes for EVERY chunk of a class entry (entry-time in P5-2; the
     /// direct-call gate uses it now). Returns per-chunk (chunk_id, index) in entry order, or
     /// `None` if any chunk declines. Cap policy: evict the least-recently-used entries of OTHER
@@ -5029,7 +7861,7 @@ impl Engine {
                     // Cap: evict LRU entries (never the just-inserted key) until under the cap.
                     let just_inserted = (table.name.clone(), chunk.chunk_id, key_id);
                     let mut total = residency.chunk_key_index_bytes.load(Ordering::Relaxed);
-                    while total > CHUNK_KEY_INDEX_CAP_BYTES {
+                    while total > chunk_key_index_cap_bytes() {
                         let victim = map
                             .iter()
                             .filter(|(k, _)| **k != just_inserted)
@@ -5088,6 +7920,51 @@ impl Engine {
         Some(crate::engine_residency::compound_key_fingerprint(&words))
     }
 
+    /// The candidate-index needle including NULL payload placeholders. Chunk fingerprints are
+    /// built from raw device values and intentionally ignore validity; the payload encoder writes
+    /// zero fixed-width words (or an empty text span) for NULL. Reproduce that representation so
+    /// a NULL-bearing exact tuple can still use the index as a no-false-negative candidate
+    /// selector; the following device `IS NULL` predicate remains authoritative.
+    fn chunk_key_candidate_needle(
+        table: &RelationalTable,
+        key_positions: &[usize],
+        values: &[SqlValue],
+    ) -> Option<i32> {
+        if key_positions.len() == 1
+            && matches!(
+                table.columns[key_positions[0]].ty,
+                SqlType::Int4 | SqlType::Date | SqlType::Int2
+            )
+        {
+            return match values.get(key_positions[0])? {
+                SqlValue::Null => Some(0),
+                _ => Self::chunk_key_needle(table, key_positions, values),
+            };
+        }
+        let mut words: Vec<i32> = Vec::new();
+        for &position in key_positions {
+            let column = table.columns.get(position)?;
+            match values.get(position)? {
+                SqlValue::Null => match column.ty {
+                    SqlType::Text => words.extend(
+                        crate::engine_residency::sql_value_key_words(
+                            SqlType::Text,
+                            &SqlValue::Text(String::new()),
+                        )?,
+                    ),
+                    SqlType::Int2 | SqlType::Int4 | SqlType::Date => words.push(0),
+                    SqlType::Int8 | SqlType::Timestamp => words.extend([0, 0]),
+                    SqlType::Numeric { .. } | SqlType::Uuid => words.extend([0, 0, 0, 0]),
+                    SqlType::Bool => return None,
+                },
+                value => words.extend(crate::engine_residency::sql_value_key_words(
+                    column.ty, value,
+                )?),
+            }
+        }
+        Some(crate::engine_residency::compound_key_fingerprint(&words))
+    }
+
     pub(crate) fn probe_chunk_key_indexes(
         &self,
         indexes: &[(usize, ChunkKeyIndex)],
@@ -5133,15 +8010,116 @@ impl Engine {
         Some(out)
     }
 
+    /// Build the exact equality predicate for one unique-key tuple. The statement values are
+    /// already type-coerced by bind. This engine's current unique semantics are structural
+    /// (`NULL == NULL`), so NULL key components lower to the device validity-mask `IS NULL`
+    /// leaf rather than SQL `=` (which would be UNKNOWN).
+    fn class_exact_key_predicate(
+        table: &RelationalTable,
+        positions: &[usize],
+        row: &[SqlValue],
+    ) -> Option<crate::engine_expr::ResidentExpr> {
+        use crate::engine_expr::{ResidentBinaryOp, ResidentExpr};
+        let mut predicate: Option<ResidentExpr> = None;
+        for &position in positions {
+            let value = row.get(position)?.clone();
+            let leaf = if matches!(value, SqlValue::Null) {
+                ResidentExpr::IsNull {
+                    col: position,
+                    is_not_null: false,
+                }
+            } else {
+                crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(
+                    table,
+                    &[vec![(position, SelectFilterOp::Eq, value)]],
+                )?
+            };
+            predicate = Some(match predicate {
+                None => leaf,
+                Some(lhs) => ResidentExpr::Binary {
+                    op: ResidentBinaryOp::And,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(leaf),
+                },
+            });
+        }
+        predicate
+    }
+
+    /// Exact within-statement unique validation over a transient DEVICE relation. Every bound
+    /// key tuple runs as a complete device predicate; there is no host grouping, NULL branch, or
+    /// value comparison. Survivor coordinates feed the device threshold kernel, whose status bit
+    /// is the final verdict readback. This is deliberately bounded until the device exact
+    /// tuple-hash/group operator replaces it.
+    fn validate_class_new_rows_unique_on_device(
+        &self,
+        table: &RelationalTable,
+        new_rows: &[Vec<SqlValue>],
+    ) -> Option<Result<(), EngineError>> {
+        if new_rows.len() < 2 {
+            return Some(Ok(()));
+        }
+        if new_rows.len() > CLASS_DEVICE_UNIQUE_BATCH_MAX_ROWS {
+            return None;
+        }
+        let (snapshot, memory) = self
+            .build_transient_relation_residency(table, new_rows)
+            .ok()?;
+        let src = ResidentExecSource {
+            descriptor: Arc::new(snapshot),
+            device_memory: Arc::new(memory),
+            row_count: new_rows.len() as u64,
+        };
+        for index in table.indexes.iter().filter(|index| index.unique) {
+            let Some(positions) =
+                crate::engine_residency::index_key_column_positions(table, index)
+            else {
+                continue;
+            };
+            for row in new_rows {
+                let predicate = Self::class_exact_key_predicate(
+                    table,
+                    &positions,
+                    row,
+                )?;
+                let slots = self
+                    .lower_resident_predicate(
+                        &predicate,
+                        table,
+                        &src.descriptor,
+                        &src.device_memory,
+                        src.row_count,
+                        None,
+                    )
+                    .ok()?;
+                self.read_state
+                    .residency
+                    .chunk_class_device_exact_rechecks
+                    .fetch_add(1, Ordering::Relaxed);
+                let candidates: Vec<u64> = slots.into_iter().map(u64::from).collect();
+                let duplicate = src
+                    .device_memory
+                    .unique_coordinate_threshold_reached(&candidates, &[], 2)
+                    .ok()?;
+                if duplicate {
+                    return Some(Err(EngineError::ApplyFailed(format!(
+                        "duplicate key value violates unique index \"{}\"",
+                        index.name
+                    ))));
+                }
+            }
+        }
+        Some(Ok(()))
+    }
+
     /// P5-2 (S-E.P5) — the KEYED-CLASS uniqueness preflight: validate a statement's NEW key
     /// images against a chunk-authoritative table ON-DEVICE. Every host validator at the call
     /// sites sees the RECLAIMED (empty) store and passes VACUOUSLY — and a vacuous accept is the
     /// C2 hazard: a WAL-durable duplicate that recovery's host-path replay then REJECTS, i.e. an
-    /// unreplayable acked commit. In-batch dups are checked host-side first (`new_rows`-only,
-    /// the exact structural semantics of `validate_unique_values_tuple`); existing-row conflicts
-    /// probe the per-chunk key indexes (ONE multi-chunk device locate per unique index) and every
-    /// hit is DEVICE-RECHECKED at `rtx` via `materialize_cold_chunk_slot` — a tombstoned slot is
-    /// NOT a conflict, and a fingerprint collision fails the full key-tuple equality.
+    /// unreplayable acked commit. In-batch duplicates are checked over a transient device
+    /// relation; existing-row conflicts probe the per-chunk indexes (ONE multi-chunk locate per
+    /// unique index), then run exact key equality + visibility through the device predicate VM.
+    /// A tombstoned slot is NOT a conflict, and a fingerprint collision fails exact equality.
     ///
     /// `exclude` — the C1 UPDATE self-exclusion: (the update's own located PACKED coordinates,
     /// the resolve-time entry epoch). An update's old version is LIVE at probe time (stamps land
@@ -5150,10 +8128,10 @@ impl Engine {
     ///
     /// `Some(Ok)` = validated; `Some(Err)` = duplicate (a statement error — the class stays);
     /// `None` = DECLINE, the caller must DE-AUTHORITIZE and fall through to host validation.
-    /// Declines: a NULL key value (host semantics are STRUCTURAL — NULL == NULL conflicts — but
-    /// the chunk fold reads raw payload bytes under the null bitmap, so a NULL key can be
-    /// neither built nor probed faithfully), an unfoldable needle, epoch drift, and any
-    /// build/probe/stage/read failure.
+    /// NULL keys use the raw-payload placeholder fingerprint only to choose candidate chunks,
+    /// then run an exact device `IS NULL` predicate, preserving structural NULL uniqueness
+    /// without de-authorizing. Declines: an unfoldable needle, epoch drift, or a
+    /// build/probe/stage/device error.
     pub(crate) fn validate_class_insert_uniqueness(
         &self,
         table: &RelationalTable,
@@ -5180,8 +8158,7 @@ impl Engine {
         if keyed.is_empty() {
             return Some(Ok(()));
         }
-        // In-batch duplicates: host-exact (structural, NULL == NULL) over the NEW rows only.
-        if let Err(err) = Self::validate_unique_indexes_for_rows(table, new_rows) {
+        if let Err(err) = self.validate_class_new_rows_unique_on_device(table, new_rows)? {
             return Some(Err(err));
         }
         let entry = self
@@ -5196,58 +8173,67 @@ impl Engine {
                 return None;
             }
         }
-        let excluded = exclude.map(|(set, _)| set);
+        // Pure marshaling for the device verdict below: these are prepare-time packed coordinates,
+        // not host-decoded values or a host-side membership oracle.
+        let excluded_coordinates: Vec<u64> = exclude
+            .map(|(set, _)| set.iter().copied().collect())
+            .unwrap_or_default();
         for (key_id, index_name, positions) in &keyed {
-            let mut needles: Vec<i32> = Vec::with_capacity(new_rows.len());
-            for row in new_rows {
-                if positions
-                    .iter()
-                    .any(|&position| matches!(row.get(position), None | Some(SqlValue::Null)))
-                {
-                    return None; // a NULL key cannot ride the fold — decline to host
-                }
-                needles.push(Self::chunk_key_needle(table, positions, row)?);
-            }
-            let chunk_indexes = self.ensure_chunk_key_indexes(table, &entry, positions, *key_id)?;
-            let hits = self.probe_chunk_key_indexes(&chunk_indexes, &needles)?;
-            // Group the recheck by chunk so each hit-bearing chunk stages ONCE.
-            let mut per_chunk: std::collections::BTreeMap<usize, Vec<(usize, u32)>> =
-                std::collections::BTreeMap::new();
+            let needles: Vec<i32> = new_rows
+                .iter()
+                .map(|row| Self::chunk_key_candidate_needle(table, positions, row))
+                .collect::<Option<Vec<_>>>()?;
+            let (hits, verdict_device) = self.chunk_key_candidate_positions(
+                table,
+                &entry,
+                positions,
+                *key_id,
+                &needles,
+            )?;
             for (needle_idx, needle_hits) in hits.iter().enumerate() {
-                for (position, slot) in needle_hits {
-                    let packed = ((*position as u64) << 32) | u64::from(*slot);
-                    if excluded.is_some_and(|set| set.contains(&packed)) {
-                        continue; // C1: the update's own row
-                    }
-                    per_chunk
-                        .entry(*position)
-                        .or_default()
-                        .push((needle_idx, *slot));
+                let candidate_positions: std::collections::BTreeSet<usize> = needle_hits
+                    .iter()
+                    .copied()
+                    .collect();
+                if candidate_positions.is_empty() {
+                    continue;
                 }
-            }
-            for (position, slot_hits) in per_chunk {
-                let chunk = entry.chunks.get(position)?;
-                let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
-                let (src, _vis) = staged.ready().ok()?;
-                for (needle_idx, slot) in slot_hits {
-                    let row =
-                        self.materialize_cold_chunk_slot(table, chunk, &src, slot as usize, rtx)?;
-                    let Some(row) = row else {
-                        continue; // tombstoned at rtx: a masked hit is NOT a conflict
-                    };
-                    let new_row = new_rows.get(needle_idx)?;
-                    if positions
-                        .iter()
-                        .all(|&position| row.get(position) == new_row.get(position))
-                    {
-                        self.read_state
-                            .residency
-                            .chunk_class_unique_probe_conflicts
-                            .fetch_add(1, Ordering::Relaxed);
-                        return Some(Err(EngineError::ApplyFailed(format!(
-                            "duplicate key value violates unique index \"{index_name}\""
-                        ))));
-                    }
+                let predicate = Self::class_exact_key_predicate(
+                    table,
+                    positions,
+                    new_rows.get(needle_idx)?,
+                )?;
+                let exact = self.locate_streaming_cold_slots_in_entry(
+                    table,
+                    &predicate,
+                    rtx,
+                    &entry,
+                    Some(&candidate_positions),
+                )?;
+                let candidates: Vec<u64> = exact
+                    .into_iter()
+                    .flat_map(|(position, slots)| {
+                        slots.into_iter().map(move |slot| {
+                            ((position as u64) << 32) | u64::from(slot)
+                        })
+                    })
+                    .collect();
+                let conflict = verdict_device
+                    .as_ref()?
+                    .unique_coordinate_threshold_reached(
+                        &candidates,
+                        &excluded_coordinates,
+                        1,
+                    )
+                    .ok()?;
+                if conflict {
+                    self.read_state
+                        .residency
+                        .chunk_class_unique_probe_conflicts
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(Err(EngineError::ApplyFailed(format!(
+                        "duplicate key value violates unique index \"{index_name}\""
+                    ))));
                 }
             }
         }
@@ -5279,6 +8265,59 @@ impl Engine {
         self.read_state
             .residency
             .chunk_class_dml_key_locates
+            .load(Ordering::Relaxed)
+    }
+
+    /// Candidate-routing launches served by compact all-chunk Bloom filters because the exact
+    /// retained key-index set exceeded its VRAM cap.
+    pub fn chunk_key_bloom_probes(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_key_bloom_probes
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn chunk_key_bloom_bytes(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_key_bloom_bytes
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stale_chunk_key_candidate_count(&self, table_name: &str) -> usize {
+        let live: std::collections::BTreeSet<u64> = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(table_name)
+            .map(|entry| entry.chunks.iter().map(|chunk| chunk.chunk_id).collect())
+            .unwrap_or_default();
+        let residency = &self.read_state.residency;
+        let indexes = residency
+            .chunk_key_index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .filter(|(table, chunk_id, _)| table == table_name && !live.contains(chunk_id))
+            .count();
+        let blooms = residency
+            .chunk_key_bloom
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .filter(|(table, chunk_id, _)| table == table_name && !live.contains(chunk_id))
+            .count();
+        indexes + blooms
+    }
+
+    /// Candidate-index and structural-NULL validations whose authoritative exact predicate
+    /// completed on-device.
+    pub fn chunk_class_device_exact_rechecks(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_device_exact_rechecks
             .load(Ordering::Relaxed)
     }
 
@@ -5694,35 +8733,78 @@ impl Engine {
     }
 }
 
-// ---------------- P5-0: THE DEVICE SLOT RECHECK (one slot, from the staged buffer) ----------------
+fn select_streaming_execution_gpus(
+    default_gpu: u16,
+    query_budget: u64,
+    physical_gpu_ids: &[u16],
+    unavailable_gpu_ids: &[u16],
+    memory_pressured_gpu_ids: &[u16],
+    budgets: &std::collections::BTreeMap<u16, u64>,
+) -> Vec<u16> {
+    let eligible = |gpu_id: u16| {
+        !unavailable_gpu_ids.contains(&gpu_id)
+            && !memory_pressured_gpu_ids.contains(&gpu_id)
+            && budgets
+                .get(&gpu_id)
+                .is_some_and(|budget| *budget >= query_budget)
+    };
+    if !physical_gpu_ids.contains(&default_gpu) || !eligible(default_gpu) {
+        return vec![default_gpu];
+    }
+    let mut gpus = vec![default_gpu];
+    gpus.extend(
+        physical_gpu_ids
+            .iter()
+            .copied()
+            .filter(|&gpu_id| gpu_id != default_gpu && eligible(gpu_id)),
+    );
+    gpus
+}
+
+#[cfg(test)]
+mod streaming_scheduler_tests {
+    use super::select_streaming_execution_gpus;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn multi_gpu_scheduler_requires_physical_health_and_full_query_budget() {
+        let budgets = BTreeMap::from([(0, 4096), (1, 4096), (2, 2048), (3, 8192)]);
+        assert_eq!(
+            select_streaming_execution_gpus(0, 4096, &[0, 1, 2, 3], &[], &[3], &budgets),
+            vec![0, 1],
+            "under-budget and pressured devices must not receive a chunk"
+        );
+        assert_eq!(
+            select_streaming_execution_gpus(0, 4096, &[0, 1], &[1], &[], &budgets),
+            vec![0],
+            "an unavailable secondary must be excluded"
+        );
+        assert_eq!(
+            select_streaming_execution_gpus(7, 4096, &[0, 1], &[], &[], &budgets),
+            vec![7],
+            "the coordinator fallback preserves the existing error surface when no GPU is eligible"
+        );
+    }
+}
+
+// ---------------- P5: FINAL SLOT READBACK (one device-approved slot) ----------------
 //
-// The chunk analog of `materialize_resident_row_via_hit` (design review M1): a uniqueness/by-key
-// probe hit rechecks by reading ONLY the hit slot's bytes from the ALREADY-STAGED device chunk
-// buffer — O(1) DtoH per column per hit — honoring the sidecar mask for that slot. NEVER the
-// whole-chunk host decode (O(chunk)/hit, and a hot-path use of the reverse-gather debt). The
-// row values it returns are readback coercions (the charter's single-final-readback carve-out).
+// Visibility and predicates have ALREADY been decided by `lower_resident_predicate`; this helper
+// only performs the charter-sanctioned final readback of an approved row image. It MUST NOT inspect
+// born/tombstone metadata or compare values — doing so would turn the host back into an execution
+// tier. It reads only one slot from the already-staged device chunk, never the host cold payload.
 
 impl Engine {
-    /// CALLER CONTRACT (audit LOW): `src` MUST be the staged buffer of THIS `chunk` (layout and
-    /// mask come from `chunk`; values from `src.device_memory`) and the recheck rtx must match
-    /// the snapshot the probe ran at — stage-and-recheck one chunk in one step. The born gate is
-    /// applied per-slot here (defensive; equal to the folds' chunk-level exclusion because the
-    /// boundary is whole-chunk).
-    /// Materialize ONE slot of a staged cold chunk from the DEVICE buffer. Returns:
-    /// `Some(Some(row))` — the slot is live at `rtx` (sidecar honored); `Some(None)` — the slot
-    /// is tombstoned at-or-below `rtx` (a masked probe hit: NOT a conflict); `None` — decline
-    /// (any read failure; the caller treats it as it treats every decline: conservatively).
-    /// The sidecar is read HOST-side from the chunk (it lives beside the payload as host bytes);
-    /// the VALUES read from the device via the descriptor's offset helpers — the same layout
-    /// authority every device reader uses.
-    pub(crate) fn materialize_cold_chunk_slot(
+    /// CALLER CONTRACT: `src` is the staged buffer of THIS `chunk`, and `slot` came from an
+    /// exact device predicate using the same source + snapshot visibility. Returns `None` only
+    /// on a read/layout failure; the caller conservatively declines.
+    pub(crate) fn read_cold_chunk_slot_values(
         &self,
         table: &RelationalTable,
         chunk: &ColdChunk,
         src: &crate::engine_expr::ResidentExecSource,
         slot: usize,
-        rtx: Index,
-    ) -> Option<Option<Vec<SqlValue>>> {
+    ) -> Option<Vec<SqlValue>> {
         use crate::relational_model::{
             resident_device_bool_column_offset, resident_device_int4_column_offset,
             resident_device_int8_column_offset, resident_device_numeric_column_offset,
@@ -5730,16 +8812,6 @@ impl Engine {
         };
         if slot >= chunk.row_count as usize {
             return None;
-        }
-        // Born gate + sidecar mask (host-side metadata; the values live on the device).
-        if chunk.payload_copin_s > rtx {
-            return Some(None);
-        }
-        if let Some(sidecar) = &chunk.deleted_by {
-            let raw = i64::from_le_bytes(sidecar.get(slot * 8..slot * 8 + 8)?.try_into().ok()?);
-            if raw <= rtx as i64 {
-                return Some(None);
-            }
         }
         let d = &chunk.snapshot;
         let memory = &src.device_memory;
@@ -5835,7 +8907,7 @@ impl Engine {
             };
             row.push(value);
         }
-        Some(Some(row))
+        Some(row)
     }
 }
 

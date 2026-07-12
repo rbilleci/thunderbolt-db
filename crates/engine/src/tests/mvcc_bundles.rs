@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn execute_mvcc_query_supports_multi_frame_provenance_filters_and_projection() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -59,7 +59,7 @@ fn execute_mvcc_query_supports_multi_frame_provenance_filters_and_projection() {
 
 #[test]
 fn execute_mvcc_query_preserves_multi_frame_provenance_identity_under_concat_distinct() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:shared").unwrap();
     e.execute_text(3, "SET team:shared=member:1").unwrap();
@@ -116,7 +116,7 @@ fn execute_mvcc_query_preserves_multi_frame_provenance_identity_under_concat_dis
 
 #[test]
 fn execute_mvcc_query_supports_provenance_path_summary_projection() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -169,7 +169,7 @@ fn execute_mvcc_query_supports_provenance_path_summary_projection() {
 
 #[test]
 fn execute_mvcc_query_provenance_summary_projection_keeps_non_join_shapes_stable() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET standalone:1=Loose").unwrap();
 
     let query = e
@@ -197,7 +197,7 @@ fn execute_mvcc_query_provenance_summary_projection_keeps_non_join_shapes_stable
 
 #[test]
 fn execute_mvcc_query_supports_frame_aware_provenance_ordering() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -258,7 +258,7 @@ fn execute_mvcc_query_supports_frame_aware_provenance_ordering() {
 
 #[test]
 fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -664,7 +664,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
 
 #[test]
 fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -863,7 +863,7 @@ fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filte
 
 #[test]
 fn execute_mvcc_query_supports_repeated_provenance_bundle_subpath_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -969,7 +969,7 @@ fn execute_mvcc_query_supports_repeated_provenance_bundle_subpath_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_relative_provenance_bundle_distance_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -1078,7 +1078,7 @@ fn execute_mvcc_query_supports_relative_provenance_bundle_distance_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_provenance_bundle_suffix_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -1189,7 +1189,7 @@ fn execute_mvcc_query_supports_provenance_bundle_suffix_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_provenance_bundle_prefix_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -1302,7 +1302,7 @@ fn execute_mvcc_query_supports_provenance_bundle_prefix_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_provenance_bundle_slice_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -1443,7 +1443,7 @@ fn execute_mvcc_query_supports_provenance_bundle_slice_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_whole_bundle_cardinality_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -1553,7 +1553,7 @@ fn execute_mvcc_query_supports_whole_bundle_cardinality_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_and_nth_occurrence_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -1895,7 +1895,7 @@ fn execute_mvcc_query_supports_bundle_first_last_and_nth_occurrence_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_occurrence_range_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -2022,7 +2022,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_range_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_occurrence_distance_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -2149,7 +2149,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_distance_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_occurrence_distance_range_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -2318,7 +2318,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_distance_range_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_occurrence_distance_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -2544,7 +2544,7 @@ fn execute_mvcc_query_supports_bundle_first_last_occurrence_distance_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_distance_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -2809,7 +2809,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_distance_
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -3078,7 +3078,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_fi
 
 #[test]
 fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -3256,7 +3256,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering(
 
 #[test]
 fn execute_mvcc_query_supports_bundle_occurrence_distance_projection_and_ordering() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -3409,7 +3409,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_distance_projection_and_orderin
 
 #[test]
 fn execute_mvcc_query_supports_bundle_mixed_occurrence_offset_pair_projection_and_ordering() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -3583,7 +3583,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_offset_pair_projection_an
 
 #[test]
 fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -3782,7 +3782,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -4089,7 +4089,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -4362,7 +4362,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filte
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_distance_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -4637,7 +4637,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_dis
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -4924,7 +4924,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_fil
 
 #[test]
 fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -5131,7 +5131,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_filters() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();

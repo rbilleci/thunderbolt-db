@@ -43,6 +43,7 @@
 //!   is mapped back to its needle's sliced result, preserving per-request order.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -150,6 +151,23 @@ struct PointLookupRequest {
     respond: oneshot::Sender<Result<QueryOutcome, DbError>>,
 }
 
+/// Monotonic production-path observations from one point-lookup batcher. A sharded group is counted
+/// exactly once: either the engine served it through its batched route, or the batcher had to run its
+/// requests individually after that route declined. Combined with the engine's GPU-probe counter,
+/// this lets a benchmark distinguish "all sharded groups were fully GPU" from a correct-but-slower
+/// per-query fallback without exposing engine internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointLookupBatcherActivitySnapshot {
+    pub sharded_batched_groups: u64,
+    pub sharded_per_query_fallback_groups: u64,
+}
+
+#[derive(Default)]
+struct PointLookupBatcherActivity {
+    sharded_batched_groups: AtomicU64,
+    sharded_per_query_fallback_groups: AtomicU64,
+}
+
 /// Handle to the running batcher. Dropping it closes the request channel, which
 /// makes the coalescer drain every still-queued request (each is answered on its
 /// `oneshot`) and then exit; the `Drop` impl joins the coalescer so all responses
@@ -157,6 +175,7 @@ struct PointLookupRequest {
 pub struct PointLookupBatcher {
     tx: Option<Sender<PointLookupRequest>>,
     coalescer: Option<JoinHandle<()>>,
+    activity: Arc<PointLookupBatcherActivity>,
 }
 
 impl PointLookupBatcher {
@@ -182,13 +201,25 @@ impl PointLookupBatcher {
         batch_size_observer: Option<Sender<usize>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PointLookupRequest>();
+        let activity = Arc::new(PointLookupBatcherActivity::default());
+        let coalescer_activity = Arc::clone(&activity);
         let coalescer = thread::Builder::new()
             .name("point-lookup-coalescer".to_string())
-            .spawn(move || coalescer_loop(engine, rx, max_items, max_wait, batch_size_observer))
+            .spawn(move || {
+                coalescer_loop(
+                    engine,
+                    rx,
+                    max_items,
+                    max_wait,
+                    batch_size_observer,
+                    coalescer_activity,
+                )
+            })
             .expect("spawn point-lookup coalescer thread");
         Self {
             tx: Some(tx),
             coalescer: Some(coalescer),
+            activity,
         }
     }
 
@@ -233,6 +264,20 @@ impl PointLookupBatcher {
         }
         receiver
     }
+
+    /// Snapshot this batcher's sharded-route activity. Counters are batcher-local and monotonic.
+    pub fn activity_snapshot(&self) -> PointLookupBatcherActivitySnapshot {
+        PointLookupBatcherActivitySnapshot {
+            sharded_batched_groups: self
+                .activity
+                .sharded_batched_groups
+                .load(AtomicOrdering::Relaxed),
+            sharded_per_query_fallback_groups: self
+                .activity
+                .sharded_per_query_fallback_groups
+                .load(AtomicOrdering::Relaxed),
+        }
+    }
 }
 
 impl Drop for PointLookupBatcher {
@@ -257,6 +302,7 @@ fn coalescer_loop(
     max_items: usize,
     max_wait: Duration,
     batch_size_observer: Option<Sender<usize>>,
+    activity: Arc<PointLookupBatcherActivity>,
 ) {
     let mut batcher = DualTriggerBatcher::<PointLookupRequest>::new(max_items, max_wait);
     let mut adaptive = AdaptiveWait::new(max_items, max_wait);
@@ -271,7 +317,13 @@ fn coalescer_loop(
         };
         if let Some(batch) = batcher.enqueue(first, Instant::now()) {
             // Count trigger fired on the first item (max_items == 1).
-            run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+            run_and_record(
+                &engine,
+                batch,
+                &mut adaptive,
+                batch_size_observer.as_ref(),
+                &activity,
+            );
             continue;
         }
 
@@ -287,7 +339,13 @@ fn coalescer_loop(
                 Ok(request) => {
                     partner_present = true;
                     if let Some(batch) = batcher.enqueue(request, Instant::now()) {
-                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+                        run_and_record(
+                            &engine,
+                            batch,
+                            &mut adaptive,
+                            batch_size_observer.as_ref(),
+                            &activity,
+                        );
                         // count trigger fired.
                         flushed_in_drain = true;
                         break;
@@ -300,7 +358,13 @@ fn coalescer_loop(
                 // `recv` observe the close and exit. No request left unanswered.
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if let Some(batch) = batcher.flush_admin() {
-                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+                        run_and_record(
+                            &engine,
+                            batch,
+                            &mut adaptive,
+                            batch_size_observer.as_ref(),
+                            &activity,
+                        );
                     }
                     flushed_in_drain = true;
                     break;
@@ -342,14 +406,26 @@ fn coalescer_loop(
             let wait = adaptive_remaining.min(ceiling);
             if wait.is_zero() {
                 if let Some(batch) = batcher.flush_admin() {
-                    run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+                    run_and_record(
+                        &engine,
+                        batch,
+                        &mut adaptive,
+                        batch_size_observer.as_ref(),
+                        &activity,
+                    );
                 }
                 break;
             }
             match rx.recv_timeout(wait) {
                 Ok(request) => {
                     if let Some(batch) = batcher.enqueue(request, Instant::now()) {
-                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+                        run_and_record(
+                            &engine,
+                            batch,
+                            &mut adaptive,
+                            batch_size_observer.as_ref(),
+                            &activity,
+                        );
                         // count trigger fired.
                         break;
                     }
@@ -358,7 +434,13 @@ fn coalescer_loop(
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // The (adaptive or ceiling) deadline elapsed — flush the partial.
                     if let Some(batch) = batcher.flush_admin() {
-                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+                        run_and_record(
+                            &engine,
+                            batch,
+                            &mut adaptive,
+                            batch_size_observer.as_ref(),
+                            &activity,
+                        );
                     }
                     break;
                 }
@@ -368,7 +450,13 @@ fn coalescer_loop(
                     // outer loop whose `recv` now reports the closed channel and we
                     // exit. No request is ever left unanswered.
                     if let Some(batch) = batcher.flush_admin() {
-                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+                        run_and_record(
+                            &engine,
+                            batch,
+                            &mut adaptive,
+                            batch_size_observer.as_ref(),
+                            &activity,
+                        );
                     }
                     break;
                 }
@@ -386,18 +474,23 @@ fn run_and_record(
     batch: Batch<PointLookupRequest>,
     adaptive: &mut AdaptiveWait,
     observer: Option<&Sender<usize>>,
+    activity: &PointLookupBatcherActivity,
 ) {
     let size = batch.items.len();
     adaptive.record_batch(size);
     if let Some(tx) = observer {
         let _ = tx.send(size);
     }
-    run_batch(engine, batch);
+    run_batch(engine, batch, activity);
 }
 
 /// Run one drained batch under a single read lock: group by `route_id`, then
 /// submit+complete each group. The lock is taken once for the whole batch.
-fn run_batch(engine: &SharedEngine, batch: Batch<PointLookupRequest>) {
+fn run_batch(
+    engine: &SharedEngine,
+    batch: Batch<PointLookupRequest>,
+    activity: &PointLookupBatcherActivity,
+) {
     let requests: Vec<PointLookupRequest> = batch.items.into_iter().map(|it| it.item).collect();
     if requests.is_empty() {
         return;
@@ -437,7 +530,7 @@ fn run_batch(engine: &SharedEngine, batch: Batch<PointLookupRequest>) {
 
     for key in group_order {
         let group = groups.remove(&key).expect("group present");
-        run_group(engine_ref, group);
+        run_group(engine_ref, group, activity);
     }
     // The batch is complete; every group ran over the shared `&Engine` (no lock to release).
 }
@@ -481,7 +574,11 @@ fn point_lookup_shape_key(select: &Select) -> String {
 /// per-query path — see its doc), so this prepares the needle-invariant template ONCE, deduplicates
 /// needles into a single `equal_any` submission, and answers each request from its needle's sliced
 /// result. Any prepare/submit/complete error is fanned out to every waiter (no hung connection).
-fn run_group(engine: &Engine, group: Vec<PointLookupRequest>) {
+fn run_group(
+    engine: &Engine,
+    group: Vec<PointLookupRequest>,
+    activity: &PointLookupBatcherActivity,
+) {
     // Deduplicate needles into one submission, then map each request back to its needle's result.
     let (distinct_needles, request_result_index) = dedup_needles(&group);
     // lpb-for-shards: a SHARD-resident int4 point-lookup batch has NO single-buffer snapshot, so serve it via
@@ -491,6 +588,9 @@ fn run_group(engine: &Engine, group: Vec<PointLookupRequest>) {
     if let Some(batched) =
         engine.submit_sharded_point_lookups_batched(&group[0].select, &distinct_needles)
     {
+        activity
+            .sharded_batched_groups
+            .fetch_add(1, AtomicOrdering::Relaxed);
         debug_assert_eq!(batched.needle_count(), distinct_needles.len());
         distribute_results_batched(group, request_result_index, batched);
         return;
@@ -504,6 +604,9 @@ fn run_group(engine: &Engine, group: Vec<PointLookupRequest>) {
             // to the unbatched path) rather than failing valid queries. A truly non-resident table (the
             // snapshot went away since classify) still fails the group uniformly.
             if engine.resident_shard_count(&group[0].select.table) > 0 {
+                activity
+                    .sharded_per_query_fallback_groups
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 run_group_per_query(engine, group);
             } else {
                 fail_group(group, err);
@@ -654,7 +757,9 @@ mod tests {
     use super::*;
     use crate::{execute_on_shared_engine, execute_on_shared_engine_batched, BatchedDispatch};
     use gpu_db_sql::{parse_command, Command};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::TryRecvError;
+    use std::sync::Barrier;
 
     fn select(sql: &str) -> Select {
         match parse_command(sql).unwrap() {
@@ -858,6 +963,7 @@ mod tests {
         let batcher =
             PointLookupBatcher::with_triggers(Arc::clone(&shared), 16, Duration::from_millis(5));
         let hb = shared.read_engine().unwrap().sharded_point_batch_hits();
+        let activity_before = batcher.activity_snapshot();
 
         let needles = [0i32, 1, 5, 64, 128, 130, 199, 999, -1];
         let sql = |k: i32| format!("SELECT id, balance FROM accounts WHERE id = {k}");
@@ -878,6 +984,11 @@ mod tests {
             shared.read_engine().unwrap().sharded_point_batch_hits() > hb,
             "the WIRED batched sharded path fired (non-vacuity)"
         );
+        assert!(
+            batcher.activity_snapshot().sharded_batched_groups
+                > activity_before.sharded_batched_groups,
+            "positive control: the batcher records a served sharded group"
+        );
         for (i, &k) in needles.iter().enumerate() {
             let want = execute_on_shared_engine(&shared, &sql(k)).unwrap();
             assert_eq!(got[i], want, "wired batched == per-query for id={k}");
@@ -891,6 +1002,7 @@ mod tests {
         if shared.read_engine().unwrap().resident_shard_count("dup") > 0 {
             let want_dup =
                 execute_on_shared_engine(&shared, "SELECT id, balance FROM dup WHERE id = 1").unwrap();
+            let fallback_before = batcher.activity_snapshot();
             let got_dup = match execute_on_shared_engine_batched(
                 &shared,
                 &batcher,
@@ -899,13 +1011,196 @@ mod tests {
                 BatchedDispatch::Batched(rx) => {
                     recv_within(rx, Duration::from_secs(5)).expect("answered").expect("ok")
                 }
-                BatchedDispatch::Immediate(r) => r.expect("ok"),
+                BatchedDispatch::Immediate(_) => {
+                    panic!("resident duplicate-key shape must enter the batcher before its gather declines")
+                }
             };
+            let fallback_after = batcher.activity_snapshot();
+            assert_eq!(
+                fallback_after.sharded_per_query_fallback_groups,
+                fallback_before.sharded_per_query_fallback_groups + 1,
+                "positive control: a declined sharded gather advances the per-query fallback counter"
+            );
             assert_eq!(got_dup, want_dup, "dup-key batched (per-query fallback) == per-query");
             if let QueryOutcome::Rows { rows, .. } = &want_dup {
                 assert_eq!(rows.len(), 2, "id=1 has 2 rows (fallback served the multi-row result)");
             }
         }
+    }
+
+    /// The production mixed read/write gate in regression size: facade reads stay admitted to the
+    /// sharded point-lookup batcher while facade INSERTs commit concurrently. Output correctness is
+    /// necessary but not sufficient, so the neutral activity snapshot proves the fully-GPU probe,
+    /// resident device append, and host-install elision all fired during the overlap.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU (mixed resident workload)"]
+    fn mixed_read_write_gpu_route_is_non_vacuous() {
+        use gpu_db_engine::Engine;
+
+        let engine = Engine::new_local();
+        engine.set_shard_residency_enabled(true);
+        engine.set_shard_size_target(32);
+        engine.set_shard_index_probe_enabled(true);
+        engine.set_shard_batched_point_read_enabled(true);
+        engine.set_auto_admit_on_commit(true);
+        engine.set_host_install_elision_enabled(true);
+        let shared = Arc::new(SharedEngine::from_engine(engine));
+        execute_on_shared_engine(&shared, "CREATE TABLE mix (id INT PRIMARY KEY, balance INT)")
+            .unwrap();
+        for id in 0..100usize {
+            let balance = if id == 1 {
+                "NULL".to_owned()
+            } else {
+                (id * 7).to_string()
+            };
+            execute_on_shared_engine(
+                &shared,
+                &format!("INSERT INTO mix (id, balance) VALUES ({id}, {balance})"),
+            )
+            .unwrap();
+        }
+        if shared.gpu_native_activity_snapshot("mix").resident_shards == 0 {
+            return;
+        }
+
+        let batcher = Arc::new(PointLookupBatcher::with_triggers(
+            Arc::clone(&shared),
+            32,
+            Duration::ZERO,
+        ));
+        let before = shared.gpu_native_activity_snapshot("mix");
+        let active_readers = Arc::new(AtomicUsize::new(1));
+        let reader_started = Arc::new(AtomicUsize::new(0));
+        let active_writers = Arc::new(AtomicUsize::new(0));
+        let writer_done = Arc::new(AtomicBool::new(false));
+        let overlapping_writes = Arc::new(AtomicUsize::new(0));
+        let overlapping_reads = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+
+        let reader = {
+            let shared = Arc::clone(&shared);
+            let batcher = Arc::clone(&batcher);
+            let active_readers = Arc::clone(&active_readers);
+            let reader_started = Arc::clone(&reader_started);
+            let active_writers = Arc::clone(&active_writers);
+            let writer_done = Arc::clone(&writer_done);
+            let overlapping_reads = Arc::clone(&overlapping_reads);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                reader_started.store(1, Ordering::Release);
+                let mut turn = 0usize;
+                loop {
+                    let id = turn % 100;
+                    let sql = format!("SELECT id FROM mix WHERE id = {id}");
+                    let outcome = match execute_on_shared_engine_batched(&shared, &batcher, &sql) {
+                        BatchedDispatch::Batched(receiver) => receiver
+                            .blocking_recv()
+                            .expect("batcher stayed alive")
+                            .expect("batched read succeeded"),
+                        BatchedDispatch::Immediate(_) => {
+                            panic!("resident mixed read bypassed the production batcher")
+                        }
+                    };
+                    match outcome {
+                        QueryOutcome::Rows { rows, .. } => {
+                            assert_eq!(rows, vec![vec![DbValue::Int4(id as i32)]])
+                        }
+                        other => panic!("unexpected point-read outcome: {other:?}"),
+                    }
+                    if active_writers.load(Ordering::Acquire) > 0 {
+                        overlapping_reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    turn += 1;
+                    if turn >= 300 && writer_done.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                active_readers.store(0, Ordering::Release);
+            })
+        };
+        let writer = {
+            let shared = Arc::clone(&shared);
+            let active_readers = Arc::clone(&active_readers);
+            let reader_started = Arc::clone(&reader_started);
+            let active_writers = Arc::clone(&active_writers);
+            let writer_done = Arc::clone(&writer_done);
+            let overlapping_writes = Arc::clone(&overlapping_writes);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                while reader_started.load(Ordering::Acquire) == 0 {
+                    std::hint::spin_loop();
+                }
+                active_writers.fetch_add(1, Ordering::Release);
+                let gpu_before_writes = shared
+                    .gpu_native_activity_snapshot("mix")
+                    .sharded_gpu_probe_batches;
+                for offset in 0..20usize {
+                    let id = 10_000 + offset;
+                    execute_on_shared_engine(
+                        &shared,
+                        &format!(
+                            "INSERT INTO mix (id, balance) VALUES ({id}, {})",
+                            id * 3
+                        ),
+                    )
+                    .unwrap();
+                    if active_readers.load(Ordering::Acquire) > 0 {
+                        overlapping_writes.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let gpu_after_writes = shared
+                    .gpu_native_activity_snapshot("mix")
+                    .sharded_gpu_probe_batches;
+                active_writers.fetch_sub(1, Ordering::Release);
+                writer_done.store(true, Ordering::Release);
+                gpu_after_writes.saturating_sub(gpu_before_writes)
+            })
+        };
+
+        barrier.wait();
+        let gpu_batches_during_writes = writer.join().expect("writer did not panic");
+        reader.join().expect("reader did not panic");
+        let after = shared.gpu_native_activity_snapshot("mix");
+        let gpu_batches = after.sharded_gpu_probe_batches - before.sharded_gpu_probe_batches;
+        let sharded_batches = after.sharded_point_batches - before.sharded_point_batches;
+        let activity = batcher.activity_snapshot();
+        assert!(gpu_batches > 0, "the fully-GPU multi-shard point probe fired");
+        assert!(
+            gpu_batches_during_writes > 0,
+            "a fully-GPU point batch completed inside the exact writer-active interval"
+        );
+        assert_eq!(
+            gpu_batches, sharded_batches,
+            "visibility-sensitive append windows remain on the dense GPU probe"
+        );
+        assert_eq!(
+            sharded_batches, activity.sharded_batched_groups,
+            "every batcher sharded group stayed on a batched resident route"
+        );
+        assert_eq!(
+            activity.sharded_per_query_fallback_groups, 0,
+            "no sharded group fell back to per-query execution"
+        );
+        assert!(
+            after.open_shard_append_commits > before.open_shard_append_commits,
+            "concurrent writes appended to resident device memory"
+        );
+        assert_eq!(
+            after.host_install_elisions - before.host_install_elisions,
+            20,
+            "every concurrent write skipped the host tuple-store install"
+        );
+        assert_eq!(
+            overlapping_writes.load(Ordering::Relaxed),
+            20,
+            "every write committed while the continuously-running reader was live"
+        );
+        assert!(
+            overlapping_reads.load(Ordering::Relaxed) > 0,
+            "at least one batched resident read completed while the writer was active"
+        );
     }
 
     #[test]
@@ -1072,16 +1367,37 @@ mod tests {
         let (obs_tx, obs_rx) = mpsc::channel::<usize>();
         // Count trigger (64) above the burst (16) so coalescing is via the wait,
         // not the count trigger; a 200ms ceiling gives the burst time to gather.
-        let batcher = PointLookupBatcher::with_triggers_observed(
+        let batcher = Arc::new(PointLookupBatcher::with_triggers_observed(
             engine,
             64,
             Duration::from_millis(200),
             obs_tx,
-        );
+        ));
         let n = 16usize;
-        let receivers: Vec<_> = (0..n)
-            .map(|needle| batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), needle as i32))
+        let start = Arc::new(Barrier::new(n + 1));
+        let (receiver_tx, receiver_rx) = mpsc::channel();
+        let workers: Vec<_> = (0..n)
+            .map(|needle| {
+                let batcher = Arc::clone(&batcher);
+                let start = Arc::clone(&start);
+                let receiver_tx = receiver_tx.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    receiver_tx
+                        .send(batcher.enqueue(
+                            select("SELECT id FROM t WHERE id = 1"),
+                            needle as i32,
+                        ))
+                        .unwrap();
+                })
+            })
             .collect();
+        drop(receiver_tx);
+        start.wait();
+        let receivers: Vec<_> = receiver_rx.iter().collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
         // Every request is still answered (completeness preserved).
         for rx in receivers {
             let outcome = recv_within(rx, Duration::from_secs(3)).expect("every waiter answered");

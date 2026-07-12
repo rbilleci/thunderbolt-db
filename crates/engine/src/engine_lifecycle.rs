@@ -13,11 +13,46 @@ impl Engine {
         Self::with_planner_config(PlannerConfig::default())
     }
 
+    /// Unit-test parity-oracle constructor. Production constructors keep STRATA S-F ON; tests
+    /// whose subject is SQL/MVCC semantics rather than residency opt out explicitly so their
+    /// result metadata and storage authority do not depend on whether the test host has CUDA.
+    #[cfg(test)]
+    pub(crate) fn new_local_cpu_oracle() -> Self {
+        let engine = Self::new_local();
+        engine.set_auto_admit_on_commit(false);
+        engine.set_host_install_elision_enabled(false);
+        engine
+    }
+
+    fn begin_recovery_replay(&self) {
+        self.set_auto_admit_on_commit(false);
+        self.set_host_install_elision_enabled(false);
+    }
+
+    fn finish_recovery_replay(&self) {
+        self.set_host_install_elision_enabled(true);
+        self.set_auto_admit_on_commit(true);
+        let tables: Vec<String> = self
+            .catalog_snapshot()
+            .relational_catalog
+            .keys()
+            .cloned()
+            .collect();
+        for table in tables {
+            let _ = self.populate_relational_residency_snapshot_shared(&table);
+        }
+    }
+
     pub fn recover_from_durable_wal(records: &[WalRecord]) -> Result<Self, EngineError> {
         let engine = Self::new_local();
+        // Recovery reconstructs the durable host/store image first. Per-record admission would
+        // repeatedly upload partial generations and can enter device-authoritative elision while
+        // later WAL records still need the host image. Admit once, after the complete replay.
+        engine.begin_recovery_replay();
         for record in records {
             engine.commit_mutation(record.txn_id, record.payload.clone())?;
         }
+        engine.finish_recovery_replay();
         Ok(engine)
     }
 
@@ -185,13 +220,12 @@ impl Engine {
             planner: Planner::new(planner_cfg),
             router: DeviceRouter::new(MockGpuRuntime::default()),
             cached_cuda_probe_runtime: OnceLock::new(),
-            // AUTO-ADMIT stays default OFF behind TWO NAMED GATES (user-ratified 2026-07-03,
-            // with the constrained-elision flip): (1) R-1 admission budgeting / shard-aware
-            // EVICTION (a default that admits every eligible table has no principled memory
-            // policy); (2) the ~200ms FIRST-ROLLOVER STALL off the commit critical path
-            // (ledger #19 — a p-max landmine on the first write after bulk admission). Flip
-            // when both land: the charter makes GPU residency the substrate, not an opt-in.
-            auto_admit_on_commit: std::sync::atomic::AtomicBool::new(false),
+            // STRATA S-F (2026-07-12): residency is the production default. Deterministic
+            // shard-aware admission eviction, bounded streaming for over-budget relations,
+            // incremental append/update/delete, and the production mixed read/write gate have
+            // closed the former default-OFF gates. The setter remains the explicit parity-oracle
+            // and operator kill switch; it is not the product direction.
+            auto_admit_on_commit: std::sync::atomic::AtomicBool::new(true),
             // DEFAULT ON (user 2026-06-29: lpb chosen over the wave engine): the R1 unique-key index probe is
             // the production read path (O(1)/needle vs the O(rows) scan it replaces; byte-identical). The
             // persistent wave has been RETIRED.
@@ -572,6 +606,7 @@ impl Engine {
                 };
                 let records = gpu_db_wal::recover_fua_wal_records(segment_path)?;
                 let mut engine = Self::with_planner_config(planner_cfg);
+                engine.begin_recovery_replay();
                 // Replay the durable prefix WITHOUT a durable backing (no segment I/O), then install
                 // a reopened FUA backend that appends above the recovered history in a fresh segment.
                 for record in &records {
@@ -589,11 +624,13 @@ impl Engine {
                 // files existed here, so the set is created fresh; activation seeds base_seq
                 // from the recovered commit index).
                 engine.attach_fresh_intent_lanes(segment_path, false)?;
+                engine.finish_recovery_replay();
                 return Ok(engine);
             }
         }
         let recovery = recover_wal_segment(segment_path)?;
         let mut engine = Self::with_planner_config(planner_cfg);
+        engine.begin_recovery_replay();
         // Replay the durable prefix WITHOUT a durable backing so the replay does no segment I/O;
         // then install the recovered segment so post-recovery commits keep appending to the same
         // file (the torn tail, if any, is durably truncated at install time).
@@ -605,6 +642,7 @@ impl Engine {
             WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
         #[cfg(unix)]
         engine.attach_fresh_intent_lanes(segment_path, false)?;
+        engine.finish_recovery_replay();
         Ok(engine)
     }
 
@@ -665,6 +703,7 @@ impl Engine {
         let lane_records = gpu_db_wal::recover_lanes_from(segment_path, lane_count, baseline)?;
 
         let mut engine = Self::with_planner_config(planner_cfg);
+        engine.begin_recovery_replay();
         // Replay (checkpoint | serial)-then-lanes WITHOUT durable backing (no segment I/O),
         // then install the continuation backends. The serial prefix's record count IS
         // `base_seq`: activation seeded the oracle from `repl.peek_next_index()` while the
@@ -829,6 +868,7 @@ impl Engine {
             state.activated.store(true, Ordering::Release);
         }
         engine.intent_lanes = Some(std::sync::Arc::new(state));
+        engine.finish_recovery_replay();
         Ok(engine)
     }
 
@@ -885,6 +925,7 @@ impl Engine {
             recovery.records.drain(..overlap);
         }
         let mut engine = Self::new_local();
+        engine.begin_recovery_replay();
         for record in checkpoint_records.iter().chain(recovery.records.iter()) {
             engine.commit_mutation(record.txn_id, record.payload.clone())?;
         }
@@ -903,6 +944,7 @@ impl Engine {
                 .wal
                 .truncate_durable_segment_prefix(checkpoint_count);
         }
+        engine.finish_recovery_replay();
         Ok(engine)
     }
 
@@ -995,12 +1037,24 @@ impl Engine {
     /// section (the resident-route planner runs there for a materialized-view create/refresh internal
     /// read; the latched read self-deadlocked — THE FLIP burn-in caught it).
     pub fn relational_residency_budget_bytes(&self, gpu_id: u16) -> Option<u64> {
-        self.read_state
+        let explicit = self.read_state
             .residency
             .admission_budget_bytes_by_gpu
             .load()
             .get(&gpu_id)
-            .copied()
+            .copied();
+        #[cfg(test)]
+        return explicit;
+        #[cfg(not(test))]
+        explicit.or_else(|| {
+                self.cuda_driver_probe_runtime()
+                    .snapshot()
+                    .devices
+                    .into_iter()
+                    .find(|device| device.id == gpu_id)
+                    .map(|device| device.total_memory_bytes.saturating_mul(4) / 5)
+                    .filter(|budget| *budget > 0)
+            })
     }
 
     pub fn relational_resident_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
@@ -1011,7 +1065,13 @@ impl Engine {
             .load()
             .values()
             .filter(|entry| entry.descriptor.gpu_id == gpu_id)
-            .map(|entry| entry.descriptor.resident_bytes)
+            .map(|entry| {
+                entry
+                    .descriptor
+                    .device_memory_proof
+                    .as_ref()
+                    .map_or(0, |proof| proof.allocated_bytes)
+            })
             .sum();
         let shard_bytes: u64 = self
             .read_state
@@ -1021,9 +1081,45 @@ impl Engine {
             .values()
             .flatten()
             .filter(|shard| shard.gpu_id == gpu_id)
-            .map(|shard| shard.resident_bytes)
+            .map(|shard| {
+                let regions = [
+                    shard.deleted_by_region.as_ref(),
+                    shard.created_by_region.as_ref(),
+                    shard.row_id_region.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|region| region.metadata().allocated_bytes)
+                .sum::<u64>();
+                shard.allocated_bytes.saturating_add(regions)
+            })
             .sum();
-        snapshot_bytes.saturating_add(shard_bytes)
+        let single_indexes = self
+            .read_state
+            .residency
+            .wave_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter_map(|index| index.index_memory.as_ref())
+            .filter(|memory| memory.metadata().gpu_id == gpu_id)
+            .map(|memory| memory.metadata().allocated_bytes)
+            .sum::<u64>();
+        let shard_indexes = self
+            .read_state
+            .residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter_map(|index| index.device_index.as_ref())
+            .filter(|memory| memory.metadata().gpu_id == gpu_id)
+            .map(|memory| memory.metadata().allocated_bytes)
+            .sum::<u64>();
+        snapshot_bytes
+            .saturating_add(shard_bytes)
+            .saturating_add(single_indexes)
+            .saturating_add(shard_indexes)
     }
 
     pub fn set_gpu_runtime_saturated(&mut self, saturated: bool) {

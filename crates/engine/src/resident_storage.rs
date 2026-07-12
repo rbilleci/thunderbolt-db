@@ -11,7 +11,7 @@ use super::*;
 /// ADR-009 R1: a cached GPU hash index over one resident int4 key column, for the index-probe
 /// point-lookup route. Built lazily by DtoH-reading the key column from the resident device buffer
 /// (NOT host rows) so the index's row→value mapping is inherently consistent with the SAME bytes the
-/// scan reads — the audit's host_rows↔device_memory cross-generation hazard cannot arise. Validity:
+/// scan reads — no host row shadow exists to create a cross-generation mapping hazard. Validity:
 /// `column_idx` + `resident_device_ptr` tag WHICH resident buffer (a unique allocation per residency
 /// generation) this index mirrors. `_resident_guard` pins that buffer so its address can never be
 /// freed-then-reused while cached — making `resident_device_ptr` an unambiguous identity check: a
@@ -918,7 +918,6 @@ impl RelationalResidentCache {
         &self,
         table: String,
         descriptor: RelationalResidencySnapshot,
-        host_rows: Vec<Vec<SqlValue>>,
         device_memory: Option<CudaResidentDeviceMemory>,
         residency: &ResidencyReadState,
     ) {
@@ -929,10 +928,7 @@ impl RelationalResidentCache {
             // in-flight reader of a prior resident generation keeps it.
             residency.device_memory.invalidate(&table);
         }
-        // Co-publish the lightweight descriptor + the heavy host rows as one Arc-shared entry, so
-        // the COW map clone (every reader + every invalidation) bumps refcounts, not row data. Admit lays
-        // the rows down as ONE segment; an INSERT commit appends further segments (Slice 1b-ii-d).
-        let entry = RelationalResidencyEntry::from_dense_host_rows(Arc::new(descriptor), host_rows);
+        let entry = RelationalResidencyEntry::new(Arc::new(descriptor));
         residency.with_snapshots_mut(|snapshots| snapshots.insert(table, entry));
     }
 

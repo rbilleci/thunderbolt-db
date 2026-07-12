@@ -36,7 +36,7 @@ use gpu_db_sql::{parse_command, Command, Decimal128, ParseError, Select, SqlType
 pub mod pg_adapter;
 mod point_lookup_batcher;
 
-pub use point_lookup_batcher::PointLookupBatcher;
+pub use point_lookup_batcher::{PointLookupBatcher, PointLookupBatcherActivitySnapshot};
 
 /// Neutral logical column type. Carries no wire OID; adapters derive the wire
 /// type from this.
@@ -316,6 +316,23 @@ pub struct SharedEngine {
     next_txn_id: AtomicU64,
 }
 
+/// Protocol-neutral non-vacuity counters for mixed GPU-native workloads. These are monotonic
+/// process-local observations, intended for operational diagnostics and benchmark gates: result
+/// equality alone cannot prove whether a resident read silently fell back or whether a write
+/// reinstalled the host store. `resident_shards` is scoped to the table passed to
+/// [`SharedEngine::gpu_native_activity_snapshot`]; every other field is engine-global.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuNativeActivitySnapshot {
+    pub valid_resident_tables: usize,
+    pub resident_shards: usize,
+    pub dense_index_probe_batches: u64,
+    pub sharded_point_batches: u64,
+    pub sharded_gpu_probe_batches: u64,
+    pub sharded_binary_route_batches: u64,
+    pub open_shard_append_commits: u64,
+    pub host_install_elisions: u64,
+}
+
 impl SharedEngine {
     /// Construct a shared façade over a local single-node engine.
     pub fn new() -> Self {
@@ -361,6 +378,24 @@ impl SharedEngine {
     /// Whether this façade's engine fsyncs commits (a durable WAL segment is installed).
     pub fn is_durable(&self) -> bool {
         self.engine.wal_is_durable()
+    }
+
+    /// Read-only activity snapshot for proving that a mixed workload used the GPU-native read and
+    /// write paths. It deliberately exposes neutral counters rather than the underlying `Engine`,
+    /// preserving the facade as the protocol boundary. Only `resident_shards` is scoped to `table`;
+    /// all activity counters and `valid_resident_tables` describe this engine instance globally.
+    pub fn gpu_native_activity_snapshot(&self, table: &str) -> GpuNativeActivitySnapshot {
+        let status = self.engine.status_snapshot();
+        GpuNativeActivitySnapshot {
+            valid_resident_tables: status.relational_residency.valid_snapshot_count(),
+            resident_shards: self.engine.resident_shard_count(table),
+            dense_index_probe_batches: self.engine.dense_index_probe_hits(),
+            sharded_point_batches: self.engine.sharded_point_batch_hits(),
+            sharded_gpu_probe_batches: self.engine.sharded_point_gpu_probe_hits(),
+            sharded_binary_route_batches: self.engine.sharded_point_binary_route_hits(),
+            open_shard_append_commits: self.engine.open_shard_append_hits(),
+            host_install_elisions: self.engine.host_install_elisions(),
+        }
     }
 
     /// Borrow the shared engine (no lock — the engine is interior-mutable). The point-lookup batcher

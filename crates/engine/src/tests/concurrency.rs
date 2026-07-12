@@ -14,7 +14,7 @@ fn concurrent_readers_execute_relational_select_on_shared_engine() {
     // execute_relational_select against ONE shared engine (one published residency
     // generation) concurrently — there is no `&mut self` bottleneck. This is the
     // property the whole P1-M3 substrate exists to enable.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -100,7 +100,7 @@ fn execute_relational_select_cpu_pinned_matches_the_public_select() {
     // GPU; this asserts the seam the fallback lands on is correct CPU-only). The two are wired to
     // the same bind + pinned MVCC read, so for a non-resident table they must agree on rows,
     // columns, and access path.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     for id in 1..=5 {
         e.execute_text(
@@ -317,7 +317,7 @@ fn stage3_old_table_generation_retired_only_after_last_reader_drains() {
 /// per-table refactor kept the fast-path index-targeted (the whole reason for per-table cells).
 #[test]
 fn stage3_resident_equality_read_still_uses_value_index_fast_path() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     // 200 rows; only 2 carry name='Ada'. A version-chain scan would touch all 200; the

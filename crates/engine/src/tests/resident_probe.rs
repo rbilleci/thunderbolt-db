@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -17,18 +17,9 @@ fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() 
     };
     let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
     assert!(snapshot.is_valid());
-    // Host rows now live in the separate `host_rows` half of the residency entry (Option C split),
-    // segmented (Slice 1b-ii-d) — count rows across segments, not the segment count.
-    assert_eq!(
-        e.relational_residency_entry("events")
-            .unwrap()
-            .host_row_count(),
-        2
-    );
-
     let before = e.metrics().snapshot();
     let resident = e
-        .execute_relational_select_with_resident_snapshot_probe(&select)
+        .execute_resident_select_via_general(&select)
         .unwrap();
     let after = e.metrics().snapshot();
     // Closed-form oracle (S9): `SELECT label FROM events WHERE id = 2 LIMIT 1` over {1:'alpha',2:'beta'}.
@@ -44,7 +35,7 @@ fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() 
     e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
         .unwrap();
     assert!(e
-        .execute_relational_select_with_resident_snapshot_probe(&select)
+        .execute_resident_select_via_general(&select)
         .unwrap_err()
         .to_string()
         .contains("resident snapshot is invalid"));
@@ -52,93 +43,15 @@ fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() 
     e.populate_relational_residency_snapshot("events").unwrap();
     e.mark_gpu_memory_pressured(0);
     assert!(e
-        .execute_relational_select_with_resident_snapshot_probe(&select)
+        .execute_resident_select_via_general(&select)
         .unwrap_err()
         .to_string()
         .contains("resident snapshot is invalid"));
 }
 
 #[test]
-fn resident_snapshot_probe_reads_aggregate_distinct_without_transfer() {
-    let mut e = Engine::new_local();
-    e.execute_text(
-        1,
-        "CREATE TABLE events (id INT, label TEXT, amount INT, category TEXT)",
-    )
-    .unwrap();
-    e.execute_text(
-            2,
-            "INSERT INTO events (id, label, amount, category) VALUES (1, 'alpha', 10, 'odd'), (2, 'beta', 20, 'even'), (3, 'gamma', 30, 'odd')",
-        )
-        .unwrap();
-    // Closed-form construction oracles (S9): data is {1:'alpha',odd,10},{2:'beta',even,20},
-    // {3:'gamma',odd,30} -> odd={10,30} (count 2, sum 40), even={20} (count 1, sum 20).
-    let queries: [(&str, Vec<Vec<SqlValue>>); 6] = [
-        (
-            "SELECT DISTINCT category FROM events ORDER BY category",
-            vec![
-                vec![SqlValue::Text("even".to_string())],
-                vec![SqlValue::Text("odd".to_string())],
-            ],
-        ),
-        (
-            "SELECT category, COUNT(*) FROM events GROUP BY category ORDER BY count DESC",
-            vec![
-                vec![SqlValue::Text("odd".to_string()), SqlValue::Int8(2)],
-                vec![SqlValue::Text("even".to_string()), SqlValue::Int8(1)],
-            ],
-        ),
-        (
-            "SELECT category, SUM(amount) FROM events GROUP BY category ORDER BY sum DESC",
-            vec![
-                vec![SqlValue::Text("odd".to_string()), SqlValue::Int8(40)],
-                vec![SqlValue::Text("even".to_string()), SqlValue::Int8(20)],
-            ],
-        ),
-        (
-            "SELECT AVG(amount) FROM events WHERE category = 'odd'",
-            vec![vec![crate::rel_exec_helpers::average_sql_value(40, 2)]],
-        ),
-        (
-            "SELECT MIN(amount) FROM events",
-            vec![vec![SqlValue::Int4(10)]],
-        ),
-        (
-            "SELECT MAX(amount) FROM events",
-            vec![vec![SqlValue::Int4(30)]],
-        ),
-    ];
-
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
-    assert!(snapshot.is_valid());
-
-    for (sql, expected) in queries {
-        let Command::Select(select) = parse_command(sql).unwrap() else {
-            panic!("expected SELECT");
-        };
-        let before = e.metrics().snapshot();
-        let resident = e
-            .execute_relational_select_with_resident_snapshot_probe(&select)
-            .unwrap();
-        let after = e.metrics().snapshot();
-
-        assert_eq!(resident.rows, expected, "{sql}");
-        assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
-        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
-        assert_eq!(resident.fallback_reason, None, "{sql}");
-        assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0, "{sql}");
-        assert_eq!(after.d2h_bytes_total - before.d2h_bytes_total, 0, "{sql}");
-        assert_eq!(
-            after.kernel_exec_samples - before.kernel_exec_samples,
-            0,
-            "{sql}"
-        );
-    }
-}
-
-#[test]
 fn resident_snapshot_budget_evicts_oldest_table_before_admission() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE small_a (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO small_a (id, label) VALUES (1, 'a')")
@@ -151,7 +64,9 @@ fn resident_snapshot_budget_evicts_oldest_table_before_admission() {
         .unwrap();
     let small_b = e.populate_relational_residency_snapshot("small_b").unwrap();
 
-    let budget_bytes = small_b.resident_bytes.saturating_mul(2);
+    // Admission budgets account allocated device bytes (capacity padding + headers), not the
+    // logical live-row estimate exposed as `snapshot.resident_bytes`.
+    let budget_bytes = e.relational_resident_bytes_for_gpu(0);
     e.set_relational_residency_budget_bytes(0, budget_bytes);
     e.execute_text(5, "CREATE TABLE small_c (id INT, label TEXT)")
         .unwrap();
@@ -174,14 +89,15 @@ fn resident_snapshot_budget_evicts_oldest_table_before_admission() {
 
 #[test]
 fn resident_snapshot_budget_rejects_oversized_snapshot_without_mutation() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO events (id, label) VALUES (1, 'alpha')")
         .unwrap();
     let original = e.populate_relational_residency_snapshot("events").unwrap();
+    let original_allocated = e.relational_resident_bytes_for_gpu(0);
 
-    e.set_relational_residency_budget_bytes(0, original.resident_bytes - 1);
+    e.set_relational_residency_budget_bytes(0, original_allocated - 1);
     let err = e
         .populate_relational_residency_snapshot("events")
         .unwrap_err()
@@ -200,21 +116,199 @@ fn resident_snapshot_budget_rejects_oversized_snapshot_without_mutation() {
     );
     assert_eq!(
         table.last_decision_current_bytes_before,
-        Some(original.resident_bytes)
+        Some(original_allocated)
     );
     assert_eq!(
         table.last_decision_current_bytes_after,
-        Some(original.resident_bytes)
+        Some(original_allocated)
     );
     assert_eq!(
         e.relational_resident_bytes_for_gpu(0),
-        original.resident_bytes
+        original_allocated
+    );
+}
+
+/// S-F/R-1 audit gate: all public benchmark installers allocate first and admit with allocator
+/// metadata. A caller cannot disguise an over-budget allocation behind tiny logical
+/// `resident_bytes`, and each decline preserves the previously published resident table.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn benchmark_installers_reject_actual_bytes_without_evicting_existing_residency() {
+    let mut e = Engine::new_local_cpu_oracle();
+    e.set_shard_residency_enabled(false);
+    e.execute_text(1, "CREATE TABLE keep_resident (id INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO keep_resident VALUES (1)")
+        .unwrap();
+    let keep = e
+        .populate_relational_residency_snapshot("keep_resident")
+        .unwrap();
+    if keep.device_memory_proof.is_none() {
+        return;
+    }
+    for (seq, table) in [(3, "borrowed_bench"), (4, "owned_bench"), (5, "sharded_bench")] {
+        e.execute_text(seq, &format!("CREATE TABLE {table} (id INT)"))
+            .unwrap();
+    }
+    let budget = e.relational_resident_bytes_for_gpu(0);
+    e.set_relational_residency_budget_bytes(0, budget);
+    let oversized_allocation = budget.saturating_add(64);
+    let mut payload = 1_u64.to_le_bytes().to_vec();
+    payload.extend_from_slice(&7_i32.to_le_bytes());
+
+    let borrowed = [CudaDeviceMemoryChunk {
+        byte_offset: 0,
+        bytes: &payload,
+    }];
+    let err = e
+        .install_benchmark_relational_residency_chunks(
+            BenchmarkRelationalResidencyChunkInstall {
+                table: "borrowed_bench",
+                gpu_id: 0,
+                row_count: 1,
+                resident_bytes: payload.len() as u64,
+                resident_device_int4_columns: vec!["id".to_string()],
+                resident_device_int4_column_stats: vec![ResidentDeviceInt4ColumnStats {
+                    name: "id".to_string(),
+                    min: 7,
+                    max: 7,
+                }],
+                resident_device_text_columns: Vec::new(),
+                allocated_bytes: oversized_allocation,
+                chunks: &borrowed,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("exceeding GPU 0 residency budget"),
+        "unexpected borrowed installer error: {err}"
+    );
+
+    let err = e
+        .install_benchmark_relational_residency_owned_chunks(
+            BenchmarkRelationalResidencyOwnedChunkInstall {
+                table: "owned_bench",
+                gpu_id: 0,
+                row_count: 1,
+                resident_bytes: payload.len() as u64,
+                resident_device_int4_columns: vec!["id".to_string()],
+                resident_device_int4_column_stats: vec![ResidentDeviceInt4ColumnStats {
+                    name: "id".to_string(),
+                    min: 7,
+                    max: 7,
+                }],
+                resident_device_text_columns: Vec::new(),
+                allocated_bytes: oversized_allocation,
+                chunks: vec![CudaOwnedDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes: payload.clone(),
+                }],
+            },
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("exceeding GPU 0 residency budget"),
+        "unexpected owned installer error: {err}"
+    );
+
+    let err = e
+        .install_benchmark_relational_residency_owned_shards(
+            BenchmarkRelationalResidencyOwnedShardInstall {
+                table: "sharded_bench",
+                gpu_id: 0,
+                shards: vec![BenchmarkRelationalResidencyOwnedShard {
+                    shard_id: 0,
+                    row_start: 0,
+                    row_count: 1,
+                    resident_bytes: payload.len() as u64,
+                    allocated_bytes: oversized_allocation,
+                    resident_device_int4_columns: vec!["id".to_string()],
+                    resident_device_text_columns: Vec::new(),
+                    chunks: vec![CudaOwnedDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: payload.clone(),
+                    }],
+                }],
+            },
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("exceeding GPU 0 residency budget"),
+        "unexpected shard installer error: {err}"
+    );
+
+    assert!(e.relational_residency_snapshot("keep_resident").is_some());
+    assert_eq!(e.relational_resident_bytes_for_gpu(0), budget);
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn resident_budget_evicts_sharded_tables_not_only_dense_snapshots() {
+    let mut e = Engine::new_local_cpu_oracle();
+    for (seq, (table, value)) in [(1_u64, ("shard_a", 1)), (3, ("shard_b", 2))] {
+        e.execute_text(seq, &format!("CREATE TABLE {table} (id INT)"))
+            .unwrap();
+        e.execute_text(seq + 1, &format!("INSERT INTO {table} VALUES ({value})"))
+            .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot(table).unwrap();
+        if snapshot.device_memory_proof.is_none() {
+            return;
+        }
+        assert!(e.resident_shard_count(table) > 0);
+    }
+    let budget = e.relational_resident_bytes_for_gpu(0);
+    e.set_relational_residency_budget_bytes(0, budget);
+    e.execute_text(5, "CREATE TABLE shard_c (id INT)").unwrap();
+    e.execute_text(6, "INSERT INTO shard_c VALUES (3)").unwrap();
+    let admitted = e.populate_relational_residency_snapshot("shard_c").unwrap();
+
+    assert_eq!(admitted.evicted_tables_on_admission, vec!["shard_a"]);
+    assert_eq!(e.resident_shard_count("shard_a"), 0);
+    assert!(e.resident_shard_count("shard_b") > 0);
+    assert!(e.resident_shard_count("shard_c") > 0);
+    assert!(e.relational_resident_bytes_for_gpu(0) <= budget);
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn open_shard_rollover_declines_before_crossing_the_gpu_budget() {
+    let mut e = Engine::new_local_cpu_oracle();
+    e.set_shard_size_target(4);
+    e.execute_text(1, "CREATE TABLE rollover_budget (id INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO rollover_budget VALUES (1), (2), (3), (4)")
+        .unwrap();
+    let snapshot = e
+        .populate_relational_residency_snapshot("rollover_budget")
+        .unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let budget = e.relational_resident_bytes_for_gpu(0);
+    e.set_relational_residency_budget_bytes(0, budget);
+    let declines_before = e.rollover_budget_declines();
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(3, "INSERT INTO rollover_budget VALUES (5)")
+        .unwrap();
+
+    assert!(e.rollover_budget_declines() > declines_before);
+    assert!(e.relational_resident_bytes_for_gpu(0) <= budget);
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM rollover_budget").unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        e.execute_relational_select(&count).unwrap().rows,
+        vec![vec![SqlValue::Int8(5)]]
     );
 }
 
 #[test]
 fn resident_snapshot_budget_keeps_wal_and_pressure_invalidation_semantics() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -245,7 +339,7 @@ fn resident_snapshot_budget_keeps_wal_and_pressure_invalidation_semantics() {
 
 #[test]
 fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let _ = e
         .cached_cuda_probe_runtime
         .set(CudaDriverRuntime::unavailable());
@@ -396,7 +490,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
 
 #[test]
 fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_telemetry() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
     e.set_shard_residency_enabled(false);
@@ -473,7 +567,7 @@ fn gpu_s10a_ordered_projection_routes_through_bridge_on_dispatch() {
     // arm through the LIVE `&Select` dispatch and now executes via the general bridge ON THE GPU, with
     // closed-form rows. Survives the probe's deletion (calls the dispatch, not the probe). Non-vacuous:
     // the literals pin the filtered + sorted + windowed result.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE p (a INT)").unwrap();
     e.execute_text(
         2,
@@ -532,7 +626,7 @@ fn gpu_s10a_ordered_projection_drops_nulls_pg_correct() {
     // path. So routing this shape is a PG-CORRECTNESS FIX, NOT byte-identical -- this test pins the
     // corrected behavior (the divergent axis the 480-shape non-null differential did not cover) and
     // cross-checks the bridge against the SQL->Expr reference on NULL data.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE p2 (a INT)").unwrap();
     e.execute_text(
         2,
@@ -594,7 +688,7 @@ fn gpu_s10b_distinct_routes_through_bridge_on_dispatch() {
     // through the LIVE `&Select` dispatch and executes via the DISTINCT bridge ON THE GPU, closed-form.
     // Survives the probes' deletion (calls the dispatch). The no-ORDER-BY case pins the deterministic
     // default order (key ASC) the grouped path produces.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE p (a INT)").unwrap();
     e.execute_text(
         2,
@@ -645,7 +739,7 @@ fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
     // column -> a NULL placeholder-0 surfaced as a phantom Int4(0)). The DISTINCT bridge groups a NULL key
     // into one group -> DISTINCT keeps exactly ONE SqlValue::Null row and NO phantom Int4(0) (PG-correct).
     // The data has NO real 0, so any Int4(0) would be the bug. Filtered DISTINCT excludes NULL via 3VL.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE p2 (a INT)").unwrap();
     e.execute_text(
         2,
@@ -740,7 +834,7 @@ fn gpu_s10a_projection_routes_through_bridge_on_dispatch() {
     // S10a keeper: the int4 projection shapes reach their route arms through the LIVE `&Select` dispatch
     // and execute via the general bridge ON THE GPU, closed-form (incl. multi-column + a mixed text+int4
     // projection). Survives the probes' deletion (calls the dispatch).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE proj (a INT, b INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -795,7 +889,7 @@ fn gpu_s10a_projection_drops_nulls_pg_correct() {
     // (placeholder 0) that passed the filter surfaced as a phantom Int4(0). The bridge filters via the 3VL
     // WHERE VM, so a NULL fails `a >= 0` / `a = 0` (UNKNOWN) and is excluded -- PG-correct. Data has real 0s
     // AND NULLs; the result must contain ONLY the real 0s.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE projn (a INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -844,7 +938,7 @@ fn gpu_s10a_filter_group_count_routes_through_bridge_on_dispatch() {
     // LIVE dispatch and executes via the bridge ON THE GPU, closed-form. NULL regression: a NULL in the
     // filter column fails the predicate via 3VL (excluded), so the bridge does NOT phantom-count it as the
     // retired probe did (NULL placeholder-0 -> matched `a = 0`).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE cnt (a INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -874,7 +968,7 @@ fn gpu_s10a_filter_group_count_routes_through_bridge_on_dispatch() {
     );
 
     // NULL data: real 0s (x2) + a NULL (x2) + a 5; `a = 0 OR a = 5` counts the 3 real matches, NOT the NULLs.
-    let mut e2 = Engine::new_local();
+    let mut e2 = Engine::new_local_cpu_oracle();
     e2.execute_text(1, "CREATE TABLE cntn (a INT)").unwrap();
     e2.execute_text(
         2,
@@ -898,7 +992,7 @@ fn gpu_s10a_filter_group_count_routes_through_bridge_on_dispatch() {
 
 #[test]
 fn relational_select_grouped_having_filters_engine_aggregate_rows() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
@@ -952,7 +1046,7 @@ fn relational_select_grouped_having_filters_engine_aggregate_rows() {
 
 #[test]
 fn gpu_resident_device_memory_membership_count_probe_materializes_int4_results() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -1034,7 +1128,7 @@ fn gpu_resident_device_memory_membership_count_probe_materializes_int4_results()
 
 #[test]
 fn gpu_resident_device_memory_between_count_probe_materializes_int4_results() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -1134,7 +1228,7 @@ fn gpu_resident_device_memory_between_count_probe_materializes_int4_results() {
 // on-device LIKE filter (`expr_text_like_scalar_filter`). Closed-form GPU-native oracle, no probe reference.
 #[test]
 fn gpu_s10a_text_prefix_like_count_routes_through_bridge_on_device() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -1187,7 +1281,7 @@ fn gpu_s10a_text_prefix_like_count_routes_through_bridge_on_device() {
 // the BE-token sabotage proved the mask-VM path is load-bearing (LIKE 'alp%' -> 0 instead of 3).
 #[test]
 fn gpu_s10a_text_prefix_like_count_nullable_text_pg_correct_on_device() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -1230,7 +1324,7 @@ fn gpu_resident_empty_nonnullable_scalar_aggregate_min_max_avg_is_null() {
     // (matching the NULLABLE path's all-NULL behavior — "PG: an aggregate of no rows is NULL").
     // This corner (an EMPTY, NON-nullable, UNFILTERED resident table) was UNTESTED; this pins it so a
     // future regression to the old empty sentinels (MIN/MAX -> Text("") / AVG -> Numeric(0)) is caught.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // Plain `INT` (no inserted NULLs) routes the NON-nullable arm (`agg_null_offset.is_none()`), the
     // same arm the populated `gpu_resident_device_memory_scalar_aggregate_probe_*` test exercises.
     e.execute_text(1, "CREATE TABLE events (amount INT)")
@@ -1262,7 +1356,7 @@ fn gpu_resident_empty_nonnullable_scalar_aggregate_min_max_avg_is_null() {
 
 #[test]
 fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
@@ -1334,7 +1428,7 @@ fn gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null() {
     // column yields SQL NULL for every aggregate (PG: aggregate of no rows is NULL). Expected values are
     // closed-form construction (the non-NULL sum/count/min/max computed by hand, AVG via the engine's
     // own PG-exact finalization) — NOT a CPU-operator oracle, per the GPU-native-oracle charter.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
     e.set_shard_residency_enabled(false);
@@ -1415,7 +1509,7 @@ fn gpu_sharded_scalar_aggregate_skips_null_values_and_all_null_is_null() {
     // semantics ON-DEVICE under the DEFAULT (sharded) layout. This is the sharded-default twin of
     // `gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null` (which pins the
     // single-buffer layer); expected values are closed-form construction, NOT a CPU-operator oracle.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE events_shnull (amount INT, allnull INT, grp INT)",
@@ -1532,7 +1626,7 @@ fn gpu_sharded_count_distinct_over_nullable_column_counts_non_null() {
     // TEXT entry (the hand-rolled grammar has no COUNT(DISTINCT); libpg_query maps it), which resolves
     // the sharded unified source inside the general executor. All-NULL -> 0 (PG: COUNT over zero rows
     // is 0, not NULL). The GROUPED COUNT(DISTINCT) paths keep their nullable clean-error.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events_cd (amount INT, allnull INT)")
         .unwrap();
     // amount: {10, NULL, 30, NULL, 20, 5, 10} -> distinct non-NULL {10, 30, 20, 5} = 4.
@@ -1580,7 +1674,7 @@ fn gpu_sharded_count_distinct_over_nullable_column_counts_non_null() {
 fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
     // M3 Slice A: filtered (compare + BETWEEN) SUM/AVG/MIN/MAX over a NULLABLE int4 column skip NULL rows
     // ON THE GPU, and a no-surviving-row result is SQL NULL. Closed-form construction oracle (not CPU).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
     e.set_shard_residency_enabled(false);
@@ -1648,7 +1742,7 @@ fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
 
 #[test]
 fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_results() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
@@ -1769,7 +1863,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
 
 #[test]
 fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_results() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
@@ -1899,7 +1993,7 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
 
 #[test]
 fn status_and_telemetry_surface_relational_residency_state() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
@@ -1916,8 +2010,16 @@ fn status_and_telemetry_surface_relational_residency_state() {
     if let Some(proof) = &events.device_memory_proof {
         assert!(proof.retained);
     }
+    let events_allocated = events
+        .device_memory_proof
+        .as_ref()
+        .map_or(events.resident_bytes, |proof| proof.allocated_bytes);
     let aux = e.populate_relational_residency_snapshot("aux").unwrap();
-    let budget_bytes = events.resident_bytes;
+    let aux_allocated = aux
+        .device_memory_proof
+        .as_ref()
+        .map_or(aux.resident_bytes, |proof| proof.allocated_bytes);
+    let budget_bytes = events_allocated;
     e.set_relational_residency_budget_bytes(0, budget_bytes);
     let admitted = e.populate_relational_residency_snapshot("events").unwrap();
     assert_eq!(admitted.evicted_tables_on_admission, vec!["aux"]);
@@ -1945,7 +2047,7 @@ fn status_and_telemetry_surface_relational_residency_state() {
     assert_eq!(table.column_count, 2);
     assert_eq!(table.resident_bytes, events.resident_bytes);
     assert_eq!(table.admission_budget_bytes, Some(budget_bytes));
-    assert_eq!(table.resident_bytes_after_admission, events.resident_bytes);
+    assert_eq!(table.resident_bytes_after_admission, events_allocated);
     assert_eq!(table.evicted_tables_on_admission, vec!["aux"]);
     assert_eq!(table.cache_state, "Valid");
     assert_eq!(table.last_decision_accepted, Some(true));
@@ -1955,11 +2057,11 @@ fn status_and_telemetry_surface_relational_residency_state() {
     );
     assert_eq!(
         table.last_decision_current_bytes_before,
-        Some(aux.resident_bytes)
+        Some(aux_allocated)
     );
     assert_eq!(
         table.last_decision_current_bytes_after,
-        Some(events.resident_bytes)
+        Some(events_allocated)
     );
     assert!(table.valid);
     assert!(status.relational_residency.table("aux").is_none());
@@ -1995,7 +2097,7 @@ fn status_and_telemetry_surface_relational_residency_state() {
     );
     assert_eq!(
         e.relational_resident_bytes_for_gpu(0),
-        events.resident_bytes
+        events_allocated
     );
     assert!(aux.resident_bytes > 0);
 }
@@ -2010,7 +2112,7 @@ fn gpu_d3_pinned_reader_is_hidden_an_unpublished_insert_append() {
     // sharded read route hides the slot from the pre-append boundary and serves it at the append's
     // own seq. SABOTAGE: skip the created_by stamp in the append (or drop the hwm/created_by gate on
     // any route below) and the phantom reappears -> this test FAILS.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE d3t (id INT, v INT)")
         .unwrap();
     e.execute_text(
@@ -2108,7 +2210,7 @@ fn gpu_d4_captured_generation_survives_a_readmit_purge() {
     // resources: whatever generation a reader loads, it holds THAT generation's buffer AND regions,
     // pinned. SABOTAGE: revert any consumer to a side-map `.get()` after `shards.load()` and this
     // gate's held-generation assertions become unenforceable (the resurrection window reopens).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // The incremental DELETE tombstone path is nested under auto-admit (the commit-path lever).
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE d4t (id INT, v INT)")

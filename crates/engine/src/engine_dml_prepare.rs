@@ -78,6 +78,9 @@ pub(crate) fn dml_filter_groups_to_device_predicate(
             // via the numeric peephole, which rescales to the column scale and handles AND/OR). Any other
             // column type / value declines to the host.
             let value_leaf = match (table.columns.get(*idx).map(|c| c.ty), value) {
+                (Some(SqlType::Int2), SqlValue::Int2(v)) => {
+                    ResidentExpr::Int4Literal(i32::from(*v))
+                }
                 (Some(SqlType::Int4), SqlValue::Int4(v)) => ResidentExpr::Int4Literal(*v),
                 (Some(SqlType::Int8), SqlValue::Int8(v)) => ResidentExpr::Int8Literal(*v),
                 (Some(SqlType::Timestamp), SqlValue::Timestamp(v)) => ResidentExpr::Int8Literal(*v),
@@ -1290,6 +1293,16 @@ impl Engine {
         if !self.dml_device_validate_enabled() {
             return None;
         }
+        if self.table_chunk_authoritative(&table.name).is_some() {
+            visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
+            return self.chunk_class_visible_row_with_value(
+                table,
+                visibility.read_txn_id,
+                column_idx,
+                value,
+                exclude_keys,
+            );
+        }
         // TYPE-COVERAGE track 2: i32-section needles (Int4/Date/Int2) probe the device hash
         // index with the exact section encoding; other types have NO device index and go
         // straight to the elided scan arm below.
@@ -1415,6 +1428,10 @@ impl Engine {
         // the preflight probes at the FACADE txn id; threading it into the reconcile stamped
         // store versions with future/foreign seqs -> "tuple not found" for later readers).
         let mut probe_visibility = visibility;
+        if self.table_chunk_authoritative(&table.name).is_some() {
+            self.deauthoritize_chunk_table(&table.name, false)?;
+            probe_visibility.read_txn_id = probe_visibility.read_txn_id.max(self.committed_seq());
+        }
         if self.table_install_elided(&table.name) {
             self.rehydrate_elided_serialized(&table.name)?;
             // Audit FINDING C hardening: the reconcile stamps at committed_seq; a caller

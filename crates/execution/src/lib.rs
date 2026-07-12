@@ -182,6 +182,108 @@ struct PinnedHostPtr(*mut c_void);
 unsafe impl Send for PinnedHostPtr {}
 unsafe impl Sync for PinnedHostPtr {}
 
+struct CudaAllocationTracker {
+    live: std::sync::atomic::AtomicU64,
+    peak: std::sync::atomic::AtomicU64,
+    limit: u64,
+}
+
+thread_local! {
+    static CUDA_ALLOCATION_TRACKER: std::cell::RefCell<Option<Arc<CudaAllocationTracker>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Thread-scoped, allocator-backed budget for relational scratch. Every pooled device-buffer lease
+/// made while the scope is active reserves its actual power-of-two allocation capacity before CUDA
+/// allocation/reuse. This makes an operator fail before crossing its VRAM allowance and exposes the
+/// true live-allocation high-water rather than a post-hoc row-width estimate.
+pub struct CudaAllocationScope {
+    tracker: Arc<CudaAllocationTracker>,
+    previous: Option<Arc<CudaAllocationTracker>>,
+}
+
+/// Reservation for a raw CUDA allocation performed by an engine-owned builder rather than the
+/// pooled execution allocator. It charges the current scope before that allocation and releases on
+/// drop, so conservative layout bounds participate in the same live high-water and hard limit.
+pub struct CudaExternalAllocationReservation {
+    tracker: Option<Arc<CudaAllocationTracker>>,
+    bytes: usize,
+}
+
+impl CudaAllocationScope {
+    pub fn with_budget(limit: u64) -> Self {
+        let tracker = Arc::new(CudaAllocationTracker {
+            live: std::sync::atomic::AtomicU64::new(0),
+            peak: std::sync::atomic::AtomicU64::new(0),
+            limit,
+        });
+        let previous = CUDA_ALLOCATION_TRACKER.with(|slot| slot.borrow_mut().replace(Arc::clone(&tracker)));
+        Self { tracker, previous }
+    }
+
+    pub fn peak_bytes(&self) -> u64 {
+        self.tracker.peak.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reserve_external(
+        bytes: usize,
+    ) -> Result<CudaExternalAllocationReservation, CudaRuntimeProbeError> {
+        let tracker = CUDA_ALLOCATION_TRACKER
+            .with(|slot| slot.borrow().as_ref().map(|tracker| tracker.reserve(bytes)))
+            .transpose()?;
+        Ok(CudaExternalAllocationReservation { tracker, bytes })
+    }
+}
+
+impl Drop for CudaAllocationScope {
+    fn drop(&mut self) {
+        CUDA_ALLOCATION_TRACKER.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+impl Drop for CudaExternalAllocationReservation {
+    fn drop(&mut self) {
+        if let Some(tracker) = &self.tracker {
+            tracker.release(self.bytes);
+        }
+    }
+}
+
+impl CudaAllocationTracker {
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<Self>, CudaRuntimeProbeError> {
+        let bytes = bytes as u64;
+        let mut live = self.live.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = live.saturating_add(bytes);
+            if next > self.limit {
+                return Err(CudaRuntimeProbeError::AllocationBudgetExceeded {
+                    requested: bytes,
+                    live,
+                    limit: self.limit,
+                });
+            }
+            match self.live.compare_exchange_weak(
+                live,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.peak.fetch_max(next, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Arc::clone(self));
+                }
+                Err(actual) => live = actual,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        self.live.fetch_sub(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct GpuPrimaryContext {
     device: i32,
     context: *mut c_void,
@@ -332,6 +434,9 @@ impl GpuPrimaryContext {
         min_bytes: usize,
     ) -> Result<PooledBufferLease<'_>, CudaRuntimeProbeError> {
         let capacity = output_buffer_bucket(min_bytes);
+        let tracker = CUDA_ALLOCATION_TRACKER
+            .with(|slot| slot.borrow().as_ref().map(|tracker| tracker.reserve(capacity)))
+            .transpose()?;
         let reused = {
             let mut pool = self
                 .output_buffers
@@ -349,7 +454,12 @@ impl GpuPrimaryContext {
             Some(ptr) => ptr,
             None => {
                 let mut ptr = 0_u64;
-                check_cuda(unsafe { (self.cu_mem_alloc)(&mut ptr, capacity) })?;
+                if let Err(err) = check_cuda(unsafe { (self.cu_mem_alloc)(&mut ptr, capacity) }) {
+                    if let Some(tracker) = &tracker {
+                        tracker.release(capacity);
+                    }
+                    return Err(err);
+                }
                 ptr
             }
         };
@@ -357,6 +467,7 @@ impl GpuPrimaryContext {
             primary: self,
             ptr,
             capacity,
+            tracker,
         })
     }
 
@@ -370,12 +481,13 @@ impl GpuPrimaryContext {
         let lease = self.lease_device_buffer(min_bytes)?;
         // Transfer the leased buffer into the owned guard without round-tripping it through the
         // pool: read its fields, then forget the borrow-scoped lease so its Drop does not release.
-        let (ptr, capacity) = (lease.ptr, lease.capacity);
+        let (ptr, capacity, tracker) = (lease.ptr, lease.capacity, lease.tracker.clone());
         std::mem::forget(lease);
         Ok(PooledDeviceBufferOwned {
             primary: Arc::clone(self),
             ptr,
             capacity,
+            tracker,
         })
     }
 
@@ -681,11 +793,15 @@ struct PooledBufferLease<'a> {
     primary: &'a GpuPrimaryContext,
     ptr: u64,
     capacity: usize,
+    tracker: Option<Arc<CudaAllocationTracker>>,
 }
 
 impl Drop for PooledBufferLease<'_> {
     fn drop(&mut self) {
         self.primary.release_device_buffer(self.ptr, self.capacity);
+        if let Some(tracker) = &self.tracker {
+            tracker.release(self.capacity);
+        }
     }
 }
 
@@ -699,11 +815,15 @@ struct PooledDeviceBufferOwned {
     primary: Arc<GpuPrimaryContext>,
     ptr: u64,
     capacity: usize,
+    tracker: Option<Arc<CudaAllocationTracker>>,
 }
 
 impl Drop for PooledDeviceBufferOwned {
     fn drop(&mut self) {
         self.primary.release_device_buffer(self.ptr, self.capacity);
+        if let Some(tracker) = &self.tracker {
+            tracker.release(self.capacity);
+        }
     }
 }
 
@@ -1067,6 +1187,15 @@ impl CudaResidentDeviceMemory {
 
     pub fn device_ptr(&self) -> u64 {
         self.device_ptr
+    }
+
+    /// Fence work submitted to the default stream before an input allocation is retired or reused.
+    /// Relational run compaction uses this at explicit lifetime boundaries; it transfers no data.
+    pub fn synchronize_default_stream(&self) -> Result<(), CudaRuntimeProbeError> {
+        self.primary.set_current()?;
+        check_cuda(unsafe {
+            (self.primary.cu_stream_synchronize)(std::ptr::null_mut())
+        })
     }
 
     /// R1b: DtoH a contiguous int4 column `[byte_offset, byte_offset + count*4)` from THIS resident
@@ -1579,8 +1708,9 @@ impl CudaResidentDeviceMemory {
     }
 
     /// GPU inner equi-join (M5 J4b) on a TEXT key with a UNIQUE build-side key. `build_texts`/`probe_texts`
-    /// are each relation's join-key bytes (the executor gathers them from host_rows -- the keys crossing to
-    /// host, like the i64 keys do). Builds an open-addressing b128 hash table keyed on a FNV-1a-64 hash of
+    /// are each relation's staged join-key bytes. The engine's resident path derives any such staging from
+    /// the device payload; residency does not retain a decoded host-row mirror. Builds an open-addressing
+    /// b128 hash table keyed on a FNV-1a-64 hash of
     /// the build bytes (lock-free atom.cas.b128 claim) and VERIFIES the full bytes on a hash match, so a
     /// 64-bit hash collision between distinct texts never mis-joins or spuriously reports a duplicate.
     /// Returns the matched `(build_row_idx, probe_row_idx)` pairs (output <= probe_n); `DuplicateBuildKey`
@@ -1747,6 +1877,19 @@ impl CudaResidentDeviceMemory {
         comparison: CudaI32Comparison,
     ) -> Result<u64, CudaRuntimeProbeError> {
         launch_cuda_resident_i32_compare_count(self, byte_offset, row_count, needle, comparison)
+    }
+
+    /// P5 uniqueness-verdict primitive: count candidate coordinates that are not present in the
+    /// UPDATE self-exclusion set and return whether `reject_at` is reached. The host may marshal
+    /// coordinates produced by preceding device predicates, but it does not filter, count, or
+    /// decide the constraint outcome; the only readback is this device-computed status bit.
+    pub fn unique_coordinate_threshold_reached(
+        &self,
+        candidates: &[u64],
+        exclusions: &[u64],
+        reject_at: u32,
+    ) -> Result<bool, CudaRuntimeProbeError> {
+        launch_cuda_unique_coordinate_threshold(self, candidates, exclusions, reject_at)
     }
 
     pub fn count_i32_between_from_payload(
@@ -2494,8 +2637,262 @@ impl CudaResidentDeviceMemory {
         &self,
         shards: &[MultiShardProbeShard],
         needles: &[i32],
+        read_snapshot: u64,
     ) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
-        submit_cuda_resident_i32_multi_shard_index_probe_dense(self, shards, needles)
+        submit_cuda_resident_i32_multi_shard_index_probe_dense(
+            self,
+            shards,
+            needles,
+            read_snapshot,
+        )
+    }
+
+    /// P5-later: probe compact per-chunk Bloom filters on-device and return candidate chunk indexes per needle.
+    /// False positives are resolved by the caller's exact device predicate; false negatives are forbidden.
+    pub fn probe_chunk_blooms(
+        &self,
+        blooms: &[ChunkBloomProbeShard],
+        needles: &[i32],
+    ) -> Result<Vec<Vec<u32>>, CudaRuntimeProbeError> {
+        probe_cuda_chunk_blooms(self, blooms, needles)
+    }
+
+    /// Rank-family columns over an already ordered device-coordinate relation. Source keys are
+    /// dereferenced from their resident payloads and rank triples remain device-resident.
+    pub fn window_ranks_from_join_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        partition: &[CudaJoinOrderKey<'_>],
+        order: &[CudaJoinOrderKey<'_>],
+    ) -> Result<CudaWindowRanksU64, CudaRuntimeProbeError> {
+        launch_cuda_window_ranks_from_join_coordinates(self, coordinates, partition, order)
+    }
+
+    /// Shift each ordered coordinate within its partition for LAG/LEAD. Rows that cross a partition
+    /// boundary become OUTER pads; the selected value is gathered only at final result framing.
+    pub fn shift_join_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        partition: &[CudaJoinOrderKey<'_>],
+        delta: i32,
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        launch_cuda_shift_join_coordinates(self, coordinates, partition, delta)
+    }
+
+    pub fn create_match_bitmap_u32(
+        &self,
+        row_count: u32,
+    ) -> Result<CudaMatchBitmapU32, CudaRuntimeProbeError> {
+        if row_count == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let byte_len = row_count as usize * std::mem::size_of::<u32>();
+        let allocation = launch_cuda_resident_device_memory(
+            self.metadata.gpu_id,
+            &vec![0_u8; byte_len],
+        )?;
+        Ok(CudaMatchBitmapU32 {
+            marks: CudaResidentDeviceMemory {
+                metadata: CudaDeviceMemoryProof {
+                    gpu_id: self.metadata.gpu_id,
+                    device_name: self.metadata.device_name.clone(),
+                    allocated_bytes: byte_len as u64,
+                    copied_bytes: byte_len as u64,
+                    retained: true,
+                },
+                device_ptr: allocation.device_ptr,
+                primary: allocation.primary,
+                last_kernel_event_elapsed_us: Mutex::new(None),
+            },
+            row_count,
+        })
+    }
+
+    /// Extend a device-resident coordinate relation by one fixed-width equi-join input. The first
+    /// step passes `accumulated=None` and `left_row_count`; later steps pass the prior coordinates.
+    /// Eligibility masks are evaluated by the kernel (typically visibility plus an INNER-pushable
+    /// WHERE predicate). OUTER complements and NULL pads are also emitted on-device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_fixed_payload_coordinates(
+        &self,
+        accumulated: Option<&CudaJoinCoordinatesU32>,
+        left_row_count: u32,
+        left_key_relations: &[u32],
+        left_keys: &[CudaJoinPayloadKey<'_>],
+        right_row_count: u32,
+        right_keys: &[CudaJoinPayloadKey<'_>],
+        left_eligibility: Option<&CudaPredicateMaskI32>,
+        right_eligibility: Option<&CudaPredicateMaskI32>,
+        outer_left: bool,
+        outer_right: bool,
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        launch_cuda_join_fixed_payload_coordinates(
+            self,
+            accumulated,
+            left_row_count,
+            left_key_relations,
+            left_keys,
+            right_row_count,
+            right_keys,
+            left_eligibility,
+            right_eligibility,
+            outer_left,
+            outer_right,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_fixed_payload_coordinate_matches(
+        &self,
+        accumulated: Option<&CudaJoinCoordinatesU32>,
+        left_row_count: u32,
+        left_key_relations: &[u32],
+        left_keys: &[CudaJoinPayloadKey<'_>],
+        right_row_count: u32,
+        right_keys: &[CudaJoinPayloadKey<'_>],
+        left_eligibility: Option<&CudaPredicateMaskI32>,
+        right_eligibility: Option<&CudaPredicateMaskI32>,
+        left_matches: &CudaMatchBitmapU32,
+        right_matches: Option<&CudaMatchBitmapU32>,
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        launch_cuda_join_fixed_payload_coordinates(
+            self,
+            accumulated,
+            left_row_count,
+            left_key_relations,
+            left_keys,
+            right_row_count,
+            right_keys,
+            left_eligibility,
+            right_eligibility,
+            false,
+            false,
+            Some(left_matches),
+            right_matches,
+        )
+    }
+
+    /// Apply post-join WHERE masks to a coordinate relation without materializing tuples. For a real
+    /// coordinate the referenced device mask decides SQL-WHERE truth; for an OUTER NULL pad the
+    /// corresponding retained one-row device mask decides without an intermediate host verdict.
+    pub fn filter_join_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        masks: &[Option<&CudaPredicateMaskI32>],
+        pad_masks: &[Option<&CudaPredicateMaskI32>],
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        launch_cuda_filter_join_coordinates(self, coordinates, masks, pad_masks)
+    }
+
+    pub fn identity_join_coordinates(
+        &self,
+        row_count: u32,
+        eligibility: Option<&CudaPredicateMaskI32>,
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        launch_cuda_identity_join_coordinates(self, row_count, eligibility)
+    }
+
+    /// Stable device merge-sort over coordinate rows. Comparators dereference the original resident
+    /// payloads, including NULL placement and varlen text, so no projected key array or row crosses the
+    /// host boundary.
+    pub fn sort_join_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        order: &[CudaJoinOrderKey<'_>],
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        launch_cuda_sort_join_coordinates(self, coordinates, order)
+    }
+
+    pub fn window_join_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        offset: u32,
+        limit: Option<u32>,
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        launch_cuda_window_join_coordinates(self, coordinates, offset, limit)
+    }
+
+    pub fn materialize_join_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        columns: &[CudaMaterializeJoinColumn<'_>],
+    ) -> Result<CudaMaterializedRelation, CudaRuntimeProbeError> {
+        launch_cuda_materialize_join_coordinates(self, coordinates, columns)
+    }
+
+    pub fn concat_materialized_relations(
+        &self,
+        left: &CudaMaterializedRelation,
+        right: &CudaMaterializedRelation,
+    ) -> Result<CudaMaterializedRelation, CudaRuntimeProbeError> {
+        launch_cuda_concat_materialized_relations(self, left, right)
+    }
+
+    /// Final fixed-width projection from retained join coordinates. The relational coordinate and
+    /// NULL decisions remain on-device; returned bytes/validity are the final result materialization.
+    pub fn project_fixed_from_join_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        relation: u32,
+        payload: &CudaResidentDeviceMemory,
+        byte_offset: u64,
+        validity_bitmap_offset: Option<u64>,
+        width: u8,
+    ) -> Result<(Vec<u8>, Vec<bool>), CudaRuntimeProbeError> {
+        launch_cuda_project_fixed_from_join_coordinates(
+            self,
+            coordinates,
+            relation,
+            payload,
+            byte_offset,
+            validity_bitmap_offset,
+            width,
+        )
+    }
+
+    pub fn project_bool_from_join_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        relation: u32,
+        payload: &CudaResidentDeviceMemory,
+        bitmap_byte_offset: u64,
+        validity_bitmap_offset: Option<u64>,
+    ) -> Result<Vec<Option<bool>>, CudaRuntimeProbeError> {
+        launch_cuda_project_bool_from_join_coordinates(
+            self,
+            coordinates,
+            relation,
+            payload,
+            bitmap_byte_offset,
+            validity_bitmap_offset,
+        )
+    }
+
+    /// Final UTF-8 projection from retained join coordinates. Device code resolves pads, NULL
+    /// validity, and source varlen offsets; the host performs only final result-buffer framing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_text_from_join_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        relation: u32,
+        payload: &CudaResidentDeviceMemory,
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        bytes_len: u64,
+        validity_bitmap_offset: Option<u64>,
+    ) -> Result<Vec<Option<String>>, CudaRuntimeProbeError> {
+        launch_cuda_project_text_from_join_coordinates(
+            self,
+            coordinates,
+            relation,
+            payload,
+            offsets_byte_offset,
+            bytes_byte_offset,
+            bytes_len,
+            validity_bitmap_offset,
+        )
     }
 
     pub fn match_i32_equal_row_indices_from_payload(
@@ -2725,6 +3122,36 @@ impl CudaResidentDeviceMemory {
         elem: ResidentElemType,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_resident_expr_predicate_filter(self, program, text_needles, row_count, elem)
+    }
+
+    /// Evaluate the boolean predicate VM but retain its TRUE/FALSE/UNKNOWN mask on the device for a
+    /// following relational operator.  Only launch metadata is returned to the host.
+    pub fn run_expr_predicate_mask_with_text(
+        &self,
+        program: &[ExprStep],
+        text_needles: &[Vec<u8>],
+        row_count: u32,
+        elem: ResidentElemType,
+    ) -> Result<CudaPredicateMaskI32, CudaRuntimeProbeError> {
+        launch_cuda_resident_expr_predicate_mask(self, program, text_needles, row_count, elem)
+    }
+
+    /// A scheduler block range becomes a device mask without uploading an O(block_rows) index vector.
+    pub fn row_range_mask_u32(
+        &self,
+        row_count: u32,
+        start: u32,
+        end: u32,
+    ) -> Result<CudaPredicateMaskI32, CudaRuntimeProbeError> {
+        launch_cuda_row_range_mask_u32(self, row_count, start, end)
+    }
+
+    pub fn and_predicate_masks(
+        &self,
+        left: &CudaPredicateMaskI32,
+        right: &CudaPredicateMaskI32,
+    ) -> Result<CudaPredicateMaskI32, CudaRuntimeProbeError> {
+        launch_cuda_and_predicate_masks(self, left, right)
     }
 
     pub fn project_i32_compare_ordered_from_payload(
@@ -3441,6 +3868,11 @@ pub enum CudaRuntimeProbeError {
     DeviceCountFailed(i32),
     InvalidDeviceCount(i32),
     InvalidInputLength(usize),
+    AllocationBudgetExceeded {
+        requested: u64,
+        live: u64,
+        limit: u64,
+    },
     KernelLaunchFailed(i32),
     /// A comparison code outside the range the called primitive supports (the fused
     /// scalar/buffer compact kernels handle 0=eq..4=ge; `5=ne` is mask-path only).
@@ -3470,6 +3902,14 @@ impl fmt::Display for CudaRuntimeProbeError {
             }
             Self::InvalidDeviceCount(count) => write!(f, "invalid CUDA device count: {count}"),
             Self::InvalidInputLength(len) => write!(f, "invalid CUDA input length: {len}"),
+            Self::AllocationBudgetExceeded {
+                requested,
+                live,
+                limit,
+            } => write!(
+                f,
+                "CUDA allocation budget exceeded: {live} live + {requested} requested > {limit} bytes"
+            ),
             Self::KernelLaunchFailed(code) => write!(f, "CUDA kernel launch failed: {code}"),
             Self::UnsupportedComparison(code) => {
                 write!(f, "unsupported comparison code for this primitive: {code}")
@@ -5980,6 +6420,199 @@ block_done:
     })?;
 
     Ok(u64::from_le_bytes(output_bytes))
+}
+
+/// Device-final uniqueness verdict over packed `(chunk, slot)` coordinates. One thread is
+/// intentional: P5 currently bounds statement batches at 256 rows, and this validation kernel is
+/// an authorization seam rather than a read-throughput operator. The replacement milestone is
+/// the tuple hash/group operator, which will keep the exact survivors resident end-to-end.
+fn launch_cuda_unique_coordinate_threshold(
+    resident: &CudaResidentDeviceMemory,
+    candidates: &[u64],
+    exclusions: &[u64],
+    reject_at: u32,
+) -> Result<bool, CudaRuntimeProbeError> {
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+
+.visible .entry gpu_db_unique_coordinate_threshold(
+    .param .u64 candidates_ptr,
+    .param .u64 candidate_count,
+    .param .u64 exclusions_ptr,
+    .param .u64 exclusion_count,
+    .param .u32 reject_at,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_excluded;
+    .reg .pred %p_equal;
+    .reg .pred %p_reject;
+    .reg .u32 %reject_at;
+    .reg .u32 %accepted;
+    .reg .u64 %candidates;
+    .reg .u64 %candidate_count;
+    .reg .u64 %exclusions;
+    .reg .u64 %exclusion_count;
+    .reg .u64 %out;
+    .reg .u64 %ci;
+    .reg .u64 %ei;
+    .reg .u64 %offset;
+    .reg .u64 %addr;
+    .reg .u64 %candidate;
+    .reg .u64 %excluded_coordinate;
+
+    ld.param.u64 %candidates, [candidates_ptr];
+    ld.param.u64 %candidate_count, [candidate_count];
+    ld.param.u64 %exclusions, [exclusions_ptr];
+    ld.param.u64 %exclusion_count, [exclusion_count];
+    ld.param.u32 %reject_at, [reject_at];
+    ld.param.u64 %out, [out_ptr];
+
+    st.global.u32 [%out], 0;
+    mov.u32 %accepted, 0;
+    mov.u64 %ci, 0;
+
+candidate_loop:
+    setp.ge.u64 %p_done, %ci, %candidate_count;
+    @%p_done bra done;
+    mul.lo.u64 %offset, %ci, 8;
+    add.u64 %addr, %candidates, %offset;
+    ld.global.u64 %candidate, [%addr];
+    mov.pred %p_excluded, 0;
+    mov.u64 %ei, 0;
+
+exclusion_loop:
+    setp.ge.u64 %p_done, %ei, %exclusion_count;
+    @%p_done bra exclusion_done;
+    mul.lo.u64 %offset, %ei, 8;
+    add.u64 %addr, %exclusions, %offset;
+    ld.global.u64 %excluded_coordinate, [%addr];
+    setp.eq.u64 %p_equal, %candidate, %excluded_coordinate;
+    @%p_equal mov.pred %p_excluded, 1;
+    @%p_equal bra exclusion_done;
+    add.u64 %ei, %ei, 1;
+    bra exclusion_loop;
+
+exclusion_done:
+    @%p_excluded bra next_candidate;
+    add.u32 %accepted, %accepted, 1;
+    setp.ge.u32 %p_reject, %accepted, %reject_at;
+    @%p_reject st.global.u32 [%out], 1;
+    @%p_reject bra done;
+
+next_candidate:
+    add.u64 %ci, %ci, 1;
+    bra candidate_loop;
+
+done:
+    ret;
+}
+"#;
+
+    if reject_at == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let candidate_bytes = candidates
+        .len()
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let exclusion_bytes = exclusions
+        .len()
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let candidates_device = primary.lease_device_buffer(candidate_bytes.max(8))?;
+    let exclusions_device = primary.lease_device_buffer(exclusion_bytes.max(8))?;
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    if candidate_bytes > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                candidates_device.ptr,
+                candidates.as_ptr().cast::<c_void>(),
+                candidate_bytes,
+            )
+        })?;
+    }
+    if exclusion_bytes > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                exclusions_device.ptr,
+                exclusions.as_ptr().cast::<c_void>(),
+                exclusion_bytes,
+            )
+        })?;
+    }
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_unique_coordinate_threshold", &ptx)?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut output_bytes = [0_u8; std::mem::size_of::<u32>()];
+    launch_on_pooled_stream(resident, Some(&mut output_bytes), |stream, output_ptr| {
+        let mut candidates_arg = candidates_device.ptr;
+        let mut candidate_count_arg = candidates.len() as u64;
+        let mut exclusions_arg = exclusions_device.ptr;
+        let mut exclusion_count_arg = exclusions.len() as u64;
+        let mut reject_at_arg = reject_at;
+        let mut output_arg = output_ptr;
+        let mut args = [
+            (&mut candidates_arg as *mut u64).cast::<c_void>(),
+            (&mut candidate_count_arg as *mut u64).cast::<c_void>(),
+            (&mut exclusions_arg as *mut u64).cast::<c_void>(),
+            (&mut exclusion_count_arg as *mut u64).cast::<c_void>(),
+            (&mut reject_at_arg as *mut u32).cast::<c_void>(),
+            (&mut output_arg as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                function,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+
+    Ok(u32::from_le_bytes(output_bytes) != 0)
 }
 
 /// Single-thread `(1,1,1)` serial comparison-count — retained ONLY (under `#[cfg(test)]`) as the
@@ -11418,8 +12051,4516 @@ DONE:
     })
 }
 
+/// P5-later: one compact per-chunk Bloom filter. `bit_mask + 1` is a power-of-two bit count.
+pub struct ChunkBloomProbeShard {
+    pub bloom: Arc<CudaResidentDeviceMemory>,
+    pub bit_mask: u32,
+}
+
+/// Bounded device-resident match state for streaming OUTER completion. Pair kernels may produce
+/// duplicate coordinates (N:N); atomic marking collapses them without any host membership verdict.
+pub struct CudaMatchBitmapU32 {
+    marks: CudaResidentDeviceMemory,
+    row_count: u32,
+}
+
+/// One fixed-width equi-join key read directly from a resident payload.  The descriptor is host-side
+/// launch metadata only: key bytes and NULL validity remain in the referenced device allocation.
+/// `width` is 4, 8, or 16 bytes.  Two 4-byte descriptors may be supplied to form a composite key.
+#[derive(Debug, Clone, Copy)]
+pub struct CudaJoinPayloadKey<'a> {
+    pub payload: &'a CudaResidentDeviceMemory,
+    /// Fixed: value-column offset. Text (`width=255`): u64 offsets-column offset.
+    pub byte_offset: u64,
+    pub validity_bitmap_offset: Option<u64>,
+    /// 4/8/16 for fixed values; 255 for a varlen text key.
+    pub width: u8,
+    /// Text bytes-section offset/length; `None/0` for fixed-width keys.
+    pub text_bytes_byte_offset: Option<u64>,
+    pub text_bytes_len: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CudaJoinOrderKey<'a> {
+    pub relation: u32,
+    pub key: CudaJoinPayloadKey<'a>,
+    pub descending: bool,
+    pub nulls_first: bool,
+    /// Width-16 keys are signed i128 by default; UUID uses bytewise canonical ordering.
+    pub lexicographic_16: bool,
+}
+
+/// Device-resident row coordinates produced by a relational join. Coordinates are row-major:
+/// `[tuple0.rel0, tuple0.rel1, ..., tuple1.rel0, ...]`; `u32::MAX` is an OUTER NULL pad.  The type is
+/// deliberately opaque outside this crate so host code cannot turn an intermediate relation into a
+/// semantic loop.  Only bounded scalar cardinalities cross D2H while the pipeline is executing.
+pub struct CudaJoinCoordinatesU32 {
+    coordinates: Option<PooledDeviceBufferOwned>,
+    row_count: u32,
+    relation_count: u32,
+    allocated_bytes: u64,
+}
+
+/// A one-i32-per-row SQL-WHERE mask kept on the device. Zero means FALSE/UNKNOWN; non-zero means
+/// TRUE. This is the non-materializing terminal used by relational pipelines; unlike the legacy
+/// `run_expr_predicate_filter*` API it does not copy survivor indices to the host.
+pub struct CudaPredicateMaskI32 {
+    mask: PooledDeviceBufferOwned,
+    row_count: u32,
+}
+
+pub struct CudaWindowRanksU64 {
+    values: PooledDeviceBufferOwned,
+    row_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaWindowRankKind {
+    RowNumber,
+    Rank,
+    DenseRank,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CudaMaterializeJoinColumn<'a> {
+    Fixed {
+        relation: u32,
+        payload: &'a CudaResidentDeviceMemory,
+        byte_offset: u64,
+        validity_bitmap_offset: Option<u64>,
+        width: u8,
+    },
+    Bool {
+        relation: u32,
+        payload: &'a CudaResidentDeviceMemory,
+        bitmap_byte_offset: u64,
+        validity_bitmap_offset: Option<u64>,
+    },
+    Text {
+        relation: u32,
+        payload: &'a CudaResidentDeviceMemory,
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        bytes_len: u64,
+        validity_bitmap_offset: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaMaterializedColumnKind {
+    Fixed { width: u8 },
+    Text,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CudaMaterializedColumnLayout {
+    pub kind: CudaMaterializedColumnKind,
+    pub value_byte_offset: u64,
+    pub text_bytes_byte_offset: Option<u64>,
+    pub text_bytes_len: u64,
+    pub validity_bitmap_offset: u64,
+}
+
+/// An opaque, self-contained device relation produced by a relational operator. It is safe to retain
+/// after source chunks are evicted because every selected value and validity bit was gathered D2D.
+pub struct CudaMaterializedRelation {
+    memory: CudaResidentDeviceMemory,
+    columns: Vec<CudaMaterializedColumnLayout>,
+    row_count: u32,
+}
+
+impl CudaMaterializedRelation {
+    pub fn memory(&self) -> &CudaResidentDeviceMemory {
+        &self.memory
+    }
+
+    pub fn columns(&self) -> &[CudaMaterializedColumnLayout] {
+        &self.columns
+    }
+
+    pub fn row_count(&self) -> u32 {
+        self.row_count
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        self.memory.metadata.allocated_bytes
+    }
+
+    pub fn payload_key(&self, column: usize) -> Option<CudaJoinPayloadKey<'_>> {
+        let layout = *self.columns.get(column)?;
+        Some(match layout.kind {
+            CudaMaterializedColumnKind::Fixed { width } => CudaJoinPayloadKey {
+                payload: &self.memory,
+                byte_offset: layout.value_byte_offset,
+                validity_bitmap_offset: Some(layout.validity_bitmap_offset),
+                width,
+                text_bytes_byte_offset: None,
+                text_bytes_len: 0,
+            },
+            CudaMaterializedColumnKind::Text => CudaJoinPayloadKey {
+                payload: &self.memory,
+                byte_offset: layout.value_byte_offset,
+                validity_bitmap_offset: Some(layout.validity_bitmap_offset),
+                width: 255,
+                text_bytes_byte_offset: layout.text_bytes_byte_offset,
+                text_bytes_len: layout.text_bytes_len,
+            },
+        })
+    }
+}
+
+impl CudaPredicateMaskI32 {
+    pub fn row_count(&self) -> u32 {
+        self.row_count
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        self.mask.capacity as u64
+    }
+}
+
+impl CudaWindowRanksU64 {
+    pub fn row_count(&self) -> u32 {
+        self.row_count
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        self.values.capacity as u64
+    }
+
+    /// Final result readback for one requested rank-family column.
+    pub fn readback(
+        &self,
+        kind: CudaWindowRankKind,
+        offset: u32,
+        limit: Option<u32>,
+    ) -> Result<Vec<u64>, CudaRuntimeProbeError> {
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        let start = offset.min(self.row_count);
+        let count = limit
+            .map_or(self.row_count - start, |limit| limit.min(self.row_count - start));
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        self.values.primary.set_current()?;
+        let dtoh = unsafe {
+            self.values
+                .primary
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| self.values.primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        // Triples are interleaved, so gather the requested lane on-device before the one final D2H.
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+            *mut *mut c_void, *mut *mut c_void,
+        ) -> i32;
+        const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_gather_rank_lane(
+    .param .u64 src, .param .u32 start, .param .u32 count,
+    .param .u32 lane, .param .u64 dst)
+{
+    .reg .pred %p;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<16>;
+    ld.param.u64 %rd1, [src];
+    ld.param.u32 %r1, [start];
+    ld.param.u32 %r2, [count];
+    ld.param.u32 %r3, [lane];
+    ld.param.u64 %rd2, [dst];
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %nctaid.x;
+    mad.lo.u32 %r8, %r5, %r6, %r4;
+    mul.lo.u32 %r9, %r7, %r6;
+LOOP:
+    setp.ge.u32 %p, %r8, %r2;
+    @%p bra DONE;
+    add.u32 %r10, %r8, %r1;
+    mul.lo.u32 %r10, %r10, 3;
+    add.u32 %r10, %r10, %r3;
+    mul.wide.u32 %rd3, %r10, 8;
+    mul.wide.u32 %rd4, %r8, 8;
+    add.u64 %rd5, %rd1, %rd3;
+    add.u64 %rd6, %rd2, %rd4;
+    ld.global.u64 %rd7, [%rd5];
+    st.global.u64 [%rd6], %rd7;
+    add.u32 %r8, %r8, %r9;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+        let output = self
+            .values
+            .primary
+            .lease_device_buffer_owned(count as usize * 8)?;
+        let launch = unsafe {
+            self.values
+                .primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let mut ptx = PTX.to_vec();
+        ptx.push(0);
+        let function = self
+            .values
+            .primary
+            .cached_function(c"gpu_db_gather_rank_lane", &ptx)?;
+        let mut a0 = self.values.ptr;
+        let mut a1 = start;
+        let mut a2 = count;
+        let mut a3 = match kind {
+            CudaWindowRankKind::RowNumber => 0_u32,
+            CudaWindowRankKind::Rank => 1,
+            CudaWindowRankKind::DenseRank => 2,
+        };
+        let mut a4 = output.ptr;
+        let mut args = [
+            (&mut a0 as *mut u64).cast(),
+            (&mut a1 as *mut u32).cast(),
+            (&mut a2 as *mut u32).cast(),
+            (&mut a3 as *mut u32).cast(),
+            (&mut a4 as *mut u64).cast(),
+        ];
+        check_cuda(unsafe {
+            launch(function, count.div_ceil(256).clamp(1, 65_535), 1, 1, 256, 1, 1, 0,
+                std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut())
+        })?;
+        let mut result = vec![0_u64; count as usize];
+        check_cuda(unsafe { dtoh(result.as_mut_ptr().cast(), output.ptr, result.len() * 8) })?;
+        Ok(result)
+    }
+}
+
+impl CudaJoinCoordinatesU32 {
+    pub fn row_count(&self) -> u32 {
+        self.row_count
+    }
+
+    pub fn relation_count(&self) -> u32 {
+        self.relation_count
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    #[cfg(test)]
+    fn readback_for_test(&self) -> Result<Vec<Vec<u32>>, CudaRuntimeProbeError> {
+        if self.row_count == 0 {
+            return Ok(Vec::new());
+        }
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        let buffer = self
+            .coordinates
+            .as_ref()
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+        buffer.primary.set_current()?;
+        let dtoh = unsafe {
+            buffer
+                .primary
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| buffer.primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let len = self.row_count as usize * self.relation_count as usize;
+        let mut flat = vec![0_u32; len];
+        check_cuda(unsafe { dtoh(flat.as_mut_ptr().cast(), buffer.ptr, len * 4) })?;
+        Ok(flat
+            .chunks_exact(self.relation_count as usize)
+            .map(<[u32]>::to_vec)
+            .collect())
+    }
+}
+
+impl CudaMatchBitmapU32 {
+    /// Mark one coordinate column from a retained device relation. Pads are skipped. No coordinate
+    /// vector crosses D2H/H2D, and N:N duplicates collapse through the same atomic bitmap update.
+    pub fn mark_coordinates(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        relation: u32,
+    ) -> Result<(), CudaRuntimeProbeError> {
+        launch_cuda_mark_coordinate_column_u32(&self.marks, self.row_count, coordinates, relation)
+    }
+
+    /// Compact this bitmap's complement directly into a padded coordinate relation. `real_relation`
+    /// receives the unmatched row index; every other relation receives the OUTER NULL sentinel.
+    pub fn unmatched_coordinates(
+        &self,
+        relation_count: u32,
+        real_relation: u32,
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        launch_cuda_unmatched_coordinate_relation(
+            &self.marks,
+            self.row_count,
+            relation_count,
+            real_relation,
+        )
+    }
+
+    /// Extend each unmatched accumulated tuple with one OUTER pad. The accumulated coordinates are
+    /// copied D2D; only the compacted cardinality scalar crosses to the scheduler.
+    pub fn unmatched_extended_coordinates(
+        &self,
+        accumulated: &CudaJoinCoordinatesU32,
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        launch_cuda_unmatched_extended_coordinates(&self.marks, self.row_count, accumulated)
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        self.marks.metadata().allocated_bytes
+    }
+}
+
+fn launch_cuda_window_ranks_from_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    coordinates: &CudaJoinCoordinatesU32,
+    partition: &[CudaJoinOrderKey<'_>],
+    order: &[CudaJoinOrderKey<'_>],
+) -> Result<CudaWindowRanksU64, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+.visible .entry gpu_db_window_rank_boundaries(
+    .param .u64 coords, .param .u32 rows, .param .u32 rels,
+    .param .u64 part_desc, .param .u32 part_n,
+    .param .u64 order_desc, .param .u32 order_n, .param .u64 out)
+{
+    .reg .pred %p<32>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<112>;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r26, %nctaid.x;
+    mad.lo.u32 %r8, %r2, %r3, %r1;
+    mul.lo.u32 %r27, %r26, %r3;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r4, [rows];
+    ld.param.u32 %r5, [rels];
+    ld.param.u64 %rd2, [part_desc];
+    ld.param.u32 %r6, [part_n];
+    ld.param.u64 %rd3, [order_desc];
+    ld.param.u32 %r7, [order_n];
+    ld.param.u64 %rd4, [out];
+ROW_LOOP:
+    setp.ge.u32 %p2, %r8, %r4;
+    @%p2 bra DONE;
+    setp.eq.u32 %p3, %r8, 0;
+    @%p3 bra NEW_PART;
+    sub.u32 %r9, %r8, 1;
+    mov.u32 %r10, 0;
+    mov.u64 %rd8, %rd2;
+    mov.u32 %r11, %r6;
+COMPARE_PART:
+    setp.ge.u32 %p4, %r10, %r11;
+    @%p4 bra SAME_PART;
+    bra COMPARE_KEY;
+SAME_PART:
+    mov.u32 %r10, 0;
+    mov.u64 %rd8, %rd3;
+    mov.u32 %r11, %r7;
+COMPARE_ORDER:
+    setp.ge.u32 %p4, %r10, %r11;
+    @%p4 bra SAME_PEER;
+COMPARE_KEY:
+    mul.wide.u32 %rd9, %r10, 72;
+    add.u64 %rd10, %rd8, %rd9;
+    ld.global.u64 %rd11, [%rd10];
+    ld.global.u64 %rd12, [%rd10+8];
+    ld.global.u64 %rd13, [%rd10+16];
+    ld.global.u64 %rd14, [%rd10+24];
+    ld.global.u64 %rd15, [%rd10+32];
+    ld.global.u64 %rd16, [%rd10+40];
+    cvt.u32.u64 %r12, %rd16;
+    mul.lo.u32 %r13, %r8, %r5;
+    add.u32 %r13, %r13, %r12;
+    mul.lo.u32 %r14, %r9, %r5;
+    add.u32 %r14, %r14, %r12;
+    mul.wide.u32 %rd17, %r13, 4;
+    mul.wide.u32 %rd18, %r14, 4;
+    add.u64 %rd19, %rd1, %rd17;
+    add.u64 %rd20, %rd1, %rd18;
+    ld.global.u32 %r15, [%rd19];
+    ld.global.u32 %r16, [%rd20];
+    setp.ne.u32 %p5, %r15, 4294967295;
+    selp.u32 %r17, 1, 0, %p5;
+    setp.ne.u32 %p6, %r16, 4294967295;
+    selp.u32 %r18, 1, 0, %p6;
+    mov.u64 %rd21, 18446744073709551615;
+    setp.eq.u64 %p7, %rd13, %rd21;
+    @%p7 bra VALID_READY;
+    setp.eq.u32 %p8, %r17, 0;
+    @%p8 bra CUR_VALID_DONE;
+    shr.u32 %r19, %r15, 5;
+    mul.wide.u32 %rd22, %r19, 4;
+    add.u64 %rd23, %rd13, %rd22;
+    ld.global.u32 %r20, [%rd23];
+    and.b32 %r19, %r15, 31;
+    shr.u32 %r20, %r20, %r19;
+    and.b32 %r17, %r20, 1;
+CUR_VALID_DONE:
+    setp.eq.u32 %p9, %r18, 0;
+    @%p9 bra VALID_READY;
+    shr.u32 %r19, %r16, 5;
+    mul.wide.u32 %rd22, %r19, 4;
+    add.u64 %rd23, %rd13, %rd22;
+    ld.global.u32 %r20, [%rd23];
+    and.b32 %r19, %r16, 31;
+    shr.u32 %r20, %r20, %r19;
+    and.b32 %r18, %r20, 1;
+VALID_READY:
+    setp.ne.u32 %p10, %r17, %r18;
+    @%p10 bra KEY_DIFFERENT;
+    setp.eq.u32 %p11, %r17, 0;
+    @%p11 bra KEY_EQUAL;
+    cvt.u32.u64 %r21, %rd14;
+    setp.eq.u32 %p12, %r21, 255;
+    @%p12 bra TEXT_EQUALITY;
+    mul.wide.u32 %rd24, %r15, %r21;
+    mul.wide.u32 %rd25, %r16, %r21;
+    add.u64 %rd26, %rd11, %rd12;
+    add.u64 %rd27, %rd26, %rd24;
+    add.u64 %rd28, %rd26, %rd25;
+    setp.eq.u32 %p13, %r21, 4;
+    @%p13 bra EQ4;
+    ld.global.u32 %r30,[%rd27]; ld.global.u32 %r31,[%rd27+4];
+    cvt.u64.u32 %rd29,%r31; shl.b64 %rd29,%rd29,32; cvt.u64.u32 %rd47,%r30; or.b64 %rd29,%rd29,%rd47;
+    ld.global.u32 %r32,[%rd28]; ld.global.u32 %r33,[%rd28+4];
+    cvt.u64.u32 %rd30,%r33; shl.b64 %rd30,%rd30,32; cvt.u64.u32 %rd47,%r32; or.b64 %rd30,%rd30,%rd47;
+    setp.ne.u64 %p14, %rd29, %rd30;
+    @%p14 bra KEY_DIFFERENT;
+    setp.eq.u32 %p15, %r21, 16;
+    @!%p15 bra KEY_EQUAL;
+    ld.global.u32 %r30,[%rd27+8]; ld.global.u32 %r31,[%rd27+12];
+    cvt.u64.u32 %rd29,%r31; shl.b64 %rd29,%rd29,32; cvt.u64.u32 %rd47,%r30; or.b64 %rd29,%rd29,%rd47;
+    ld.global.u32 %r32,[%rd28+8]; ld.global.u32 %r33,[%rd28+12];
+    cvt.u64.u32 %rd30,%r33; shl.b64 %rd30,%rd30,32; cvt.u64.u32 %rd47,%r32; or.b64 %rd30,%rd30,%rd47;
+    setp.ne.u64 %p14, %rd29, %rd30;
+    @%p14 bra KEY_DIFFERENT;
+    bra KEY_EQUAL;
+EQ4:
+    ld.global.u32 %r22, [%rd27];
+    ld.global.u32 %r23, [%rd28];
+    setp.ne.u32 %p14, %r22, %r23;
+    @%p14 bra KEY_DIFFERENT;
+    bra KEY_EQUAL;
+TEXT_EQUALITY:
+    mul.wide.u32 %rd31, %r15, 8;
+    mul.wide.u32 %rd32, %r16, 8;
+    add.u64 %rd33, %rd11, %rd12;
+    add.u64 %rd34, %rd33, %rd31;
+    add.u64 %rd35, %rd33, %rd32;
+    ld.global.u64 %rd36, [%rd34];
+    ld.global.u64 %rd37, [%rd34+8];
+    ld.global.u64 %rd38, [%rd35];
+    ld.global.u64 %rd39, [%rd35+8];
+    sub.u64 %rd40, %rd37, %rd36;
+    sub.u64 %rd41, %rd39, %rd38;
+    setp.ne.u64 %p16, %rd40, %rd41;
+    @%p16 bra KEY_DIFFERENT;
+    add.u64 %rd42, %rd11, %rd15;
+    add.u64 %rd42, %rd42, %rd36;
+    add.u64 %rd43, %rd11, %rd15;
+    add.u64 %rd43, %rd43, %rd38;
+    mov.u64 %rd44, 0;
+TEXT_EQ_LOOP:
+    setp.ge.u64 %p17, %rd44, %rd40;
+    @%p17 bra KEY_EQUAL;
+    add.u64 %rd45, %rd42, %rd44;
+    add.u64 %rd46, %rd43, %rd44;
+    ld.global.u8 %r24, [%rd45];
+    ld.global.u8 %r25, [%rd46];
+    setp.ne.u32 %p18, %r24, %r25;
+    @%p18 bra KEY_DIFFERENT;
+    add.u64 %rd44, %rd44, 1;
+    bra TEXT_EQ_LOOP;
+KEY_EQUAL:
+    add.u32 %r10, %r10, 1;
+    setp.eq.u64 %p19, %rd8, %rd2;
+    @%p19 bra COMPARE_PART;
+    bra COMPARE_ORDER;
+KEY_DIFFERENT:
+    setp.eq.u64 %p20, %rd8, %rd2;
+    @%p20 bra NEW_PART;
+    bra NEW_PEER;
+SAME_PEER:
+    mov.u64 %rd5, 0;
+    mov.u64 %rd6, 0;
+    mov.u64 %rd7, 0;
+    bra WRITE;
+NEW_PART:
+    mov.u64 %rd5, 1;
+    cvt.u64.u32 %rd6, %r8;
+    mov.u64 %rd7, %rd6;
+    bra WRITE;
+NEW_PEER:
+    mov.u64 %rd5, 1;
+    mov.u64 %rd6, 0;
+    cvt.u64.u32 %rd7, %r8;
+WRITE:
+    mul.wide.u32 %rd47, %r8, 24;
+    add.u64 %rd48, %rd4, %rd47;
+    st.global.u64 [%rd48], %rd5;
+    st.global.u64 [%rd48+8], %rd6;
+    st.global.u64 [%rd48+16], %rd7;
+    add.u32 %r8, %r8, %r27;
+    bra ROW_LOOP;
+DONE:
+    ret;
+}
+
+// Hillis-Steele passes compute, in parallel, the inclusive peer-boundary count and the latest
+// partition/peer boundary row. Ping-pong buffers make every pass race-free.
+.visible .entry gpu_db_window_rank_scan(
+    .param .u64 src, .param .u64 dst, .param .u32 rows, .param .u32 stride)
+{
+    .reg .pred %p<4>; .reg .b32 %r<12>; .reg .b64 %rd<24>;
+    ld.param.u64 %rd1,[src]; ld.param.u64 %rd2,[dst];
+    ld.param.u32 %r1,[rows]; ld.param.u32 %r2,[stride];
+    mov.u32 %r3,%tid.x; mov.u32 %r4,%ctaid.x; mov.u32 %r5,%ntid.x;
+    mov.u32 %r6,%nctaid.x; mad.lo.u32 %r7,%r4,%r5,%r3; mul.lo.u32 %r8,%r6,%r5;
+SCAN_ROW:
+    setp.ge.u32 %p1,%r7,%r1; @%p1 bra SCAN_DONE;
+    mul.wide.u32 %rd3,%r7,24; add.u64 %rd4,%rd1,%rd3;
+    ld.global.u64 %rd5,[%rd4]; ld.global.u64 %rd6,[%rd4+8]; ld.global.u64 %rd7,[%rd4+16];
+    setp.lt.u32 %p2,%r7,%r2; @%p2 bra SCAN_STORE;
+    sub.u32 %r9,%r7,%r2; mul.wide.u32 %rd8,%r9,24; add.u64 %rd9,%rd1,%rd8;
+    ld.global.u64 %rd10,[%rd9]; ld.global.u64 %rd11,[%rd9+8]; ld.global.u64 %rd12,[%rd9+16];
+    add.u64 %rd5,%rd5,%rd10; max.u64 %rd6,%rd6,%rd11; max.u64 %rd7,%rd7,%rd12;
+SCAN_STORE:
+    add.u64 %rd13,%rd2,%rd3; st.global.u64 [%rd13],%rd5;
+    st.global.u64 [%rd13+8],%rd6; st.global.u64 [%rd13+16],%rd7;
+    add.u32 %r7,%r7,%r8; bra SCAN_ROW;
+SCAN_DONE: ret;
+}
+
+.visible .entry gpu_db_window_rank_finalize(
+    .param .u64 src, .param .u64 dst, .param .u32 rows)
+{
+    .reg .pred %p; .reg .b32 %r<12>; .reg .b64 %rd<28>;
+    ld.param.u64 %rd1,[src]; ld.param.u64 %rd2,[dst]; ld.param.u32 %r1,[rows];
+    mov.u32 %r2,%tid.x; mov.u32 %r3,%ctaid.x; mov.u32 %r4,%ntid.x;
+    mov.u32 %r5,%nctaid.x; mad.lo.u32 %r6,%r3,%r4,%r2; mul.lo.u32 %r7,%r5,%r4;
+FINAL_ROW:
+    setp.ge.u32 %p,%r6,%r1; @%p bra FINAL_DONE;
+    mul.wide.u32 %rd3,%r6,24; add.u64 %rd4,%rd1,%rd3;
+    ld.global.u64 %rd5,[%rd4]; ld.global.u64 %rd6,[%rd4+8]; ld.global.u64 %rd7,[%rd4+16];
+    mul.lo.u64 %rd8,%rd6,24; add.u64 %rd9,%rd1,%rd8; ld.global.u64 %rd10,[%rd9];
+    cvt.u64.u32 %rd11,%r6; sub.u64 %rd12,%rd11,%rd6; add.u64 %rd12,%rd12,1;
+    sub.u64 %rd13,%rd7,%rd6; add.u64 %rd13,%rd13,1;
+    sub.u64 %rd14,%rd5,%rd10; add.u64 %rd14,%rd14,1;
+    add.u64 %rd15,%rd2,%rd3; st.global.u64 [%rd15],%rd12;
+    st.global.u64 [%rd15+8],%rd13; st.global.u64 [%rd15+16],%rd14;
+    add.u32 %r6,%r6,%r7; bra FINAL_ROW;
+FINAL_DONE: ret;
+}
+"#;
+    if partition.iter().chain(order).any(|key| {
+        key.relation >= coordinates.relation_count
+            || key.key.payload.metadata.gpu_id != ctx.metadata.gpu_id
+    }) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(coordinates.row_count as usize));
+    }
+    let primary = ctx.primary_arc();
+    let bytes = (coordinates.row_count as usize).saturating_mul(24).max(1);
+    let mut output = Some(primary.lease_device_buffer_owned(bytes)?);
+    if coordinates.row_count == 0 {
+        return Ok(CudaWindowRanksU64 {
+            values: output.take().expect("rank output"),
+            row_count: 0,
+        });
+    }
+    let source = coordinates.coordinates.as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let pack = |keys: &[CudaJoinOrderKey<'_>]| {
+        keys.iter()
+            .flat_map(|item| {
+                [
+                    item.key.payload.device_ptr,
+                    item.key.byte_offset,
+                    item.key.validity_bitmap_offset
+                        .map_or(u64::MAX, |off| item.key.payload.device_ptr + off),
+                    u64::from(item.key.width),
+                    item.key.text_bytes_byte_offset.unwrap_or(0),
+                    u64::from(item.relation),
+                    0,
+                    0,
+                    0,
+                ]
+            })
+            .collect::<Vec<_>>()
+    };
+    let part_host = pack(partition);
+    let order_host = pack(order);
+    let part_dev = primary.lease_device_buffer_owned(std::mem::size_of_val(part_host.as_slice()).max(1))?;
+    let order_dev = primary.lease_device_buffer_owned(std::mem::size_of_val(order_host.as_slice()).max(1))?;
+    primary.set_current()?;
+    let htod = unsafe {
+        primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    if !part_host.is_empty() {
+        check_cuda(unsafe { htod(part_dev.ptr, part_host.as_ptr().cast(), std::mem::size_of_val(part_host.as_slice())) })?;
+    }
+    if !order_host.is_empty() {
+        check_cuda(unsafe { htod(order_dev.ptr, order_host.as_ptr().cast(), std::mem::size_of_val(order_host.as_slice())) })?;
+    }
+    let launch = unsafe {
+        primary.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let boundary_fn = primary.cached_function(c"gpu_db_window_rank_boundaries", &ptx)?;
+    let scan_fn = primary.cached_function(c"gpu_db_window_rank_scan", &ptx)?;
+    let finalize_fn = primary.cached_function(c"gpu_db_window_rank_finalize", &ptx)?;
+    let mut scratch = Some(primary.lease_device_buffer_owned(bytes)?);
+    let mut a0 = source.ptr;
+    let mut a1 = coordinates.row_count;
+    let mut a2 = coordinates.relation_count;
+    let mut a3 = part_dev.ptr;
+    let mut a4 = partition.len() as u32;
+    let mut a5 = order_dev.ptr;
+    let mut a6 = order.len() as u32;
+    let mut a7 = output.as_ref().expect("rank output").ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast(),
+        (&mut a1 as *mut u32).cast(),
+        (&mut a2 as *mut u32).cast(),
+        (&mut a3 as *mut u64).cast(),
+        (&mut a4 as *mut u32).cast(),
+        (&mut a5 as *mut u64).cast(),
+        (&mut a6 as *mut u32).cast(),
+        (&mut a7 as *mut u64).cast(),
+    ];
+    check_cuda(unsafe {
+        launch(boundary_fn, coordinates.row_count.div_ceil(256).clamp(1, 65_535), 1, 1, 256, 1, 1, 0,
+            std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut())
+    })?;
+    let mut src_ptr = output.as_ref().expect("rank output").ptr;
+    let mut dst_ptr = scratch.as_ref().expect("rank scratch").ptr;
+    let mut stride = 1_u32;
+    while stride < coordinates.row_count {
+        let mut s0 = src_ptr;
+        let mut s1 = dst_ptr;
+        let mut s2 = coordinates.row_count;
+        let mut s3 = stride;
+        let mut scan_args = [
+            (&mut s0 as *mut u64).cast(),
+            (&mut s1 as *mut u64).cast(),
+            (&mut s2 as *mut u32).cast(),
+            (&mut s3 as *mut u32).cast(),
+        ];
+        check_cuda(unsafe {
+            launch(scan_fn, coordinates.row_count.div_ceil(256).clamp(1, 65_535), 1, 1, 256, 1, 1, 0,
+                std::ptr::null_mut(), scan_args.as_mut_ptr(), std::ptr::null_mut())
+        })?;
+        std::mem::swap(&mut src_ptr, &mut dst_ptr);
+        stride = stride.saturating_mul(2);
+    }
+    // Finalize into the buffer not holding the scan. It reads the partition-start peer prefix from
+    // the stable scan buffer, so this must remain a distinct allocation for the whole launch.
+    let mut f0 = src_ptr;
+    let mut f1 = dst_ptr;
+    let mut f2 = coordinates.row_count;
+    let mut finalize_args = [
+        (&mut f0 as *mut u64).cast(),
+        (&mut f1 as *mut u64).cast(),
+        (&mut f2 as *mut u32).cast(),
+    ];
+    check_cuda(unsafe {
+        launch(finalize_fn, coordinates.row_count.div_ceil(256).clamp(1, 65_535), 1, 1, 256, 1, 1, 0,
+            std::ptr::null_mut(), finalize_args.as_mut_ptr(), std::ptr::null_mut())
+    })?;
+    ctx.synchronize_default_stream()?;
+    let values = if dst_ptr == output.as_ref().expect("rank output").ptr {
+        output.take().expect("rank output")
+    } else {
+        scratch.take().expect("rank scratch")
+    };
+    Ok(CudaWindowRanksU64 {
+        values,
+        row_count: coordinates.row_count,
+    })
+}
+
+fn launch_cuda_shift_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    coordinates: &CudaJoinCoordinatesU32,
+    partition: &[CudaJoinOrderKey<'_>],
+    delta: i32,
+) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+.visible .entry gpu_db_shift_join_coordinates(
+    .param .u64 coords, .param .u32 rows, .param .u32 rels,
+    .param .u64 part_desc, .param .u32 part_n, .param .s32 delta, .param .u64 out)
+{
+    .reg .pred %p<24>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<64>;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [rels];
+    ld.param.u64 %rd2, [part_desc];
+    ld.param.u32 %r3, [part_n];
+    ld.param.s32 %r4, [delta];
+    ld.param.u64 %rd3, [out];
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mov.u32 %r8, %nctaid.x;
+    mad.lo.u32 %r9, %r6, %r7, %r5;
+    mul.lo.u32 %r10, %r8, %r7;
+ROW_LOOP:
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra DONE;
+    cvt.s64.s32 %rd4, %r4;
+    cvt.u64.u32 %rd5, %r9;
+    cvt.s64.u64 %rd6, %rd5;
+    add.s64 %rd7, %rd6, %rd4;
+    setp.lt.s64 %p2, %rd7, 0;
+    @%p2 bra WRITE_PAD;
+    cvt.u64.s64 %rd8, %rd7;
+    cvt.u64.u32 %rd9, %r1;
+    setp.ge.u64 %p3, %rd8, %rd9;
+    @%p3 bra WRITE_PAD;
+    mov.u32 %r11, 0;
+PART_LOOP:
+    setp.ge.u32 %p4, %r11, %r3;
+    @%p4 bra COPY_CANDIDATE;
+    mul.wide.u32 %rd10, %r11, 48;
+    add.u64 %rd11, %rd2, %rd10;
+    ld.global.u64 %rd12, [%rd11];
+    ld.global.u64 %rd13, [%rd11+8];
+    ld.global.u64 %rd14, [%rd11+16];
+    ld.global.u64 %rd15, [%rd11+24];
+    ld.global.u64 %rd16, [%rd11+32];
+    ld.global.u64 %rd33, [%rd11+40];
+    cvt.u32.u64 %r12, %rd33;
+    mul.lo.u32 %r13, %r9, %r2;
+    add.u32 %r13, %r13, %r12;
+    cvt.u32.u64 %r14, %rd8;
+    mul.lo.u32 %r15, %r14, %r2;
+    add.u32 %r15, %r15, %r12;
+    mul.wide.u32 %rd17, %r13, 4;
+    mul.wide.u32 %rd18, %r15, 4;
+    add.u64 %rd19, %rd1, %rd17;
+    add.u64 %rd20, %rd1, %rd18;
+    ld.global.u32 %r16, [%rd19];
+    ld.global.u32 %r17, [%rd20];
+    setp.eq.u32 %p5, %r16, 4294967295;
+    @%p5 bra WRITE_PAD;
+    setp.eq.u32 %p5, %r17, 4294967295;
+    @%p5 bra WRITE_PAD;
+    mov.u32 %r18, 1;
+    mov.u32 %r19, 1;
+    mov.u64 %rd21, 18446744073709551615;
+    setp.eq.u64 %p6, %rd14, %rd21;
+    @%p6 bra VALID_READY;
+    shr.u32 %r20, %r16, 5;
+    mul.wide.u32 %rd22, %r20, 4;
+    add.u64 %rd23, %rd14, %rd22;
+    ld.global.u32 %r21, [%rd23];
+    and.b32 %r20, %r16, 31;
+    shr.u32 %r21, %r21, %r20;
+    and.b32 %r18, %r21, 1;
+    shr.u32 %r20, %r17, 5;
+    mul.wide.u32 %rd22, %r20, 4;
+    add.u64 %rd23, %rd14, %rd22;
+    ld.global.u32 %r21, [%rd23];
+    and.b32 %r20, %r17, 31;
+    shr.u32 %r21, %r21, %r20;
+    and.b32 %r19, %r21, 1;
+VALID_READY:
+    setp.ne.u32 %p7, %r18, %r19;
+    @%p7 bra WRITE_PAD;
+    setp.eq.u32 %p8, %r18, 0;
+    @%p8 bra PART_NEXT;
+    add.u64 %rd24, %rd12, %rd13;
+    cvt.u32.u64 %r22, %rd15;
+    setp.eq.u32 %p9, %r22, 255;
+    @%p9 bra CMP_TEXT;
+    mul.wide.u32 %rd25, %r16, %r22;
+    mul.wide.u32 %rd26, %r17, %r22;
+    add.u64 %rd25, %rd24, %rd25;
+    add.u64 %rd26, %rd24, %rd26;
+    setp.eq.u32 %p9, %r22, 4;
+    @%p9 bra CMP4;
+    ld.global.u32 %r30,[%rd25]; ld.global.u32 %r31,[%rd25+4];
+    cvt.u64.u32 %rd27,%r31; shl.b64 %rd27,%rd27,32; cvt.u64.u32 %rd44,%r30; or.b64 %rd27,%rd27,%rd44;
+    ld.global.u32 %r32,[%rd26]; ld.global.u32 %r33,[%rd26+4];
+    cvt.u64.u32 %rd28,%r33; shl.b64 %rd28,%rd28,32; cvt.u64.u32 %rd44,%r32; or.b64 %rd28,%rd28,%rd44;
+    setp.ne.u64 %p10, %rd27, %rd28;
+    @%p10 bra WRITE_PAD;
+    setp.ne.u32 %p11, %r22, 16;
+    @%p11 bra PART_NEXT;
+    ld.global.u32 %r30,[%rd25+8]; ld.global.u32 %r31,[%rd25+12];
+    cvt.u64.u32 %rd27,%r31; shl.b64 %rd27,%rd27,32; cvt.u64.u32 %rd44,%r30; or.b64 %rd27,%rd27,%rd44;
+    ld.global.u32 %r32,[%rd26+8]; ld.global.u32 %r33,[%rd26+12];
+    cvt.u64.u32 %rd28,%r33; shl.b64 %rd28,%rd28,32; cvt.u64.u32 %rd44,%r32; or.b64 %rd28,%rd28,%rd44;
+    setp.ne.u64 %p10, %rd27, %rd28;
+    @%p10 bra WRITE_PAD;
+    bra PART_NEXT;
+CMP_TEXT:
+    mul.wide.u32 %rd25,%r16,8; mul.wide.u32 %rd26,%r17,8;
+    add.u64 %rd25,%rd24,%rd25; add.u64 %rd26,%rd24,%rd26;
+    ld.global.u64 %rd27,[%rd25]; ld.global.u64 %rd28,[%rd25+8];
+    ld.global.u64 %rd34,[%rd26]; ld.global.u64 %rd35,[%rd26+8];
+    sub.u64 %rd36,%rd28,%rd27; sub.u64 %rd37,%rd35,%rd34;
+    setp.ne.u64 %p10,%rd36,%rd37; @%p10 bra WRITE_PAD;
+    add.u64 %rd38,%rd12,%rd16; add.u64 %rd39,%rd38,%rd27; add.u64 %rd40,%rd38,%rd34;
+    mov.u64 %rd41,0;
+CMP_TEXT_LOOP:
+    setp.ge.u64 %p14,%rd41,%rd36; @%p14 bra PART_NEXT;
+    add.u64 %rd42,%rd39,%rd41; add.u64 %rd43,%rd40,%rd41;
+    ld.global.u8 %r30,[%rd42]; ld.global.u8 %r31,[%rd43];
+    setp.ne.u32 %p10,%r30,%r31; @%p10 bra WRITE_PAD;
+    add.u64 %rd41,%rd41,1; bra CMP_TEXT_LOOP;
+CMP4:
+    ld.global.u32 %r23, [%rd25];
+    ld.global.u32 %r24, [%rd26];
+    setp.ne.u32 %p10, %r23, %r24;
+    @%p10 bra WRITE_PAD;
+PART_NEXT:
+    add.u32 %r11, %r11, 1;
+    bra PART_LOOP;
+COPY_CANDIDATE:
+    mov.u32 %r25, 0;
+COPY_LOOP:
+    setp.ge.u32 %p12, %r25, %r2;
+    @%p12 bra NEXT_ROW;
+    cvt.u32.u64 %r26, %rd8;
+    mul.lo.u32 %r27, %r26, %r2;
+    add.u32 %r27, %r27, %r25;
+    mul.lo.u32 %r28, %r9, %r2;
+    add.u32 %r28, %r28, %r25;
+    mul.wide.u32 %rd29, %r27, 4;
+    mul.wide.u32 %rd30, %r28, 4;
+    add.u64 %rd31, %rd1, %rd29;
+    add.u64 %rd32, %rd3, %rd30;
+    ld.global.u32 %r29, [%rd31];
+    st.global.u32 [%rd32], %r29;
+    add.u32 %r25, %r25, 1;
+    bra COPY_LOOP;
+WRITE_PAD:
+    mov.u32 %r25, 0;
+PAD_LOOP:
+    setp.ge.u32 %p13, %r25, %r2;
+    @%p13 bra NEXT_ROW;
+    mul.lo.u32 %r28, %r9, %r2;
+    add.u32 %r28, %r28, %r25;
+    mul.wide.u32 %rd30, %r28, 4;
+    add.u64 %rd32, %rd3, %rd30;
+    mov.u32 %r29, 4294967295;
+    st.global.u32 [%rd32], %r29;
+    add.u32 %r25, %r25, 1;
+    bra PAD_LOOP;
+NEXT_ROW:
+    add.u32 %r9, %r9, %r10;
+    bra ROW_LOOP;
+DONE:
+    ret;
+}
+"#;
+    if coordinates.row_count == 0 {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: coordinates.relation_count,
+            allocated_bytes: 0,
+        });
+    }
+    if partition.iter().any(|key| {
+        key.relation >= coordinates.relation_count
+            || !matches!(key.key.width, 4 | 8 | 16 | 255)
+            || (key.key.width == 255 && key.key.text_bytes_byte_offset.is_none())
+            || key.key.payload.metadata.gpu_id != ctx.metadata.gpu_id
+    }) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(partition.len()));
+    }
+    let source = coordinates
+        .coordinates
+        .as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let descriptors = partition
+        .iter()
+        .flat_map(|item| {
+            [
+                item.key.payload.device_ptr,
+                item.key.byte_offset,
+                item.key
+                    .validity_bitmap_offset
+                    .map_or(u64::MAX, |offset| item.key.payload.device_ptr + offset),
+                u64::from(item.key.width),
+                item.key.text_bytes_byte_offset.unwrap_or(0),
+                u64::from(item.relation),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let desc = if descriptors.is_empty() {
+        None
+    } else {
+        let buffer = primary.lease_device_buffer_owned(descriptors.len() * 8)?;
+        let htod = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        check_cuda(unsafe {
+            htod(
+                buffer.ptr,
+                descriptors.as_ptr().cast(),
+                descriptors.len() * 8,
+            )
+        })?;
+        Some(buffer)
+    };
+    let bytes = coordinates.row_count as usize * coordinates.relation_count as usize * 4;
+    let output = primary.lease_device_buffer_owned(bytes)?;
+    let launch = unsafe {
+        primary
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_shift_join_coordinates", &ptx)?;
+    let mut a0 = source.ptr;
+    let mut a1 = coordinates.row_count;
+    let mut a2 = coordinates.relation_count;
+    let mut a3 = desc.as_ref().map_or(0, |buffer| buffer.ptr);
+    let mut a4 = partition.len() as u32;
+    let mut a5 = delta;
+    let mut a6 = output.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast(),
+        (&mut a1 as *mut u32).cast(),
+        (&mut a2 as *mut u32).cast(),
+        (&mut a3 as *mut u64).cast(),
+        (&mut a4 as *mut u32).cast(),
+        (&mut a5 as *mut i32).cast(),
+        (&mut a6 as *mut u64).cast(),
+    ];
+    check_cuda(unsafe {
+        launch(
+            function,
+            coordinates.row_count.div_ceil(256).clamp(1, 65_535),
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    Ok(CudaJoinCoordinatesU32 {
+        coordinates: Some(output),
+        row_count: coordinates.row_count,
+        relation_count: coordinates.relation_count,
+        allocated_bytes: bytes as u64,
+    })
+}
+
+fn launch_cuda_concat_materialized_relations(
+    ctx: &CudaResidentDeviceMemory,
+    left: &CudaMaterializedRelation,
+    right: &CudaMaterializedRelation,
+) -> Result<CudaMaterializedRelation, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,u32,u32,u32,u32,u32,u32,u32,*mut c_void,*mut *mut c_void,*mut *mut c_void,
+    )->i32;
+    type CuMemcpyDtoD = unsafe extern "C" fn(u64,u64,usize)->i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64,u8,usize)->i32;
+    const PTX:&[u8]=br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_concat_validity(
+ .param .u64 src,.param .u32 src_rows,.param .u64 dst,.param .u32 dst_base)
+{
+ .reg .pred %p<3>; .reg .b32 %r<20>; .reg .b64 %rd<16>;
+ ld.param.u64 %rd1,[src];ld.param.u32 %r1,[src_rows];ld.param.u64 %rd2,[dst];ld.param.u32 %r2,[dst_base];
+ mov.u32 %r3,%tid.x;mov.u32 %r4,%ctaid.x;mov.u32 %r5,%ntid.x;mov.u32 %r6,%nctaid.x;mad.lo.u32 %r7,%r4,%r5,%r3;mul.lo.u32 %r8,%r6,%r5;
+V_LOOP:setp.ge.u32 %p1,%r7,%r1;@%p1 bra V_DONE;shr.u32 %r9,%r7,5;mul.wide.u32 %rd3,%r9,4;add.u64 %rd4,%rd1,%rd3;ld.global.u32 %r10,[%rd4];and.b32 %r11,%r7,31;shr.u32 %r10,%r10,%r11;and.b32 %r10,%r10,1;setp.eq.u32 %p2,%r10,0;@%p2 bra V_NEXT;
+ add.u32 %r12,%r7,%r2;shr.u32 %r13,%r12,5;mul.wide.u32 %rd5,%r13,4;add.u64 %rd6,%rd2,%rd5;and.b32 %r14,%r12,31;mov.u32 %r15,1;shl.b32 %r15,%r15,%r14;atom.global.or.b32 %r16,[%rd6],%r15;
+V_NEXT:add.u32 %r7,%r7,%r8;bra V_LOOP;V_DONE:ret;
+}
+.visible .entry gpu_db_concat_text_offsets(
+ .param .u64 src,.param .u32 src_rows,.param .u64 dst,.param .u32 dst_base,.param .u64 byte_base)
+{
+ .reg .pred %p; .reg .b32 %r<16>; .reg .b64 %rd<20>;
+ ld.param.u64 %rd1,[src];ld.param.u32 %r1,[src_rows];ld.param.u64 %rd2,[dst];ld.param.u32 %r2,[dst_base];ld.param.u64 %rd3,[byte_base];
+ mov.u32 %r3,%tid.x;mov.u32 %r4,%ctaid.x;mov.u32 %r5,%ntid.x;mov.u32 %r6,%nctaid.x;mad.lo.u32 %r7,%r4,%r5,%r3;mul.lo.u32 %r8,%r6,%r5;add.u32 %r1,%r1,1;
+O_LOOP:setp.ge.u32 %p,%r7,%r1;@%p bra O_DONE;mul.wide.u32 %rd4,%r7,8;add.u64 %rd5,%rd1,%rd4;ld.global.u64 %rd6,[%rd5];add.u64 %rd6,%rd6,%rd3;add.u32 %r9,%r7,%r2;mul.wide.u32 %rd7,%r9,8;add.u64 %rd8,%rd2,%rd7;st.global.u64 [%rd8],%rd6;add.u32 %r7,%r7,%r8;bra O_LOOP;O_DONE:ret;
+}
+"#;
+    if left.columns.len()!=right.columns.len() || left.columns.iter().zip(&right.columns).any(|(a,b)|a.kind!=b.kind) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(left.columns.len()));
+    }
+    let rows=left.row_count.checked_add(right.row_count).ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let align=|v:u64,a:u64|v.div_ceil(a)*a;let valid_bytes=u64::from(rows).div_ceil(32)*4;let mut cursor=0_u64;let mut layouts=Vec::with_capacity(left.columns.len());
+    for (l,r) in left.columns.iter().zip(&right.columns) {
+        match l.kind {
+            CudaMaterializedColumnKind::Fixed{width}=>{cursor=align(cursor,u64::from(width.min(8)));let value=cursor;cursor+=u64::from(rows)*u64::from(width);cursor=align(cursor,4);let valid=cursor;cursor+=valid_bytes;layouts.push(CudaMaterializedColumnLayout{kind:l.kind,value_byte_offset:value,text_bytes_byte_offset:None,text_bytes_len:0,validity_bitmap_offset:valid});}
+            CudaMaterializedColumnKind::Text=>{cursor=align(cursor,8);let offsets=cursor;cursor+=(u64::from(rows)+1)*8;let bytes=cursor;let text_len=l.text_bytes_len.checked_add(r.text_bytes_len).ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;cursor+=text_len;cursor=align(cursor,4);let valid=cursor;cursor+=valid_bytes;layouts.push(CudaMaterializedColumnLayout{kind:l.kind,value_byte_offset:offsets,text_bytes_byte_offset:Some(bytes),text_bytes_len:text_len,validity_bitmap_offset:valid});}
+        }
+    }
+    let primary=ctx.primary_arc();primary.set_current()?;let allocated=cursor.max(1);let mut ptr=0;check_cuda(unsafe{(primary.cu_mem_alloc)(&mut ptr,allocated as usize)})?;
+    let memory=CudaResidentDeviceMemory{metadata:CudaDeviceMemoryProof{gpu_id:ctx.metadata.gpu_id,device_name:ctx.metadata.device_name.clone(),allocated_bytes:allocated,copied_bytes:0,retained:true},device_ptr:ptr,primary:Arc::clone(&primary),last_kernel_event_elapsed_us:Mutex::new(None)};
+    let memset=unsafe{primary.lib().get::<CuMemsetD8>(b"cuMemsetD8_v2\0").or_else(|_|primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0")).map_err(|_|CudaRuntimeProbeError::DriverLibraryUnavailable)?};check_cuda(unsafe{memset(memory.device_ptr,0,allocated as usize)})?;
+    let dtod=unsafe{primary.lib().get::<CuMemcpyDtoD>(b"cuMemcpyDtoD_v2\0").or_else(|_|primary.lib().get::<CuMemcpyDtoD>(b"cuMemcpyDtoD\0")).map_err(|_|CudaRuntimeProbeError::DriverLibraryUnavailable)?};
+    let launch=unsafe{primary.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0").map_err(|_|CudaRuntimeProbeError::DriverLibraryUnavailable)?};let mut ptx=PTX.to_vec();ptx.push(0);let valid_fn=primary.cached_function(c"gpu_db_concat_validity",&ptx)?;let offsets_fn=primary.cached_function(c"gpu_db_concat_text_offsets",&ptx)?;
+    for (index,&out) in layouts.iter().enumerate(){let l=left.columns[index];let r=right.columns[index];match out.kind{
+        CudaMaterializedColumnKind::Fixed{width}=>{let lb=left.row_count as usize*width as usize;let rb=right.row_count as usize*width as usize;if lb>0{check_cuda(unsafe{dtod(memory.device_ptr+out.value_byte_offset,left.memory.device_ptr+l.value_byte_offset,lb)})?;}
+        if rb>0{check_cuda(unsafe{dtod(memory.device_ptr+out.value_byte_offset+lb as u64,right.memory.device_ptr+r.value_byte_offset,rb)})?;}},
+        CudaMaterializedColumnKind::Text=>{let dst_bytes=memory.device_ptr+out.text_bytes_byte_offset.unwrap();if l.text_bytes_len>0{check_cuda(unsafe{dtod(dst_bytes,left.memory.device_ptr+l.text_bytes_byte_offset.unwrap(),l.text_bytes_len as usize)})?;}
+        if r.text_bytes_len>0{check_cuda(unsafe{dtod(dst_bytes+l.text_bytes_len,right.memory.device_ptr+r.text_bytes_byte_offset.unwrap(),r.text_bytes_len as usize)})?;}for (src,src_rows,dst_base,byte_base) in [(left.memory.device_ptr+l.value_byte_offset,left.row_count,0_u32,0_u64),(right.memory.device_ptr+r.value_byte_offset,right.row_count,left.row_count,l.text_bytes_len)]{let mut a0=src;let mut a1=src_rows;let mut a2=memory.device_ptr+out.value_byte_offset;let mut a3=dst_base;let mut a4=byte_base;let mut args=[(&mut a0 as *mut u64).cast(),(&mut a1 as *mut u32).cast(),(&mut a2 as *mut u64).cast(),(&mut a3 as *mut u32).cast(),(&mut a4 as *mut u64).cast()];check_cuda(unsafe{launch(offsets_fn,(src_rows+1).div_ceil(256).clamp(1,65_535),1,1,256,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut())})?;}}
+    }for (src,src_rows,dst_base) in [(left.memory.device_ptr+l.validity_bitmap_offset,left.row_count,0_u32),(right.memory.device_ptr+r.validity_bitmap_offset,right.row_count,left.row_count)]{if src_rows==0{continue;}let mut a0=src;let mut a1=src_rows;let mut a2=memory.device_ptr+out.validity_bitmap_offset;let mut a3=dst_base;let mut args=[(&mut a0 as *mut u64).cast(),(&mut a1 as *mut u32).cast(),(&mut a2 as *mut u64).cast(),(&mut a3 as *mut u32).cast()];check_cuda(unsafe{launch(valid_fn,src_rows.div_ceil(256).clamp(1,65_535),1,1,256,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut())})?;}}
+    Ok(CudaMaterializedRelation{memory,columns:layouts,row_count:rows})
+}
+
+fn launch_cuda_materialize_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    coordinates: &CudaJoinCoordinatesU32,
+    columns: &[CudaMaterializeJoinColumn<'_>],
+) -> Result<CudaMaterializedRelation, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+.visible .entry gpu_db_materialize_fixed(
+    .param .u64 coords, .param .u32 rows, .param .u32 rels, .param .u32 relation,
+    .param .u64 src, .param .u64 src_off, .param .u64 src_valid, .param .u32 width,
+    .param .u64 dst, .param .u64 dst_off, .param .u64 dst_valid)
+{
+    .reg .pred %p<8>; .reg .b32 %r<32>; .reg .b64 %rd<40>;
+    ld.param.u64 %rd1,[coords]; ld.param.u32 %r1,[rows]; ld.param.u32 %r2,[rels];
+    ld.param.u32 %r3,[relation]; ld.param.u64 %rd2,[src]; ld.param.u64 %rd3,[src_off];
+    ld.param.u64 %rd4,[src_valid]; ld.param.u32 %r4,[width]; ld.param.u64 %rd5,[dst];
+    ld.param.u64 %rd6,[dst_off]; ld.param.u64 %rd7,[dst_valid];
+    mov.u32 %r5,%tid.x; mov.u32 %r6,%ctaid.x; mov.u32 %r7,%ntid.x; mov.u32 %r8,%nctaid.x;
+    mad.lo.u32 %r9,%r6,%r7,%r5; mul.lo.u32 %r10,%r8,%r7;
+F_LOOP:
+    setp.ge.u32 %p1,%r9,%r1; @%p1 bra F_DONE;
+    mul.lo.u32 %r11,%r9,%r2; add.u32 %r11,%r11,%r3; mul.wide.u32 %rd8,%r11,4;
+    add.u64 %rd9,%rd1,%rd8; ld.global.u32 %r12,[%rd9];
+    setp.eq.u32 %p2,%r12,4294967295; @%p2 bra F_NEXT;
+    mov.u64 %rd10,18446744073709551615; setp.eq.u64 %p3,%rd4,%rd10; @%p3 bra F_VALID;
+    shr.u32 %r13,%r12,5; mul.wide.u32 %rd11,%r13,4; add.u64 %rd12,%rd4,%rd11;
+    ld.global.u32 %r14,[%rd12]; and.b32 %r13,%r12,31; shr.u32 %r14,%r14,%r13;
+    and.b32 %r14,%r14,1; setp.eq.u32 %p4,%r14,0; @%p4 bra F_NEXT;
+F_VALID:
+    mul.wide.u32 %rd13,%r12,%r4; add.u64 %rd13,%rd13,%rd2; add.u64 %rd13,%rd13,%rd3;
+    mul.wide.u32 %rd14,%r9,%r4; add.u64 %rd14,%rd14,%rd5; add.u64 %rd14,%rd14,%rd6;
+    setp.eq.u32 %p5,%r4,4; @%p5 bra F_COPY4;
+    ld.global.u64 %rd15,[%rd13]; st.global.u64 [%rd14],%rd15;
+    setp.eq.u32 %p6,%r4,16; @!%p6 bra F_MARK;
+    ld.global.u64 %rd15,[%rd13+8]; st.global.u64 [%rd14+8],%rd15; bra F_MARK;
+F_COPY4: ld.global.u32 %r15,[%rd13]; st.global.u32 [%rd14],%r15;
+F_MARK:
+    shr.u32 %r16,%r9,5; mul.wide.u32 %rd16,%r16,4; add.u64 %rd17,%rd5,%rd7; add.u64 %rd17,%rd17,%rd16;
+    and.b32 %r17,%r9,31; mov.u32 %r18,1; shl.b32 %r18,%r18,%r17; atom.global.or.b32 %r19,[%rd17],%r18;
+F_NEXT: add.u32 %r9,%r9,%r10; bra F_LOOP;
+F_DONE: ret;
+}
+
+.visible .entry gpu_db_materialize_bool(
+    .param .u64 coords, .param .u32 rows, .param .u32 rels, .param .u32 relation,
+    .param .u64 src, .param .u64 src_bitmap, .param .u64 src_valid,
+    .param .u64 dst, .param .u64 dst_off, .param .u64 dst_valid)
+{
+    .reg .pred %p<7>; .reg .b32 %r<32>; .reg .b64 %rd<36>;
+    ld.param.u64 %rd1,[coords]; ld.param.u32 %r1,[rows]; ld.param.u32 %r2,[rels]; ld.param.u32 %r3,[relation];
+    ld.param.u64 %rd2,[src]; ld.param.u64 %rd3,[src_bitmap]; ld.param.u64 %rd4,[src_valid];
+    ld.param.u64 %rd5,[dst]; ld.param.u64 %rd6,[dst_off]; ld.param.u64 %rd7,[dst_valid];
+    mov.u32 %r4,%tid.x; mov.u32 %r5,%ctaid.x; mov.u32 %r6,%ntid.x; mov.u32 %r7,%nctaid.x;
+    mad.lo.u32 %r8,%r5,%r6,%r4; mul.lo.u32 %r9,%r7,%r6;
+B_LOOP: setp.ge.u32 %p1,%r8,%r1; @%p1 bra B_DONE;
+    mul.lo.u32 %r10,%r8,%r2; add.u32 %r10,%r10,%r3; mul.wide.u32 %rd8,%r10,4; add.u64 %rd9,%rd1,%rd8;
+    ld.global.u32 %r11,[%rd9]; setp.eq.u32 %p2,%r11,4294967295; @%p2 bra B_NEXT;
+    mov.u64 %rd10,18446744073709551615; setp.eq.u64 %p3,%rd4,%rd10; @%p3 bra B_VALID;
+    shr.u32 %r12,%r11,5; mul.wide.u32 %rd11,%r12,4; add.u64 %rd12,%rd4,%rd11; ld.global.u32 %r13,[%rd12];
+    and.b32 %r12,%r11,31; shr.u32 %r13,%r13,%r12; and.b32 %r13,%r13,1; setp.eq.u32 %p4,%r13,0; @%p4 bra B_NEXT;
+B_VALID:
+    shr.u32 %r12,%r11,5; mul.wide.u32 %rd11,%r12,4; add.u64 %rd12,%rd2,%rd3; add.u64 %rd12,%rd12,%rd11;
+    ld.global.u32 %r13,[%rd12]; and.b32 %r12,%r11,31; shr.u32 %r13,%r13,%r12; and.b32 %r13,%r13,1;
+    mul.wide.u32 %rd13,%r8,4; add.u64 %rd14,%rd5,%rd6; add.u64 %rd14,%rd14,%rd13; st.global.u32 [%rd14],%r13;
+    shr.u32 %r14,%r8,5; mul.wide.u32 %rd15,%r14,4; add.u64 %rd16,%rd5,%rd7; add.u64 %rd16,%rd16,%rd15;
+    and.b32 %r15,%r8,31; mov.u32 %r16,1; shl.b32 %r16,%r16,%r15; atom.global.or.b32 %r17,[%rd16],%r16;
+B_NEXT: add.u32 %r8,%r8,%r9; bra B_LOOP;
+B_DONE: ret;
+}
+
+.visible .entry gpu_db_materialize_text_lengths(
+    .param .u64 coords,.param .u32 rows,.param .u32 rels,.param .u32 relation,
+    .param .u64 src,.param .u64 src_offsets,.param .u64 src_valid,.param .u64 lengths)
+{
+    .reg .pred %p<6>; .reg .b32 %r<24>; .reg .b64 %rd<32>;
+    ld.param.u64 %rd1,[coords]; ld.param.u32 %r1,[rows]; ld.param.u32 %r2,[rels]; ld.param.u32 %r3,[relation];
+    ld.param.u64 %rd2,[src]; ld.param.u64 %rd3,[src_offsets]; ld.param.u64 %rd4,[src_valid]; ld.param.u64 %rd5,[lengths];
+    mov.u32 %r4,%tid.x; mov.u32 %r5,%ctaid.x; mov.u32 %r6,%ntid.x; mov.u32 %r7,%nctaid.x;
+    mad.lo.u32 %r8,%r5,%r6,%r4; mul.lo.u32 %r9,%r7,%r6;
+TL_LOOP: setp.ge.u32 %p1,%r8,%r1; @%p1 bra TL_DONE; mov.u64 %rd6,0;
+    mul.lo.u32 %r10,%r8,%r2; add.u32 %r10,%r10,%r3; mul.wide.u32 %rd7,%r10,4; add.u64 %rd8,%rd1,%rd7;
+    ld.global.u32 %r11,[%rd8]; setp.eq.u32 %p2,%r11,4294967295; @%p2 bra TL_WRITE;
+    mov.u64 %rd9,18446744073709551615; setp.eq.u64 %p3,%rd4,%rd9; @%p3 bra TL_VALID;
+    shr.u32 %r12,%r11,5; mul.wide.u32 %rd10,%r12,4; add.u64 %rd11,%rd4,%rd10; ld.global.u32 %r13,[%rd11];
+    and.b32 %r12,%r11,31; shr.u32 %r13,%r13,%r12; and.b32 %r13,%r13,1; setp.eq.u32 %p4,%r13,0; @%p4 bra TL_WRITE;
+TL_VALID: mul.wide.u32 %rd12,%r11,8; add.u64 %rd13,%rd2,%rd3; add.u64 %rd13,%rd13,%rd12;
+    ld.global.u64 %rd14,[%rd13]; ld.global.u64 %rd15,[%rd13+8]; sub.u64 %rd6,%rd15,%rd14;
+TL_WRITE: mul.wide.u32 %rd16,%r8,8; add.u64 %rd17,%rd5,%rd16; st.global.u64 [%rd17],%rd6;
+    add.u32 %r8,%r8,%r9; bra TL_LOOP; TL_DONE: ret;
+}
+
+.visible .entry gpu_db_materialize_text_copy(
+    .param .u64 coords,.param .u32 rows,.param .u32 rels,.param .u32 relation,
+    .param .u64 src,.param .u64 src_offsets,.param .u64 src_bytes,.param .u64 src_valid,
+    .param .u64 dst,.param .u64 dst_offsets,.param .u64 dst_bytes,.param .u64 dst_valid)
+{
+    .reg .pred %p<7>; .reg .b32 %r<28>; .reg .b64 %rd<48>;
+    ld.param.u64 %rd1,[coords]; ld.param.u32 %r1,[rows]; ld.param.u32 %r2,[rels]; ld.param.u32 %r3,[relation];
+    ld.param.u64 %rd2,[src]; ld.param.u64 %rd3,[src_offsets]; ld.param.u64 %rd4,[src_bytes]; ld.param.u64 %rd5,[src_valid];
+    ld.param.u64 %rd6,[dst]; ld.param.u64 %rd7,[dst_offsets]; ld.param.u64 %rd8,[dst_bytes]; ld.param.u64 %rd9,[dst_valid];
+    mov.u32 %r4,%tid.x; mov.u32 %r5,%ctaid.x; mov.u32 %r6,%ntid.x; mov.u32 %r7,%nctaid.x;
+    mad.lo.u32 %r8,%r5,%r6,%r4; mul.lo.u32 %r9,%r7,%r6;
+TC_LOOP: setp.ge.u32 %p1,%r8,%r1; @%p1 bra TC_DONE;
+    mul.lo.u32 %r10,%r8,%r2; add.u32 %r10,%r10,%r3; mul.wide.u32 %rd10,%r10,4; add.u64 %rd11,%rd1,%rd10;
+    ld.global.u32 %r11,[%rd11]; setp.eq.u32 %p2,%r11,4294967295; @%p2 bra TC_NEXT;
+    mov.u64 %rd12,18446744073709551615; setp.eq.u64 %p3,%rd5,%rd12; @%p3 bra TC_VALID;
+    shr.u32 %r12,%r11,5; mul.wide.u32 %rd13,%r12,4; add.u64 %rd14,%rd5,%rd13; ld.global.u32 %r13,[%rd14];
+    and.b32 %r12,%r11,31; shr.u32 %r13,%r13,%r12; and.b32 %r13,%r13,1; setp.eq.u32 %p4,%r13,0; @%p4 bra TC_NEXT;
+TC_VALID:
+    mul.wide.u32 %rd15,%r11,8; add.u64 %rd16,%rd2,%rd3; add.u64 %rd16,%rd16,%rd15;
+    ld.global.u64 %rd17,[%rd16]; ld.global.u64 %rd18,[%rd16+8]; sub.u64 %rd19,%rd18,%rd17;
+    mul.wide.u32 %rd20,%r8,8; add.u64 %rd21,%rd6,%rd7; add.u64 %rd21,%rd21,%rd20; ld.global.u64 %rd22,[%rd21];
+    add.u64 %rd23,%rd2,%rd4; add.u64 %rd23,%rd23,%rd17; add.u64 %rd24,%rd6,%rd8; add.u64 %rd24,%rd24,%rd22;
+    mov.u64 %rd25,0;
+TC_BYTES: setp.ge.u64 %p5,%rd25,%rd19; @%p5 bra TC_MARK; add.u64 %rd26,%rd23,%rd25; add.u64 %rd27,%rd24,%rd25;
+    ld.global.u8 %r14,[%rd26]; st.global.u8 [%rd27],%r14; add.u64 %rd25,%rd25,1; bra TC_BYTES;
+TC_MARK: shr.u32 %r15,%r8,5; mul.wide.u32 %rd28,%r15,4; add.u64 %rd29,%rd6,%rd9; add.u64 %rd29,%rd29,%rd28;
+    and.b32 %r16,%r8,31; mov.u32 %r17,1; shl.b32 %r17,%r17,%r16; atom.global.or.b32 %r18,[%rd29],%r17;
+TC_NEXT: add.u32 %r8,%r8,%r9; bra TC_LOOP; TC_DONE: ret;
+}
+"#;
+    if columns.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    if coordinates.row_count > 0 && coordinates.coordinates.is_none() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(coordinates.row_count as usize));
+    }
+    let source_coords = coordinates.coordinates.as_ref().map_or(0, |buffer| buffer.ptr);
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let launch = unsafe { primary.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+        .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)? };
+    let htod = unsafe { primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+        .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+        .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)? };
+    let dtoh = unsafe { primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+        .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+        .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)? };
+    let memset = unsafe { primary.lib().get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+        .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+        .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)? };
+    let mut ptx = PTX.to_vec(); ptx.push(0);
+    let fixed_fn = primary.cached_function(c"gpu_db_materialize_fixed", &ptx)?;
+    let bool_fn = primary.cached_function(c"gpu_db_materialize_bool", &ptx)?;
+    let text_lengths_fn = primary.cached_function(c"gpu_db_materialize_text_lengths", &ptx)?;
+    let text_copy_fn = primary.cached_function(c"gpu_db_materialize_text_copy", &ptx)?;
+    let n = coordinates.row_count as usize;
+    let grid = coordinates.row_count.div_ceil(256).clamp(1,65_535);
+    let mut text_offsets: Vec<Option<Vec<u64>>> = vec![None; columns.len()];
+    if n > 0 {
+        for (index, column) in columns.iter().enumerate() {
+            let CudaMaterializeJoinColumn::Text { relation, payload, offsets_byte_offset, validity_bitmap_offset, .. } = *column else { continue };
+            let lengths_dev = primary.lease_device_buffer_owned(n * 8)?;
+            let mut a0=source_coords; let mut a1=coordinates.row_count; let mut a2=coordinates.relation_count; let mut a3=relation;
+            let mut a4=payload.device_ptr; let mut a5=offsets_byte_offset;
+            let mut a6=validity_bitmap_offset.map_or(u64::MAX,|off|payload.device_ptr+off); let mut a7=lengths_dev.ptr;
+            let mut args=[(&mut a0 as *mut u64).cast(),(&mut a1 as *mut u32).cast(),(&mut a2 as *mut u32).cast(),(&mut a3 as *mut u32).cast(),(&mut a4 as *mut u64).cast(),(&mut a5 as *mut u64).cast(),(&mut a6 as *mut u64).cast(),(&mut a7 as *mut u64).cast()];
+            check_cuda(unsafe { launch(text_lengths_fn,grid,1,1,256,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut()) })?;
+            let mut lengths=vec![0_u64;n]; check_cuda(unsafe { dtoh(lengths.as_mut_ptr().cast(),lengths_dev.ptr,n*8) })?;
+            let mut offsets=Vec::with_capacity(n+1); offsets.push(0_u64);
+            for len in lengths { offsets.push(offsets.last().copied().unwrap().checked_add(len).ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?); }
+            text_offsets[index]=Some(offsets);
+        }
+    }
+    let align = |value:u64, alignment:u64| value.div_ceil(alignment)*alignment;
+    let validity_bytes = u64::from(coordinates.row_count).div_ceil(32)*4;
+    let mut cursor=0_u64; let mut layouts=Vec::with_capacity(columns.len());
+    for (index,column) in columns.iter().enumerate() {
+        match *column {
+            CudaMaterializeJoinColumn::Fixed{width,..} => {
+                if !matches!(width,4|8|16) { return Err(CudaRuntimeProbeError::InvalidInputLength(width as usize)); }
+                cursor=align(cursor,u64::from(width.min(8))); let value=cursor; cursor=cursor.saturating_add(u64::from(coordinates.row_count)*u64::from(width));
+                cursor=align(cursor,4); let valid=cursor; cursor=cursor.saturating_add(validity_bytes);
+                layouts.push(CudaMaterializedColumnLayout{kind:CudaMaterializedColumnKind::Fixed{width},value_byte_offset:value,text_bytes_byte_offset:None,text_bytes_len:0,validity_bitmap_offset:valid});
+            }
+            CudaMaterializeJoinColumn::Bool{..} => {
+                cursor=align(cursor,4); let value=cursor; cursor=cursor.saturating_add(u64::from(coordinates.row_count)*4);
+                cursor=align(cursor,4); let valid=cursor; cursor=cursor.saturating_add(validity_bytes);
+                layouts.push(CudaMaterializedColumnLayout{kind:CudaMaterializedColumnKind::Fixed{width:4},value_byte_offset:value,text_bytes_byte_offset:None,text_bytes_len:0,validity_bitmap_offset:valid});
+            }
+            CudaMaterializeJoinColumn::Text{..} => {
+                cursor=align(cursor,8); let offsets=cursor; cursor=cursor.saturating_add((u64::from(coordinates.row_count)+1)*8);
+                let text_len=text_offsets[index].as_ref().and_then(|v|v.last()).copied().unwrap_or(0); let bytes=cursor; cursor=cursor.saturating_add(text_len);
+                cursor=align(cursor,4); let valid=cursor; cursor=cursor.saturating_add(validity_bytes);
+                layouts.push(CudaMaterializedColumnLayout{kind:CudaMaterializedColumnKind::Text,value_byte_offset:offsets,text_bytes_byte_offset:Some(bytes),text_bytes_len:text_len,validity_bitmap_offset:valid});
+            }
+        }
+    }
+    let allocated=cursor.max(1); let mut ptr=0_u64; check_cuda(unsafe { (primary.cu_mem_alloc)(&mut ptr,allocated as usize) })?;
+    let memory=CudaResidentDeviceMemory{metadata:CudaDeviceMemoryProof{gpu_id:ctx.metadata.gpu_id,device_name:ctx.metadata.device_name.clone(),allocated_bytes:allocated,copied_bytes:0,retained:true},device_ptr:ptr,primary:Arc::clone(&primary),last_kernel_event_elapsed_us:Mutex::new(None)};
+    check_cuda(unsafe { memset(memory.device_ptr,0,allocated as usize) })?;
+    for (index,column) in columns.iter().enumerate() {
+        let layout=layouts[index];
+        match *column {
+            CudaMaterializeJoinColumn::Fixed{relation,payload,byte_offset,validity_bitmap_offset,width} => {
+                let mut a0=source_coords;let mut a1=coordinates.row_count;let mut a2=coordinates.relation_count;let mut a3=relation;let mut a4=payload.device_ptr;let mut a5=byte_offset;let mut a6=validity_bitmap_offset.map_or(u64::MAX,|off|payload.device_ptr+off);let mut a7=u32::from(width);let mut a8=memory.device_ptr;let mut a9=layout.value_byte_offset;let mut a10=layout.validity_bitmap_offset;
+                let mut args=[(&mut a0 as *mut u64).cast(),(&mut a1 as *mut u32).cast(),(&mut a2 as *mut u32).cast(),(&mut a3 as *mut u32).cast(),(&mut a4 as *mut u64).cast(),(&mut a5 as *mut u64).cast(),(&mut a6 as *mut u64).cast(),(&mut a7 as *mut u32).cast(),(&mut a8 as *mut u64).cast(),(&mut a9 as *mut u64).cast(),(&mut a10 as *mut u64).cast()];
+                if n>0 { check_cuda(unsafe { launch(fixed_fn,grid,1,1,256,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut()) })?; }
+            }
+            CudaMaterializeJoinColumn::Bool{relation,payload,bitmap_byte_offset,validity_bitmap_offset} => {
+                let mut a0=source_coords;let mut a1=coordinates.row_count;let mut a2=coordinates.relation_count;let mut a3=relation;let mut a4=payload.device_ptr;let mut a5=bitmap_byte_offset;let mut a6=validity_bitmap_offset.map_or(u64::MAX,|off|payload.device_ptr+off);let mut a7=memory.device_ptr;let mut a8=layout.value_byte_offset;let mut a9=layout.validity_bitmap_offset;
+                let mut args=[(&mut a0 as *mut u64).cast(),(&mut a1 as *mut u32).cast(),(&mut a2 as *mut u32).cast(),(&mut a3 as *mut u32).cast(),(&mut a4 as *mut u64).cast(),(&mut a5 as *mut u64).cast(),(&mut a6 as *mut u64).cast(),(&mut a7 as *mut u64).cast(),(&mut a8 as *mut u64).cast(),(&mut a9 as *mut u64).cast()];
+                if n>0 { check_cuda(unsafe { launch(bool_fn,grid,1,1,256,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut()) })?; }
+            }
+            CudaMaterializeJoinColumn::Text{relation,payload,offsets_byte_offset,bytes_byte_offset,validity_bitmap_offset,..} => {
+                let offsets=text_offsets[index].as_ref().cloned().unwrap_or_else(||vec![0]); check_cuda(unsafe { htod(memory.device_ptr+layout.value_byte_offset,offsets.as_ptr().cast(),offsets.len()*8) })?;
+                let mut a0=source_coords;let mut a1=coordinates.row_count;let mut a2=coordinates.relation_count;let mut a3=relation;let mut a4=payload.device_ptr;let mut a5=offsets_byte_offset;let mut a6=bytes_byte_offset;let mut a7=validity_bitmap_offset.map_or(u64::MAX,|off|payload.device_ptr+off);let mut a8=memory.device_ptr;let mut a9=layout.value_byte_offset;let mut a10=layout.text_bytes_byte_offset.unwrap();let mut a11=layout.validity_bitmap_offset;
+                let mut args=[(&mut a0 as *mut u64).cast(),(&mut a1 as *mut u32).cast(),(&mut a2 as *mut u32).cast(),(&mut a3 as *mut u32).cast(),(&mut a4 as *mut u64).cast(),(&mut a5 as *mut u64).cast(),(&mut a6 as *mut u64).cast(),(&mut a7 as *mut u64).cast(),(&mut a8 as *mut u64).cast(),(&mut a9 as *mut u64).cast(),(&mut a10 as *mut u64).cast(),(&mut a11 as *mut u64).cast()];
+                if n>0 { check_cuda(unsafe { launch(text_copy_fn,grid,1,1,256,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut()) })?; }
+            }
+        }
+    }
+    Ok(CudaMaterializedRelation{memory,columns:layouts,row_count:coordinates.row_count})
+}
+
+fn launch_cuda_sort_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    coordinates: &CudaJoinCoordinatesU32,
+    order: &[CudaJoinOrderKey<'_>],
+) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+.visible .entry gpu_db_merge_join_coordinates(
+    .param .u64 src, .param .u64 dst, .param .u32 rows, .param .u32 rels,
+    .param .u64 width, .param .u64 desc, .param .u32 key_count)
+{
+    .reg .pred %p<40>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<128>;
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [rels];
+    ld.param.u64 %rd3, [width];
+    ld.param.u64 %rd4, [desc];
+    ld.param.u32 %r3, [key_count];
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mad.lo.u32 %r7, %r5, %r6, %r4;
+    cvt.u64.u32 %rd5, %r7;
+    mul.lo.u64 %rd6, %rd3, 2;
+    mul.lo.u64 %rd7, %rd5, %rd6;
+    cvt.u64.u32 %rd8, %r1;
+    setp.ge.u64 %p1, %rd7, %rd8;
+    @%p1 bra DONE;
+    add.u64 %rd9, %rd7, %rd3;
+    min.u64 %rd9, %rd9, %rd8;
+    add.u64 %rd10, %rd7, %rd6;
+    min.u64 %rd10, %rd10, %rd8;
+    mov.u64 %rd11, %rd7;
+    mov.u64 %rd12, %rd9;
+    mov.u64 %rd13, %rd7;
+MERGE_LOOP:
+    setp.ge.u64 %p2, %rd13, %rd10;
+    @%p2 bra DONE;
+    setp.ge.u64 %p3, %rd11, %rd9;
+    @%p3 bra TAKE_RIGHT;
+    setp.ge.u64 %p4, %rd12, %rd10;
+    @%p4 bra TAKE_LEFT;
+    mov.u32 %r8, 0;
+KEY_LOOP:
+    setp.ge.u32 %p5, %r8, %r3;
+    @%p5 bra TAKE_LEFT; // stable tie
+    mul.wide.u32 %rd14, %r8, 72;
+    add.u64 %rd15, %rd4, %rd14;
+    ld.global.u64 %rd16, [%rd15];      // payload base
+    ld.global.u64 %rd17, [%rd15+8];    // value/offsets off
+    ld.global.u64 %rd18, [%rd15+16];   // validity absolute or sentinel
+    ld.global.u64 %rd19, [%rd15+24];   // width
+    ld.global.u64 %rd20, [%rd15+32];   // text bytes off
+    ld.global.u64 %rd21, [%rd15+40];   // relation
+    ld.global.u64 %rd22, [%rd15+48];   // descending
+    ld.global.u64 %rd23, [%rd15+56];   // nulls first
+    ld.global.u64 %rd24, [%rd15+64];   // lexicographic 16
+    cvt.u32.u64 %r9, %rd21;
+    cvt.u32.u64 %r10, %rd11;
+    cvt.u32.u64 %r11, %rd12;
+    mul.lo.u32 %r12, %r10, %r2;
+    add.u32 %r12, %r12, %r9;
+    mul.lo.u32 %r13, %r11, %r2;
+    add.u32 %r13, %r13, %r9;
+    mul.wide.u32 %rd25, %r12, 4;
+    mul.wide.u32 %rd26, %r13, 4;
+    add.u64 %rd27, %rd1, %rd25;
+    add.u64 %rd28, %rd1, %rd26;
+    ld.global.u32 %r14, [%rd27];
+    ld.global.u32 %r15, [%rd28];
+    setp.ne.u32 %p6, %r14, 4294967295;
+    selp.u32 %r16, 1, 0, %p6;
+    setp.ne.u32 %p7, %r15, 4294967295;
+    selp.u32 %r17, 1, 0, %p7;
+    mov.u64 %rd29, 18446744073709551615;
+    setp.eq.u64 %p8, %rd18, %rd29;
+    @%p8 bra VALID_READY;
+    setp.eq.u32 %p9, %r16, 0;
+    @%p9 bra A_VALID_DONE;
+    shr.u32 %r18, %r14, 5;
+    mul.wide.u32 %rd30, %r18, 4;
+    add.u64 %rd31, %rd18, %rd30;
+    ld.global.u32 %r19, [%rd31];
+    and.b32 %r18, %r14, 31;
+    shr.u32 %r19, %r19, %r18;
+    and.b32 %r16, %r19, 1;
+A_VALID_DONE:
+    setp.eq.u32 %p10, %r17, 0;
+    @%p10 bra VALID_READY;
+    shr.u32 %r18, %r15, 5;
+    mul.wide.u32 %rd30, %r18, 4;
+    add.u64 %rd31, %rd18, %rd30;
+    ld.global.u32 %r19, [%rd31];
+    and.b32 %r18, %r15, 31;
+    shr.u32 %r19, %r19, %r18;
+    and.b32 %r17, %r19, 1;
+VALID_READY:
+    setp.eq.u32 %p11, %r16, %r17;
+    @%p11 bra BOTH_SAME_VALID;
+    // A NULL comes first iff nulls_first; otherwise B/non-NULL comes first.
+    setp.eq.u32 %p12, %r16, 0;
+    setp.ne.u64 %p13, %rd23, 0;
+    and.pred %p14, %p12, %p13;
+    @%p14 bra TAKE_LEFT;
+    @%p12 bra TAKE_RIGHT;
+    @%p13 bra TAKE_RIGHT;
+    bra TAKE_LEFT;
+BOTH_SAME_VALID:
+    setp.eq.u32 %p15, %r16, 0;
+    @%p15 bra KEY_NEXT; // NULL peer
+    add.u64 %rd32, %rd16, %rd17;
+    cvt.u32.u64 %r20, %rd19;
+    setp.eq.u32 %p16, %r20, 255;
+    @%p16 bra CMP_TEXT;
+    mul.wide.u32 %rd33, %r14, %r20;
+    mul.wide.u32 %rd34, %r15, %r20;
+    add.u64 %rd35, %rd32, %rd33;
+    add.u64 %rd36, %rd32, %rd34;
+    setp.eq.u32 %p17, %r20, 4;
+    @%p17 bra CMP_I32;
+    setp.eq.u32 %p18, %r20, 8;
+    @%p18 bra CMP_I64;
+    setp.ne.u64 %p19, %rd24, 0;
+    @%p19 bra CMP_UUID;
+    ld.global.u32 %r25,[%rd35+8]; ld.global.u32 %r26,[%rd35+12];
+    cvt.u64.u32 %rd37,%r26; shl.b64 %rd37,%rd37,32; cvt.u64.u32 %rd42,%r25; or.b64 %rd37,%rd37,%rd42;
+    ld.global.u32 %r27,[%rd36+8]; ld.global.u32 %r28,[%rd36+12];
+    cvt.u64.u32 %rd38,%r28; shl.b64 %rd38,%rd38,32; cvt.u64.u32 %rd42,%r27; or.b64 %rd38,%rd38,%rd42;
+    setp.lt.s64 %p20, %rd37, %rd38;
+    @%p20 bra A_LESS;
+    setp.gt.s64 %p21, %rd37, %rd38;
+    @%p21 bra A_GREATER;
+    ld.global.u32 %r25,[%rd35]; ld.global.u32 %r26,[%rd35+4];
+    cvt.u64.u32 %rd37,%r26; shl.b64 %rd37,%rd37,32; cvt.u64.u32 %rd42,%r25; or.b64 %rd37,%rd37,%rd42;
+    ld.global.u32 %r27,[%rd36]; ld.global.u32 %r28,[%rd36+4];
+    cvt.u64.u32 %rd38,%r28; shl.b64 %rd38,%rd38,32; cvt.u64.u32 %rd42,%r27; or.b64 %rd38,%rd38,%rd42;
+    setp.lt.u64 %p20, %rd37, %rd38;
+    @%p20 bra A_LESS;
+    setp.gt.u64 %p21, %rd37, %rd38;
+    @%p21 bra A_GREATER;
+    bra KEY_NEXT;
+CMP_I32:
+    ld.global.s32 %r21, [%rd35];
+    ld.global.s32 %r22, [%rd36];
+    setp.lt.s32 %p20, %r21, %r22;
+    @%p20 bra A_LESS;
+    setp.gt.s32 %p21, %r21, %r22;
+    @%p21 bra A_GREATER;
+    bra KEY_NEXT;
+CMP_I64:
+    ld.global.u32 %r25,[%rd35]; ld.global.u32 %r26,[%rd35+4];
+    cvt.u64.u32 %rd37,%r26; shl.b64 %rd37,%rd37,32; cvt.u64.u32 %rd42,%r25; or.b64 %rd37,%rd37,%rd42;
+    ld.global.u32 %r27,[%rd36]; ld.global.u32 %r28,[%rd36+4];
+    cvt.u64.u32 %rd38,%r28; shl.b64 %rd38,%rd38,32; cvt.u64.u32 %rd42,%r27; or.b64 %rd38,%rd38,%rd42;
+    setp.lt.s64 %p20, %rd37, %rd38;
+    @%p20 bra A_LESS;
+    setp.gt.s64 %p21, %rd37, %rd38;
+    @%p21 bra A_GREATER;
+    bra KEY_NEXT;
+CMP_UUID:
+    mov.u64 %rd39, 0;
+UUID_LOOP:
+    setp.ge.u64 %p22, %rd39, 16;
+    @%p22 bra KEY_NEXT;
+    add.u64 %rd40, %rd35, %rd39;
+    add.u64 %rd41, %rd36, %rd39;
+    ld.global.u8 %r23, [%rd40];
+    ld.global.u8 %r24, [%rd41];
+    setp.lt.u32 %p23, %r23, %r24;
+    @%p23 bra A_LESS;
+    setp.gt.u32 %p24, %r23, %r24;
+    @%p24 bra A_GREATER;
+    add.u64 %rd39, %rd39, 1;
+    bra UUID_LOOP;
+CMP_TEXT:
+    mul.wide.u32 %rd42, %r14, 8;
+    mul.wide.u32 %rd43, %r15, 8;
+    add.u64 %rd44, %rd32, %rd42;
+    add.u64 %rd45, %rd32, %rd43;
+    ld.global.u64 %rd46, [%rd44];
+    ld.global.u64 %rd47, [%rd44+8];
+    ld.global.u64 %rd48, [%rd45];
+    ld.global.u64 %rd49, [%rd45+8];
+    sub.u64 %rd50, %rd47, %rd46;
+    sub.u64 %rd51, %rd49, %rd48;
+    min.u64 %rd52, %rd50, %rd51;
+    add.u64 %rd53, %rd16, %rd20;
+    add.u64 %rd53, %rd53, %rd46;
+    add.u64 %rd54, %rd16, %rd20;
+    add.u64 %rd54, %rd54, %rd48;
+    mov.u64 %rd55, 0;
+TEXT_LOOP:
+    setp.ge.u64 %p25, %rd55, %rd52;
+    @%p25 bra TEXT_LENGTH;
+    add.u64 %rd56, %rd53, %rd55;
+    add.u64 %rd57, %rd54, %rd55;
+    ld.global.u8 %r25, [%rd56];
+    ld.global.u8 %r26, [%rd57];
+    setp.lt.u32 %p26, %r25, %r26;
+    @%p26 bra A_LESS;
+    setp.gt.u32 %p27, %r25, %r26;
+    @%p27 bra A_GREATER;
+    add.u64 %rd55, %rd55, 1;
+    bra TEXT_LOOP;
+TEXT_LENGTH:
+    setp.lt.u64 %p28, %rd50, %rd51;
+    @%p28 bra A_LESS;
+    setp.gt.u64 %p29, %rd50, %rd51;
+    @%p29 bra A_GREATER;
+    bra KEY_NEXT;
+A_LESS:
+    setp.eq.u64 %p30, %rd22, 0;
+    @%p30 bra TAKE_LEFT;
+    bra TAKE_RIGHT;
+A_GREATER:
+    setp.eq.u64 %p31, %rd22, 0;
+    @%p31 bra TAKE_RIGHT;
+    bra TAKE_LEFT;
+KEY_NEXT:
+    add.u32 %r8, %r8, 1;
+    bra KEY_LOOP;
+
+TAKE_LEFT:
+    mov.u64 %rd58, %rd11;
+    add.u64 %rd11, %rd11, 1;
+    bra COPY_ROW;
+TAKE_RIGHT:
+    mov.u64 %rd58, %rd12;
+    add.u64 %rd12, %rd12, 1;
+COPY_ROW:
+    cvt.u64.u32 %rd59, %r2;
+    mul.lo.u64 %rd60, %rd58, %rd59;
+    mul.lo.u64 %rd61, %rd13, %rd59;
+    mov.u32 %r27, 0;
+COPY_LOOP:
+    setp.ge.u32 %p32, %r27, %r2;
+    @%p32 bra COPY_DONE;
+    cvt.u64.u32 %rd62, %r27;
+    add.u64 %rd63, %rd60, %rd62;
+    add.u64 %rd64, %rd61, %rd62;
+    mul.lo.u64 %rd63, %rd63, 4;
+    mul.lo.u64 %rd64, %rd64, 4;
+    add.u64 %rd63, %rd1, %rd63;
+    add.u64 %rd64, %rd2, %rd64;
+    ld.global.u32 %r28, [%rd63];
+    st.global.u32 [%rd64], %r28;
+    add.u32 %r27, %r27, 1;
+    bra COPY_LOOP;
+COPY_DONE:
+    add.u64 %rd13, %rd13, 1;
+    bra MERGE_LOOP;
+DONE:
+    ret;
+}
+"#;
+    if order.is_empty() || coordinates.row_count <= 1 {
+        return launch_cuda_window_join_coordinates(
+            ctx,
+            coordinates,
+            0,
+            Some(coordinates.row_count),
+        );
+    }
+    if order.iter().any(|key| {
+        key.relation >= coordinates.relation_count
+            || !matches!(key.key.width, 4 | 8 | 16 | 255)
+            || key.key.payload.metadata.gpu_id != ctx.metadata.gpu_id
+    }) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(order.len()));
+    }
+    let source = coordinates.coordinates.as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let descriptor: Vec<u64> = order
+        .iter()
+        .flat_map(|item| {
+            [
+                item.key.payload.device_ptr,
+                item.key.byte_offset,
+                item.key.validity_bitmap_offset
+                    .map_or(u64::MAX, |off| item.key.payload.device_ptr + off),
+                u64::from(item.key.width),
+                item.key.text_bytes_byte_offset.unwrap_or(0),
+                u64::from(item.relation),
+                u64::from(item.descending),
+                u64::from(item.nulls_first),
+                u64::from(item.lexicographic_16),
+            ]
+        })
+        .collect();
+    let desc_bytes = std::mem::size_of_val(descriptor.as_slice());
+    let desc = primary.lease_device_buffer_owned(desc_bytes)?;
+    let htod = unsafe {
+        primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    check_cuda(unsafe { htod(desc.ptr, descriptor.as_ptr().cast(), desc_bytes) })?;
+    let bytes = coordinates.row_count as usize * coordinates.relation_count as usize * 4;
+    let mut a = Some(primary.lease_device_buffer_owned(bytes)?);
+    let mut b = Some(primary.lease_device_buffer_owned(bytes)?);
+    let launch = unsafe {
+        primary.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_merge_join_coordinates", &ptx)?;
+    let mut width = 1_u64;
+    let mut pass = 0_u32;
+    let mut src_ptr = source.ptr;
+    while width < u64::from(coordinates.row_count) {
+        let dst_ptr = if pass.is_multiple_of(2) {
+            a.as_ref().unwrap().ptr
+        } else {
+            b.as_ref().unwrap().ptr
+        };
+        let merge_count = u64::from(coordinates.row_count).div_ceil(width * 2);
+        let mut a0 = src_ptr;
+        let mut a1 = dst_ptr;
+        let mut a2 = coordinates.row_count;
+        let mut a3 = coordinates.relation_count;
+        let mut a4 = width;
+        let mut a5 = desc.ptr;
+        let mut a6 = order.len() as u32;
+        let mut args = [
+            (&mut a0 as *mut u64).cast(),
+            (&mut a1 as *mut u64).cast(),
+            (&mut a2 as *mut u32).cast(),
+            (&mut a3 as *mut u32).cast(),
+            (&mut a4 as *mut u64).cast(),
+            (&mut a5 as *mut u64).cast(),
+            (&mut a6 as *mut u32).cast(),
+        ];
+        check_cuda(unsafe {
+            launch(function, merge_count.div_ceil(256).clamp(1, 65_535) as u32, 1, 1, 256, 1, 1, 0,
+                std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut())
+        })?;
+        src_ptr = dst_ptr;
+        pass += 1;
+        width = width.saturating_mul(2);
+    }
+    let output = if pass % 2 == 1 {
+        a.take().unwrap()
+    } else {
+        b.take().unwrap()
+    };
+    Ok(CudaJoinCoordinatesU32 {
+        coordinates: Some(output),
+        row_count: coordinates.row_count,
+        relation_count: coordinates.relation_count,
+        // Only the selected output buffer is retained; the alternate merge buffer and descriptor
+        // are returned to their pools before this coordinate relation escapes.
+        allocated_bytes: bytes as u64,
+    })
+}
+
+fn launch_cuda_identity_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    row_count: u32,
+    eligibility: Option<&CudaPredicateMaskI32>,
+) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+.visible .entry gpu_db_identity_join_coordinates(
+    .param .u32 rows, .param .u64 mask, .param .u64 out, .param .u64 cursor)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+    ld.param.u32 %r1, [rows];
+    ld.param.u64 %rd1, [mask];
+    ld.param.u64 %rd2, [out];
+    ld.param.u64 %rd3, [cursor];
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %nctaid.x;
+    mad.lo.u32 %r6, %r3, %r4, %r2;
+    mul.lo.u32 %r7, %r5, %r4;
+LOOP:
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra DONE;
+    mov.u64 %rd4, 18446744073709551615;
+    setp.eq.u64 %p2, %rd1, %rd4;
+    @%p2 bra KEEP;
+    mul.wide.u32 %rd5, %r6, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.u32 %r8, [%rd6];
+    setp.eq.u32 %p3, %r8, 0;
+    @%p3 bra NEXT;
+KEEP:
+    atom.global.add.u64 %rd7, [%rd3], 1;
+    setp.eq.u64 %p4, %rd2, 0;
+    @%p4 bra NEXT;
+    mul.lo.u64 %rd8, %rd7, 4;
+    add.u64 %rd9, %rd2, %rd8;
+    st.global.u32 [%rd9], %r6;
+NEXT:
+    add.u32 %r6, %r6, %r7;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+    if eligibility.is_some_and(|mask| mask.row_count != row_count) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(row_count as usize));
+    }
+    if row_count == 0 {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: 1,
+            allocated_bytes: 0,
+        });
+    }
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let launch = unsafe {
+        primary.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let dtoh = unsafe {
+        primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let memset = unsafe {
+        primary.lib().get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cursor = primary.lease_device_buffer_owned(8)?;
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_identity_join_coordinates", &ptx)?;
+    let run = |out: u64| -> Result<(), CudaRuntimeProbeError> {
+        let mut a0 = row_count;
+        let mut a1 = eligibility.map_or(u64::MAX, |mask| mask.mask.ptr);
+        let mut a2 = out;
+        let mut a3 = cursor.ptr;
+        let mut args = [
+            (&mut a0 as *mut u32).cast(),
+            (&mut a1 as *mut u64).cast(),
+            (&mut a2 as *mut u64).cast(),
+            (&mut a3 as *mut u64).cast(),
+        ];
+        check_cuda(unsafe {
+            launch(function, 1, 1, 1, 1, 1, 1, 0,
+                std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut())
+        })
+    };
+    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
+    run(0)?;
+    let mut count = 0_u64;
+    check_cuda(unsafe { dtoh((&mut count as *mut u64).cast(), cursor.ptr, 8) })?;
+    if count == 0 {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: 1,
+            allocated_bytes: 0,
+        });
+    }
+    let count_u32 = u32::try_from(count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let bytes = count_u32 as usize * 4;
+    let output = primary.lease_device_buffer_owned(bytes)?;
+    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
+    run(output.ptr)?;
+    Ok(CudaJoinCoordinatesU32 {
+        coordinates: Some(output),
+        row_count: count_u32,
+        relation_count: 1,
+        // The scalar compaction cursor is temporary and has already been released.
+        allocated_bytes: bytes as u64,
+    })
+}
+
+fn launch_cuda_window_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    coordinates: &CudaJoinCoordinatesU32,
+    offset: u32,
+    limit: Option<u32>,
+) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_window_join_coordinates(
+    .param .u64 src, .param .u32 start, .param .u32 rows,
+    .param .u32 rels, .param .u64 dst)
+{
+    .reg .pred %p;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+    ld.param.u64 %rd1, [src];
+    ld.param.u32 %r1, [start];
+    ld.param.u32 %r2, [rows];
+    ld.param.u32 %r3, [rels];
+    ld.param.u64 %rd2, [dst];
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %nctaid.x;
+    mad.lo.u32 %r8, %r5, %r6, %r4;
+    mul.lo.u32 %r9, %r7, %r6;
+LOOP:
+    setp.ge.u32 %p, %r8, %r2;
+    @%p bra DONE;
+    add.u32 %r10, %r8, %r1;
+    mul.lo.u32 %r10, %r10, %r3;
+    mul.lo.u32 %r11, %r8, %r3;
+    mov.u32 %r12, 0;
+COPY:
+    setp.ge.u32 %p, %r12, %r3;
+    @%p bra NEXT;
+    add.u32 %r13, %r10, %r12;
+    add.u32 %r14, %r11, %r12;
+    mul.wide.u32 %rd3, %r13, 4;
+    mul.wide.u32 %rd4, %r14, 4;
+    add.u64 %rd5, %rd1, %rd3;
+    add.u64 %rd6, %rd2, %rd4;
+    ld.global.u32 %r15, [%rd5];
+    st.global.u32 [%rd6], %r15;
+    add.u32 %r12, %r12, 1;
+    bra COPY;
+NEXT:
+    add.u32 %r8, %r8, %r9;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+    let start = offset.min(coordinates.row_count);
+    let available = coordinates.row_count - start;
+    let rows = limit.map_or(available, |limit| limit.min(available));
+    if rows == 0 {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: coordinates.relation_count,
+            allocated_bytes: 0,
+        });
+    }
+    if start == 0 && rows == coordinates.row_count {
+        // A no-op window still returns a distinct device relation because the coordinate guard is not
+        // cloneable by design; one D2D pass keeps ownership explicit.
+    }
+    let source = coordinates.coordinates.as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let bytes = rows as usize * coordinates.relation_count as usize * 4;
+    let output = primary.lease_device_buffer_owned(bytes)?;
+    let launch = unsafe {
+        primary.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_window_join_coordinates", &ptx)?;
+    let mut a0 = source.ptr;
+    let mut a1 = start;
+    let mut a2 = rows;
+    let mut a3 = coordinates.relation_count;
+    let mut a4 = output.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast(),
+        (&mut a1 as *mut u32).cast(),
+        (&mut a2 as *mut u32).cast(),
+        (&mut a3 as *mut u32).cast(),
+        (&mut a4 as *mut u64).cast(),
+    ];
+    check_cuda(unsafe {
+        launch(function, rows.div_ceil(256).clamp(1, 65_535), 1, 1, 256, 1, 1, 0,
+            std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut())
+    })?;
+    Ok(CudaJoinCoordinatesU32 {
+        coordinates: Some(output),
+        row_count: rows,
+        relation_count: coordinates.relation_count,
+        allocated_bytes: bytes as u64,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_project_text_from_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    coordinates: &CudaJoinCoordinatesU32,
+    relation: u32,
+    payload: &CudaResidentDeviceMemory,
+    offsets_byte_offset: u64,
+    bytes_byte_offset: u64,
+    bytes_len: u64,
+    validity_bitmap_offset: Option<u64>,
+) -> Result<Vec<Option<String>>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_project_text_join_lengths(
+    .param .u64 coords, .param .u32 rows, .param .u32 rels, .param .u32 relation,
+    .param .u64 payload, .param .u64 offsets_off, .param .u64 validity,
+    .param .u64 out_lengths, .param .u64 out_valid)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<32>;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [rels];
+    ld.param.u32 %r3, [relation];
+    ld.param.u64 %rd2, [payload];
+    ld.param.u64 %rd3, [offsets_off];
+    ld.param.u64 %rd4, [validity];
+    ld.param.u64 %rd5, [out_lengths];
+    ld.param.u64 %rd6, [out_valid];
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %nctaid.x;
+    mad.lo.u32 %r8, %r5, %r6, %r4;
+    mul.lo.u32 %r9, %r7, %r6;
+L_LOOP:
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra L_DONE;
+    mov.u32 %r10, 0;
+    mov.u64 %rd7, 0;
+    mul.lo.u32 %r11, %r8, %r2;
+    add.u32 %r11, %r11, %r3;
+    mul.wide.u32 %rd8, %r11, 4;
+    add.u64 %rd9, %rd1, %rd8;
+    ld.global.u32 %r12, [%rd9];
+    setp.eq.u32 %p2, %r12, 4294967295;
+    @%p2 bra L_WRITE;
+    mov.u64 %rd10, 18446744073709551615;
+    setp.eq.u64 %p3, %rd4, %rd10;
+    @%p3 bra L_VALID;
+    shr.u32 %r13, %r12, 5;
+    mul.wide.u32 %rd11, %r13, 4;
+    add.u64 %rd12, %rd4, %rd11;
+    ld.global.u32 %r14, [%rd12];
+    and.b32 %r13, %r12, 31;
+    shr.u32 %r14, %r14, %r13;
+    and.b32 %r14, %r14, 1;
+    setp.eq.u32 %p4, %r14, 0;
+    @%p4 bra L_WRITE;
+L_VALID:
+    mov.u32 %r10, 1;
+    mul.wide.u32 %rd13, %r12, 8;
+    add.u64 %rd14, %rd2, %rd3;
+    add.u64 %rd15, %rd14, %rd13;
+    ld.global.u64 %rd16, [%rd15];
+    ld.global.u64 %rd17, [%rd15+8];
+    sub.u64 %rd7, %rd17, %rd16;
+L_WRITE:
+    mul.wide.u32 %rd18, %r8, 8;
+    add.u64 %rd19, %rd5, %rd18;
+    st.global.u64 [%rd19], %rd7;
+    cvt.u64.u32 %rd20, %r8;
+    add.u64 %rd21, %rd6, %rd20;
+    st.global.u8 [%rd21], %r10;
+    add.u32 %r8, %r8, %r9;
+    bra L_LOOP;
+L_DONE:
+    ret;
+}
+
+.visible .entry gpu_db_project_text_join_copy(
+    .param .u64 coords, .param .u32 rows, .param .u32 rels, .param .u32 relation,
+    .param .u64 payload, .param .u64 offsets_off, .param .u64 bytes_off,
+    .param .u64 validity, .param .u64 dest_offsets, .param .u64 out_bytes)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<40>;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [rels];
+    ld.param.u32 %r3, [relation];
+    ld.param.u64 %rd2, [payload];
+    ld.param.u64 %rd3, [offsets_off];
+    ld.param.u64 %rd4, [bytes_off];
+    ld.param.u64 %rd5, [validity];
+    ld.param.u64 %rd6, [dest_offsets];
+    ld.param.u64 %rd7, [out_bytes];
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %nctaid.x;
+    mad.lo.u32 %r8, %r5, %r6, %r4;
+    mul.lo.u32 %r9, %r7, %r6;
+C_ROW:
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra C_DONE;
+    mul.lo.u32 %r10, %r8, %r2;
+    add.u32 %r10, %r10, %r3;
+    mul.wide.u32 %rd8, %r10, 4;
+    add.u64 %rd9, %rd1, %rd8;
+    ld.global.u32 %r11, [%rd9];
+    setp.eq.u32 %p2, %r11, 4294967295;
+    @%p2 bra C_NEXT;
+    mov.u64 %rd10, 18446744073709551615;
+    setp.eq.u64 %p3, %rd5, %rd10;
+    @%p3 bra C_VALID;
+    shr.u32 %r12, %r11, 5;
+    mul.wide.u32 %rd11, %r12, 4;
+    add.u64 %rd12, %rd5, %rd11;
+    ld.global.u32 %r13, [%rd12];
+    and.b32 %r12, %r11, 31;
+    shr.u32 %r13, %r13, %r12;
+    and.b32 %r13, %r13, 1;
+    setp.eq.u32 %p4, %r13, 0;
+    @%p4 bra C_NEXT;
+C_VALID:
+    mul.wide.u32 %rd13, %r11, 8;
+    add.u64 %rd14, %rd2, %rd3;
+    add.u64 %rd15, %rd14, %rd13;
+    ld.global.u64 %rd16, [%rd15];
+    ld.global.u64 %rd17, [%rd15+8];
+    mul.wide.u32 %rd18, %r8, 8;
+    add.u64 %rd19, %rd6, %rd18;
+    ld.global.u64 %rd20, [%rd19];
+    add.u64 %rd21, %rd2, %rd4;
+    add.u64 %rd21, %rd21, %rd16;
+    add.u64 %rd22, %rd7, %rd20;
+    sub.u64 %rd23, %rd17, %rd16;
+    mov.u64 %rd24, 0;
+C_BYTE:
+    setp.ge.u64 %p5, %rd24, %rd23;
+    @%p5 bra C_NEXT;
+    add.u64 %rd25, %rd21, %rd24;
+    add.u64 %rd26, %rd22, %rd24;
+    ld.global.u8 %r14, [%rd25];
+    st.global.u8 [%rd26], %r14;
+    add.u64 %rd24, %rd24, 1;
+    bra C_BYTE;
+C_NEXT:
+    add.u32 %r8, %r8, %r9;
+    bra C_ROW;
+C_DONE:
+    ret;
+}
+"#;
+    if relation >= coordinates.relation_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(relation as usize));
+    }
+    if coordinates.row_count == 0 {
+        return Ok(Vec::new());
+    }
+    if payload.metadata.gpu_id != ctx.metadata.gpu_id
+        || offsets_byte_offset > payload.metadata.allocated_bytes
+        || bytes_byte_offset
+            .checked_add(bytes_len)
+            .is_none_or(|end| end > payload.metadata.allocated_bytes)
+        || validity_bitmap_offset.is_some_and(|off| off > payload.metadata.allocated_bytes)
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes_len as usize));
+    }
+    let source = coordinates
+        .coordinates
+        .as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let htod = unsafe {
+        primary
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let dtoh = unsafe {
+        primary
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let launch = unsafe {
+        primary
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let n = coordinates.row_count as usize;
+    let lengths_dev = primary.lease_device_buffer_owned(n * 8)?;
+    let valid_dev = primary.lease_device_buffer_owned(n)?;
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let lengths_fn = primary.cached_function(c"gpu_db_project_text_join_lengths", &ptx)?;
+    let copy_fn = primary.cached_function(c"gpu_db_project_text_join_copy", &ptx)?;
+    let validity = validity_bitmap_offset.map_or(u64::MAX, |off| payload.device_ptr + off);
+    let mut a0 = source.ptr;
+    let mut a1 = coordinates.row_count;
+    let mut a2 = coordinates.relation_count;
+    let mut a3 = relation;
+    let mut a4 = payload.device_ptr;
+    let mut a5 = offsets_byte_offset;
+    let mut a6 = validity;
+    let mut a7 = lengths_dev.ptr;
+    let mut a8 = valid_dev.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast(),
+        (&mut a1 as *mut u32).cast(),
+        (&mut a2 as *mut u32).cast(),
+        (&mut a3 as *mut u32).cast(),
+        (&mut a4 as *mut u64).cast(),
+        (&mut a5 as *mut u64).cast(),
+        (&mut a6 as *mut u64).cast(),
+        (&mut a7 as *mut u64).cast(),
+        (&mut a8 as *mut u64).cast(),
+    ];
+    let grid = coordinates.row_count.div_ceil(256).clamp(1, 65_535);
+    check_cuda(unsafe {
+        launch(
+            lengths_fn,
+            grid,
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    let mut lengths = vec![0_u64; n];
+    let mut valid = vec![0_u8; n];
+    check_cuda(unsafe { dtoh(lengths.as_mut_ptr().cast(), lengths_dev.ptr, n * 8) })?;
+    check_cuda(unsafe { dtoh(valid.as_mut_ptr().cast(), valid_dev.ptr, n) })?;
+    let mut destinations = Vec::with_capacity(n + 1);
+    destinations.push(0_u64);
+    for &len in &lengths {
+        destinations.push(
+            destinations
+                .last()
+                .copied()
+                .unwrap()
+                .checked_add(len)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+        );
+    }
+    let total = usize::try_from(*destinations.last().unwrap())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let destination_dev = primary.lease_device_buffer_owned(destinations.len() * 8)?;
+    check_cuda(unsafe {
+        htod(
+            destination_dev.ptr,
+            destinations.as_ptr().cast(),
+            destinations.len() * 8,
+        )
+    })?;
+    let bytes_dev = primary.lease_device_buffer_owned(total.max(1))?;
+    let mut c0 = source.ptr;
+    let mut c1 = coordinates.row_count;
+    let mut c2 = coordinates.relation_count;
+    let mut c3 = relation;
+    let mut c4 = payload.device_ptr;
+    let mut c5 = offsets_byte_offset;
+    let mut c6 = bytes_byte_offset;
+    let mut c7 = validity;
+    let mut c8 = destination_dev.ptr;
+    let mut c9 = bytes_dev.ptr;
+    let mut cargs = [
+        (&mut c0 as *mut u64).cast(),
+        (&mut c1 as *mut u32).cast(),
+        (&mut c2 as *mut u32).cast(),
+        (&mut c3 as *mut u32).cast(),
+        (&mut c4 as *mut u64).cast(),
+        (&mut c5 as *mut u64).cast(),
+        (&mut c6 as *mut u64).cast(),
+        (&mut c7 as *mut u64).cast(),
+        (&mut c8 as *mut u64).cast(),
+        (&mut c9 as *mut u64).cast(),
+    ];
+    check_cuda(unsafe {
+        launch(
+            copy_fn,
+            grid,
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            cargs.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    let mut bytes = vec![0_u8; total];
+    if total > 0 {
+        check_cuda(unsafe { dtoh(bytes.as_mut_ptr().cast(), bytes_dev.ptr, total) })?;
+    }
+    (0..n)
+        .map(|row| {
+            if valid[row] == 0 {
+                return Ok(None);
+            }
+            let start = destinations[row] as usize;
+            let end = destinations[row + 1] as usize;
+            String::from_utf8(bytes[start..end].to_vec())
+                .map(Some)
+                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(end - start))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_project_bool_from_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    coordinates: &CudaJoinCoordinatesU32,
+    relation: u32,
+    payload: &CudaResidentDeviceMemory,
+    bitmap_byte_offset: u64,
+    validity_bitmap_offset: Option<u64>,
+) -> Result<Vec<Option<bool>>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_project_bool_join_coordinates(
+    .param .u64 coords, .param .u32 rows, .param .u32 rels, .param .u32 relation,
+    .param .u64 payload, .param .u64 bitmap, .param .u64 validity,
+    .param .u64 out_values, .param .u64 out_valid)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<32>;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [rels];
+    ld.param.u32 %r3, [relation];
+    ld.param.u64 %rd2, [payload];
+    ld.param.u64 %rd3, [bitmap];
+    ld.param.u64 %rd4, [validity];
+    ld.param.u64 %rd5, [out_values];
+    ld.param.u64 %rd6, [out_valid];
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %nctaid.x;
+    mad.lo.u32 %r8, %r5, %r6, %r4;
+    mul.lo.u32 %r9, %r7, %r6;
+LOOP:
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra DONE;
+    mov.u32 %r10, 0;
+    mov.u32 %r11, 0;
+    mul.lo.u32 %r12, %r8, %r2;
+    add.u32 %r12, %r12, %r3;
+    mul.wide.u32 %rd7, %r12, 4;
+    add.u64 %rd8, %rd1, %rd7;
+    ld.global.u32 %r13, [%rd8];
+    setp.eq.u32 %p2, %r13, 4294967295;
+    @%p2 bra WRITE;
+    mov.u64 %rd9, 18446744073709551615;
+    setp.eq.u64 %p3, %rd4, %rd9;
+    @%p3 bra VALID;
+    shr.u32 %r14, %r13, 5;
+    mul.wide.u32 %rd10, %r14, 4;
+    add.u64 %rd11, %rd4, %rd10;
+    ld.global.u32 %r15, [%rd11];
+    and.b32 %r14, %r13, 31;
+    shr.u32 %r15, %r15, %r14;
+    and.b32 %r15, %r15, 1;
+    setp.eq.u32 %p4, %r15, 0;
+    @%p4 bra WRITE;
+VALID:
+    mov.u32 %r10, 1;
+    shr.u32 %r14, %r13, 5;
+    mul.wide.u32 %rd10, %r14, 4;
+    add.u64 %rd11, %rd2, %rd3;
+    add.u64 %rd11, %rd11, %rd10;
+    ld.global.u32 %r15, [%rd11];
+    and.b32 %r14, %r13, 31;
+    shr.u32 %r15, %r15, %r14;
+    and.b32 %r11, %r15, 1;
+WRITE:
+    cvt.u64.u32 %rd12, %r8;
+    add.u64 %rd13, %rd5, %rd12;
+    add.u64 %rd14, %rd6, %rd12;
+    st.global.u8 [%rd13], %r11;
+    st.global.u8 [%rd14], %r10;
+    add.u32 %r8, %r8, %r9;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+    if relation >= coordinates.relation_count || coordinates.row_count == 0 {
+        return if coordinates.row_count == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(CudaRuntimeProbeError::InvalidInputLength(relation as usize))
+        };
+    }
+    let source = coordinates.coordinates.as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let n = coordinates.row_count as usize;
+    let values = primary.lease_device_buffer_owned(n)?;
+    let valid = primary.lease_device_buffer_owned(n)?;
+    let launch = unsafe {
+        primary.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let dtoh = unsafe {
+        primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_project_bool_join_coordinates", &ptx)?;
+    let mut a0 = source.ptr;
+    let mut a1 = coordinates.row_count;
+    let mut a2 = coordinates.relation_count;
+    let mut a3 = relation;
+    let mut a4 = payload.device_ptr;
+    let mut a5 = bitmap_byte_offset;
+    let mut a6 = validity_bitmap_offset.map_or(u64::MAX, |off| payload.device_ptr + off);
+    let mut a7 = values.ptr;
+    let mut a8 = valid.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast(),
+        (&mut a1 as *mut u32).cast(),
+        (&mut a2 as *mut u32).cast(),
+        (&mut a3 as *mut u32).cast(),
+        (&mut a4 as *mut u64).cast(),
+        (&mut a5 as *mut u64).cast(),
+        (&mut a6 as *mut u64).cast(),
+        (&mut a7 as *mut u64).cast(),
+        (&mut a8 as *mut u64).cast(),
+    ];
+    check_cuda(unsafe {
+        launch(function, coordinates.row_count.div_ceil(256).clamp(1, 65_535), 1, 1, 256, 1, 1, 0,
+            std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut())
+    })?;
+    let mut values_host = vec![0_u8; n];
+    let mut valid_host = vec![0_u8; n];
+    check_cuda(unsafe { dtoh(values_host.as_mut_ptr().cast(), values.ptr, n) })?;
+    check_cuda(unsafe { dtoh(valid_host.as_mut_ptr().cast(), valid.ptr, n) })?;
+    Ok(values_host
+        .into_iter()
+        .zip(valid_host)
+        .map(|(value, valid)| (valid != 0).then_some(value != 0))
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_project_fixed_from_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    coordinates: &CudaJoinCoordinatesU32,
+    relation: u32,
+    payload: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    validity_bitmap_offset: Option<u64>,
+    width: u8,
+) -> Result<(Vec<u8>, Vec<bool>), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_project_fixed_join_coordinates(
+    .param .u64 coords, .param .u32 rows, .param .u32 rels, .param .u32 relation,
+    .param .u64 payload, .param .u64 offset, .param .u64 validity, .param .u32 width,
+    .param .u64 out_values, .param .u64 out_valid)
+{
+    .reg .pred %p<10>;
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<40>;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [rels];
+    ld.param.u32 %r3, [relation];
+    ld.param.u64 %rd2, [payload];
+    ld.param.u64 %rd3, [offset];
+    ld.param.u64 %rd4, [validity];
+    ld.param.u32 %r4, [width];
+    ld.param.u64 %rd5, [out_values];
+    ld.param.u64 %rd6, [out_valid];
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mov.u32 %r8, %nctaid.x;
+    mad.lo.u32 %r9, %r6, %r7, %r5;
+    mul.lo.u32 %r10, %r8, %r7;
+LOOP:
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra DONE;
+    mul.lo.u32 %r11, %r9, %r2;
+    add.u32 %r11, %r11, %r3;
+    mul.wide.u32 %rd7, %r11, 4;
+    add.u64 %rd8, %rd1, %rd7;
+    ld.global.u32 %r12, [%rd8];
+    mov.u32 %r13, 0;
+    setp.eq.u32 %p2, %r12, 4294967295;
+    @%p2 bra WRITE_VALID;
+    mov.u64 %rd9, 18446744073709551615;
+    setp.eq.u64 %p3, %rd4, %rd9;
+    @%p3 bra VALUE_VALID;
+    shr.u32 %r14, %r12, 5;
+    mul.wide.u32 %rd10, %r14, 4;
+    add.u64 %rd11, %rd4, %rd10;
+    ld.global.u32 %r15, [%rd11];
+    and.b32 %r14, %r12, 31;
+    shr.u32 %r15, %r15, %r14;
+    and.b32 %r15, %r15, 1;
+    setp.eq.u32 %p4, %r15, 0;
+    @%p4 bra WRITE_VALID;
+VALUE_VALID:
+    mov.u32 %r13, 1;
+    mul.wide.u32 %rd12, %r12, %r4;
+    add.u64 %rd12, %rd12, %rd2;
+    add.u64 %rd12, %rd12, %rd3;
+    mul.wide.u32 %rd13, %r9, %r4;
+    add.u64 %rd13, %rd5, %rd13;
+    setp.eq.u32 %p5, %r4, 4;
+    @%p5 bra COPY4;
+    ld.global.u64 %rd14, [%rd12];
+    st.global.u64 [%rd13], %rd14;
+    setp.eq.u32 %p6, %r4, 16;
+    @!%p6 bra WRITE_VALID;
+    ld.global.u64 %rd14, [%rd12+8];
+    st.global.u64 [%rd13+8], %rd14;
+    bra WRITE_VALID;
+COPY4:
+    ld.global.u32 %r16, [%rd12];
+    st.global.u32 [%rd13], %r16;
+WRITE_VALID:
+    cvt.u64.u32 %rd15, %r9;
+    add.u64 %rd15, %rd6, %rd15;
+    st.global.u8 [%rd15], %r13;
+    add.u32 %r9, %r9, %r10;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+    if relation >= coordinates.relation_count || !matches!(width, 4 | 8 | 16) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(relation as usize));
+    }
+    if coordinates.row_count == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if payload.metadata.gpu_id != ctx.metadata.gpu_id
+        || byte_offset > payload.metadata.allocated_bytes
+        || validity_bitmap_offset.is_some_and(|off| off > payload.metadata.allocated_bytes)
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(byte_offset as usize));
+    }
+    let source = coordinates
+        .coordinates
+        .as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let launch = unsafe {
+        primary
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let dtoh = unsafe {
+        primary
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let value_bytes = coordinates.row_count as usize * width as usize;
+    let values = primary.lease_device_buffer_owned(value_bytes)?;
+    let valid = primary.lease_device_buffer_owned(coordinates.row_count as usize)?;
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_project_fixed_join_coordinates", &ptx)?;
+    let mut a0 = source.ptr;
+    let mut a1 = coordinates.row_count;
+    let mut a2 = coordinates.relation_count;
+    let mut a3 = relation;
+    let mut a4 = payload.device_ptr;
+    let mut a5 = byte_offset;
+    let mut a6 = validity_bitmap_offset.map_or(u64::MAX, |off| payload.device_ptr + off);
+    let mut a7 = u32::from(width);
+    let mut a8 = values.ptr;
+    let mut a9 = valid.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast(),
+        (&mut a1 as *mut u32).cast(),
+        (&mut a2 as *mut u32).cast(),
+        (&mut a3 as *mut u32).cast(),
+        (&mut a4 as *mut u64).cast(),
+        (&mut a5 as *mut u64).cast(),
+        (&mut a6 as *mut u64).cast(),
+        (&mut a7 as *mut u32).cast(),
+        (&mut a8 as *mut u64).cast(),
+        (&mut a9 as *mut u64).cast(),
+    ];
+    check_cuda(unsafe {
+        launch(
+            function,
+            coordinates.row_count.div_ceil(256).clamp(1, 65_535),
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    let mut host_values = vec![0_u8; value_bytes];
+    let mut host_valid = vec![0_u8; coordinates.row_count as usize];
+    check_cuda(unsafe { dtoh(host_values.as_mut_ptr().cast(), values.ptr, value_bytes) })?;
+    check_cuda(unsafe {
+        dtoh(
+            host_valid.as_mut_ptr().cast(),
+            valid.ptr,
+            host_valid.len(),
+        )
+    })?;
+    Ok((
+        host_values,
+        host_valid.into_iter().map(|value| value != 0).collect(),
+    ))
+}
+
+fn launch_cuda_filter_join_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    coordinates: &CudaJoinCoordinatesU32,
+    masks: &[Option<&CudaPredicateMaskI32>],
+    pad_masks: &[Option<&CudaPredicateMaskI32>],
+) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+.visible .entry gpu_db_filter_join_coordinates(
+    .param .u64 coords, .param .u32 rows, .param .u32 rels,
+    .param .u64 desc, .param .u64 out, .param .u64 cursor)
+{
+    .reg .pred %p<12>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<40>;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [rels];
+    ld.param.u64 %rd2, [desc];
+    ld.param.u64 %rd3, [out];
+    ld.param.u64 %rd4, [cursor];
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %nctaid.x;
+    mad.lo.u32 %r7, %r4, %r5, %r3;
+    mul.lo.u32 %r8, %r6, %r5;
+ROW_LOOP:
+    setp.ge.u32 %p1, %r7, %r1;
+    @%p1 bra DONE;
+    mov.u32 %r9, 0;
+REL_LOOP:
+    setp.ge.u32 %p2, %r9, %r2;
+    @%p2 bra KEEP;
+    mul.lo.u32 %r10, %r7, %r2;
+    add.u32 %r10, %r10, %r9;
+    mul.wide.u32 %rd5, %r10, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.u32 %r11, [%rd6];
+    mul.wide.u32 %rd7, %r9, 16;
+    add.u64 %rd8, %rd2, %rd7;
+    ld.global.u64 %rd9, [%rd8];
+    ld.global.u64 %rd10, [%rd8+8];
+    mov.u64 %rd11, 18446744073709551615;
+    setp.eq.u32 %p3, %r11, 4294967295;
+    @%p3 bra PAD_TEST;
+    setp.eq.u64 %p4, %rd9, %rd11;
+    @%p4 bra REL_NEXT;
+    mul.wide.u32 %rd12, %r11, 4;
+    add.u64 %rd13, %rd9, %rd12;
+    ld.global.u32 %r12, [%rd13];
+    setp.eq.u32 %p5, %r12, 0;
+    @%p5 bra ROW_NEXT;
+    bra REL_NEXT;
+PAD_TEST:
+    setp.eq.u64 %p6, %rd9, %rd11;
+    @%p6 bra REL_NEXT;
+    setp.eq.u64 %p7, %rd10, %rd11;
+    @%p7 bra REL_NEXT;
+    ld.global.u32 %r12, [%rd10];
+    setp.eq.u32 %p7, %r12, 0;
+    @%p7 bra ROW_NEXT;
+REL_NEXT:
+    add.u32 %r9, %r9, 1;
+    bra REL_LOOP;
+KEEP:
+    atom.global.add.u64 %rd14, [%rd4], 1;
+    setp.eq.u64 %p8, %rd3, 0;
+    @%p8 bra ROW_NEXT;
+    cvt.u64.u32 %rd15, %r2;
+    mul.lo.u64 %rd16, %rd14, %rd15;
+    mov.u32 %r13, 0;
+COPY_LOOP:
+    setp.ge.u32 %p9, %r13, %r2;
+    @%p9 bra ROW_NEXT;
+    mul.lo.u32 %r14, %r7, %r2;
+    add.u32 %r14, %r14, %r13;
+    mul.wide.u32 %rd17, %r14, 4;
+    add.u64 %rd18, %rd1, %rd17;
+    ld.global.u32 %r15, [%rd18];
+    cvt.u64.u32 %rd19, %r13;
+    add.u64 %rd20, %rd16, %rd19;
+    mul.lo.u64 %rd20, %rd20, 4;
+    add.u64 %rd20, %rd3, %rd20;
+    st.global.u32 [%rd20], %r15;
+    add.u32 %r13, %r13, 1;
+    bra COPY_LOOP;
+ROW_NEXT:
+    add.u32 %r7, %r7, %r8;
+    bra ROW_LOOP;
+DONE:
+    ret;
+}
+"#;
+    if masks.len() != coordinates.relation_count as usize
+        || pad_masks.len() != masks.len()
+        || masks.iter().flatten().any(|mask| mask.row_count == 0)
+        || pad_masks
+            .iter()
+            .flatten()
+            .any(|mask| mask.row_count != 1)
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(masks.len()));
+    }
+    if coordinates.row_count == 0 {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: coordinates.relation_count,
+            allocated_bytes: 0,
+        });
+    }
+    let source = coordinates
+        .coordinates
+        .as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let htod = unsafe {
+        primary
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let dtoh = unsafe {
+        primary
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let memset = unsafe {
+        primary
+            .lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let launch = unsafe {
+        primary
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let descriptor: Vec<u64> = masks
+        .iter()
+        .zip(pad_masks)
+        .flat_map(|(mask, pad)| {
+            [
+                mask.map_or(u64::MAX, |mask| mask.mask.ptr),
+                pad.map_or(u64::MAX, |mask| mask.mask.ptr),
+            ]
+        })
+        .collect();
+    let desc_bytes = std::mem::size_of_val(descriptor.as_slice());
+    let desc = primary.lease_device_buffer_owned(desc_bytes.max(1))?;
+    check_cuda(unsafe { htod(desc.ptr, descriptor.as_ptr().cast(), desc_bytes) })?;
+    let cursor = primary.lease_device_buffer_owned(8)?;
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_filter_join_coordinates", &ptx)?;
+    const BLOCK: u32 = 256;
+    let grid = coordinates.row_count.div_ceil(BLOCK).clamp(1, 65_535);
+    let run = |out: u64| -> Result<(), CudaRuntimeProbeError> {
+        let mut a0 = source.ptr;
+        let mut a1 = coordinates.row_count;
+        let mut a2 = coordinates.relation_count;
+        let mut a3 = desc.ptr;
+        let mut a4 = out;
+        let mut a5 = cursor.ptr;
+        let mut args = [
+            (&mut a0 as *mut u64).cast(),
+            (&mut a1 as *mut u32).cast(),
+            (&mut a2 as *mut u32).cast(),
+            (&mut a3 as *mut u64).cast(),
+            (&mut a4 as *mut u64).cast(),
+            (&mut a5 as *mut u64).cast(),
+        ];
+        check_cuda(unsafe {
+            launch(
+                function,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+    };
+    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
+    run(0)?;
+    let mut total = 0_u64;
+    check_cuda(unsafe { dtoh((&mut total as *mut u64).cast(), cursor.ptr, 8) })?;
+    let total_u32 = u32::try_from(total)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if total == 0 {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: coordinates.relation_count,
+            allocated_bytes: 0,
+        });
+    }
+    let output_bytes = total
+        .checked_mul(u64::from(coordinates.relation_count))
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output = primary.lease_device_buffer_owned(output_bytes)?;
+    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
+    run(output.ptr)?;
+    Ok(CudaJoinCoordinatesU32 {
+        coordinates: Some(output),
+        row_count: total_u32,
+        relation_count: coordinates.relation_count,
+        allocated_bytes: output_bytes as u64 + desc_bytes as u64 + 8,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_join_fixed_payload_coordinates(
+    ctx: &CudaResidentDeviceMemory,
+    accumulated: Option<&CudaJoinCoordinatesU32>,
+    left_row_count: u32,
+    left_key_relations: &[u32],
+    left_keys: &[CudaJoinPayloadKey<'_>],
+    right_row_count: u32,
+    right_keys: &[CudaJoinPayloadKey<'_>],
+    left_eligibility: Option<&CudaPredicateMaskI32>,
+    right_eligibility: Option<&CudaPredicateMaskI32>,
+    outer_left: bool,
+    outer_right: bool,
+    persistent_left_marks: Option<&CudaMatchBitmapU32>,
+    persistent_right_marks: Option<&CudaMatchBitmapU32>,
+) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+
+// Match/count or match/emit one accumulated tuple x one new-relation row. Keys are read straight
+// from their source payloads; `coords` carries the accumulated relation's absolute row coordinate.
+.visible .entry gpu_db_join_fixed_match(
+    .param .u64 coords, .param .u32 left_n, .param .u32 left_rels,
+    .param .u32 has_coords, .param .u64 left_key_rels,
+    .param .u64 lb0, .param .u64 lo0, .param .u64 lv0, .param .u32 lw0,
+    .param .u64 rb0, .param .u64 ro0, .param .u64 rv0, .param .u32 rw0,
+    .param .u64 lb1, .param .u64 lo1, .param .u64 lv1, .param .u32 lw1,
+    .param .u64 rb1, .param .u64 ro1, .param .u64 rv1, .param .u32 rw1,
+    .param .u32 right_n, .param .u64 left_mask, .param .u64 right_mask,
+    .param .u64 left_marks, .param .u64 right_marks,
+    .param .u64 out, .param .u64 cursor)
+{
+    .reg .pred %p<32>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<96>;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r1, [left_n];
+    ld.param.u32 %r2, [left_rels];
+    ld.param.u32 %r3, [has_coords];
+    ld.param.u64 %rd64, [left_key_rels]; cvt.u32.u64 %r34, %rd64;
+    shr.u64 %rd64, %rd64, 32; cvt.u32.u64 %r4, %rd64;
+    ld.param.u32 %r5, [right_n];
+    ld.param.u64 %rd2, [left_mask];
+    ld.param.u64 %rd3, [right_mask];
+    ld.param.u64 %rd4, [left_marks];
+    ld.param.u64 %rd5, [right_marks];
+    ld.param.u64 %rd6, [out];
+    ld.param.u64 %rd7, [cursor];
+
+    mov.u32 %r6, %tid.x;
+    mov.u32 %r7, %ctaid.x;
+    mov.u32 %r8, %ntid.x;
+    mov.u32 %r9, %nctaid.x;
+    mad.lo.u32 %r10, %r7, %r8, %r6;
+    mul.lo.u32 %r11, %r9, %r8;
+    cvt.u64.u32 %rd8, %r10;
+    cvt.u64.u32 %rd9, %r11;
+    cvt.u64.u32 %rd10, %r1;
+    cvt.u64.u32 %rd11, %r5;
+    mul.lo.u64 %rd12, %rd10, %rd11;
+PAIR_LOOP:
+    setp.ge.u64 %p1, %rd8, %rd12;
+    @%p1 bra MATCH_DONE;
+    div.u64 %rd13, %rd8, %rd11;
+    rem.u64 %rd14, %rd8, %rd11;
+    cvt.u32.u64 %r12, %rd13;
+    cvt.u32.u64 %r13, %rd14;
+    setp.eq.u32 %p2, %r3, 0;
+    @%p2 mov.u32 %r14, %r12;
+    @%p2 bra LEFT_ROW_READY;
+    mul.lo.u32 %r15, %r12, %r2;
+    add.u32 %r15, %r15, %r4;
+    mul.wide.u32 %rd15, %r15, 4;
+    add.u64 %rd16, %rd1, %rd15;
+    ld.global.u32 %r14, [%rd16];
+LEFT_ROW_READY:
+    setp.eq.u32 %p3, %r14, 4294967295;
+    @%p3 bra PAIR_NEXT;
+
+    mov.u64 %rd17, 18446744073709551615;
+    setp.eq.u64 %p4, %rd2, %rd17;
+    @%p4 bra LEFT_MASK_OK;
+    mul.wide.u32 %rd18, %r14, 4;
+    add.u64 %rd19, %rd2, %rd18;
+    ld.global.u32 %r16, [%rd19];
+    setp.eq.u32 %p5, %r16, 0;
+    @%p5 bra PAIR_NEXT;
+LEFT_MASK_OK:
+    setp.eq.u64 %p4, %rd3, %rd17;
+    @%p4 bra RIGHT_MASK_OK;
+    mul.wide.u32 %rd18, %r13, 4;
+    add.u64 %rd19, %rd3, %rd18;
+    ld.global.u32 %r16, [%rd19];
+    setp.eq.u32 %p5, %r16, 0;
+    @%p5 bra PAIR_NEXT;
+RIGHT_MASK_OK:
+
+    // Component 0 validity.
+    ld.param.u64 %rd20, [lv0];
+    setp.eq.u64 %p6, %rd20, %rd17;
+    @%p6 bra L0_VALID;
+    shr.u32 %r17, %r14, 5;
+    mul.wide.u32 %rd21, %r17, 4;
+    add.u64 %rd21, %rd20, %rd21;
+    ld.global.u32 %r18, [%rd21];
+    and.b32 %r17, %r14, 31;
+    shr.u32 %r18, %r18, %r17;
+    and.b32 %r18, %r18, 1;
+    setp.eq.u32 %p7, %r18, 0;
+    @%p7 bra PAIR_NEXT;
+L0_VALID:
+    ld.param.u64 %rd22, [rv0];
+    setp.eq.u64 %p6, %rd22, %rd17;
+    @%p6 bra R0_VALID;
+    shr.u32 %r17, %r13, 5;
+    mul.wide.u32 %rd21, %r17, 4;
+    add.u64 %rd21, %rd22, %rd21;
+    ld.global.u32 %r18, [%rd21];
+    and.b32 %r17, %r13, 31;
+    shr.u32 %r18, %r18, %r17;
+    and.b32 %r18, %r18, 1;
+    setp.eq.u32 %p7, %r18, 0;
+    @%p7 bra PAIR_NEXT;
+R0_VALID:
+    ld.param.u64 %rd23, [lb0];
+    ld.param.u64 %rd24, [lo0];
+    ld.param.u64 %rd25, [rb0];
+    ld.param.u64 %rd26, [ro0];
+    ld.param.u32 %r19, [lw0];
+    mul.wide.u32 %rd27, %r14, %r19;
+    mul.wide.u32 %rd28, %r13, %r19;
+    add.u64 %rd27, %rd27, %rd23;
+    add.u64 %rd27, %rd27, %rd24;
+    add.u64 %rd28, %rd28, %rd25;
+    add.u64 %rd28, %rd28, %rd26;
+    setp.eq.u32 %p20, %r19, 255;
+    @%p20 bra CMP0_TEXT;
+    setp.eq.u32 %p8, %r19, 4;
+    @%p8 bra CMP0_4;
+    ld.global.u32 %r35,[%rd27]; ld.global.u32 %r36,[%rd27+4];
+    cvt.u64.u32 %rd29,%r36; shl.b64 %rd29,%rd29,32; cvt.u64.u32 %rd72,%r35; or.b64 %rd29,%rd29,%rd72;
+    ld.global.u32 %r37,[%rd28]; ld.global.u32 %r38,[%rd28+4];
+    cvt.u64.u32 %rd30,%r38; shl.b64 %rd30,%rd30,32; cvt.u64.u32 %rd72,%r37; or.b64 %rd30,%rd30,%rd72;
+    setp.ne.u64 %p9, %rd29, %rd30;
+    @%p9 bra PAIR_NEXT;
+    setp.eq.u32 %p10, %r19, 16;
+    @!%p10 bra CMP0_DONE;
+    ld.global.u32 %r35,[%rd27+8]; ld.global.u32 %r36,[%rd27+12];
+    cvt.u64.u32 %rd29,%r36; shl.b64 %rd29,%rd29,32; cvt.u64.u32 %rd72,%r35; or.b64 %rd29,%rd29,%rd72;
+    ld.global.u32 %r37,[%rd28+8]; ld.global.u32 %r38,[%rd28+12];
+    cvt.u64.u32 %rd30,%r38; shl.b64 %rd30,%rd30,32; cvt.u64.u32 %rd72,%r37; or.b64 %rd30,%rd30,%rd72;
+    setp.ne.u64 %p9, %rd29, %rd30;
+    @%p9 bra PAIR_NEXT;
+    bra CMP0_DONE;
+CMP0_4:
+    ld.global.u32 %r20, [%rd27];
+    ld.global.u32 %r21, [%rd28];
+    setp.ne.u32 %p9, %r20, %r21;
+    @%p9 bra PAIR_NEXT;
+    bra CMP0_DONE;
+CMP0_TEXT:
+    // lo0/ro0 point at u64 row offsets; lo1/ro1 carry the corresponding bytes-section offsets.
+    mul.wide.u32 %rd51, %r14, 8;
+    mul.wide.u32 %rd52, %r13, 8;
+    add.u64 %rd53, %rd23, %rd24;
+    add.u64 %rd54, %rd25, %rd26;
+    add.u64 %rd55, %rd53, %rd51;
+    add.u64 %rd56, %rd54, %rd52;
+    ld.global.u64 %rd57, [%rd55];
+    ld.global.u64 %rd58, [%rd55+8];
+    ld.global.u64 %rd59, [%rd56];
+    ld.global.u64 %rd60, [%rd56+8];
+    sub.u64 %rd61, %rd58, %rd57;
+    sub.u64 %rd62, %rd60, %rd59;
+    setp.ne.u64 %p21, %rd61, %rd62;
+    @%p21 bra PAIR_NEXT;
+    ld.param.u64 %rd63, [lb1];
+    ld.param.u64 %rd64, [lo1];
+    ld.param.u64 %rd65, [rb1];
+    ld.param.u64 %rd66, [ro1];
+    add.u64 %rd67, %rd63, %rd64;
+    add.u64 %rd67, %rd67, %rd57;
+    add.u64 %rd68, %rd65, %rd66;
+    add.u64 %rd68, %rd68, %rd59;
+    mov.u64 %rd69, 0;
+TEXT_LOOP:
+    setp.ge.u64 %p22, %rd69, %rd61;
+    @%p22 bra CMP0_DONE;
+    add.u64 %rd70, %rd67, %rd69;
+    add.u64 %rd71, %rd68, %rd69;
+    ld.global.u8 %r33, [%rd70];
+    ld.global.u8 %r34, [%rd71];
+    setp.ne.u32 %p23, %r33, %r34;
+    @%p23 bra PAIR_NEXT;
+    add.u64 %rd69, %rd69, 1;
+    bra TEXT_LOOP;
+CMP0_DONE:
+
+    // Optional component 1 (a two-column fixed-width composite key).
+    ld.param.u32 %r22, [lw1];
+    setp.eq.u32 %p11, %r22, 0;
+    @%p11 bra PAIR_MATCH;
+    ld.param.u64 %rd31, [lv1];
+    setp.eq.u64 %p12, %rd31, %rd17;
+    @%p12 bra L1_VALID;
+    shr.u32 %r23, %r14, 5;
+    mul.wide.u32 %rd32, %r23, 4;
+    add.u64 %rd32, %rd31, %rd32;
+    ld.global.u32 %r24, [%rd32];
+    and.b32 %r23, %r14, 31;
+    shr.u32 %r24, %r24, %r23;
+    and.b32 %r24, %r24, 1;
+    setp.eq.u32 %p13, %r24, 0;
+    @%p13 bra PAIR_NEXT;
+L1_VALID:
+    ld.param.u64 %rd33, [rv1];
+    setp.eq.u64 %p12, %rd33, %rd17;
+    @%p12 bra R1_VALID;
+    shr.u32 %r23, %r13, 5;
+    mul.wide.u32 %rd32, %r23, 4;
+    add.u64 %rd32, %rd33, %rd32;
+    ld.global.u32 %r24, [%rd32];
+    and.b32 %r23, %r13, 31;
+    shr.u32 %r24, %r24, %r23;
+    and.b32 %r24, %r24, 1;
+    setp.eq.u32 %p13, %r24, 0;
+    @%p13 bra PAIR_NEXT;
+R1_VALID:
+    ld.param.u64 %rd34, [lb1];
+    ld.param.u64 %rd35, [lo1];
+    ld.param.u64 %rd36, [rb1];
+    ld.param.u64 %rd37, [ro1];
+    mul.wide.u32 %rd38, %r14, %r22;
+    mul.wide.u32 %rd39, %r13, %r22;
+    add.u64 %rd38, %rd38, %rd34;
+    add.u64 %rd38, %rd38, %rd35;
+    add.u64 %rd39, %rd39, %rd36;
+    add.u64 %rd39, %rd39, %rd37;
+    setp.eq.u32 %p14, %r22, 4;
+    @%p14 bra CMP1_4;
+    ld.global.u32 %r35,[%rd38]; ld.global.u32 %r36,[%rd38+4];
+    cvt.u64.u32 %rd40,%r36; shl.b64 %rd40,%rd40,32; cvt.u64.u32 %rd72,%r35; or.b64 %rd40,%rd40,%rd72;
+    ld.global.u32 %r37,[%rd39]; ld.global.u32 %r38,[%rd39+4];
+    cvt.u64.u32 %rd41,%r38; shl.b64 %rd41,%rd41,32; cvt.u64.u32 %rd72,%r37; or.b64 %rd41,%rd41,%rd72;
+    setp.ne.u64 %p15, %rd40, %rd41;
+    @%p15 bra PAIR_NEXT;
+    setp.eq.u32 %p16, %r22, 16;
+    @!%p16 bra PAIR_MATCH;
+    ld.global.u32 %r35,[%rd38+8]; ld.global.u32 %r36,[%rd38+12];
+    cvt.u64.u32 %rd40,%r36; shl.b64 %rd40,%rd40,32; cvt.u64.u32 %rd72,%r35; or.b64 %rd40,%rd40,%rd72;
+    ld.global.u32 %r37,[%rd39+8]; ld.global.u32 %r38,[%rd39+12];
+    cvt.u64.u32 %rd41,%r38; shl.b64 %rd41,%rd41,32; cvt.u64.u32 %rd72,%r37; or.b64 %rd41,%rd41,%rd72;
+    setp.ne.u64 %p15, %rd40, %rd41;
+    @%p15 bra PAIR_NEXT;
+    bra PAIR_MATCH;
+CMP1_4:
+    ld.global.u32 %r25, [%rd38];
+    ld.global.u32 %r26, [%rd39];
+    setp.ne.u32 %p15, %r25, %r26;
+    @%p15 bra PAIR_NEXT;
+
+PAIR_MATCH:
+    mul.wide.u32 %rd42, %r12, 4;
+    add.u64 %rd43, %rd4, %rd42;
+    mov.u32 %r27, 1;
+    atom.global.exch.b32 %r28, [%rd43], %r27;
+    mul.wide.u32 %rd42, %r13, 4;
+    add.u64 %rd43, %rd5, %rd42;
+    atom.global.exch.b32 %r28, [%rd43], %r27;
+    atom.global.add.u64 %rd44, [%rd7], 1;
+    setp.eq.u64 %p17, %rd6, 0;
+    @%p17 bra PAIR_NEXT;
+    add.u32 %r29, %r2, 1;
+    cvt.u64.u32 %rd45, %r29;
+    mul.lo.u64 %rd46, %rd44, %rd45;
+    mov.u32 %r30, 0;
+COPY_LEFT:
+    setp.ge.u32 %p18, %r30, %r2;
+    @%p18 bra WRITE_RIGHT;
+    setp.eq.u32 %p19, %r3, 0;
+    @%p19 mov.u32 %r31, %r12;
+    @%p19 bra COPY_STORE;
+    mul.lo.u32 %r32, %r12, %r2;
+    add.u32 %r32, %r32, %r30;
+    mul.wide.u32 %rd47, %r32, 4;
+    add.u64 %rd48, %rd1, %rd47;
+    ld.global.u32 %r31, [%rd48];
+COPY_STORE:
+    cvt.u64.u32 %rd49, %r30;
+    add.u64 %rd50, %rd46, %rd49;
+    mul.lo.u64 %rd50, %rd50, 4;
+    add.u64 %rd50, %rd6, %rd50;
+    st.global.u32 [%rd50], %r31;
+    add.u32 %r30, %r30, 1;
+    bra COPY_LEFT;
+WRITE_RIGHT:
+    cvt.u64.u32 %rd49, %r2;
+    add.u64 %rd50, %rd46, %rd49;
+    mul.lo.u64 %rd50, %rd50, 4;
+    add.u64 %rd50, %rd6, %rd50;
+    st.global.u32 [%rd50], %r13;
+PAIR_NEXT:
+    add.u64 %rd8, %rd8, %rd9;
+    bra PAIR_LOOP;
+MATCH_DONE:
+    ret;
+}
+
+// Build a chained hash table directly from fixed-width right-payload keys. Excluded/NULL rows are
+// not chained. Buckets contain row indices, so N:N duplicates remain distinct.
+.visible .entry gpu_db_join_fixed_hash_build(
+    .param .u64 rb0, .param .u64 ro0, .param .u64 rv0, .param .u32 rw0,
+    .param .u64 rb1, .param .u64 ro1, .param .u64 rv1, .param .u32 rw1,
+    .param .u32 right_n, .param .u64 right_mask,
+    .param .u64 heads, .param .u64 next, .param .u32 bucket_mask)
+{
+    .reg .pred %p<16>;
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<48>;
+    ld.param.u64 %rd1, [rb0]; ld.param.u64 %rd2, [ro0];
+    ld.param.u64 %rd3, [rv0]; ld.param.u32 %r1, [rw0];
+    ld.param.u64 %rd4, [rb1]; ld.param.u64 %rd5, [ro1];
+    ld.param.u64 %rd6, [rv1]; ld.param.u32 %r2, [rw1];
+    ld.param.u32 %r3, [right_n]; ld.param.u64 %rd7, [right_mask];
+    ld.param.u64 %rd8, [heads]; ld.param.u64 %rd9, [next];
+    ld.param.u32 %r4, [bucket_mask];
+    mov.u32 %r5, %tid.x; mov.u32 %r6, %ctaid.x; mov.u32 %r7, %ntid.x;
+    mov.u32 %r8, %nctaid.x; mad.lo.u32 %r9, %r6, %r7, %r5;
+    mul.lo.u32 %r10, %r8, %r7; mov.u64 %rd10, 18446744073709551615;
+BUILD_ROW:
+    setp.ge.u32 %p1, %r9, %r3; @%p1 bra BUILD_DONE;
+    setp.eq.u64 %p2, %rd7, %rd10; @%p2 bra BUILD_MASK_OK;
+    mul.wide.u32 %rd11, %r9, 4; add.u64 %rd12, %rd7, %rd11;
+    ld.global.u32 %r11, [%rd12]; setp.eq.u32 %p3, %r11, 0; @%p3 bra BUILD_NEXT;
+BUILD_MASK_OK:
+    setp.eq.u64 %p4, %rd3, %rd10; @%p4 bra BUILD_VALID0;
+    shr.u32 %r12, %r9, 5; mul.wide.u32 %rd13, %r12, 4; add.u64 %rd13, %rd3, %rd13;
+    ld.global.u32 %r13, [%rd13]; and.b32 %r12, %r9, 31; shr.u32 %r13, %r13, %r12;
+    and.b32 %r13, %r13, 1; setp.eq.u32 %p5, %r13, 0; @%p5 bra BUILD_NEXT;
+BUILD_VALID0:
+    setp.eq.u32 %p6, %r2, 0; @%p6 bra BUILD_HASH;
+    setp.eq.u64 %p4, %rd6, %rd10; @%p4 bra BUILD_HASH;
+    shr.u32 %r12, %r9, 5; mul.wide.u32 %rd13, %r12, 4; add.u64 %rd13, %rd6, %rd13;
+    ld.global.u32 %r13, [%rd13]; and.b32 %r12, %r9, 31; shr.u32 %r13, %r13, %r12;
+    and.b32 %r13, %r13, 1; setp.eq.u32 %p5, %r13, 0; @%p5 bra BUILD_NEXT;
+BUILD_HASH:
+    mov.u64 %rd14, 14695981039346656037;
+    setp.eq.u32 %p9, %r1, 255; @%p9 bra BUILD_HASH0_TEXT;
+    mul.wide.u32 %rd15, %r9, %r1; add.u64 %rd15, %rd15, %rd1; add.u64 %rd15, %rd15, %rd2;
+    setp.eq.u32 %p9, %r1, 4; @%p9 bra BUILD_HASH0_I4;
+    setp.eq.u32 %p9, %r1, 8; @%p9 bra BUILD_HASH0_I8;
+    mov.u32 %r14, 0;
+BUILD_HASH0_LOOP:
+    setp.ge.u32 %p7, %r14, %r1; @%p7 bra BUILD_HASH1_START;
+    cvt.u64.u32 %rd16, %r14; add.u64 %rd17, %rd15, %rd16; ld.global.u8 %r15, [%rd17];
+    cvt.u64.u32 %rd18, %r15; xor.b64 %rd14, %rd14, %rd18;
+    mul.lo.u64 %rd14, %rd14, 1099511628211; add.u32 %r14, %r14, 1; bra BUILD_HASH0_LOOP;
+BUILD_HASH0_I4:
+    ld.global.s32 %r33,[%rd15]; cvt.s64.s32 %rd32,%r33; bra BUILD_HASH0_INT_START;
+BUILD_HASH0_I8:
+    ld.global.u32 %r33,[%rd15]; ld.global.u32 %r34,[%rd15+4];
+    cvt.u64.u32 %rd32,%r34; shl.b64 %rd32,%rd32,32; cvt.u64.u32 %rd33,%r33;
+    or.b64 %rd32,%rd32,%rd33;
+BUILD_HASH0_INT_START:
+    mov.u32 %r14,0;
+BUILD_HASH0_INT_LOOP:
+    setp.ge.u32 %p7,%r14,8; @%p7 bra BUILD_HASH1_START;
+    and.b64 %rd18,%rd32,255; xor.b64 %rd14,%rd14,%rd18;
+    mul.lo.u64 %rd14,%rd14,1099511628211; shr.u64 %rd32,%rd32,8;
+    add.u32 %r14,%r14,1; bra BUILD_HASH0_INT_LOOP;
+BUILD_HASH0_TEXT:
+    mul.wide.u32 %rd23, %r9, 8; add.u64 %rd24, %rd1, %rd2; add.u64 %rd24, %rd24, %rd23;
+    ld.global.u64 %rd25, [%rd24]; ld.global.u64 %rd26, [%rd24+8];
+    add.u64 %rd27, %rd4, %rd5; add.u64 %rd27, %rd27, %rd25;
+    sub.u64 %rd28, %rd26, %rd25; mov.u64 %rd29, 0;
+BUILD_HASH0_TEXT_LOOP:
+    setp.ge.u64 %p10, %rd29, %rd28; @%p10 bra BUILD_HASH1_START;
+    add.u64 %rd30, %rd27, %rd29; ld.global.u8 %r15, [%rd30]; cvt.u64.u32 %rd18, %r15;
+    xor.b64 %rd14, %rd14, %rd18; mul.lo.u64 %rd14, %rd14, 1099511628211;
+    add.u64 %rd29, %rd29, 1; bra BUILD_HASH0_TEXT_LOOP;
+BUILD_HASH1_START:
+    setp.eq.u32 %p8, %r2, 0; @%p8 bra BUILD_INSERT;
+    mul.wide.u32 %rd15, %r9, %r2; add.u64 %rd15, %rd15, %rd4; add.u64 %rd15, %rd15, %rd5;
+    setp.eq.u32 %p9,%r2,4; @%p9 bra BUILD_HASH1_I4;
+    setp.eq.u32 %p9,%r2,8; @%p9 bra BUILD_HASH1_I8;
+    mov.u32 %r14, 0;
+BUILD_HASH1_LOOP:
+    setp.ge.u32 %p7, %r14, %r2; @%p7 bra BUILD_INSERT;
+    cvt.u64.u32 %rd16, %r14; add.u64 %rd17, %rd15, %rd16; ld.global.u8 %r15, [%rd17];
+    cvt.u64.u32 %rd18, %r15; xor.b64 %rd14, %rd14, %rd18;
+    mul.lo.u64 %rd14, %rd14, 1099511628211; add.u32 %r14, %r14, 1; bra BUILD_HASH1_LOOP;
+BUILD_HASH1_I4:
+    ld.global.s32 %r33,[%rd15]; cvt.s64.s32 %rd32,%r33; bra BUILD_HASH1_INT_START;
+BUILD_HASH1_I8:
+    ld.global.u32 %r33,[%rd15]; ld.global.u32 %r34,[%rd15+4];
+    cvt.u64.u32 %rd32,%r34; shl.b64 %rd32,%rd32,32; cvt.u64.u32 %rd33,%r33;
+    or.b64 %rd32,%rd32,%rd33;
+BUILD_HASH1_INT_START:
+    mov.u32 %r14,0;
+BUILD_HASH1_INT_LOOP:
+    setp.ge.u32 %p7,%r14,8; @%p7 bra BUILD_INSERT;
+    and.b64 %rd18,%rd32,255; xor.b64 %rd14,%rd14,%rd18;
+    mul.lo.u64 %rd14,%rd14,1099511628211; shr.u64 %rd32,%rd32,8;
+    add.u32 %r14,%r14,1; bra BUILD_HASH1_INT_LOOP;
+BUILD_INSERT:
+    cvt.u32.u64 %r16, %rd14; and.b32 %r16, %r16, %r4;
+    mul.wide.u32 %rd19, %r16, 4; add.u64 %rd20, %rd8, %rd19;
+    atom.global.exch.b32 %r17, [%rd20], %r9;
+    mul.wide.u32 %rd21, %r9, 4; add.u64 %rd22, %rd9, %rd21; st.global.u32 [%rd22], %r17;
+BUILD_NEXT:
+    add.u32 %r9, %r9, %r10; bra BUILD_ROW;
+BUILD_DONE:
+    ret;
+}
+
+// Probe one accumulated tuple per thread. Hash collisions are verified byte-for-byte before the
+// coordinate is emitted, and chained right rows preserve the full N:N cross product.
+.visible .entry gpu_db_join_fixed_hash_probe_v2(
+    .param .u64 coords, .param .u32 left_n, .param .u32 left_rels,
+    .param .u32 has_coords, .param .u64 left_key_rels,
+    .param .u64 lb0, .param .u64 lo0, .param .u64 lv0, .param .u32 lw0,
+    .param .u64 rb0, .param .u64 ro0, .param .u32 rw0,
+    .param .u64 lb1, .param .u64 lo1, .param .u64 lv1, .param .u32 lw1,
+    .param .u64 rb1, .param .u64 ro1, .param .u32 rw1,
+    .param .u64 left_mask, .param .u64 heads, .param .u64 next,
+    .param .u32 bucket_mask, .param .u64 left_marks, .param .u64 right_marks,
+    .param .u64 out, .param .u64 cursor)
+{
+    .reg .pred %p<24>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<80>;
+    ld.param.u64 %rd1, [coords]; ld.param.u32 %r1, [left_n];
+    ld.param.u32 %r2, [left_rels]; ld.param.u32 %r3, [has_coords];
+    // Packed as relation 0 in the high word and relation 1 in the low word. Keeping the
+    // component coordinates in one launch parameter avoids another ABI slot while still letting
+    // each composite-key component address its own accumulated relation.
+    ld.param.u64 %rd64, [left_key_rels]; cvt.u32.u64 %r34, %rd64;
+    shr.u64 %rd64, %rd64, 32; cvt.u32.u64 %r4, %rd64;
+    ld.param.u64 %rd2, [lb0]; ld.param.u64 %rd3, [lo0]; ld.param.u64 %rd4, [lv0];
+    ld.param.u32 %r5, [lw0]; ld.param.u64 %rd5, [rb0]; ld.param.u64 %rd6, [ro0];
+    ld.param.u32 %r6, [rw0];
+    ld.param.u64 %rd7, [lb1]; ld.param.u64 %rd8, [lo1]; ld.param.u64 %rd9, [lv1];
+    ld.param.u32 %r7, [lw1]; ld.param.u64 %rd10, [rb1]; ld.param.u64 %rd11, [ro1];
+    ld.param.u32 %r8, [rw1]; ld.param.u64 %rd12, [left_mask];
+    ld.param.u64 %rd13, [heads]; ld.param.u64 %rd14, [next];
+    ld.param.u32 %r9, [bucket_mask]; ld.param.u64 %rd15, [left_marks];
+    ld.param.u64 %rd16, [right_marks]; ld.param.u64 %rd17, [out];
+    ld.param.u64 %rd18, [cursor];
+    mov.u32 %r10, %tid.x; mov.u32 %r11, %ctaid.x; mov.u32 %r12, %ntid.x;
+    mov.u32 %r13, %nctaid.x; mad.lo.u32 %r14, %r11, %r12, %r10;
+    mul.lo.u32 %r15, %r13, %r12; mov.u64 %rd19, 18446744073709551615;
+PROBE_ROW:
+    setp.ge.u32 %p1, %r14, %r1; @%p1 bra PROBE_DONE;
+    setp.eq.u32 %p2, %r3, 0; @%p2 mov.u32 %r16, %r14; @%p2 bra PROBE_LEFT_READY;
+    mul.lo.u32 %r17, %r14, %r2; add.u32 %r17, %r17, %r4;
+    mul.wide.u32 %rd20, %r17, 4; add.u64 %rd21, %rd1, %rd20; ld.global.u32 %r16, [%rd21];
+PROBE_LEFT_READY:
+    setp.eq.u32 %p3, %r16, 4294967295; @%p3 bra PROBE_NEXT;
+    mov.u32 %r35, %r16;
+    setp.eq.u32 %p23, %r7, 0; @%p23 bra PROBE_LEFT1_READY;
+    setp.eq.u32 %p23, %r3, 0; @%p23 bra PROBE_LEFT1_READY;
+    mul.lo.u32 %r36, %r14, %r2; add.u32 %r36, %r36, %r34;
+    mul.wide.u32 %rd62, %r36, 4; add.u64 %rd63, %rd1, %rd62; ld.global.u32 %r35, [%rd63];
+    setp.eq.u32 %p23, %r35, 4294967295; @%p23 bra PROBE_NEXT;
+PROBE_LEFT1_READY:
+    setp.eq.u64 %p4, %rd12, %rd19; @%p4 bra PROBE_MASK_OK;
+    mul.wide.u32 %rd22, %r16, 4; add.u64 %rd23, %rd12, %rd22; ld.global.u32 %r18, [%rd23];
+    setp.eq.u32 %p5, %r18, 0; @%p5 bra PROBE_NEXT;
+PROBE_MASK_OK:
+    setp.eq.u64 %p6, %rd4, %rd19; @%p6 bra PROBE_VALID0;
+    shr.u32 %r19, %r16, 5; mul.wide.u32 %rd24, %r19, 4; add.u64 %rd24, %rd4, %rd24;
+    ld.global.u32 %r20, [%rd24]; and.b32 %r19, %r16, 31; shr.u32 %r20, %r20, %r19;
+    and.b32 %r20, %r20, 1; setp.eq.u32 %p7, %r20, 0; @%p7 bra PROBE_NEXT;
+PROBE_VALID0:
+    setp.eq.u32 %p8, %r7, 0; @%p8 bra PROBE_HASH;
+    setp.eq.u64 %p6, %rd9, %rd19; @%p6 bra PROBE_HASH;
+    shr.u32 %r19, %r35, 5; mul.wide.u32 %rd24, %r19, 4; add.u64 %rd24, %rd9, %rd24;
+    ld.global.u32 %r20, [%rd24]; and.b32 %r19, %r35, 31; shr.u32 %r20, %r20, %r19;
+    and.b32 %r20, %r20, 1; setp.eq.u32 %p7, %r20, 0; @%p7 bra PROBE_NEXT;
+PROBE_HASH:
+    mov.u64 %rd25, 14695981039346656037;
+    setp.eq.u32 %p18, %r5, 255; @%p18 bra PROBE_HASH0_TEXT;
+    mul.wide.u32 %rd26, %r16, %r5; add.u64 %rd26, %rd26, %rd2; add.u64 %rd26, %rd26, %rd3;
+    setp.eq.u32 %p18,%r5,4; @%p18 bra PROBE_HASH0_I4;
+    setp.eq.u32 %p18,%r5,8; @%p18 bra PROBE_HASH0_I8;
+    mov.u32 %r21, 0;
+PROBE_HASH0_LOOP:
+    setp.ge.u32 %p9, %r21, %r5; @%p9 bra PROBE_HASH1_START;
+    cvt.u64.u32 %rd27, %r21; add.u64 %rd28, %rd26, %rd27; ld.global.u8 %r22, [%rd28];
+    cvt.u64.u32 %rd29, %r22; xor.b64 %rd25, %rd25, %rd29;
+    mul.lo.u64 %rd25, %rd25, 1099511628211; add.u32 %r21, %r21, 1; bra PROBE_HASH0_LOOP;
+PROBE_HASH0_I4:
+    ld.global.s32 %r37,[%rd26]; cvt.s64.s32 %rd64,%r37; bra PROBE_HASH0_INT_START;
+PROBE_HASH0_I8:
+    ld.global.u32 %r37,[%rd26]; ld.global.u32 %r38,[%rd26+4];
+    cvt.u64.u32 %rd64,%r38; shl.b64 %rd64,%rd64,32; cvt.u64.u32 %rd66,%r37;
+    or.b64 %rd64,%rd64,%rd66;
+PROBE_HASH0_INT_START:
+    mov.u32 %r21,0;
+PROBE_HASH0_INT_LOOP:
+    setp.ge.u32 %p9,%r21,8; @%p9 bra PROBE_HASH1_START;
+    and.b64 %rd29,%rd64,255; xor.b64 %rd25,%rd25,%rd29;
+    mul.lo.u64 %rd25,%rd25,1099511628211; shr.u64 %rd64,%rd64,8;
+    add.u32 %r21,%r21,1; bra PROBE_HASH0_INT_LOOP;
+PROBE_HASH0_TEXT:
+    mul.wide.u32 %rd48, %r16, 8; add.u64 %rd49, %rd2, %rd3; add.u64 %rd49, %rd49, %rd48;
+    ld.global.u64 %rd50, [%rd49]; ld.global.u64 %rd51, [%rd49+8];
+    add.u64 %rd52, %rd7, %rd8; add.u64 %rd52, %rd52, %rd50;
+    sub.u64 %rd53, %rd51, %rd50; mov.u64 %rd54, 0;
+PROBE_HASH0_TEXT_LOOP:
+    setp.ge.u64 %p19, %rd54, %rd53; @%p19 bra PROBE_HASH1_START;
+    add.u64 %rd55, %rd52, %rd54; ld.global.u8 %r22, [%rd55]; cvt.u64.u32 %rd29, %r22;
+    xor.b64 %rd25, %rd25, %rd29; mul.lo.u64 %rd25, %rd25, 1099511628211;
+    add.u64 %rd54, %rd54, 1; bra PROBE_HASH0_TEXT_LOOP;
+PROBE_HASH1_START:
+    setp.eq.u32 %p10, %r7, 0; @%p10 bra PROBE_BUCKET;
+    mul.wide.u32 %rd26, %r35, %r7; add.u64 %rd26, %rd26, %rd7; add.u64 %rd26, %rd26, %rd8;
+    setp.eq.u32 %p18,%r7,4; @%p18 bra PROBE_HASH1_I4;
+    setp.eq.u32 %p18,%r7,8; @%p18 bra PROBE_HASH1_I8;
+    mov.u32 %r21, 0;
+PROBE_HASH1_LOOP:
+    setp.ge.u32 %p9, %r21, %r7; @%p9 bra PROBE_BUCKET;
+    cvt.u64.u32 %rd27, %r21; add.u64 %rd28, %rd26, %rd27; ld.global.u8 %r22, [%rd28];
+    cvt.u64.u32 %rd29, %r22; xor.b64 %rd25, %rd25, %rd29;
+    mul.lo.u64 %rd25, %rd25, 1099511628211; add.u32 %r21, %r21, 1; bra PROBE_HASH1_LOOP;
+PROBE_HASH1_I4:
+    ld.global.s32 %r37,[%rd26]; cvt.s64.s32 %rd64,%r37; bra PROBE_HASH1_INT_START;
+PROBE_HASH1_I8:
+    ld.global.u32 %r37,[%rd26]; ld.global.u32 %r38,[%rd26+4];
+    cvt.u64.u32 %rd64,%r38; shl.b64 %rd64,%rd64,32; cvt.u64.u32 %rd66,%r37;
+    or.b64 %rd64,%rd64,%rd66;
+PROBE_HASH1_INT_START:
+    mov.u32 %r21,0;
+PROBE_HASH1_INT_LOOP:
+    setp.ge.u32 %p9,%r21,8; @%p9 bra PROBE_BUCKET;
+    and.b64 %rd29,%rd64,255; xor.b64 %rd25,%rd25,%rd29;
+    mul.lo.u64 %rd25,%rd25,1099511628211; shr.u64 %rd64,%rd64,8;
+    add.u32 %r21,%r21,1; bra PROBE_HASH1_INT_LOOP;
+PROBE_BUCKET:
+    cvt.u32.u64 %r23, %rd25; and.b32 %r23, %r23, %r9;
+    mul.wide.u32 %rd30, %r23, 4; add.u64 %rd31, %rd13, %rd30; ld.global.u32 %r24, [%rd31];
+CHAIN_LOOP:
+    setp.eq.u32 %p11, %r24, 4294967295; @%p11 bra PROBE_NEXT;
+    setp.eq.u32 %p20, %r5, 255; @%p20 bra CMP_HASH0_TEXT;
+    mul.wide.u32 %rd32, %r16, %r5; add.u64 %rd32, %rd32, %rd2; add.u64 %rd32, %rd32, %rd3;
+    mul.wide.u32 %rd33, %r24, %r6; add.u64 %rd33, %rd33, %rd5; add.u64 %rd33, %rd33, %rd6;
+    setp.eq.u32 %p23,%r5,4; @%p23 bra CMP_HASH0_LEFT_I4;
+    setp.eq.u32 %p23,%r5,8; @%p23 bra CMP_HASH0_LEFT_I8;
+    mov.u32 %r25, 0;
+CMP_HASH0_LOOP:
+    setp.ge.u32 %p12, %r25, %r5; @%p12 bra CMP_HASH1_START;
+    cvt.u64.u32 %rd34, %r25; add.u64 %rd35, %rd32, %rd34; add.u64 %rd36, %rd33, %rd34;
+    ld.global.u8 %r26, [%rd35]; ld.global.u8 %r27, [%rd36];
+    setp.ne.u32 %p13, %r26, %r27; @%p13 bra CHAIN_NEXT;
+    add.u32 %r25, %r25, 1; bra CMP_HASH0_LOOP;
+CMP_HASH0_LEFT_I4:
+    ld.global.s32 %r37,[%rd32]; cvt.s64.s32 %rd64,%r37; bra CMP_HASH0_RIGHT;
+CMP_HASH0_LEFT_I8:
+    ld.global.u32 %r37,[%rd32]; ld.global.u32 %r38,[%rd32+4];
+    cvt.u64.u32 %rd64,%r38; shl.b64 %rd64,%rd64,32; cvt.u64.u32 %rd66,%r37;
+    or.b64 %rd64,%rd64,%rd66;
+CMP_HASH0_RIGHT:
+    setp.eq.u32 %p23,%r6,4; @%p23 bra CMP_HASH0_RIGHT_I4;
+    ld.global.u32 %r37,[%rd33]; ld.global.u32 %r38,[%rd33+4];
+    cvt.u64.u32 %rd65,%r38; shl.b64 %rd65,%rd65,32; cvt.u64.u32 %rd66,%r37;
+    or.b64 %rd65,%rd65,%rd66; bra CMP_HASH0_INT_COMPARE;
+CMP_HASH0_RIGHT_I4:
+    ld.global.s32 %r37,[%rd33]; cvt.s64.s32 %rd65,%r37;
+CMP_HASH0_INT_COMPARE:
+    setp.ne.u64 %p13,%rd64,%rd65; @%p13 bra CHAIN_NEXT; bra CMP_HASH1_START;
+CMP_HASH0_TEXT:
+    mul.wide.u32 %rd48, %r16, 8; add.u64 %rd49, %rd2, %rd3; add.u64 %rd49, %rd49, %rd48;
+    ld.global.u64 %rd50, [%rd49]; ld.global.u64 %rd51, [%rd49+8];
+    mul.wide.u32 %rd48, %r24, 8; add.u64 %rd56, %rd5, %rd6; add.u64 %rd56, %rd56, %rd48;
+    ld.global.u64 %rd57, [%rd56]; ld.global.u64 %rd58, [%rd56+8];
+    sub.u64 %rd53, %rd51, %rd50; sub.u64 %rd59, %rd58, %rd57;
+    setp.ne.u64 %p21, %rd53, %rd59; @%p21 bra CHAIN_NEXT;
+    add.u64 %rd52, %rd7, %rd8; add.u64 %rd52, %rd52, %rd50;
+    add.u64 %rd60, %rd10, %rd11; add.u64 %rd60, %rd60, %rd57; mov.u64 %rd54, 0;
+CMP_HASH0_TEXT_LOOP:
+    setp.ge.u64 %p22, %rd54, %rd53; @%p22 bra HASH_MATCH;
+    add.u64 %rd55, %rd52, %rd54; add.u64 %rd61, %rd60, %rd54;
+    ld.global.u8 %r26, [%rd55]; ld.global.u8 %r27, [%rd61];
+    setp.ne.u32 %p13, %r26, %r27; @%p13 bra CHAIN_NEXT;
+    add.u64 %rd54, %rd54, 1; bra CMP_HASH0_TEXT_LOOP;
+CMP_HASH1_START:
+    setp.eq.u32 %p14, %r7, 0; @%p14 bra HASH_MATCH;
+    mul.wide.u32 %rd32, %r35, %r7; add.u64 %rd32, %rd32, %rd7; add.u64 %rd32, %rd32, %rd8;
+    mul.wide.u32 %rd33, %r24, %r8; add.u64 %rd33, %rd33, %rd10; add.u64 %rd33, %rd33, %rd11;
+    setp.eq.u32 %p23,%r7,4; @%p23 bra CMP_HASH1_LEFT_I4;
+    setp.eq.u32 %p23,%r7,8; @%p23 bra CMP_HASH1_LEFT_I8;
+    mov.u32 %r25, 0;
+CMP_HASH1_LOOP:
+    setp.ge.u32 %p12, %r25, %r7; @%p12 bra HASH_MATCH;
+    cvt.u64.u32 %rd34, %r25; add.u64 %rd35, %rd32, %rd34; add.u64 %rd36, %rd33, %rd34;
+    ld.global.u8 %r26, [%rd35]; ld.global.u8 %r27, [%rd36];
+    setp.ne.u32 %p13, %r26, %r27; @%p13 bra CHAIN_NEXT;
+    add.u32 %r25, %r25, 1; bra CMP_HASH1_LOOP;
+CMP_HASH1_LEFT_I4:
+    ld.global.s32 %r37,[%rd32]; cvt.s64.s32 %rd64,%r37; bra CMP_HASH1_RIGHT;
+CMP_HASH1_LEFT_I8:
+    ld.global.u32 %r37,[%rd32]; ld.global.u32 %r38,[%rd32+4];
+    cvt.u64.u32 %rd64,%r38; shl.b64 %rd64,%rd64,32; cvt.u64.u32 %rd66,%r37;
+    or.b64 %rd64,%rd64,%rd66;
+CMP_HASH1_RIGHT:
+    setp.eq.u32 %p23,%r8,4; @%p23 bra CMP_HASH1_RIGHT_I4;
+    ld.global.u32 %r37,[%rd33]; ld.global.u32 %r38,[%rd33+4];
+    cvt.u64.u32 %rd65,%r38; shl.b64 %rd65,%rd65,32; cvt.u64.u32 %rd66,%r37;
+    or.b64 %rd65,%rd65,%rd66; bra CMP_HASH1_INT_COMPARE;
+CMP_HASH1_RIGHT_I4:
+    ld.global.s32 %r37,[%rd33]; cvt.s64.s32 %rd65,%r37;
+CMP_HASH1_INT_COMPARE:
+    setp.ne.u64 %p13,%rd64,%rd65; @%p13 bra CHAIN_NEXT;
+HASH_MATCH:
+    mul.wide.u32 %rd37, %r14, 4; add.u64 %rd38, %rd15, %rd37; mov.u32 %r28, 1;
+    atom.global.exch.b32 %r29, [%rd38], %r28;
+    mul.wide.u32 %rd37, %r24, 4; add.u64 %rd38, %rd16, %rd37;
+    atom.global.exch.b32 %r29, [%rd38], %r28;
+    atom.global.add.u64 %rd39, [%rd18], 1; setp.eq.u64 %p15, %rd17, 0; @%p15 bra CHAIN_NEXT;
+    add.u32 %r30, %r2, 1; cvt.u64.u32 %rd40, %r30; mul.lo.u64 %rd41, %rd39, %rd40;
+    mov.u32 %r31, 0;
+HASH_COPY_LEFT:
+    setp.ge.u32 %p16, %r31, %r2; @%p16 bra HASH_WRITE_RIGHT;
+    setp.eq.u32 %p17, %r3, 0; @%p17 mov.u32 %r32, %r14; @%p17 bra HASH_COPY_STORE;
+    mul.lo.u32 %r33, %r14, %r2; add.u32 %r33, %r33, %r31;
+    mul.wide.u32 %rd42, %r33, 4; add.u64 %rd43, %rd1, %rd42; ld.global.u32 %r32, [%rd43];
+HASH_COPY_STORE:
+    cvt.u64.u32 %rd44, %r31; add.u64 %rd45, %rd41, %rd44; mul.lo.u64 %rd45, %rd45, 4;
+    add.u64 %rd45, %rd17, %rd45; st.global.u32 [%rd45], %r32;
+    add.u32 %r31, %r31, 1; bra HASH_COPY_LEFT;
+HASH_WRITE_RIGHT:
+    cvt.u64.u32 %rd44, %r2; add.u64 %rd45, %rd41, %rd44; mul.lo.u64 %rd45, %rd45, 4;
+    add.u64 %rd45, %rd17, %rd45; st.global.u32 [%rd45], %r24;
+CHAIN_NEXT:
+    mul.wide.u32 %rd46, %r24, 4; add.u64 %rd47, %rd14, %rd46; ld.global.u32 %r24, [%rd47];
+    bra CHAIN_LOOP;
+PROBE_NEXT:
+    add.u32 %r14, %r14, %r15; bra PROBE_ROW;
+PROBE_DONE:
+    ret;
+}
+
+.visible .entry gpu_db_join_fixed_unmatched(
+    .param .u64 coords, .param .u32 left_n, .param .u32 left_rels,
+    .param .u32 has_coords, .param .u32 right_n,
+    .param .u64 left_mask, .param .u64 right_mask,
+    .param .u64 left_marks, .param .u64 right_marks,
+    .param .u32 outer_left, .param .u32 outer_right,
+    .param .u64 out, .param .u64 cursor)
+{
+    .reg .pred %p<20>;
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<64>;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r1, [left_n];
+    ld.param.u32 %r2, [left_rels];
+    ld.param.u32 %r3, [has_coords];
+    ld.param.u32 %r4, [right_n];
+    ld.param.u64 %rd2, [left_mask];
+    ld.param.u64 %rd3, [right_mask];
+    ld.param.u64 %rd4, [left_marks];
+    ld.param.u64 %rd5, [right_marks];
+    ld.param.u32 %r5, [outer_left];
+    ld.param.u32 %r6, [outer_right];
+    ld.param.u64 %rd6, [out];
+    ld.param.u64 %rd7, [cursor];
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %ctaid.x;
+    mov.u32 %r9, %ntid.x;
+    mov.u32 %r10, %nctaid.x;
+    mad.lo.u32 %r11, %r8, %r9, %r7;
+    mul.lo.u32 %r12, %r10, %r9;
+    mov.u64 %rd8, 18446744073709551615;
+    setp.eq.u32 %p1, %r5, 0;
+    @%p1 bra RIGHT_PHASE;
+    mov.u32 %r13, %r11;
+LEFT_LOOP:
+    setp.ge.u32 %p2, %r13, %r1;
+    @%p2 bra RIGHT_PHASE;
+    mul.wide.u32 %rd9, %r13, 4;
+    add.u64 %rd10, %rd4, %rd9;
+    ld.global.u32 %r14, [%rd10];
+    setp.ne.u32 %p3, %r14, 0;
+    @%p3 bra LEFT_NEXT;
+    setp.ne.u32 %p4, %r3, 0;
+    @%p4 bra LEFT_ELIGIBLE;
+    setp.eq.u64 %p5, %rd2, %rd8;
+    @%p5 bra LEFT_ELIGIBLE;
+    add.u64 %rd10, %rd2, %rd9;
+    ld.global.u32 %r14, [%rd10];
+    setp.eq.u32 %p6, %r14, 0;
+    @%p6 bra LEFT_NEXT;
+LEFT_ELIGIBLE:
+    atom.global.add.u64 %rd11, [%rd7], 1;
+    setp.eq.u64 %p7, %rd6, 0;
+    @%p7 bra LEFT_NEXT;
+    add.u32 %r15, %r2, 1;
+    cvt.u64.u32 %rd12, %r15;
+    mul.lo.u64 %rd13, %rd11, %rd12;
+    mov.u32 %r16, 0;
+LEFT_COPY:
+    setp.ge.u32 %p8, %r16, %r2;
+    @%p8 bra LEFT_PAD;
+    setp.eq.u32 %p9, %r3, 0;
+    @%p9 mov.u32 %r17, %r13;
+    @%p9 bra LEFT_STORE;
+    mul.lo.u32 %r18, %r13, %r2;
+    add.u32 %r18, %r18, %r16;
+    mul.wide.u32 %rd14, %r18, 4;
+    add.u64 %rd15, %rd1, %rd14;
+    ld.global.u32 %r17, [%rd15];
+LEFT_STORE:
+    cvt.u64.u32 %rd16, %r16;
+    add.u64 %rd17, %rd13, %rd16;
+    mul.lo.u64 %rd17, %rd17, 4;
+    add.u64 %rd17, %rd6, %rd17;
+    st.global.u32 [%rd17], %r17;
+    add.u32 %r16, %r16, 1;
+    bra LEFT_COPY;
+LEFT_PAD:
+    cvt.u64.u32 %rd16, %r2;
+    add.u64 %rd17, %rd13, %rd16;
+    mul.lo.u64 %rd17, %rd17, 4;
+    add.u64 %rd17, %rd6, %rd17;
+    mov.u32 %r17, 4294967295;
+    st.global.u32 [%rd17], %r17;
+LEFT_NEXT:
+    add.u32 %r13, %r13, %r12;
+    bra LEFT_LOOP;
+
+RIGHT_PHASE:
+    setp.eq.u32 %p10, %r6, 0;
+    @%p10 bra UNMATCHED_DONE;
+    mov.u32 %r13, %r11;
+RIGHT_LOOP:
+    setp.ge.u32 %p11, %r13, %r4;
+    @%p11 bra UNMATCHED_DONE;
+    mul.wide.u32 %rd9, %r13, 4;
+    add.u64 %rd10, %rd5, %rd9;
+    ld.global.u32 %r14, [%rd10];
+    setp.ne.u32 %p12, %r14, 0;
+    @%p12 bra RIGHT_NEXT;
+    setp.eq.u64 %p13, %rd3, %rd8;
+    @%p13 bra RIGHT_ELIGIBLE;
+    add.u64 %rd10, %rd3, %rd9;
+    ld.global.u32 %r14, [%rd10];
+    setp.eq.u32 %p14, %r14, 0;
+    @%p14 bra RIGHT_NEXT;
+RIGHT_ELIGIBLE:
+    atom.global.add.u64 %rd11, [%rd7], 1;
+    setp.eq.u64 %p15, %rd6, 0;
+    @%p15 bra RIGHT_NEXT;
+    add.u32 %r15, %r2, 1;
+    cvt.u64.u32 %rd12, %r15;
+    mul.lo.u64 %rd13, %rd11, %rd12;
+    mov.u32 %r16, 0;
+RIGHT_PAD_LOOP:
+    setp.ge.u32 %p16, %r16, %r2;
+    @%p16 bra RIGHT_VALUE;
+    cvt.u64.u32 %rd16, %r16;
+    add.u64 %rd17, %rd13, %rd16;
+    mul.lo.u64 %rd17, %rd17, 4;
+    add.u64 %rd17, %rd6, %rd17;
+    mov.u32 %r17, 4294967295;
+    st.global.u32 [%rd17], %r17;
+    add.u32 %r16, %r16, 1;
+    bra RIGHT_PAD_LOOP;
+RIGHT_VALUE:
+    cvt.u64.u32 %rd16, %r2;
+    add.u64 %rd17, %rd13, %rd16;
+    mul.lo.u64 %rd17, %rd17, 4;
+    add.u64 %rd17, %rd6, %rd17;
+    st.global.u32 [%rd17], %r13;
+RIGHT_NEXT:
+    add.u32 %r13, %r13, %r12;
+    bra RIGHT_LOOP;
+UNMATCHED_DONE:
+    ret;
+}
+"#;
+
+    if left_keys.is_empty()
+        || left_keys.len() > 2
+        || left_keys.len() != right_keys.len()
+        || left_key_relations.len() != left_keys.len()
+        || left_keys
+            .iter()
+            .zip(right_keys)
+            .any(|(l, r)| {
+                !matches!(l.width, 4 | 8 | 16 | 255)
+                    || !matches!(r.width, 4 | 8 | 16 | 255)
+                    || (l.width != r.width
+                        && !matches!((l.width, r.width), (4, 8) | (8, 4)))
+            })
+        || (left_keys.len() > 1 && left_keys.iter().any(|key| key.width == 255))
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(left_keys.len()));
+    }
+    let left_key_relation0 = left_key_relations[0];
+    let left_key_relation1 = left_key_relations.get(1).copied().unwrap_or(left_key_relation0);
+    let (left_n, left_rels, coords_ptr, has_coords) = match accumulated {
+        Some(coords) => {
+            if left_row_count != 0
+                || left_key_relations
+                    .iter()
+                    .any(|relation| *relation >= coords.relation_count)
+            {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(
+                    left_key_relation0 as usize,
+                ));
+            }
+            (
+                coords.row_count,
+                coords.relation_count,
+                coords.coordinates.as_ref().map_or(0, |b| b.ptr),
+                1_u32,
+            )
+        }
+        None => {
+            if left_key_relations.iter().any(|relation| *relation != 0) {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(
+                    left_key_relation0 as usize,
+                ));
+            }
+            (left_row_count, 1_u32, 0_u64, 0_u32)
+        }
+    };
+    if left_eligibility.is_some_and(|m| m.row_count != left_row_count)
+        || right_eligibility.is_some_and(|m| m.row_count != right_row_count)
+        || (accumulated.is_some() && left_eligibility.is_some())
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(left_n as usize));
+    }
+    if persistent_left_marks.is_some_and(|marks| marks.row_count != left_n) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(left_n as usize));
+    }
+    if persistent_right_marks.is_some_and(|marks| marks.row_count != right_row_count) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(right_row_count as usize));
+    }
+    let gpu_id = ctx.metadata.gpu_id;
+    let valid_key = |key: &CudaJoinPayloadKey<'_>, rows: u32| {
+        if rows == 0 {
+            return key.payload.metadata.gpu_id == gpu_id;
+        }
+        let values_end = if key.width == 255 {
+            key.byte_offset
+                .checked_add((u64::from(rows) + 1).saturating_mul(8))
+        } else {
+            key.byte_offset
+                .checked_add(u64::from(rows).saturating_mul(u64::from(key.width)))
+        };
+        key.payload.metadata.gpu_id == gpu_id
+            && values_end.is_some_and(|end| end <= key.payload.metadata.allocated_bytes)
+            && (key.width != 255
+                || key
+                    .text_bytes_byte_offset
+                    .and_then(|off| off.checked_add(key.text_bytes_len))
+                    .is_some_and(|end| end <= key.payload.metadata.allocated_bytes))
+            && key
+                .validity_bitmap_offset
+                .and_then(|off| off.checked_add(u64::from(rows).div_ceil(32) * 4))
+                .is_none_or(|end| end <= key.payload.metadata.allocated_bytes)
+    };
+    // An accumulated key addresses original relation rows, whose cardinality is not `left_n`; its
+    // descriptor bounds were already validated when that resident layout was admitted. Validate the
+    // right side exactly and the left offset itself here; engine-side layout construction supplies the
+    // original source allocation.
+    if right_keys.iter().any(|key| !valid_key(key, right_row_count))
+        || left_keys
+            .iter()
+            .any(|key| key.payload.metadata.gpu_id != gpu_id)
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(right_row_count as usize));
+    }
+    if left_n == 0 && !outer_right {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: left_rels + 1,
+            allocated_bytes: 0,
+        });
+    }
+    if right_row_count == 0 && !outer_left {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: left_rels + 1,
+            allocated_bytes: 0,
+        });
+    }
+
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let launch = unsafe {
+        primary
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let dtoh = unsafe {
+        primary
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let memset = unsafe {
+        primary
+            .lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let left_marks_bytes = (left_n as usize).saturating_mul(4).max(1);
+    let right_marks_bytes = (right_row_count as usize).saturating_mul(4).max(1);
+    let owned_left_marks = if persistent_left_marks.is_none() {
+        Some(primary.lease_device_buffer_owned(left_marks_bytes)?)
+    } else {
+        None
+    };
+    let left_marks_ptr = persistent_left_marks
+        .map(|marks| marks.marks.device_ptr)
+        .or_else(|| owned_left_marks.as_ref().map(|marks| marks.ptr))
+        .expect("left match storage");
+    let owned_right_marks = if persistent_right_marks.is_none() {
+        Some(primary.lease_device_buffer_owned(right_marks_bytes)?)
+    } else {
+        None
+    };
+    let right_marks_ptr = persistent_right_marks
+        .map(|marks| marks.marks.device_ptr)
+        .or_else(|| owned_right_marks.as_ref().map(|marks| marks.ptr))
+        .expect("right match storage");
+    let cursor = primary.lease_device_buffer_owned(8)?;
+    if persistent_left_marks.is_none() {
+        check_cuda(unsafe { memset(left_marks_ptr, 0, left_marks_bytes) })?;
+    }
+    if persistent_right_marks.is_none() {
+        check_cuda(unsafe { memset(right_marks_ptr, 0, right_marks_bytes) })?;
+    }
+    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let hash_build_fn = primary.cached_function(c"gpu_db_join_fixed_hash_build", &ptx)?;
+    let hash_probe_fn = primary.cached_function(c"gpu_db_join_fixed_hash_probe_v2", &ptx)?;
+    let unmatched_fn = primary.cached_function(c"gpu_db_join_fixed_unmatched", &ptx)?;
+    let sentinel = u64::MAX;
+    let key_args = |keys: &[CudaJoinPayloadKey<'_>], i: usize| {
+        keys.get(i).map_or((0, 0, sentinel, 0), |key| {
+            (
+                key.payload.device_ptr,
+                key.byte_offset,
+                key.validity_bitmap_offset
+                    .map_or(sentinel, |off| key.payload.device_ptr + off),
+                u32::from(key.width),
+            )
+        })
+    };
+    let (lb0, lo0, lv0, lw0) = key_args(left_keys, 0);
+    let (rb0, ro0, rv0, rw0) = key_args(right_keys, 0);
+    let (lb1, lo1, lv1, lw1) = if left_keys[0].width == 255 {
+        (
+            left_keys[0].payload.device_ptr,
+            left_keys[0]
+                .text_bytes_byte_offset
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?,
+            sentinel,
+            0,
+        )
+    } else {
+        key_args(left_keys, 1)
+    };
+    let (rb1, ro1, rv1, rw1) = if right_keys[0].width == 255 {
+        (
+            right_keys[0].payload.device_ptr,
+            right_keys[0]
+                .text_bytes_byte_offset
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?,
+            sentinel,
+            0,
+        )
+    } else {
+        key_args(right_keys, 1)
+    };
+    let left_mask = left_eligibility.map_or(sentinel, |m| m.mask.ptr);
+    let right_mask = right_eligibility.map_or(sentinel, |m| m.mask.ptr);
+    const BLOCK: u32 = 256;
+    let hash_slots = (right_row_count as usize)
+        .saturating_mul(2)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .max(2);
+    if hash_slots > u32::MAX as usize {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(hash_slots));
+    }
+    let hash_heads = primary.lease_device_buffer_owned(hash_slots.saturating_mul(4))?;
+    let hash_next = primary.lease_device_buffer_owned(right_marks_bytes)?;
+    let hash_mask = hash_slots.saturating_sub(1) as u32;
+    {
+        check_cuda(unsafe { memset(hash_heads.ptr, 0xff, hash_slots * 4) })?;
+        check_cuda(unsafe { memset(hash_next.ptr, 0xff, right_marks_bytes) })?;
+        let mut b0 = rb0;
+        let mut b1 = ro0;
+        let mut b2 = rv0;
+        let mut b3 = rw0;
+        let mut b4 = rb1;
+        let mut b5 = ro1;
+        let mut b6 = rv1;
+        let mut b7 = rw1;
+        let mut b8 = right_row_count;
+        let mut b9 = right_mask;
+        let mut b10 = hash_heads.ptr;
+        let mut b11 = hash_next.ptr;
+        let mut b12 = hash_mask;
+        let mut build_args = [
+            (&mut b0 as *mut u64).cast(),
+            (&mut b1 as *mut u64).cast(),
+            (&mut b2 as *mut u64).cast(),
+            (&mut b3 as *mut u32).cast(),
+            (&mut b4 as *mut u64).cast(),
+            (&mut b5 as *mut u64).cast(),
+            (&mut b6 as *mut u64).cast(),
+            (&mut b7 as *mut u32).cast(),
+            (&mut b8 as *mut u32).cast(),
+            (&mut b9 as *mut u64).cast(),
+            (&mut b10 as *mut u64).cast(),
+            (&mut b11 as *mut u64).cast(),
+            (&mut b12 as *mut u32).cast(),
+        ];
+        let build_grid = u64::from(right_row_count)
+            .div_ceil(u64::from(BLOCK))
+            .clamp(1, 65_535) as u32;
+        if right_row_count > 0 {
+            check_cuda(unsafe {
+                launch(
+                    hash_build_fn,
+                    build_grid,
+                    1,
+                    1,
+                    BLOCK,
+                    1,
+                    1,
+                    0,
+                    std::ptr::null_mut(),
+                    build_args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            })?;
+        }
+    }
+    let unmatched_n = left_n.max(right_row_count);
+
+    let run_phase = |out_ptr: u64| -> Result<(), CudaRuntimeProbeError> {
+        if left_n > 0 && right_row_count > 0 {
+                let mut h0 = coords_ptr;
+                let mut h1 = left_n;
+                let mut h2 = left_rels;
+                let mut h3 = has_coords;
+                let mut h4 = u64::from(left_key_relation1)
+                    | (u64::from(left_key_relation0) << 32);
+                let mut h5 = lb0;
+                let mut h6 = lo0;
+                let mut h7 = lv0;
+                let mut h8 = lw0;
+                let mut h9 = rb0;
+                let mut h10 = ro0;
+                let mut h11 = rw0;
+                let mut h12 = lb1;
+                let mut h13 = lo1;
+                let mut h14 = lv1;
+                let mut h15 = lw1;
+                let mut h16 = rb1;
+                let mut h17 = ro1;
+                let mut h18 = rw1;
+                let mut h19 = left_mask;
+                let mut h20 = hash_heads.ptr;
+                let mut h21 = hash_next.ptr;
+                let mut h22 = hash_mask;
+                let mut h23 = left_marks_ptr;
+                let mut h24 = right_marks_ptr;
+                let mut h25 = out_ptr;
+                let mut h26 = cursor.ptr;
+                let mut hash_args = [
+                    (&mut h0 as *mut u64).cast(), (&mut h1 as *mut u32).cast(),
+                    (&mut h2 as *mut u32).cast(), (&mut h3 as *mut u32).cast(),
+                    (&mut h4 as *mut u64).cast(), (&mut h5 as *mut u64).cast(),
+                    (&mut h6 as *mut u64).cast(), (&mut h7 as *mut u64).cast(),
+                    (&mut h8 as *mut u32).cast(), (&mut h9 as *mut u64).cast(),
+                    (&mut h10 as *mut u64).cast(), (&mut h11 as *mut u32).cast(),
+                    (&mut h12 as *mut u64).cast(), (&mut h13 as *mut u64).cast(),
+                    (&mut h14 as *mut u64).cast(), (&mut h15 as *mut u32).cast(),
+                    (&mut h16 as *mut u64).cast(), (&mut h17 as *mut u64).cast(),
+                    (&mut h18 as *mut u32).cast(), (&mut h19 as *mut u64).cast(),
+                    (&mut h20 as *mut u64).cast(), (&mut h21 as *mut u64).cast(),
+                    (&mut h22 as *mut u32).cast(), (&mut h23 as *mut u64).cast(),
+                    (&mut h24 as *mut u64).cast(), (&mut h25 as *mut u64).cast(),
+                    (&mut h26 as *mut u64).cast(),
+                ];
+                let probe_grid = u64::from(left_n)
+                    .div_ceil(u64::from(BLOCK))
+                    .clamp(1, 65_535) as u32;
+                check_cuda(unsafe {
+                    launch(
+                        hash_probe_fn,
+                        probe_grid,
+                        1,
+                        1,
+                        BLOCK,
+                        1,
+                        1,
+                        0,
+                        std::ptr::null_mut(),
+                        hash_args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                })?;
+        }
+        let mut u0 = coords_ptr;
+        let mut u1 = left_n;
+        let mut u2 = left_rels;
+        let mut u3 = has_coords;
+        let mut u4 = right_row_count;
+        let mut u5 = left_mask;
+        let mut u6 = right_mask;
+        let mut u7 = left_marks_ptr;
+        let mut u8 = right_marks_ptr;
+        let mut u9 = u32::from(outer_left);
+        let mut u10 = u32::from(outer_right);
+        let mut u11 = out_ptr;
+        let mut u12 = cursor.ptr;
+        let mut uargs = [
+            (&mut u0 as *mut u64).cast(),
+            (&mut u1 as *mut u32).cast(),
+            (&mut u2 as *mut u32).cast(),
+            (&mut u3 as *mut u32).cast(),
+            (&mut u4 as *mut u32).cast(),
+            (&mut u5 as *mut u64).cast(),
+            (&mut u6 as *mut u64).cast(),
+            (&mut u7 as *mut u64).cast(),
+            (&mut u8 as *mut u64).cast(),
+            (&mut u9 as *mut u32).cast(),
+            (&mut u10 as *mut u32).cast(),
+            (&mut u11 as *mut u64).cast(),
+            (&mut u12 as *mut u64).cast(),
+        ];
+        if (outer_left || outer_right) && unmatched_n > 0 {
+            check_cuda(unsafe {
+                launch(
+                    unmatched_fn,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    std::ptr::null_mut(),
+                    uargs.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            })?;
+        }
+        Ok(())
+    };
+
+    run_phase(0)?;
+    let mut total = 0_u64;
+    check_cuda(unsafe { dtoh((&mut total as *mut u64).cast(), cursor.ptr, 8) })?;
+    let total_u32 = u32::try_from(total)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if total == 0 {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: left_rels + 1,
+            allocated_bytes: 0,
+        });
+    }
+    let output_bytes = total
+        .checked_mul(u64::from(left_rels + 1))
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output = primary.lease_device_buffer_owned(output_bytes)?;
+    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
+    run_phase(output.ptr)?;
+    let mut emitted = 0_u64;
+    check_cuda(unsafe { dtoh((&mut emitted as *mut u64).cast(), cursor.ptr, 8) })?;
+    if emitted != total {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(emitted as usize));
+    }
+    Ok(CudaJoinCoordinatesU32 {
+        coordinates: Some(output),
+        row_count: total_u32,
+        relation_count: left_rels + 1,
+        allocated_bytes: output_bytes as u64,
+    })
+}
+
+fn launch_cuda_unmatched_coordinate_relation(
+    marks: &CudaResidentDeviceMemory,
+    row_count: u32,
+    relation_count: u32,
+    real_relation: u32,
+) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,u32,u32,u32,u32,u32,u32,u32,*mut c_void,*mut *mut c_void,*mut *mut c_void,
+    )->i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void,u64,usize)->i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64,u8,usize)->i32;
+    const PTX:&[u8]=br#"
+.version 6.0
+.target sm_60
+.address_size 64
+.visible .entry gpu_db_unmatched_coordinate_relation(
+ .param .u64 marks,.param .u32 rows,.param .u32 rels,.param .u32 real_rel,
+ .param .u64 out,.param .u64 cursor)
+{
+ .reg .pred %p<5>; .reg .b32 %r<24>; .reg .b64 %rd<24>;
+ ld.param.u64 %rd1,[marks];ld.param.u32 %r1,[rows];ld.param.u32 %r2,[rels];ld.param.u32 %r3,[real_rel];ld.param.u64 %rd2,[out];ld.param.u64 %rd3,[cursor];
+ mov.u32 %r4,0;
+ROW_LOOP:setp.ge.u32 %p1,%r4,%r1;@%p1 bra DONE;mul.wide.u32 %rd4,%r4,4;add.u64 %rd5,%rd1,%rd4;ld.global.u32 %r5,[%rd5];setp.ne.u32 %p2,%r5,0;@%p2 bra NEXT;
+ atom.global.add.u64 %rd6,[%rd3],1;setp.eq.u64 %p3,%rd2,0;@%p3 bra NEXT;cvt.u64.u32 %rd7,%r2;mul.lo.u64 %rd8,%rd6,%rd7;mov.u32 %r6,0;
+COL_LOOP:setp.ge.u32 %p4,%r6,%r2;@%p4 bra NEXT;setp.eq.u32 %p3,%r6,%r3;selp.u32 %r7,%r4,4294967295,%p3;cvt.u64.u32 %rd9,%r6;add.u64 %rd10,%rd8,%rd9;mul.lo.u64 %rd10,%rd10,4;add.u64 %rd10,%rd2,%rd10;st.global.u32 [%rd10],%r7;add.u32 %r6,%r6,1;bra COL_LOOP;
+NEXT:add.u32 %r4,%r4,1;bra ROW_LOOP;DONE:ret;
+}
+"#;
+    if relation_count==0||real_relation>=relation_count{return Err(CudaRuntimeProbeError::InvalidInputLength(real_relation as usize));}
+    let primary=marks.primary_arc();primary.set_current()?;let cursor=primary.lease_device_buffer_owned(8)?;
+    let memset=unsafe{primary.lib().get::<CuMemsetD8>(b"cuMemsetD8_v2\0").or_else(|_|primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0")).map_err(|_|CudaRuntimeProbeError::DriverLibraryUnavailable)?};
+    let dtoh=unsafe{primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0").or_else(|_|primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0")).map_err(|_|CudaRuntimeProbeError::DriverLibraryUnavailable)?};
+    let launch=unsafe{primary.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0").map_err(|_|CudaRuntimeProbeError::DriverLibraryUnavailable)?};let mut ptx=PTX.to_vec();ptx.push(0);let function=primary.cached_function(c"gpu_db_unmatched_coordinate_relation",&ptx)?;
+    let run=|out:u64|->Result<(),CudaRuntimeProbeError>{let mut a0=marks.device_ptr;let mut a1=row_count;let mut a2=relation_count;let mut a3=real_relation;let mut a4=out;let mut a5=cursor.ptr;let mut args=[(&mut a0 as *mut u64).cast(),(&mut a1 as *mut u32).cast(),(&mut a2 as *mut u32).cast(),(&mut a3 as *mut u32).cast(),(&mut a4 as *mut u64).cast(),(&mut a5 as *mut u64).cast()];check_cuda(unsafe{launch(function,1,1,1,1,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut())})};
+    check_cuda(unsafe{memset(cursor.ptr,0,8)})?;run(0)?;let mut count=0_u64;check_cuda(unsafe{dtoh((&mut count as *mut u64).cast(),cursor.ptr,8)})?;let count=u32::try_from(count).map_err(|_|CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if count==0{return Ok(CudaJoinCoordinatesU32{coordinates:None,row_count:0,relation_count,allocated_bytes:0});}
+    let bytes=count as usize*relation_count as usize*4;let output=primary.lease_device_buffer_owned(bytes)?;check_cuda(unsafe{memset(cursor.ptr,0,8)})?;run(output.ptr)?;
+    Ok(CudaJoinCoordinatesU32{coordinates:Some(output),row_count:count,relation_count,allocated_bytes:bytes as u64+8})
+}
+
+fn launch_cuda_unmatched_extended_coordinates(
+    marks: &CudaResidentDeviceMemory,
+    row_count: u32,
+    accumulated: &CudaJoinCoordinatesU32,
+) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+.visible .entry gpu_db_unmatched_extended_coordinates(
+    .param .u64 marks, .param .u64 coords, .param .u32 rows, .param .u32 rels,
+    .param .u64 out, .param .u64 cursor)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<28>;
+    ld.param.u64 %rd1, [marks];
+    ld.param.u64 %rd2, [coords];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [rels];
+    ld.param.u64 %rd3, [out];
+    ld.param.u64 %rd4, [cursor];
+    mov.u32 %r3, 0;
+ROW_LOOP:
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra DONE;
+    mul.wide.u32 %rd5, %r3, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.u32 %r4, [%rd6];
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra NEXT;
+    atom.global.add.u64 %rd7, [%rd4], 1;
+    setp.eq.u64 %p3, %rd3, 0;
+    @%p3 bra NEXT;
+    add.u32 %r5, %r2, 1;
+    cvt.u64.u32 %rd8, %r5;
+    mul.lo.u64 %rd9, %rd7, %rd8;
+    mov.u32 %r6, 0;
+COPY_LOOP:
+    setp.ge.u32 %p4, %r6, %r2;
+    @%p4 bra WRITE_PAD;
+    mul.lo.u32 %r7, %r3, %r2;
+    add.u32 %r7, %r7, %r6;
+    mul.wide.u32 %rd10, %r7, 4;
+    add.u64 %rd11, %rd2, %rd10;
+    ld.global.u32 %r8, [%rd11];
+    cvt.u64.u32 %rd12, %r6;
+    add.u64 %rd13, %rd9, %rd12;
+    mul.lo.u64 %rd13, %rd13, 4;
+    add.u64 %rd14, %rd3, %rd13;
+    st.global.u32 [%rd14], %r8;
+    add.u32 %r6, %r6, 1;
+    bra COPY_LOOP;
+WRITE_PAD:
+    cvt.u64.u32 %rd12, %r2;
+    add.u64 %rd13, %rd9, %rd12;
+    mul.lo.u64 %rd13, %rd13, 4;
+    add.u64 %rd14, %rd3, %rd13;
+    mov.u32 %r8, 4294967295;
+    st.global.u32 [%rd14], %r8;
+NEXT:
+    add.u32 %r3, %r3, 1;
+    bra ROW_LOOP;
+DONE:
+    ret;
+}
+"#;
+    if accumulated.row_count != row_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(row_count as usize));
+    }
+    if row_count == 0 {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: accumulated.relation_count + 1,
+            allocated_bytes: 0,
+        });
+    }
+    let source = accumulated
+        .coordinates
+        .as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let primary = marks.primary_arc();
+    primary.set_current()?;
+    let cursor = primary.lease_device_buffer_owned(8)?;
+    let memset = unsafe {
+        primary
+            .lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let dtoh = unsafe {
+        primary
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let launch = unsafe {
+        primary
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_unmatched_extended_coordinates", &ptx)?;
+    let run = |out: u64| -> Result<(), CudaRuntimeProbeError> {
+        let mut a0 = marks.device_ptr;
+        let mut a1 = source.ptr;
+        let mut a2 = row_count;
+        let mut a3 = accumulated.relation_count;
+        let mut a4 = out;
+        let mut a5 = cursor.ptr;
+        let mut args = [
+            (&mut a0 as *mut u64).cast(),
+            (&mut a1 as *mut u64).cast(),
+            (&mut a2 as *mut u32).cast(),
+            (&mut a3 as *mut u32).cast(),
+            (&mut a4 as *mut u64).cast(),
+            (&mut a5 as *mut u64).cast(),
+        ];
+        check_cuda(unsafe {
+            launch(
+                function,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+    };
+    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
+    run(0)?;
+    let mut count = 0_u64;
+    check_cuda(unsafe { dtoh((&mut count as *mut u64).cast(), cursor.ptr, 8) })?;
+    let count = u32::try_from(count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if count == 0 {
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: None,
+            row_count: 0,
+            relation_count: accumulated.relation_count + 1,
+            allocated_bytes: 0,
+        });
+    }
+    let bytes = count as usize * (accumulated.relation_count as usize + 1) * 4;
+    let output = primary.lease_device_buffer_owned(bytes)?;
+    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
+    run(output.ptr)?;
+    Ok(CudaJoinCoordinatesU32 {
+        coordinates: Some(output),
+        row_count: count,
+        relation_count: accumulated.relation_count + 1,
+        allocated_bytes: bytes as u64,
+    })
+}
+
+fn launch_cuda_mark_coordinate_column_u32(
+    marks: &CudaResidentDeviceMemory,
+    row_count: u32,
+    coordinates: &CudaJoinCoordinatesU32,
+    relation: u32,
+) -> Result<(), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_mark_coordinate_column_u32(
+    .param .u64 coords, .param .u32 tuple_count, .param .u32 relation_count,
+    .param .u32 relation, .param .u64 marks, .param .u32 row_count)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [coords];
+    ld.param.u32 %r1, [tuple_count];
+    ld.param.u32 %r2, [relation_count];
+    ld.param.u32 %r3, [relation];
+    ld.param.u64 %rd2, [marks];
+    ld.param.u32 %r4, [row_count];
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mov.u32 %r8, %nctaid.x;
+    mad.lo.u32 %r9, %r6, %r7, %r5;
+    mul.lo.u32 %r10, %r8, %r7;
+LOOP:
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra DONE;
+    mul.lo.u32 %r11, %r9, %r2;
+    add.u32 %r11, %r11, %r3;
+    mul.wide.u32 %rd3, %r11, 4;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.u32 %r12, [%rd4];
+    setp.ge.u32 %p2, %r12, %r4;
+    @%p2 bra NEXT;
+    mul.wide.u32 %rd5, %r12, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    mov.u32 %r13, 1;
+    atom.global.exch.b32 %r14, [%rd6], %r13;
+NEXT:
+    add.u32 %r9, %r9, %r10;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+    if relation >= coordinates.relation_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(relation as usize));
+    }
+    if coordinates.row_count == 0 {
+        return Ok(());
+    }
+    let source = coordinates
+        .coordinates
+        .as_ref()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let primary = marks.primary_arc();
+    primary.set_current()?;
+    let launch = unsafe {
+        primary
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_mark_coordinate_column_u32", &ptx)?;
+    let mut a0 = source.ptr;
+    let mut a1 = coordinates.row_count;
+    let mut a2 = coordinates.relation_count;
+    let mut a3 = relation;
+    let mut a4 = marks.device_ptr;
+    let mut a5 = row_count;
+    let mut args = [
+        (&mut a0 as *mut u64).cast(),
+        (&mut a1 as *mut u32).cast(),
+        (&mut a2 as *mut u32).cast(),
+        (&mut a3 as *mut u32).cast(),
+        (&mut a4 as *mut u64).cast(),
+        (&mut a5 as *mut u32).cast(),
+    ];
+    check_cuda(unsafe {
+        launch(
+            function,
+            coordinates.row_count.div_ceil(256).clamp(1, 65_535),
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
+}
+
+fn probe_cuda_chunk_blooms(
+    ctx: &CudaResidentDeviceMemory,
+    blooms: &[ChunkBloomProbeShard],
+    needles: &[i32],
+) -> Result<Vec<Vec<u32>>, CudaRuntimeProbeError> {
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_chunk_bloom_probe(
+    .param .u64 desc_ptr, .param .u32 chunk_count, .param .u64 needles_ptr,
+    .param .u32 needle_count, .param .u64 out_ptr)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<18>;
+    ld.param.u64 %rd1, [desc_ptr];
+    ld.param.u32 %r1, [chunk_count];
+    ld.param.u64 %rd2, [needles_ptr];
+    ld.param.u32 %r2, [needle_count];
+    ld.param.u64 %rd3, [out_ptr];
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.u32 %r6, %r4, %r5, %r3;
+    mul.lo.u32 %r7, %r1, %r2;
+    setp.ge.u32 %p1, %r6, %r7;
+    @%p1 bra DONE;
+    div.u32 %r8, %r6, %r1;
+    rem.u32 %r9, %r6, %r1;
+    mul.wide.u32 %rd4, %r8, 4;
+    add.u64 %rd5, %rd2, %rd4;
+    ld.global.u32 %r10, [%rd5];
+    mul.wide.u32 %rd6, %r9, 16;
+    add.u64 %rd7, %rd1, %rd6;
+    ld.global.u64 %rd8, [%rd7];
+    ld.global.u64 %rd9, [%rd7+8];
+    cvt.u32.u64 %r11, %rd9;
+    mul.lo.u32 %r12, %r10, 2654435761;
+    shr.u32 %r13, %r10, 16;
+    xor.b32 %r13, %r13, %r10;
+    mul.lo.u32 %r13, %r13, 2246822519;
+    or.b32 %r13, %r13, 1;
+    mov.u32 %r14, 0;
+LOOP:
+    mad.lo.u32 %r15, %r14, %r13, %r12;
+    and.b32 %r15, %r15, %r11;
+    shr.u32 %r16, %r15, 5;
+    and.b32 %r17, %r15, 31;
+    mov.u32 %r18, 1;
+    shl.b32 %r18, %r18, %r17;
+    mul.wide.u32 %rd10, %r16, 4;
+    add.u64 %rd11, %rd8, %rd10;
+    ld.global.u32 %r19, [%rd11];
+    and.b32 %r19, %r19, %r18;
+    setp.eq.u32 %p2, %r19, 0;
+    @%p2 bra MISS;
+    add.u32 %r14, %r14, 1;
+    setp.lt.u32 %p3, %r14, 3;
+    @%p3 bra LOOP;
+    mov.u32 %r20, 1;
+    bra WRITE;
+MISS:
+    mov.u32 %r20, 0;
+WRITE:
+    cvt.u64.u32 %rd12, %r6;
+    add.u64 %rd13, %rd3, %rd12;
+    st.global.u8 [%rd13], %r20;
+DONE:
+    ret;
+}
+"#;
+    if blooms.is_empty() || needles.is_empty() {
+        return Ok(vec![Vec::new(); needles.len()]);
+    }
+    let chunk_count = u32::try_from(blooms.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(blooms.len()))?;
+    let needle_count = u32::try_from(needles.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
+    let total = blooms.len().checked_mul(needles.len())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut desc = Vec::with_capacity(blooms.len() * 2);
+    let mut guards = Vec::with_capacity(blooms.len());
+    for bloom in blooms {
+        if bloom.bloom.metadata().gpu_id != ctx.metadata().gpu_id {
+            return Err(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(
+                bloom.bloom.metadata().gpu_id,
+            )));
+        }
+        if bloom.bit_mask == 0 || !bloom.bit_mask.wrapping_add(1).is_power_of_two() {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(bloom.bit_mask as usize));
+        }
+        let required = (u64::from(bloom.bit_mask) + 1).div_ceil(8);
+        if required > bloom.bloom.metadata().allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(required as usize));
+        }
+        desc.push(bloom.bloom.device_ptr());
+        desc.push(u64::from(bloom.bit_mask));
+        guards.push(Arc::clone(&bloom.bloom));
+    }
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+    let htod = unsafe { primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+        .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+        .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)? };
+    let dtoh = unsafe { primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+        .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+        .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)? };
+    let launch = unsafe { primary.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+        .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)? };
+    let desc_bytes = std::mem::size_of_val(desc.as_slice());
+    let needle_bytes = std::mem::size_of_val(needles);
+    let desc_guard = primary.lease_device_buffer_owned(desc_bytes)?;
+    let needle_guard = primary.lease_device_buffer_owned(needle_bytes)?;
+    let out_guard = primary.lease_device_buffer_owned(total)?;
+    check_cuda(unsafe { htod(desc_guard.ptr, desc.as_ptr().cast(), desc_bytes) })?;
+    check_cuda(unsafe { htod(needle_guard.ptr, needles.as_ptr().cast(), needle_bytes) })?;
+    let mut ptx = PTX.to_vec(); ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_chunk_bloom_probe", &ptx)?;
+    let mut desc_arg = desc_guard.ptr;
+    let mut chunks_arg = chunk_count;
+    let mut needles_arg = needle_guard.ptr;
+    let mut needle_count_arg = needle_count;
+    let mut out_arg = out_guard.ptr;
+    let mut args = [
+        (&mut desc_arg as *mut u64).cast(), (&mut chunks_arg as *mut u32).cast(),
+        (&mut needles_arg as *mut u64).cast(), (&mut needle_count_arg as *mut u32).cast(),
+        (&mut out_arg as *mut u64).cast(),
+    ];
+    let threads = 128u32;
+    let blocks = u32::try_from(total).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(total))?.div_ceil(threads);
+    check_cuda(unsafe { launch(function, blocks, 1, 1, threads, 1, 1, 0,
+        std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut()) })?;
+    let mut raw = vec![0u8; total];
+    check_cuda(unsafe { dtoh(raw.as_mut_ptr().cast(), out_guard.ptr, total) })?;
+    drop(guards);
+    let mut out = vec![Vec::new(); needles.len()];
+    for (needle, row) in raw.chunks_exact(blooms.len()).enumerate() {
+        for (chunk, &hit) in row.iter().enumerate() {
+            if hit != 0 { out[needle].push(chunk as u32); }
+        }
+    }
+    Ok(out)
+}
+
 /// Sub-slice 8 v2: one shard's inputs for the MULTI-SHARD dense-emit probe. The kernel reads these from a
-/// device-resident descriptor array (64 bytes/shard) so ONE kernel launch probes ALL shards per needle,
+/// device-resident descriptor array (88 bytes/shard) so ONE kernel launch probes ALL shards per needle,
 /// emits ONE dense slot (1xN output, no S*N DtoH, no host merge).
 pub struct MultiShardProbeShard {
     /// The shard's column BUFFER (probed at the capacity-strided projection offsets).
@@ -11432,6 +16573,10 @@ pub struct MultiShardProbeShard {
     pub projection_offsets: Vec<u64>,
     /// The shard's live row count (for the projection bounds check).
     pub row_count: u64,
+    /// Per-row birth/death stamps from the SAME published shard snapshot. `None` means born-visible/all-live.
+    /// The Arcs pin these regions through completion; the descriptor passes only their device pointers.
+    pub created_by: Option<Arc<CudaResidentDeviceMemory>>,
+    pub deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
     /// Zone map [min, max] of the FILTER column for this shard (from `resident_device_int4_column_stats`);
     /// the kernel skips this shard for a needle outside [min, max] (on-device prune). Pass `(i32::MIN,
     /// i32::MAX)` when the shard has no stat for the column -> always in-range (matches the scan, which keeps
@@ -11451,6 +16596,7 @@ fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
     ctx: &CudaResidentDeviceMemory,
     shards: &[MultiShardProbeShard],
     needles: &[i32],
+    read_snapshot: u64,
 ) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
@@ -11469,8 +16615,8 @@ fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
     ) -> i32;
 
     const MAX_PROJECTIONS: usize = 4;
-    const DESC_U64_PER_SHARD: usize = 8; // resident_ptr, index_ptr, mask|shift, proj0..3, reserved
-                                         // PTX: outer SHARD loop over a device descriptor array (64 B/shard) wrapping the single-shard probe +
+    const DESC_U64_PER_SHARD: usize = 11; // resident, index, mask|shift, proj0..3, zone, created, deleted, rows
+                                         // PTX: outer SHARD loop over an 88 B/shard descriptor array.
                                          // gather. Each thread probes shard 0, 1, ... until a FOUND (emit slot + status=1) or all miss (status=2).
                                          // The hash/probe/gather is byte-identical to `gpu_db_resident_i32_index_probe_dense`; only the shard loop +
                                          // per-shard descriptor reads are new. ASCII-only.
@@ -11487,10 +16633,11 @@ fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
     .param .u64 needles_ptr,
     .param .u64 out_values_ptr,
     .param .u64 out_status_ptr,
-    .param .u32 binary_mode
+    .param .u32 binary_mode,
+    .param .u64 read_snapshot
 )
 {
-    .reg .pred %p<6>;
+    .reg .pred %p<9>;
     .reg .b32 %r<40>;
     .reg .b64 %rd<48>;
 
@@ -11502,6 +16649,7 @@ fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
     ld.param.u64 %rd3, [out_values_ptr];
     ld.param.u64 %rd4, [out_status_ptr];
     ld.param.u32 %r26, [binary_mode];
+    ld.param.u64 %rd36, [read_snapshot];
 
     mov.u32 %r4, %tid.x;
     mov.u32 %r5, %ctaid.x;
@@ -11530,7 +16678,7 @@ BSEARCH:
     @%p1 bra BDONE;
     add.u32 %r29, %r27, %r28;
     shr.u32 %r29, %r29, 1;
-    mul.wide.u32 %rd32, %r29, 64;
+    mul.wide.u32 %rd32, %r29, 88;
     add.u64 %rd33, %rd1, %rd32;
     ld.global.u64 %rd34, [%rd33+56];
     cvt.u32.u64 %r30, %rd34;
@@ -11545,7 +16693,7 @@ BDONE:
     setp.eq.u32 %p1, %r27, 0;
     @%p1 bra BKEEP0;
     sub.u32 %r9, %r27, 1;
-    mul.wide.u32 %rd32, %r9, 64;
+    mul.wide.u32 %rd32, %r9, 88;
     add.u64 %rd33, %rd1, %rd32;
     ld.global.u64 %rd34, [%rd33+56];
     shr.u64 %rd35, %rd34, 32;
@@ -11578,12 +16726,16 @@ LINEARINIT:
 SHARD:
     setp.ge.u32 %p1, %r9, %r23;
     @%p1 bra ALLDONE;
-    mul.wide.u32 %rd7, %r9, 64;
+    mul.wide.u32 %rd7, %r9, 88;
     add.u64 %rd8, %rd1, %rd7;
     ld.global.u64 %rd9, [%rd8];
     ld.global.u64 %rd10, [%rd8+8];
     ld.global.u64 %rd11, [%rd8+16];
     ld.global.u64 %rd30, [%rd8+56];
+    ld.global.u64 %rd37, [%rd8+64];
+    ld.global.u64 %rd38, [%rd8+72];
+    ld.global.u64 %rd44, [%rd8+80];
+    cvt.u32.u64 %r31, %rd44;
     cvt.u32.u64 %r20, %rd30;
     shr.u64 %rd31, %rd30, 32;
     cvt.u32.u64 %r21, %rd31;
@@ -11613,23 +16765,36 @@ PROBE:
     cvt.u32.u64 %r15, %rd16;
     setp.eq.s32 %p2, %r15, %r8;
     @%p2 bra FOUND;
-    add.u32 %r13, %r13, 1;
-    add.u32 %r14, %r14, 1;
-    setp.ge.u32 %p3, %r14, 256;
-    @%p3 bra NEXTSHARD;
-    bra PROBE;
+    bra ADVANCEPROBE;
 
 NEXTSHARD:
     add.u32 %r9, %r9, 1;
     bra SHARD;
 
 FOUND:
+    cvt.u32.u64 %r16, %rd15;
+    sub.u32 %r16, %r16, 1;
+    setp.ge.u32 %p8, %r16, %r31;
+    @%p8 bra ADVANCEPROBE;
+    cvt.u64.u32 %rd17, %r16;
+    mul.lo.u64 %rd39, %rd17, 8;
+    setp.eq.u64 %p6, %rd37, 0;
+    @%p6 bra CREATEDOK;
+    add.u64 %rd40, %rd37, %rd39;
+    ld.global.u64 %rd41, [%rd40];
+    setp.gt.u64 %p6, %rd41, %rd36;
+    @%p6 bra ADVANCEPROBE;
+CREATEDOK:
+    setp.eq.u64 %p7, %rd38, 0;
+    @%p7 bra VISIBLE;
+    add.u64 %rd42, %rd38, %rd39;
+    ld.global.u64 %rd43, [%rd42];
+    setp.le.u64 %p7, %rd43, %rd36;
+    @%p7 bra ADVANCEPROBE;
+VISIBLE:
     setp.eq.u32 %p5, %r19, 1;
     @%p5 bra DUP;
     mov.u32 %r19, 1;
-    cvt.u32.u64 %r16, %rd15;
-    sub.u32 %r16, %r16, 1;
-    cvt.u64.u32 %rd17, %r16;
     mul.lo.u64 %rd24, %rd17, 4;
 
     cvt.u64.u32 %rd18, %r7;
@@ -11677,8 +16842,12 @@ FOUND:
     st.global.s32 [%rd27], %r18;
 
 AFTEREMIT:
-    add.u32 %r9, %r9, 1;
-    bra SHARD;
+ADVANCEPROBE:
+    add.u32 %r13, %r13, 1;
+    add.u32 %r14, %r14, 1;
+    setp.ge.u32 %p3, %r14, 256;
+    @%p3 bra NEXTSHARD;
+    bra PROBE;
 
 DUP:
     cvt.u64.u32 %rd18, %r7;
@@ -11722,14 +16891,17 @@ DONE:
     }
     // Build the descriptor array + per-shard bounds check; all shards share projection_count.
     let mut desc: Vec<u64> = Vec::with_capacity(shards.len() * DESC_U64_PER_SHARD);
-    let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> = Vec::with_capacity(shards.len() * 2);
+    let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> = Vec::with_capacity(shards.len() * 4);
     for shard in shards {
         if shard.projection_offsets.len() != projection_count {
             return Err(CudaRuntimeProbeError::InvalidInputLength(
                 shard.projection_offsets.len(),
             ));
         }
-        if shard.row_count == 0 || shard.index.device_ptr() == 0 {
+        if shard.row_count == 0
+            || shard.row_count > u32::MAX as u64
+            || shard.index.device_ptr() == 0
+        {
             return Err(CudaRuntimeProbeError::InvalidInputLength(0));
         }
         let allocated = shard.resident.metadata().allocated_bytes;
@@ -11754,6 +16926,22 @@ DONE:
         // Slot 7: the filter column's zone map [min, max] packed as `min | (max << 32)` (the kernel skips
         // this shard for a needle out of range).
         desc.push((shard.min as u32 as u64) | ((shard.max as u32 as u64) << 32));
+        for region in [&shard.created_by, &shard.deleted_by] {
+            if let Some(region) = region {
+                let required = shard
+                    .row_count
+                    .checked_mul(std::mem::size_of::<u64>() as u64)
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                if required > region.metadata().allocated_bytes {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(required as usize));
+                }
+                desc.push(region.device_ptr());
+                index_guards.push(Arc::clone(region));
+            } else {
+                desc.push(0);
+            }
+        }
+        desc.push(shard.row_count);
         // Pin the shard's column buffer + its device index alive until the kernel completes.
         index_guards.push(Arc::clone(&shard.resident));
         index_guards.push(Arc::clone(&shard.index));
@@ -11835,6 +17023,7 @@ DONE:
     let mut output_arg = values_guard.ptr;
     let mut status_arg = status_guard.ptr;
     let mut binary_mode_arg = binary_mode;
+    let mut read_snapshot_arg = read_snapshot;
     let mut args = [
         (&mut desc_arg as *mut u64).cast::<c_void>(),
         (&mut shard_count_arg as *mut u32).cast::<c_void>(),
@@ -11844,6 +17033,7 @@ DONE:
         (&mut output_arg as *mut u64).cast::<c_void>(),
         (&mut status_arg as *mut u64).cast::<c_void>(),
         (&mut binary_mode_arg as *mut u32).cast::<c_void>(),
+        (&mut read_snapshot_arg as *mut u64).cast::<c_void>(),
     ];
     let threads_per_block = 128;
     let blocks = needle_count_u32.div_ceil(threads_per_block);
@@ -12365,9 +17555,9 @@ DONE:
 /// E2.5c FUSED APPLY (2M+ push (b)): ONE kernel for the whole merged-apply device pass —
 /// column scatter (each appended row's i32 values into every column section's headroom slots)
 /// + created_by stamps + row-id stamps + the incremental PK hash-index CAS insert — replacing
-/// the ~8 driver calls of the unfused chain (C column HtoDs + 2 stamp HtoDs + the 4-call index
-/// insert) with 1 staging HtoD + 1 launch + 1 decline DtoH (which also serializes the stamps
-/// ahead of the host's row_count publish, preserving the SV6 stamp-before-publish order).
+///   the ~8 driver calls of the unfused chain (C column HtoDs + 2 stamp HtoDs + the 4-call index
+///   insert) with 1 staging HtoD + 1 launch + 1 decline DtoH (which also serializes the stamps
+///   ahead of the host's row_count publish, preserving the SV6 stamp-before-publish order).
 ///
 /// Everything travels in ONE staging buffer read by the kernel (fixed 80B header + a per-column
 /// dest-pointer table + col-major values + stamps + optional row ids); the decline flag lives
@@ -21076,6 +26266,231 @@ fn launch_cuda_resident_expr_predicate_filter(
     compact_mask_i32_to_indices(resident, mask.ptr, n)
 }
 
+fn launch_cuda_resident_expr_predicate_mask(
+    resident: &CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    text_needles: &[Vec<u8>],
+    n: u32,
+    elem: ResidentElemType,
+) -> Result<CudaPredicateMaskI32, CudaRuntimeProbeError> {
+    let n64 = u64::from(n);
+    if n == 0 {
+        return Ok(CudaPredicateMaskI32 {
+            mask: resident.primary_arc().lease_device_buffer_owned(1)?,
+            row_count: 0,
+        });
+    }
+    let mut stack = run_resident_arith_program(resident, program, text_needles, n64, elem)?;
+    let mask = stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !stack.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    // Transfer the pool lease without a device copy. The owned guard keeps the shared primary
+    // context alive and returns exactly the same bucket to the pool on drop.
+    let ptr = mask.ptr;
+    let capacity = mask.capacity;
+    let tracker = mask.tracker.clone();
+    std::mem::forget(mask);
+    Ok(CudaPredicateMaskI32 {
+        mask: PooledDeviceBufferOwned {
+            primary: resident.primary_arc(),
+            ptr,
+            capacity,
+            tracker,
+        },
+        row_count: n,
+    })
+}
+
+fn launch_cuda_row_range_mask_u32(
+    resident: &CudaResidentDeviceMemory,
+    row_count: u32,
+    start: u32,
+    end: u32,
+) -> Result<CudaPredicateMaskI32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_row_range_mask(
+    .param .u32 rows, .param .u32 start, .param .u32 end, .param .u64 mask)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<5>;
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [start];
+    ld.param.u32 %r3, [end];
+    ld.param.u64 %rd1, [mask];
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %nctaid.x;
+    mad.lo.u32 %r8, %r5, %r6, %r4;
+    mul.lo.u32 %r9, %r7, %r6;
+LOOP:
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra DONE;
+    setp.ge.u32 %p2, %r8, %r2;
+    setp.lt.u32 %p3, %r8, %r3;
+    and.pred %p2, %p2, %p3;
+    selp.u32 %r10, 1, 0, %p2;
+    mul.wide.u32 %rd2, %r8, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r10;
+    add.u32 %r8, %r8, %r9;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+    if start > end || end > row_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(end as usize));
+    }
+    let primary = resident.primary_arc();
+    primary.set_current()?;
+    let bytes = (row_count as usize).saturating_mul(4).max(1);
+    let mask = primary.lease_device_buffer_owned(bytes)?;
+    if row_count > 0 {
+        let launch = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let mut ptx = PTX.to_vec();
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_row_range_mask", &ptx)?;
+        let mut a0 = row_count;
+        let mut a1 = start;
+        let mut a2 = end;
+        let mut a3 = mask.ptr;
+        let mut args = [
+            (&mut a0 as *mut u32).cast(),
+            (&mut a1 as *mut u32).cast(),
+            (&mut a2 as *mut u32).cast(),
+            (&mut a3 as *mut u64).cast(),
+        ];
+        check_cuda(unsafe {
+            launch(
+                function,
+                row_count.div_ceil(256).clamp(1, 65_535),
+                1,
+                1,
+                256,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+    }
+    Ok(CudaPredicateMaskI32 { mask, row_count })
+}
+
+fn launch_cuda_and_predicate_masks(
+    resident: &CudaResidentDeviceMemory,
+    left: &CudaPredicateMaskI32,
+    right: &CudaPredicateMaskI32,
+) -> Result<CudaPredicateMaskI32, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+.visible .entry gpu_db_and_predicate_masks(
+    .param .u64 a, .param .u64 b, .param .u32 n, .param .u64 out)
+{
+    .reg .pred %p;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [a];
+    ld.param.u64 %rd2, [b];
+    ld.param.u32 %r1, [n];
+    ld.param.u64 %rd3, [out];
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %nctaid.x;
+    mad.lo.u32 %r6, %r3, %r4, %r2;
+    mul.lo.u32 %r7, %r5, %r4;
+LOOP:
+    setp.ge.u32 %p, %r6, %r1;
+    @%p bra DONE;
+    mul.wide.u32 %rd4, %r6, 4;
+    add.u64 %rd5, %rd1, %rd4;
+    add.u64 %rd6, %rd2, %rd4;
+    add.u64 %rd7, %rd3, %rd4;
+    ld.global.u32 %r8, [%rd5];
+    ld.global.u32 %r9, [%rd6];
+    and.b32 %r10, %r8, %r9;
+    st.global.u32 [%rd7], %r10;
+    add.u32 %r6, %r6, %r7;
+    bra LOOP;
+DONE:
+    ret;
+}
+"#;
+    if left.row_count != right.row_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(left.row_count as usize));
+    }
+    let primary = resident.primary_arc();
+    primary.set_current()?;
+    let bytes = (left.row_count as usize).saturating_mul(4).max(1);
+    let output = primary.lease_device_buffer_owned(bytes)?;
+    if left.row_count > 0 {
+        let launch = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let mut ptx = PTX.to_vec();
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_and_predicate_masks", &ptx)?;
+        let mut a0 = left.mask.ptr;
+        let mut a1 = right.mask.ptr;
+        let mut a2 = left.row_count;
+        let mut a3 = output.ptr;
+        let mut args = [
+            (&mut a0 as *mut u64).cast(),
+            (&mut a1 as *mut u64).cast(),
+            (&mut a2 as *mut u32).cast(),
+            (&mut a3 as *mut u64).cast(),
+        ];
+        check_cuda(unsafe {
+            launch(
+                function,
+                a2.div_ceil(256).clamp(1, 65_535),
+                1,
+                1,
+                256,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+    }
+    Ok(CudaPredicateMaskI32 {
+        mask: output,
+        row_count: left.row_count,
+    })
+}
+
 // P2 §9.5/S2 — stable bitonic argsort primitive (the small-result branch of the adaptive GPU sort
 // operator). Sorts N i64 keys (resident, at `keys_byte_offset`) by (key, original index) and returns
 // the permutation indices, ascending or descending. Two kernels on one pooled stream:
@@ -28169,6 +33584,123 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let build = |keys: &[i32], payload: &[i32]| {
+            let mut bytes = Vec::new();
+            for value in keys.iter().chain(payload) {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let resident = Arc::new(runtime.retain_device_memory_copy(0, &bytes).unwrap());
+            let size = ((keys.len() * 2) as u32).next_power_of_two();
+            let mask = size - 1;
+            let shift = 32 - size.trailing_zeros();
+            let mut entries = vec![0_u64; size as usize];
+            for (slot, &key) in keys.iter().enumerate() {
+                let mut at = (key as u32).wrapping_mul(0x9E37_79B1) >> shift;
+                at &= mask;
+                while entries[at as usize] != 0 {
+                    at = (at + 1) & mask;
+                }
+                entries[at as usize] = ((key as u32 as u64) << 32) | (slot as u64 + 1);
+            }
+            let index_bytes: Vec<u8> = entries.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let index = Arc::new(runtime.retain_device_memory_copy(0, &index_bytes).unwrap());
+            (resident, index, mask, shift)
+        };
+
+        // An append-mutated index may be ahead of a reader's captured descriptor. With no birth region in that
+        // older descriptor, row_count is the only sound upper bound: slot 2 must not leak through row_count 2.
+        let (resident, index, mask, shift) = build(&[1, 2, 3], &[10, 20, 30]);
+        let ahead = MultiShardProbeShard {
+            resident: Arc::clone(&resident),
+            index,
+            table_mask: mask,
+            hash_shift: shift,
+            projection_offsets: vec![0, 12],
+            row_count: 2,
+            created_by: None,
+            deleted_by: None,
+            min: 1,
+            max: 3,
+        };
+        let (cols, _) = resident
+            .submit_multi_shard_i32_index_probe_dense(&[ahead], &[3], 100)
+            .unwrap()
+            .complete_detached_columnar()
+            .unwrap();
+        assert_eq!(cols.status, vec![2], "ahead-index slot is outside captured row_count");
+
+        // A dead and live version of the same key can occupy adjacent probe slots in one dup-tolerant index.
+        // The kernel must advance past the invisible twin and gather the visible one.
+        let (resident, index, mask, shift) = build(&[3, 3], &[30, 31]);
+        let created_bytes: Vec<u8> = [1_u64, 5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let deleted_bytes: Vec<u8> = [5_u64, u64::MAX]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let twin = MultiShardProbeShard {
+            resident: Arc::clone(&resident),
+            index,
+            table_mask: mask,
+            hash_shift: shift,
+            projection_offsets: vec![0, 8],
+            row_count: 2,
+            created_by: Some(Arc::new(runtime.retain_device_memory_copy(0, &created_bytes).unwrap())),
+            deleted_by: Some(Arc::new(runtime.retain_device_memory_copy(0, &deleted_bytes).unwrap())),
+            min: 3,
+            max: 3,
+        };
+        let (cols, _) = resident
+            .submit_multi_shard_i32_index_probe_dense(&[twin], &[3], 5)
+            .unwrap()
+            .complete_detached_columnar()
+            .unwrap();
+        assert_eq!(cols.status, vec![1]);
+        assert_eq!(cols.values, vec![3, 31], "visible twin gathered after dead twin");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_chunk_bloom_probe_has_no_false_negatives() {
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let build = |keys: &[i32]| {
+            let bit_count = (keys.len() as u64 * 8).max(256).next_power_of_two();
+            let bit_mask = (bit_count - 1) as u32;
+            let mut words = vec![0_u32; (bit_count / 32) as usize];
+            for &key in keys {
+                let key = key as u32;
+                let h1 = key.wrapping_mul(2_654_435_761);
+                let h2 = (key ^ (key >> 16)).wrapping_mul(2_246_822_519) | 1;
+                for i in 0..3_u32 {
+                    let bit = h1.wrapping_add(i.wrapping_mul(h2)) & bit_mask;
+                    words[(bit >> 5) as usize] |= 1_u32 << (bit & 31);
+                }
+            }
+            let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            ChunkBloomProbeShard {
+                bloom: Arc::new(runtime.retain_device_memory_copy(0, &bytes).unwrap()),
+                bit_mask,
+            }
+        };
+        let chunks = [vec![1, 2, 3], vec![10, 20], vec![-5, 77]];
+        let blooms: Vec<_> = chunks.iter().map(|keys| build(keys)).collect();
+        let needles = [1, 20, -5, 404];
+        let candidates = blooms[0]
+            .bloom
+            .probe_chunk_blooms(&blooms, &needles)
+            .expect("Bloom candidate probe");
+        assert!(candidates[0].contains(&0), "key 1 must retain chunk 0");
+        assert!(candidates[1].contains(&1), "key 20 must retain chunk 1");
+        assert!(candidates[2].contains(&2), "key -5 must retain chunk 2");
+        assert!(
+            candidates[3].len() <= chunks.len(),
+            "an absent key may false-positive but cannot produce an invalid chunk"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_bitonic_sort_i64_orders_and_permutes() {
         let runtime = CudaDriverRuntime::probe().expect("probe");
         // The sort never reads the residency; a tiny dummy payload just supplies the shared context.
@@ -28550,6 +34082,540 @@ mod tests {
             expected,
             "200 unique build keys probed by all 200 (forces collision walks) + 2 misses"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_payload_join_retains_nn_outer_coordinates_on_device() {
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let encode = |keys: &[i32], validity: u32| {
+            let mut bytes = keys
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            bytes.extend_from_slice(&validity.to_le_bytes());
+            bytes
+        };
+        let left = runtime
+            .retain_device_memory_copy(0, &encode(&[1, 2, 2, 0], 0b0111))
+            .expect("left payload");
+        let right = runtime
+            .retain_device_memory_copy(0, &encode(&[2, 2, 3, 0], 0b0111))
+            .expect("right payload");
+        let left_key = CudaJoinPayloadKey {
+            payload: &left,
+            byte_offset: 0,
+            validity_bitmap_offset: Some(16),
+            width: 4,
+            text_bytes_byte_offset: None,
+            text_bytes_len: 0,
+        };
+        let right_key = CudaJoinPayloadKey {
+            payload: &right,
+            byte_offset: 0,
+            validity_bitmap_offset: Some(16),
+            width: 4,
+            text_bytes_byte_offset: None,
+            text_bytes_len: 0,
+        };
+        let coordinates = left
+            .join_fixed_payload_coordinates(
+                None,
+                4,
+                &[0],
+                &[left_key],
+                4,
+                &[right_key],
+                None,
+                None,
+                true,
+                true,
+            )
+            .expect("full outer payload join");
+        assert_eq!(coordinates.row_count(), 8);
+        assert_eq!(coordinates.relation_count(), 2);
+        let mut actual = coordinates.readback_for_test().expect("coordinate readback");
+        actual.sort_unstable();
+        let x = u32::MAX;
+        let mut expected = vec![
+            vec![1, 0],
+            vec![1, 1],
+            vec![2, 0],
+            vec![2, 1],
+            vec![0, x],
+            vec![3, x],
+            vec![x, 2],
+            vec![x, 3],
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+
+        let right_is_two = right
+            .run_expr_predicate_mask_with_text(
+                &[
+                    ExprStep::LoadColumn { byte_offset: 0 },
+                    ExprStep::CompareScalar {
+                        cmp: 0,
+                        scalar: 2,
+                        scalar_on_left: false,
+                    },
+                ],
+                &[],
+                4,
+                ResidentElemType::I32,
+            )
+            .expect("device predicate mask");
+        let pad_false = left
+            .row_range_mask_u32(1, 0, 0)
+            .expect("false NULL-pad mask");
+        let filtered = left
+            .filter_join_coordinates(
+                &coordinates,
+                &[None, Some(&right_is_two)],
+                &[Some(&pad_false), Some(&pad_false)],
+            )
+            .expect("device post-join filter");
+        assert_eq!(filtered.row_count(), 4);
+        let bitmap = left.create_match_bitmap_u32(4).expect("match bitmap");
+        bitmap
+            .mark_coordinates(&filtered, 1)
+            .expect("device coordinate marking");
+        assert_eq!(
+            bitmap
+                .unmatched_coordinates(2, 1)
+                .expect("device complement")
+                .readback_for_test()
+                .expect("test-only coordinate readback"),
+            vec![vec![u32::MAX, 2], vec![u32::MAX, 3]]
+        );
+        let (projected, valid) = left
+            .project_fixed_from_join_coordinates(&coordinates, 0, &left, 0, Some(16), 4)
+            .expect("final coordinate projection");
+        let values: Vec<i32> = projected
+            .chunks_exact(4)
+            .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 8);
+        assert_eq!(valid.iter().filter(|&&v| v).count(), 5);
+        assert_eq!(
+            values
+                .iter()
+                .zip(&valid)
+                .filter_map(|(&value, &is_valid)| is_valid.then_some(value))
+                .filter(|&value| value == 2)
+                .count(),
+            4
+        );
+        let sorted = left
+            .sort_join_coordinates(
+                &coordinates,
+                &[CudaJoinOrderKey {
+                    relation: 0,
+                    key: left_key,
+                    descending: false,
+                    nulls_first: false,
+                    lexicographic_16: false,
+                }],
+            )
+            .expect("device coordinate sort");
+        let (sorted_bytes, sorted_valid) = left
+            .project_fixed_from_join_coordinates(&sorted, 0, &left, 0, Some(16), 4)
+            .expect("sorted coordinate projection");
+        let sorted_values: Vec<Option<i32>> = sorted_bytes
+            .chunks_exact(4)
+            .zip(sorted_valid)
+            .map(|(bytes, valid)| {
+                valid.then(|| i32::from_le_bytes(bytes.try_into().unwrap()))
+            })
+            .collect();
+        assert_eq!(
+            sorted_values,
+            vec![Some(1), Some(2), Some(2), Some(2), Some(2), None, None, None]
+        );
+        let window = left
+            .window_join_coordinates(&sorted, 1, Some(2))
+            .expect("device coordinate window");
+        assert_eq!(window.row_count(), 2);
+
+        let rank_payload_bytes: Vec<u8> = [1_i32, 1, 1, 2, 10, 10, 20, 5]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let rank_payload = runtime
+            .retain_device_memory_copy(0, &rank_payload_bytes)
+            .expect("rank payload");
+        let identity = rank_payload
+            .identity_join_coordinates(4, None)
+            .expect("identity coordinates");
+        let part_key = CudaJoinOrderKey {
+            relation: 0,
+            key: CudaJoinPayloadKey {
+                payload: &rank_payload,
+                byte_offset: 0,
+                validity_bitmap_offset: None,
+                width: 4,
+                text_bytes_byte_offset: None,
+                text_bytes_len: 0,
+            },
+            descending: false,
+            nulls_first: false,
+            lexicographic_16: false,
+        };
+        let order_key = CudaJoinOrderKey {
+            relation: 0,
+            key: CudaJoinPayloadKey {
+                payload: &rank_payload,
+                byte_offset: 16,
+                validity_bitmap_offset: None,
+                width: 4,
+                text_bytes_byte_offset: None,
+                text_bytes_len: 0,
+            },
+            descending: false,
+            nulls_first: false,
+            lexicographic_16: false,
+        };
+        let rank_sorted = rank_payload
+            .sort_join_coordinates(&identity, &[part_key, order_key])
+            .expect("rank physical ordering");
+        let ranks = rank_payload
+            .window_ranks_from_join_coordinates(&rank_sorted, &[part_key], &[order_key])
+            .expect("coordinate ranks");
+        assert_eq!(
+            ranks
+                .readback(CudaWindowRankKind::RowNumber, 0, None)
+                .expect("row number"),
+            vec![1, 2, 3, 1]
+        );
+        assert_eq!(
+            ranks
+                .readback(CudaWindowRankKind::Rank, 0, None)
+                .expect("rank"),
+            vec![1, 1, 3, 1]
+        );
+        assert_eq!(
+            ranks
+                .readback(CudaWindowRankKind::DenseRank, 0, None)
+                .expect("dense rank"),
+            vec![1, 1, 2, 1]
+        );
+
+        // A later left-deep step consumes relation-1 coordinates in place; no pair vector is exposed.
+        let third = runtime
+            .retain_device_memory_copy(0, &encode(&[2, 9], 0b11))
+            .expect("third payload");
+        let third_key = CudaJoinPayloadKey {
+            payload: &third,
+            byte_offset: 0,
+            validity_bitmap_offset: Some(8),
+            width: 4,
+            text_bytes_byte_offset: None,
+            text_bytes_len: 0,
+        };
+        let extended = left
+            .join_fixed_payload_coordinates(
+                Some(&coordinates),
+                0,
+                &[1],
+                &[right_key],
+                2,
+                &[third_key],
+                None,
+                None,
+                false,
+                false,
+            )
+            .expect("three-way coordinate extension");
+        assert_eq!(extended.row_count(), 4);
+        assert!(extended
+            .readback_for_test()
+            .expect("extended coordinate readback")
+            .iter()
+            .all(|row| row.len() == 3 && row[1] < 2 && row[2] == 0));
+
+        let encode_text = |values: &[Option<&str>]| {
+            let mut offsets = vec![0_u64];
+            let mut data = Vec::new();
+            let mut validity = 0_u32;
+            for (row, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    validity |= 1 << row;
+                    data.extend_from_slice(value.as_bytes());
+                }
+                offsets.push(data.len() as u64);
+            }
+            let bytes_offset = offsets.len() as u64 * 8;
+            let validity_offset = (bytes_offset + data.len() as u64).next_multiple_of(4);
+            let mut payload = offsets
+                .iter()
+                .flat_map(|offset| offset.to_le_bytes())
+                .collect::<Vec<_>>();
+            payload.extend_from_slice(&data);
+            payload.resize(validity_offset as usize, 0);
+            payload.extend_from_slice(&validity.to_le_bytes());
+            (payload, bytes_offset, data.len() as u64, validity_offset)
+        };
+        let (left_text_bytes, left_text_off, left_text_len, left_text_valid) =
+            encode_text(&[Some("a"), Some("b"), Some("b"), None]);
+        let (right_text_bytes, right_text_off, right_text_len, right_text_valid) =
+            encode_text(&[Some("b"), Some("b"), Some("c"), None]);
+        let left_text = runtime
+            .retain_device_memory_copy(0, &left_text_bytes)
+            .expect("left text payload");
+        let right_text = runtime
+            .retain_device_memory_copy(0, &right_text_bytes)
+            .expect("right text payload");
+        let text_coordinates = left_text
+            .join_fixed_payload_coordinates(
+                None,
+                4,
+                &[0],
+                &[CudaJoinPayloadKey {
+                    payload: &left_text,
+                    byte_offset: 0,
+                    validity_bitmap_offset: Some(left_text_valid),
+                    width: 255,
+                    text_bytes_byte_offset: Some(left_text_off),
+                    text_bytes_len: left_text_len,
+                }],
+                4,
+                &[CudaJoinPayloadKey {
+                    payload: &right_text,
+                    byte_offset: 0,
+                    validity_bitmap_offset: Some(right_text_valid),
+                    width: 255,
+                    text_bytes_byte_offset: Some(right_text_off),
+                    text_bytes_len: right_text_len,
+                }],
+                None,
+                None,
+                false,
+                false,
+            )
+            .expect("text payload join");
+        assert_eq!(text_coordinates.row_count(), 4);
+        assert_eq!(
+            left_text
+                .project_text_from_join_coordinates(
+                    &text_coordinates,
+                    1,
+                    &right_text,
+                    0,
+                    right_text_off,
+                    right_text_len,
+                    Some(right_text_valid),
+                )
+                .expect("text coordinate projection"),
+            vec![
+                Some("b".to_string()),
+                Some("b".to_string()),
+                Some("b".to_string()),
+                Some("b".to_string()),
+            ]
+        );
+        let materialized = left
+            .materialize_join_coordinates(
+                &text_coordinates,
+                &[
+                    CudaMaterializeJoinColumn::Text {
+                        relation: 0,
+                        payload: &left_text,
+                        offsets_byte_offset: 0,
+                        bytes_byte_offset: left_text_off,
+                        bytes_len: left_text_len,
+                        validity_bitmap_offset: Some(left_text_valid),
+                    },
+                    CudaMaterializeJoinColumn::Text {
+                        relation: 1,
+                        payload: &right_text,
+                        offsets_byte_offset: 0,
+                        bytes_byte_offset: right_text_off,
+                        bytes_len: right_text_len,
+                        validity_bitmap_offset: Some(right_text_valid),
+                    },
+                ],
+            )
+            .expect("D2D materialized relation");
+        drop(text_coordinates);
+        drop(left_text);
+        drop(right_text);
+        let run_identity = materialized
+            .memory()
+            .identity_join_coordinates(materialized.row_count(), None)
+            .expect("materialized identity");
+        let run_key = CudaJoinOrderKey {
+            relation: 0,
+            key: materialized.payload_key(1).expect("run text key"),
+            descending: false,
+            nulls_first: false,
+            lexicographic_16: false,
+        };
+        let run_sorted = materialized
+            .memory()
+            .sort_join_coordinates(&run_identity, &[run_key])
+            .expect("materialized sort");
+        let run_layout = materialized.columns()[0];
+        assert_eq!(
+            materialized
+                .memory()
+                .project_text_from_join_coordinates(
+                    &run_sorted,
+                    0,
+                    materialized.memory(),
+                    run_layout.value_byte_offset,
+                    run_layout.text_bytes_byte_offset.unwrap(),
+                    run_layout.text_bytes_len,
+                    Some(run_layout.validity_bitmap_offset),
+                )
+                .expect("materialized final projection"),
+            vec![
+                Some("b".to_string()),
+                Some("b".to_string()),
+                Some("b".to_string()),
+                Some("b".to_string()),
+            ]
+        );
+        let concatenated = materialized
+            .memory()
+            .concat_materialized_relations(&materialized, &materialized)
+            .expect("D2D concatenated runs");
+        let concat_identity = concatenated
+            .memory()
+            .identity_join_coordinates(concatenated.row_count(), None)
+            .expect("concat identity");
+        let concat_layout = concatenated.columns()[1];
+        assert_eq!(
+            concatenated
+                .memory()
+                .project_text_from_join_coordinates(
+                    &concat_identity,
+                    0,
+                    concatenated.memory(),
+                    concat_layout.value_byte_offset,
+                    concat_layout.text_bytes_byte_offset.unwrap(),
+                    concat_layout.text_bytes_len,
+                    Some(concat_layout.validity_bitmap_offset),
+                )
+                .expect("concat projection"),
+            vec![Some("b".to_string()); 8]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_payload_composite_join_reads_each_accumulated_relation() {
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let retain = |values: &[i32]| {
+            runtime
+                .retain_device_memory_copy(
+                    0,
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .expect("key payload")
+        };
+        let ak = retain(&[1, 2]);
+        let bk = retain(&[1, 2]);
+        let ax = retain(&[10, 20]);
+        let by = retain(&[100, 200]);
+        let cx = retain(&[10, 20, 10]);
+        let cy = retain(&[100, 200, 200]);
+        fn key(payload: &CudaResidentDeviceMemory) -> CudaJoinPayloadKey<'_> {
+            CudaJoinPayloadKey {
+                payload,
+                byte_offset: 0,
+                validity_bitmap_offset: None,
+                width: 4,
+                text_bytes_byte_offset: None,
+                text_bytes_len: 0,
+            }
+        }
+        let direct = ax
+            .join_fixed_payload_coordinates(
+                None,
+                2,
+                &[0, 0],
+                &[key(&ax), key(&by)],
+                3,
+                &[key(&cx), key(&cy)],
+                None,
+                None,
+                false,
+                false,
+            )
+            .expect("direct composite join");
+        let mut direct_rows = direct.readback_for_test().unwrap();
+        direct_rows.sort_unstable();
+        assert_eq!(direct_rows, vec![vec![0, 0], vec![1, 1]]);
+        let ab = ak
+            .join_fixed_payload_coordinates(
+                None,
+                2,
+                &[0],
+                &[key(&ak)],
+                2,
+                &[key(&bk)],
+                None,
+                None,
+                false,
+                false,
+            )
+            .expect("first join");
+        assert_eq!(ab.readback_for_test().unwrap(), vec![vec![0, 0], vec![1, 1]]);
+        let abc = ak
+            .join_fixed_payload_coordinates(
+                Some(&ab),
+                0,
+                &[0, 1],
+                &[key(&ax), key(&by)],
+                3,
+                &[key(&cx), key(&cy)],
+                None,
+                None,
+                false,
+                false,
+            )
+            .expect("cross-relation composite join");
+        let mut rows = abc.readback_for_test().unwrap();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![vec![0, 0, 0], vec![1, 1, 1]]);
+
+        let mixed_left = retain(&[-1, 2]);
+        let mixed_right = runtime
+            .retain_device_memory_copy(
+                0,
+                &[-1_i64, 2, i64::from(i32::MAX) + 1]
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("int8 key payload");
+        let mixed = mixed_left
+            .join_fixed_payload_coordinates(
+                None,
+                2,
+                &[0],
+                &[key(&mixed_left)],
+                3,
+                &[CudaJoinPayloadKey {
+                    payload: &mixed_right,
+                    byte_offset: 0,
+                    validity_bitmap_offset: None,
+                    width: 8,
+                    text_bytes_byte_offset: None,
+                    text_bytes_len: 0,
+                }],
+                None,
+                None,
+                false,
+                false,
+            )
+            .expect("mixed int4/int8 join");
+        let mut mixed_rows = mixed.readback_for_test().unwrap();
+        mixed_rows.sort_unstable();
+        assert_eq!(mixed_rows, vec![vec![0, 0], vec![1, 1]]);
     }
 
     #[test]
@@ -32380,7 +38446,7 @@ mod tests {
             "257 alternating MAX/MIN (partial block, odd)",
         );
         check(
-            &(0..1001).map(|i| (i as i32) - 500).collect::<Vec<_>>(),
+            &(0..1001).map(|i| i - 500).collect::<Vec<_>>(),
             "1001 rows -500..500 (partial block, odd, mixed sign, true sum 500)",
         );
 
@@ -32706,7 +38772,7 @@ mod tests {
         // is_null every 9th row; non-null values include negatives, both sentinels, and zeros-as-real only
         // on NON-null rows would be ambiguous with the placeholder, so non-null values avoid 0.
         let n: usize = 4096 + 137; // > one block, odd tail, two grid-stride iters at clamp
-        let is_null = |i: usize| i % 9 == 0;
+        let is_null = |i: usize| i.is_multiple_of(9);
         let raw: Vec<i32> = (0..n)
             .map(|i| {
                 if is_null(i) {
@@ -32795,8 +38861,8 @@ mod tests {
             .map(|i| match i % 13 {
                 0 => i32::MIN,
                 1 => i32::MAX,
-                2 => -(i as i32),
-                k => (i as i32) - (k as i32) * 7,
+                2 => -i,
+                k => i - k * 7,
             })
             .collect();
         let nn_bitmap = vec![0u32; nn.len().div_ceil(32)]; // unused (None path), but retain needs a slice

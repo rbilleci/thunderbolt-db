@@ -156,17 +156,18 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
     // stage rejections (multiple FROM relations, aggregate projection) fire before the residency check;
     // mapper-stage rejections (unsupported operator, AND/OR, non-int literal) fire after the single
     // bind. None silently mis-answer.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
 
     // NB: `SELECT a FROM t` (no WHERE) is NOT rejected any more -- it is a supported full-table scan
     // (covered by gpu_execute_resident_expr_select_sql_full_table_no_where).
     // A comma join WITH an equi-join condition is supported now (gpu_inner_join_comma_join_from_where);
-    // a comma list with NO join condition between the relations is a cartesian product -> a clean reject.
+    // an unqualified column present on both sides is ambiguous before the disconnected graph can be
+    // classified (qualifying it would then expose the missing equi-join condition).
     assert_sql_err_contains(
         &e,
         "SELECT a FROM t x, t y WHERE a > 0",
-        "equi-join condition",
+        "ambiguous",
     );
     // count(*) / sum / min / max / avg are supported now (operator axis, GPU-tested); count(col) and
     // other functions are follow-ons, still rejected at the parser.
@@ -209,7 +210,7 @@ fn execute_resident_expr_select_sql_maps_supported_predicate_and_reaches_gpu_dis
     // proving the full SQL -> ResidentExpr binding succeeds end to end up to device dispatch. With no
     // residency snapshot populated it stops at the residency error (deterministic on any box), which
     // is PAST parse/map/bind — i.e. NOT a mapper rejection. (The GPU e2e test below runs it through.)
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     match e.execute_resident_expr_select_sql("SELECT a FROM t WHERE a + b > 400") {
         Ok(_) => panic!("no residency snapshot populated, so this cannot return rows"),
@@ -230,7 +231,7 @@ fn execute_resident_expr_select_sql_maps_is_null_predicate_and_reaches_gpu_dispa
     // binds, reaching the GPU residency stage (PAST parse/map/bind) -- not a mapper "unsupported node"
     // rejection. With no residency populated it stops at the residency error, which is deterministic on
     // any box. (The GPU e2e validity-bitmap test in resident_expr.rs runs it through end to end.)
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     for sql in [
         "SELECT id FROM t WHERE v IS NULL",
@@ -255,7 +256,7 @@ fn execute_resident_expr_select_sql_maps_is_null_predicate_and_reaches_gpu_dispa
 fn gpu_execute_resident_expr_select_sql_runs_predicate_from_sql_text() {
     // The whole loop: a SQL STRING -> libpg_query -> ResidentExpr -> general GPU executor, end to end.
     // Same GPU-native closed-form oracle as the programmatic Expr tests, now driven from real SQL.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
 
     const N: i32 = 600;
@@ -328,7 +329,7 @@ fn gpu_execute_resident_expr_select_sql_runs_boolean_predicates_from_sql_text() 
     // AND / OR from SQL text -> BoolExpr -> Binary{And/Or} -> the mask VM on the GPU. Closed-form
     // oracle: a[i]=b[i]=i, so each comparison is a contiguous range and the boolean combinator is set
     // algebra on those ranges.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
 
     const N: i32 = 600;
@@ -436,7 +437,7 @@ fn select_text_keeps_simple_predicates_on_the_existing_path() {
     // text dispatch runs it through the existing path (here CPU, no residency populated) and returns
     // the right rows. Proves the routing only ADDS arithmetic coverage and never hijacks the shapes
     // the hand-rolled parser + tuned fast-paths already own.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a, b) VALUES (5, 1), (6, 2), (7, 3)")
         .unwrap();
@@ -456,7 +457,7 @@ fn select_text_non_resident_order_by_falls_through_to_existing_path() {
     // table is GPU-RESIDENT (that path has no CPU fallback). On a NON-resident table the routing gate
     // falls through to the existing path, which sorts correctly rather than hard-erroring with "no
     // resident snapshot". Guards the residency condition on the GPU-sort routing.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a) VALUES (5), (2), (8), (1)")
         .unwrap();
@@ -481,7 +482,7 @@ fn select_text_non_resident_text_order_by_falls_through_to_existing_path() {
     // A single-text-key ORDER BY routes to the GPU text sort ONLY when the table is GPU-resident. On a
     // NON-resident table the gate falls through to the existing path, which sorts the text correctly
     // rather than hard-erroring. Guards the residency condition for the text leg of the GPU sort.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (s TEXT)").unwrap();
     e.execute_text(
         2,
@@ -513,7 +514,7 @@ fn grouped_multikey_order_by_sorts_on_the_gpu() {
     // Multi-key ORDER BY on a GROUPED result now sorts ON THE GPU (the grouped-sort migration): no
     // host-side sort, no first-key-only. A count tie is broken by the secondary key on-device. A
     // multi-aggregate GROUP BY routes via the Err arm to the general path's grouped branch.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE g (a INT)").unwrap();
     // counts: a=1->2, a=2->2, a=3->1. ORDER BY count ASC, a DESC -> count 1 (a=3), then the count-2 tie
     // by a DESC (a=2 then a=1) -> the `a` column = [3, 2, 1].
@@ -543,7 +544,7 @@ fn grouped_count_distinct_routes_through_text_entry() {
     // COUNT(DISTINCT v) via the wire/text dispatch (execute_relational_select_text): the hand-rolled
     // parser rejects DISTINCT, so the Err arm falls through to the general libpg_query path's grouped
     // branch -- the same user-facing route the PG-wire server uses.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -573,7 +574,7 @@ fn grouped_count_distinct_routes_through_text_entry() {
 fn scalar_count_distinct_routes_through_text_entry() {
     // Scalar COUNT(DISTINCT v) (no GROUP BY) via the wire/text dispatch: the hand-rolled parser rejects
     // DISTINCT, so the Err arm falls through to the general path's scalar-aggregate branch.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (v INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (v) VALUES (10),(10),(20),(30),(30)")
         .unwrap();
@@ -599,7 +600,7 @@ fn gpu_inner_join_two_relations_int_key() {
     // is UNIQUE (the build side); child.parent_id is the FK (1:N + an orphan + a childless parent).
     //   parent: (1,a),(2,b),(3,c)   child: (1,x),(1,y),(2,z),(99,orphan)
     //   parent JOIN child ON parent.id = child.parent_id -> (a,x),(a,y),(b,z); 99 + parent 3 dropped.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE parent (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE child (parent_id INT, label TEXT)")
@@ -697,7 +698,7 @@ fn gpu_inner_join_excludes_null_keys_three_valued_logic() {
     // M3 NULL-key gate (doc 21): in an equi-join `NULL = x` is UNKNOWN, so a row whose join key is NULL
     // matches NOTHING -- on BOTH sides. INT keys would otherwise share the 0 placeholder and SPURIOUSLY
     // match each other; TEXT/b128 keys would otherwise ERROR in the key gather. Both NULL-key rows drop.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let pairs = |res: &RelationalSelectResult| -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = res
             .rows
@@ -842,7 +843,7 @@ fn gpu_join_null_keys_at_scale_grid_stride_v1b() {
     // from colliding with the real key 0 (which DOES exist here). bigp.id is unique on its non-NULL rows, so
     // the unique-build kernel runs; if the skip were broken, a NULL build row (placeholder 0) would collide
     // with real key 0 -> a spurious DuplicateBuildKey N:N fallback + wrong pairs, caught by the exact set.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     const N: i32 = 600;
     let mut pv = String::new();
     let mut cv = String::new();
@@ -913,7 +914,7 @@ fn gpu_join_null_keys_int2_int8_uuid_v1b() {
     // exercise the i64-section gather; key 0 is a real key on both sides, so the NULL row's 0 placeholder
     // (a NULL int8 cell stores 0, NOT i64::MIN, so the launcher's i64::MIN reject is not tripped) must not
     // collide with it.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE i2a (k INT2, x TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE i2b (k INT2, y TEXT)")
@@ -1016,7 +1017,7 @@ fn gpu_join_null_keys_n_to_n_int_and_text_v1b() {
     // a NULL PROBE key emits nothing. Both sides carry DUPLICATE keys (forcing the N:N fallback) PLUS NULLs;
     // key 0 (int) / 'm' (text) is a real DUPLICATED key, so a broken skip would chain the placeholder-0 /
     // empty-string NULL rows into that key's cross-product and emit spurious pairs.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE nna (k INT, x TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE nnb (k INT, y TEXT)")
@@ -1101,7 +1102,7 @@ fn gpu_join_null_keys_right_and_full_outer_padded_v1b() {
     // outer side, never dropped or spuriously matched against the OTHER side's NULL-key row. RIGHT keeps
     // every right row (its NULL-key row left-padded; the left NULL-key row is left-only -> dropped); FULL
     // keeps both sides' unmatched rows (incl. both NULL-key rows).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE ol (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE orr (rid INT, label TEXT)")
@@ -1172,7 +1173,7 @@ fn audit_v1b_all_null_build_column_empty_effective_build() {
     // empty => nothing matches, EVEN against a real probe key 0. The build's placeholder index 0 is itself
     // a NULL row. Skip-disabled: the two NULL build rows (placeholder key 0) collide => DuplicateBuildKey =>
     // N:N => both spuriously match the probe's real key 0.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE ba (k INT, x TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE bb (k INT, y TEXT)")
@@ -1203,7 +1204,7 @@ fn audit_v1b_null_on_build_side_when_smaller_side_swaps() {
     // The bitmaps must SWAP with the keys when the smaller side becomes the build. Here the NEW (right) side
     // is smaller, so the hash join builds on it (build/probe swap); the right bitmap must follow to the build
     // slot. NULLs on BOTH sides. Skip-disabled or a mis-swapped bitmap => a NULL row leaks into the result.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // acc (left) = 3 rows incl a NULL; new (right) = 2 rows incl a NULL => smaller_is_left = false => the
     // build swaps to the right side.
     e.execute_text(1, "CREATE TABLE sa (k INT, x TEXT)")
@@ -1248,7 +1249,7 @@ fn audit_v1b_composite_one_member_null_other_equals_real_row() {
     // AND'd across BOTH members, so `(5,NULL)` is skipped. The NULL member's 0 placeholder makes `(5,NULL)`
     // pack identically to a real `(5,0)` row on the other side -- if validity were checked on member0 only,
     // `(5,NULL)` would spuriously match `(5,0)`.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE ca (k1 INT, k2 INT, x TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE cb (k1 INT, k2 INT, y TEXT)")
@@ -1292,7 +1293,7 @@ fn audit_v1b_anti_join_left_where_inner_is_null_with_null_keys() {
     // The anti-join `LEFT JOIN ... WHERE inner IS NULL` with NULL keys on BOTH sides. The left NULL-key row
     // matches nothing => it is NULL-padded => WHERE inner IS NULL KEEPS it. If the two NULL rows spuriously
     // matched, the left NULL-key row would be a MATCH (inner not NULL) and silently DROPPED -- data loss.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE la (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE lb (rid INT, label TEXT)")
@@ -1335,7 +1336,7 @@ fn audit_v1b_anti_join_left_where_inner_is_null_with_null_keys() {
 fn audit_v1b_null_at_word_boundary_index_32() {
     // The ONLY NULL key is at row index 32 -- bitmap word 1 (32>>5), bit 0 (32&31). Catches any off-by-one
     // in the kernel's bitmap word/bit math: exactly row 32 must be skipped, every other row matches 1:1.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     const N: i32 = 40;
     let mut wa = String::new();
     let mut wb = String::new();
@@ -1393,7 +1394,7 @@ fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
     // 2-relation LEFT OUTER join (M3 -- doc 21): every LEFT row appears; an unmatched left row -- the
     // CHILDLESS parent 3, AND the NULL-key left row 'nokey' (which matches nothing, 3VL) -- is kept with
     // the right relation's columns NULL-padded.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE lp (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE lc (pid INT, label TEXT)")
@@ -1533,7 +1534,7 @@ fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
 fn gpu_right_and_full_outer_join_null_pad_the_correct_side() {
     // RIGHT keeps every RIGHT (new) row (unmatched -> the left columns NULL-padded); FULL keeps both
     // sides' unmatched rows (M3 -- doc 21). rl 2 'b' is left-only; rr 3 'z' is right-only.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE rl (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE rr (rid INT, label TEXT)")
@@ -1597,10 +1598,10 @@ fn gpu_right_and_full_outer_join_null_pad_the_correct_side() {
 fn gpu_nway_outer_join_null_pads_through_the_pipeline() {
     // N-way (multi-step) OUTER join (M3 -- doc 21): a prior step's NULL pad carries a JOIN_NULL_ROW
     // sentinel; the next step reads it as a NULL key (matches nothing; a LEFT step re-pads it) instead of
-    // OOB-reading host_rows. Two cases: (1) the carried NULL is in a relation NOT used as the next key (the
+    // treating the sentinel as a device row index. Two cases: (1) the carried NULL is in a relation NOT used as the next key (the
     // tuple still participates via a non-padded key); (2) the carried NULL IS the next key (the tuple is
     // re-padded). All on the GPU join pipeline.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // Case 1: A LEFT JOIN B (on A.id) LEFT JOIN C (on A.id). A=3 has no B (B NULL-padded) but matches C=3.
     e.execute_text(1, "CREATE TABLE a3 (id INT, name TEXT)")
         .unwrap();
@@ -1651,7 +1652,7 @@ fn gpu_nway_outer_join_null_pads_through_the_pipeline() {
     );
 
     // Case 2: A LEFT JOIN B (on A.id) LEFT JOIN C (on B.cid). A=3's B is NULL-padded, so B.cid is a carried
-    // NULL key at step 2 -> A=3 matches no C -> C re-padded (would OOB-read host_rows without the fix).
+    // NULL key at step 2 -> A=3 matches no C -> C re-padded (the sentinel must never become a device row index).
     e.execute_text(7, "CREATE TABLE a4 (id INT, name TEXT)")
         .unwrap();
     e.execute_text(8, "CREATE TABLE b4 (aid INT, cid INT, bl TEXT)")
@@ -1754,7 +1755,7 @@ fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
     // M3 (doc 21): explicit NULLS FIRST / NULLS LAST OVERRIDES PG's default placement, honored ON-DEVICE
     // in the GPU sort comparator (the per-key nulls_first bitmask), DECOUPLED from ASC/DESC. Without an
     // override ASC = NULLS LAST and DESC = NULLS FIRST (the default, covered elsewhere).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(
         2,
@@ -1826,7 +1827,7 @@ fn gpu_group_by_nullable_composite_key_per_member_null_on_device() {
     // (1,5), (NULL,6), (NULL,NULL), (1,NULL) are all DISTINCT groups, each member rendered SqlValue::Null
     // from the representative row. A nullable composite routes to the wide-key path (the i64 pack has no
     // room for validity).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(
         2,
@@ -1891,7 +1892,7 @@ fn gpu_count_distinct_over_a_nullable_value_clean_errors() {
     // the distinct pass sees no NULLs — the former clean-error is resolved); the GROUPED paths still
     // have no value validity in the sort-based reps pass, so they keep the clean error rather than
     // silently over-count. (A non-null COUNT(DISTINCT) is unaffected -- the count_distinct suite.)
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -1926,7 +1927,7 @@ fn gpu_group_by_nullable_expression_key_forms_a_null_group_on_device() {
     // M3 (doc 21): GROUP BY a NULLABLE int4 EXPRESSION (`a + b`, b non-null) -- the rows where a is NULL
     // (so a+b is NULL) form their OWN group, rendered SqlValue::Null. Reuses the single-column NULL-key
     // reserved slot via the one nullable operand's validity bitmap (ZERO kernel change).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(
         2,
@@ -1992,7 +1993,7 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
     // M3 (doc 21): ORDER BY a NULLABLE int4 EXPRESSION (`a + b`). A NULL result (any operand NULL) becomes
     // the i64::MAX default-end sentinel, blended ON-DEVICE (a validity-mask VM run + the blend kernel), so
     // NULL-expression rows sort to PG's default end. No host NULL decision.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, a INT, b INT)")
         .unwrap();
     e.execute_text(
@@ -2055,7 +2056,7 @@ fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
     // M3 (doc 21): explicit NULLS FIRST/LAST on a GROUP BY result ORDER BY, honored ON-DEVICE in
     // gpu_sort_result_rows (an int result key's NULL sentinel value is chosen per the request). The NULL
     // group's key renders SqlValue::Null and places per the override.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -2148,7 +2149,7 @@ fn gpu_join_order_by_explicit_nulls_first_last_on_device() {
     // M3 (doc 21): explicit NULLS FIRST/LAST on a JOIN-result ORDER BY, honored ON-DEVICE via
     // gpu_sort_result_rows (the override is threaded through JoinPlan.order_by_nulls_first). A LEFT join
     // pads the unmatched row's x to NULL; the override places it.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, n TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, x INT)")
@@ -2222,7 +2223,7 @@ fn gpu_outer_join_with_where_filters_the_result_not_the_inputs() {
     // pushdown (which is not filter-commutative for an outer join). The predicate runs on the GPU
     // (lower_resident_predicate); its survivor set post-filters the padded result: a JOIN_NULL_ROW pad
     // means the relation's columns are NULL -> the predicate is UNKNOWN -> the tuple is dropped.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, x INT)")
@@ -2310,7 +2311,7 @@ fn gpu_outer_join_pad_where_3vl_on_device_v2() {
     // `predicate_truth_on_null_pad`. Covers pad-SURVIVES (IS NULL, IS NULL OR cmp, IS NULL AND IS NULL) and
     // pad-DROPS (IS NOT NULL, comparison compound) across the SAME query so a wrong pad decision shows up as
     // a missing/extra row. l=3 ('c') is the unmatched (padded) left row; r1.x small, r2.x large.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, x INT, y INT)")
@@ -2386,7 +2387,7 @@ fn gpu_outer_join_pad_where_3vl_types_and_full_join_v2() {
     // S6/V2: the on-device pad eval works for a NON-int pad column (numeric / text IS NULL) and for a FULL
     // join (both sides can be padded). A numeric/text `IS NULL` on the all-NULL pad must read the validity
     // bit on-device (0 -> NULL -> IS NULL TRUE), not depend on a host Kleene.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, amt NUMERIC(10,2), tag TEXT)")
@@ -2468,7 +2469,7 @@ fn audit_s6_outer_where_real_null_mixed_with_pad() {
     // A real-NULL matched row AND the synthetic pad both satisfy `IS NULL` (the survivor pass evaluates the
     // real NULL on-device; the pad eval evaluates the synthetic NULL on-device -- both must agree). An N-way
     // OUTER then carries a JOIN_NULL_ROW into a SECOND pad.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, x INT)")
@@ -2549,7 +2550,7 @@ fn audit_s6_outer_where_real_null_mixed_with_pad() {
 fn audit_s6_pad_where_kleene_corners() {
     // Kleene corners on the all-NULL pad (real data fully non-null so the survivor pass uses the
     // non-nullable peephole -> the pad eval is the only 3VL difference). Each fold is checked against PG.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2625,7 +2626,7 @@ fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
     // still read the left relation's rows after the build side flips).
     //   s: (1,'p'),(1,'q')  [smaller, key 1 duplicated]   l: (1,'A'),(2,'B'),(3,'C')  [larger, unique]
     //   s JOIN l ON s.k = l.k -> (p,A),(q,A).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE s (k INT, sv TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE l (k INT, lv TEXT)")
@@ -2670,7 +2671,7 @@ fn gpu_inner_join_with_where_pushed_per_side() {
     //   ON parent.id = child.parent_id WHERE parent.id >= 2 AND child.v > 15
     //   -> parent survivors abs{1,2}, child survivors abs{1,2,3} (BOTH sides drop an EARLY row, so the
     //      matched survivor POSITION != the absolute row on both sides) -> (b,z),(c,w).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE parent (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE child (parent_id INT, v INT, label TEXT)")
@@ -2729,7 +2730,7 @@ fn gpu_inner_join_with_where_pushed_per_side() {
 fn gpu_inner_join_int8_and_mixed_int_keys() {
     // M5 J4a: int8/bigint join keys (i64 section) -- incl. a value beyond the int4 range -- and a MIXED
     // int4=int8 join (both project to i64, so 5_i32 == 5_i64 matches).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // (a) both BIGINT keys, one beyond int4 range.
     e.execute_text(1, "CREATE TABLE big (id BIGINT, name TEXT)")
         .unwrap();
@@ -2820,7 +2821,7 @@ fn gpu_inner_join_int8_and_mixed_int_keys() {
 fn gpu_inner_join_star_projection() {
     // M5: `SELECT *` (all columns of both relations, left then right) and `SELECT alias.*` (one
     // relation) on a join.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE parent (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE child (pid INT, label TEXT)")
@@ -2922,7 +2923,7 @@ fn gpu_inner_join_star_projection() {
 #[test]
 fn gpu_inner_join_rejects_unsupported_shapes() {
     // Host-side clean rejections (no GPU): the parser gates the join slice's scope.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE a (k INT, x INT)").unwrap();
     e.execute_text(2, "CREATE TABLE b (k INT, y INT)").unwrap();
     let reject = |sql: &str| {
@@ -3013,7 +3014,7 @@ fn gpu_inner_join_catalog_relations_transient_payload() {
     // join -- charter). Construction oracle: the user tables we CREATE are EXACTLY the relkind='r' rows
     // of pg_class in the public namespace, so `pg_class JOIN pg_namespace ON n.oid = c.relnamespace`
     // filtered to public/'r' is identity over their names -> {(alpha,public),(beta,public)}.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE alpha (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE beta (id INT)").unwrap();
@@ -3110,7 +3111,7 @@ fn gpu_inner_join_three_way_user_tables() {
     // step joins on a column from the FIRST relation joined in step 0 (cust.rid), exercising
     // accumulated-set resolution.
     //   ord JOIN cust ON cust.cid = ord.cid JOIN region ON region.rid = cust.rid
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, cname TEXT)")
@@ -3194,7 +3195,7 @@ fn gpu_inner_join_three_way_catalog_describe_shape() {
     //   pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
     // Construction oracle: `people` has exactly columns (id, name); filtering c.relname='people' selects
     // them out of multiple tables -> the people columns, each tagged public.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE teams (tid INT)").unwrap();
@@ -3247,7 +3248,7 @@ fn gpu_inner_join_four_way_back_reference_to_first_relation() {
     // must project the accumulated key from the relation the ON names (a, index 0), NOT the immediately
     // prior relation -- the very distinction the index-vector pipeline exists for.
     //   a JOIN b ON b.aid=a.aid JOIN c ON c.bid=b.bid JOIN d ON d.aid=a.aid
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE a (aid INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE b (bid INT, aid INT)")
@@ -3313,7 +3314,7 @@ fn gpu_inner_join_composite_on_two_column_key() {
     // packs each side's two <=32-bit keys into one i64 (pa<<32|pb) for the existing hash join. The oracle
     // is constructed so a SINGLE-column join would mis-match: child(1,20) shares pa=1 with parent(1,10)
     // but must map to parent(1,20) -- proving BOTH members are compared.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE parent (pa INT, pb INT, pname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE child (ca INT, cb INT, label TEXT)")
@@ -3378,7 +3379,7 @@ fn gpu_inner_join_composite_on_int8_member_rejected() {
     // A 2-column composite key packs two members into ONE i64, so each member must be <=32 bits. An
     // int8/timestamp composite member would overflow -> a clean reject (the `narrow_key` gate). This runs
     // BEFORE residency (the key-type precompute), so it needs no GPU. A SINGLE int8 key is still allowed.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE pp (pa BIGINT, pb INT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE cc (ca BIGINT, cb INT)")
@@ -3401,7 +3402,7 @@ fn gpu_inner_join_comma_join_from_where() {
     // M5 J6: a comma join `FROM ord, cust, region WHERE ...` -- the join conditions live in the WHERE and
     // are lifted into the SAME left-deep `JoinStep` pipeline as an explicit JOIN. A single-relation WHERE
     // conjunct stays a per-relation GPU filter; a cross-relation `=` becomes a join edge.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, cname TEXT)")
@@ -3493,7 +3494,7 @@ fn gpu_inner_join_text_key() {
     // M5 J4b: a join on a TEXT key, run by the GPU text hash join (FNV-hash + full byte-verify -- a
     // 64-bit hash collision between distinct names can never mis-join). users.name is UNIQUE (the build
     // side); logins.name is the FK (1:N + a userless 'dave' + a loginless 'carol').
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE users (uid INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE logins (name TEXT, ts INT)")
@@ -3551,7 +3552,7 @@ fn gpu_inner_join_text_key() {
 fn gpu_inner_join_text_key_step_in_multi_way() {
     // M5 J4b: a TEXT-key step (cust.email = ord.email) followed by an INT-key step (region.rid = cust.rid)
     // in the carried-index multi-way pipeline -- the text join's matched indices feed the next step.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, email TEXT)")
@@ -3610,7 +3611,7 @@ fn gpu_inner_join_text_key_step_in_multi_way() {
 fn gpu_inner_join_uuid_and_numeric_keys() {
     // M5 J4c: NUMERIC and UUID join keys reuse the J4b text/byte hash join over each value's 16-byte
     // canonical form (uuid = raw bytes; numeric = i128 mantissa, both columns the same scale).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // --- UUID key: users.gid -> groups.gid (groups.gid unique build side) ---
     e.execute_text(1, "CREATE TABLE groups (gid UUID, gname TEXT)")
         .unwrap();
@@ -3728,7 +3729,7 @@ fn gpu_inner_join_n_to_n_cross_product() {
     // M5 N:N: BOTH sides have duplicate join keys -> the chaining many-to-many join emits each key's
     // (left rows x right rows). On k=100, left {lid 1,2} x right {rid 10,11} = 4 pairs; k=200 (left-only)
     // and k=300 (right-only) drop. (Previously a hard "N:N is a follow-up" reject.)
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE lhs (lid INT, k INT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE rhs (rid INT, k INT)")
@@ -3783,7 +3784,7 @@ fn gpu_inner_join_n_to_n_cross_product() {
 fn gpu_inner_join_n_to_n_text_and_numeric_keys() {
     // M5: N:N many-to-many over NON-int keys (text + numeric/uuid reuse the chaining text/byte kernel).
     // Both sides duplicate the key -> each key's (left x right) cross product.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE lt (lid INT, tag TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE rt (rid INT, tag TEXT)")
@@ -3862,7 +3863,7 @@ fn gpu_inner_join_n_to_n_text_and_numeric_keys() {
 fn gpu_where_in_and_not_in() {
     // IN / NOT IN lower to an OR-chain of `=` / AND-chain of `<>` on the general GPU executor (no new
     // kernel) -- INT keys here (text IN awaits text AND/OR on the executor; see gpu-type-matrix).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE inq (id INT, tag INT)")
         .unwrap();
     e.execute_text(
@@ -3923,7 +3924,7 @@ fn gpu_where_in_and_not_in() {
 fn gpu_where_text_and_or_and_in() {
     // Text AND/OR on the general executor: each text `=`/`<>` becomes a TextEqMask the mask VM combines
     // with AND/OR (and with int4) -- so text IN / NOT IN / multi-text WHERE run on the GPU.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE tq (id INT, tag TEXT)")
         .unwrap();
     e.execute_text(
@@ -3996,7 +3997,7 @@ fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
     // relpersistence (newly synthesized), filtered by nspname + relkind, ORDER BY relname -- the whole
     // query on the GPU join + GPU sort path. BOTH sides are SYNTHESIZED catalog relations (transient
     // device payloads), schema-qualified `pg_catalog.<rel>`.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE dz_people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE dz_teams (id INT)").unwrap();
@@ -4078,7 +4079,7 @@ fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
 fn gpu_where_bool_and_or() {
     // Bool column in AND/OR on the general executor: a bool bitmap -> i32 mask the VM combines with
     // AND/OR (and int4). `NOT flag` is `flag = false`. Reuses gpu_db_resident_bool_to_mask (no new kernel).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE bq (id INT, active BOOL, qty INT)")
         .unwrap();
     e.execute_text(
@@ -4132,7 +4133,7 @@ fn gpu_catalog_pg_attribute_d_table_columns() {
     // Function-free `\d <table>` column listing (golden 24 minus format_type): 3-way pg_attribute JOIN
     // pg_class JOIN pg_namespace, the per-side `attnum > 0 AND NOT attisdropped` (int4 AND bool, now on
     // the GPU mask VM), ORDER BY attnum, projecting the newly-synthesized atttypmod/attisdropped.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE dt_widget (id INT, label TEXT, qty INT)")
         .unwrap();
     let probe = e.execute_resident_expr_select_sql(
@@ -4192,7 +4193,7 @@ fn gpu_catalog_pg_attribute_d_table_columns() {
 fn gpu_inner_join_order_by_limit_offset() {
     // M5 (catalog \d prerequisite): ORDER BY / LIMIT / OFFSET on a join. ORDER BY is a GPU sort over the
     // join result (int key via the matrix path, text+int multi-key via the hetero payload path).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, lid INT, score INT)")
@@ -4311,7 +4312,7 @@ fn gpu_join_result_nullable_value_columns_from_device() {
     // the device stores for a NULL cell. The existing NULL-key tests only DROP NULL-KEY rows; here the join
     // KEY is non-null and the NULLs live in projected value columns of MATCHED rows (int, text, numeric).
     // Plus a LEFT-outer variant where a pad-NULL (JOIN_NULL_ROW) and a value-NULL coexist.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, v INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, w NUMERIC(10,2))")
@@ -4399,7 +4400,7 @@ fn gpu_join_limit_offset_window_edges() {
     // S7/V3: OFFSET/LIMIT on the join result now WINDOWS the device sort permutation (gpu_sort_permutation),
     // gathering only the kept window -- no host drain/truncate on result data. Edge cases vs the old
     // drain/truncate: OFFSET past the end -> empty, LIMIT 0 -> empty, OFFSET+LIMIT past the end -> clamped.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, score INT)")
@@ -4468,7 +4469,7 @@ fn gpu_join_limit_offset_window_edges() {
 fn gpu_inner_join_using_and_natural() {
     // M5: USING / NATURAL joins -- the join column is COALESCED (appears once in `*`, PG order: join cols,
     // then left's rest, then right's; an unqualified ref resolves to the left copy).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE emp (eid INT, dept INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE dept (dept INT, dname TEXT)")
@@ -4590,7 +4591,7 @@ fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.
     // Multi-aggregate forces the general path.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (name TEXT, v INT)")
         .unwrap();
     e.execute_text(
@@ -4629,7 +4630,7 @@ fn grouped_order_by_numeric_key_sorts_on_the_gpu() {
     // GROUP BY a NUMERIC column, ORDER BY it DESC: the grouped GPU sort builds a resident-like 16-byte
     // (b128) payload section + sorts on-device. Assert via the per-group COUNT (distinct) to avoid a
     // numeric-literal compare. Multi-aggregate forces the general path.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (v NUMERIC(10,2), w INT)")
         .unwrap();
     // counts by v: 1.00->2, 2.00->3, 3.00->1. ORDER BY v DESC -> 3.00(1), 2.00(3), 1.00(2).
@@ -4668,7 +4669,7 @@ fn grouped_order_by_numeric_key_sorts_on_the_gpu() {
 fn grouped_order_by_expression_is_rejected() {
     // ORDER BY an EXPRESSION on a GROUPED result has no GPU sort yet (the grouped-sort migration lands
     // that) -> a clean reject, not a silent host first-key sort. Multi-aggregate forces the general path.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE g (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO g (a) VALUES (1), (1), (2)")
         .unwrap();
@@ -4691,7 +4692,7 @@ fn select_text_multikey_order_by_non_resident_rejects() {
     // table the routing gate falls through to the enumerated/CPU path, which has NO multi-key sort and
     // must reject it cleanly (never silently sort by the first key). No GPU needed -- the rejection is
     // on the CPU choke point. Charter: no CPU relational multi-key sort.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a, b) VALUES (1, 9), (1, 3), (2, 5)")
         .unwrap();
@@ -4725,7 +4726,7 @@ fn gpu_select_text_routes_arithmetic_predicate_to_general_expr_path() {
     // arithmetic-WHERE SELECT, which the hand-rolled parser cannot express, to the general GPU Expr
     // executor, end to end. Same closed-form oracle as the direct entry; this proves the ROUTING hook
     // (not just the standalone SQL->Expr method).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
 
     const N: i32 = 600;
@@ -4783,7 +4784,7 @@ fn audit_join_matched_row_value_null_every_type() {
     // for EVERY nullable type -- not the device placeholder (0/""/0-mantissa/zero-uuid/false). The
     // committed test only proves int4/text/numeric. Here: int2, int8, date, timestamp, uuid, bool,
     // numeric@scale4. The join KEY (id) is non-null; every value column carries a NULL on the matched row.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
     e.execute_text(
         2,
@@ -4858,7 +4859,7 @@ fn audit_join_outer_pad_on_nonnullable_columns_all_types() {
     // HUNT #2 + #3: an OUTER pad must force NULL on a column that has NO validity bitmap (non-nullable),
     // independent of validity -- AND must not leak row-0's value (pads use placeholder index 0). Row 0 of
     // the padded relation holds DISTINCTIVE values for every type; the unmatched left rows must be NULL.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
     // r has NO nullable columns (none of these ever hold a NULL -> no validity bitmap is built).
     e.execute_text(
@@ -4924,7 +4925,7 @@ fn audit_join_outer_pad_on_nonnullable_columns_all_types() {
 fn audit_join_empty_padded_side_right_full() {
     // HUNT #3: a relation whose row_count==0 appears as a PADDED side (RIGHT/FULL with an empty side).
     // gather_col must early-return all-NULL (no device read at index 0 into an empty payload) -- no panic.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, w INT)")
@@ -4973,7 +4974,7 @@ fn audit_join_limit_offset_no_orderby_matches_join_order() {
     // HUNT #5: LIMIT/OFFSET WITHOUT ORDER BY must window the join result in JOIN ORDER (identity perm),
     // exactly as the old drain/truncate did. We make the join order deterministic (unique 1:1 keys, build
     // on the unique side) and verify the windowed slice is a contiguous slice of the full result.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, score INT)")
@@ -5032,7 +5033,7 @@ fn audit_join_limit_offset_no_orderby_matches_join_order() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_join_empty_result_no_matches() {
     // HUNT #9: no matches -> work_n == 0 -> the gather returns empty, transpose -> 0 rows, no panic.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, w NUMERIC(10,2))")
@@ -5072,7 +5073,7 @@ fn audit_join_empty_result_no_matches() {
 fn audit_join_nn_and_multiway_gather_right_rows() {
     // HUNT #8: N:N many-to-many + a 3-way chain. The carried index vectors must gather the RIGHT rows
     // from each side's device payload (text + numeric + null values), not misaligned values.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // N:N on an int key: l has key 1 twice, r has key 1 twice -> 4 result rows, each a distinct (l,r) pair.
     e.execute_text(1, "CREATE TABLE l (k INT, lv TEXT)")
         .unwrap();
@@ -5168,7 +5169,7 @@ fn audit_join_nn_and_multiway_gather_right_rows() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_join_using_natural_and_star_gather() {
     // HUNT #7: USING coalesced column (mapped to rel 0) + bare `*` gather correctly.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, lname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (id INT, rscore INT)")
@@ -5227,7 +5228,7 @@ fn audit_nonvacuity_placeholder_would_leak_without_override() {
     // asserts the placeholder values directly via a deliberately-WRONG expectation -- it MUST PANIC,
     // proving the SqlValue::Null in the real test is the validity override doing real work (not that the
     // device happens to be empty/absent). If this test ever PASSES, the placeholder is leaking == bug.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
     e.execute_text(
         2,
@@ -5279,7 +5280,7 @@ fn audit_join_order_by_nullable_value_with_window() {
     // HUNT #5 + #1 cross: ORDER BY a device-gathered NULLABLE value column on the join, then window it.
     // The gathered NULL must (a) render Null and (b) sort to PG default (NULLs last ASC), and the window
     // must slice the SORTED order (not join order). A divergence would silently reorder/mis-window.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, w INT)")
         .unwrap();
@@ -5359,7 +5360,7 @@ fn audit_join_order_by_nullable_value_with_window() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_uuid_byteorder_value_exactness() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE gd (gid UUID, gname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE ud (uid INT, gid UUID)")
@@ -5453,7 +5454,7 @@ fn audit_s5_uuid_byteorder_value_exactness() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_numeric_mantissa_exactness_negatives_and_large() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // scale 0. NEGATIVES are the high-limb probe: a -1 mantissa is 0xFF..FF across ALL 16 bytes
     // (including the HIGH 64-bit limb); a dropped/zeroed high limb in project_i128 would turn it into a
     // large POSITIVE value and break the match. Also a beyond-i32 positive (3e9) crosses the 32-bit line.
@@ -5557,7 +5558,7 @@ fn audit_s5_numeric_mantissa_exactness_negatives_and_large() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_b128_key_in_later_multiway_step() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // r0 (int pk) -> r1 (int fk to r0, uuid u) -> r2 (uuid u). The uuid join is the SECOND step, joining
     // the ACCUMULATED (r0,r1) on r1.u against r2.u. r1.u is gathered at carried r1 indices.
     e.execute_text(1, "CREATE TABLE r0 (id INT, tag TEXT)")
@@ -5636,7 +5637,7 @@ fn audit_s5_b128_key_in_later_multiway_step() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_empty_side_before_b128_and_text_step() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE gu (gid UUID, gname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE uu (uid INT, gid UUID)")
@@ -5718,7 +5719,7 @@ fn audit_s5_empty_side_before_b128_and_text_step() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_nn_numeric_with_null_key_gate() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE ln (lid INT, amt NUMERIC(10,2))")
         .unwrap();
     e.execute_text(2, "CREATE TABLE rn (rid INT, amt NUMERIC(10,2))")
@@ -5781,7 +5782,7 @@ fn audit_s5_nn_numeric_with_null_key_gate() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_mixed_uuid_numeric_end_to_end() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE k (gid UUID, amt NUMERIC(12,3))")
         .unwrap();
     e.execute_text(2, "CREATE TABLE p (gid UUID, tag TEXT)")

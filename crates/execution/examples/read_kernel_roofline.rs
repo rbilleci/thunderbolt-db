@@ -40,7 +40,8 @@
 use std::time::Instant;
 
 use gpu_db_execution::{
-    CudaDeviceMemoryChunk, CudaDriverRuntime, CudaI32Comparison, ExprStep, HashJoinOutcome,
+    CudaDeviceMemoryChunk, CudaDriverRuntime, CudaI32Comparison, CudaJoinPayloadKey, ExprStep,
+    HashJoinOutcome,
 };
 
 fn p50(mut v: Vec<u128>) -> u128 {
@@ -141,7 +142,7 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
          rows={rows}, iters={iters}"
     );
     println!("\n# (1) RESIDENT-INPUT scans -- kernel-clean, wall ~= kernel (vs the sum_i32 read roofline) ---");
-    let needles_miss: Vec<i32> = (0..8).map(|k| -((k as i32) + 1)).collect(); // negative -> never match A
+    let needles_miss: Vec<i32> = (0..8).map(|k| -(k + 1)).collect(); // negative -> never match A
                                                                               // ROOFLINE = sum_i32: a pure 1-pass read+reduce over the same i32 column -> the HBM streaming peak.
     let roof = bench(
         "sum_i32 (ROOFLINE: pure 1-pass read+reduce)",
@@ -471,6 +472,34 @@ fn main() {
             }),
         );
     }
+    let payload_key = CudaJoinPayloadKey {
+        payload: &resident,
+        byte_offset: off_b,
+        validity_bitmap_offset: None,
+        width: 4,
+        text_bytes_byte_offset: None,
+        text_bytes_len: 0,
+    };
+    throughput(
+        "join_payload_hash_i32 (resident D2D)",
+        sort_n,
+        Box::new(|| {
+            resident
+                .join_fixed_payload_coordinates(
+                    None,
+                    sort_n as u32,
+                    &[0],
+                    &[payload_key],
+                    sort_n as u32,
+                    &[payload_key],
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .map_or(0, |coordinates| coordinates.row_count() as usize)
+        }),
+    );
     // LIVE per-group GROUP BY (the two-level shared-mem kernel the engine uses), grouping by the
     // ~1M-distinct key column A and summing B over a full-table scan (indices = 0..rows, as the executor
     // passes for an unfiltered GROUP BY). Replaces the removed `grouped_stats_i32` hash-agg measurement.

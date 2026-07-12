@@ -155,6 +155,11 @@ fn build_resident_engine(rows: i64) -> Result<Engine, Box<dyn Error>> {
         txn += 1;
     }
     let t_insert = t_build.elapsed();
+    // This harness measures the retained lpb template, whose API consumes one unified retained
+    // snapshot. The production default now enables segmented/sharded residency, so pin the
+    // benchmark's intended representation explicitly; otherwise route planning accepts the
+    // sharded multi-column shape and template preparation fails before any measurement.
+    e.set_shard_residency_enabled(false);
     e.populate_relational_residency_snapshot("accounts")?;
     println!(
         "# build: {rows} rows loaded + made resident in {:.1}s (insert {:.1}s + residency {:.1}s)",

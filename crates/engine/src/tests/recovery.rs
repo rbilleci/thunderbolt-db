@@ -10,7 +10,7 @@ use super::*;
 /// `Engine::with_durable_wal_segment`. The FUA backend has its own crash-safety coverage in the
 /// `gpu_db_wal` crate (roundtrip / segment-roll / reopen-across-lives).
 fn serial_durable_engine(path: impl AsRef<std::path::Path>) -> Engine {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine.commit_state_mut().wal = WalBuffer::with_durable_segment(path.as_ref());
     engine
 }
@@ -18,7 +18,7 @@ fn serial_durable_engine(path: impl AsRef<std::path::Path>) -> Engine {
 #[test]
 fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
     let path = test_wal_path("restart");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -44,8 +44,8 @@ fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
     };
     let result = recovered.execute_relational_select(&select).unwrap();
 
-    assert_eq!(
-        *result.access_path,
+    assert_recovered_relational_access_path(
+        &result,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("name".to_string()),
@@ -53,7 +53,7 @@ fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
             order_column: "id".to_string(),
             descending: false,
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(result.rows, vec![vec![SqlValue::Int4(3)]]);
 }
@@ -434,7 +434,7 @@ fn relational_state_recovers_from_wal_checkpoint_control_after_restart() {
     ));
     let control_path = dir.join("CONTROL");
     let segment_path = dir.join("segment-0001.wal");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -460,13 +460,13 @@ fn relational_state_recovers_from_wal_checkpoint_control_after_restart() {
     };
     let result = recovered.execute_relational_select(&select).unwrap();
 
-    assert_eq!(
-        *result.access_path,
+    assert_recovered_relational_access_path(
+        &result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
 }
@@ -480,7 +480,7 @@ fn relational_state_recovers_from_multi_segment_wal_archive() {
     ));
     let manifest_path = dir.join("MANIFEST");
     let segment_dir = dir.join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -507,13 +507,13 @@ fn relational_state_recovers_from_multi_segment_wal_archive() {
     };
     let result = recovered.execute_relational_select(&select).unwrap();
 
-    assert_eq!(
-        *result.access_path,
+    assert_recovered_relational_access_path(
+        &result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
 }
@@ -531,7 +531,7 @@ fn relational_state_recovers_from_wal_archive_object_backup() {
     let object_dir = dir.join("backup").join("objects");
     let restored_manifest_path = dir.join("restored").join("MANIFEST");
     let restored_segment_dir = dir.join("restored").join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -574,13 +574,13 @@ fn relational_state_recovers_from_wal_archive_object_backup() {
     };
     let result = recovered.execute_relational_select(&select).unwrap();
 
-    assert_eq!(
-        *result.access_path,
+    assert_recovered_relational_access_path(
+        &result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
 }
@@ -595,7 +595,7 @@ fn relational_state_recovers_after_wal_archive_segment_ingestion() {
     let manifest_path = dir.join("archive").join("MANIFEST");
     let segment_dir = dir.join("archive").join("segments");
     let ingest_segment = segment_dir.join("segment-0002.wal");
-    let base = Engine::new_local();
+    let base = Engine::new_local_cpu_oracle();
     base.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     base.execute_text_at_timestamp_micros(
@@ -659,13 +659,13 @@ fn relational_state_recovers_after_wal_archive_segment_ingestion() {
         panic!("expected SELECT plan");
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
-    assert_eq!(
-        *grace_result.access_path,
+    assert_recovered_relational_access_path(
+        &grace_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
 
@@ -693,7 +693,7 @@ fn relational_state_recovers_from_wal_archive_transaction_target() {
     ));
     let manifest_path = dir.join("MANIFEST");
     let segment_dir = dir.join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -719,13 +719,13 @@ fn relational_state_recovers_from_wal_archive_transaction_target() {
         panic!("expected SELECT plan");
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
-    assert_eq!(
-        *grace_result.access_path,
+    assert_recovered_relational_access_path(
+        &grace_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
 
@@ -749,7 +749,7 @@ fn relational_state_recovers_from_wal_archive_timestamp_target() {
     ));
     let manifest_path = dir.join("MANIFEST");
     let segment_dir = dir.join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -787,13 +787,13 @@ fn relational_state_recovers_from_wal_archive_timestamp_target() {
         panic!("expected SELECT plan");
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
-    assert_eq!(
-        *grace_result.access_path,
+    assert_recovered_relational_access_path(
+        &grace_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
 
@@ -825,7 +825,7 @@ fn relational_state_recovers_from_forked_wal_archive_timeline_branch() {
     let timeline_path = dir.join("branch").join("TIMELINE");
     let pruned_timeline_path = dir.join("pruned-branch").join("TIMELINE");
     let registry_path = dir.join("TIMELINE_REGISTRY");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -946,13 +946,13 @@ fn relational_state_recovers_from_forked_wal_archive_timeline_branch() {
         panic!("expected SELECT plan");
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
-    assert_eq!(
-        *grace_result.access_path,
+    assert_recovered_relational_access_path(
+        &grace_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
 
@@ -980,7 +980,7 @@ fn relational_state_recovers_from_base_checkpoint_plus_wal_archive_transaction_t
     let base_segment_path = dir.join("base").join("base.wal");
     let manifest_path = dir.join("archive").join("MANIFEST");
     let segment_dir = dir.join("archive").join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -1012,13 +1012,13 @@ fn relational_state_recovers_from_base_checkpoint_plus_wal_archive_transaction_t
         panic!("expected SELECT plan");
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
-    assert_eq!(
-        *grace_result.access_path,
+    assert_recovered_relational_access_path(
+        &grace_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
 
@@ -1044,7 +1044,7 @@ fn relational_state_recovers_from_base_checkpoint_plus_wal_archive_timestamp_tar
     let base_segment_path = dir.join("base").join("base.wal");
     let manifest_path = dir.join("archive").join("MANIFEST");
     let segment_dir = dir.join("archive").join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -1105,7 +1105,7 @@ fn base_checkpoint_plus_wal_archive_rejects_missing_base_overlap() {
     let base_segment_path = dir.join("base").join("base.wal");
     let manifest_path = dir.join("archive").join("MANIFEST");
     let segment_dir = dir.join("archive").join("segments");
-    let base = Engine::new_local();
+    let base = Engine::new_local_cpu_oracle();
     base.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     base.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -1113,7 +1113,7 @@ fn base_checkpoint_plus_wal_archive_rejects_missing_base_overlap() {
     base.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
         .unwrap();
 
-    let archive = Engine::new_local();
+    let archive = Engine::new_local_cpu_oracle();
     archive
         .execute_text(3, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1139,7 +1139,7 @@ fn base_checkpoint_plus_wal_archive_rejects_missing_base_overlap() {
 
 #[test]
 fn engine_written_wal_archive_timestamps_are_monotonic() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET a=1").unwrap();
     e.execute_text(2, "SET b=2").unwrap();
 
@@ -1158,7 +1158,7 @@ fn relational_state_recovers_after_wal_archive_retention_cleanup() {
     ));
     let manifest_path = dir.join("MANIFEST");
     let segment_dir = dir.join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -1186,13 +1186,13 @@ fn relational_state_recovers_after_wal_archive_retention_cleanup() {
         panic!("expected SELECT plan");
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
-    assert_eq!(
-        *grace_result.access_path,
+    assert_recovered_relational_access_path(
+        &grace_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
 
@@ -1218,7 +1218,7 @@ fn relational_state_recovers_after_timestamp_wal_archive_retention_cleanup() {
     ));
     let manifest_path = dir.join("MANIFEST");
     let segment_dir = dir.join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -1262,13 +1262,13 @@ fn relational_state_recovers_after_timestamp_wal_archive_retention_cleanup() {
         panic!("expected SELECT plan");
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
-    assert_eq!(
-        *grace_result.access_path,
+    assert_recovered_relational_access_path(
+        &grace_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
 
@@ -1296,7 +1296,7 @@ fn relational_state_recovers_after_base_checkpoint_archive_retention_cleanup() {
     let base_segment_path = dir.join("base").join("base.wal");
     let manifest_path = dir.join("archive").join("MANIFEST");
     let segment_dir = dir.join("archive").join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -1347,13 +1347,13 @@ fn relational_state_recovers_after_base_checkpoint_archive_retention_cleanup() {
         panic!("expected SELECT plan");
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
-    assert_eq!(
-        *grace_result.access_path,
+    assert_recovered_relational_access_path(
+        &grace_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
 
@@ -1386,7 +1386,7 @@ fn base_checkpoint_archive_retention_rejects_prefix_mismatch_before_cleanup() {
     let base_segment_path = dir.join("base").join("base.wal");
     let manifest_path = dir.join("archive").join("MANIFEST");
     let segment_dir = dir.join("archive").join("segments");
-    let base = Engine::new_local();
+    let base = Engine::new_local_cpu_oracle();
     base.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     base.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -1394,7 +1394,7 @@ fn base_checkpoint_archive_retention_rejects_prefix_mismatch_before_cleanup() {
     base.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
         .unwrap();
 
-    let archive = Engine::new_local();
+    let archive = Engine::new_local_cpu_oracle();
     archive
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1434,7 +1434,7 @@ fn checkpoint_window_archive_retention_preserves_pitr_recovery() {
     let base_segment_path = dir.join("base").join("base.wal");
     let manifest_path = dir.join("archive").join("MANIFEST");
     let segment_dir = dir.join("archive").join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -1524,7 +1524,7 @@ fn maintenance_cleanup_prunes_archive_and_timelines_before_registered_recovery()
     let prune_segments = dir.join("timeline-prune").join("segments");
     let prune_timeline_path = dir.join("timeline-prune").join("TIMELINE");
     let registry_path = dir.join("TIMELINE_REGISTRY");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -1683,7 +1683,7 @@ fn maintenance_cleanup_rejects_stale_timeline_before_archive_mutation() {
     let branch_segments = dir.join("timeline-branch").join("segments");
     let branch_timeline_path = dir.join("timeline-branch").join("TIMELINE");
     let registry_path = dir.join("TIMELINE_REGISTRY");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -1767,7 +1767,7 @@ fn checkpoint_window_archive_retention_rejects_unsafe_recent_base_without_mutati
     let base_segment_path = dir.join("base").join("base.wal");
     let manifest_path = dir.join("archive").join("MANIFEST");
     let segment_dir = dir.join("archive").join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .unwrap();
     e.execute_text_at_timestamp_micros(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')", 2_000)
@@ -1817,7 +1817,7 @@ fn wal_archive_transaction_target_rejects_unavailable_durable_boundary() {
     ));
     let manifest_path = dir.join("MANIFEST");
     let segment_dir = dir.join("segments");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(10, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(20, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -1839,7 +1839,7 @@ fn wal_archive_transaction_target_rejects_unavailable_durable_boundary() {
 #[test]
 fn checkpoint_vacuum_prunes_mvcc_versions_only_at_durable_safe_boundary() {
     let path = test_wal_path("vacuum");
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:1=closed").unwrap();
 
@@ -1906,7 +1906,7 @@ fn checkpoint_vacuum_prunes_mvcc_versions_only_at_durable_safe_boundary() {
 fn checkpoint_vacuum_rejects_unsafe_boundaries() {
     // Stage 4 reasons in `commit_seq`/`Index` space (was façade-`txn_id`): the durable boundary is
     // `committed_seq`, and the active-snapshot guard is the oldest active READ SNAPSHOT.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     let no_commit_err = e.checkpoint_vacuum_mvcc_versions(1).unwrap_err();
     assert!(
         no_commit_err
@@ -2154,6 +2154,11 @@ fn w5a_binary_wal_records_replay_identically_to_text() {
         let path = test_wal_path(&format!("w5a-replay-{tag}"));
         {
             let e = Engine::with_durable_wal_segment(&path);
+            // This fixture manually forces the pre-admission elided state to exercise WAL
+            // encoding. Keep S-F out of that setup; otherwise CREATE auto-admits an empty device
+            // generation before the synthetic `set_table_install_elided` transition.
+            e.set_auto_admit_on_commit(false);
+            e.set_host_install_elision_enabled(false);
             e.set_binary_wal_records_enabled(binary);
             e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
             // Force the covered class deterministically (no GPU needed for the WAL semantics

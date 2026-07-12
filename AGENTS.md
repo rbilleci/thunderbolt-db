@@ -48,10 +48,18 @@ When choosing between implementation approaches:
 
 ## Documentation Expectations
 
+`docs/PLAN.md` is the **only** document that owns open, deferred, blocked, or sequenced work. `STATUS.md`
+records facts; `HANDOVER.md` is a short pointer to active PLAN IDs; architecture, ADR, and `docs/design/`
+documents do not own tasks. Everything under `docs/archive/` is historical and non-actionable even when it
+contains words such as `NEXT`, `TODO`, or `OPEN`.
+
+Permanent analysis instrumentation lives behind the build-only `probe-timing` Cargo feature. Reuse and extend
+those probes instead of writing and reverting one-off hot-path timers.
+
 Before major runtime, storage, or scheduler changes, read:
 
 - `docs/CHARTER.md` — mandate, invariants, the OLTP bet, execution discipline + gotchas
-- `docs/ARCHITECTURE.md` — the full system design (execution model, residency/STRATA, OLTP wave engine, MVCC,
+- `docs/ARCHITECTURE.md` — the full system design (execution model, residency/STRATA, deterministic OLTP, MVCC,
   durability, multi-GPU)
 - `docs/DECISIONS.md` — the decision ledger (ADRs)
 - `docs/PLAN.md` (ordered work) · `docs/STATUS.md` (current state) · `docs/HANDOVER.md` (resume baton)
@@ -127,9 +135,10 @@ gathered i32 column (4B/row) to exceed 128MB => > 32M rows. Section C uses **48M
 (1.5x L2)** by default.
 
 **BUILD-TIME NOTE (why Section C has its own timeout):** `r2_wave_engine_ab` builds its table via a SQL
-INSERT loop at ~11 us/row (CPU-bound SQL parse + txn/MVCC apply; in-memory WAL, no fsync). So 48M rows
-take ~9 min to build, which cannot fit a 280s box. Section C therefore gets `SECTION_C_TIMEOUT=700`
-(Sections A/B keep 280). The INSERT-chunk size was measured non-helpful (250/1000/10000 all ~11 us/row --
-the cost is the engine's per-row apply, not per-statement overhead), so the lever is the timeout, not the
-chunk. Tunables (env): `OUT_OF_L2_ROWS`, `OUT_OF_L2_BATCHES` (default 300; p50 stable there),
-`SECTION_{A,B,C}_TIMEOUT`, `GPU_GAP`. Never `--gpu-reset`.
+INSERT loop at ~11 us/row (CPU-bound SQL parse + txn/MVCC apply; in-memory WAL, no fsync). A 2026-07-12
+run measured 719s insert + 33s residency; even 1000s cut off during the final batch-65536 scan. Section C
+therefore gets `SECTION_C_TIMEOUT=1200` (Sections A/B keep 280). The INSERT-chunk size was measured
+non-helpful (250/1000/10000 all ~11 us/row -- the cost is the engine's per-row apply, not per-statement
+overhead), so the lever is the timeout, not the chunk. Tunables (env): `OUT_OF_L2_ROWS`,
+`OUT_OF_L2_BATCHES` (default 300; p50 stable there), `SECTION_{A,B,C}_TIMEOUT`, `GPU_GAP`. Never
+`--gpu-reset`.

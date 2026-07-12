@@ -1720,6 +1720,7 @@ pub(crate) fn bind_update_assignments(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn relational_select_pushes_limit(select: &Select) -> bool {
     select.limit.is_some() && select.offset.is_none() && select.order_by.is_empty()
 }
@@ -1740,6 +1741,7 @@ pub(crate) fn relational_select_pushed_limit(
         .map(|limit| limit.saturating_add(select.offset.unwrap_or(0)))
 }
 
+#[cfg(test)]
 pub(crate) fn relational_select_limit_satisfied_by_access_path(
     select: &Select,
     access_path: &RelationalAccessPath,
@@ -1753,6 +1755,7 @@ pub(crate) fn relational_select_limit_satisfied_by_access_path(
                 && matches!(access_path, RelationalAccessPath::OrderedKeyBatch { .. })))
 }
 
+#[cfg(test)]
 pub(crate) fn relational_select_needs_host_sql_finalization(
     select: &Select,
     access_path: &RelationalAccessPath,
@@ -1849,6 +1852,7 @@ pub(crate) fn select_is_aggregate_result_column(select: &Select, column: &str) -
     }
 }
 
+#[cfg(test)]
 pub(crate) fn select_aggregate_result_column_name(select: &Select) -> Option<&'static str> {
     match select.projection {
         SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => Some("count"),
@@ -1865,6 +1869,7 @@ pub(crate) fn select_aggregate_result_column_name(select: &Select) -> Option<&'s
     }
 }
 
+#[cfg(test)]
 pub(crate) fn grouped_row_matches_having(
     select: &Select,
     group_column: &str,
@@ -1993,6 +1998,7 @@ pub(crate) fn aggregate_int4_error_message(aggregate: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn int4_aggregate_value(
     value: &SqlValue,
     aggregate: &'static str,

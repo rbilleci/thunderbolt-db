@@ -1269,7 +1269,7 @@ impl Engine {
             let mut tables = Vec::new();
             for (table, entry) in snapshots.iter_mut() {
                 if entry.descriptor.gpu_id == gpu_id {
-                    // COW only the pressured tables' descriptors (host_rows stays shared).
+                    // COW only the pressured tables' descriptors.
                     let snapshot = std::sync::Arc::make_mut(&mut entry.descriptor);
                     snapshot.invalidated_by_memory_pressure = true;
                     snapshot.memory_pressure_active = true;

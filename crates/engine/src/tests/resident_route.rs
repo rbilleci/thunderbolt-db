@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -103,7 +103,7 @@ fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
 
 #[test]
 fn p8_default_resident_route_executes_accepted_shapes() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE events (id INT, bucket INT, amount INT, label TEXT)",
@@ -435,7 +435,7 @@ fn p8_default_resident_route_executes_accepted_shapes() {
 
 #[test]
 fn p8_resident_route_batches_int4_equality_projection_literals() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE events (id INT, bucket INT, amount INT, label TEXT)",
@@ -666,7 +666,7 @@ fn p8_resident_route_batches_int4_equality_projection_literals() {
 
 #[test]
 fn p8_resident_route_executes_same_column_equality_projection() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, amount INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -920,7 +920,7 @@ fn p8_resident_route_executes_same_column_equality_projection() {
 
 #[test]
 fn p8_opt_in_resident_route_rejects_before_execution() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -974,7 +974,7 @@ fn p8_opt_in_resident_route_rejects_before_execution() {
 
 #[test]
 fn p8_resident_route_decisions_reject_evicted_and_memory_pressured_snapshots() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
@@ -989,7 +989,11 @@ fn p8_resident_route_decisions_reject_evicted_and_memory_pressured_snapshots() {
 
     let aux = e.populate_relational_residency_snapshot("aux").unwrap();
     let events = e.populate_relational_residency_snapshot("events").unwrap();
-    e.set_relational_residency_budget_bytes(0, events.resident_bytes);
+    let events_allocated = events
+        .device_memory_proof
+        .as_ref()
+        .map_or(events.resident_bytes, |proof| proof.allocated_bytes);
+    e.set_relational_residency_budget_bytes(0, events_allocated);
     let admitted = e.populate_relational_residency_snapshot("events").unwrap();
     assert_eq!(admitted.evicted_tables_on_admission, vec!["aux"]);
 
@@ -1027,7 +1031,7 @@ fn p8_resident_route_decisions_reject_evicted_and_memory_pressured_snapshots() {
 
 #[test]
 fn p8_sharded_resident_count_reduces_valid_shards_and_rejects_invalidated() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -1134,7 +1138,7 @@ fn p8_sharded_resident_count_reduces_valid_shards_and_rejects_invalidated() {
 
 #[test]
 fn p8_sharded_resident_key_lookup_merges_matches_and_rejects_invalidated() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -1251,7 +1255,7 @@ fn p8_sharded_resident_key_lookup_merges_matches_and_rejects_invalidated() {
 
 #[test]
 fn p8_sharded_resident_multi_column_lookup_merges_projected_rows_and_rejects_missing_layout() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -1421,7 +1425,7 @@ fn p8_sharded_resident_multi_column_lookup_merges_projected_rows_and_rejects_mis
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local();
+    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
     missing_layout_engine
             .execute_text(
                 1,
@@ -1508,7 +1512,7 @@ fn p8_sharded_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_
     // below and breaking the sharded ascending-merge. It passes only because the route now
     // sorts the [0, count) indices host-side. The loop re-runs the query so a sort-less route
     // surfaces a wrong ordering on at least one iteration.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -1652,7 +1656,7 @@ fn p8_batched_multi_column_projection_matches_per_query_for_more_than_one_warp_o
     // reference is NOT value-sorted and NOT the atomic-append order. WITHOUT the stable-order
     // sort the batched scatter would emit a non-deterministic permutation (caught by the exact
     // comparison and the 25× loop), and it would differ from the per-query path.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: the retained-jobs API is the SINGLE-BUFFER lpb layer (sharded tables are served by
     // the sharded batched gather in production) — pin the layer under test.
     e.set_shard_residency_enabled(false);
@@ -1760,7 +1764,7 @@ fn p8_batched_mixed_column_projection_matches_per_query_for_more_than_one_warp_o
     // Non-vacuous: the projected `label` text is a by-row SCRAMBLED value, so the ascending-by-row
     // reference is neither value-sorted nor the atomic-append order. WITHOUT the sort the scatter
     // is a non-deterministic permutation (caught by the exact comparison + the 25× loop).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (k INT, label TEXT)")
         .unwrap();
     const NEEDLE: i32 = 7;
@@ -1854,7 +1858,7 @@ fn p8_batched_mixed_column_projection_matches_per_query_for_more_than_one_warp_o
 
 #[test]
 fn p8_sharded_resident_sum_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -1992,7 +1996,7 @@ fn p8_sharded_resident_sum_reduces_matches_and_rejects_missing_layout() {
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local();
+    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
     missing_layout_engine
             .execute_text(
                 1,
@@ -2026,7 +2030,7 @@ fn p8_sharded_resident_sum_reduces_matches_and_rejects_missing_layout() {
 
 #[test]
 fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -2180,7 +2184,7 @@ fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() 
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local();
+    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
     missing_layout_engine
             .execute_text(
                 1,
@@ -2214,7 +2218,7 @@ fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() 
 
 #[test]
 fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -2361,7 +2365,7 @@ fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout()
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local();
+    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
     missing_layout_engine
             .execute_text(
                 1,
@@ -2395,7 +2399,7 @@ fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout()
 
 #[test]
 fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -2542,7 +2546,7 @@ fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout()
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local();
+    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
     missing_layout_engine
             .execute_text(
                 1,
@@ -2576,7 +2580,7 @@ fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout()
 
 #[test]
 fn p8_sharded_resident_filtered_avg_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -2728,7 +2732,7 @@ fn p8_sharded_resident_filtered_avg_reduces_matches_and_rejects_missing_layout()
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local();
+    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
     missing_layout_engine
             .execute_text(
                 1,
@@ -2762,7 +2766,7 @@ fn p8_sharded_resident_filtered_avg_reduces_matches_and_rejects_missing_layout()
 
 #[test]
 fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -2874,7 +2878,7 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
 
 #[test]
 fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
@@ -2896,6 +2900,10 @@ fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
 
     let events_size = e.populate_relational_residency_snapshot("events").unwrap();
     let aux_size = e.populate_relational_residency_snapshot("aux").unwrap();
+    let events_budget = events_size
+        .device_memory_proof
+        .as_ref()
+        .map_or(events_size.resident_bytes, |proof| proof.allocated_bytes);
     e.clear_relational_residency_budget_bytes(0);
     let report = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
         tables: vec![
@@ -2903,11 +2911,11 @@ fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
             "aux".to_string(),
             "missing".to_string(),
         ],
-        budget_bytes: Some(events_size.resident_bytes),
+        budget_bytes: Some(events_budget),
         refresh_invalidated: true,
         ..RelationalResidencyWarmupPolicy::default()
     });
-    assert_eq!(report.budget_bytes, Some(events_size.resident_bytes));
+    assert_eq!(report.budget_bytes, Some(events_budget));
     assert_eq!(report.entries.len(), 3);
     assert!(report.entries.iter().any(|entry| entry.table == "missing"
         && entry.action == RelationalResidencyWarmupAction::Skipped));
@@ -2962,7 +2970,7 @@ fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
 
 #[test]
 fn p8_resident_maintenance_tick_summarizes_refresh_and_route_readiness() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
@@ -3032,7 +3040,7 @@ fn p8_resident_maintenance_tick_summarizes_refresh_and_route_readiness() {
 
 #[test]
 fn p8_resident_maintenance_tick_reports_pressure_and_budget_blockers() {
-    let mut pressured = Engine::new_local();
+    let mut pressured = Engine::new_local_cpu_oracle();
     pressured
         .execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
@@ -3053,7 +3061,7 @@ fn p8_resident_maintenance_tick_reports_pressure_and_budget_blockers() {
     );
     assert!(pressured.relational_residency_snapshot("events").is_none());
 
-    let mut oversized = Engine::new_local();
+    let mut oversized = Engine::new_local_cpu_oracle();
     oversized
         .execute_text(1, "CREATE TABLE oversized (id INT, label TEXT)")
         .unwrap();
@@ -3115,7 +3123,7 @@ fn telemetry_snapshot_reflects_replication_lag_and_runtime_metrics() {
 
 #[test]
 fn status_snapshot_answers_snapshot_and_replication_health_questions() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let token = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     let exported = e.export_snapshot_meta();
 
@@ -3139,7 +3147,7 @@ fn status_snapshot_answers_snapshot_and_replication_health_questions() {
 
 #[test]
 fn status_snapshot_surfaces_active_fallback_reasons_and_rollups() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.mark_gpu_unavailable(0);
     e.set_gpu_runtime_saturated(true);
 
@@ -3175,7 +3183,7 @@ fn status_snapshot_surfaces_active_fallback_reasons_and_rollups() {
 // general SUM's empty-set hard error while staying PG-correct.
 #[test]
 fn p8_sharded_resident_sum_all_empty_returns_null() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -3282,7 +3290,7 @@ fn p8_sharded_resident_sum_all_empty_returns_null() {
 // the bridge enforces uniformity itself; the route's referenced-column membership check does not catch it.
 #[test]
 fn p8_sharded_resident_rejects_nonuniform_int4_layout() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -3409,7 +3417,7 @@ fn s10c_2b_logical_rows() -> Vec<(i32, i32)> {
 /// k contiguous, then v contiguous). Returns `None` (caller should `return`) if there is no local GPU/driver.
 #[cfg(test)]
 fn s10c_2b_sharded_engine() -> Option<Engine> {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE pt (k INT, v INT)").unwrap();
     let shards = s10c_2b_shard_values()
         .iter()
@@ -3460,7 +3468,7 @@ fn s10c_2b_sharded_engine() -> Option<Engine> {
 /// (caller should `return`) if there is no local GPU/driver (no device-memory proof).
 #[cfg(test)]
 fn s10c_2b_single_store_engine() -> Option<Engine> {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE pt (k INT, v INT)").unwrap();
     let values = s10c_2b_logical_rows()
         .into_iter()
@@ -3665,7 +3673,7 @@ fn s_b_auto_admit_on_commit_makes_committed_table_gpu_resident() {
     };
 
     // Auto-admit ON, and NO explicit populate/warm call — residency must come purely from the commit.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute_text(
@@ -3703,7 +3711,7 @@ fn s_b_auto_admit_on_commit_makes_committed_table_gpu_resident() {
     );
 
     // Flag OFF (default): identical data is NOT auto-admitted -> host path -> byte-identical rows.
-    let host = Engine::new_local();
+    let host = Engine::new_local_cpu_oracle();
     host.execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
     host.execute_text(
@@ -3731,7 +3739,7 @@ fn s_b_auto_admit_fires_on_the_concurrent_dml_commit_path() {
         vec![SqlValue::Int4(2), SqlValue::Null],
         vec![SqlValue::Int4(3), SqlValue::Int4(30)],
     ];
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     // Drive the INSERT through the concurrent path that production uses for a no-sequence-default
@@ -3778,7 +3786,7 @@ fn s_b_auto_admit_fires_on_the_concurrent_dml_commit_path() {
 /// gracefully when there is no GPU residency route (CI without a GPU).
 #[test]
 fn r1_wave_index_probe_matches_scan_differential() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
@@ -3935,6 +3943,67 @@ fn r1_wave_index_probe_matches_scan_differential() {
     );
 }
 
+/// S-F/R-1: a lazy single-buffer device index is an optional optimization, not permission to
+/// exceed the residency cap. With the budget pinned to the already-resident table, the index
+/// allocation must decline, the retained GPU scan must still return the row, and accounting must
+/// remain at or below the cap.
+#[test]
+fn wave_index_declines_at_residency_budget_without_losing_gpu_scan() {
+    let mut e = Engine::new_local_cpu_oracle();
+    e.set_shard_residency_enabled(false);
+    e.execute_text(1, "CREATE TABLE capped_index (id INT, balance INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO capped_index VALUES (10, 100), (20, 200), (30, 300)",
+    )
+    .unwrap();
+    let admitted = e
+        .populate_relational_residency_snapshot("capped_index")
+        .unwrap();
+    if admitted.device_memory_proof.is_none() {
+        return;
+    }
+    let budget = e.relational_resident_bytes_for_gpu(0);
+    e.set_relational_residency_budget_bytes(0, budget);
+    e.set_index_probe_enabled(true);
+    let select = match parse_command(
+        "SELECT id, balance FROM capped_index WHERE id = 1",
+    )
+    .unwrap()
+    {
+        Command::Select(select) => select,
+        _ => unreachable!(),
+    };
+    let template = e
+        .prepare_relational_retained_read_template(&select)
+        .unwrap();
+    let results = e
+        .complete_relational_retained_read_submission(
+            e.submit_relational_retained_template_point_lookups(&template, &[20])
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        results[0].rows,
+        vec![vec![SqlValue::Int4(20), SqlValue::Int4(200)]]
+    );
+    let cache = e
+        .read_state
+        .residency
+        .wave_index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        cache
+            .get("capped_index")
+            .is_some_and(|entry| entry.index_memory.is_none()),
+        "the optional index must cache a decline rather than retain over-budget memory"
+    );
+    drop(cache);
+    assert!(e.relational_resident_bytes_for_gpu(0) <= budget);
+}
+
 // ADR-009 R1 (lifecycle + routing): the launch-per-batch (lpb) GPU hash-index probe returns BYTE-IDENTICAL
 // rows to the full scan, across NULL data, NULL-as-0 keys, absent needles, non-unique fallback, and a
 // generation rebuild. The `dense_index_probe_hits` counter is the non-vacuity signal that the index route
@@ -3943,7 +4012,7 @@ fn r1_wave_index_probe_matches_scan_differential() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_wave_engine_matches_lpb_differential() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
@@ -4137,7 +4206,7 @@ fn r2_wave_engine_matches_lpb_differential() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_batched_completion_matches_per_needle() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
@@ -4221,7 +4290,7 @@ fn r2_batched_completion_matches_per_needle() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_batched_completion_matches_per_needle_multirow() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
@@ -4419,7 +4488,7 @@ fn r2_batched_assembly_unique_fastpath_scatters_by_needle() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_dense_index_probe_matches_atomic() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer (a supported, settable configuration;
     // sharded is the default) — pin the layout under test.
     e.set_shard_residency_enabled(false);
@@ -4509,7 +4578,7 @@ fn r2_dense_index_probe_matches_atomic() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn w0_concurrent_invalidation_must_not_leave_write_locate_trusting_stale_shards() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // Pin the plain host-install regime (the shipped default has auto_admit OFF, which makes
     // elision inert anyway — pin both OFF so the regime under test is explicit and stable).
     e.set_host_install_elision_enabled(false);

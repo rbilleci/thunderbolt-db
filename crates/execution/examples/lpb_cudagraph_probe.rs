@@ -257,7 +257,7 @@ fn main() {
 
     for &batch in &[1usize, 8, 32, 256] {
         let n = batch as u32;
-        let blocks = ((batch + 255) / 256) as u32;
+        let blocks = batch.div_ceil(256) as u32;
         let tpb = if batch >= 256 { 256u32 } else { batch as u32 };
 
         // ---- DIRECT path ----

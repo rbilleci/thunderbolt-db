@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn snapshot_export_tracks_last_applied_index() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let token = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
 
     let exported = e.export_snapshot_meta();
@@ -16,7 +16,7 @@ fn snapshot_export_tracks_last_applied_index() {
 
 #[test]
 fn install_snapshot_advances_visible_and_replication_watermarks() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.install_snapshot(SnapshotMeta {
         last_included_index: 7,
         last_included_term: 3,
@@ -42,7 +42,7 @@ fn install_snapshot_advances_visible_and_replication_watermarks() {
 
 #[test]
 fn export_snapshot_meta_is_reflected_in_replication_watermarks() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
 
     assert_eq!(e.replication_watermarks().snapshot_id, 0);
 
@@ -55,7 +55,7 @@ fn export_snapshot_meta_is_reflected_in_replication_watermarks() {
 
 #[test]
 fn relational_residency_snapshot_accounts_bytes_and_invalidates_on_later_wal_apply() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -129,7 +129,7 @@ fn relational_residency_snapshot_accounts_bytes_and_invalidates_on_later_wal_app
 fn mutation_invalidates_only_the_mutated_table_residency() {
     // P1-M3 step 2: per-table residency invalidation. A write to one table must no
     // longer evict every other table's residency (the former stop-the-world bug).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
     e.set_shard_residency_enabled(false);
@@ -163,7 +163,7 @@ fn mutation_invalidates_only_the_mutated_table_residency() {
 fn create_table_does_not_invalidate_existing_residency() {
     // CREATE TABLE introduces a brand-new table with no prior residency, so it must
     // touch no existing table's snapshot (scope contributes the empty set).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
     e.set_shard_residency_enabled(false);
@@ -186,7 +186,7 @@ fn unscoped_ddl_conservatively_invalidates_unrelated_residency() {
     // Over-invalidation is safe; under-invalidation would serve wrong rows. (The
     // mutated table `a` has its snapshot rebuilt by the schema change itself, so we
     // observe the conservative fallback on the untouched table `b`.)
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
     e.set_shard_residency_enabled(false);
@@ -258,7 +258,7 @@ fn residency_snapshot_retains_int8_columns_at_the_layout_offset() {
     // device payload, so residency retains int8 columns as fixed 8-byte row-major data AFTER the int4
     // section. Verify the bookkeeping (the column list + the offset resolver); the on-device read is
     // exercised by the int8 VM slice. CPU-side bookkeeping, so this runs without a GPU.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     // i64-SECTION FLIP pin: this test verifies the SINGLE-BUFFER int8 layout bookkeeping —
     // the kill-switch configuration since the 2026-07-03 flip (default = sharded admission).
     e.set_shard_int8_section_enabled(false);
@@ -307,7 +307,7 @@ fn residency_snapshot_retains_numeric_columns_at_the_layout_offset() {
     // device payload, so residency retains numeric columns as fixed 16-byte i128 mantissas AFTER the
     // int4 AND int8 sections (before text). Verify the bookkeeping (the column list + the offset
     // resolver); the on-device read is exercised by the numeric VM slice. CPU-side, no GPU needed.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE t (a INT, big BIGINT, price NUMERIC(10,2), b INT, tax NUMERIC(10,2), label TEXT)",

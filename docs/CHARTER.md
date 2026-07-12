@@ -31,15 +31,16 @@ coherence) so it **closes as GPU hardware advances** while the CPU path sits nea
 
 ## The invariant — host is control plane ONLY
 - Every relational decision and every result value is computed on, and read back from, the **device**.
-  `host_rows` is ingest-staging only.
+  Decoded host rows are ingest/upload staging only and are discarded after upload; a published residency
+  generation does not retain a host relational shadow.
 - **Host MAY:** wire I/O; SQL parse + plan; kernel orchestration/launch; txn coordination + **sequencing**;
   WAL/durability I/O; replication; the COPY/DDL **staging upload** (build + upload the next device generation);
   the single **final device→wire result readback**.
 - **Host MUST NOT:** scans, filters, joins, aggregates, sorts, grouping, DISTINCT, HAVING, LIMIT/OFFSET on data,
   expression eval, NULL/3VL — and must not materialize results from `host_rows`.
-- **The engine REQUIRES a GPU** (sm_120 floor). No CPU-only / hybrid steady-state mode. CPU relational execution
-  exists ONLY as (a) the **parity oracle** and (b) **operational-safety on GPU fault** — both interim GPU-parity
-  **debt to be deleted**, never product direction (DECISIONS ADR-006, supersedes ADR-003).
+- **The engine REQUIRES a GPU** (sm_120 floor). No CPU-only / hybrid steady-state mode. Production SELECT/MVCC
+  declines and GPU faults fail loud; they never execute relational work on the host. CPU relational execution is
+  compiled only under `cfg(test)` as an interim parity oracle, never product direction (ADR-006/007).
 
 ## Transaction model (the OLTP shape — DECISIONS ADR-009)
 - **Fast path = deterministic, predeclarable transaction _waves_**: PK / unique-key equality point operations +

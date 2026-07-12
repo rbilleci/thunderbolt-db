@@ -38,7 +38,7 @@ fn select(sql: &str) -> Select {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_reduction_over_budget_stays_on_device_out_of_core() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -143,9 +143,1075 @@ fn gpu_streaming_reduction_over_budget_stays_on_device_out_of_core() {
 }
 
 #[test]
+#[ignore = "requires at least two local NVIDIA GPUs"]
+fn gpu_streaming_scalar_partial_combine_executes_chunks_on_multiple_gpus() {
+    let Ok(runtime) = gpu_db_execution::CudaDriverRuntime::probe() else {
+        return;
+    };
+    if runtime.snapshot().device_count < 2 {
+        return;
+    }
+
+    let mut e = Engine::new_local_cpu_oracle();
+    e.set_auto_admit_on_commit(false);
+    let mut seq = 0_u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE multi_gpu_fold (a INT)")
+        .unwrap();
+    const N: i32 = 2_000;
+    let values = (0..N)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(
+        seq,
+        &format!("INSERT INTO multi_gpu_fold (a) VALUES {values}"),
+    )
+    .unwrap();
+    let budget = 4_096;
+    e.set_relational_residency_budget_bytes(0, budget);
+    e.set_relational_residency_budget_bytes(1, budget);
+
+    let secondary_before = e.streaming_fold_secondary_gpu_chunks();
+    let result = e
+        .execute_relational_select(&select("SELECT SUM(a) FROM multi_gpu_fold"))
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![SqlValue::Int8((0..i64::from(N)).sum())]]
+    );
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert!(
+        e.streaming_fold_secondary_gpu_chunks() > secondary_before,
+        "at least one completed partial must come from a secondary GPU"
+    );
+}
+
+/// ADR-012 JOIN: two non-resident relations are captured at budget/4, joined as bounded logical
+/// block pairs on the GPU, and concatenated. NULL join keys never match; NULL projected values survive.
+/// Differential oracle is the same GPU join after explicit whole-table residency, never a CPU join.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_inner_join_two_over_budget_relations() {
+    let _entry_disabled = ClassEntryDisabled::new();
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0_u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jl (k INT, lv INT, note TEXT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jr (k INT, rv INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jna (k INT, x INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jnb (k INT, y INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jnc (k INT, z INT, note TEXT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jnd (k INT, q INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE joa (k INT, x INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE job (k INT, y INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jxa (k INT, x INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jxb (k INT, y INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jxc (x INT, y INT, z INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jm4 (k INT, v INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE jm8 (k BIGINT, v INT)")
+        .unwrap();
+    let left = (0..600)
+        .map(|i| {
+            let key = if i % 97 == 0 { "NULL".to_string() } else { i.to_string() };
+            let note = if i % 17 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'n{i:04}'")
+            };
+            format!("({key}, {i}, {note})")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let right = (300..900)
+        .map(|i| {
+            let key = if i % 89 == 0 { "NULL".to_string() } else { i.to_string() };
+            format!("({key}, {i})")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO jl VALUES {left}"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO jr VALUES {right}"))
+        .unwrap();
+    let nna = (0..60)
+        .map(|i| format!("({}, {i})", i % 3))
+        .collect::<Vec<_>>()
+        .join(",");
+    let nnb = (0..45)
+        .map(|i| format!("({}, {i})", i % 3))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO jna VALUES {nna}"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO jna VALUES (9, 999)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO jnb VALUES {nnb}"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO jnb VALUES (7, 777)")
+        .unwrap();
+    let nnc = (0..30)
+        .map(|i| {
+            let key = if i == 29 { "NULL".to_string() } else { (i % 3).to_string() };
+            let note = if i % 5 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'c{i:02}'")
+            };
+            format!("({key}, {i}, {note})")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO jnc VALUES {nnc}"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO jnd VALUES (0, 7), (0, 8), (7, 9)")
+        .unwrap();
+    let outer_a = (0..400)
+        .map(|i| format!("({i}, {})", i * 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    let outer_b = (200..600)
+        .map(|i| format!("({i}, {})", i * 100))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO joa VALUES {outer_a}"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO job VALUES {outer_b}"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO jxa VALUES (1, 10), (2, 20)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO jxb VALUES (1, 100), (2, 200)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(
+        seq,
+        "INSERT INTO jxc VALUES (10, 100, 111), (20, 200, 222), (10, 200, 999)",
+    )
+    .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO jm4 VALUES (-1, 10), (2, 20)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(
+        seq,
+        "INSERT INTO jm8 VALUES (-1, 100), (2, 200), (2147483648, 999)",
+    )
+    .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+    // Prime both cold entries, then stamp one left row dead. The join must compose the chunk
+    // sidecar visibility mask before matching; a leaked tombstone would survive the resident oracle.
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM jl"))
+        .unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM jr"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM jl WHERE k = 400").unwrap();
+    let sql = "SELECT l.k, l.lv, r.rv, l.note FROM jl l JOIN jr r ON l.k = r.k \
+               WHERE l.lv >= 350 AND r.rv < 550";
+    let streamed = e
+        .execute_resident_expr_select_sql(sql)
+        .expect("streaming join");
+    assert_eq!(streamed.executed_target, DeviceTarget::Gpu(0));
+    assert!(e.streaming_join_hits() > 0, "streaming join route fired");
+    assert!(e.streaming_join_block_pairs() > 1, "genuine multi-block fold");
+    assert!(
+        e.streaming_join_peak_device_bytes() <= 4096,
+        "all simultaneously live join payload/scratch allocations stay within budget"
+    );
+    let ordered_sql = "SELECT l.k, l.lv, r.rv, l.note FROM jl l JOIN jr r ON l.k = r.k \
+                       WHERE l.lv >= 350 AND r.rv < 550 \
+                       ORDER BY l.lv DESC LIMIT 31 OFFSET 7";
+    let streamed_ordered = e
+        .execute_resident_expr_select_sql(ordered_sql)
+        .expect("streaming ordered top-N join");
+    assert_eq!(streamed_ordered.rows.len(), 31);
+    let hidden_order_sql = "SELECT l.lv FROM jl l JOIN jr r ON l.k = r.k \
+                            ORDER BY r.rv DESC LIMIT 23 OFFSET 4";
+    let streamed_hidden_order = e
+        .execute_resident_expr_select_sql(hidden_order_sql)
+        .expect("qualified non-projected streaming JOIN order key");
+    let aliased_order = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.lv AS left_value FROM jl l JOIN jr r ON l.k = r.k \
+             ORDER BY left_value DESC LIMIT 7",
+        )
+        .expect("streaming JOIN output alias and alias ORDER BY");
+    assert_eq!(aliased_order.columns[0].name, "left_value");
+    let aliased_values = aliased_order
+        .rows
+        .iter()
+        .map(|row| match row[0] {
+            SqlValue::Int4(value) => value,
+            ref other => panic!("aliased value: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert!(aliased_values.windows(2).all(|values| values[0] >= values[1]));
+    let ambiguous_where = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.lv FROM jl l JOIN jr r ON l.k = r.k WHERE k > 350",
+        )
+        .expect_err("unqualified duplicate WHERE column must be ambiguous");
+    assert!(ambiguous_where.to_string().contains("ambiguous"));
+    let mixed_width = e
+        .execute_resident_expr_select_sql(
+            "SELECT a.v, b.v FROM jm4 a JOIN jm8 b ON a.k = b.k ORDER BY a.v",
+        )
+        .expect("mixed int4/int8 streaming join");
+    assert_eq!(
+        mixed_width.rows,
+        vec![
+            vec![SqlValue::Int4(10), SqlValue::Int4(100)],
+            vec![SqlValue::Int4(20), SqlValue::Int4(200)],
+        ]
+    );
+    let duplicate_name_order_sql = "SELECT l.k, r.k FROM jl l JOIN jr r ON l.k = r.k \
+                                    ORDER BY r.k DESC LIMIT 19";
+    let streamed_duplicate_name_order = e
+        .execute_resident_expr_select_sql(duplicate_name_order_sql)
+        .expect("qualified streaming JOIN order key with duplicate output names");
+    let nn_sql = "SELECT a.x, b.y FROM jna a JOIN jnb b ON a.k = b.k";
+    let streamed_nn = e
+        .execute_resident_expr_select_sql(nn_sql)
+        .expect("bounded streaming N:N join");
+    assert_eq!(streamed_nn.rows.len(), 900);
+    // The bounded 4-column run includes a variable-width text column and 78 retained candidates.
+    // Allocator-backed accounting charges the real power-of-two pool buckets, so this distinct shape
+    // gets an honest 8 KiB query budget rather than a logical-width estimate.
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let nway_sql = "SELECT a.x, b.y, c.z, c.note \
+                    FROM jna a JOIN jnb b ON a.k = b.k \
+                               JOIN jnc c ON b.k = c.k \
+                    ORDER BY a.x, b.y, c.z LIMIT 73 OFFSET 5";
+    let streamed_nway = e
+        .execute_resident_expr_select_sql(nway_sql)
+        .expect("bounded three-relation streaming join");
+    assert_eq!(streamed_nway.rows.len(), 73);
+    assert!(streamed_nway
+        .rows
+        .iter()
+        .any(|row| row[3] == SqlValue::Null));
+    let cross_relation_composite = e
+        .execute_resident_expr_select_sql(
+            "SELECT c.z FROM jxa a JOIN jxb b ON a.k = b.k \
+             JOIN jxc c ON a.x = c.x AND b.y = c.y",
+        )
+        .expect("composite N-way keys from different accumulated relations");
+    let mut cross_relation_rows = cross_relation_composite.rows.clone().into_boxed();
+    cross_relation_rows.sort();
+    assert_eq!(
+        cross_relation_rows,
+        vec![vec![SqlValue::Int4(111)], vec![SqlValue::Int4(222)]],
+        "each composite component must gather from its own accumulated relation; z=999 is a trap"
+    );
+    let nway_left_sql = "SELECT a.x, b.y, d.q \
+                         FROM jna a LEFT JOIN jnb b ON a.k = b.k \
+                                    LEFT JOIN jnd d ON b.k = d.k \
+                         ORDER BY a.x, b.y, d.q LIMIT 41";
+    let streamed_nway_left = e
+        .execute_resident_expr_select_sql(nway_left_sql)
+        .expect("streaming multi-step LEFT OUTER join");
+    assert_eq!(streamed_nway_left.rows.len(), 41);
+    assert!(streamed_nway_left
+        .rows
+        .iter()
+        .any(|row| row[2] == SqlValue::Null));
+    let nway_right_sql = "SELECT a.x, b.y, d.q \
+                          FROM jna a JOIN jnb b ON a.k = b.k \
+                                     RIGHT JOIN jnd d ON b.k = d.k \
+                          ORDER BY d.q DESC, a.x, b.y LIMIT 5";
+    let streamed_nway_right = e
+        .execute_resident_expr_select_sql(nway_right_sql)
+        .expect("streaming RIGHT step over a multi-relation accumulated side");
+    assert_eq!(streamed_nway_right.rows.row(0), &[SqlValue::Null, SqlValue::Null, SqlValue::Int4(9)]);
+    let nway_two_right_sql = "SELECT a.x, b.y, d.q \
+                              FROM jna a RIGHT JOIN jnb b ON a.k = b.k \
+                                         FULL JOIN jnd d ON b.k = d.k \
+                              ORDER BY b.y DESC NULLS LAST, d.q, a.x LIMIT 5";
+    e.set_relational_residency_budget_bytes(0, 4608);
+    let streamed_nway_two_right = e
+        .execute_resident_expr_select_sql(nway_two_right_sql)
+        .expect("streaming prefix replay across two RIGHT/FULL steps");
+    assert!(streamed_nway_two_right.rows.iter().any(|row| {
+        row == &[SqlValue::Null, SqlValue::Int4(777), SqlValue::Int4(9)]
+    }));
+    e.set_relational_residency_budget_bytes(0, 4096);
+    let outer_sql =
+        "SELECT a.k, a.x, b.k, b.y FROM joa a FULL JOIN job b ON a.k = b.k";
+    let streamed_outer = e
+        .execute_resident_expr_select_sql(outer_sql)
+        .expect("streaming FULL OUTER join");
+    assert_eq!(streamed_outer.rows.len(), 600);
+    assert!(streamed_outer.rows.iter().any(|row| row[0] == SqlValue::Null));
+    assert!(streamed_outer.rows.iter().any(|row| row[2] == SqlValue::Null));
+    let outer_where_sql = "SELECT a.k, a.x, b.y FROM joa a LEFT JOIN job b ON a.k = b.k \
+                           WHERE b.y IS NULL";
+    let streamed_outer_where = e
+        .execute_resident_expr_select_sql(outer_where_sql)
+        .expect("streaming OUTER WHERE anti-join");
+    assert_eq!(streamed_outer_where.rows.len(), 200);
+    assert!(streamed_outer_where
+        .rows
+        .iter()
+        .all(|row| row[2] == SqlValue::Null));
+    // Keep offset+limit itself within the budget while forcing the final window to cross from
+    // matched rows into the globally appended right-unmatched tail.
+    e.set_relational_residency_budget_bytes(0, 32 * 1024);
+    let outer_ordered_sql = "SELECT a.k, a.x, b.k, b.y FROM joa a FULL JOIN job b ON a.k = b.k \
+                             ORDER BY b.y ASC NULLS LAST LIMIT 37 OFFSET 390";
+    let streamed_outer_ordered = e
+        .execute_resident_expr_select_sql(outer_ordered_sql)
+        .expect("streaming ordered FULL OUTER join");
+    assert_eq!(streamed_outer_ordered.rows.len(), 37);
+    let outer_limit_sql =
+        "SELECT a.k, a.x, b.k, b.y FROM joa a FULL JOIN job b ON a.k = b.k LIMIT 29 OFFSET 13";
+    let streamed_outer_limit = e
+        .execute_resident_expr_select_sql(outer_limit_sql)
+        .expect("bounded unordered FULL OUTER join window");
+    assert_eq!(streamed_outer_limit.rows.len(), 29);
+
+    // GPU-native whole-resident oracle.
+    e.clear_relational_residency_budget_bytes(0);
+    e.populate_relational_residency_snapshot("jl").unwrap();
+    e.populate_relational_residency_snapshot("jr").unwrap();
+    e.populate_relational_residency_snapshot("jna").unwrap();
+    e.populate_relational_residency_snapshot("jnb").unwrap();
+    e.populate_relational_residency_snapshot("jnc").unwrap();
+    e.populate_relational_residency_snapshot("jnd").unwrap();
+    e.populate_relational_residency_snapshot("joa").unwrap();
+    e.populate_relational_residency_snapshot("job").unwrap();
+    let resident = e
+        .execute_resident_expr_select_sql(sql)
+        .expect("resident join oracle");
+    let resident_ordered = e
+        .execute_resident_expr_select_sql(ordered_sql)
+        .expect("resident ordered join oracle");
+    let resident_hidden_order = e
+        .execute_resident_expr_select_sql(hidden_order_sql)
+        .expect("resident hidden-order join oracle");
+    let resident_duplicate_name_order = e
+        .execute_resident_expr_select_sql(duplicate_name_order_sql)
+        .expect("resident duplicate-name order oracle");
+    let resident_nn = e
+        .execute_resident_expr_select_sql(nn_sql)
+        .expect("resident N:N join oracle");
+    let resident_nway = e
+        .execute_resident_expr_select_sql(nway_sql)
+        .expect("resident three-relation join oracle");
+    let resident_nway_left = e
+        .execute_resident_expr_select_sql(nway_left_sql)
+        .expect("resident multi-step LEFT oracle");
+    let resident_nway_right = e
+        .execute_resident_expr_select_sql(nway_right_sql)
+        .expect("resident multi-step RIGHT oracle");
+    let resident_nway_two_right = e
+        .execute_resident_expr_select_sql(nway_two_right_sql)
+        .expect("resident two-step RIGHT/FULL oracle");
+    let resident_outer = e
+        .execute_resident_expr_select_sql(outer_sql)
+        .expect("resident FULL OUTER join oracle");
+    let resident_outer_where = e
+        .execute_resident_expr_select_sql(outer_where_sql)
+        .expect("resident OUTER WHERE oracle");
+    let resident_outer_ordered = e
+        .execute_resident_expr_select_sql(outer_ordered_sql)
+        .expect("resident ordered FULL OUTER join oracle");
+    let mut streamed_rows = streamed.rows.clone().into_boxed();
+    let mut resident_rows = resident.rows.clone().into_boxed();
+    streamed_rows.sort_by(|a, b| crate::rel_exec_helpers::compare_sql_values(&a[1], &b[1]));
+    resident_rows.sort_by(|a, b| crate::rel_exec_helpers::compare_sql_values(&a[1], &b[1]));
+    assert_eq!(streamed_rows, resident_rows);
+    assert_eq!(
+        streamed_ordered.rows.clone().into_boxed(),
+        resident_ordered.rows.clone().into_boxed(),
+        "streaming local-top-N compaction + final device merge matches resident GPU ordering"
+    );
+    assert_eq!(
+        streamed_hidden_order.rows.clone().into_boxed(),
+        resident_hidden_order.rows.clone().into_boxed(),
+        "qualified non-projected ORDER BY remains device-resident"
+    );
+    assert_eq!(
+        streamed_duplicate_name_order.rows.clone().into_boxed(),
+        resident_duplicate_name_order.rows.clone().into_boxed(),
+        "qualified ORDER BY resolves provenance despite duplicate projected names"
+    );
+    let sort_pair_rows = |result: &RelationalSelectResult| {
+        let mut rows = result.rows.clone().into_boxed();
+        rows.sort_by(|a, b| {
+            crate::rel_exec_helpers::compare_sql_values(&a[0], &b[0]).then_with(|| {
+                crate::rel_exec_helpers::compare_sql_values(&a[1], &b[1])
+            })
+        });
+        rows
+    };
+    assert_eq!(sort_pair_rows(&streamed_nn), sort_pair_rows(&resident_nn));
+    assert_eq!(
+        streamed_nway.rows.clone().into_boxed(),
+        resident_nway.rows.clone().into_boxed(),
+        "N-way chunk/block Cartesian scheduling matches the resident left-deep GPU join"
+    );
+    assert_eq!(
+        streamed_nway_left.rows.clone().into_boxed(),
+        resident_nway_left.rows.clone().into_boxed(),
+        "multi-step LEFT scheduling emits each globally unmatched tuple exactly once"
+    );
+    assert_eq!(
+        streamed_nway_right.rows.clone().into_boxed(),
+        resident_nway_right.rows.clone().into_boxed(),
+        "a RIGHT step globally completes after every accumulated chunk/block"
+    );
+    assert_eq!(
+        streamed_nway_two_right.rows.clone().into_boxed(),
+        resident_nway_two_right.rows.clone().into_boxed(),
+        "recursive prefix replay preserves an earlier right complement through a later FULL step"
+    );
+    let sort_outer_rows = |result: &RelationalSelectResult| {
+        let mut rows = result.rows.clone().into_boxed();
+        rows.sort_by(|a, b| {
+            crate::rel_exec_helpers::compare_sql_values(&a[0], &b[0])
+                .then_with(|| crate::rel_exec_helpers::compare_sql_values(&a[2], &b[2]))
+        });
+        rows
+    };
+    assert_eq!(
+        sort_outer_rows(&streamed_outer),
+        sort_outer_rows(&resident_outer),
+        "global unmatched-coordinate completion matches resident FULL OUTER GPU join"
+    );
+    assert_eq!(
+        sort_outer_rows(&streamed_outer_where),
+        sort_outer_rows(&resident_outer_where),
+        "OUTER WHERE membership is post-join while unmatched membership remains ON-only"
+    );
+    assert_eq!(
+        streamed_outer_ordered
+            .rows
+            .iter()
+            .map(|row| row[3].clone())
+            .collect::<Vec<_>>(),
+        resident_outer_ordered
+            .rows
+            .iter()
+            .map(|row| row[3].clone())
+            .collect::<Vec<_>>(),
+        "outer unmatched tails participate in bounded top-N compaction"
+    );
+    assert!(streamed_outer_ordered.rows.iter().all(|row| {
+        resident_outer.rows.iter().any(|candidate| candidate == row)
+    }));
+    for row in streamed_outer_limit.rows.iter() {
+        assert!(
+            resident_outer.rows.iter().any(|candidate| candidate == row),
+            "unordered early-window output must be a valid FULL OUTER row: {row:?}"
+        );
+    }
+    assert!(
+        streamed_rows.iter().any(|row| row[3] == SqlValue::Null),
+        "projected NULL data survives the streaming join"
+    );
+    assert!(
+        streamed_rows
+            .iter()
+            .all(|row| row[0] != SqlValue::Null && row[1] == row[2]),
+        "NULL keys never match and every emitted key/value pair is exact"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_join_mixed_int4_int8_keys() {
+    let _entry_disabled = ClassEntryDisabled::new();
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0_u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE mix4 (k INT, v INT)").unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE mix8 (k BIGINT, v INT)").unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO mix4 VALUES (-1, 10), (2, 20)").unwrap();
+    seq += 1;
+    e.execute_text(
+        seq,
+        "INSERT INTO mix8 VALUES (-1, 100), (2, 200), (2147483648, 999)",
+    )
+    .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+    let result = e
+        .execute_resident_expr_select_sql(
+            "SELECT a.v, b.v FROM mix4 a JOIN mix8 b ON a.k = b.k ORDER BY a.v",
+        )
+        .expect("mixed-width streaming join");
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![SqlValue::Int4(10), SqlValue::Int4(100)],
+            vec![SqlValue::Int4(20), SqlValue::Int4(200)],
+        ]
+    );
+}
+
+/// GPU rank windows over an over-budget input: the streaming ordered fold produces the bounded
+/// window order, the device rank kernel assigns ROW_NUMBER/RANK/DENSE_RANK, and the final OFFSET/LIMIT
+/// is another device window. An unrelated projected NULL column gates NULL-safe materialization.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_rank_windows_over_ordered_input() {
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0_u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(
+        seq,
+        "CREATE TABLE wr (a INT, score INT, bucket INT, note TEXT)",
+    )
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE wt (label TEXT, a INT)")
+        .unwrap();
+    let values = (0..600)
+        .map(|i| {
+            let note = if i % 5 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'n{i:04}'")
+            };
+            format!("({i}, {}, {}, {note})", i / 3, i % 2)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO wr VALUES {values}"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(
+        seq,
+        "INSERT INTO wr VALUES (600, NULL, 0, 'p0'), (601, NULL, 1, NULL), \
+                               (602, NULL, 0, 'p2'), (603, NULL, 1, 'p3')",
+    )
+    .unwrap();
+    let text_partition_values = (0..300)
+        .map(|i| format!("('p{}', {i})", i % 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(
+        seq,
+        &format!("INSERT INTO wt VALUES {text_partition_values}"),
+    )
+    .unwrap();
+    e.set_relational_residency_budget_bytes(0, 16 * 1024);
+    let sql = "SELECT a AS aid, score, note, \
+                      row_number() OVER (ORDER BY score) AS rn, \
+                      rank() OVER (ORDER BY score) AS rnk, \
+                      dense_rank() OVER (ORDER BY score) AS dr \
+               FROM wr ORDER BY score LIMIT 40 OFFSET 7";
+    let streamed = e
+        .execute_resident_expr_select_sql(sql)
+        .expect("streaming rank windows");
+    assert!(e.streaming_window_hits() > 0, "GPU rank-window kernel fired");
+    assert_eq!(streamed.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(streamed.columns[0].name, "aid");
+    assert!(
+        e.streaming_fold_peak_chunk_bytes() <= 16 * 1024,
+        "ordered input + rank output remain within the configured device budget"
+    );
+    assert_eq!(streamed.rows.len(), 40);
+    assert!(streamed.rows.iter().any(|row| row[2] == SqlValue::Null));
+    for row in streamed.rows.iter() {
+        let score = match row[1] {
+            SqlValue::Int4(score) => score,
+            ref other => panic!("score: {other:?}"),
+        };
+        assert_eq!(row[4], SqlValue::Int8(i64::from(score * 3 + 1)));
+        assert_eq!(row[5], SqlValue::Int8(i64::from(score + 1)));
+    }
+    assert_eq!(streamed.rows.row(0)[3], SqlValue::Int8(8));
+    assert!(
+        e.execute_resident_expr_select_sql(
+            "SELECT row_number(*) OVER (ORDER BY score) FROM wr LIMIT 1"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("arguments or aggregate modifiers"),
+        "window FuncCall modifiers must never be silently ignored"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql(
+            "SELECT row_number() OVER (ORDER BY score USING <) FROM wr LIMIT 1"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ORDER BY USING"),
+        "custom ORDER BY operators must never be treated as ASC"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql(
+            "SELECT row_number() OVER w FROM wr \
+             WINDOW w AS (ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             LIMIT 1"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("explicit window frames"),
+        "named explicit frames must be rejected instead of silently ignored"
+    );
+    let partitioned_sql = "SELECT score, a, \
+                                  row_number() OVER (PARTITION BY score ORDER BY a) AS rn, \
+                                  rank() OVER (PARTITION BY score ORDER BY a) AS rnk, \
+                                  dense_rank() OVER (PARTITION BY score ORDER BY a) AS dr \
+                           FROM wr ORDER BY score, a LIMIT 40 OFFSET 7";
+    let streamed_partitioned = e
+        .execute_resident_expr_select_sql(partitioned_sql)
+        .expect("streaming partitioned rank windows");
+    assert_eq!(streamed_partitioned.rows.len(), 40);
+    for row in streamed_partitioned.rows.iter() {
+        assert_eq!(row[2], row[3]);
+        assert_eq!(row[3], row[4]);
+    }
+    let multi_key_sql = "SELECT bucket, score, a, \
+                                row_number() OVER (PARTITION BY bucket, score ORDER BY a, score) AS rn, \
+                                rank() OVER (PARTITION BY bucket, score ORDER BY a, score) AS rnk, \
+                                dense_rank() OVER (PARTITION BY bucket, score ORDER BY a, score) AS dr \
+                         FROM wr ORDER BY bucket, score, a, score LIMIT 40 OFFSET 7";
+    let streamed_multi_key = e
+        .execute_resident_expr_select_sql(multi_key_sql)
+        .expect("multi-partition/multi-order rank window");
+    assert_eq!(streamed_multi_key.rows.len(), 40);
+    assert!(streamed_multi_key
+        .rows
+        .iter()
+        .all(|row| row[3] == row[4] && row[4] == row[5]));
+    let named_window_sql = "SELECT bucket, score, a, \
+                                   row_number() OVER w AS rn, \
+                                   rank() OVER w AS rnk, \
+                                   dense_rank() OVER w AS dr \
+                            FROM wr \
+                            WINDOW p AS (PARTITION BY bucket, score), \
+                                   w AS (p ORDER BY a, score) \
+                            ORDER BY bucket, score, a, score LIMIT 40 OFFSET 7";
+    let streamed_named_window = e
+        .execute_resident_expr_select_sql(named_window_sql)
+        .expect("inherited named rank window");
+    let filtered_window_sql = "SELECT a, score, \
+                                      row_number() OVER (ORDER BY score, a) AS rn, \
+                                      rank() OVER (ORDER BY score, a) AS rnk, \
+                                      dense_rank() OVER (ORDER BY score, a) AS dr \
+                               FROM wr WHERE a >= 300 \
+                               ORDER BY score, a LIMIT 40 OFFSET 7";
+    let streamed_filtered_window = e
+        .execute_resident_expr_select_sql(filtered_window_sql)
+        .expect("filtered streaming rank window");
+    let empty_window_sql = "SELECT a, row_number() OVER (ORDER BY a) AS rn \
+                            FROM wr WHERE a < 0 ORDER BY a LIMIT 10";
+    let streamed_empty_window = e
+        .execute_resident_expr_select_sql(empty_window_sql)
+        .expect("empty filtered rank window");
+    assert!(streamed_empty_window.rows.is_empty());
+    let null_peer_sql = "SELECT a, score, \
+                                row_number() OVER (ORDER BY score DESC) AS rn, \
+                                rank() OVER (ORDER BY score DESC) AS rnk, \
+                                dense_rank() OVER (ORDER BY score DESC) AS dr \
+                         FROM wr ORDER BY score DESC LIMIT 6";
+    let null_peers = e
+        .execute_resident_expr_select_sql(null_peer_sql)
+        .expect("NULL peer rank window");
+    for row in null_peers.rows.iter().take(4) {
+        assert_eq!(row[1], SqlValue::Null);
+        assert_eq!(row[3], SqlValue::Int8(1));
+        assert_eq!(row[4], SqlValue::Int8(1));
+    }
+    assert_eq!(null_peers.rows.row(4)[3], SqlValue::Int8(5));
+    assert_eq!(null_peers.rows.row(4)[4], SqlValue::Int8(2));
+    e.set_relational_residency_budget_bytes(0, 64 * 1024);
+    let null_partition_sql = "SELECT score, a, \
+                                     row_number() OVER (PARTITION BY score ORDER BY a) AS rn, \
+                                     rank() OVER (PARTITION BY score ORDER BY a) AS rnk, \
+                                     dense_rank() OVER (PARTITION BY score ORDER BY a) AS dr \
+                              FROM wr ORDER BY score, a LIMIT 4 OFFSET 600";
+    let null_partition = e
+        .execute_resident_expr_select_sql(null_partition_sql)
+        .expect("NULL partition rank window");
+    assert_eq!(null_partition.rows.len(), 4);
+    for (idx, row) in null_partition.rows.iter().enumerate() {
+        assert_eq!(row[0], SqlValue::Null);
+        let expected = SqlValue::Int8((idx + 1) as i64);
+        assert_eq!(row[2], expected);
+        assert_eq!(row[3], expected);
+        assert_eq!(row[4], expected);
+    }
+    let explicit_nulls_sql = "SELECT a, score, \
+                                     row_number() OVER (ORDER BY score ASC NULLS FIRST, a) AS rn, \
+                                     rank() OVER (ORDER BY score ASC NULLS FIRST, a) AS rnk \
+                              FROM wr ORDER BY score ASC NULLS FIRST, a";
+    let streamed_explicit_nulls = e
+        .execute_resident_expr_select_sql(explicit_nulls_sql)
+        .expect("unbounded streaming rank with explicit NULL placement");
+    assert_eq!(streamed_explicit_nulls.rows.len(), 604);
+    assert!(streamed_explicit_nulls
+        .rows
+        .iter()
+        .take(4)
+        .all(|row| row[1] == SqlValue::Null));
+    let empty_over_sql = "SELECT a, row_number() OVER () AS rn FROM wr LIMIT 5";
+    let streamed_empty_over = e
+        .execute_resident_expr_select_sql(empty_over_sql)
+        .expect("ROW_NUMBER over an empty window specification");
+    assert_eq!(streamed_empty_over.rows.len(), 5);
+    assert_eq!(streamed_empty_over.rows.row(0)[1], SqlValue::Int8(1));
+    let offset_window_sql = "SELECT bucket, a, note, \
+                                    lag(note) OVER (PARTITION BY bucket ORDER BY a) AS previous_note, \
+                                    lead(a, 2) OVER (PARTITION BY bucket ORDER BY a) AS next_a \
+                             FROM wr ORDER BY bucket, a LIMIT 50";
+    let streamed_offset_windows = e
+        .execute_resident_expr_select_sql(offset_window_sql)
+        .expect("streaming LAG/LEAD windows");
+    assert_eq!(streamed_offset_windows.rows.len(), 50);
+    assert_eq!(streamed_offset_windows.rows.row(0)[3], SqlValue::Null);
+    assert_eq!(streamed_offset_windows.rows.row(0)[4], SqlValue::Int4(4));
+    let text_partition_window_sql = "SELECT label, a, \
+                                            lag(a) OVER (PARTITION BY label ORDER BY a) AS previous_a, \
+                                            lead(a) OVER (PARTITION BY label ORDER BY a) AS next_a \
+                                     FROM wt ORDER BY label, a LIMIT 80";
+    let streamed_text_partition_window = e
+        .execute_resident_expr_select_sql(text_partition_window_sql)
+        .expect("streaming LAG/LEAD with TEXT partition key");
+    assert_eq!(
+        &streamed_text_partition_window.rows.row(0)[..],
+        &[
+            SqlValue::Text("p0".to_string()),
+            SqlValue::Int4(0),
+            SqlValue::Null,
+            SqlValue::Int4(2),
+        ]
+    );
+    assert_eq!(streamed_text_partition_window.rows.row(1)[2], SqlValue::Int4(0));
+
+    e.clear_relational_residency_budget_bytes(0);
+    e.populate_relational_residency_snapshot("wr").unwrap();
+    let resident = e
+        .execute_resident_expr_select_sql(sql)
+        .expect("resident GPU rank oracle");
+    let resident_partitioned = e
+        .execute_resident_expr_select_sql(partitioned_sql)
+        .expect("resident partitioned rank oracle");
+    let resident_multi_key = e
+        .execute_resident_expr_select_sql(multi_key_sql)
+        .expect("resident multi-key rank oracle");
+    let resident_named_window = e
+        .execute_resident_expr_select_sql(named_window_sql)
+        .expect("resident named-window rank oracle");
+    let resident_filtered_window = e
+        .execute_resident_expr_select_sql(filtered_window_sql)
+        .expect("resident filtered-window rank oracle");
+    let resident_empty_window = e
+        .execute_resident_expr_select_sql(empty_window_sql)
+        .expect("resident empty-window rank oracle");
+    let resident_null_peers = e
+        .execute_resident_expr_select_sql(null_peer_sql)
+        .expect("resident NULL peer rank oracle");
+    let resident_null_partition = e
+        .execute_resident_expr_select_sql(null_partition_sql)
+        .expect("resident NULL partition rank oracle");
+    let resident_explicit_nulls = e
+        .execute_resident_expr_select_sql(explicit_nulls_sql)
+        .expect("resident explicit-NULL rank oracle");
+    let resident_empty_over = e
+        .execute_resident_expr_select_sql(empty_over_sql)
+        .expect("resident empty-OVER rank oracle");
+    let resident_offset_windows = e
+        .execute_resident_expr_select_sql(offset_window_sql)
+        .expect("resident LAG/LEAD oracle");
+    e.populate_relational_residency_snapshot("wt").unwrap();
+    let resident_text_partition_window = e
+        .execute_resident_expr_select_sql(text_partition_window_sql)
+        .expect("resident TEXT-partition LAG/LEAD oracle");
+    let normalize = |result: &RelationalSelectResult| {
+        let mut rows: Vec<Vec<SqlValue>> = result
+            .rows
+            .iter()
+            .map(|row| vec![row[0].clone(), row[1].clone(), row[2].clone(), row[4].clone(), row[5].clone()])
+            .collect();
+        rows.sort_by(|a, b| crate::rel_exec_helpers::compare_sql_values(&a[0], &b[0]));
+        rows
+    };
+    assert_eq!(
+        normalize(&streamed),
+        normalize(&resident),
+        "streaming rank/dense-rank rows == resident GPU oracle (ROW_NUMBER peer order is unspecified)"
+    );
+    assert_eq!(
+        streamed_partitioned.rows.clone().into_boxed(),
+        resident_partitioned.rows.clone().into_boxed(),
+        "partitioned multi-key streaming rank window == resident GPU oracle"
+    );
+    assert_eq!(
+        streamed_multi_key.rows.clone().into_boxed(),
+        resident_multi_key.rows.clone().into_boxed(),
+        "multi-key partition/order ranks == resident GPU oracle"
+    );
+    assert_eq!(
+        streamed_named_window.rows.clone().into_boxed(),
+        resident_named_window.rows.clone().into_boxed(),
+        "named/inherited window definition == resident GPU oracle"
+    );
+    assert_eq!(
+        streamed_filtered_window.rows.clone().into_boxed(),
+        resident_filtered_window.rows.clone().into_boxed(),
+        "WHERE is applied on-device before window ordering/ranking"
+    );
+    assert_eq!(
+        streamed_empty_window.rows.clone().into_boxed(),
+        resident_empty_window.rows.clone().into_boxed()
+    );
+    let normalize_null_peers = |result: &RelationalSelectResult| {
+        let mut rows: Vec<Vec<SqlValue>> = result
+            .rows
+            .iter()
+            .map(|row| vec![row[0].clone(), row[1].clone(), row[3].clone(), row[4].clone()])
+            .collect();
+        rows.sort_by(|a, b| crate::rel_exec_helpers::compare_sql_values(&a[0], &b[0]));
+        rows
+    };
+    assert_eq!(
+        normalize_null_peers(&null_peers),
+        normalize_null_peers(&resident_null_peers),
+        "NULL peer ranks == resident GPU oracle (ROW_NUMBER peer order is unspecified)"
+    );
+    assert_eq!(
+        null_partition.rows.clone().into_boxed(),
+        resident_null_partition.rows.clone().into_boxed(),
+        "NULL partition ranks == resident GPU oracle"
+    );
+    assert_eq!(
+        streamed_explicit_nulls.rows.clone().into_boxed(),
+        resident_explicit_nulls.rows.clone().into_boxed(),
+        "unbounded explicit-NULL streaming rank == resident GPU oracle"
+    );
+    assert_eq!(
+        streamed_empty_over.rows.clone().into_boxed(),
+        resident_empty_over.rows.clone().into_boxed(),
+        "ROW_NUMBER OVER () == resident GPU oracle"
+    );
+    assert_eq!(
+        streamed_offset_windows.rows.clone().into_boxed(),
+        resident_offset_windows.rows.clone().into_boxed(),
+        "streaming LAG/LEAD == resident GPU oracle"
+    );
+    assert_eq!(
+        streamed_text_partition_window.rows.clone().into_boxed(),
+        resident_text_partition_window.rows.clone().into_boxed(),
+        "TEXT partition boundaries for LAG/LEAD == resident GPU oracle"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_rank_keeps_one_catalog_data_boundary_across_ddl() {
+    let mut engine = Engine::new_local_cpu_oracle();
+    let mut seq = 0_u64;
+    if !gpu_available(&mut engine, &mut seq) {
+        return;
+    }
+    engine.set_relational_residency_budget_bytes(0, 4096);
+    let e = Arc::new(engine);
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE wrd (a INT, score INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(
+        seq,
+        "INSERT INTO wrd VALUES (1, 30), (2, 10), (3, 20), (4, 20)",
+    )
+    .unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM wrd"))
+        .unwrap();
+    let pinned = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let reader = {
+        let e = Arc::clone(&e);
+        let pinned = Arc::clone(&pinned);
+        let resume = Arc::clone(&resume);
+        std::thread::spawn(move || {
+            e.execute_gpu_rank_window_select_instrumented(
+                "SELECT a, score, row_number() OVER (ORDER BY score, a) AS rn \
+                 FROM wrd ORDER BY score, a",
+                &|| {
+                    pinned.wait();
+                    resume.wait();
+                },
+            )
+            .unwrap()
+        })
+    };
+    pinned.wait();
+    seq += 1;
+    e.execute_text(seq, "ALTER TABLE wrd ADD COLUMN extra INT DEFAULT 7")
+        .unwrap();
+    resume.wait();
+    let result = reader.join().expect("rank reader");
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![SqlValue::Int4(2), SqlValue::Int4(10), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(3), SqlValue::Int4(20), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(4), SqlValue::Int4(20), SqlValue::Int8(3)],
+            vec![SqlValue::Int4(1), SqlValue::Int4(30), SqlValue::Int8(4)],
+        ],
+        "the pinned rank fold must use its pre-DDL table shape and cold payload"
+    );
+}
+
+/// Plain and layered views preserve their stored relational plan when recursively expanded, so an
+/// over-budget base relation still reaches the streaming GPU fold rather than the host executor.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_streaming_views_expand_into_device_fold() {
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0_u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE vb (a INT, note TEXT)")
+        .unwrap();
+    let values = (0..1000)
+        .map(|i| {
+            let note = if i % 13 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'v{i:04}'")
+            };
+            format!("({i}, {note})")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO vb VALUES {values}"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE VIEW vv AS SELECT a, note FROM vb WHERE a >= 500")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE VIEW vv2 AS SELECT * FROM vv")
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+    let hits = e.streaming_fold_hits();
+    let viewed = e
+        .execute_relational_select(&select("SELECT * FROM vv2"))
+        .expect("layered streaming view");
+    assert!(e.streaming_fold_hits() > hits, "view expansion reached the streaming fold");
+    assert_eq!(viewed.rows.len(), 500);
+    assert_eq!(viewed.rows.row(0)[0], SqlValue::Int4(500));
+    assert!(viewed.rows.iter().any(|row| row[1] == SqlValue::Null));
+    let direct = e
+        .execute_relational_select(&select("SELECT a, note FROM vb WHERE a >= 500"))
+        .unwrap();
+    assert_eq!(viewed.rows.clone().into_boxed(), direct.rows.clone().into_boxed());
+}
+
+#[test]
+fn layered_view_keeps_one_catalog_data_boundary_across_ddl() {
+    let e = Arc::new(Engine::new_local_cpu_oracle());
+    e.execute_text(1, "CREATE TABLE vd (a INT, b INT)").unwrap();
+    e.execute_text(2, "INSERT INTO vd VALUES (1, 10), (2, 20)")
+        .unwrap();
+    e.execute_text(3, "CREATE VIEW vd1 AS SELECT * FROM vd")
+        .unwrap();
+    e.execute_text(4, "CREATE VIEW vd2 AS SELECT * FROM vd1")
+        .unwrap();
+    let query = select("SELECT * FROM vd2");
+    let pinned = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let reader = {
+        let e = Arc::clone(&e);
+        let pinned = Arc::clone(&pinned);
+        let resume = Arc::clone(&resume);
+        std::thread::spawn(move || {
+            e.execute_relational_select_instrumented(&query, || {
+                pinned.wait();
+                resume.wait();
+            })
+            .unwrap()
+        })
+    };
+    pinned.wait();
+    e.execute_text(5, "ALTER TABLE vd ADD COLUMN c INT DEFAULT 7")
+        .unwrap();
+    resume.wait();
+    let old_boundary = reader.join().expect("reader");
+    assert_eq!(old_boundary.columns.len(), 2);
+    assert_eq!(
+        old_boundary.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(20)]
+        ]
+    );
+    let new_boundary = e
+        .execute_relational_select(&select("SELECT * FROM vd2"))
+        .unwrap();
+    assert_eq!(new_boundary.columns.len(), 3);
+    assert!(new_boundary
+        .rows
+        .iter()
+        .all(|row| row[2] == SqlValue::Int4(7)));
+}
+
+#[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_reduction_bigint_sum_combines_as_numeric() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -205,7 +1271,7 @@ fn gpu_streaming_reduction_null_heavy_table_stays_bounded() {
     // over-budget table must STILL chunk. Before the fix (chunk sizing by logical value bytes, 0 for
     // NULL) the whole table accumulated into one chunk and the out-of-core bound broke. Also exercises
     // MIN/MAX skipping NULL across chunks (the min of the sparse non-null values, not NULL).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -272,7 +1338,7 @@ fn gpu_streaming_reduction_null_heavy_table_stays_bounded() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_reduction_empty_table_pg_semantics() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -322,7 +1388,7 @@ fn gpu_streaming_reduction_empty_table_pg_semantics() {
 fn gpu_streaming_projection_over_budget_filters_on_device() {
     // S-E.2: a filtered PROJECTION over an over-budget table streams — each chunk's WHERE + column gather
     // run on the device, survivors CONCAT across chunks (scan order == the CPU pinned path's seq order).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -394,7 +1460,7 @@ fn gpu_streaming_projection_limit_offset_windows_and_early_exits() {
     // S-E.2: LIMIT/OFFSET window the concatenated survivor stream across chunks; a satisfied LIMIT stops
     // the scan EARLY (chunks-run proves the tail was never staged). LIMIT without ORDER BY is any-N-rows
     // per SQL; this engine's scan order is the deterministic seq order, matching the CPU pinned path.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -496,6 +1562,29 @@ impl Drop for ClassEntryDisabled {
     }
 }
 
+/// Force the retained exact key-index set over-cap so small GPU fixtures exercise the compact
+/// all-chunk Bloom route. The ignored GPU suite is run with `--test-threads=1`.
+struct ChunkKeyIndexCapOverride;
+impl ChunkKeyIndexCapOverride {
+    fn tiny() -> Self {
+        crate::engine_streaming_exec::CHUNK_KEY_INDEX_CAP_BYTES_TEST
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine_streaming_exec::CHUNK_KEY_BLOOM_ALL_POSITIVE_TEST
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for ChunkKeyIndexCapOverride {
+    fn drop(&mut self) {
+        crate::engine_streaming_exec::CHUNK_KEY_INDEX_CAP_BYTES_TEST
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::engine_streaming_exec::CHUNK_KEY_BLOOM_CAP_BYTES_TEST
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::engine_streaming_exec::CHUNK_KEY_BLOOM_ALL_POSITIVE_TEST
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn sorted_rows(result: &RelationalSelectResult) -> Vec<Vec<SqlValue>> {
     let mut rows = result.rows.clone().into_boxed();
     rows.sort_by(|a, b| crate::rel_exec_helpers::compare_sql_values(&a[0], &b[0]));
@@ -509,7 +1598,7 @@ fn gpu_streaming_grouped_over_budget_two_level_merge() {
     // concat, one final device merge (COUNT folds as SUM(count), SUM as SUM(sum), MIN/MAX as the
     // extreme). Groups SPAN chunks (g = i % 7 over 1500 rows, many chunks), so a broken merge
     // double-counts or drops cross-chunk groups.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -620,7 +1709,7 @@ fn gpu_streaming_grouped_over_budget_two_level_merge() {
 fn gpu_streaming_distinct_over_budget_set_union() {
     // S-E.3 DISTINCT: per-chunk device distinct keys, concat, final device re-distinct = SET UNION.
     // Keys repeat across chunks (i % 13), so a broken union duplicates or drops values.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -675,7 +1764,7 @@ fn gpu_streaming_grouped_compaction_and_over_cardinality_defer() {
     // mid-scan via the device merge back to 100 — and still produce exact counts. (2) an all-unique
     // key (1500 groups, 30KB of true partials) cannot compact below the target -> the fold DEFERS to
     // the CPU path (correct rows, no hit counted).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -757,7 +1846,7 @@ fn gpu_streaming_ordered_top_n_across_chunks() {
     // device sort + the real window produces the answer. The global top-N spans chunks (ascending
     // values inserted in scan order, so the DESC winners live in the LAST chunk — a first-chunk-only
     // fold would answer wrongly).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -862,7 +1951,7 @@ fn gpu_streaming_ordered_unbounded_fits_or_defers() {
     // S-E.4 unbounded ORDER BY: a selective WHERE whose survivor set fits the budget streams (per-chunk
     // plain filter/project, ONE final device sort); a survivor set that outgrows the budget DEFERS
     // honestly to the CPU path (its final device sort could not fit) — correct rows, no hit.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -926,7 +2015,7 @@ fn gpu_streaming_ordered_unbounded_fits_or_defers() {
 /// default byte-identical behavior is gated everywhere.
 #[test]
 fn streaming_reduction_absent_without_budget_uses_host_path() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a) VALUES (1), (2), (3), (4)")
         .unwrap();
@@ -952,7 +2041,7 @@ fn streaming_reduction_absent_without_budget_uses_host_path() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_cold_tier_replay_probe() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1013,7 +2102,7 @@ fn gpu_streaming_cold_tier_invalidates_on_write() {
     // invalidate it (the tuple-store generation Arc changes on every COW publish) — a stale hit would
     // serve pre-write data to post-write readers. Build -> hit -> INSERT -> fresh result -> hit again
     // -> DELETE -> fresh result.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1110,7 +2199,7 @@ fn gpu_streaming_cold_tier_spills_and_replays_from_disk() {
     crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
         .store(1024, std::sync::atomic::Ordering::Relaxed);
     let result = std::panic::catch_unwind(|| {
-        let mut e = Engine::new_local();
+        let mut e = Engine::new_local_cpu_oracle();
         let mut seq = 0u64;
         if !gpu_available(&mut e, &mut seq) {
             return;
@@ -1207,7 +2296,7 @@ fn gpu_streaming_grouped_bigint_sum_repro() {
     crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
         .store(1024, std::sync::atomic::Ordering::Relaxed);
     let outcome = std::panic::catch_unwind(|| {
-        let mut e = Engine::new_local();
+        let mut e = Engine::new_local_cpu_oracle();
         let mut seq = 0u64;
         if !gpu_available(&mut e, &mut seq) {
             return;
@@ -1289,7 +2378,7 @@ fn gpu_streaming_cold_tier_patches_deltas_chunk_granular() {
     // DELETE rebuilds EXACTLY ONE dirty chunk (of several); every aggregate stays exact through
     // the patches. Composes: COW chain identity (imbl diff), effective-range tiling, the rollover
     // tail, the S-E.6a settled-boundary install.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1407,7 +2496,7 @@ fn gpu_streaming_cold_tier_eager_commit_maintenance() {
     // 6c-3: a COMMIT eagerly patches the table's cold entry (best-effort, under the held commit
     // mutex, O(delta)) — the patch counter moves AT COMMIT TIME, before any read; the next read is
     // a CLEAN HIT (no read-time patch). Reads never pay the maintenance.
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1568,7 +2657,7 @@ fn p1_lanes_streaming_fixture(
     std::fs::create_dir_all(&dir).unwrap();
     let base = dir.join("db.wal");
     let row_base = {
-        let mut e = Engine::new_local();
+        let mut e = Engine::new_local_cpu_oracle();
         e.commit_state_mut().wal = WalBuffer::with_durable_segment(&base);
         let mut seq = 0u64;
         if !gpu_available(&mut e, &mut seq) {
@@ -1897,12 +2986,12 @@ fn gpu_cold_checkpoint_restores_under_lane_pump_frontier_watermark() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_dml_locate_range_delete_on_device() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
     }
-    let mut twin = Engine::new_local(); // host-arm oracle (no budget -> host seq_scan locate)
+    let mut twin = Engine::new_local_cpu_oracle(); // host-arm oracle (no budget -> host seq_scan locate)
     let mut twin_seq = 0u64;
 
     const N: i32 = 1500;
@@ -1963,12 +3052,12 @@ fn gpu_streaming_dml_locate_range_delete_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_dml_locate_range_update_on_device() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
     }
-    let mut twin = Engine::new_local();
+    let mut twin = Engine::new_local_cpu_oracle();
     let mut twin_seq = 0u64;
 
     const N: i32 = 1500;
@@ -2033,7 +3122,7 @@ fn gpu_streaming_dml_locate_range_update_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_dml_locate_zero_matches_is_a_resolve() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2081,7 +3170,7 @@ fn gpu_streaming_dml_locate_zero_matches_is_a_resolve() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_dml_locate_declines_without_budget() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2115,12 +3204,12 @@ fn gpu_streaming_dml_locate_declines_without_budget() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_dml_locate_type_matrix_differential() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
     }
-    let mut twin = Engine::new_local();
+    let mut twin = Engine::new_local_cpu_oracle();
     let mut twin_seq = 0u64;
 
     const N: i32 = 600;
@@ -2219,7 +3308,7 @@ fn gpu_cold_sidecar_stamps_mask_rows_across_chunks() {
     // These gates exercise the STORE-DRIVEN patch/stamp machinery (live for non-class tables);
     // without this the table class-enters mid-test and the semantics legitimately change.
     let _class_off = ClassEntryDisabled::new();
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2321,7 +3410,7 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
     // A STORE-DRIVEN-era gate (P2 stamps + the P2b artifact round-trip against a replayed twin
     // whose id space must match): the class would shift ids via skipped installs mid-test.
     let _class_off = ClassEntryDisabled::new();
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2420,7 +3509,7 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
 
     // The twin replays the identical statement history (same commit boundary), restores the
     // artifact directly, and its FIRST streaming read replays the stamped bytes.
-    let mut twin = Engine::new_local();
+    let mut twin = Engine::new_local_cpu_oracle();
     let mut twin_seq = 0u64;
     if !gpu_available(&mut twin, &mut twin_seq) {
         return;
@@ -2495,7 +3584,7 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
 /// for correctness-bearing deltas. This is the minimal CPU repro, pinned forever.
 #[test]
 fn cow_change_log_reports_every_pinned_generation_delta() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE big (a INT, b INT)")
         .unwrap();
     const N: i32 = 1500;
@@ -2540,7 +3629,7 @@ fn cow_change_log_reports_every_pinned_generation_delta() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_reverse_gather_round_trips_all_types_and_sidecars() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2663,7 +3752,7 @@ fn gpu_reverse_gather_round_trips_all_types_and_sidecars() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_native_locate_matches_store_locate() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2751,7 +3840,7 @@ fn gpu_chunk_native_locate_matches_store_locate() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_locate_driven_stamp_masks_rows_without_store() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2851,12 +3940,12 @@ fn gpu_locate_driven_stamp_masks_rows_without_store() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
     }
-    let mut twin = Engine::new_local();
+    let mut twin = Engine::new_local_cpu_oracle();
     let mut twin_seq = 0u64;
 
     const N: i32 = 1200;
@@ -3040,7 +4129,7 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_dml_stamps_without_deauth() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -3164,7 +4253,7 @@ fn gpu_chunk_class_dml_stamps_without_deauth() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_born_gate_serves_old_boundaries() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -3266,7 +4355,7 @@ fn gpu_chunk_class_born_gate_serves_old_boundaries() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_compaction_deletes_dead_slots() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -3386,7 +4475,7 @@ fn gpu_chunk_class_compaction_deletes_dead_slots() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_device_slot_recheck_matches_host_decoder() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -3461,9 +4550,8 @@ fn gpu_device_slot_recheck_matches_host_decoder() {
     let map = e.read_state.residency.streaming_cold_chunks.load();
     let entry = map.get("mix").expect("cold entry");
     let mut checked = 0usize;
-    let mut masked = 0usize;
     for chunk in &entry.chunks {
-        // Stage once per chunk; recheck every slot against the host decoder.
+        // Stage once per chunk; final-readback every slot against the construction oracle.
         let (staged, _vis) = e
             .stage_cold_chunk(chunk, rtx)
             .expect("stage")
@@ -3471,33 +4559,42 @@ fn gpu_device_slot_recheck_matches_host_decoder() {
             .expect("ready");
         let host_unmasked =
             crate::engine_streaming_exec::decode_cold_chunk_rows(&table, chunk, 0).unwrap();
-        let host_masked =
-            crate::engine_streaming_exec::decode_cold_chunk_rows(&table, chunk, rtx).unwrap();
-        let mut masked_iter = host_masked.iter();
         for (slot, expected) in host_unmasked.iter().enumerate() {
             let got = e
-                .materialize_cold_chunk_slot(&table, chunk, &staged, slot, rtx)
+                .read_cold_chunk_slot_values(&table, chunk, &staged, slot)
                 .expect("no decline");
-            // Determine liveness from the host sidecar semantics: the unmasked row is always
-            // present; the masked stream skips dead slots.
-            match &got {
-                Some(row) => {
-                    assert_eq!(row, expected, "slot {slot} value mismatch");
-                    assert_eq!(
-                        Some(row),
-                        masked_iter.next(),
-                        "masked-stream alignment at slot {slot}"
-                    );
-                }
-                None => {
-                    masked += 1;
-                }
-            }
+            assert_eq!(&got, expected, "slot {slot} value mismatch");
             checked += 1;
         }
     }
     assert_eq!(checked, N as usize, "every slot rechecked");
-    assert_eq!(masked, 1, "exactly the stamped row masks");
+    // Visibility is a DEVICE decision: the deleted key no longer locates, while an adjacent
+    // live key does. No host sidecar inspection participates in the oracle.
+    let dead = crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(
+        &table,
+        &[vec![(0, SelectFilterOp::Eq, SqlValue::Int4(42))]],
+    )
+    .unwrap();
+    assert!(
+        e.locate_streaming_cold_slots(&table, &dead, rtx)
+            .unwrap()
+            .is_empty(),
+        "the device visibility mask excludes the stamped row"
+    );
+    let live = crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(
+        &table,
+        &[vec![(0, SelectFilterOp::Eq, SqlValue::Int4(41))]],
+    )
+    .unwrap();
+    assert_eq!(
+        e.locate_streaming_cold_slots(&table, &live, rtx)
+            .unwrap()
+            .iter()
+            .map(|(_, slots)| slots.len())
+            .sum::<usize>(),
+        1,
+        "the neighboring live row survives on-device"
+    );
 }
 
 /// P5-1 — THE CHUNK KEY-INDEX CACHE: build per-chunk device hash indexes over a key column,
@@ -3507,7 +4604,7 @@ fn gpu_device_slot_recheck_matches_host_decoder() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_key_index_builds_probes_and_rechecks() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -3574,43 +4671,39 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
         .probe_chunk_key_indexes(&indexes, &needles)
         .expect("probe");
     assert_eq!(hits.len(), 5);
-    // Present keys: exactly one live hit each whose recheck yields the key value.
+    // Present keys: the raw index hits, and the exact DEVICE predicate yields one live slot.
     for (n, expect_a) in [(0usize, 5i32), (1, 500), (2, 100000)] {
-        let mut live = 0;
-        for (pos, slot) in &hits[n] {
-            let chunk = &entry.chunks[*pos];
-            let (staged, _) = e.stage_cold_chunk(chunk, rtx).unwrap().ready().unwrap();
-            if let Some(row) = e
-                .materialize_cold_chunk_slot(&table, chunk, &staged, *slot as usize, rtx)
-                .expect("no decline")
-            {
-                assert_eq!(
-                    row[0],
-                    SqlValue::Int4(expect_a),
-                    "hit rechecks to the needle"
-                );
-                live += 1;
-            }
-        }
-        assert_eq!(live, 1, "needle {n}: exactly one live hit");
+        assert!(!hits[n].is_empty(), "needle {n}: raw index hit");
+        let predicate = crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(
+            &table,
+            &[vec![(0, SelectFilterOp::Eq, SqlValue::Int4(expect_a))]],
+        )
+        .unwrap();
+        let exact = e
+            .locate_streaming_cold_slots(&table, &predicate, rtx)
+            .unwrap();
+        assert_eq!(
+            exact.iter().map(|(_, slots)| slots.len()).sum::<usize>(),
+            1,
+            "needle {n}: exactly one device-approved hit"
+        );
     }
     // The STAMPED key: the index hits, the recheck masks — no live hit (the P5-2 not-a-conflict).
     assert!(
         !hits[3].is_empty(),
         "the all-visible index still hits the stamped key"
     );
-    let mut live = 0;
-    for (pos, slot) in &hits[3] {
-        let chunk = &entry.chunks[*pos];
-        let (staged, _) = e.stage_cold_chunk(chunk, rtx).unwrap().ready().unwrap();
-        if e.materialize_cold_chunk_slot(&table, chunk, &staged, *slot as usize, rtx)
-            .expect("no decline")
-            .is_some()
-        {
-            live += 1;
-        }
-    }
-    assert_eq!(live, 0, "the stamped hit is masked at the recheck");
+    let stamped = crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(
+        &table,
+        &[vec![(0, SelectFilterOp::Eq, SqlValue::Int4(7))]],
+    )
+    .unwrap();
+    assert!(
+        e.locate_streaming_cold_slots(&table, &stamped, rtx)
+            .unwrap()
+            .is_empty(),
+        "the stamped hit is masked by the device recheck"
+    );
     // The absent key: no hits at all.
     assert!(hits[4].is_empty(), "an absent key misses every chunk index");
 
@@ -3665,47 +4758,52 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
     let hits8 = e
         .probe_chunk_key_indexes(&indexes8, &[present, absent])
         .expect("probe");
+    assert!(!hits8[0].is_empty(), "the present folded fingerprint hits");
     let rtx8 = e.committed_seq();
-    let mut live = 0;
-    for (pos, slot) in &hits8[0] {
-        let chunk = &entry8.chunks[*pos];
-        let (staged, _) = e.stage_cold_chunk(chunk, rtx8).unwrap().ready().unwrap();
-        if let Some(row) = e
-            .materialize_cold_chunk_slot(&table8, chunk, &staged, *slot as usize, rtx8)
-            .expect("no decline")
-        {
-            if row[0] == SqlValue::Int8(5 * 1_000_000_007) {
-                live += 1;
-            }
-        }
-    }
-    assert_eq!(live, 1, "the folded int8 key locates its exact row");
-    // The absent fingerprint may collide (32-bit) — every hit must FAIL the recheck.
-    for (pos, slot) in &hits8[1] {
-        let chunk = &entry8.chunks[*pos];
-        let (staged, _) = e.stage_cold_chunk(chunk, rtx8).unwrap().ready().unwrap();
-        if let Some(row) = e
-            .materialize_cold_chunk_slot(&table8, chunk, &staged, *slot as usize, rtx8)
-            .expect("no decline")
-        {
-            assert_ne!(
-                row[0],
-                SqlValue::Int8(999_999_999_999),
-                "collision resolved by recheck"
-            );
-        }
-    }
+    let present_predicate = crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(
+        &table8,
+        &[vec![(
+            0,
+            SelectFilterOp::Eq,
+            SqlValue::Int8(5 * 1_000_000_007),
+        )]],
+    )
+    .unwrap();
+    assert_eq!(
+        e.locate_streaming_cold_slots(&table8, &present_predicate, rtx8)
+            .unwrap()
+            .iter()
+            .map(|(_, slots)| slots.len())
+            .sum::<usize>(),
+        1,
+        "the folded int8 key locates its exact row on-device"
+    );
+    let absent_predicate = crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(
+        &table8,
+        &[vec![(
+            0,
+            SelectFilterOp::Eq,
+            SqlValue::Int8(999_999_999_999),
+        )]],
+    )
+    .unwrap();
+    assert!(
+        e.locate_streaming_cold_slots(&table8, &absent_predicate, rtx8)
+            .unwrap()
+            .is_empty(),
+        "an absent fingerprint collision cannot survive the exact device predicate"
+    );
 }
 
 /// P5-2 — THE KEYED-CLASS LIFT (INSERT): a PK'd over-budget table ENTERS the class (eligibility
 /// no longer refuses unique indexes); its host rows are RECLAIMED; INSERT uniqueness is then
 /// validated ON-DEVICE (per-chunk key-index probe + P5-0 slot recheck at the statement
-/// snapshot): a genuine dup rejects WITHOUT de-auth, an in-batch dup rejects host-exact, a
+/// snapshot): a genuine dup rejects WITHOUT de-auth, an in-batch dup rejects on-device, a
 /// tombstoned key re-inserts (a masked hit is NOT a conflict), and fresh keys append as tails.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -3747,6 +4845,7 @@ fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
     );
 
     // A genuine duplicate vs a BASE chunk: rejected on-device, class INTACT.
+    let exact_before = e.chunk_class_device_exact_rechecks();
     seq += 1;
     let err = e
         .execute_text(seq, "INSERT INTO ku (a, t) VALUES (500, 'dup')")
@@ -3764,16 +4863,26 @@ fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
         e.chunk_class_unique_probe_conflicts() >= 1,
         "the conflict came from the device probe's recheck"
     );
+    assert!(
+        e.chunk_class_device_exact_rechecks() > exact_before,
+        "the exact key verdict ran through the device predicate VM"
+    );
 
     // A duplicate vs a TAIL chunk (the enter row): the tail's index builds lazily and probes.
+    let exact_before = e.chunk_class_device_exact_rechecks();
     seq += 1;
     let err = e
         .execute_text(seq, "INSERT INTO ku (a, t) VALUES (100000, 'dup-tail')")
         .expect_err("dup key 100000 must reject");
     assert!(format!("{err:?}").contains("duplicate key value"));
     assert_eq!(e.chunk_class_deauths(), 0);
+    assert!(
+        e.chunk_class_device_exact_rechecks() > exact_before,
+        "the tail-key exact equality ran on-device"
+    );
 
-    // An IN-BATCH duplicate: host-exact structural check inside the class preflight.
+    // An IN-BATCH duplicate: exact comparison over the transient device relation.
+    let exact_before = e.chunk_class_device_exact_rechecks();
     seq += 1;
     let err = e
         .execute_text(
@@ -3783,6 +4892,10 @@ fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
         .expect_err("in-batch dup must reject");
     assert!(format!("{err:?}").contains("duplicate key value"));
     assert_eq!(e.chunk_class_deauths(), 0);
+    assert!(
+        e.chunk_class_device_exact_rechecks() > exact_before,
+        "within-statement exact equality ran on-device"
+    );
     assert_eq!(count(&e), i64::from(N) + 1, "no rejected row ever landed");
 
     // Fresh keys append as tails; the probe VALIDATED (non-vacuity) and the class held.
@@ -3813,6 +4926,495 @@ fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
     assert_eq!(count(&e), i64::from(N) + 2);
 }
 
+/// Wider class eligibility: CHECK remains row-local, while non-self outbound and inbound FK
+/// validation probes chunk-authoritative parent/child rows with exact device predicates. Genuine
+/// violations reject without de-authorizing; deleting the child then its provider succeeds.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0_u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(
+        seq,
+        "CREATE TABLE cp (id INT PRIMARY KEY, note TEXT, CHECK (id > 0))",
+    )
+    .unwrap();
+    seq += 1;
+    e.execute_text(
+        seq,
+        "CREATE TABLE cc (id INT PRIMARY KEY, parent_id INT, v INT, note TEXT, \
+                          CONSTRAINT cc_v_pos CHECK (v > 0))",
+    )
+    .unwrap();
+    seq += 1;
+    e.execute_text(
+        seq,
+        "ALTER TABLE ONLY cc ADD CONSTRAINT cc_parent_fk FOREIGN KEY (parent_id) \
+         REFERENCES cp(id)",
+    )
+    .unwrap();
+    let parents = (1..=1200)
+        .map(|id| format!("({id}, 'p{id:04}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let children = (1..=1200)
+        .map(|id| format!("({id}, {id}, 1, 'c{id:04}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO cp VALUES {parents}"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO cc VALUES {children}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM cp"))
+        .unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM cc"))
+        .unwrap();
+
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO cp VALUES (100000, 'enter')")
+        .unwrap();
+    assert!(e.table_chunk_authoritative("cp").is_some());
+    let exact_before = e.chunk_class_device_exact_rechecks();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO cc VALUES (100000, 100000, 1, 'enter')")
+        .unwrap();
+    assert!(e.table_chunk_authoritative("cc").is_some());
+    assert!(
+        e.chunk_class_device_exact_rechecks() > exact_before,
+        "child entry validated its provider against parent chunks"
+    );
+
+    seq += 1;
+    let fk_error = e
+        .execute_text(seq, "INSERT INTO cc VALUES (100001, 999999, 1, 'bad-fk')")
+        .expect_err("missing provider must reject");
+    assert!(format!("{fk_error:?}").contains("foreign key constraint"));
+    seq += 1;
+    let check_error = e
+        .execute_text(seq, "INSERT INTO cc VALUES (100002, 100000, -1, 'bad-check')")
+        .expect_err("CHECK violation must reject");
+    assert!(format!("{check_error:?}").contains("check constraint"));
+    assert_eq!(e.chunk_class_deauths(), 0);
+
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM cc WHERE id = 100000")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM cp WHERE id = 100000")
+        .unwrap();
+
+    // Use a distinct pair for the rejected inbound check so the successful child->provider delete
+    // sequence above also proves both classed DELETE arms independently.
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO cp VALUES (100003, 'guarded')")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO cc VALUES (100003, 100003, 1, 'guarded')")
+        .unwrap();
+    let exact_before = e.chunk_class_device_exact_rechecks();
+    seq += 1;
+    let inbound_error = e
+        .execute_text(seq, "DELETE FROM cp WHERE id = 100003")
+        .expect_err("referenced provider delete must reject");
+    assert!(format!("{inbound_error:?}").contains("foreign key constraint"));
+    assert!(e.chunk_class_device_exact_rechecks() > exact_before);
+    let provider_after_reject = e
+        .execute_relational_select(&select("SELECT id FROM cp WHERE id = 100003"))
+        .unwrap();
+    assert_eq!(
+        provider_after_reject.rows.len(),
+        1,
+        "a rejected parent DELETE must not hide its provider"
+    );
+    assert_eq!(e.chunk_class_deauths(), 0);
+    assert!(e.table_chunk_authoritative("cp").is_some());
+    assert!(e.table_chunk_authoritative("cc").is_some());
+}
+
+/// P5-later — OVER-CAP KEYED CLASS: when the complete retained exact-index set cannot co-reside,
+/// compact per-chunk Bloom filters still admit the class. The GPU Bloom probe only chooses
+/// chunks; exact predicate + visibility remains authoritative for duplicate checks and point DML.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
+    let _forced_over_cap = ChunkKeyIndexCapOverride::tiny();
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0_u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE kb (a INT PRIMARY KEY, u INT UNIQUE, v INT)")
+        .unwrap();
+    const N: i32 = 1200;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {}, {})", i + 50_000, i * 10));
+    }
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO kb (a, u, v) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM kb"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (100000, 150000, -1)")
+        .unwrap();
+    assert_eq!(e.chunk_class_entries(), 1, "over-cap keyed table enters via Bloom set");
+    assert!(e.table_chunk_authoritative("kb").is_some());
+    assert!(e.chunk_class_reclaimed_rows() > 0, "host row chains were reclaimed");
+
+    let bloom_0 = e.chunk_key_bloom_probes();
+    let exact_0 = e.chunk_class_device_exact_rechecks();
+    seq += 1;
+    let err = e
+        .execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (1100, 999999, 1)")
+        .expect_err("base-chunk duplicate must reject");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert!(e.chunk_key_bloom_probes() > bloom_0, "candidate decision ran on GPU Bloom");
+    assert!(e.chunk_class_device_exact_rechecks() > exact_0, "conflict was exactly rechecked");
+    assert_eq!(e.chunk_class_deauths(), 0);
+
+    // The entry-triggering row is a later tail chunk. Its Bloom is built on demand and must not
+    // be omitted merely because it was not part of the original base capture.
+    let bloom_1 = e.chunk_key_bloom_probes();
+    seq += 1;
+    let err = e
+        .execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (100000, 777777, 2)")
+        .expect_err("tail duplicate must reject");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert!(e.chunk_key_bloom_probes() > bloom_1);
+
+    // Structural NULL uniqueness also uses the Bloom candidate set and exact IS NULL predicate.
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (200000, NULL, 3)")
+        .unwrap();
+    let exact_2 = e.chunk_class_device_exact_rechecks();
+    seq += 1;
+    let err = e
+        .execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (200001, NULL, 4)")
+        .expect_err("second NULL unique key must reject");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert!(e.chunk_class_device_exact_rechecks() > exact_2);
+
+    // Every test Bloom is deliberately ALL-POSITIVE, so the absent key is a guaranteed false
+    // positive in every chunk. Point UPDATE and the miss must still resolve exactly on-device;
+    // no host-store restoration or de-authorization is allowed.
+    let bloom_2 = e.chunk_key_bloom_probes();
+    let locates_2 = e.chunk_class_dml_key_locates();
+    seq += 1;
+    e.execute_text(seq, "UPDATE kb SET v = 4242 WHERE a = 1100")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kb WHERE a = 987654")
+        .unwrap();
+    assert!(e.chunk_key_bloom_probes() >= bloom_2 + 2);
+    assert!(e.chunk_class_dml_key_locates() >= locates_2 + 2);
+    assert_eq!(e.chunk_class_deauths(), 0, "Bloom route stays chunk-authoritative");
+    assert!(e.table_chunk_authoritative("kb").is_some());
+    let bloom_ids_before: std::collections::BTreeSet<u64> = e
+        .read_state
+        .residency
+        .chunk_key_bloom
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .keys()
+        .filter_map(|(table, chunk_id, _)| (table == "kb").then_some(*chunk_id))
+        .collect();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kb WHERE a < 400").unwrap();
+    assert!(e.chunk_class_compactions() > 0, "range delete compacts a keyed chunk");
+    let bloom_ids_after: std::collections::BTreeSet<u64> = e
+        .read_state
+        .residency
+        .chunk_key_bloom
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .keys()
+        .filter_map(|(table, chunk_id, _)| (table == "kb").then_some(*chunk_id))
+        .collect();
+    assert!(
+        bloom_ids_before.difference(&bloom_ids_after).next().is_some(),
+        "compaction publication purges the replaced chunk-id Bloom"
+    );
+    let row = e
+        .execute_relational_select(&select("SELECT v FROM kb WHERE a = 1100"))
+        .unwrap();
+    assert_eq!(row.rows.clone().into_boxed(), vec![vec![SqlValue::Int4(4242)]]);
+}
+
+/// The Bloom cap is global. A second table that cannot reserve a complete set must roll back every
+/// partial buffer, leave the already-authoritative first table intact, and refuse class entry.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_bloom_global_cap_rolls_back_failed_admission() {
+    let _forced_over_cap = ChunkKeyIndexCapOverride::tiny();
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0_u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    let rows = |base: i32| {
+        (0..800)
+            .map(|i| format!("({}, {})", base + i, i))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE bca (a INT PRIMARY KEY, v INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE bcb (a INT PRIMARY KEY, v INT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO bca (a, v) VALUES {}", rows(0)))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO bcb (a, v) VALUES {}", rows(200000)))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM bca"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO bca (a, v) VALUES (100000, 1)")
+        .unwrap();
+    assert!(e.table_chunk_authoritative("bca").is_some());
+    let first_bytes = e.chunk_key_bloom_bytes();
+    assert!(first_bytes > 0);
+    let forced_cap = first_bytes + first_bytes / 2;
+    crate::engine_streaming_exec::CHUNK_KEY_BLOOM_CAP_BYTES_TEST
+        .store(forced_cap, std::sync::atomic::Ordering::Relaxed);
+
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM bcb"))
+        .unwrap();
+    assert!(
+        e.chunk_key_bloom_bytes() <= first_bytes,
+        "failed priming cannot retain any additional VRAM"
+    );
+    assert!(
+        !e.read_state
+            .residency
+            .chunk_key_bloom
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .any(|(table, _, _)| table == "bcb"),
+        "failed priming must roll back every partial bcb Bloom"
+    );
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO bcb (a, v) VALUES (300000, 2)")
+        .unwrap();
+    assert!(e.table_chunk_authoritative("bcb").is_none());
+    assert!(e.table_chunk_authoritative("bca").is_some());
+    assert!(e.chunk_key_bloom_bytes() <= forced_cap);
+}
+
+/// Spill-backed keyed captures prime their Bloom set only after the capture installer releases the
+/// commit mutex. The later entry may build the fresh RAM tail, but must not reread old spill chunks.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_bloom_spill_is_primed_before_class_entry() {
+    let _forced_over_cap = ChunkKeyIndexCapOverride::tiny();
+    crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
+        .store(1024, std::sync::atomic::Ordering::Relaxed);
+    let result = std::panic::catch_unwind(|| {
+        let mut e = Engine::new_local_cpu_oracle();
+        let mut seq = 0_u64;
+        if !gpu_available(&mut e, &mut seq) {
+            return;
+        }
+        seq += 1;
+        e.execute_text(seq, "CREATE TABLE kbs (a INT PRIMARY KEY, v INT)")
+            .unwrap();
+        let values = (0..1200)
+            .map(|i| format!("({i}, {})", i * 10))
+            .collect::<Vec<_>>()
+            .join(",");
+        seq += 1;
+        e.execute_text(seq, &format!("INSERT INTO kbs (a, v) VALUES {values}"))
+            .unwrap();
+        e.set_relational_residency_budget_bytes(0, 4096);
+        let _ = e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM kbs"))
+            .unwrap();
+        assert!(e.streaming_cold_spills() > 0, "fixture must be spill-backed");
+        assert!(e.chunk_key_bloom_bytes() > 0, "Bloom set primed off-lock");
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO kbs (a, v) VALUES (100000, -1)")
+            .unwrap();
+        assert!(e.table_chunk_authoritative("kbs").is_some());
+        assert_eq!(e.chunk_class_deauths(), 0);
+    });
+    crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Deterministic E1-prime/E2-publication race: the cold read publishes E1 and pauses before its
+/// off-lock candidate build; a concurrent UPDATE replaces chunks and publishes E2; E1 then builds.
+/// Final epoch validation must remove every now-stale E1 candidate inserted after E2's cleanup.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_bloom_offlock_prime_cannot_strand_stale_ids() {
+    let _forced_over_cap = ChunkKeyIndexCapOverride::tiny();
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0_u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE kbr (a INT PRIMARY KEY, v INT)")
+        .unwrap();
+    let values = (0..1200)
+        .map(|i| format!("({i}, {i})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO kbr (a, v) VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 4096);
+    let e = std::sync::Arc::new(e);
+    let (published_e1, resume_prime) =
+        crate::engine_streaming_exec::install_chunk_key_prime_pin_hook();
+    let reader = std::sync::Arc::clone(&e);
+    let capture = std::thread::spawn(move || {
+        reader.execute_relational_select(&select("SELECT COUNT(*) FROM kbr"))
+    });
+    published_e1.wait();
+    seq += 1;
+    e.execute_text(seq, "UPDATE kbr SET v = 999999 WHERE a < 400")
+        .unwrap();
+    assert!(e.streaming_cold_patches() > 0, "interposed UPDATE published E2");
+    resume_prime.wait();
+    capture.join().expect("capture thread").expect("streaming read");
+    assert_eq!(
+        e.stale_chunk_key_candidate_count("kbr"),
+        0,
+        "E1 prime inserted after E2 cleanup must self-retire stale chunk IDs"
+    );
+}
+
+/// Audit M2 — the temporary exact-predicate batch bound is an authorization seam, not a silent
+/// acceptance seam. Exactly 256 fresh rows stay classed and are device-validated; 257 fresh rows
+/// loudly de-authorize before succeeding through the restored host reference; and a separate
+/// 257-row batch containing a duplicate likewise de-authorizes, then rejects with no partial land.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_unique_batch_bound_deauthorizes_257() {
+    fn populate_and_enter(e: &mut Engine, seq: &mut u64, table: &str) {
+        let entries_before = e.chunk_class_entries();
+        *seq += 1;
+        e.execute_text(*seq, &format!("CREATE TABLE {table} (a INT PRIMARY KEY)"))
+            .unwrap();
+        let values = (0..600)
+            .map(|i| format!("({i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        *seq += 1;
+        e.execute_text(*seq, &format!("INSERT INTO {table} VALUES {values}"))
+            .unwrap();
+        e.set_relational_residency_budget_bytes(0, 8192);
+        let _ = e
+            .execute_relational_select(&select(&format!("SELECT COUNT(*) FROM {table}")))
+            .unwrap();
+        *seq += 1;
+        e.execute_text(*seq, &format!("INSERT INTO {table} VALUES (100000)"))
+            .unwrap();
+        assert_eq!(
+            e.chunk_class_entries(),
+            entries_before + 1,
+            "premise: {table} entered the class"
+        );
+    }
+
+    fn count(e: &Engine, table: &str) -> i64 {
+        match e
+            .execute_relational_select(&select(&format!("SELECT COUNT(*) FROM {table}")))
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(value) => value,
+            ref other => panic!("count: {other:?}"),
+        }
+    }
+
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+
+    populate_and_enter(&mut e, &mut seq, "bound_ok");
+    let deauth_before = e.chunk_class_deauths();
+    let probes_before = e.chunk_class_unique_probes();
+    let values_256 = (0..256)
+        .map(|i| format!("({})", 200000 + i))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO bound_ok VALUES {values_256}"))
+        .unwrap();
+    assert_eq!(
+        e.chunk_class_deauths(),
+        deauth_before,
+        "the inclusive 256-row bound remains device-authoritative"
+    );
+    assert!(e.chunk_class_unique_probes() > probes_before);
+
+    let values_257 = (0..257)
+        .map(|i| format!("({})", 300000 + i))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO bound_ok VALUES {values_257}"))
+        .unwrap();
+    assert_eq!(
+        e.chunk_class_deauths(),
+        deauth_before + 1,
+        "257 rows must loudly de-authorize before the host reference accepts"
+    );
+    assert_eq!(count(&e, "bound_ok"), 600 + 1 + 256 + 257);
+
+    populate_and_enter(&mut e, &mut seq, "bound_dup");
+    let deauth_before = e.chunk_class_deauths();
+    let mut duplicate_values = (0..256)
+        .map(|i| format!("({})", 400000 + i))
+        .collect::<Vec<_>>();
+    duplicate_values.push("(400000)".to_owned());
+    seq += 1;
+    let err = e
+        .execute_text(
+            seq,
+            &format!("INSERT INTO bound_dup VALUES {}", duplicate_values.join(",")),
+        )
+        .expect_err("the restored host reference must reject the 257-row duplicate");
+    assert!(format!("{err:?}").contains("duplicate key value"));
+    assert_eq!(
+        e.chunk_class_deauths(),
+        deauth_before + 1,
+        "the rejecting oversized batch also crosses the visible deauth seam"
+    );
+    assert_eq!(count(&e, "bound_dup"), 601, "no rejected row landed");
+}
+
 /// P5-2 — C1 SELF-EXCLUSION: an UPDATE's own located coordinates are SELF, not conflicts (the
 /// old versions are live at probe time — stamps land in the commit hook). Key-preserving
 /// multi-row updates pass; a key change INTO an existing key rejects; a key change to a fresh
@@ -3820,7 +5422,7 @@ fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_update_self_exclusion() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -3944,7 +5546,7 @@ fn gpu_chunk_class_keyed_compound_fold_parity_and_collision() {
     );
     assert!((a1, b1) != (a2, b2), "distinct tuples");
 
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -4015,14 +5617,14 @@ fn gpu_chunk_class_keyed_compound_fold_parity_and_collision() {
     assert_eq!(e.chunk_class_deauths(), 0, "the whole arc stayed classed");
 }
 
-/// P5-2 — NULL KEY DECLINE: host unique semantics are STRUCTURAL (NULL == NULL conflicts), but
-/// the chunk fold reads raw payload bytes under the null bitmap — a NULL key can be neither
-/// built nor probed faithfully, so the class preflight DECLINES to host (de-auth). The first
-/// NULL insert succeeds on the rebuilt store; the second rejects host-side (structural dup).
+/// P5 charter closure — NULL KEY: unique semantics are STRUCTURAL (NULL == NULL conflicts).
+/// Fingerprints do not encode validity, so a NULL tuple bypasses the candidate index and runs
+/// an exact `IS NULL` predicate over the chunks on-device. The first NULL succeeds while the
+/// class stays authoritative; the second rejects from the device result.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_chunk_class_keyed_null_unique_declines_to_host() {
-    let mut e = Engine::new_local();
+fn gpu_chunk_class_keyed_null_unique_stays_device_native() {
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -4061,8 +5663,8 @@ fn gpu_chunk_class_keyed_null_unique_declines_to_host() {
     assert!(format!("{err:?}").contains("duplicate key value"));
     assert_eq!(e.chunk_class_deauths(), 0);
 
-    // A NULL key: DECLINE -> de-auth -> the host validates against the rebuilt store (a single
-    // NULL passes).
+    // A NULL key uses the raw-placeholder candidate fingerprint; a single NULL misses and passes.
+    let probes_before = e.chunk_class_unique_probes();
     seq += 1;
     e.execute_text(
         seq,
@@ -4071,19 +5673,156 @@ fn gpu_chunk_class_keyed_null_unique_declines_to_host() {
     .unwrap();
     assert_eq!(
         e.chunk_class_deauths(),
-        1,
-        "the NULL key must decline the class (host semantics are structural)"
+        0,
+        "the NULL key must stay chunk-authoritative"
     );
-    // The SECOND NULL: the host's structural check (NULL == NULL) rejects — the exact semantics
-    // the device probe cannot reproduce, proving the decline was the right call.
+    assert!(
+        e.chunk_class_unique_probes() > probes_before,
+        "the structural NULL miss came from the device candidate probe"
+    );
+    // The SECOND NULL: the same exact device predicate sees the live NULL and rejects.
+    let exact_before = e.chunk_class_device_exact_rechecks();
     seq += 1;
     let err = e
         .execute_text(
             seq,
             "INSERT INTO kn (a, u, t) VALUES (2000001, NULL, 'null2')",
         )
-        .expect_err("the second NULL is a structural dup");
+        .expect_err("the second NULL is a device-detected structural dup");
     assert!(format!("{err:?}").contains("duplicate key value"));
+    assert_eq!(e.chunk_class_deauths(), 0, "the class remains authoritative");
+    assert!(
+        e.chunk_class_device_exact_rechecks() > exact_before,
+        "the matching NULL tuple was confirmed by an exact device predicate"
+    );
+}
+
+/// Audit M1 — compound partial-NULL uniqueness through every class seam: distinct tuples in one
+/// batch pass, an in-batch duplicate rejects on the transient device relation, an existing-row
+/// duplicate rejects through the placeholder-fingerprint candidate probe + exact `IS NULL`, a
+/// key-preserving UPDATE self-excludes, tombstone/reinsert succeeds, and WAL replay lands the
+/// identical accepted history.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_compound_partial_null_unique_device_and_replay() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-p5-null-compound-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("db.wal");
+    let expected = {
+        let mut e = Engine::new_local_cpu_oracle();
+        e.commit_state_mut().wal = WalBuffer::with_durable_segment(&base);
+        let mut seq = 0u64;
+        if !gpu_available(&mut e, &mut seq) {
+            return;
+        }
+        seq += 1;
+        e.execute_text(
+            seq,
+            "CREATE TABLE null_k (id INT, u INT, v INT, payload INT, UNIQUE (u, v))",
+        )
+        .unwrap();
+        let values = (0..600)
+            .map(|i| format!("({i}, {}, {}, {i})", i + 1000, i + 2000))
+            .collect::<Vec<_>>()
+            .join(",");
+        seq += 1;
+        e.execute_text(seq, &format!("INSERT INTO null_k VALUES {values}"))
+            .unwrap();
+        e.set_relational_residency_budget_bytes(0, 8192);
+        let _ = e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM null_k"))
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO null_k VALUES (90000, 90000, 90000, 0)")
+            .unwrap();
+        assert_eq!(e.chunk_class_entries(), 1, "premise: compound classed");
+
+        // Same NULL component, distinct second key: legal and device-validated in one batch.
+        seq += 1;
+        e.execute_text(
+            seq,
+            "INSERT INTO null_k VALUES (10000, NULL, 7, 1), (10001, NULL, 8, 2)",
+        )
+        .unwrap();
+        // Exact duplicate inside one statement: transient device relation must reject it.
+        let exact_before = e.chunk_class_device_exact_rechecks();
+        seq += 1;
+        let err = e
+            .execute_text(
+                seq,
+                "INSERT INTO null_k VALUES (10002, NULL, 9, 3), (10003, NULL, 9, 4)",
+            )
+            .expect_err("partial-NULL in-batch duplicate");
+        assert!(format!("{err:?}").contains("duplicate key value"));
+        assert!(e.chunk_class_device_exact_rechecks() > exact_before);
+
+        // Existing partial-NULL duplicate: candidate index + exact IS NULL rejects.
+        seq += 1;
+        let err = e
+            .execute_text(seq, "INSERT INTO null_k VALUES (10004, NULL, 7, 5)")
+            .expect_err("existing partial-NULL duplicate");
+        assert!(format!("{err:?}").contains("duplicate key value"));
+
+        // Key-preserving UPDATE: its own NULL-key coordinate is self, not a conflict.
+        seq += 1;
+        e.execute_text(seq, "UPDATE null_k SET payload = 77 WHERE id = 10000")
+            .unwrap();
+        // Tombstone the old tuple by a non-key locator; the same NULL key is then reusable.
+        seq += 1;
+        e.execute_text(seq, "DELETE FROM null_k WHERE id = 10000")
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO null_k VALUES (10005, NULL, 7, 88)")
+            .unwrap();
+        assert_eq!(e.chunk_class_deauths(), 0, "all NULL seams stayed classed");
+
+        let count = match e
+            .execute_relational_select(&select("SELECT COUNT(*) FROM null_k"))
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(v) => v,
+            ref other => panic!("count: {other:?}"),
+        };
+        let sum = match e
+            .execute_relational_select(&select("SELECT SUM(payload) FROM null_k"))
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(v) => v,
+            ref other => panic!("sum: {other:?}"),
+        };
+        (count, sum)
+    };
+    let e = Engine::open_durable_wal_segment(&base).expect("partial-NULL history replays");
+    let count = match e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM null_k"))
+        .unwrap()
+        .rows
+        .row(0)[0]
+    {
+        SqlValue::Int8(v) => v,
+        ref other => panic!("count: {other:?}"),
+    };
+    let sum = match e
+        .execute_relational_select(&select("SELECT SUM(payload) FROM null_k"))
+        .unwrap()
+        .rows
+        .row(0)[0]
+    {
+        SqlValue::Int8(v) => v,
+        ref other => panic!("sum: {other:?}"),
+    };
+    assert_eq!((count, sum), expected, "live/replay partial-NULL parity");
 }
 
 /// P5-2 — THE C2 REPLAY DIFFERENTIAL: every keyed-class verdict must MATCH what recovery's
@@ -4107,7 +5846,7 @@ fn gpu_chunk_class_keyed_replay_differential() {
     let base = dir.join("db.wal");
     const N: i32 = 1000;
     let (count_live, sum_live) = {
-        let mut e = Engine::new_local();
+        let mut e = Engine::new_local_cpu_oracle();
         e.commit_state_mut().wal = WalBuffer::with_durable_segment(&base);
         let mut seq = 0u64;
         if !gpu_available(&mut e, &mut seq) {
@@ -4226,7 +5965,7 @@ fn gpu_chunk_class_keyed_replay_differential() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_txn_insert_dup_rejected() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -4298,7 +6037,7 @@ fn gpu_chunk_class_keyed_text_key_probe_and_replay() {
     let base = dir.join("db.wal");
     const N: i32 = 1000;
     let (count_live, sum_live) = {
-        let mut e = Engine::new_local();
+        let mut e = Engine::new_local_cpu_oracle();
         e.commit_state_mut().wal = WalBuffer::with_durable_segment(&base);
         let mut seq = 0u64;
         if !gpu_available(&mut e, &mut seq) {
@@ -4409,13 +6148,13 @@ fn gpu_chunk_class_keyed_text_key_probe_and_replay() {
 /// P5-3 — BY-KEY DML LOCATE: an Eq-on-unique-key WHERE resolves through the chunk key-index
 /// probe (one device locate + slot rechecks) instead of the full fold scan, with matches
 /// materialized from the rechecked slots — the reverse-gather decoder stays off the point-DML
-/// hot path. Residual non-key predicates re-filter host-side; misses and dead keys yield 0-row
-/// DML; range WHERE keeps the fold. The differential twin: the same logical history driven
+/// hot path. Residual non-key predicates and visibility re-filter on-device; misses and dead
+/// keys yield 0-row DML; range WHERE keeps the fold. The differential twin: the same history driven
 /// through range predicates (the fold path) must land the identical state.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_dml_key_locate() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -4475,12 +6214,17 @@ fn gpu_chunk_class_keyed_dml_key_locate() {
 
     // Residual predicate: key matches, non-key predicate does NOT -> 0-row DML.
     let key_locates_1 = e.chunk_class_dml_key_locates();
+    let exact_rechecks_1 = e.chunk_class_device_exact_rechecks();
     seq += 1;
     e.execute_text(seq, "DELETE FROM kp WHERE a = 701 AND v = -999")
         .unwrap();
     assert!(
         e.chunk_class_dml_key_locates() > key_locates_1,
         "the residual-predicate DELETE still rode the probe"
+    );
+    assert!(
+        e.chunk_class_device_exact_rechecks() > exact_rechecks_1,
+        "the residual predicate was decided by the device VM"
     );
     seq += 1;
     e.execute_text(
@@ -4532,6 +6276,81 @@ fn gpu_chunk_class_keyed_dml_key_locate() {
     }
 }
 
+/// Audit C1 — off-lock class prepare must keep one entry Arc from coordinate locate through
+/// row-image materialization and the epoch token. Pause a DELETE after it pins E1, publish E2 by
+/// deleting enough rows to compact the chunk (including the paused DELETE's key), then resume. The E1
+/// write-set must conflict with E2; reloading E2 under the old snapshot would born-skip the
+/// compacted chunk, miss the key, and let the stale DELETE erase the concurrent update.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_compaction() {
+    let mut engine = Engine::new_local_cpu_oracle();
+    let mut seq = 0u64;
+    if !gpu_available(&mut engine, &mut seq) {
+        return;
+    }
+    seq += 1;
+    engine
+        .execute_text(seq, "CREATE TABLE epoch_t (a INT PRIMARY KEY, v INT)")
+        .unwrap();
+    let values = (0..1000)
+        .map(|i| format!("({i}, {i})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    engine
+        .execute_text(seq, &format!("INSERT INTO epoch_t VALUES {values}"))
+        .unwrap();
+    engine.set_relational_residency_budget_bytes(0, 8192);
+    let _ = engine
+        .execute_relational_select(&select("SELECT COUNT(*) FROM epoch_t"))
+        .unwrap();
+    seq += 1;
+    engine
+        .execute_text(seq, "INSERT INTO epoch_t VALUES (100000, -1)")
+        .unwrap();
+    assert_eq!(engine.chunk_class_entries(), 1, "premise: classed");
+
+    let engine = std::sync::Arc::new(engine);
+    let (pinned, resume) =
+        crate::engine_streaming_exec::install_class_resolve_pin_hook();
+    let deleting = std::sync::Arc::clone(&engine);
+    let delete_seq = seq + 1;
+    let delete = std::thread::spawn(move || {
+        deleting.execute_dml_concurrent(delete_seq, "DELETE FROM epoch_t WHERE v = 100")
+    });
+    pinned.wait(); // DELETE pinned E1 and its read snapshot; it has not located yet.
+
+    let update_seq = seq + 2;
+    engine
+        .execute_text(
+            update_seq,
+            "DELETE FROM epoch_t WHERE a < 200 OR a = 900",
+        )
+        .unwrap();
+    assert!(
+        engine.chunk_class_compactions() > 0,
+        "the interposed write must publish a compacted E2"
+    );
+    resume.wait();
+    let err = delete
+        .join()
+        .expect("delete thread")
+        .expect_err("the stale off-lock write-set must conflict");
+    assert!(
+        matches!(err, ExecuteError::Serialization(_)),
+        "expected SI conflict, got {err:?}"
+    );
+    let row = engine
+        .execute_relational_select(&select("SELECT COUNT(*) FROM epoch_t WHERE a = 100"))
+        .unwrap();
+    assert_eq!(
+        row.rows.iter().collect::<Vec<_>>(),
+        vec![&[SqlValue::Int8(0)][..]],
+        "the interposed delete remains the sole committed writer"
+    );
+}
+
 /// P5-3 (audit LOW) — COMPOUND-KEY DML through the probe: the by-key locate on a (a, b) PK
 /// rides the FOLDED fingerprint needle (not the raw-i32 fast path) — a needle/build divergence
 /// here is a silently MISSED DML match (lost delete/update), so the probe twin (Eq on both key
@@ -4539,7 +6358,7 @@ fn gpu_chunk_class_keyed_dml_key_locate() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_compound_dml_key_locate() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;

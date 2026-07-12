@@ -71,7 +71,7 @@ fn keys_touched_at(e: &Engine, commit_seq: TxnId) -> BTreeSet<String> {
 fn prepare_dml_does_not_mutate_engine_state() {
     // Stage 2 invariant (a): `prepare_*` is PURE — calling it leaves every mutable engine
     // structure (versions, value index, row-id counter, sequences) byte-for-byte unchanged.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -145,7 +145,7 @@ fn prepare_insert_with_sequence_default_is_pure_and_advances_on_apply() {
     // advance the sequence (pure), but the prepared delta must, and `apply_delta` must install
     // exactly the advancement the old in-line apply produced.
     let seq_name = "s_id_seq"; // SERIAL auto-creates `<table>_<col>_seq`.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE s (id SERIAL, v TEXT)")
         .unwrap();
     let seq_before = e
@@ -189,7 +189,7 @@ fn prepare_insert_with_sequence_default_is_pure_and_advances_on_apply() {
 
     // Parity: a fresh engine running the SAME insert through the public path lands on the same
     // sequence state.
-    let golden = Engine::new_local();
+    let golden = Engine::new_local_cpu_oracle();
     golden
         .execute_text(1, "CREATE TABLE s (id SERIAL, v TEXT)")
         .unwrap();
@@ -230,7 +230,7 @@ fn prepare_insert_failing_preflight_advances_nothing() {
     // not the store. (The old apply advanced the sequence before preflighting.) This is the
     // Stage-4 abort-is-side-effect-free property; unobservable on live paths because
     // `execute_text` preflights before committing.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE p (id SERIAL, code INT UNIQUE)")
         .unwrap();
     e.execute_text(2, "INSERT INTO p (code) VALUES (100)")
@@ -260,7 +260,7 @@ fn write_set_is_exactly_the_keys_apply_touches_for_insert() {
     // key there would spuriously conflict two concurrent disjoint inserts), even though
     // `apply_delta` DOES install those row keys. Inserts conflict ONLY on the unique-index slots
     // they occupy.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO t (id, label) VALUES (1, 'a')")
@@ -304,7 +304,7 @@ fn write_set_is_exactly_the_keys_apply_touches_for_insert() {
 fn insert_write_set_records_unique_slots_but_not_row_keys() {
     // BUG-1 fix, complement: an INSERT into a table WITH a unique index records the unique slot it
     // occupies (the genuine first-committer-wins conflict dimension) but STILL records no row key.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE u (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE UNIQUE INDEX u_id ON u (id)")
@@ -335,7 +335,7 @@ fn insert_write_set_records_unique_slots_but_not_row_keys() {
 fn write_set_is_exactly_the_keys_apply_touches_for_update() {
     // Stage 2 invariant (b), UPDATE: the write-set's row keys equal exactly the row keys whose
     // chain apply rewrote (old tombstoned + new created at the same key).
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -374,7 +374,7 @@ fn write_set_is_exactly_the_keys_apply_touches_for_update() {
 fn write_set_is_exactly_the_keys_apply_touches_for_delete() {
     // Stage 2 invariant (b), DELETE: the write-set's row keys equal exactly the row keys whose
     // version apply tombstoned.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -410,7 +410,7 @@ fn write_set_records_unique_index_slots_for_unique_insert() {
     // Stage 2 invariant (b), unique slots: a unique-column insert records exactly the
     // `(table, column, value)` slots it claims — the Stage 4 first-committer-wins conflict
     // points — and nothing for non-unique columns.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE u (id INT UNIQUE, label TEXT)")
         .unwrap();
 
@@ -464,8 +464,8 @@ fn prepare_apply_round_trips_to_same_state_as_public_path() {
     //
     // `manual` drives prepare/apply by hand at the commit-seq each commit would receive;
     // `golden` runs the identical statements through `execute_text`.
-    let mut manual = Engine::new_local();
-    let mut golden = Engine::new_local();
+    let mut manual = Engine::new_local_cpu_oracle();
+    let mut golden = Engine::new_local_cpu_oracle();
     for e in [&mut manual, &mut golden] {
         e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
             .unwrap();
@@ -544,7 +544,7 @@ fn serialized_dml_records_its_write_set_into_the_si_ledger() {
     // first-committer-wins check, so a concurrent transaction prepared against an older snapshot
     // could silently overwrite it (a lost update). Every applied serialized DML now records its
     // prepare-computed write-set at its commit seq, exactly like the concurrent path.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10)")
         .unwrap();
@@ -589,7 +589,7 @@ fn serialized_unique_insert_records_its_unique_slot_into_the_si_ledger() {
     // C2, unique-slot dimension: a serialized INSERT claiming a unique-index slot must be
     // visible to a concurrent committer preparing a DIFFERENT row with the SAME unique value
     // against an older snapshot (their row keys differ; only the unique slot collides).
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute_text(2, "CREATE UNIQUE INDEX t_id ON t (id)")
         .unwrap();

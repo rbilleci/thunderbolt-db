@@ -9,7 +9,7 @@ use super::*;
 /// clear error instead of silently taking an unvalidated fast path.
 #[test]
 fn covered_insert_route_requires_covered_shape() {
-    let engine = Engine::new_local();
+    let engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -392,7 +392,7 @@ fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<Covered
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     let txn_ids = AtomicU64::new(2);
     let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
         return; // driverless box
@@ -504,7 +504,7 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_intent_sharded_wave_same_pk_single_winner() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     let txn_ids = AtomicU64::new(2);
     let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
         return; // driverless box
@@ -1552,7 +1552,7 @@ fn gpu_lane_update_sustained_stays_elided() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -1668,7 +1668,7 @@ fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -1776,7 +1776,7 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_text_key_elides_and_validates_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -1881,7 +1881,7 @@ fn gpu_compound_text_key_elides_and_validates_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -2033,7 +2033,7 @@ fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_zero_match_dml_keeps_table_elided() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8, s TEXT)")
         .unwrap();
@@ -2129,7 +2129,7 @@ fn gpu_zero_match_dml_keeps_table_elided() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -2232,7 +2232,7 @@ fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_range_dml_resolves_on_device_without_deelide() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -2365,7 +2365,7 @@ fn gpu_range_dml_resolves_on_device_without_deelide() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_int8_range_dml_resolves_on_device() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8)")
         .unwrap();
@@ -2484,7 +2484,7 @@ fn gpu_int8_range_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_timestamp_range_delete_resolves_on_device() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)")
         .unwrap();
@@ -2568,7 +2568,7 @@ fn gpu_timestamp_range_delete_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)")
         .unwrap();
@@ -2657,7 +2657,7 @@ fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_nullable_column_dml_resolves_on_device() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, notes TEXT)")
         .unwrap();
@@ -2761,7 +2761,7 @@ fn gpu_nullable_column_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_numeric_range_dml_resolves_on_device() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, amt NUMERIC(12,2))")
         .unwrap();
@@ -2882,7 +2882,7 @@ fn gpu_numeric_range_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_text_predicate_dml_resolves_on_device() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -2998,7 +2998,7 @@ fn gpu_text_predicate_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_like_prefix_dml_resolves_on_device() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -3077,7 +3077,7 @@ fn gpu_like_prefix_dml_resolves_on_device() {
 /// Returns `None` (self-guard) with no usable GPU. `col_ddl` is the extra column (e.g. "u UUID").
 #[cfg(test)]
 fn gpu_elided_pk_table_with_column(col_ddl: &str, seed: &[(i64, &str)]) -> Option<Engine> {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -3500,7 +3500,7 @@ fn gpu_date_range_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_check_constrained_table_elides() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -3609,7 +3609,7 @@ fn gpu_check_constrained_table_elides() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_fk_referenced_parent_elides() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -3730,7 +3730,7 @@ fn gpu_fk_referenced_parent_elides() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_fk_child_table_elides() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -3835,7 +3835,7 @@ fn gpu_fk_child_table_elides() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_fk_child_date_fk_stays_elided() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE days (d DATE PRIMARY KEY, note TEXT)")
         .unwrap();
@@ -3936,7 +3936,7 @@ fn gpu_fk_child_date_fk_stays_elided() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_fk_child_noni32_fk_columns_stay_elided() {
     const TXN0: u64 = 1000;
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     for (parent_ddl, child_ddl, fk_ddl) in [
         (
             "CREATE TABLE vendors (vid UUID PRIMARY KEY, vname TEXT)",
@@ -4155,7 +4155,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_mixed_width_dml_resolves_on_device() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -4341,7 +4341,7 @@ fn gpu_mixed_width_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_check_elided_preflight_rehydrate_no_bypass() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -4717,7 +4717,7 @@ fn gpu_text_range_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_multi_entry_insert_batch_stays_elided() {
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
@@ -4807,7 +4807,7 @@ fn gpu_multi_entry_insert_batch_stays_elided() {
 /// the `applied_changed_rows` guard it would ENTER elision on a table with no device backing. Driverless.
 #[test]
 fn zero_row_dml_must_not_enter_elision_on_nonelided_table() {
-    let engine = Engine::new_local();
+    let engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -4870,7 +4870,7 @@ fn zero_row_dml_must_not_enter_elision_on_nonelided_table() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -5029,7 +5029,7 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_delete_update_by_key_stays_device_native() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,
@@ -5138,7 +5138,7 @@ fn gpu_compound_delete_update_by_key_stays_device_native() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_drop_constraint_shifts_ordinal_without_aliasing_the_device_index() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local();
+    let mut engine = Engine::new_local_cpu_oracle();
     engine
         .execute_text(
             1,

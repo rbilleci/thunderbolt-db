@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn relational_sql_create_insert_select_uses_mvcc_execution_path() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -65,7 +65,7 @@ fn relational_sql_create_insert_select_uses_mvcc_execution_path() {
 
 #[test]
 fn relational_copy_rows_commit_through_engine_wal_mvcc() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE people (id INT PRIMARY KEY, name TEXT DEFAULT 'unknown'::text)",
@@ -173,14 +173,17 @@ fn relational_copy_rows_commit_through_engine_wal_mvcc() {
         .execute_relational_select(&indexed_select)
         .unwrap();
     assert_eq!(recovered_indexed.rows, indexed_result.rows);
-    assert_eq!(recovered_indexed.access_path, indexed_result.access_path);
+    assert_recovered_relational_access_path(
+        &recovered_indexed,
+        (*indexed_result.access_path).clone(),
+    );
 }
 
 #[test]
 fn relational_copy_ingests_null_marker_and_selects_back_null() {
     // M3 (doc 21) Slice G: the COPY NULL marker ingests as a SQL NULL. TEXT format: the unquoted `\N`.
     // CSV format: an UNQUOTED empty field (a QUOTED empty field is the empty STRING, not NULL).
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, name TEXT)")
         .unwrap();
 
@@ -258,7 +261,7 @@ fn relational_copy_round_trips_all_column_types_and_null() {
     // round-trips every value AND a `\N` NULL per type through the COPY-to-engine bridge
     // (render_sql_value_literal -> re-parsed INSERT -> store). Previously the render errored on any
     // non-int4/text/Null column ("supports int4/text rows only").
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE tt (id INT, big BIGINT, amt NUMERIC(12,2), flag BOOL, d DATE, ts TIMESTAMP, u UUID)",
@@ -363,7 +366,7 @@ fn relational_copy_round_trips_all_column_types_and_null() {
 
 #[test]
 fn relational_column_defaults_fill_omitted_insert_columns_and_replay() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE default_people (id INT, name TEXT DEFAULT 'unknown'::text, bucket INT DEFAULT 7)",
@@ -438,7 +441,7 @@ fn relational_column_defaults_fill_omitted_insert_columns_and_replay() {
 
 #[test]
 fn relational_add_column_default_rewrites_rows_and_replays() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE default_people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -505,7 +508,7 @@ fn relational_add_column_default_rewrites_rows_and_replays() {
         )
         .unwrap_err();
     assert!(duplicate.to_string().contains("already exists"));
-    let no_default = Engine::new_local();
+    let no_default = Engine::new_local_cpu_oracle();
     no_default
         .execute_text(1, "CREATE TABLE default_people (id INT)")
         .unwrap();
@@ -522,7 +525,7 @@ fn relational_add_column_default_rewrites_rows_and_replays() {
 
 #[test]
 fn relational_add_column_sequence_default_rewrites_rows_and_replays() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE default_people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -657,7 +660,7 @@ fn relational_add_column_sequence_default_rewrites_rows_and_replays() {
 
 #[test]
 fn relational_drop_column_rewrites_rows_and_replays() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE drop_column_people (id INT, name TEXT, bucket INT DEFAULT 7)",
@@ -733,7 +736,7 @@ fn relational_drop_column_rewrites_rows_and_replays() {
         .unwrap_err();
     assert!(missing_column.to_string().contains("does not exist"));
 
-    let constrained = Engine::new_local();
+    let constrained = Engine::new_local_cpu_oracle();
     constrained
         .execute_text(
             1,
@@ -748,7 +751,7 @@ fn relational_drop_column_rewrites_rows_and_replays() {
 
 #[test]
 fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(
             1,
             "CREATE TABLE rename_table_people (id INT PRIMARY KEY, name TEXT UNIQUE, bucket INT DEFAULT 7)",
@@ -868,7 +871,7 @@ fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
         .unwrap_err();
     assert!(duplicate.to_string().contains("already exists"));
 
-    let view_engine = Engine::new_local();
+    let view_engine = Engine::new_local_cpu_oracle();
     view_engine
         .execute_text(1, "CREATE TABLE rename_table_base (id INT, name TEXT)")
         .unwrap();
@@ -890,7 +893,7 @@ fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
 
 #[test]
 fn relational_rename_column_updates_catalog_indexes_and_replays() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE rename_column_people (id INT PRIMARY KEY, name TEXT DEFAULT 'unknown')",
@@ -980,7 +983,7 @@ fn relational_rename_column_updates_catalog_indexes_and_replays() {
         .unwrap_err();
     assert!(duplicate.to_string().contains("already exists"));
 
-    let view_engine = Engine::new_local();
+    let view_engine = Engine::new_local_cpu_oracle();
     view_engine
         .execute_text(1, "CREATE TABLE rename_base (id INT, name TEXT)")
         .unwrap();
@@ -1001,7 +1004,7 @@ fn relational_rename_column_updates_catalog_indexes_and_replays() {
 
 #[test]
 fn relational_rename_constraint_updates_index_comments_and_replays() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE rename_constraint_people (id INT PRIMARY KEY, name TEXT UNIQUE)",
@@ -1118,7 +1121,7 @@ fn relational_rename_constraint_updates_index_comments_and_replays() {
             .unwrap_err();
     assert!(missing_constraint.to_string().contains("does not exist"));
 
-    let view_engine = Engine::new_local();
+    let view_engine = Engine::new_local_cpu_oracle();
     view_engine
         .execute_text(1, "CREATE TABLE rename_constraint_base (id INT, name TEXT)")
         .unwrap();
@@ -1139,7 +1142,7 @@ fn relational_rename_constraint_updates_index_comments_and_replays() {
 
 #[test]
 fn relational_sql_delete_uses_wal_before_visibility_and_rebuilds_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1173,19 +1176,19 @@ fn relational_sql_delete_uses_wal_before_visibility_and_rebuilds_from_wal() {
     };
     let index_result = recovered.execute_relational_select(&index_select).unwrap();
     assert!(index_result.rows.is_empty());
-    assert_eq!(
-        *index_result.access_path,
+    assert_recovered_relational_access_path(
+        &index_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "id".to_string(),
             matched_keys: 1,
-        }
+        },
     );
 }
 
 #[test]
 fn relational_sql_update_uses_wal_before_visibility_and_rebuilds_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1234,8 +1237,8 @@ fn relational_sql_update_uses_wal_before_visibility_and_rebuilds_from_wal() {
             vec![SqlValue::Int4(4)],
         ]
     );
-    assert_eq!(
-        *index_result.access_path,
+    assert_recovered_relational_access_path(
+        &index_result,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("name".to_string()),
@@ -1243,13 +1246,13 @@ fn relational_sql_update_uses_wal_before_visibility_and_rebuilds_from_wal() {
             order_column: "id".to_string(),
             descending: false,
             matched_keys: 3,
-        }
+        },
     );
 }
 
 #[test]
 fn relational_sql_views_select_and_replay_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1305,7 +1308,7 @@ fn relational_sql_views_select_and_replay_from_wal() {
 
 #[test]
 fn relational_sql_create_or_replace_view_replays_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1388,7 +1391,7 @@ fn relational_sql_create_or_replace_view_replays_from_wal() {
 
 #[test]
 fn relational_sql_layered_views_select_and_replay_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1489,7 +1492,7 @@ fn relational_sql_layered_views_select_and_replay_from_wal() {
 
 #[test]
 fn relational_sql_rename_view_replays_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1578,7 +1581,7 @@ fn relational_sql_rename_view_replays_from_wal() {
 
 #[test]
 fn relational_sql_drop_view_replays_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1628,7 +1631,7 @@ fn relational_sql_drop_view_replays_from_wal() {
         .to_string()
         .contains("view \"active_people\" does not exist"));
 
-    let table_target_engine = Engine::new_local();
+    let table_target_engine = Engine::new_local_cpu_oracle();
     table_target_engine
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1637,7 +1640,7 @@ fn relational_sql_drop_view_replays_from_wal() {
         .unwrap_err();
     assert!(table_target.to_string().contains("not a view"));
 
-    let preflight_engine = Engine::new_local();
+    let preflight_engine = Engine::new_local_cpu_oracle();
     preflight_engine
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1676,7 +1679,7 @@ fn relational_sql_drop_view_replays_from_wal() {
 
 #[test]
 fn relational_sql_sequence_catalog_objects_replay_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE SEQUENCE public.people_seq")
@@ -1735,7 +1738,7 @@ fn relational_sql_sequence_catalog_objects_replay_from_wal() {
         .relational_catalog_sequence("people_id_seq")
         .is_none());
 
-    let boundary = Engine::new_local();
+    let boundary = Engine::new_local_cpu_oracle();
     boundary
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1756,7 +1759,7 @@ fn relational_sql_sequence_catalog_objects_replay_from_wal() {
         .to_string()
         .contains("sequence \"missing_seq\" does not exist"));
 
-    let rename_boundary = Engine::new_local();
+    let rename_boundary = Engine::new_local_cpu_oracle();
     rename_boundary
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1777,7 +1780,7 @@ fn relational_sql_sequence_catalog_objects_replay_from_wal() {
 
 #[test]
 fn relational_sql_sequence_values_replay_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE SEQUENCE public.people_seq")
         .unwrap();
     let sequence = e.relational_catalog_sequence("people_seq").unwrap();
@@ -1828,7 +1831,7 @@ fn relational_sql_sequence_values_replay_from_wal() {
 
 #[test]
 fn relational_sequence_defaults_fill_omitted_columns_and_replay() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(
         1,
         "CREATE TABLE serial_people (id SERIAL PRIMARY KEY, name TEXT)",
@@ -1945,7 +1948,7 @@ fn relational_sequence_defaults_fill_omitted_columns_and_replay() {
 
 #[test]
 fn relational_sql_materialized_view_lifecycle_replays_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2055,7 +2058,7 @@ fn relational_sql_materialized_view_lifecycle_replays_from_wal() {
         None
     );
 
-    let boundary = Engine::new_local();
+    let boundary = Engine::new_local_cpu_oracle();
     boundary
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -2091,7 +2094,7 @@ fn relational_sql_materialized_view_lifecycle_replays_from_wal() {
 
 #[test]
 fn relational_sql_select_gpu_bridge_matches_cpu_results_at_sql_level() {
-    let cpu = Engine::new_local();
+    let cpu = Engine::new_local_cpu_oracle();
     cpu.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     cpu.execute_text(
@@ -2119,7 +2122,7 @@ fn relational_sql_select_gpu_bridge_matches_cpu_results_at_sql_level() {
 
 #[test]
 fn relational_sql_gpu_bridge_projection_result_shaping_does_not_report_gpu_fallback() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2145,7 +2148,7 @@ fn relational_sql_gpu_bridge_projection_result_shaping_does_not_report_gpu_fallb
 
 #[test]
 fn relational_sql_gpu_bridge_order_by_decoded_column_uses_ordered_key_batch() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2182,7 +2185,7 @@ fn relational_sql_gpu_bridge_order_by_decoded_column_uses_ordered_key_batch() {
 
 #[test]
 fn relational_sql_gpu_bridge_full_scan_order_by_uses_ordered_key_batch() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2221,7 +2224,7 @@ fn relational_sql_gpu_bridge_full_scan_order_by_uses_ordered_key_batch() {
 
 #[test]
 fn relational_sql_gpu_bridge_ordered_limit_offset_uses_ordered_key_batch() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2262,7 +2265,7 @@ fn relational_sql_gpu_bridge_ordered_limit_offset_uses_ordered_key_batch() {
 
 #[test]
 fn relational_sql_gpu_bridge_filtered_offset_without_limit_skips_after_order() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2299,7 +2302,7 @@ fn relational_sql_gpu_bridge_filtered_offset_without_limit_skips_after_order() {
 
 #[test]
 fn relational_sql_gpu_bridge_distinct_projection_keeps_gpu_row_fetch() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2343,7 +2346,7 @@ fn relational_sql_gpu_bridge_distinct_projection_keeps_gpu_row_fetch() {
 
 #[test]
 fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2481,7 +2484,7 @@ fn primary_key_rejects_null_on_insert_and_update() {
     // PK was validated only as a unique index whose BTreeSet collides NULLs, so exactly ONE NULL row
     // could slip in (and would then poison the resident PK index routes + the NULL-blind aggregate
     // fast paths). Both validator arms (index-driven + scan fallback) must reject it identically.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE pk_nn (id INT PRIMARY KEY, v INT)")
         .unwrap();
 
@@ -2561,7 +2564,7 @@ fn alter_add_primary_key_rejects_null_bearing_column() {
     // PG: promoting a null-bearing column to PRIMARY KEY fails (the creation-time half of the PK
     // NOT NULL invariant the DML validators rely on). After the NULL row is gone the promotion
     // succeeds, and the promoted PK then enforces not-null on subsequent writes.
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE promote (id INT, v INT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO promote (id, v) VALUES (NULL, 1), (2, 2)")

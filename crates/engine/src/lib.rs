@@ -12,9 +12,12 @@ use gpu_db_execution::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32BatchProjectionColumns,
     CudaI32Comparison, CudaI32EqualAnyProjectSubmission, CudaI32IndexProbeDenseSubmission,
     CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory,
-    CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, ExprStep, FilterOperator,
-    LimitOperator, MockGpuRuntime, Operator, PlannedOp, ProjectOperator, ResidentElemType,
-    RouteDecision, ScanOperator, SortOperator, VisibleLocateShard, WriteLocateShard,
+    CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, ExprStep, MockGpuRuntime, PlannedOp,
+    ResidentElemType, RouteDecision, VisibleLocateShard, WriteLocateShard,
+};
+#[cfg(test)]
+use gpu_db_execution::{
+    FilterOperator, LimitOperator, Operator, ProjectOperator, ScanOperator, SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{

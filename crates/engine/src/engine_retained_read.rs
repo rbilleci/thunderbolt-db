@@ -666,6 +666,15 @@ impl Engine {
         // rebuilds + overwrites — rare (once per residency generation) and harmless: each index is
         // self-contained and its in-flight kernels pin their own `Arc`, so a replaced entry's index buffer
         // is freed only once no submission still holds it.
+        // Serialize the budget check, device allocation, and cache publication with admission.
+        // A cap decline is intentionally just an index miss: the caller executes the same query
+        // with the resident GPU scan, never with host relational execution.
+        let _budget_allocation = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let built = self.build_wave_resident_int4_index(device_memory, filter_offset, row_count);
         let (index_memory, table_mask, hash_shift) = match &built {
             Some((memory, mask, shift)) => (Some(Arc::clone(memory)), *mask, *shift),
@@ -721,9 +730,29 @@ impl Engine {
         let index_bytes: Vec<u8> = index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
         let runtime = self.cuda_driver_probe_runtime();
         let gpu_id = device_memory.metadata().gpu_id;
+        if self
+            .relational_residency_budget_bytes(gpu_id)
+            .is_some_and(|budget| {
+                self.relational_resident_bytes_for_gpu(gpu_id)
+                    .saturating_add(index_bytes.len() as u64)
+                    > budget
+            })
+        {
+            return None;
+        }
         let memory = runtime
             .retain_device_memory_copy(gpu_id, &index_bytes)
             .ok()?;
+        if self
+            .relational_residency_budget_bytes(gpu_id)
+            .is_some_and(|budget| {
+                self.relational_resident_bytes_for_gpu(gpu_id)
+                    .saturating_add(memory.metadata().allocated_bytes)
+                    > budget
+            })
+        {
+            return None;
+        }
         Some((Arc::new(memory), table_mask, hash_shift))
     }
 
@@ -2122,11 +2151,16 @@ impl Engine {
                 return None;
             }
         }
-        // M3-for-shards: the batched gather (GPU dense-emit + host paths) both emit RAW i32 with NO validity
-        // channel, so they would read a NULL-stored-0 as 0 while the sharded SCAN is now NULL-aware. DECLINE a
-        // null-bearing table so the caller (facade -> per-query scan) serves it NULL-correctly. null-bearing is
-        // single-shard by construction, so this never costs the many-shard batched win. The
-        // `sharded_point_batch_*` null differentials are the tripwire that this decline holds.
+        // M3-for-shards: the batched gather (GPU dense-emit + host paths) emits RAW i32 with NO validity
+        // channel, so a NULL in the FILTER or any PROJECTED column would surface as a phantom 0. NULLs in
+        // UNREFERENCED columns are irrelevant: neither the device index nor the result kernel reads those
+        // bytes. Decline iff a referenced column has a bitmap; the caller's per-query NULL-aware scan serves
+        // that shape. This metadata-only eligibility check performs no host relational decision.
+        let mut referenced_names: std::collections::BTreeSet<&str> = selected_indexes
+            .iter()
+            .filter_map(|&idx| table.columns.get(idx).map(|column| column.name.as_str()))
+            .collect();
+        referenced_names.insert(table.columns.get(filter_idx)?.name.as_str());
         if self
             .read_state
             .residency
@@ -2134,9 +2168,12 @@ impl Engine {
             .load()
             .get(&table.name)
             .is_some_and(|shards| {
-                shards
-                    .iter()
-                    .any(|s| !s.resident_device_null_columns.is_empty())
+                shards.iter().any(|shard| {
+                    shard
+                        .resident_device_null_columns
+                        .iter()
+                        .any(|layout| referenced_names.contains(layout.name.as_str()))
+                })
             })
         {
             return None;
@@ -2144,8 +2181,9 @@ impl Engine {
         // Sub-slice 8: PREFER the fully-GPU dense-emit path (device-resident per-shard index + the
         // `gpu_db_resident_i32_index_probe_dense` kernel probes+gathers+emits on the GPU — no host per-needle
         // probe, one bulk DtoH per shard). Returns None -> fall through to the host-probe path below when a
-        // shard is VERSIONED (needs the SV3b deleted_by gate the dense kernel lacks), the shape/ncols is
-        // unsupported (>4 cols), or the index declines (dup) / errors. Byte-identical either way.
+        // shape/ncols is unsupported (>4 cols), or the index declines / errors. The dense kernel now evaluates
+        // created_by/deleted_by visibility itself; the host gather remains a correctness fallback, not the normal
+        // append-window route. Byte-identical either way.
         if let Some(gpu) = self.gather_sharded_int4_point_lookups_batched_gpu(
             table,
             filter_idx,
@@ -2462,6 +2500,14 @@ impl Engine {
         } else {
             row_count_u64.saturating_mul(2)
         };
+        // The host hash build is outside the allocation lock. Only its retained GPU result affects
+        // the residency cap, so serialize from this point through cache publication.
+        let _budget_allocation = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (device_index, table_mask, hash_shift) = match build_int4_pk_hash_table_host_visible(
             &keys,
             sizing_rows,
@@ -2470,9 +2516,9 @@ impl Engine {
             // F3/U4: place MVCC version twins (dead-old + live-new sharing a pk) rather than
             // declining — BUT only on a VERSIONED shard (one that carries a `deleted_by` region).
             // A version twin can only exist where a delete/update tombstoned the old, so a versioned
-            // shard's same-key duplicates are twins the dup-tolerant visible/write-locate resolves;
-            // the read-path first-match dense probe declines versioned shards outright, so this is
-            // safe for it. A DELETE-FREE shard has no versions, so a same-key duplicate is a genuine
+            // shard's same-key duplicates are twins the dup-tolerant visible/write-locate AND dense-read
+            // probes resolve by advancing past invisible hits. A DELETE-FREE shard has no versions, so a
+            // same-key duplicate is a genuine
             // DATA duplicate (a non-unique-key table) that MUST still decline the whole shard — the
             // first-match probe cannot resolve it. `deleted_stamps.is_some()` is exactly that gate.
             deleted_stamps.is_some(),
@@ -2482,11 +2528,31 @@ impl Engine {
                     index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
                 let runtime = self.cuda_driver_probe_runtime();
                 let gpu_id = build_memory.metadata().gpu_id;
+                if self
+                    .relational_residency_budget_bytes(gpu_id)
+                    .is_some_and(|budget| {
+                        self.relational_resident_bytes_for_gpu(gpu_id)
+                            .saturating_add(index_bytes.len() as u64)
+                            > budget
+                    })
+                {
+                    return None;
+                }
                 // An upload failure (e.g. OOM) is TRANSIENT -> return None WITHOUT caching (retry next
                 // batch); the caller falls back to the host path meanwhile.
                 let Ok(mem) = runtime.retain_device_memory_copy(gpu_id, &index_bytes) else {
                     return None;
                 };
+                if self
+                    .relational_residency_budget_bytes(gpu_id)
+                    .is_some_and(|budget| {
+                        self.relational_resident_bytes_for_gpu(gpu_id)
+                            .saturating_add(mem.metadata().allocated_bytes)
+                            > budget
+                    })
+                {
+                    return None;
+                }
                 (Some(Arc::new(mem)), table_mask, hash_shift)
             }
             // Duplicate / oversize key column -> declined; CACHE `None` so it is not rebuilt every batch.
@@ -2521,17 +2587,15 @@ impl Engine {
     }
 
     /// Sub-slice 8 (GPU-native probe): the FULLY-GPU batched cross-shard point-lookup — the charter-faithful
-    /// completion of lpb-for-shards. Per shard: ensure the device-resident PK index, then launch the
-    /// `gpu_db_resident_i32_index_probe_dense` kernel (`submit_match_project_i32_index_probe_dense_from_payload`)
-    /// which PROBES each needle + GATHERS the projected columns + DENSE-EMITS on the GPU — no host per-needle
-    /// probe, one bulk DtoH per shard. The per-shard dense outputs merge in ONE O(shards*needles) host pass
-    /// (status scan + flat compaction, NO per-needle allocation), scattered to NEEDLE ORDER.
+    /// completion of lpb-for-shards. It ensures each shard's device-resident PK index, then launches ONE
+    /// multi-shard kernel which probes, applies MVCC visibility, gathers, and dense-emits in needle order.
+    /// There is no per-shard launch, per-needle host probe, or host merge; completion performs one flat status
+    /// compaction over the single needle-indexed output.
     ///
     /// Returns `None` (the caller falls back to the host-probe `gather_sharded_int4_point_lookups_batched`
-    /// body, which applies the SV3b deleted_by gate) when: the projection is >4 int4 columns (the dense
-    /// kernel gathers <=4); ANY surviving shard is VERSIONED (has a `deleted_by` region — the dense kernel has
-    /// NO visibility gate, so a versioned shard MUST take the gated host path); a shard is invalid; the device
-    /// index declines (dup) / fails; a needle Hits >1 shard (cross-shard dup); or any device error. The
+    /// body, which applies the same visibility gates) when: the projection is >4 int4 columns (the dense
+    /// kernel gathers <=4); a shard is invalid; the device index declines / fails; a needle has >1 VISIBLE
+    /// match (uniqueness violation); or any device error. The
     /// DELETE-FREE majority (incl. the benchmark) takes this fully-GPU path. Increments
     /// `sharded_point_gpu_probe_hits` + `sharded_point_batch_hits`.
     fn gather_sharded_int4_point_lookups_batched_gpu(
@@ -2540,8 +2604,7 @@ impl Engine {
         filter_idx: usize,
         selected_indexes: &[usize],
         needles: &[i32],
-        // D3 hwm gate: the reader's boundary — created_by-only shards with hwm <= it are
-        // effectively version-free for the ungated dense kernel.
+        // D3: the reader's pinned boundary is consumed by the dense kernel's per-hit visibility gate.
         read_boundary: Index,
     ) -> Option<BatchedShardProjection> {
         let ncols = selected_indexes.len();
@@ -2556,7 +2619,7 @@ impl Engine {
         }
         let runtime_snapshot = self.router.runtime().snapshot();
         let n = needles.len();
-        // Build the per-shard descriptor list for the MULTI-SHARD kernel: for each non-empty, delete-free,
+        // Build the per-shard descriptor list for the MULTI-SHARD kernel: for each non-empty,
         // valid shard, ensure its DEVICE index + capture (device buffer, device index, mask, shift, capacity-
         // strided projection offsets, row_count). ONE kernel then probes ALL shards per needle + dense-emits a
         // single needle-indexed output (no S*N DtoH, no host merge).
@@ -2574,25 +2637,9 @@ impl Engine {
             if shard.row_count == 0 {
                 continue;
             }
-            // VERSION-FREE gate: a VERSIONED shard needs the SV3b `deleted_by[slot]` (and/or the SV6
-            // `created_by[slot]`) visibility gate, which the dense kernel does not apply -> fall back to
-            // the host gather (which applies both) for the whole batch. The `created_by` arm is DEFENSIVE
-            // today (sabotage-checked UNREACHABLE-to-violate: an incremental UPDATE always tombstones the
-            // old version FIRST, and the old row's shard precedes-or-equals the stamped open/rolled shard
-            // in this published-order scan, so the `deleted_by` arm always declines the batch no later
-            // than this one could). It becomes LOAD-BEARING the moment `deleted_by` regions can be
-            // reclaimed independently (VACUUM/GC, scalability-ledger #5) — do NOT remove it then.
-            // D4: read the version-freeness from the SAME loaded descriptor the batch will probe —
-            // a concurrent re-admit purging the side maps can no longer fake version-freeness here.
-            // D3 hwm gate: a created_by-only shard whose stamps are ALL <= the reader's boundary is
-            // effectively version-free — the ungated dense kernel is exact for this reader. Only a
-            // reader pinned inside an append window (s < hwm) falls back to the gated host gather.
-            // The deleted_by arm stays unconditional (LOAD-BEARING under VACUUM, ledger #5).
-            if shard.deleted_by_region.is_some()
-                || (shard.created_by_region.is_some() && read_boundary < shard.max_created_by)
-            {
-                return None;
-            }
+            // D3/D4: version regions come from this SAME loaded shard descriptor and ride the kernel submission
+            // as pinned Arcs. The dense probe applies `created_by <= read_boundary < deleted_by` per candidate,
+            // including readers pinned inside append publication and dead/live version twins in one hash index.
             let descriptor = self.resident_snapshot_for_shard(shard, table);
             let filter_offset =
                 resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
@@ -2637,6 +2684,8 @@ impl Engine {
                 hash_shift,
                 projection_offsets,
                 row_count: shard.row_count as u64,
+                created_by: shard.created_by_region.clone(),
+                deleted_by: shard.deleted_by_region.clone(),
                 min,
                 max,
             });
@@ -2651,7 +2700,11 @@ impl Engine {
             // own ptr from the descriptor array). ONE kernel launch, ONE bulk DtoH.
             let submission = probe_shards[0]
                 .resident
-                .submit_multi_shard_i32_index_probe_dense(&probe_shards, needles)
+                .submit_multi_shard_i32_index_probe_dense(
+                    &probe_shards,
+                    needles,
+                    read_boundary as u64,
+                )
                 .ok()?;
             let binary_mode = submission.multi_shard_binary_mode;
             let (cols, _elapsed) = submission.complete_detached_columnar().ok()?;

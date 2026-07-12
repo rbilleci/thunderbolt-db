@@ -6,6 +6,7 @@
 //! that pick the CPU/GPU path and hand off to the resident-probe executors.
 
 use super::*;
+use crate::engine_expr::ResidentExecSource;
 
 /// A non-grouped projection (no aggregate / GROUP BY / HAVING) with an ORDER BY whose keys are ALL
 /// i64-sortable int columns (int2/int4/int8/date/timestamp) -- one OR several keys (e.g.
@@ -177,6 +178,14 @@ impl Engine {
         // non-routable key (text/numeric/uuid/expression) or a non-resident table: a clean error, never a
         // wrong (first-key-only) result.
         if select.order_by.len() > 1 {
+            if self.table_is_gpu_resident(&select.table) {
+                on_pinned();
+                return self.execute_resident_select_via_general(select);
+            }
+            if let Some(result) = self.try_streaming_select(select) {
+                on_pinned();
+                return result;
+            }
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "multi-key ORDER BY runs on the GPU sort path (every key must be an i64-sortable \
                  base column on a GPU-resident table)"
@@ -205,7 +214,8 @@ impl Engine {
                     "only plain SELECT * FROM view is supported for views".to_string(),
                 )));
             }
-            return self.execute_relational_select(&view.query);
+            on_pinned();
+            return self.execute_relational_view_at(&view.query, s);
         }
         if let Some(view) = catalog
             .relational_materialized_views
@@ -218,14 +228,17 @@ impl Engine {
                         .to_string(),
                 )));
             }
-            return Ok(RelationalSelectResult {
-                columns: Arc::new(view.columns),
-                rows: (view.rows).into(),
-                planned_target: DeviceTarget::Cpu,
-                executed_target: DeviceTarget::Cpu,
-                fallback_reason: Some(FallbackReason::NotGpuEligible),
-                access_path: Arc::new(RelationalAccessPath::FullTableScan),
-            });
+            let table = RelationalTable {
+                schema: view.schema,
+                name: view.name,
+                oid: view.oid,
+                columns: view.columns,
+                indexes: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                acl: BTreeMap::new(),
+            };
+            return self.execute_transient_rows_via_general(select, table, view.rows, s);
         }
         // Phase-3 M2: a SELECT against a synthesized pg_catalog/information_schema relation
         // runs through the SAME bind -> filter -> project -> order/limit core as a user
@@ -235,26 +248,11 @@ impl Engine {
             if let Some((catalog_table, catalog_rows)) =
                 synthesize_catalog_relation(&select.table, &catalog)
             {
-                let bound = bind_relational_select(&catalog_table, select)?;
-                let result = MvccReadResult {
-                    planned_target: DeviceTarget::Cpu,
-                    executed_target: DeviceTarget::Cpu,
-                    fallback_reason: Some(FallbackReason::NotGpuEligible),
-                    rows: catalog_rows
-                        .iter()
-                        .map(|row| MvccReadRow {
-                            source_key: None,
-                            key: None,
-                            value: Some(encode_relational_row(row)),
-                        })
-                        .collect(),
-                };
-                return self.finalize_relational_select(
+                return self.execute_transient_rows_via_general(
                     select,
                     catalog_table,
-                    bound,
-                    RelationalAccessPath::FullTableScan,
-                    result,
+                    catalog_rows,
+                    s,
                 );
             }
         }
@@ -325,13 +323,39 @@ impl Engine {
         self.execute_relational_select_cpu_pinned_instrumented(select, on_pinned)
     }
 
+    fn execute_relational_view_at(
+        &self,
+        select: &Select,
+        copin_s: Index,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let catalog = self.read_state.catalog_as_of(copin_s);
+        if let Some(view) = catalog.relational_views.get(&select.table).cloned() {
+            if !select_is_plain_view_scan(select) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "only plain SELECT * FROM view is supported for views".to_string(),
+                )));
+            }
+            return self.execute_relational_view_at(&view.query, copin_s);
+        }
+        if let Some(result) = self.try_streaming_select_at(select, copin_s) {
+            return result;
+        }
+        if self.table_is_gpu_resident(&select.table) && !select.distinct {
+            let (table, bound, _) = self.bind_relational_select_at(select, copin_s)?;
+            return self.execute_resident_grouped_via_general_with_binding(
+                select, &table, bound, copin_s, None, None,
+            );
+        }
+        self.execute_relational_select_cpu_pinned_at(select, copin_s, || {})
+    }
+
     /// CPU-ENGINE RETIREMENT (ADR-006): is `table` GPU-resident right now — i.e. does it have a published
     /// single-buffer residency snapshot OR at least one live shard? The general Expr executor has no CPU
     /// fallback and hard-errors on a non-resident table, so the declined-route fallback gates on this
     /// (mirrors the `execute_relational_select_text` residency gate). A racing invalidation between this
     /// check and the executor's own load surfaces as an `is_residency_invalidated` error, which the
     /// fallback already routes to the CPU pinned path.
-    fn table_is_gpu_resident(&self, table: &str) -> bool {
+    pub(crate) fn table_is_gpu_resident(&self, table: &str) -> bool {
         self.relational_residency_snapshot(table).is_some()
             || self
                 .read_state
@@ -342,12 +366,38 @@ impl Engine {
                 .is_some_and(|shards| !shards.is_empty())
     }
 
+    fn execute_transient_rows_via_general(
+        &self,
+        select: &Select,
+        table: RelationalTable,
+        rows: Vec<Vec<SqlValue>>,
+        copin_s: Index,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let bound = bind_relational_select(&table, select)?;
+        let row_count = rows.len() as u64;
+        let (snapshot, memory) = self.build_transient_relation_residency(&table, &rows)?;
+        let source = ResidentExecSource {
+            descriptor: Arc::new(snapshot),
+            device_memory: Arc::new(memory),
+            row_count,
+        };
+        self.execute_resident_grouped_via_general_with_binding(
+            select,
+            &table,
+            bound,
+            copin_s,
+            Some(&source),
+            None,
+        )
+    }
+
     /// The CPU pinned-read path for a relational SELECT (write-half MVCC, Stage 4): bind, pin ONE
     /// generation + ONE visibility boundary for the whole statement (prereq #1 — the value-index
     /// lookup AND the row resolution both read from `pin`, never two `load_table()`s), build + run
     /// the MVCC query, finalize. Used both when the table is not GPU-resident AND as the transparent
     /// fallback when a resident route's residency was invalidated mid-statement by a concurrent
     /// committer (see [`Engine::execute_relational_select`]).
+    #[cfg(test)]
     pub(crate) fn execute_relational_select_cpu_pinned(
         &self,
         select: &Select,
@@ -355,14 +405,47 @@ impl Engine {
         self.execute_relational_select_cpu_pinned_instrumented(select, || {})
     }
 
+    #[cfg(not(test))]
+    pub(crate) fn execute_relational_select_cpu_pinned(
+        &self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        Err(self.gpu_read_required(select, "no GPU route accepted the statement"))
+    }
+
     /// [`Engine::execute_relational_select_cpu_pinned`] with the PART B test hook fired in the window
     /// BETWEEN binding the catalog (which captures the co-pin boundary `copin_s`) and pinning the data
     /// at that SAME `copin_s`. This is precisely the window co-pinning closes: the pin reuses
     /// `copin_s`, so a DDL committed while the hook is parked cannot make the data pin a different
     /// generation than the bound catalog. Production passes an empty hook (zero overhead).
+    #[cfg(test)]
     fn execute_relational_select_cpu_pinned_instrumented(
         &self,
         select: &Select,
+        on_bound_before_pin: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_select_cpu_pinned_at(
+            select,
+            self.committed_seq(),
+            on_bound_before_pin,
+        )
+    }
+
+    #[cfg(not(test))]
+    fn execute_relational_select_cpu_pinned_instrumented(
+        &self,
+        select: &Select,
+        on_bound_before_pin: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        on_bound_before_pin();
+        Err(self.gpu_read_required(select, "no GPU route accepted the statement"))
+    }
+
+    #[cfg(test)]
+    fn execute_relational_select_cpu_pinned_at(
+        &self,
+        select: &Select,
+        statement_copin_s: Index,
         on_bound_before_pin: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
         // RETIREMENT A4e — the READ-SIDE ladder seam: a host-path read on an ELIDED table would
@@ -385,13 +468,33 @@ impl Engine {
             self.deauthoritize_chunk_table(&select.table, false)
                 .map_err(ExecuteError::Engine)?;
         }
-        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) =
+            self.bind_relational_select_at(select, statement_copin_s)?;
         on_bound_before_pin();
         let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =
             self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
         let result = self.execute_mvcc_query_on_pin(&pin, &query)?;
         self.finalize_relational_select(select, table, bound, access_path, result)
+    }
+
+    #[cfg(not(test))]
+    fn execute_relational_select_cpu_pinned_at(
+        &self,
+        select: &Select,
+        _statement_copin_s: Index,
+        on_bound_before_pin: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        on_bound_before_pin();
+        Err(self.gpu_read_required(select, "the pinned GPU route became unavailable"))
+    }
+
+    #[cfg(not(test))]
+    fn gpu_read_required(&self, select: &Select, detail: &str) -> ExecuteError {
+        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "GPU execution is required for SELECT on relation \"{}\": {detail}",
+            select.table
+        )))
     }
 
     pub fn execute_relational_function(
@@ -407,31 +510,70 @@ impl Engine {
             ))));
         };
         let value = parse_bounded_sql_function_body(&function.body, function.return_type)?;
-        self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
-        Ok(RelationalSelectResult {
-            columns: Arc::new(vec![RelationalColumn {
-                id: 0,
-                table_oid: function.oid,
-                attnum: 1,
-                name: function.name.clone(),
-                ty: function.return_type,
-                domain: None,
-                default: None,
-                type_oid: function.return_type.postgres_oid(),
-                type_size: function.return_type.type_size(),
-            }]),
-            rows: (vec![vec![value]]).into(),
-            planned_target: DeviceTarget::Cpu,
-            executed_target: DeviceTarget::Cpu,
-            fallback_reason: Some(FallbackReason::NotGpuEligible),
-            access_path: Arc::new(RelationalAccessPath::FullTableScan),
-        })
+        // A bounded SQL function body is a typed literal. Parsing it is control-plane work;
+        // returning it is relational execution. Upload the literal as a one-row transient
+        // relation and run the same device projection used by catalog/materialized-view rows.
+        let column = RelationalColumn {
+            id: 0,
+            table_oid: function.oid,
+            attnum: 1,
+            name: function.name.clone(),
+            ty: function.return_type,
+            domain: None,
+            default: None,
+            type_oid: function.return_type.postgres_oid(),
+            type_size: function.return_type.type_size(),
+        };
+        let table = RelationalTable {
+            schema: function.schema.clone(),
+            name: format!("__gpu_function_{}", function.oid),
+            oid: function.oid,
+            columns: vec![column],
+            indexes: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            acl: BTreeMap::new(),
+        };
+        let select = Select {
+            table: table.name.clone(),
+            distinct: false,
+            projection: SelectProjection::All,
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        self.execute_transient_rows_via_general(
+            &select,
+            table,
+            vec![vec![value]],
+            self.committed_seq(),
+        )
     }
 
     pub fn execute_relational_select_with_cuda_driver_probe(
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        #[cfg(not(test))]
+        {
+            if self.table_is_gpu_resident(&select.table) {
+                return self.execute_resident_select_via_general(select);
+            }
+            if let Some(result) = self.try_streaming_select(select) {
+                return result;
+            }
+            Err(self.gpu_read_required(
+                select,
+                "the legacy CUDA-probe entry has no resident or streaming source",
+            ))
+        }
+        #[cfg(test)]
+        {
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =
@@ -439,55 +581,7 @@ impl Engine {
         let result =
             self.execute_mvcc_query_with_cuda_driver_probe_on_store(pin.store(), &query)?;
         self.finalize_relational_select(select, table, bound, access_path, result)
-    }
-
-    pub fn execute_relational_select_with_resident_snapshot_probe(
-        &self,
-        select: &Select,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-        let pin = self.pin_relational_read_at(&select.table, copin_s);
-        let (_query, access_path) =
-            self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
-        // Fetch the descriptor + host rows as ONE atomic entry (a single `load()`), so the metadata
-        // checked here and the rows materialized below come from the same residency generation.
-        let entry = self
-            .relational_residency_entry(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no resident snapshot",
-                    table.name
-                )))
-            })?;
-        let snapshot = &entry.descriptor;
-        if snapshot.schema != table.schema || snapshot.table != table.name {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot no longer matches catalog table identity".to_string(),
-            )));
         }
-        if !snapshot.is_valid() {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" resident snapshot is invalid",
-                table.name
-            ))));
-        }
-
-        // The host-row materialization is the other (Arc-shared) half of the SAME entry fetched above
-        // -- one consistent generation, no second load.
-        let result = MvccReadResult {
-            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            fallback_reason: None,
-            rows: entry
-                .host_rows_iter()
-                .map(|row| MvccReadRow {
-                    source_key: None,
-                    key: None,
-                    value: Some(encode_relational_row(row)),
-                })
-                .collect(),
-        };
-        self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
     pub fn execute_relational_select_with_resident_route(

@@ -15,6 +15,10 @@ impl Engine {
         &self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
+        #[cfg(not(test))]
+        return self.execute_mvcc_query_with_cuda_driver_probe(query);
+        #[cfg(test)]
+        {
         let backend = CpuMvccExecutionBackend;
         let kv = self.read_state.mvcc.load_kv();
         self.execute_mvcc_query_with_fallback_reason(
@@ -24,11 +28,13 @@ impl Engine {
             Some(FallbackReason::GpuMvccReadParityGap),
             false,
         )
+        }
     }
 
     /// Resolve a `MvccReadQuery` against the SAME pinned generation the query was built from
     /// (prereq #1, Stage 4) — the rows come from the exact `commit_seq` whose value-index produced
     /// the keys, so no concurrent publish can interleave index and rows.
+    #[cfg(test)]
     pub(crate) fn execute_mvcc_query_on_pin(
         &self,
         pin: &RelationalReadPin,
@@ -133,8 +139,22 @@ impl Engine {
         };
 
         let cuda_start = observe_cuda_probe_metrics.then(Instant::now);
+        #[cfg(test)]
         let backend_result =
             execute_mvcc_backend_chain(query, rows, backend, &CpuMvccExecutionBackend);
+        #[cfg(not(test))]
+        let backend_result = match backend.execute(query, rows) {
+            MvccBackendDispatch::Executed(executed) => FinalizedMvccBackendExecution {
+                executed_target: executed.executed_target,
+                fallback_reason: None,
+                rows: executed.rows,
+            },
+            MvccBackendDispatch::Fallback { reason, .. } => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "GPU execution is required for MVCC reads: {reason:?}"
+                ))))
+            }
+        };
         let result = MvccReadResult {
             planned_target,
             executed_target: backend_result.executed_target,
@@ -164,7 +184,7 @@ impl Engine {
         let mut cuda_h2d_bytes = cuda_mvcc_row_batch_transfer_bytes(&rows);
 
         let cuda_start = Instant::now();
-        let backend_result = match &query.source {
+        let backend_attempt = match &query.source {
             MvccReadSource::KeyBatchLookup { keys } => {
                 match execute_cuda_native_key_batch_query(query, keys, rows, backend) {
                     Ok((execution, key_batch_h2d_bytes)) => {
@@ -221,8 +241,9 @@ impl Engine {
                 execute_cuda_native_composition_query(query, source, rows, backend)
             }
             _ => execute_cuda_native_single_source_query(query, rows, backend),
-        }
-        .unwrap_or_else(|reason| {
+        };
+        #[cfg(test)]
+        let backend_result = backend_attempt.unwrap_or_else(|reason| {
             let visible_rows = resolve_mvcc_source(read_store, &query.source, query.visibility)
                 .expect("visibility was validated before native CUDA dispatch");
             let cpu_execution = match CpuMvccExecutionBackend.execute(query, visible_rows) {
@@ -237,6 +258,12 @@ impl Engine {
                 rows: cpu_execution.rows,
             }
         });
+        #[cfg(not(test))]
+        let backend_result = backend_attempt.map_err(|reason| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "GPU execution is required for MVCC reads: {reason:?}"
+            )))
+        })?;
 
         let result = MvccReadResult {
             planned_target,

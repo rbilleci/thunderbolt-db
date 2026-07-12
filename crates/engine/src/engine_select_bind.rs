@@ -22,6 +22,16 @@ impl Engine {
         select: &Select,
     ) -> Result<(RelationalTable, BoundRelationalSelect, Index), ExecuteError> {
         let s = self.committed_seq();
+        self.bind_relational_select_at(select, s)
+    }
+
+    /// Bind at a boundary already chosen by the statement owner. Recursive views/windows use this
+    /// entry so catalog resolution and every underlying data source share one `copin_s`.
+    pub(crate) fn bind_relational_select_at(
+        &self,
+        select: &Select,
+        s: Index,
+    ) -> Result<(RelationalTable, BoundRelationalSelect, Index), ExecuteError> {
         let table = self
             .read_state
             .catalog_as_of(s)
@@ -483,6 +493,7 @@ impl Engine {
         Ok(keyed_rows.into_iter().map(|(key, _)| key).collect())
     }
 
+    #[cfg(test)]
     pub(crate) fn finalize_relational_select(
         &self,
         select: &Select,

@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_filters() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -69,7 +69,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_filters
 
 #[test]
 fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_filters() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -127,7 +127,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_fi
 
 #[test]
 fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_order() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=member:1").unwrap();
@@ -195,7 +195,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_or
 
 #[test]
 fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_projection() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=Alpha Team").unwrap();
@@ -246,7 +246,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_pr
 
 #[test]
 fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_concat_cpu_resolved_sources() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -313,7 +313,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_concat_cpu_resolve
 
 #[test]
 fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_filters() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -384,7 +384,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_
 
 #[test]
 fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_path_filters() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -458,7 +458,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_
 #[test]
 fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_occurrence_path_filters(
 ) {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -525,7 +525,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_
 
 #[test]
 fn execute_mvcc_query_first_cuda_slice_backend_runs_nested_native_composition() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
 
@@ -577,7 +577,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_runs_nested_native_composition() 
 
 #[test]
 fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     for (txn_id, command) in include_str!("../../../../tests/fixtures/mvcc-read-workload.txt")
         .lines()
         .enumerate()
@@ -636,7 +636,7 @@ fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() 
 
 #[test]
 fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     for (txn_id, command) in include_str!("../../../../tests/fixtures/mvcc-full-scan-workload.txt")
         .lines()
         .enumerate()
@@ -722,7 +722,7 @@ fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
 
 #[test]
 fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     for (txn_id, command) in
         include_str!("../../../../tests/fixtures/mvcc-source-composition-workload.txt")
             .lines()
@@ -817,7 +817,7 @@ fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture(
 
 #[test]
 fn execute_mvcc_query_supports_multi_key_lookup_fan_in_source() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=locked").unwrap();
     e.execute_text(3, "SET user:1=active").unwrap();
@@ -901,7 +901,7 @@ fn execute_mvcc_query_supports_multi_key_lookup_fan_in_source() {
 
 #[test]
 fn execute_mvcc_query_supports_concat_source_composition() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1018,7 +1018,7 @@ fn execute_mvcc_query_supports_concat_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_concat_distinct_source_composition() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1120,7 +1120,7 @@ fn execute_mvcc_query_supports_concat_distinct_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_intersect_distinct_source_composition() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -1207,7 +1207,7 @@ fn execute_mvcc_query_supports_intersect_distinct_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_except_distinct_source_composition() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -1302,7 +1302,7 @@ fn execute_mvcc_query_supports_except_distinct_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_symmetric_difference_distinct_source_composition() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -1398,7 +1398,7 @@ fn execute_mvcc_query_supports_symmetric_difference_distinct_source_composition(
 
 #[test]
 fn execute_mvcc_query_supports_intersect_all_source_composition() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1487,7 +1487,7 @@ fn execute_mvcc_query_supports_intersect_all_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_except_all_source_composition() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1580,7 +1580,7 @@ fn execute_mvcc_query_supports_except_all_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_prefixes_source() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -1683,7 +1683,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_prefixes_sourc
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_refs_source() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -1783,7 +1783,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_refs
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_prefixes_source() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -1890,7 +1890,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_pref
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_ref_prefixes_source() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -2005,7 +2005,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_ref_
 
 #[test]
 fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -2110,7 +2110,7 @@ fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_chain_branches_source() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -2317,7 +2317,7 @@ fn execute_mvcc_query_supports_follow_value_chain_branches_source() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_chain_branch_first_non_empty_fan_in() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -2468,7 +2468,7 @@ fn execute_mvcc_query_supports_follow_value_chain_branch_first_non_empty_fan_in(
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_chain_terminal_input_provenance() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -2515,7 +2515,7 @@ fn execute_mvcc_query_supports_follow_value_chain_terminal_input_provenance() {
 
 #[test]
 fn execute_mvcc_query_supports_branch_fan_in_with_terminal_input_provenance() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=profile:3").unwrap();

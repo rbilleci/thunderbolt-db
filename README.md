@@ -1,139 +1,48 @@
 # gpu-database-engine
 
-Bootstrap implementation workspace for the GPU-first PostgreSQL-compatible
-database engine.
+A GPU-native PostgreSQL-compatible database engine under active development. GPU-resident execution is the
+product direction: the host handles protocol, planning, sequencing, durability, replication, staging, and final
+readback, while relational decisions and result values execute on the device.
 
-The current tree is a local product-readiness proof, not a production database
-claim. The durable source of truth is CPU/WAL/checkpoint/archive state; GPU
-resident state is explicit acceleration cache that can be rebuilt, refreshed,
-invalidated, or evicted without weakening WAL-before-visibility.
+## Start here
 
-## Current Envelope
+- [`docs/CHARTER.md`](docs/CHARTER.md) — mandate and non-negotiable execution boundary.
+- [`docs/PLAN.md`](docs/PLAN.md) — the **only** open/deferred work ledger.
+- [`docs/STATUS.md`](docs/STATUS.md) — current implementation facts and verification snapshot.
+- [`docs/HANDOVER.md`](docs/HANDOVER.md) — short current resume baton.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system design.
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — accepted rationale and ADRs.
 
-- PostgreSQL-facing compatibility covers a bounded `public` `int4`/`text`
-  relational subset with real `psql` and checked application-driver smokes for
-  `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, `psycopg`, `pgx`, JDBC,
-  and R2DBC.
-- DDL/catalog support is intentionally narrow but tested: supported public
-  tables, bounded indexes/constraints/defaults, views, materialized views,
-  sequences, domains, zero-argument literal SQL functions, selected comments,
-  bounded ACL/default-privilege metadata, and dump/restore surfaces are covered
-  where documented in the compatibility matrix.
-- Local release-candidate evidence is script-driven. The top-level preflight
-  aggregates validation, PostgreSQL product compatibility, local GPU residency,
-  and connection-security posture gates.
-- P8 retained GPU residency is bounded to supported public `int4`/`text` table
-  shapes. Current retained routes include aggregate/count families, supported
-  int4 projection and lookup families, selected-row composite/text lookup
-  materialization, warmup, maintenance, admission/eviction, invalidation, and
-  route telemetry.
-- The engine-backed benchmark pgwire endpoint is a bounded proof endpoint for
-  retained-route benchmarking through real `psql`/libpq traffic. It is not a
-  broad replacement for the full compatibility server.
+Design references under `docs/design/` are non-authoritative. Material under `docs/archive/` is historical and
+must never be interpreted as current work.
 
-See [docs/STATUS.md](docs/STATUS.md) for the current compatibility surface and the broad compat-suite total.
+## Current envelope
 
-## Quick Validation
+The engine has production-default GPU admission, sharded and streaming relational execution, GPU-native
+catalog/transient relations, PostgreSQL-facing compatibility for the documented bounded surface, WAL-before-
+visibility durability, covered intent-lane writes, and mixed GPU read/write gates. See `docs/STATUS.md` for the
+exact built surface and measurements; see `docs/PLAN.md` for every remaining obligation.
+
+## Common validation
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo check --workspace --all-targets --all-features
 cargo test --workspace --all-features
 scripts/run_psql_golden.sh
 scripts/run_application_driver_smokes.sh
-scripts/run_local_release_candidate_preflight.sh
 ```
 
-GPU/P8-specific local gates:
+Read/residency/result-path changes use the canonical report card:
 
 ```bash
-scripts/run_local_gpu_residency_preflight.sh
-scripts/run_p8_resident_warmup_preflight_smoke.sh
-scripts/run_p8_resident_maintenance_smoke.sh
-scripts/run_p8_ch_benchmark_residency_probe.sh --dry-run
+scripts/benchmark_report_card.sh
 ```
 
-P8 long-run benchmark commands are guarded. Do not run the full 25% or 125%
-tiers from unattended automation; use the benchmark doc and reports below to
-choose an operator-approved window and artifact budget.
+GPU tests must use bounded timeouts and serial sweeps. Never use `--gpu-reset`. Follow `AGENTS.md` for the full
+repository discipline and environment-specific gates.
 
-## P8 Benchmark Status
+## Safety invariant
 
-P8 benchmark work is currently focused on CH-benCHmark-derived `order_line`
-retained-residency evidence under identical PostgreSQL-compatible client
-boundaries.
-
-Current accepted smoke evidence:
-
-- The same scaled `psql`/libpq driver, query text, concurrency schedule, and
-  metric schema now runs against default PostgreSQL, tuned PostgreSQL, and the
-  GPU DB retained endpoint.
-- The latest scaled identical target includes the composite/text point lookup:
-  `SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info FROM order_line WHERE ol_o_id = <literal> AND ol_i_id = <literal>`.
-- The retained equality lookup path now uses device-side match-index compaction
-  for accepted int4 equality filters before selected int4/text projection
-  readback.
-- The scaled smoke is graph-ready for concurrency `1,2`; it is not the full
-  161,061,274-row 25% curve.
-- The identical target load path streams `CREATE TABLE` plus `COPY FROM STDIN`
-  into each target through `psql` and no longer writes a generated full-load
-  `load.sql`; the GPU DB endpoint now admits decoded COPY rows in bounded
-  chunks and sizes its lifecycle from the requested GPU DB curve. Richard
-  approved the guarded full 25% run, then pivoted the next attempt to 10% of
-  GPU memory. The first approved 25% attempt proved default PostgreSQL can load
-  all 161,061,274 rows. Reserved row-key MVCC insertion, grouped value-index
-  appends, and the COPY admission phase-profile fix made the bounded GPU DB
-  endpoint 1,048,576-row probe project the 64,424,510-row 10% COPY load inside
-  the 6h worker budget. The first 10% attempt loaded the target rows, but is
-  blocked because GPU DB sustained COPY admission measured below 30k rows/sec
-  and retained query timings made the remaining full concurrency curve
-  indefensible inside the worker budget. A follow-up 1,048,576-row retained
-  query profile removed the measured query setup bottlenecks. The WAL/current
-  apply architecture slice then cleared the bounded 30k rows/sec COPY gate by
-  avoiding duplicate generic state-machine clone/reparse of the current
-  engine-applied COPY WAL entry. The full 10% retry remains the next benchmark
-  decision.
-
-Current blockers and non-claims:
-
-- `missing_partitioned_over_resident_execution`
-- `p8_identical_10pct_execution_v4_required`
-- `pgsql_128_client_count_query_errors_need_classification`
-- no accepted 10% or full 25% default/tuned PostgreSQL/GPU DB retained curve
-- no completed 125% over-resident PostgreSQL-vs-GPU retained tier
-- no full CH-benCHmark, BenchBase, join, transaction-mix, external load
-  generation, production cache-daemon, durable GPU page, or external
-  orchestration claim
-
-Benchmark methodology and the dated run reports are archived under
-[docs/archive/testing/](docs/archive/testing/) (`benchmarks/` + `reports/series/...`).
-
-## Security And Operations
-
-The default compatibility endpoint remains a local/dev no-TLS, trust-style
-profile. The opt-in production security profile v1 requires complete TLS and
-SCRAM-SHA-256 verifier material and is covered by the local security posture
-preflight.
-
-Still out of scope: mTLS, certificate lifecycle automation, enterprise identity,
-external secret-manager/KMS/HSM integration, audit hash-chain, row-level
-security, masking, broad authorization, live systemd/Kubernetes rollout policy,
-physical page-image backup, production object storage, PITR/DR production
-runbooks beyond the documented local gates, migrations/upgrades, and broad
-prepared-statement/portal/cursor parity beyond the current supported subset.
-
-## Docs Map
-
-- [docs/README.md](docs/README.md): index of the six canonical docs.
-- [docs/CHARTER.md](docs/CHARTER.md): mandate, invariants, the OLTP bet, gotchas.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the full system design.
-- [docs/DECISIONS.md](docs/DECISIONS.md): decision ledger (ADRs).
-- [docs/PLAN.md](docs/PLAN.md): ordered forward work.
-- [docs/STATUS.md](docs/STATUS.md): current state (built / audited / gaps).
-- [docs/HANDOVER.md](docs/HANDOVER.md): rolling resume baton.
-- [docs/archive/](docs/archive/): reference corpus, dated benchmark evidence, ops runbooks, and superseded plans.
-
-## Safety Invariant
-
-The engine preserves **WAL-before-visibility**: a state transition is never
-visible to readers before its corresponding WAL record is durably flushed.
+A state transition is never visible before its WAL record is durably committed. Recovery, fallback, and repair
+changes must preserve acknowledged commits; fail-loud behavior is not an acceptable substitute for an
+RPO-preserving repair path.

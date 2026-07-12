@@ -1214,99 +1214,6 @@ mod capacity_payload_tests {
         );
     }
 
-    /// Slice 1b-ii-d: committed INSERTs append host rows as immutable SEGMENTS (so the commit is O(rows
-    /// appended), not the O(table) `host_rows` deep-clone — the dual-store tax's last residual; benchmark
-    /// shows the tax now flat ~40us at every base size). This gate proves the segmented `host_rows` reads
-    /// back CORRECTLY through the HOST-MATERIALIZATION path
-    /// (`execute_relational_select_with_resident_snapshot_probe`, which iterates `host_rows` segments via
-    /// `host_rows_iter`): after many appends produce MULTIPLE segments (non-vacuity assert), a scan +
-    /// point lookup over them must match the non-resident store baseline — same rows, same order. A
-    /// cross-segment ordering bug (or a dropped segment) in `host_rows_iter` fails the scan equality.
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn host_rows_segmented_append_reads_match_baseline() {
-        use gpu_db_sql::{parse_command, Command};
-        let load = |e: &Engine| {
-            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
-                .unwrap();
-            for i in 0..200_i64 {
-                e.execute_text(
-                    (i as u64) + 2,
-                    &format!(
-                        "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
-                        i * 10
-                    ),
-                )
-                .unwrap();
-            }
-        };
-
-        // Resident path: auto-admit -> the open-shard append fires repeatedly, accumulating host_rows
-        // SEGMENTS between headroom-overflow re-admits.
-        let e = Engine::new_local();
-        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-        e.set_host_install_elision_enabled(false);
-        // THE FLIP: this test exercises the SINGLE-BUFFER layer (a supported, settable configuration;
-        // sharded is the default) — pin the layout under test.
-        e.set_shard_residency_enabled(false);
-        e.set_auto_admit_on_commit(true);
-        load(&e);
-        // NON-VACUITY: the appends produced MULTIPLE host_rows segments — else cross-segment iteration
-        // order is untested (a single dense segment reads correctly trivially).
-        let entry = e.relational_residency_entry("accounts").unwrap();
-        assert!(
-            entry.host_rows.len() > 1,
-            "appends must produce multiple host_rows segments (got {}) or this gate is vacuous",
-            entry.host_rows.len()
-        );
-        assert_eq!(entry.host_row_count(), 200, "all 200 rows across segments");
-        drop(entry);
-
-        // Non-resident store baseline (single canonical materialization).
-        let base = Engine::new_local();
-        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-        base.set_host_install_elision_enabled(false);
-        load(&base);
-
-        let resident = |sql: &str| match parse_command(sql).unwrap() {
-            Command::Select(s) => {
-                e.execute_relational_select_with_resident_snapshot_probe(&s) // iterates host_rows segments
-                    .unwrap()
-                    .rows
-            }
-            _ => panic!("not a SELECT"),
-        };
-        let baseline = |sql: &str| match parse_command(sql).unwrap() {
-            Command::Select(s) => {
-                base.execute_relational_select_with_cuda_driver_probe(&s)
-                    .unwrap()
-                    .rows
-            }
-            _ => panic!("not a SELECT"),
-        };
-        // No ORDER BY: the result order IS the host_rows_iter (segment) order, so this differential is
-        // sensitive to cross-segment ordering (a re-sort would mask a wrong-order bug). Both paths yield
-        // insertion / TupleId order, so they must match iff the segments iterate in append order.
-        let scan = "SELECT id, balance FROM accounts";
-        let point = "SELECT id, balance FROM accounts WHERE id = 137";
-        let r_scan = resident(scan);
-        assert_eq!(
-            r_scan,
-            baseline(scan),
-            "segmented host_rows scan must match the baseline (cross-segment ORDER + content)"
-        );
-        assert_eq!(
-            resident(point),
-            baseline(point),
-            "segmented host_rows point lookup must match the baseline"
-        );
-        assert_eq!(
-            r_scan.len(),
-            200,
-            "all 200 rows present via the segmented host path"
-        );
-    }
-
     /// Billions-of-rows S-d1: admitting a table as a (single dense) SEGMENTED shard — `shard_residency`
     /// flag ON, routed through the sharded resident read path — must produce byte-identical reads to the
     /// single capacity-padded unified buffer (flag OFF). NON-VACUITY: with the flag ON the table lands in
@@ -7348,13 +7255,10 @@ mod capacity_payload_tests {
         // gather declines them post-M3, so this NULL-free differential no longer exercises a NULL sub-case.)
     }
 
-    /// M3-for-shards: the BATCHED gather DECLINES on a NULL-BEARING table. The batched path emits RAW i32 with
-    /// no validity channel, so (like the 3b route) it would read a NULL-stored-0 as 0 while the sharded SCAN is
-    /// now NULL-aware -> `gather_sharded_int4_point_lookups_batched` returns None for a table whose shard carries
-    /// a null bitmap, and the facade's per-query fallback serves it via the NULL-aware scan. A NULL-free control
-    /// still SERVES (the decline is null-specific, not always-None). (Before M3 this exercised the kernel's
-    /// keep-shard-0 NULL-as-0 find; that corner is now correctly unreachable via the batched gather. The
-    /// kernel's keep-shard-0 stays exercised for the out-of-range ABSENT case by the `matches` differential.)
+    /// M3-for-shards: the RAW-i32 batched gather DECLINES iff a REFERENCED filter/projection column carries a
+    /// NULL bitmap. A NULL in an unreferenced column is safe (the kernel never reads it) and must not disable the
+    /// GPU route for `SELECT id WHERE id = ?`; selecting that nullable column still declines to the NULL-aware
+    /// per-query scan. A NULL filter key likewise declines. These controls pin both sides of the metadata gate.
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn sharded_point_batch_declines_on_null_bearing() {
@@ -7376,6 +7280,47 @@ mod capacity_payload_tests {
             "NULL-free table: batched gather SERVES (the decline is null-specific, not always-None)"
         );
 
+        // A NULL in an UNREFERENCED column must not disable the raw-i32 route: SELECT id reads only
+        // the non-null key/projection column. Selecting the nullable column still declines because
+        // the compact batched result has no validity channel yet.
+        let u = Engine::new_local();
+        u.set_shard_residency_enabled(true);
+        u.set_auto_admit_on_commit(true);
+        u.set_shard_index_probe_enabled(true);
+        u.execute_text(1, "CREATE TABLE unref (id INT PRIMARY KEY, balance INT)")
+            .unwrap();
+        u.execute_text(2, "INSERT INTO unref (id, balance) VALUES (5,NULL),(7,70)")
+            .unwrap();
+        let tu = u.relational_catalog_table("unref").unwrap();
+        let idu = crate::rel_exec_helpers::relational_column_index(&tu, "id").unwrap();
+        let balu = crate::rel_exec_helpers::relational_column_index(&tu, "balance").unwrap();
+        let gpu_before = u.sharded_point_gpu_probe_hits();
+        let projected = u
+            .gather_sharded_int4_point_lookups_batched(
+                u.committed_seq(),
+                &tu,
+                idu,
+                &[idu],
+                &[5],
+            )
+            .expect("NULL in an unreferenced column does not disable the GPU batched route");
+        assert_eq!(projected.values, vec![5]);
+        assert!(
+            u.sharded_point_gpu_probe_hits() > gpu_before,
+            "unreferenced-NULL control executed the GPU probe"
+        );
+        assert!(
+            u.gather_sharded_int4_point_lookups_batched(
+                u.committed_seq(),
+                &tu,
+                idu,
+                &[idu, balu],
+                &[5],
+            )
+            .is_none(),
+            "referencing the nullable projection still declines to the NULL-aware path"
+        );
+
         // NULL-BEARING (a NULL id -> a null bitmap on the filter column): the batched gather DECLINES (None).
         let k = Engine::new_local();
         k.set_shard_residency_enabled(true);
@@ -7393,7 +7338,7 @@ mod capacity_payload_tests {
         assert!(
             k.gather_sharded_int4_point_lookups_batched(k.committed_seq(), &t, id, &[id, bal], &[5])
                 .is_none(),
-            "null-bearing table: batched gather DECLINES (-> the facade per-query fallback runs the NULL-aware scan)"
+            "NULL filter key: batched gather DECLINES (-> the facade per-query fallback runs the NULL-aware scan)"
         );
     }
 
@@ -7402,10 +7347,9 @@ mod capacity_payload_tests {
     /// O(log shards) (binary-search depth ~4) instead of the O(shards) linear scan. Needles span EVERY shard
     /// (present), the exact seal boundaries (15/16/.../240), and out-of-all-ranges keys (300/-5/1000 -> the
     /// binary BKEEP0 fallback -> absent). Byte-identical to the scan proves the binary search lands on the RIGHT
-    /// shard at every depth. NOTE: multi-shard tables are NULL-FREE by construction (the incremental-rollover
-    /// admit rejects NULLs -> a NULL forces a single shard = LINEAR mode), so binary BKEEP0 only ever resolves
-    /// to absent here; a null-bearing table declines the whole batched gather (see
-    /// `sharded_point_batch_declines_on_null_bearing`) so its NULL-as-0 read is served by the NULL-aware scan.
+    /// shard at every depth. A NULL in a referenced key/projection still declines to the NULL-aware scan; a
+    /// nullable unreferenced column is permitted because the batched kernel never reads it (see
+    /// `sharded_point_batch_declines_on_null_bearing`).
     /// Sabotage: a wrong binary candidate (or a broken bound) makes a present needle materialize the wrong row.
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
@@ -7487,10 +7431,10 @@ mod capacity_payload_tests {
         }
     }
 
-    /// STEP 1 (lpb-for-shards) — the BATCHED path applies the SV3b `deleted_by` visibility gate: with in-place
-    /// tombstoning ON, a deleted needle materializes ZERO rows in the batch == the single-flight route, while
-    /// live neighbors in the SAME versioned shard still materialize. Sabotage: inverting the gate leaks the
-    /// tombstoned row into the batch.
+    /// Dense sharded point batches apply BOTH visibility bounds on-device. A deleted needle is hidden while live
+    /// neighbors survive, and an INSERT committed after an explicitly pinned boundary is hidden at the old
+    /// boundary but visible at the current one. The GPU counter must advance for both versioned cases: a host
+    /// visibility gather would make this test vacuous. Sabotage either compare and a dead/future row leaks.
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn sharded_point_batch_deleted_by_gate() {
@@ -7529,13 +7473,9 @@ mod capacity_payload_tests {
                 &needles,
             )
             .expect("batched served");
-        // Sub-slice 8: the shard is VERSIONED (has a deleted_by region), so the un-gated GPU dense-emit path
-        // must DECLINE -> the host-probe path (which applies the SV3b gate) serves it. Prove the GPU path did
-        // NOT fire (else it would leak the tombstoned row).
-        assert_eq!(
-            t.sharded_point_gpu_probe_hits(),
-            gpu_hb,
-            "versioned shard -> GPU dense path declined -> host-gated fallback served it"
+        assert!(
+            t.sharded_point_gpu_probe_hits() > gpu_hb,
+            "versioned shard stays on the fully-GPU dense path"
         );
         let count = |i: usize| proj.needle_ranges[i].1;
         assert_eq!(count(0), 1, "id=129 live -> 1 row");
@@ -7566,6 +7506,38 @@ mod capacity_payload_tests {
                 "batched row count == single-flight for id={k}"
             );
         }
+
+        // D3 lower bound: append a fresh row, then query it at the prior and current snapshots. Both calls fire
+        // the dense route; only the snapshot boundary changes the on-device visibility verdict.
+        let prior_snapshot = t.committed_seq();
+        t.execute_text(301, "INSERT INTO accounts (id, balance) VALUES (201, 2010)")
+            .unwrap();
+        let table = t.relational_catalog_table("accounts").unwrap();
+        let gpu_before_birth_checks = t.sharded_point_gpu_probe_hits();
+        let old = t
+            .gather_sharded_int4_point_lookups_batched(
+                prior_snapshot,
+                &table,
+                id_col,
+                &[id_col, bal_col],
+                &[201],
+            )
+            .expect("prior-snapshot dense probe served");
+        assert_eq!(old.needle_ranges[0].1, 0, "future-born row hidden");
+        let current = t
+            .gather_sharded_int4_point_lookups_batched(
+                t.committed_seq(),
+                &table,
+                id_col,
+                &[id_col, bal_col],
+                &[201],
+            )
+            .expect("current-snapshot dense probe served");
+        assert_eq!(current.needle_ranges[0].1, 1, "born row visible now");
+        assert!(
+            t.sharded_point_gpu_probe_hits() >= gpu_before_birth_checks + 2,
+            "both snapshot-bound checks fired the fully-GPU dense probe"
+        );
     }
 
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
@@ -7605,6 +7577,57 @@ mod capacity_payload_tests {
         let (names, types) = int4_cols();
         let rows = int4_rows(5);
         assert!(build_relational_device_payload_with_capacity(&names, &types, &rows, 3).is_err());
+    }
+
+    /// S-F/R-1: the per-shard device hash index obeys the same hard cap as base payloads.
+    /// At a cap equal to the admitted shard+identity bytes, the optional index declines and the
+    /// sharded point path still returns the correct row through its GPU-scan/host-routing fallback.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sharded_device_index_declines_at_residency_budget() {
+        let mut e = Engine::new_local_cpu_oracle();
+        e.set_shard_residency_enabled(true);
+        e.set_shard_index_probe_enabled(true);
+        e.execute_text(1, "CREATE TABLE capped_shard_index (id INT, balance INT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO capped_shard_index VALUES (10, 100), (20, 200), (30, 300)",
+        )
+        .unwrap();
+        let admitted = e
+            .populate_relational_residency_snapshot("capped_shard_index")
+            .unwrap();
+        if admitted.device_memory_proof.is_none() {
+            return;
+        }
+        let budget = e.relational_resident_bytes_for_gpu(0);
+        e.set_relational_residency_budget_bytes(0, budget);
+        let table = e.relational_catalog_table("capped_shard_index").unwrap();
+        let id = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+        let balance =
+            crate::rel_exec_helpers::relational_column_index(&table, "balance").unwrap();
+        let result = e
+            .gather_sharded_int4_point_lookups_batched(
+                e.committed_seq(),
+                &table,
+                id,
+                &[id, balance],
+                &[20],
+            )
+            .expect("the capped index declines to the correct sharded fallback");
+        assert_eq!(result.values, vec![20, 200]);
+        assert!(
+            e.read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .all(|entry| entry.device_index.is_none()),
+            "no over-budget shard index may remain retained"
+        );
+        assert!(e.relational_resident_bytes_for_gpu(0) <= budget);
     }
 }
 
@@ -7841,14 +7864,65 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .contains(&gpu_id);
-        let admission_budget_bytes = cat
-            .relational_resident_cache
-            .budget_bytes_by_gpu
-            .get(&gpu_id)
-            .copied();
-        let (evicted_tables_on_admission, resident_bytes_after_admission) =
-            self.admit_relational_residency_snapshot_inner(cat, table, gpu_id, resident_bytes)?;
+        let use_sharded_layout = self.shard_residency_enabled()
+            && (purely_int4 || fixed_width_sections || text_sectioned);
+        let row_id_payload = use_sharded_layout.then(|| {
+            let mut payload =
+                vec![ROW_ID_UNSTAMPED_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
+            for (slot, row_id) in resident_row_ids.iter().enumerate() {
+                payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
+            }
+            payload
+        });
+
+        // S-F/R-1: allocate the complete mandatory replacement set BEFORE selecting or removing
+        // an evictee. Allocation failure therefore leaves every published resident generation
+        // untouched. The same lock is used by lazy index publication, making the budget preflight
+        // and the final descriptor/index publication one serialized accounting transaction.
+        let _budget_allocation = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let device_memory = self.relational_residency_device_memory(gpu_id, &device_payload);
+        #[cfg(not(test))]
+        if device_memory.is_none() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{table}\" GPU {gpu_id} residency allocation failed before admission"
+            ))));
+        }
+        let admitted_row_id_region = if device_memory.is_some() {
+            row_id_payload.as_ref().and_then(|payload| {
+                self.relational_residency_device_memory(gpu_id, payload)
+                    .map(Arc::new)
+            })
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        if row_id_payload.is_some() && admitted_row_id_region.is_none() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{table}\" GPU {gpu_id} mandatory row-identity allocation failed before admission"
+            ))));
+        }
+        let allocated_payload_bytes = device_memory.as_ref().map_or(
+            device_payload.len() as u64,
+            |memory| memory.metadata().allocated_bytes,
+        );
+        let allocated_row_id_bytes = admitted_row_id_region
+            .as_ref()
+            .map_or(0, |memory| memory.metadata().allocated_bytes);
+        let admitted_allocated_bytes =
+            allocated_payload_bytes.saturating_add(allocated_row_id_bytes);
+        let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
+        let (evicted_tables_on_admission, resident_bytes_after_admission) =
+            self.admit_relational_residency_snapshot_inner(
+                cat,
+                table,
+                gpu_id,
+                admitted_allocated_bytes,
+            )?;
         let device_memory_proof = device_memory
             .as_ref()
             .map(|device_memory| device_memory.metadata().clone());
@@ -7934,30 +8008,17 @@ impl Engine {
                 .residency
                 .shard_created_by_memory
                 .remove_table(table);
-            // RETIREMENT A1: replace the row-identity regions with this rebuild's (parsed from the
-            // scanned tuple keys; capacity-sized, sentinel-filled headroom). Installed BEFORE the
-            // shard metadata publishes, mirroring the device-memory ordering. Allocation failure ->
-            // no region -> identity-unknown (device resolves decline; never a wrong identity).
+            // RETIREMENT A1: replace the row-identity regions with this rebuild's already-allocated
+            // capacity-sized region. Allocation happened before budget eviction, so a failure could
+            // not strand the resident set in a partially-evicted state.
             read_state.residency.shard_row_id_memory.remove_table(table);
-            // D4: keep the region Arc so the published descriptor carries it (one-load snapshot).
-            let admitted_row_id_region = {
-                let mut payload =
-                    vec![ROW_ID_UNSTAMPED_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
-                for (slot, row_id) in resident_row_ids.iter().enumerate() {
-                    payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
-                }
-                let region = self
-                    .relational_residency_device_memory(gpu_id, &payload)
-                    .map(Arc::new);
-                if let Some(region) = &region {
-                    read_state.residency.shard_row_id_memory.insert_shard(
-                        table,
-                        0,
-                        Arc::clone(region),
-                    );
-                }
-                region
-            };
+            if let Some(region) = &admitted_row_id_region {
+                read_state.residency.shard_row_id_memory.insert_shard(
+                    table,
+                    0,
+                    Arc::clone(region),
+                );
+            }
             // Sub-slice 3b: this sharded re-admit replaces the table's shards -> purge stale cached indexes.
             read_state.residency.purge_shard_pk_index_for_table(table);
             let dm = Arc::new(device_memory.expect("device_memory.is_some() checked"));
@@ -7992,7 +8053,7 @@ impl Engine {
                     .resident_device_int4_column_stats
                     .clone(),
                 resident_bytes,
-                allocated_bytes: device_payload.len() as u64,
+                allocated_bytes: allocated_payload_bytes,
                 count_header_byte_offset: 0,
                 resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
                 // TYPE-COVERAGE track 2 slice 2: the i64 section rides the same payload.
@@ -8059,7 +8120,6 @@ impl Engine {
         cat.relational_resident_cache.install_snapshot(
             catalog_table.name,
             snapshot.clone(),
-            resident_rows,
             device_memory,
             &read_state.residency,
         );
@@ -8073,11 +8133,7 @@ impl Engine {
         gpu_id: u16,
         resident_bytes: u64,
     ) -> Result<(Vec<String>, u64), ExecuteError> {
-        let Some(budget_bytes) = cat
-            .relational_resident_cache
-            .budget_bytes_by_gpu
-            .get(&gpu_id)
-            .copied()
+        let Some(budget_bytes) = self.relational_residency_budget_bytes(gpu_id)
         else {
             let resident_bytes_after_admission = self
                 .relational_resident_bytes_for_gpu_excluding(gpu_id, table)
@@ -8116,9 +8172,8 @@ impl Engine {
             ))));
         }
 
-        let mut current_bytes = self.relational_resident_bytes_for_gpu_excluding(gpu_id, table);
+        let current_bytes = self.relational_resident_bytes_for_gpu_excluding(gpu_id, table);
         let current_bytes_before = current_bytes;
-        let mut evicted_tables = Vec::new();
         if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
             cat.relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
@@ -8132,38 +8187,78 @@ impl Engine {
                     current_bytes_after: current_bytes + resident_bytes,
                     evicted_tables: Vec::new(),
                 });
-            return Ok((evicted_tables, current_bytes + resident_bytes));
+            return Ok((Vec::new(), current_bytes + resident_bytes));
         }
 
-        let mut candidates = self
+        let mut candidates: BTreeMap<String, u64> = self
             .read_state
             .residency
             .snapshots
             .load()
             .iter()
             .filter(|(name, entry)| name.as_str() != table && entry.descriptor.gpu_id == gpu_id)
-            .map(|(name, entry)| {
-                (
-                    entry.descriptor.valid_through_index,
-                    entry.descriptor.table.clone(),
-                    name.clone(),
-                    entry.descriptor.resident_bytes,
-                )
-            })
-            .collect::<Vec<_>>();
+            .map(|(name, entry)| (name.clone(), entry.descriptor.valid_through_index))
+            .collect();
+        for (name, shards) in self.read_state.residency.shards.load().iter() {
+            if name == table || !shards.iter().any(|shard| shard.gpu_id == gpu_id) {
+                continue;
+            }
+            let age = shards
+                .iter()
+                .filter(|shard| shard.gpu_id == gpu_id)
+                .map(|shard| shard.max_created_by)
+                .max()
+                .unwrap_or(0);
+            candidates.entry(name.clone()).or_insert(age);
+        }
+        let mut candidates: Vec<(u64, String)> = candidates
+            .into_iter()
+            .map(|(name, age)| (age, name))
+            .collect();
         candidates.sort();
-        for (_valid_through_index, _snapshot_table, map_key, bytes) in candidates {
-            if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
+        // Select the complete deterministic eviction prefix without mutating the published
+        // resident set. `resident_bytes` has already been allocated successfully by the caller.
+        // If the prefix cannot make enough room, the operation declines with zero evictions.
+        let mut projected_bytes = current_bytes;
+        let mut evicted_tables = Vec::new();
+        for (_age, map_key) in candidates {
+            if projected_bytes.saturating_add(resident_bytes) <= budget_bytes {
                 break;
             }
-            let read_state = Arc::clone(&self.read_state);
+            let candidate_bytes = self.relational_resident_table_bytes_for_gpu(&map_key, gpu_id);
+            if candidate_bytes == 0 {
+                continue;
+            }
+            projected_bytes = projected_bytes.saturating_sub(candidate_bytes);
+            evicted_tables.push(map_key);
+        }
+        if projected_bytes.saturating_add(resident_bytes) > budget_bytes {
+            cat.relational_resident_cache
+                .record_decision(RelationalResidentCacheDecision {
+                    table: table.to_string(),
+                    gpu_id,
+                    accepted: false,
+                    reason: "insufficient evictable GPU residency budget".to_string(),
+                    resident_bytes,
+                    budget_bytes: Some(budget_bytes),
+                    current_bytes_before,
+                    current_bytes_after: current_bytes,
+                    evicted_tables: Vec::new(),
+                });
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{table}\" cannot be admitted within GPU {gpu_id} residency budget {budget_bytes} bytes from the available eviction set"
+            ))));
+        }
+
+        // No fallible work remains after this point: the replacement buffers are retained and the
+        // full eviction prefix is known to fit. Publish the retirements, then the replacement.
+        let read_state = Arc::clone(&self.read_state);
+        for map_key in &evicted_tables {
             cat.relational_resident_cache.remove_table(
-                &map_key,
+                map_key,
                 &read_state.residency,
                 &read_state.route_telemetry,
             );
-            current_bytes = current_bytes.saturating_sub(bytes);
-            evicted_tables.push(map_key);
         }
 
         cat.relational_resident_cache
@@ -8179,10 +8274,10 @@ impl Engine {
                 resident_bytes,
                 budget_bytes: Some(budget_bytes),
                 current_bytes_before,
-                current_bytes_after: current_bytes + resident_bytes,
+                current_bytes_after: projected_bytes + resident_bytes,
                 evicted_tables: evicted_tables.clone(),
             });
-        Ok((evicted_tables, current_bytes + resident_bytes))
+        Ok((evicted_tables, projected_bytes + resident_bytes))
     }
 
     /// `&mut self` entry for the operator warm path: acquire the catalog latch, then run the
@@ -8208,9 +8303,10 @@ impl Engine {
         self.populate_relational_residency_snapshot_inner(&mut guard, table, gpu_id)
     }
 
-    /// `&mut self` entry for the benchmark residency installers.
+    /// Catalog-latched entry for the benchmark residency installers. `&self` lets the caller keep
+    /// the shared allocation transaction held through allocate → admit → publish.
     fn admit_relational_residency_snapshot(
-        &mut self,
+        &self,
         table: &str,
         gpu_id: u16,
         resident_bytes: u64,
@@ -8219,15 +8315,15 @@ impl Engine {
         self.admit_relational_residency_snapshot_inner(&mut guard, table, gpu_id, resident_bytes)
     }
 
-    /// STRATA S-B: enable/disable automatic GPU-residency admission on commit. Default OFF — turning it
-    /// on makes a committed table GPU-resident so subsequent reads take the GPU-native route instead of
-    /// the host path. `&self` (an interior-mutable flag the commit path reads).
+    /// STRATA S-F: enable/disable automatic GPU-residency admission on commit. Default ON: committed
+    /// tables become GPU-resident so subsequent reads take the GPU-native route. Turning it off is an
+    /// explicit parity-oracle/operator kill switch. `&self` (an interior-mutable flag the commit path reads).
     pub fn set_auto_admit_on_commit(&self, on: bool) {
         self.auto_admit_on_commit
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) fn auto_admit_on_commit_enabled(&self) -> bool {
+    pub fn auto_admit_on_commit_enabled(&self) -> bool {
         self.auto_admit_on_commit
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -8831,6 +8927,13 @@ impl Engine {
             .map_or(0, |shards| shards.len())
     }
 
+    pub fn rollover_budget_declines(&self) -> u64 {
+        self.read_state
+            .residency
+            .rollover_budget_declines
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Slice 1b-ii: append an INSERT's APPLIED rows IN PLACE into the table's resident OPEN shard's
     /// capacity headroom, instead of a full re-admit. `new_rows` MUST be the post-coercion/post-default
     /// applied images (the WriteDelta's `PreparedMutation::Insert.inserted_rows`), in catalog order, so
@@ -8949,15 +9052,6 @@ impl Engine {
                 desc.generation = desc.generation.saturating_add(1);
                 desc.row_count += k;
                 desc.resident_bytes = desc.resident_bytes.saturating_add(appended_bytes);
-                // Keep host_rows (the CPU-path materialization) consistent: new INSERTs get monotonic
-                // tuple_ids, so they sort to the END of the seq-scan order — the same place the device
-                // append wrote them. Slice 1b-ii-d: APPEND a new immutable segment (the appended rows)
-                // instead of deep-cloning the whole row vec. make_mut here clones only the small
-                // Vec<HostRowSegment> pointer list (one element per append since the last re-admit folds it
-                // back to one), so the host side is O(rows appended) + O(num_segments) — no longer the
-                // O(table) dual-store residual. Prior segments' row data is shared (refcounted), not copied.
-                std::sync::Arc::make_mut(&mut entry.host_rows)
-                    .push(std::sync::Arc::new(new_rows.to_vec()));
             }
         });
         // Slice 1b-ii (audit Finding A): the wave/lpb GPU index cache (engine_retained_read.rs) validates a
@@ -8985,8 +9079,8 @@ impl Engine {
     /// headroom (the last shard in `residency.shards`) — the shard-path analog of the single-buffer append.
     /// Empty + NULL-bearing rows are already rejected by the caller. Returns false (caller invalidates +
     /// re-admits) when the open shard isn't int4-appendable, is invalid, or has no headroom (seal + a fresh
-    /// open shard on overflow is S-d2c), or the device append fails. No host_rows (shard tables read via the
-    /// device recompaction, not the host-materialization path) and no single-buffer `wave_index` to drop.
+    /// open shard on overflow is S-d2c), or the device append fails. Shard tables read via device
+    /// recompaction and have no single-buffer `wave_index` to drop.
     /// (The sub-slice-3a `shard_pk_index` per-shard cache IS ptr-keyed but ALSO row_count-validated, so an
     /// in-place append grows row_count -> next probe misses -> rebuild; no explicit invalidation needed here.)
     fn try_append_to_resident_open_shard(
@@ -9375,6 +9469,38 @@ impl Engine {
                 }
                 Err(_) => return false,
             };
+        // R-1 / S-F: rollover is an admission event too. Account the new payload plus its
+        // mandatory created_by region and optional row-identity region before allocating any of
+        // them. If it would cross the configured/default GPU budget, decline atomically; the
+        // caller invalidates this table and the normal admission path may evict an older table or
+        // leave this relation to the bounded streaming executor. The commit remains durable.
+        let rollover_bytes = (device_payload.len() as u64)
+            .saturating_add((new_capacity as u64).saturating_mul(8))
+            .saturating_add(if row_ids.is_some() {
+                (new_capacity as u64).saturating_mul(8)
+            } else {
+                0
+            });
+        let _budget_allocation = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .relational_residency_budget_bytes(gpu_id)
+            .is_some_and(|budget| {
+                self.relational_resident_bytes_for_gpu(gpu_id)
+                    .saturating_add(rollover_bytes)
+                    > budget
+            })
+        {
+            self.read_state
+                .residency
+                .rollover_budget_declines
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         // SV1/SV2: the rolled shard carries NO version metadata in its payload — `created_by` is gone and
         // `deleted_by` is on-demand (allocated in `shard_deleted_by_memory` on the shard's first delete).
         let Some(new_device_memory) = self
@@ -9417,6 +9543,36 @@ impl Engine {
         } else {
             None
         };
+        if row_ids.is_some() && rolled_row_id_region.is_none() {
+            return false;
+        }
+        let rollover_allocated_bytes = new_device_memory
+            .metadata()
+            .allocated_bytes
+            .saturating_add(
+                rolled_created_by_region
+                    .as_ref()
+                    .map_or(0, |region| region.metadata().allocated_bytes),
+            )
+            .saturating_add(
+                rolled_row_id_region
+                    .as_ref()
+                    .map_or(0, |region| region.metadata().allocated_bytes),
+            );
+        if self
+            .relational_residency_budget_bytes(gpu_id)
+            .is_some_and(|budget| {
+                self.relational_resident_bytes_for_gpu(gpu_id)
+                    .saturating_add(rollover_allocated_bytes)
+                    > budget
+            })
+        {
+            self.read_state
+                .residency
+                .rollover_budget_declines
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         let new_shard = RelationalResidentShard {
             shard_id: new_shard_id,
             row_start: row_start.saturating_add(row_count),
@@ -9439,7 +9595,7 @@ impl Engine {
                     .iter()
                     .map(|t| (k + 1) * 8 + t.bytes_len as usize)
                     .sum::<usize>()) as u64,
-            allocated_bytes: device_payload.len() as u64,
+            allocated_bytes: new_device_memory.metadata().allocated_bytes,
             count_header_byte_offset: 0,
             resident_device_int4_columns: shard_int4_names.clone(),
             resident_device_int8_columns: shard_int8_names.clone(),
@@ -9586,37 +9742,69 @@ impl Engine {
         {
             Some(region) => region,
             None => {
-                // Born all-live: every u64 = the LIVE sentinel `0x7F7F_7F7F_7F7F_7F7F` (memset byte 0x7F).
-                // It must be a LARGE POSITIVE SIGNED i64 (the read visibility compare `deleted_by >
-                // read_txn_id` uses the SIGNED s64 kernel) — `u64::MAX` would be -1 as signed and a live row
-                // would wrongly FAIL `> read_txn_id`. 0x7F7F... ≈ 9.1e18 > every real commit `Index`; byte
-                // 0x7F is also uniform so the same value is producible by the SV3a recompaction memset-fill.
-                let live_payload =
-                    vec![DELETED_BY_LIVE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
-                let Some(region) = self.relational_residency_device_memory(gpu_id, &live_payload)
-                else {
-                    return false;
-                };
-                let region = Arc::new(region);
-                self.read_state
+                let _budget_allocation = self
+                    .read_state
+                    .residency
+                    .budget_allocation_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Re-check after joining the allocation transaction: another first-delete may
+                // have published the region while this caller waited.
+                if let Some(region) = self
+                    .read_state
                     .residency
                     .shard_deleted_by_memory
-                    .insert_shard(table, shard_id, Arc::clone(&region));
-                // D4 (ADR-013 pre2): REPUBLISH the descriptor with the new region — readers take
-                // resources from the ONE `shards.load()` snapshot; a region living only in the side
-                // map is invisible to them. Born all-live, so a reader observing the republished
-                // descriptor mid-commit reads every row live (correct until the stamps land + the
-                // commit publishes). Runs under the commit lock like the alloc itself.
-                self.read_state.residency.with_shards_mut(|shards| {
-                    if let Some(table_shards) = shards.get_mut(table) {
-                        if let Some(shard) =
-                            table_shards.iter_mut().find(|s| s.shard_id == shard_id)
-                        {
-                            shard.deleted_by_region = Some(Arc::clone(&region));
-                        }
+                    .get(&(table.to_string(), shard_id))
+                {
+                    region
+                } else {
+                    // Born all-live: every u64 is the large positive signed sentinel produced by
+                    // byte-fill 0x7F. The signed visibility comparison therefore keeps it live.
+                    let live_payload =
+                        vec![DELETED_BY_LIVE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
+                    if self
+                        .relational_residency_budget_bytes(gpu_id)
+                        .is_some_and(|budget| {
+                            self.relational_resident_bytes_for_gpu(gpu_id)
+                                .saturating_add(live_payload.len() as u64)
+                                > budget
+                        })
+                    {
+                        return false;
                     }
-                });
-                region
+                    let Some(region) =
+                        self.relational_residency_device_memory(gpu_id, &live_payload)
+                    else {
+                        return false;
+                    };
+                    let region = Arc::new(region);
+                    if self
+                        .relational_residency_budget_bytes(gpu_id)
+                        .is_some_and(|budget| {
+                            self.relational_resident_bytes_for_gpu(gpu_id)
+                                .saturating_add(region.metadata().allocated_bytes)
+                                > budget
+                        })
+                    {
+                        return false;
+                    }
+                    self.read_state
+                        .residency
+                        .shard_deleted_by_memory
+                        .insert_shard(table, shard_id, Arc::clone(&region));
+                    // D4: republish the descriptor with the same region before releasing the
+                    // allocation transaction; readers obtain resources from one shard snapshot.
+                    self.read_state.residency.with_shards_mut(|shards| {
+                        if let Some(table_shards) = shards.get_mut(table) {
+                            if let Some(shard) =
+                                table_shards.iter_mut().find(|s| s.shard_id == shard_id)
+                            {
+                                shard.deleted_by_region = Some(Arc::clone(&region));
+                            }
+                        }
+                    });
+                    region
+                }
             }
         };
         // U1 perf lever B: ONE scatter launch (2 HtoDs + 1 kernel) instead of N per-slot HtoD
@@ -9653,8 +9841,42 @@ impl Engine {
         {
             return Some(region);
         }
+        let _budget_allocation = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(region) = self
+            .read_state
+            .residency
+            .shard_created_by_memory
+            .get(&(table.to_string(), shard_id))
+        {
+            return Some(region);
+        }
         let payload = vec![CREATED_BY_VISIBLE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
+        if self
+            .relational_residency_budget_bytes(gpu_id)
+            .is_some_and(|budget| {
+                self.relational_resident_bytes_for_gpu(gpu_id)
+                    .saturating_add(payload.len() as u64)
+                    > budget
+            })
+        {
+            return None;
+        }
         let region = Arc::new(self.relational_residency_device_memory(gpu_id, &payload)?);
+        if self
+            .relational_residency_budget_bytes(gpu_id)
+            .is_some_and(|budget| {
+                self.relational_resident_bytes_for_gpu(gpu_id)
+                    .saturating_add(region.metadata().allocated_bytes)
+                    > budget
+            })
+        {
+            return None;
+        }
         self.read_state
             .residency
             .shard_created_by_memory
@@ -10160,6 +10382,7 @@ impl Engine {
         &self,
         table: &RelationalTable,
         rows: &[Vec<SqlValue>],
+        gpu_id: u16,
     ) -> Result<
         (
             RelationalResidencySnapshot,
@@ -10170,7 +10393,6 @@ impl Engine {
         ),
         ExecuteError,
     > {
-        let gpu_id = self.planner.default_gpu_id();
         let column_names: Vec<String> = table
             .columns
             .iter()
@@ -10325,9 +10547,12 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .contains(&gpu_id);
-        let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
-        let (evicted_tables_on_admission, resident_bytes_after_admission) =
-            self.admit_relational_residency_snapshot(table, gpu_id, resident_bytes)?;
+        let _budget_allocation = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let runtime = self.cuda_driver_probe_runtime();
         let device_memory = runtime
             .retain_device_memory_chunks(gpu_id, allocated_bytes, chunks)
@@ -10336,6 +10561,10 @@ impl Engine {
                     "benchmark resident chunk admission failed CUDA retained upload: {err}"
                 )))
             })?;
+        let allocated_bytes = device_memory.metadata().allocated_bytes;
+        let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
+        let (evicted_tables_on_admission, resident_bytes_after_admission) =
+            self.admit_relational_residency_snapshot(table, gpu_id, allocated_bytes)?;
         let device_memory_proof = Some(device_memory.metadata().clone());
         let snapshot = RelationalResidencySnapshot {
             gpu_id,
@@ -10381,12 +10610,11 @@ impl Engine {
             device_memory_proof,
         };
         let read_state = Arc::clone(&self.read_state);
-        self.ddl_catalog_mut()
+        self.ddl_catalog()
             .relational_resident_cache
             .install_snapshot(
                 catalog_table.name,
                 snapshot.clone(),
-                Vec::new(), // benchmark install path: no host-row materialization
                 Some(device_memory),
                 &read_state.residency,
             );
@@ -10448,9 +10676,12 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .contains(&gpu_id);
-        let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
-        let (evicted_tables_on_admission, resident_bytes_after_admission) =
-            self.admit_relational_residency_snapshot(table, gpu_id, resident_bytes)?;
+        let _budget_allocation = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let runtime = self.cuda_driver_probe_runtime();
         let device_memory = runtime
             .retain_device_memory_owned_chunks(gpu_id, allocated_bytes, install.chunks)
@@ -10459,6 +10690,10 @@ impl Engine {
                     "benchmark resident chunk admission failed CUDA retained upload: {err}"
                 )))
             })?;
+        let allocated_bytes = device_memory.metadata().allocated_bytes;
+        let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
+        let (evicted_tables_on_admission, resident_bytes_after_admission) =
+            self.admit_relational_residency_snapshot(table, gpu_id, allocated_bytes)?;
         let device_memory_proof = Some(device_memory.metadata().clone());
         let snapshot = RelationalResidencySnapshot {
             gpu_id,
@@ -10504,12 +10739,11 @@ impl Engine {
             device_memory_proof,
         };
         let read_state = Arc::clone(&self.read_state);
-        self.ddl_catalog_mut()
+        self.ddl_catalog()
             .relational_resident_cache
             .install_snapshot(
                 catalog_table.name,
                 snapshot.clone(),
-                Vec::new(), // benchmark install path: no host-row materialization
                 Some(device_memory),
                 &read_state.residency,
             );
@@ -10543,7 +10777,7 @@ impl Engine {
             ))));
         }
 
-        let total_resident_bytes = install.shards.iter().try_fold(0_u64, |total, shard| {
+        let _total_resident_bytes = install.shards.iter().try_fold(0_u64, |total, shard| {
             if shard.row_count == 0 {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "benchmark resident shard {} has no rows",
@@ -10562,18 +10796,22 @@ impl Engine {
                 ))
             })
         })?;
-        let (_evicted_tables_on_admission, _resident_bytes_after_admission) =
-            self.admit_relational_residency_snapshot(table, install.gpu_id, total_resident_bytes)?;
-
         let memory_pressure_active = self
             .router
             .runtime()
             .snapshot()
             .memory_pressured_gpu_ids
             .contains(&install.gpu_id);
+        let _budget_allocation = self
+            .read_state
+            .residency
+            .budget_allocation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let runtime = self.cuda_driver_probe_runtime();
         let mut shards = Vec::new();
         let mut device_memory = BTreeMap::new();
+        let mut total_allocated_bytes = 0_u64;
         for shard in install.shards {
             let copied_bytes = shard.chunks.iter().try_fold(0_u64, |total, chunk| {
                 let len = u64::try_from(chunk.bytes.len()).map_err(|_| {
@@ -10615,6 +10853,14 @@ impl Engine {
                         "benchmark resident shard admission failed CUDA retained upload: {err}"
                     )))
                 })?;
+            let retained_allocated_bytes = retained.metadata().allocated_bytes;
+            total_allocated_bytes = total_allocated_bytes
+                .checked_add(retained_allocated_bytes)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "benchmark resident shard allocated byte count overflowed".to_string(),
+                    ))
+                })?;
             let device_memory_proof = Some(retained.metadata().clone());
             shards.push(RelationalResidentShard {
                 shard_id: shard.shard_id,
@@ -10629,7 +10875,7 @@ impl Engine {
                 // A1/SV2: benchmark shards carry no version metadata (no on-demand deleted_by region) -> the
                 // visibility mask is skipped (they read as all-live, correct for latest-snapshot benchmarks).
                 resident_bytes: shard.resident_bytes,
-                allocated_bytes: shard.allocated_bytes,
+                allocated_bytes: retained_allocated_bytes,
                 count_header_byte_offset: 0,
                 resident_device_int4_columns: shard.resident_device_int4_columns,
                 resident_device_int8_columns: Vec::new(), // benchmark chunks are int4-only
@@ -10656,9 +10902,15 @@ impl Engine {
             });
             device_memory.insert(shard.shard_id, Arc::new(retained));
         }
+        let (_evicted_tables_on_admission, _resident_bytes_after_admission) = self
+            .admit_relational_residency_snapshot(
+                table,
+                install.gpu_id,
+                total_allocated_bytes,
+            )?;
         shards.sort_by_key(|shard| (shard.row_start, shard.shard_id));
         let read_state = Arc::clone(&self.read_state);
-        self.ddl_catalog_mut()
+        self.ddl_catalog()
             .relational_resident_cache
             .install_shards(
                 catalog_table.name,
@@ -11486,7 +11738,13 @@ impl Engine {
             .load()
             .iter()
             .filter(|(name, entry)| name.as_str() != table && entry.descriptor.gpu_id == gpu_id)
-            .map(|(_name, entry)| entry.descriptor.resident_bytes)
+            .map(|(_name, entry)| {
+                entry
+                    .descriptor
+                    .device_memory_proof
+                    .as_ref()
+                    .map_or(0, |proof| proof.allocated_bytes)
+            })
             .sum();
         let shard_bytes: u64 = self
             .read_state
@@ -11497,9 +11755,111 @@ impl Engine {
             .filter(|(name, _shards)| name.as_str() != table)
             .flat_map(|(_name, shards)| shards)
             .filter(|shard| shard.gpu_id == gpu_id)
-            .map(|shard| shard.resident_bytes)
+            .map(|shard| {
+                let regions = [
+                    shard.deleted_by_region.as_ref(),
+                    shard.created_by_region.as_ref(),
+                    shard.row_id_region.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|region| region.metadata().allocated_bytes)
+                .sum::<u64>();
+                shard.allocated_bytes.saturating_add(regions)
+            })
             .sum();
-        snapshot_bytes.saturating_add(shard_bytes)
+        let single_indexes = self
+            .read_state
+            .residency
+            .wave_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(name, _)| name.as_str() != table)
+            .filter_map(|(_, index)| index.index_memory.as_ref())
+            .filter(|memory| memory.metadata().gpu_id == gpu_id)
+            .map(|memory| memory.metadata().allocated_bytes)
+            .sum::<u64>();
+        let shard_indexes = self
+            .read_state
+            .residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|((name, _, _), _)| name.as_str() != table)
+            .filter_map(|(_, index)| index.device_index.as_ref())
+            .filter(|memory| memory.metadata().gpu_id == gpu_id)
+            .map(|memory| memory.metadata().allocated_bytes)
+            .sum::<u64>();
+        snapshot_bytes
+            .saturating_add(shard_bytes)
+            .saturating_add(single_indexes)
+            .saturating_add(shard_indexes)
+    }
+
+    /// Actual retained allocation bytes attributable to one table on one GPU. This is the exact
+    /// inverse unit used by two-phase admission: candidate selection subtracts these bytes from the
+    /// same payload/region/index categories counted by `relational_resident_bytes_for_gpu_excluding`,
+    /// so the chosen prefix is known to fit before any descriptor is retired.
+    fn relational_resident_table_bytes_for_gpu(&self, table: &str, gpu_id: u16) -> u64 {
+        let snapshot_bytes = self
+            .read_state
+            .residency
+            .snapshots
+            .load()
+            .get(table)
+            .filter(|entry| entry.descriptor.gpu_id == gpu_id)
+            .and_then(|entry| entry.descriptor.device_memory_proof.as_ref())
+            .map_or(0, |proof| proof.allocated_bytes);
+        let shard_bytes = self
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get(table)
+            .into_iter()
+            .flatten()
+            .filter(|shard| shard.gpu_id == gpu_id)
+            .map(|shard| {
+                let regions = [
+                    shard.deleted_by_region.as_ref(),
+                    shard.created_by_region.as_ref(),
+                    shard.row_id_region.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|region| region.metadata().allocated_bytes)
+                .sum::<u64>();
+                shard.allocated_bytes.saturating_add(regions)
+            })
+            .sum::<u64>();
+        let single_index_bytes = self
+            .read_state
+            .residency
+            .wave_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(table)
+            .and_then(|index| index.index_memory.as_ref())
+            .filter(|memory| memory.metadata().gpu_id == gpu_id)
+            .map_or(0, |memory| memory.metadata().allocated_bytes);
+        let shard_index_bytes = self
+            .read_state
+            .residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|((name, _, _), _)| name == table)
+            .filter_map(|(_, index)| index.device_index.as_ref())
+            .filter(|memory| memory.metadata().gpu_id == gpu_id)
+            .map(|memory| memory.metadata().allocated_bytes)
+            .sum::<u64>();
+        snapshot_bytes
+            .saturating_add(shard_bytes)
+            .saturating_add(single_index_bytes)
+            .saturating_add(shard_index_bytes)
     }
 
     pub fn relational_residency_snapshot(
@@ -11586,9 +11946,8 @@ impl Engine {
     /// consumers only read scalar fields + column layouts off it before submitting — so an owned clone
     /// is a drop-in for the former borrow with no lifetime entanglement. Cloning a single snapshot's
     /// metadata once per resident-route statement is negligible against the GPU kernel it precedes.
-    /// The lightweight, Arc-shared GPU/catalog DESCRIPTOR for a resident table (no host rows). Readers
-    /// clone the `Arc` -- a refcount bump, never the row data. (Was an owned deep-clone that copied the
-    /// table's host rows on every general-executor query; the split moved those to `host_rows`.)
+    /// The lightweight, Arc-shared GPU/catalog descriptor for a resident table. Readers clone the
+    /// `Arc` -- a refcount bump, never row data.
     pub(crate) fn relational_residency_snapshot_ref(
         &self,
         table: &str,
@@ -11601,10 +11960,7 @@ impl Engine {
             .map(|entry| entry.descriptor.clone())
     }
 
-    /// The WHOLE residency entry (descriptor + host rows) from ONE atomic `load()`, so a reader that
-    /// needs BOTH halves sees a single consistent generation. Use this instead of calling
-    /// `relational_residency_snapshot_ref` + `relational_residency_host_rows` separately -- two
-    /// `load()`s could straddle a concurrent publish and pair a descriptor with mismatched rows.
+    /// The residency entry from one atomic descriptor-map load.
     pub(crate) fn relational_residency_entry(
         &self,
         table: &str,

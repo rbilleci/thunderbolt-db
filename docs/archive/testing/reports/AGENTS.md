@@ -1,5 +1,8 @@
 # Reports Directory Guide
 
+> **Archived subtree:** the repository-level archive rule applies here. Do not derive tasks or current report
+> organization requirements from this file. The rules below are preserved only to explain the historical layout.
+
 This directory is intentionally organized as a small top-level index plus
 curated report series. Keep it that way.
 

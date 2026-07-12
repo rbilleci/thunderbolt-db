@@ -363,10 +363,9 @@ pub struct RelationalResidencySnapshot {
     pub capacity: usize,
     pub column_count: usize,
     pub resident_bytes: u64,
-    // NOTE: the heavy host-side row materialization (`resident_rows`) is NOT here -- it lives in the
-    // separate, Arc-shared `RelationalResidencyEntry.host_rows`, so this GPU/catalog DESCRIPTOR stays
-    // lightweight and is never deep-copied on the GPU read path (it is the device executor's contract;
-    // only the CPU / enumerated paths read host rows). See `RelationalResidencyEntry`.
+    // The descriptor is the complete published read contract. Decoded host rows are staging data
+    // used to build a device generation and are discarded after upload; residency never retains a
+    // relational host shadow.
     pub resident_device_int4_columns: Vec<String>,
     pub resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
     /// int8 columns retained in the device payload (fixed 8-byte row-major, after the int4 section,
@@ -401,49 +400,16 @@ pub struct RelationalResidencySnapshot {
     pub device_memory_proof: Option<CudaDeviceMemoryProof>,
 }
 
-/// A published, immutable per-table residency entry (the value stored in the residency snapshot map).
-/// Splits the lightweight GPU/catalog DESCRIPTOR ([`RelationalResidencySnapshot`]) from the heavy
-/// host-side row materialization, each `Arc`-shared so a reader -- or a `with_snapshots_mut` map clone
-/// (every invalidation / DDL) -- bumps a refcount instead of deep-copying the rows. The GPU executor
-/// reads only `descriptor`; the CPU / enumerated paths read `host_rows`. Keeping the host copy (the
-/// charter's "CPU materialization = debt") off the device read path AND independently shareable is the
-/// architectural point. Fetch the published pair via `relational_residency_entry`; read the rows via
-/// [`RelationalResidencyEntry::host_rows_iter`] / [`RelationalResidencyEntry::host_row_count`] (the host
-/// rows are SEGMENTED — Slice 1b-ii-d — so callers must not assume one contiguous vec).
-/// A host-row materialization SEGMENT — an immutable, `Arc`-shared batch of rows. The entry holds a
-/// *sequence* of these (Slice 1b-ii-d) so an INSERT commit can APPEND a new segment — O(rows appended)
-/// plus a tiny num-segments pointer clone — instead of deep-cloning the whole row vec (O(table), which was
-/// the dual-store tax's host-side residual). Re-admit folds back to a single segment.
-pub type HostRowSegment = std::sync::Arc<Vec<Vec<SqlValue>>>;
-
+/// A published, immutable per-table residency entry. The wrapper keeps descriptor publication
+/// call sites stable while making the absence of a host relational shadow explicit.
 #[derive(Debug, Clone)]
 pub struct RelationalResidencyEntry {
     pub descriptor: std::sync::Arc<RelationalResidencySnapshot>,
-    /// Host rows as a sequence of immutable Arc'd segments (append-friendly; see [`HostRowSegment`]).
-    /// Read via [`Self::host_rows_iter`] / [`Self::host_row_count`] — callers should not assume one segment.
-    pub host_rows: std::sync::Arc<Vec<HostRowSegment>>,
 }
 
 impl RelationalResidencyEntry {
-    /// Build the dense single-segment entry (the admit / transient case) from a flat row vec.
-    pub fn from_dense_host_rows(
-        descriptor: std::sync::Arc<RelationalResidencySnapshot>,
-        host_rows: Vec<Vec<SqlValue>>,
-    ) -> Self {
-        Self {
-            descriptor,
-            host_rows: std::sync::Arc::new(vec![std::sync::Arc::new(host_rows)]),
-        }
-    }
-
-    /// Total host row count (sum over segments) — what the CPU / enumerated paths see.
-    pub fn host_row_count(&self) -> usize {
-        self.host_rows.iter().map(|seg| seg.len()).sum()
-    }
-
-    /// Iterate host rows in stored (append / TupleId-ascending) order across all segments.
-    pub fn host_rows_iter(&self) -> impl Iterator<Item = &Vec<SqlValue>> {
-        self.host_rows.iter().flat_map(|seg| seg.iter())
+    pub fn new(descriptor: std::sync::Arc<RelationalResidencySnapshot>) -> Self {
+        Self { descriptor }
     }
 }
 

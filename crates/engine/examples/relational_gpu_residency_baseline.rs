@@ -1609,7 +1609,7 @@ fn timed_resident_probe_many(
     let start = Instant::now();
     let mut results = Vec::with_capacity(queries.len());
     for query in queries {
-        results.push(engine.execute_relational_select_with_resident_snapshot_probe(query)?);
+        results.push(engine.execute_relational_select(query)?);
     }
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
@@ -1618,7 +1618,7 @@ fn timed_resident_probe_many(
             actual.columns == expected.columns && actual.rows == expected.rows
         });
     if !correctness_validated {
-        return Err(format!("{name} resident snapshot results diverged").into());
+        return Err(format!("{name} resident GPU results diverged").into());
     }
     let result_rows = results.iter().map(|result| result.rows.len()).sum();
     let sql_fallback = results
@@ -1672,12 +1672,12 @@ fn timed_resident_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result = engine.execute_relational_select_with_resident_snapshot_probe(query)?;
+    let result = engine.execute_relational_select(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
     if !correctness_validated {
-        return Err(format!("{name} resident snapshot results diverged").into());
+        return Err(format!("{name} resident GPU results diverged").into());
     }
     Ok(ProbeReport {
         name,

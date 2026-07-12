@@ -46,6 +46,28 @@ pub(crate) fn assert_mvcc_query_uses_tracked_cpu_fallback(
     );
 }
 
+/// Recovery now bulk-admits after WAL replay (STRATA S-F). Off-GPU, the parity-oracle CPU route
+/// retains its exact index metadata; on a GPU host, the resident route is authoritative and may
+/// report its device scan framing instead. Keep ordinary recovery tests hardware-independent while
+/// still proving that a GPU result did not fall back.
+pub(crate) fn assert_recovered_relational_access_path(
+    result: &RelationalSelectResult,
+    expected_cpu: RelationalAccessPath,
+) {
+    match result.executed_target {
+        DeviceTarget::Cpu => assert_eq!(*result.access_path, expected_cpu),
+        DeviceTarget::Gpu(_) => {
+            assert!(
+                matches!(
+                    result.access_path.as_ref(),
+                    RelationalAccessPath::FullTableScan
+                ) || *result.access_path == expected_cpu
+            );
+            assert_eq!(result.fallback_reason, None);
+        }
+    }
+}
+
 pub(crate) fn test_wal_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "gpu-db-engine-{name}-{}-{}.segment",

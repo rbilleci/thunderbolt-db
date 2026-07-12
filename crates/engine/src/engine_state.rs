@@ -554,6 +554,13 @@ pub(crate) struct ResidencyReadState {
     /// as `shard_pk_index` (via `purge_shard_pk_index_for_table`). Parallel to the host `shard_pk_index`.
     pub(crate) shard_pk_device_index:
         Mutex<BTreeMap<(String, u32, usize), CachedShardPkDeviceIndex>>,
+    /// S-F/R-1 hard-cap serialization. Every allocation that becomes part of the durable
+    /// relational resident set (admission payloads/mandatory regions and lazy device indexes)
+    /// holds this lock from its budget preflight through publication. That closes the otherwise
+    /// unavoidable check-then-allocate race between concurrent readers building indexes and an
+    /// admission replacing/evicting tables. The lock is deliberately allocation-scoped, never
+    /// held across a kernel launch or query execution.
+    pub(crate) budget_allocation_lock: Mutex<()>,
     /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe (vs the atomic
     /// kernel). The test signal that proves the dense route actually ran (output equality alone can't, since
     /// dense and atomic are byte-identical by design). `Relaxed` monotonic counter.
@@ -582,6 +589,9 @@ pub(crate) struct ResidencyReadState {
     /// (append and re-admit are byte-identical), and device-ptr stability can't either (a same-size
     /// re-admit reuses the just-freed address). `Relaxed` monotonic counter.
     pub(crate) open_shard_append_hits: std::sync::atomic::AtomicU64,
+    /// S-F/R-1: open-shard rollovers declined before allocation because the new payload plus
+    /// version/identity regions would exceed the GPU residency budget.
+    pub(crate) rollover_budget_declines: std::sync::atomic::AtomicU64,
     /// E2.5c 2M+ push (b): merged applies served by the FUSED device pass.
     pub(crate) fused_apply_hits: std::sync::atomic::AtomicU64,
     /// S-d3: count of shards actually GATHERED (recompacted) by the sharded read after zone-map pruning.
@@ -631,10 +641,19 @@ pub(crate) struct ResidencyReadState {
     /// STRATA S-E.1: total streaming chunks reduced across all folds (a fold over an over-budget table
     /// runs >1). Proves bounded-residency chunking actually fired (a single-chunk fold == 1).
     pub(crate) streaming_fold_chunks: std::sync::atomic::AtomicU64,
+    /// STRATA S-E multi-GPU partial combine: chunks whose device work completed on a GPU other
+    /// than the query's coordinator/default GPU. A non-zero delta proves round-robin routing
+    /// actually executed remotely; merely discovering or configuring a second GPU is insufficient.
+    pub(crate) streaming_fold_secondary_gpu_chunks: std::sync::atomic::AtomicU64,
     /// STRATA S-E.1: the high-water device bytes of any single streaming chunk (the peak transient
     /// residency of the fold). The out-of-core proof: this stays <= the configured budget even when the
     /// whole table's bytes dwarf it. `fetch_max`, monotonic across the process.
     pub(crate) streaming_fold_peak_chunk_bytes: std::sync::atomic::AtomicU64,
+    /// ADR-012 streaming two-relation joins served as bounded chunk/block pairs.
+    pub(crate) streaming_join_hits: std::sync::atomic::AtomicU64,
+    pub(crate) streaming_join_block_pairs: std::sync::atomic::AtomicU64,
+    pub(crate) streaming_join_peak_device_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) streaming_window_hits: std::sync::atomic::AtomicU64,
     /// STRATA S-E.6: the streaming COLD TIER — per-table DEVICE-FORMAT chunk payloads cached in host
     /// RAM after a fold's first (MVCC-scan) build, replayed byte-for-byte on later streaming reads
     /// (no per-row decode, no payload assembly — the measured ~68% host wall). Validity = the pinned
@@ -705,6 +724,12 @@ pub(crate) struct ResidencyReadState {
     pub(crate) chunk_key_index_bytes: std::sync::atomic::AtomicU64,
     /// P5-1: the LRU touch clock.
     pub(crate) chunk_key_index_clock: std::sync::atomic::AtomicU64,
+    /// P5-later: compact all-chunk Bloom filters used when the full retained index set exceeds its cap.
+    pub(crate) chunk_key_bloom:
+        Mutex<BTreeMap<(String, u64, usize), crate::engine_streaming_exec::ChunkKeyBloom>>,
+    pub(crate) chunk_key_bloom_bytes: std::sync::atomic::AtomicU64,
+    /// Candidate-routing launches served by the Bloom path (non-vacuity for over-cap keyed admission).
+    pub(crate) chunk_key_bloom_probes: std::sync::atomic::AtomicU64,
     /// P5-2: keyed-class uniqueness preflights served ON-DEVICE (probe + slot recheck) — the
     /// non-vacuity signal for the keyed eligibility lift.
     pub(crate) chunk_class_unique_probes: std::sync::atomic::AtomicU64,
@@ -712,6 +737,10 @@ pub(crate) struct ResidencyReadState {
     pub(crate) chunk_class_unique_probe_conflicts: std::sync::atomic::AtomicU64,
     /// P5-3: class DML locates served by the KEY-INDEX PROBE (vs the full fold scan).
     pub(crate) chunk_class_dml_key_locates: std::sync::atomic::AtomicU64,
+    /// P5 charter closure: candidate-index hits whose visibility + exact key/residual
+    /// predicate were decided by the device predicate VM. This proves the host comparator is
+    /// not silently serving the authoritative recheck.
+    pub(crate) chunk_class_device_exact_rechecks: std::sync::atomic::AtomicU64,
     /// VACUUM #5: per-table count of incremental tombstone stamps since the last rebuild —
     /// the CHURN signal (each SV4b/SV5/A4b tombstone adds a dead slot; enough of them degrade
     /// the PK index to dup-declines and bloat scans). Reset by vacuum/re-admit. Serialized-path
@@ -799,7 +828,7 @@ impl ResidencyReadState {
         if !snapshot_flagged {
             let mut next = (**self.snapshots.load()).clone();
             if let Some(entry) = next.get_mut(table) {
-                // make_mut COWs the shared descriptor into a fresh version (host_rows stays shared).
+                // make_mut COWs the shared descriptor into a fresh version.
                 let snapshot = Arc::make_mut(&mut entry.descriptor);
                 if snapshot.invalidated_by_txn_id.is_none() {
                     snapshot.invalidated_by_txn_id = Some(txn_id);

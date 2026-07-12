@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn planner_targets_mutations_to_gpu() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     let plan = e.plan_text("SET a=1").unwrap();
 
     assert_eq!(plan.nodes().len(), 1);
@@ -11,7 +11,7 @@ fn planner_targets_mutations_to_gpu() {
 
 #[test]
 fn planner_targets_get_to_cpu_fallback_path() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     let plan = e.plan_text("GET a").unwrap();
 
     assert_eq!(plan.nodes().len(), 1);
@@ -29,7 +29,7 @@ fn planner_config_can_override_default_gpu_target() {
 
 #[test]
 fn wal_before_visibility_holds() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     let t = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     assert!(e.wal_flushed_count() >= 1);
     assert!(e.visible_up_to() >= t.index);
@@ -38,7 +38,7 @@ fn wal_before_visibility_holds() {
 
 #[test]
 fn commit_indices_monotonic() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     let a = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     let b = e.commit_mutation(2, b"SET b=2".to_vec().into()).unwrap();
     assert!(b.index > a.index);
@@ -47,7 +47,7 @@ fn commit_indices_monotonic() {
 
 #[test]
 fn execute_set_updates_state_machine() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET balance=100").unwrap();
     assert_eq!(e.get("balance").as_deref(), Some("100"));
     assert_eq!(e.metrics().snapshot().commits_total, 1);
@@ -55,7 +55,7 @@ fn execute_set_updates_state_machine() {
 
 #[test]
 fn execute_set_accepts_session_and_local_scope_aliases() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET SESSION balance=100").unwrap();
     e.execute_text(2, "SET LOCAL balance TO 101").unwrap();
 
@@ -65,7 +65,7 @@ fn execute_set_accepts_session_and_local_scope_aliases() {
 
 #[test]
 fn execute_del_removes_existing_key() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET balance=100").unwrap();
     e.execute_text(2, "DEL balance").unwrap();
 
@@ -75,7 +75,7 @@ fn execute_del_removes_existing_key() {
 
 #[test]
 fn execute_delete_alias_removes_existing_key() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET balance=100").unwrap();
     e.execute_text(2, "DELETE balance").unwrap();
 
@@ -85,7 +85,7 @@ fn execute_delete_alias_removes_existing_key() {
 
 #[test]
 fn execute_read_text_get_returns_current_value_without_committing() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET balance=100").unwrap();
 
     let value = e.execute_read_text("GET balance").unwrap();
@@ -102,7 +102,7 @@ fn execute_read_text_get_returns_current_value_without_committing() {
 
 #[test]
 fn execute_read_text_get_missing_key_does_not_track_d2h_bytes() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let value = e.execute_read_text("GET absent").unwrap();
 
     assert_eq!(value, None);
@@ -112,7 +112,7 @@ fn execute_read_text_get_missing_key_does_not_track_d2h_bytes() {
 
 #[test]
 fn execute_read_text_rejects_non_read_commands() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
 
     let begin_err = e.execute_read_text("BEGIN").unwrap_err();
     assert!(matches!(begin_err, ExecuteError::NonReadCommand("BEGIN")));
@@ -144,7 +144,7 @@ fn execute_read_text_rejects_non_read_commands() {
 
 #[test]
 fn execute_read_text_rejects_get_when_not_leader() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET balance=100").unwrap();
     e.become_follower(2);
 
@@ -157,7 +157,7 @@ fn execute_read_text_rejects_get_when_not_leader() {
 
 #[test]
 fn execute_text_get_rejects_when_not_leader() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.become_follower(2);
 
     let err = e.execute_text(1, "GET balance").unwrap_err();
@@ -169,7 +169,7 @@ fn execute_text_get_rejects_when_not_leader() {
 
 #[test]
 fn execute_text_get_rejects_when_candidate() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.become_candidate(2);
 
     let err = e.execute_text(1, "GET balance").unwrap_err();
@@ -181,7 +181,7 @@ fn execute_text_get_rejects_when_candidate() {
 
 #[test]
 fn execute_text_get_tracks_d2h_bytes_for_hits_only() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET balance=100").unwrap();
 
     e.execute_text(2, "GET balance").unwrap();
@@ -193,7 +193,7 @@ fn execute_text_get_tracks_d2h_bytes_for_hits_only() {
 
 #[test]
 fn execute_read_text_rejects_get_when_candidate() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "SET balance=100").unwrap();
     e.become_candidate(2);
 
@@ -386,7 +386,7 @@ fn deterministic_replay_matches_between_immediate_and_batched_mutation_paths() {
         (6, "SET acct_a=99"),
     ];
 
-    let immediate = Engine::new_local();
+    let immediate = Engine::new_local_cpu_oracle();
     for (txn_id, cmd) in trace {
         immediate.execute_text(txn_id, cmd).unwrap();
     }
@@ -414,7 +414,7 @@ fn deterministic_replay_matches_between_immediate_and_batched_mutation_paths() {
 
 #[test]
 fn visible_state_fingerprint_changes_with_visible_kv_state() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
     let empty = e.visible_state_fingerprint();
 
     e.execute_text(1, "SET a=1").unwrap();
@@ -455,7 +455,7 @@ fn flush_aliases_drain_pending_batch() {
 
 #[test]
 fn wal_flush_failure_prevents_visibility_advance() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.simulate_next_wal_flush_failure();
     let res = e.commit_mutation(1, b"SET a=1".to_vec().into());
     assert!(matches!(res, Err(EngineError::Durability(_))));
@@ -464,7 +464,7 @@ fn wal_flush_failure_prevents_visibility_advance() {
 
 #[test]
 fn wal_flush_failure_does_not_leak_into_later_successful_commit() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.simulate_next_wal_flush_failure();
     let _ = e.commit_mutation(1, b"SET a=1".to_vec().into());
 
@@ -477,7 +477,7 @@ fn wal_flush_failure_does_not_leak_into_later_successful_commit() {
 
 #[test]
 fn wal_flush_failure_discards_unflushed_record_from_buffer() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.simulate_next_wal_flush_failure();
 
     let err = e
@@ -492,7 +492,7 @@ fn wal_flush_failure_discards_unflushed_record_from_buffer() {
 
 #[test]
 fn durable_wal_records_exclude_failed_commit_attempts() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
 
     e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     e.simulate_next_wal_flush_failure();
@@ -506,7 +506,7 @@ fn durable_wal_records_exclude_failed_commit_attempts() {
 
 #[test]
 fn follower_rejects_commit_without_visibility_or_wal_flush() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.become_follower(2);
 
     let err = e
@@ -581,7 +581,7 @@ fn enqueue_get_tracks_d2h_bytes_for_hits_only() {
 
 #[test]
 fn execute_text_mutation_falls_back_to_cpu_when_gpu_is_unavailable() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     e.mark_gpu_unavailable(0);
 
     e.execute_text(1, "SET balance=100").unwrap();
@@ -869,7 +869,7 @@ fn pending_batch_can_be_flushed_after_follower_is_promoted_back_to_leader() {
 
 #[test]
 fn execute_text_non_mutations_count_as_not_gpu_eligible_fallbacks() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(1, "BEGIN").unwrap();
     e.execute_text(1, "COMMIT").unwrap();
@@ -897,7 +897,7 @@ fn execute_text_non_mutations_count_as_not_gpu_eligible_fallbacks() {
 
 #[test]
 fn execute_text_bounds_bootstrap_extension_create() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(1, "CREATE EXTENSION IF NOT EXISTS plpgsql")
         .unwrap();
@@ -939,7 +939,7 @@ fn execute_text_bounds_bootstrap_extension_create() {
 
 #[test]
 fn execute_text_accepts_bootstrap_extension_if_exists_cleanup() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(1, "COMMENT ON EXTENSION plpgsql IS 'bootstrap extension'")
         .unwrap();
@@ -976,7 +976,7 @@ fn execute_text_accepts_bootstrap_extension_if_exists_cleanup() {
 
 #[test]
 fn execute_text_records_bootstrap_extension_comment_and_replays_from_wal() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(1, "COMMENT ON EXTENSION plpgsql IS 'bootstrap extension'")
         .unwrap();
@@ -1007,7 +1007,7 @@ fn execute_text_records_bootstrap_extension_comment_and_replays_from_wal() {
 
 #[test]
 fn execute_text_replays_bounded_role_metadata_and_acl_grantees() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(1, "CREATE ROLE app_reader WITH LOGIN")
         .unwrap();
@@ -1083,14 +1083,14 @@ fn execute_text_replays_bounded_role_metadata_and_acl_grantees() {
         .relational_default_table_acl
         .contains_key("app_writer"));
 
-    let missing_grantee = Engine::new_local()
+    let missing_grantee = Engine::new_local_cpu_oracle()
         .execute_text(1, "GRANT SELECT ON TABLE people TO missing_role")
         .unwrap_err();
     assert!(missing_grantee
         .to_string()
         .contains("relation \"people\" does not exist"));
 
-    let missing_role = Engine::new_local();
+    let missing_role = Engine::new_local_cpu_oracle();
     missing_role
         .execute_text(1, "CREATE TABLE people (id INT)")
         .unwrap();
@@ -1121,7 +1121,7 @@ fn execute_text_replays_bounded_role_metadata_and_acl_grantees() {
 
 #[test]
 fn execute_text_replays_bounded_database_metadata() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(1, "CREATE DATABASE appdb").unwrap();
     e.execute_text(2, "COMMENT ON DATABASE appdb IS 'application database'")
@@ -1203,30 +1203,30 @@ fn execute_text_replays_bounded_database_metadata() {
     assert!(recovered.relational_database("appdb_renamed").is_none());
     assert_eq!(recovered.relational_database_comment("appdb_renamed"), None);
 
-    let kept = Engine::new_local();
+    let kept = Engine::new_local_cpu_oracle();
     kept.execute_text(1, "CREATE DATABASE appdb").unwrap();
     let recovered_kept = Engine::recover_from_durable_wal(&kept.durable_wal_records()).unwrap();
     assert!(recovered_kept.relational_database("appdb").is_some());
 
-    assert!(Engine::new_local()
+    assert!(Engine::new_local_cpu_oracle()
         .execute_text(1, "DROP DATABASE postgres")
         .unwrap_err()
         .to_string()
         .contains("cannot drop bootstrap database"));
-    assert!(Engine::new_local()
+    assert!(Engine::new_local_cpu_oracle()
         .execute_text(1, "ALTER DATABASE postgres RENAME TO appdb")
         .unwrap_err()
         .to_string()
         .contains("cannot rename bootstrap database"));
-    assert!(Engine::new_local()
+    assert!(Engine::new_local_cpu_oracle()
         .execute_text(1, "ALTER DATABASE missing_db RENAME TO appdb")
         .unwrap_err()
         .to_string()
         .contains("database \"missing_db\" does not exist"));
-    assert!(Engine::new_local()
+    assert!(Engine::new_local_cpu_oracle()
         .execute_text(1, "CREATE DATABASE templated TEMPLATE template1")
         .is_err());
-    assert!(Engine::new_local()
+    assert!(Engine::new_local_cpu_oracle()
         .execute_text(1, "GRANT CONNECT ON DATABASE missing_db TO PUBLIC")
         .unwrap_err()
         .to_string()
@@ -1256,7 +1256,7 @@ fn enqueue_non_mutations_count_as_not_gpu_eligible_fallbacks() {
 
 #[test]
 fn commit_and_rollback_require_active_transaction_context() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     let commit_err = e.execute_text(10, "COMMIT").unwrap_err();
     assert!(matches!(
@@ -1283,7 +1283,7 @@ fn commit_and_rollback_require_active_transaction_context() {
 
 #[test]
 fn and_chain_forms_reopen_transaction_context() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(21, "BEGIN").unwrap();
     e.execute_text(21, "COMMIT AND CHAIN").unwrap();
@@ -1300,7 +1300,7 @@ fn and_chain_forms_reopen_transaction_context() {
 
 #[test]
 fn enqueue_non_mutation_chain_forms_reopen_transaction_context() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let t0 = Instant::now();
 
     e.enqueue_set_text(41, "BEGIN", t0).unwrap();
@@ -1318,7 +1318,7 @@ fn enqueue_non_mutation_chain_forms_reopen_transaction_context() {
 
 #[test]
 fn transaction_control_alias_chain_forms_reopen_transaction_context() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(61, "BEGIN").unwrap();
     e.execute_text(61, "END AND CHAIN").unwrap();
@@ -1347,7 +1347,7 @@ fn transaction_control_alias_chain_forms_reopen_transaction_context() {
 
 #[test]
 fn start_alias_and_work_aliases_drive_transaction_state_transitions() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(73, "START TRANSACTION READ ONLY").unwrap();
     assert_eq!(e.active_txn_count(), 1);
@@ -1363,7 +1363,7 @@ fn start_alias_and_work_aliases_drive_transaction_state_transitions() {
 
 #[test]
 fn enqueue_transaction_control_alias_chain_forms_reopen_transaction_context() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let t0 = Instant::now();
 
     e.enqueue_set_text(81, "BEGIN", t0).unwrap();
@@ -1393,7 +1393,7 @@ fn enqueue_transaction_control_alias_chain_forms_reopen_transaction_context() {
 
 #[test]
 fn enqueue_start_alias_and_work_aliases_drive_transaction_state_transitions() {
-    let mut e = Engine::new_local();
+    let mut e = Engine::new_local_cpu_oracle();
     let t0 = Instant::now();
 
     e.enqueue_set_text(93, "START TRANSACTION READ ONLY", t0)
@@ -1411,7 +1411,7 @@ fn enqueue_start_alias_and_work_aliases_drive_transaction_state_transitions() {
 
 #[test]
 fn commit_and_chain_propagates_txn_id_exhaustion() {
-    let e = Engine::new_local();
+    let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(u64::MAX, "BEGIN").unwrap();
     let err = e.execute_text(u64::MAX, "COMMIT AND CHAIN").unwrap_err();

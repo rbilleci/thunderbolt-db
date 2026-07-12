@@ -36,8 +36,10 @@ pub(crate) trait MvccExecutionBackend {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg(test)]
 pub(crate) struct CpuMvccExecutionBackend;
 
+#[cfg(test)]
 impl MvccExecutionBackend for CpuMvccExecutionBackend {
     fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendDispatch {
         let projection = &query.projection;
@@ -769,6 +771,7 @@ pub(crate) struct FinalizedMvccBackendExecution {
     pub(crate) rows: Vec<MvccReadRow>,
 }
 
+#[cfg(test)]
 pub(crate) fn execute_mvcc_backend_chain<B: MvccExecutionBackend, F: MvccExecutionBackend>(
     query: &MvccReadQuery,
     rows: Vec<ResolvedMvccRow>,
@@ -4223,6 +4226,7 @@ pub(crate) fn resolved_mvcc_row_key(row: &ResolvedMvccRow) -> ResolvedMvccRowIde
     )
 }
 
+#[cfg(test)]
 pub(crate) fn collect_operator_rows<Row, Op>(mut operator: Op) -> Vec<Row>
 where
     Op: Operator<Row>,

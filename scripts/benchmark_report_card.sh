@@ -17,7 +17,8 @@
 #   - read_kernel_roofline emits IN-L2 (32MB/col, 8M rows) + OUT-OF-L2 (256MB/col, 64M rows) in ONE run.
 #   - r2_wave_engine_ab builds its table via a SQL INSERT loop (~11 us/row, CPU-bound parse+txn). At 48M
 #     rows (192MB/col = 1.5x L2 -> clearly out-of-L2) the build alone is ~9 min, so Section C gets its own
-#     larger timeout (the build cannot fit a 280s box; see BUILD-TIME RISK in the task that created this).
+#     larger timeout. A 2026-07-12 run measured 719s insert + 33s residency, and the batch-65536
+#     scan needs several more minutes; 700s and 1000s both cut off before the full card completed.
 #
 # Discipline: this is a shared GPU box. Never run two GPU examples back-to-back without a gap (sleep 12).
 # Never pass --gpu-reset anywhere. set -uo pipefail (NOT -e) so a timeout in one section does not abort
@@ -30,7 +31,7 @@
 #   OUT_OF_L2_BATCHES  measured batches for the large pass (default 300; p50 is stable at ~300)
 #   SECTION_A_TIMEOUT  roofline timeout, seconds           (default 280)
 #   SECTION_B_TIMEOUT  in-L2 engine timeout, seconds       (default 280)
-#   SECTION_C_TIMEOUT  out-of-L2 engine timeout, seconds   (default 700; covers the ~9 min 48M build)
+#   SECTION_C_TIMEOUT  out-of-L2 engine timeout, seconds   (default 1200; measured 752.6s build + large scans)
 #   GPU_GAP            inter-section GPU cool-down, seconds (default 12)
 
 set -uo pipefail
@@ -42,7 +43,7 @@ OUT_OF_L2_ROWS="${OUT_OF_L2_ROWS:-48000000}"
 OUT_OF_L2_BATCHES="${OUT_OF_L2_BATCHES:-300}"
 SECTION_A_TIMEOUT="${SECTION_A_TIMEOUT:-280}"
 SECTION_B_TIMEOUT="${SECTION_B_TIMEOUT:-280}"
-SECTION_C_TIMEOUT="${SECTION_C_TIMEOUT:-700}"
+SECTION_C_TIMEOUT="${SECTION_C_TIMEOUT:-1200}"
 GPU_GAP="${GPU_GAP:-12}"
 
 l2_mb=128
