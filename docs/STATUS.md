@@ -79,8 +79,11 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   adopted. The 883-line `execution::cuda_driver` module now owns runtime probing/snapshots, primitive dispatch,
   resident allocation construction, async-copy fallback, raw HtoD/DtoD builders, and `GpuRuntime` routing. Its
   real-GPU driver/smoke/allocation/NULL matrix passed 3× sequential and 2× concurrent; independent audit found
-  proof, fencing, guard, and recompaction behavior unchanged. The execution root is 30,466 lines. Further
-  extraction is owned by **STRUCT-001G/STRUCT-001**.
+  proof, fencing, guard, and recompaction behavior unchanged. The 405-line `execution::resident_memory` module
+  now owns resident allocation/read-view/chunk contracts, bounded copies, append, telemetry, the read-source
+  trait, Debug, and context-bound Drop. Its append/generation/submit-complete/NULL GPU matrix passed 3×
+  sequential and 2× concurrent; independent audit found bounds, Arc lifetime, and field-drop behavior unchanged.
+  The execution root is 30,076 lines. Further extraction is owned by **STRUCT-001H/STRUCT-001**.
 
 ## Known boundaries
 

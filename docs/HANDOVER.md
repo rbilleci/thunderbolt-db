@@ -21,8 +21,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001G:** extract resident-memory ownership/lifecycle and bounded copy/append methods while leaving
-   relational operator families separate; preserve root types, Drop ownership, and driver construction.
+1. **STRUCT-001H:** extract deferred point-read submission/result ownership, preserving pool guard/drop order,
+   detached completion, one bounded final readback, and stable root APIs.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
