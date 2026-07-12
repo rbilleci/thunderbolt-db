@@ -427,6 +427,7 @@ pub struct RelationalRetainedSnapshotHandle {
     pub has_retained_device_memory: bool,
     pub resident_device_int4_columns: Vec<String>,
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
+    pub resident_device_null_columns: Vec<ResidentDeviceNullBitmapLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

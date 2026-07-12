@@ -116,7 +116,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   stayed green: in-L2/out-of-L2 `sum_i32` measured 1,485/1,443 GB/s, `count_i32_compare` measured 0.88x/1.01x
   roofline, and 65,536-batch point reads measured 248.2M/252.7M lookups/s at p50 138/132us. The audit confirmed a
   pre-existing TEXT-only zero-int4-projection framing panic; the fact is owned here and its immediate fix is
-  **STRUCT-001M**. The execution root is 26,238 lines; further structural extraction remains **STRUCT-001**.
+  now complete: match-count-indexed framing supports zero numeric projections and validates every result vector;
+  nullable int4 filter validity is passed through both wrappers and benchmark handles and checked in PTX before
+  comparing the raw placeholder. A retained GPU differential proves present/absent, ordering, `''`, real `0`, and
+  NULL-key exclusion with no CPU fallback. The exact inventory is 99 tests (four intentional framing additions),
+  29 non-ignored tests pass, and TEXT-only/filter-NULL/pinned-pool gates pass 3× sequential and 2× concurrent with
+  zero CUDA 700/716/717 errors. Independent audit passed after its correctness, exact-count, and test non-vacuity
+  findings were adopted. The final card stayed green: `count_i32_compare` measured 0.96x/1.01x same-run roofline
+  in-L2/out-of-L2, while 65,536-batch point reads measured 247.3M/252.2M lookups/s at p50 139/132us. The focused
+  GPU regression is isolated in a new 74-line test module. Projected nullable text identity remains **STRUCT-001N**.
+  The execution root is 26,242 lines; further structural extraction remains **STRUCT-001**.
 
 ## Known boundaries
 

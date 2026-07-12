@@ -1268,6 +1268,8 @@ impl Engine {
             ))
         })?;
         let filter_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let filter_validity_bitmap_offset =
+            resident_device_null_column_offset(&snapshot, &table, filter_idx)?;
         let all_int4_projection = selected_indexes
             .iter()
             .all(|idx| table.columns[*idx].ty == SqlType::Int4);
@@ -1323,6 +1325,7 @@ impl Engine {
                 device_memory
                     .match_project_i32_equal_any_text_from_payload(
                         filter_offset,
+                        filter_validity_bitmap_offset,
                         &needles,
                         &int4_projection_offsets,
                         layout.offsets_byte_offset,

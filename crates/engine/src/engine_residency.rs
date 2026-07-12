@@ -11920,6 +11920,7 @@ impl Engine {
                         .contains_key(table),
                     resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
                     resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
+                    resident_device_null_columns: snapshot.resident_device_null_columns.clone(),
                 }
             })
     }

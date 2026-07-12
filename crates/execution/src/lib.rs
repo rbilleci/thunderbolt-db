@@ -109,6 +109,7 @@ impl CudaResidentDeviceMemoryReadView {
     pub fn match_project_i32_equal_any_text_from_payload(
         &self,
         filter_offset: u64,
+        filter_validity_bitmap_offset: Option<u64>,
         needles: &[i32],
         projection_offsets: &[u64],
         text_offsets_byte_offset: u64,
@@ -119,6 +120,7 @@ impl CudaResidentDeviceMemoryReadView {
         launch_cuda_resident_i32_equal_any_project_text(
             self,
             filter_offset,
+            filter_validity_bitmap_offset,
             needles,
             projection_offsets,
             text_offsets_byte_offset,
@@ -1682,6 +1684,7 @@ impl CudaResidentDeviceMemory {
     pub fn match_project_i32_equal_any_text_from_payload(
         &self,
         filter_offset: u64,
+        filter_validity_bitmap_offset: Option<u64>,
         needles: &[i32],
         projection_offsets: &[u64],
         text_offsets_byte_offset: u64,
@@ -1692,6 +1695,7 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_equal_any_project_text(
             self,
             filter_offset,
+            filter_validity_bitmap_offset,
             needles,
             projection_offsets,
             text_offsets_byte_offset,

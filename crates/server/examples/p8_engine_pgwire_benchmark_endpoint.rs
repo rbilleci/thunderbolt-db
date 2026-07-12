@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use gpu_db_engine::{
     Engine, RelationalResidencyWarmupPolicy, RelationalRetainedReadJob,
-    RelationalRetainedReadSubmission, RelationalSelectResult, ResidentDeviceTextColumnLayout,
+    RelationalRetainedReadSubmission, RelationalSelectResult, ResidentDeviceNullBitmapLayout,
+    ResidentDeviceTextColumnLayout,
 };
 use gpu_db_execution::CudaResidentDeviceMemoryReadView;
 use gpu_db_metrics::RuntimeMetricsSnapshot;
@@ -85,6 +86,7 @@ struct RetainedReadRuntimeRoute {
     row_count: u64,
     int4_columns: Vec<String>,
     text_columns: Vec<ResidentDeviceTextColumnLayout>,
+    null_columns: Vec<ResidentDeviceNullBitmapLayout>,
     read_view: CudaResidentDeviceMemoryReadView,
 }
 
@@ -548,6 +550,11 @@ fn execute_retained_read_runtime_batch(
             route,
             batch_key,
             filter_offset,
+            route
+                .null_columns
+                .iter()
+                .find(|layout| layout.name == batch_key.filter_column)
+                .map(|layout| layout.bitmap_byte_offset),
             &int4_projection_columns,
             &int4_projection_offsets,
             text_layout,
@@ -621,6 +628,7 @@ fn execute_retained_read_runtime_text_batch(
     route: &RetainedReadRuntimeRoute,
     batch_key: &RetainedSelectLiteralBatchKey,
     filter_offset: u64,
+    filter_validity_bitmap_offset: Option<u64>,
     int4_projection_columns: &[String],
     int4_projection_offsets: &[u64],
     text_layout: &ResidentDeviceTextColumnLayout,
@@ -643,6 +651,7 @@ fn execute_retained_read_runtime_text_batch(
         .read_view
         .match_project_i32_equal_any_text_from_payload(
             filter_offset,
+            filter_validity_bitmap_offset,
             &unique_needles,
             int4_projection_offsets,
             text_layout.offsets_byte_offset,
@@ -1685,6 +1694,7 @@ impl EndpointState {
                 row_count: u64::try_from(handle.row_count).unwrap_or(u64::MAX),
                 int4_columns: handle.resident_device_int4_columns,
                 text_columns: handle.resident_device_text_columns,
+                null_columns: handle.resident_device_null_columns,
                 read_view,
             };
             self.retained_read_runtime

@@ -10,6 +10,7 @@ use super::{
 pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentReadSource>(
     resident: &R,
     filter_offset: u64,
+    filter_validity_bitmap_offset: Option<u64>,
     needles: &[i32],
     projection_offsets: &[u64],
     text_offsets_byte_offset: u64,
@@ -46,6 +47,8 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     .param .u32 needle_count,
     .param .u32 projection_count,
     .param .u64 filter_offset,
+    .param .u64 filter_validity_offset,
+    .param .u32 has_filter_validity,
     .param .u64 projection_offset0,
     .param .u64 projection_offset1,
     .param .u64 projection_offset2,
@@ -75,6 +78,11 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     .reg .u32 %idx32;
     .reg .u32 %needle_count;
     .reg .u32 %projection_count;
+    .reg .u32 %has_filter_validity;
+    .reg .u32 %validity_word_idx;
+    .reg .u32 %validity_bit_idx;
+    .reg .u32 %validity_word;
+    .reg .u32 %validity_mask;
     .reg .u32 %needle_idx;
     .reg .u32 %slot;
     .reg .u32 %text_start32;
@@ -87,6 +95,8 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     .reg .u64 %rows;
     .reg .u64 %resident;
     .reg .u64 %filter_offset;
+    .reg .u64 %filter_validity_offset;
+    .reg .u64 %validity_word_byte;
     .reg .u64 %projection_offset0;
     .reg .u64 %projection_offset1;
     .reg .u64 %projection_offset2;
@@ -124,6 +134,8 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     ld.param.u32 %needle_count, [needle_count];
     ld.param.u32 %projection_count, [projection_count];
     ld.param.u64 %filter_offset, [filter_offset];
+    ld.param.u64 %filter_validity_offset, [filter_validity_offset];
+    ld.param.u32 %has_filter_validity, [has_filter_validity];
     ld.param.u64 %projection_offset0, [projection_offset0];
     ld.param.u64 %projection_offset1, [projection_offset1];
     ld.param.u64 %projection_offset2, [projection_offset2];
@@ -150,6 +162,22 @@ pub(super) fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentRea
     @%p_out bra DONE;
     setp.eq.u32 %p_done, %needle_count, 0;
     @%p_done bra DONE;
+
+    setp.eq.u32 %p_done, %has_filter_validity, 0;
+    @%p_done bra FILTER_VALID;
+    shr.u32 %validity_word_idx, %idx32, 5;
+    and.b32 %validity_bit_idx, %idx32, 31;
+    mul.wide.u32 %validity_word_byte, %validity_word_idx, 4;
+    add.u64 %addr, %resident, %filter_validity_offset;
+    add.u64 %addr, %addr, %validity_word_byte;
+    ld.global.u32 %validity_word, [%addr];
+    mov.u32 %validity_mask, 1;
+    shl.b32 %validity_mask, %validity_mask, %validity_bit_idx;
+    and.b32 %validity_word, %validity_word, %validity_mask;
+    setp.eq.u32 %p_done, %validity_word, 0;
+    @%p_done bra DONE;
+
+FILTER_VALID:
 
     mul.lo.u64 %row_byte, %idx, 4;
     add.u64 %addr, %resident, %filter_offset;
@@ -292,6 +320,18 @@ DONE:
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             filter_bytes.max(text_offsets_end).max(text_bytes_end) as usize,
         ));
+    }
+    if let Some(validity_offset) = filter_validity_bitmap_offset {
+        let validity_end = row_count
+            .div_ceil(32)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .and_then(|bytes| validity_offset.checked_add(bytes))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if validity_end > resident.metadata().allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                validity_end as usize,
+            ));
+        }
     }
     for byte_offset in projection_offsets {
         let bytes = row_count
@@ -437,6 +477,8 @@ DONE:
     let mut projection_count_arg = u32::try_from(projection_offsets.len())
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(projection_offsets.len()))?;
     let mut filter_offset_arg = filter_offset;
+    let mut filter_validity_offset_arg = filter_validity_bitmap_offset.unwrap_or(0);
+    let mut has_filter_validity_arg = u32::from(filter_validity_bitmap_offset.is_some());
     let mut projected_offsets = [0_u64; MAX_PROJECTIONS];
     for (idx, offset) in projection_offsets.iter().enumerate() {
         projected_offsets[idx] = *offset;
@@ -459,6 +501,8 @@ DONE:
         (&mut needle_count_arg as *mut u32).cast::<c_void>(),
         (&mut projection_count_arg as *mut u32).cast::<c_void>(),
         (&mut filter_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut filter_validity_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut has_filter_validity_arg as *mut u32).cast::<c_void>(),
         (&mut projected_offsets[0] as *mut u64).cast::<c_void>(),
         (&mut projected_offsets[1] as *mut u64).cast::<c_void>(),
         (&mut projected_offsets[2] as *mut u64).cast::<c_void>(),
@@ -707,6 +751,7 @@ DONE:
             needles,
             row_count,
             projection_count,
+            match_count_usize,
             &values,
             &needle_indices,
             &row_indices,
@@ -836,6 +881,7 @@ DONE:
         needles,
         row_count,
         projection_count,
+        match_count_usize,
         &values,
         &needle_indices,
         &row_indices,
@@ -853,6 +899,7 @@ fn assemble_i32_text_batch_projection_rows(
     needles: &[i32],
     row_count: u64,
     projection_count: usize,
+    expected_match_count: usize,
     values: &[i32],
     needle_indices: &[u32],
     row_indices: &[u64],
@@ -860,42 +907,160 @@ fn assemble_i32_text_batch_projection_rows(
     text_lens: &[u32],
     text_bytes: &[u8],
 ) -> Result<Vec<CudaI32TextBatchProjectionRow>, CudaRuntimeProbeError> {
-    values
-        .chunks_exact(projection_count)
-        .zip(needle_indices.iter().copied())
-        .zip(row_indices.iter().copied())
-        .zip(text_starts.iter().copied())
-        .zip(text_lens.iter().copied())
-        .map(
-            |((((row, needle_index), row_index), text_start), text_len)| {
-                let needle_index = usize::try_from(needle_index)
-                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-                if needle_index >= needles.len() {
-                    return Err(CudaRuntimeProbeError::InvalidInputLength(needle_index));
-                }
-                if row_index >= row_count {
-                    return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
-                }
-                let text_start = usize::try_from(text_start)
-                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-                let text_len = usize::try_from(text_len)
-                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-                let text_end = text_start
-                    .checked_add(text_len)
-                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-                if text_end > text_bytes.len() {
-                    return Err(CudaRuntimeProbeError::InvalidInputLength(text_end));
-                }
-                let text = std::str::from_utf8(&text_bytes[text_start..text_end])
-                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(text_len))?
-                    .to_string();
-                Ok(CudaI32TextBatchProjectionRow {
-                    needle_index,
-                    row_index,
-                    values: row.to_vec(),
-                    text,
-                })
-            },
-        )
+    if needle_indices.len() != expected_match_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            needle_indices.len(),
+        ));
+    }
+    let match_count = expected_match_count;
+    let expected_values = match_count
+        .checked_mul(projection_count)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if values.len() != expected_values {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(values.len()));
+    }
+    for result_len in [row_indices.len(), text_starts.len(), text_lens.len()] {
+        if result_len != match_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(result_len));
+        }
+    }
+
+    (0..match_count)
+        .map(|match_idx| {
+            let value_start = match_idx
+                .checked_mul(projection_count)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            let value_end = value_start
+                .checked_add(projection_count)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            let row = &values[value_start..value_end];
+            let needle_index = needle_indices[match_idx];
+            let row_index = row_indices[match_idx];
+            let text_start = text_starts[match_idx];
+            let text_len = text_lens[match_idx];
+            let needle_index = usize::try_from(needle_index)
+                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if needle_index >= needles.len() {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(needle_index));
+            }
+            if row_index >= row_count {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+            }
+            let text_start = usize::try_from(text_start)
+                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            let text_len = usize::try_from(text_len)
+                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            let text_end = text_start
+                .checked_add(text_len)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if text_end > text_bytes.len() {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(text_end));
+            }
+            let text = std::str::from_utf8(&text_bytes[text_start..text_end])
+                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(text_len))?
+                .to_string();
+            Ok(CudaI32TextBatchProjectionRow {
+                needle_index,
+                row_index,
+                values: row.to_vec(),
+                text,
+            })
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_row_assembly_supports_zero_numeric_projections() {
+        let rows = assemble_i32_text_batch_projection_rows(
+            &[7, 9],
+            3,
+            0,
+            2,
+            &[],
+            &[0, 1],
+            &[0, 2],
+            &[0, 3],
+            &[3, 0],
+            b"abc",
+        )
+        .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                CudaI32TextBatchProjectionRow {
+                    needle_index: 0,
+                    row_index: 0,
+                    values: Vec::new(),
+                    text: "abc".to_string(),
+                },
+                CudaI32TextBatchProjectionRow {
+                    needle_index: 1,
+                    row_index: 2,
+                    values: Vec::new(),
+                    text: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn text_row_assembly_rejects_mismatched_result_vectors() {
+        let err = assemble_i32_text_batch_projection_rows(
+            &[7],
+            1,
+            0,
+            1,
+            &[],
+            &[0],
+            &[],
+            &[0],
+            &[1],
+            b"x",
+        )
+        .unwrap_err();
+        assert!(matches!(err, CudaRuntimeProbeError::InvalidInputLength(0)));
+    }
+
+    #[test]
+    fn text_row_assembly_rejects_mismatched_numeric_values() {
+        let err = assemble_i32_text_batch_projection_rows(
+            &[7],
+            1,
+            2,
+            1,
+            &[11],
+            &[0],
+            &[0],
+            &[0],
+            &[1],
+            b"x",
+        )
+        .unwrap_err();
+        assert!(matches!(err, CudaRuntimeProbeError::InvalidInputLength(1)));
+    }
+
+    #[test]
+    fn text_row_assembly_validates_kernel_reported_match_count() {
+        for needle_indices in [&[][..], &[0, 0][..]] {
+            let err = assemble_i32_text_batch_projection_rows(
+                &[7],
+                1,
+                0,
+                1,
+                &[],
+                needle_indices,
+                &[0],
+                &[0],
+                &[1],
+                b"x",
+            )
+            .unwrap_err();
+            assert!(matches!(err, CudaRuntimeProbeError::InvalidInputLength(_)));
+        }
+    }
 }
