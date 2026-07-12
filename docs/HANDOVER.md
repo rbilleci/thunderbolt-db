@@ -26,12 +26,14 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **MULTI-002:** when a physical two-GPU host is available, partition write/visible-locate submissions by
+1. **STRUCT-001AD:** make the extracted sidecar APIs total with typed same-context sources, exact slot/bitmap/
+   text extents, alignment/arithmetic preflight, and launched-error draining.
+2. **MULTI-002:** when a physical two-GPU host is available, partition write/visible-locate submissions by
    primary context and deterministically merge bounded metadata; never move lookup or visibility to the host.
-2. **STRUCT-001:** continue disposition of the 29 source-size outliers with the next cohesive execution leaf.
-3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
+3. **STRUCT-001:** continue disposition of the 29 source-size outliers after the promoted leaf closes.
+4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
-4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 

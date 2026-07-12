@@ -281,6 +281,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   independent audit are clean. `write_apply.rs` is 1,256 lines and the execution root is 19,022 lines. The
   physical cross-context branch remains necessarily vacuous on this one-GPU host; **MULTI-002** owns the
   non-vacuous multi-device gate.
+  The five resident sidecar launchers and their byte-identical ASCII PTX now live in the private 819-line
+  `execution::resident_sidecar` module: u64 slot scatter, bool bitmap range set, bool/null bitmap shard gather,
+  and text-offset rebase. Method bodies are normalized-exact apart from blank lines; symbols, arguments/grids,
+  source/destination addressing, bit/NULL/text semantics, synchronization, inherent APIs, and all engine callers
+  are unchanged. The exact 120-test execution inventory and 44/76 suite remain stable. Five resident DELETE,
+  bool, NULL, multi-shard text-rebase, and compound-text gates passed 15 sequential and 10 concurrent invocations
+  without CUDA 700/716/717; workspace check and execution clippy are green. Independent extraction audit is
+  clean and exposed pre-existing raw source ownership/context/extent, unbounded scatter/bitmap destinations,
+  and implicit semantic preconditions, promoted as **STRUCT-001AD** ahead of further decomposition. The execution
+  root is 18,207 lines.
 
 ## Known boundaries
 
