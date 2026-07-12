@@ -12,6 +12,7 @@ readback, while relational decisions and result values execute on the device.
 - [`docs/HANDOVER.md`](docs/HANDOVER.md) — short current resume baton.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system design.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — accepted rationale and ADRs.
+- [`docs/CODE_SIZE.md`](docs/CODE_SIZE.md) — source-size and safe decomposition standard.
 
 Design references under `docs/design/` are non-authoritative. Material under `docs/archive/` is historical and
 must never be interpreted as current work.

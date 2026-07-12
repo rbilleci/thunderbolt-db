@@ -63,9 +63,22 @@ Before major runtime, storage, or scheduler changes, read:
   durability, multi-GPU)
 - `docs/DECISIONS.md` — the decision ledger (ADRs)
 - `docs/PLAN.md` (ordered work) · `docs/STATUS.md` (current state) · `docs/HANDOVER.md` (resume baton)
+- `docs/CODE_SIZE.md` — source-size thresholds, decomposition method, reference updates, and exceptions
 
 When a change intentionally favors CPU-first behavior, document why it is a
 fallback, bootstrap step, or product-scope exception.
+
+## Source File Size and Module Boundaries
+
+Follow `docs/CODE_SIZE.md`. Production source over 2,000 lines and test/example/tool source over 3,000 lines
+requires an audited disposition; any file over 5,000 lines must remain owned by a PLAN task until it is split or
+accepted in the exception registry. New modules should normally remain below 1,500 lines.
+
+Split by invariant and ownership, not by line range. Preserve stable facades, move the closest tests, update
+module/import/re-export/build/test/doc references in the same slice, and verify old paths and symbols are gone.
+Do not create `part1`/`part2` shards, catch-all modules, dependency cycles, or broad visibility solely to make a
+split compile. Keep behavior changes separate from structural extraction and run the gates prescribed by the
+standard and the affected subsystem.
 
 ## Read-path performance regression benchmark (standard)
 

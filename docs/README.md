@@ -8,6 +8,7 @@ Each kind of information has one owner:
 - [`HANDOVER.md`](HANDOVER.md) — short resume baton pointing to PLAN IDs: the **resume point**.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — system design: the **how**.
 - [`DECISIONS.md`](DECISIONS.md) — accepted ADRs and rationale: the **why**.
+- [`CODE_SIZE.md`](CODE_SIZE.md) — source-size, decomposition, reference-update, and exception rules.
 - [`CONFIG.md`](CONFIG.md) and [`SHARD_STORAGE.md`](SHARD_STORAGE.md) — focused current contracts.
 
 `design/` contains non-authoritative mechanism references. Slice orders, open questions, and recommendations in

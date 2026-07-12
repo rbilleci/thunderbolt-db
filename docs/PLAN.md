@@ -18,16 +18,112 @@ task ID here or be explicitly historical.
 
 ## Current focus
 
-1. **R3-001 — reconcile the live write path with the target GPU-native write design.** This is the next
-   architecture decision needed before wider write work or host-store deletion.
-2. **BENCH-001 — complete the open-loop OLTP comparison.** Run in parallel when benchmark capacity is
+1. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
+   reduce the highest context risks before broad implementation work expands them further.
+2. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
+   architecture decision needed before wider write work or host-store deletion; structural extraction may
+   precede it, but must not make the decision implicitly.
+3. **BENCH-001 — complete the open-loop OLTP comparison.** Run in parallel when benchmark capacity is
    available; it remains the evidence gate for ordering performance work.
-3. **CFG-001 — retire obsolete runtime arms and knobs opportunistically with their replacement paths.**
+
+## STRUCT-001 — oversized-file remediation method
+
+The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). The 2026-07-12 baseline has **29 files outside its
+analysis envelopes**: 17 production files over 2,000 lines, eight test files over 3,000 lines, and four examples
+or tools over 3,000 lines. This inventory is a review queue, not a predetermined request to split every file.
+
+### Analysis packet required for each file
+
+Before editing an outlier, put a compact packet in its implementation commit/PR and distill the result into
+that file's disposition cell in the inventory below:
+
+1. current line count, class, and generated/archive status;
+2. responsibility map by major types/functions/tests/kernels and the invariant owned by each cluster;
+3. dependency map covering callers, imports/re-exports, shared state, feature gates, unsafe/device boundaries,
+   build integration, and external API consumers;
+4. change-history/co-change evidence sufficient to distinguish real cohesion from accidental accumulation;
+5. one disposition: decompose, retain by registered exception, regenerate, archive, or delete;
+6. for decomposition, the target module map, dependency direction, stable facade/re-exports, test moves, risks,
+   and exact compile/test/GPU/performance gates.
+
+Execute one behavior-preserving ownership extraction at a time. Keep semantic rewrites separate, update every
+code/build/test/doc reference in the same slice, search for old paths and symbols, and do not create numbered
+shards, catch-all modules, cycles, or a compensating `pub(crate)` sprawl. Target new modules below 1,500 lines.
+Critical outliers over 5,000 lines receive priority; a pure structural move uses targeted correctness gates,
+while any runtime/kernel/residency/result-path change also uses the full applicable `AGENTS.md` gates.
+
+### Ordered inventory
+
+**Wave 1 — critical production context risks (over 10,000 lines).** Analyze facades and embedded implementation
+first so extraction preserves crate APIs and GPU/kernel ownership.
+
+| Lines | File | Disposition / evidence |
+|---:|---|---|
+| 40,308 | `crates/execution/src/lib.rs` | QUEUED |
+| 31,858 | `crates/protocol/src/bin/gpu-db-server.rs` | QUEUED |
+| 20,164 | `crates/replication/src/lib.rs` | QUEUED |
+| 12,958 | `crates/engine/src/engine_residency.rs` | QUEUED |
+| 11,173 | `crates/engine/src/engine_expr.rs` | QUEUED |
+| 10,271 | `crates/protocol/src/lib.rs` | QUEUED |
+
+**Wave 2 — other critical production files (5,001–10,000 lines).** Start after each affected crate has a stable
+module map; work may run independently across crates but GPU validation remains serialized.
+
+| Lines | File | Disposition / evidence |
+|---:|---|---|
+| 9,410 | `crates/engine/src/engine_streaming_exec.rs` | QUEUED |
+| 7,749 | `crates/wal/src/lib.rs` | QUEUED |
+| 7,445 | `crates/sql/src/lib.rs` | QUEUED |
+
+**Wave 3 — production review outliers (2,001–5,000 lines).** Analyze after Waves 1–2 establish the relevant
+facades, unless one is a safe leaf extraction that directly reduces an earlier wave.
+
+| Lines | File | Disposition / evidence |
+|---:|---|---|
+| 4,727 | `crates/engine/src/engine_dml_concurrent.rs` | QUEUED |
+| 4,636 | `crates/engine/src/mvcc_read_exec.rs` | QUEUED |
+| 3,869 | `crates/engine/src/engine_retained_read.rs` | QUEUED |
+| 3,437 | `crates/engine/src/engine_sql_pg.rs` | QUEUED |
+| 2,696 | `crates/write_conveyor/src/wal_segment.rs` | QUEUED |
+| 2,255 | `crates/engine/src/engine_write_apply.rs` | QUEUED |
+| 2,195 | `crates/engine/src/engine_dml_prepare.rs` | QUEUED |
+| 2,135 | `crates/engine/src/rel_exec_helpers.rs` | QUEUED |
+
+**Wave 4 — test-suite outliers (over 3,000 lines).** Split by behavioral seam and fixture ownership after, or
+alongside, the production module they cover; do not fragment tests merely to reduce a count.
+
+| Lines | File | Disposition / evidence |
+|---:|---|---|
+| 10,369 | `crates/engine/src/tests/resident_expr.rs` | QUEUED |
+| 6,460 | `crates/engine/src/tests/streaming_exec.rs` | QUEUED |
+| 5,827 | `crates/engine/src/tests/sql_pg.rs` | QUEUED |
+| 5,374 | `crates/engine/src/tests/mvcc_bundles.rs` | QUEUED |
+| 5,206 | `crates/engine/src/tests/intent_fast_path.rs` | QUEUED |
+| 4,649 | `crates/engine/src/tests/resident_route.rs` | QUEUED |
+| 3,958 | `crates/engine/src/tests/sql_catalog.rs` | QUEUED |
+| 3,502 | `crates/engine/src/tests/mvcc_query.rs` | QUEUED |
+
+**Wave 5 — example and tool outliers (over 3,000 lines).** Determine whether each is a cohesive executable,
+handwritten tool, reproducible generated artifact, or obsolete evidence before choosing modules or an exception.
+
+| Lines | File | Disposition / evidence |
+|---:|---|---|
+| 14,889 | `scripts/generate_research_paper_mechanism_links.py` | QUEUED |
+| 4,738 | `crates/write_conveyor/examples/write_conveyor_bench.rs` | QUEUED |
+| 3,634 | `crates/server/examples/p8_engine_pgwire_benchmark_endpoint.rs` | QUEUED |
+| 3,137 | `scripts/run_p8_ch_benchmark_residency_probe.sh` | QUEUED |
+
+STRUCT-001 closes only when every row has an audited disposition; every accepted retention appears in the
+`CODE_SIZE.md` exception registry; no non-excepted production file exceeds 2,000 lines and no non-excepted
+test/example/tool exceeds 3,000; all references resolve; targeted gates pass after every extraction; and a fresh
+inventory finds no unowned outlier. Line-count drift is expected, so the fresh inventory—not this snapshot—is
+the final acceptance source.
 
 ## Work ledger
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
+| **STRUCT-001** | NOW | P0 | Analyze and disposition every source-size outlier through the method and ordered inventory above. Decompose by ownership, register a bounded exception, or prove generated/archive/delete status; update all references and pass targeted gates. Close only when a fresh inventory has no unowned outlier. | None | `docs/CODE_SIZE.md` |
 | **R3-001** | NOW | P0 | Audit the current lane, chunk-authoritative, MVCC-sidecar, and recovery implementations against the target write model; choose the surviving version-storage/index/CC design in an ADR. Explicitly disposition the retired mega-fuse idea rather than reviving it from archived handovers. No implementation begins from an unaccepted proposal. | None | `docs/design/write-path-design-inputs.md` |
 | **BENCH-001** | NOW | P0 | Open-loop offered-rate harness reports p50/p99/p99.9/p99.99 and saturation TPS against tuned PostgreSQL on the same host, split by deterministic-fast and interactive-slow transaction classes. Exclude warm-up from sustained metrics and publish the exact Postgres/host configuration. Results identify whether the residual is GPU-architectural or host-serial. | Quiet benchmark window and reproducible Postgres config | ADR-008; ARCHITECTURE §9 |
 | **R3-002** | NEXT | P0 | Extend the GPU-native write/read fast path beyond int4-PK: numeric/UUID, bool, wider fixed-width types, then variable-width text and compound keys. For every graduated shape, DML locate and constraint validation use device indexes/predicates without `CachedShardPkIndex` or host-probe fallback; GPU-fired differentials, recovery parity, and mixed read/write coverage are required. | R3-001 | Type-coverage evidence in archived handovers; `docs/design/non-int4-index-design-inputs.md` |
