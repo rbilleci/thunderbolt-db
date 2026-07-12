@@ -392,6 +392,106 @@
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_dense_index_probe_drop_without_complete_drains_before_pool_reuse() {
+        // The dense submission owns the same asynchronous HtoD/kernel work and pooled buffers/stream as its
+        // atomic sibling. Dropping it before completion must synchronize before any guard returns to a shared
+        // pool. Droppers and completers intentionally contend on one primary context so an omitted drain turns
+        // into corrupt status/value slots or a CUDA safety failure.
+        use std::sync::Arc;
+
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let row_count = 4_096_u64;
+        let keys: Vec<i32> = (1..=row_count as i32).collect();
+        let payload: Vec<i32> = keys.iter().map(|key| key * 10).collect();
+        let mut bytes = Vec::with_capacity(row_count as usize * 8);
+        for value in keys.iter().chain(&payload) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let resident = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &bytes)
+                .expect("resident device memory"),
+        );
+        let (index, table_mask, hash_shift) = build_pk_hash(&keys);
+        let index_bytes: Vec<u8> = index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
+        let index = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &index_bytes)
+                .expect("index device memory"),
+        );
+        let projection_offsets = [0, row_count * std::mem::size_of::<i32>() as u64];
+        let needles = [1, 2_048, 4_096, -1];
+
+        let assert_complete = |columns: CudaI32BatchProjectionColumns| {
+            assert_eq!(columns.status, [1, 1, 1, 2]);
+            assert_eq!(&columns.values[0..2], &[1, 10]);
+            assert_eq!(&columns.values[2..4], &[2_048, 20_480]);
+            assert_eq!(&columns.values[4..6], &[4_096, 40_960]);
+        };
+
+        const ITERS: usize = 100;
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let resident = Arc::clone(&resident);
+            let index = Arc::clone(&index);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ITERS {
+                    let submission = resident
+                        .submit_match_project_i32_index_probe_dense_from_payload(
+                            &index,
+                            table_mask,
+                            hash_shift,
+                            &needles,
+                            &projection_offsets,
+                            row_count,
+                        )
+                        .expect("dense submit to drop");
+                    drop(submission);
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let resident = Arc::clone(&resident);
+            let index = Arc::clone(&index);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ITERS {
+                    let (columns, _) = resident
+                        .submit_match_project_i32_index_probe_dense_from_payload(
+                            &index,
+                            table_mask,
+                            hash_shift,
+                            &needles,
+                            &projection_offsets,
+                            row_count,
+                        )
+                        .expect("dense submit to complete")
+                        .complete_detached_columnar()
+                        .expect("dense complete");
+                    assert_complete(columns);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("dense pool-reuse worker panicked");
+        }
+
+        let (columns, _) = resident
+            .submit_match_project_i32_index_probe_dense_from_payload(
+                &index,
+                table_mask,
+                hash_shift,
+                &needles,
+                &projection_offsets,
+                row_count,
+            )
+            .expect("final dense submit")
+            .complete_detached_columnar()
+            .expect("final dense complete");
+        assert_complete(columns);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_resident_i32_compare_project_matches_expected_under_concurrent_pool_reuse() {
         // P2-M2 regression for the `compare_project` migration to the pooled-async substrate.
         // `compare_project` is a SINGLE-FRAME route (no submit→complete split), so the
@@ -2065,4 +2165,3 @@
             "current generation g2 was freed early"
         );
     }
-

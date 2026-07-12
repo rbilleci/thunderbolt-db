@@ -93,8 +93,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   independent byte-level audit found PTX, launch parameters, bounds, fallbacks, guards, fences, and index pinning
   unchanged. The canonical report card stayed green in both layers and cache regimes: in-L2/out-of-L2 `sum_i32`
   measured 1,471/1,453 GB/s, `count_i32_compare` measured 0.89x/1.00x roofline, and 65,536-batch point reads
-  measured 246.1M/253.3M lookups/s at p50 138/132us. The execution root is 28,353 lines. Further extraction is
-  owned by **STRUCT-001J/STRUCT-001**.
+  measured 246.1M/253.3M lookups/s at p50 138/132us. The 1,086-line `execution::point_read_dense` module now
+  owns the dense unique-index result/lifecycle contract, single- and multi-shard submit/PTX, and shard descriptor.
+  Device hash probing, MVCC birth/death and row bounds, zone pruning, binary/linear routing, root APIs, guards,
+  events, fallback/drain behavior, and drop fencing remain unchanged. The exact inventory is now 95 tests due to
+  one intentional dense drop-without-complete regression; 25 non-ignored tests pass. Five dense/MVCC/binary/NULL/
+  drop GPU gates passed 3× sequential and 2× concurrent with zero CUDA 700/716/717 errors, and independent audit
+  found no issue at any severity. Its canonical report card stayed green: in-L2/out-of-L2 `sum_i32` measured
+  1,483/1,443 GB/s, `count_i32_compare` measured 0.86x/1.00x roofline, and 65,536-batch point reads measured
+  247.1M/252.3M lookups/s at p50 139/132us. The execution root is 27,280 lines. Further extraction is owned by
+  **STRUCT-001K/STRUCT-001**.
 
 ## Known boundaries
 
