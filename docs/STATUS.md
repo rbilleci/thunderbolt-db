@@ -101,8 +101,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   drop GPU gates passed 3× sequential and 2× concurrent with zero CUDA 700/716/717 errors, and independent audit
   found no issue at any severity. Its canonical report card stayed green: in-L2/out-of-L2 `sum_i32` measured
   1,483/1,443 GB/s, `count_i32_compare` measured 0.86x/1.00x roofline, and 65,536-batch point reads measured
-  247.1M/252.3M lookups/s at p50 139/132us. The execution root is 27,280 lines. Further extraction is owned by
-  **STRUCT-001K/STRUCT-001**.
+  247.1M/252.3M lookups/s at p50 139/132us. The 206-line `execution::point_read_bloom` module now owns chunk-
+  Bloom device pruning. Two-hash/three-probe bit addressing, descriptor/output layout, bounds, pooled allocations,
+  resident guards, synchronous launch/readback, and the root API remain unchanged. The exact 95-test inventory,
+  25 non-ignored tests, and Bloom false-negative/NULL GPU gates passed 3× sequential and 2× concurrent with zero
+  CUDA 700/716/717 errors; independent audit found no remaining issue after its formatting finding was adopted.
+  Its canonical report card stayed green: in-L2/out-of-L2 `sum_i32` measured 1,479/1,444 GB/s,
+  `count_i32_compare` measured 0.89x/1.00x roofline, and 65,536-batch point reads measured 246.3M/253.5M
+  lookups/s at p50 139/131us. The execution root is 27,128 lines. Further extraction is owned by
+  **STRUCT-001L/STRUCT-001**.
 
 ## Known boundaries
 

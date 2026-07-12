@@ -21,9 +21,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001K:** isolate chunk-Bloom device pruning in the point-read layer while preserving hashing, mask and
-   bounded result layout, resident guards, root APIs, NULL boundaries, GPU HAZARD gates, and the canonical report
-   card.
+1. **STRUCT-001L:** isolate equal-any int4-filter/text projection and bounded text row assembly in the point-read
+   layer while preserving PTX, async staging, UTF-8/text bounds, root APIs, NULL/pool HAZARD gates, and the
+   canonical report card.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
