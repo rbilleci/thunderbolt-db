@@ -76,7 +76,11 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and CUDA RAII guards now live in the 948-line `execution::cuda_context` module with parent-private visibility.
   Real-GPU context/pool/count and NULL-validity gates passed 3× sequential and 2× concurrent with zero CUDA
   safety errors; an independent audit found no ownership/drop-order regression and its visibility findings were
-  adopted. The execution root is 31,334 lines. Further extraction is owned by **STRUCT-001F/STRUCT-001**.
+  adopted. The 883-line `execution::cuda_driver` module now owns runtime probing/snapshots, primitive dispatch,
+  resident allocation construction, async-copy fallback, raw HtoD/DtoD builders, and `GpuRuntime` routing. Its
+  real-GPU driver/smoke/allocation/NULL matrix passed 3× sequential and 2× concurrent; independent audit found
+  proof, fencing, guard, and recompaction behavior unchanged. The execution root is 30,466 lines. Further
+  extraction is owned by **STRUCT-001G/STRUCT-001**.
 
 ## Known boundaries
 
