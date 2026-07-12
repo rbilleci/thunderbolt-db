@@ -224,6 +224,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   1,678.0 M elements/s, count at 0.88x/1.01x same-run roofline, gather at 349.5/155.3 GB/s, and 65,536-batch point
   reads at 247.4M/251.4M lookups/s with p50 138/132us in-L2/out-of-L2. The execution root is 20,589 lines;
   `group_input.rs` is 639 lines and `resident_group.rs` is 1,282 lines. Further extraction remains **STRUCT-001**.
+  The four device write/visible-locate contracts, both ASCII PTX programs, and both launchers now live in the
+  private 721-line `execution::write_locate` module with stable crate-root re-exports. The PTX byte arrays and
+  moved method/documentation bodies are exact matches to their prior root definitions; descriptor packing,
+  duplicate advancement, overflow sentinel, unsigned MVCC visibility, output ordering, and GPU-only addressing
+  are unchanged. The exact 116-test inventory and 42/74 suite remain stable. Write locate, visible DELETE/UPDATE,
+  and sharded duplicate gates passed 12 sequential and 8 concurrent invocations without CUDA 700/716/717.
+  Independent audit found no extraction defect and identified a pre-existing safe-boundary gap: cross-context or
+  geometrically incoherent indexes, unowned/unbounded version pointers, packed slots beyond version extents, and
+  post-launch DtoH errors without a best-effort drain. Those gaps are now owned by **STRUCT-001Z** ahead of further
+  decomposition. The execution root is 19,881 lines.
 
 ## Known boundaries
 
