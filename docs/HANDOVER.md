@@ -21,9 +21,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001T:** close the audit-found safe typed-filter OOB boundary with checked fixed-width/bitmap/text
-   windows and device-side text-span guards before any byte read; add non-GPU overflow/OOB and real-GPU malformed
-   text/type/NULL regressions without a host validation scan or relational fallback.
+1. **STRUCT-001U:** isolate fixed-width filtered SUM/MIN/MAX and i128 partial aggregate launchers in a focused
+   private module while preserving root APIs, device reduction/overflow semantics, pooled lifetimes, bounded
+   readback, and performance.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.

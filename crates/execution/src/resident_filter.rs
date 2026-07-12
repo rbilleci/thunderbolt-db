@@ -5,6 +5,63 @@ use super::{
     CudaRuntimeProbeError,
 };
 
+fn invalid_window(end: u64) -> CudaRuntimeProbeError {
+    CudaRuntimeProbeError::InvalidInputLength(usize::try_from(end).unwrap_or(usize::MAX))
+}
+
+fn validate_window(
+    allocated_bytes: u64,
+    byte_offset: u64,
+    element_count: u64,
+    element_width: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    let end = element_count
+        .checked_mul(element_width)
+        .and_then(|bytes| byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if end > allocated_bytes {
+        return Err(invalid_window(end));
+    }
+    Ok(())
+}
+
+fn validate_bitmap_windows(
+    allocated_bytes: u64,
+    bitmap_offsets: &[u64],
+    row_count: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    let word_count = row_count.div_ceil(32);
+    for &offset in bitmap_offsets {
+        validate_window(
+            allocated_bytes,
+            offset,
+            word_count,
+            std::mem::size_of::<u32>() as u64,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_text_windows(
+    allocated_bytes: u64,
+    offsets_byte_offset: u64,
+    bytes_byte_offset: u64,
+    bytes_len: u64,
+    row_count: u64,
+) -> Result<u64, CudaRuntimeProbeError> {
+    let offset_count = row_count
+        .checked_add(1)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    validate_window(
+        allocated_bytes,
+        offsets_byte_offset,
+        offset_count,
+        std::mem::size_of::<u64>() as u64,
+    )?;
+    validate_window(allocated_bytes, bytes_byte_offset, bytes_len, 1)?;
+    Ok(bytes_len)
+}
+
 /// Evaluate `col <cmp> scalar` (or `scalar <cmp> col` when `scalar_on_left`) over a resident int8
 /// column to surviving row indices (the type matrix, doc 19): run
 /// `gpu_db_resident_i64_compare_scalar_to_mask` to a 0/1 mask, then compact it with the type-agnostic
@@ -35,6 +92,12 @@ pub(super) fn launch_cuda_resident_i64_compare_scalar_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
+    validate_window(
+        resident.metadata().allocated_bytes,
+        byte_offset,
+        n,
+        std::mem::size_of::<i64>() as u64,
+    )?;
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -117,6 +180,14 @@ pub(super) fn launch_cuda_resident_i64_compare_columns_filter(
 
     if n == 0 {
         return Ok(Vec::new());
+    }
+    for offset in [a_byte_offset, b_byte_offset] {
+        validate_window(
+            resident.metadata().allocated_bytes,
+            offset,
+            n,
+            std::mem::size_of::<i64>() as u64,
+        )?;
     }
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
@@ -202,6 +273,12 @@ pub(super) fn launch_cuda_resident_i128_compare_scalar_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
+    validate_window(
+        resident.metadata().allocated_bytes,
+        byte_offset,
+        n,
+        std::mem::size_of::<i128>() as u64,
+    )?;
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -268,6 +345,7 @@ pub(super) fn launch_cuda_resident_text_eq_scalar_filter(
     resident: &CudaResidentDeviceMemory,
     offsets_byte_offset: u64,
     bytes_byte_offset: u64,
+    bytes_len: u64,
     needle: &[u8],
     negate: bool,
     n: u64,
@@ -290,6 +368,13 @@ pub(super) fn launch_cuda_resident_text_eq_scalar_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
+    let text_bytes_limit = validate_text_windows(
+        resident.metadata().allocated_bytes,
+        offsets_byte_offset,
+        bytes_byte_offset,
+        bytes_len,
+        n,
+    )?;
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -321,20 +406,22 @@ pub(super) fn launch_cuda_resident_text_eq_scalar_filter(
     let mut a0 = resident.device_ptr();
     let mut a1 = offsets_byte_offset;
     let mut a2 = bytes_byte_offset;
-    let mut a3 = needle_lease.ptr;
-    let mut a4 = needle.len() as u64;
-    let mut a5 = u32::from(negate);
-    let mut a6 = n;
-    let mut a7 = mask.ptr;
+    let mut a3 = text_bytes_limit;
+    let mut a4 = needle_lease.ptr;
+    let mut a5 = needle.len() as u64;
+    let mut a6 = u32::from(negate);
+    let mut a7 = n;
+    let mut a8 = mask.ptr;
     let mut args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
         (&mut a2 as *mut u64).cast::<c_void>(),
         (&mut a3 as *mut u64).cast::<c_void>(),
         (&mut a4 as *mut u64).cast::<c_void>(),
-        (&mut a5 as *mut u32).cast::<c_void>(),
-        (&mut a6 as *mut u64).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+        (&mut a6 as *mut u32).cast::<c_void>(),
         (&mut a7 as *mut u64).cast::<c_void>(),
+        (&mut a8 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         if !needle.is_empty() {
@@ -380,6 +467,7 @@ pub(super) fn launch_cuda_resident_text_compare_scalar_filter(
     resident: &CudaResidentDeviceMemory,
     offsets_byte_offset: u64,
     bytes_byte_offset: u64,
+    bytes_len: u64,
     needle: &[u8],
     scalar_on_left: bool,
     comparison: u32,
@@ -404,6 +492,14 @@ pub(super) fn launch_cuda_resident_text_compare_scalar_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
+    let text_bytes_limit = validate_text_windows(
+        resident.metadata().allocated_bytes,
+        offsets_byte_offset,
+        bytes_byte_offset,
+        bytes_len,
+        n,
+    )?;
+    validate_bitmap_windows(resident.metadata().allocated_bytes, validity_offsets, n)?;
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -434,22 +530,24 @@ pub(super) fn launch_cuda_resident_text_compare_scalar_filter(
     let mut a0 = resident.device_ptr();
     let mut a1 = offsets_byte_offset;
     let mut a2 = bytes_byte_offset;
-    let mut a3 = needle_lease.ptr;
-    let mut a4 = needle.len() as u64;
-    let mut a5 = u32::from(scalar_on_left);
-    let mut a6 = comparison;
-    let mut a7 = n;
-    let mut a8 = mask.ptr;
+    let mut a3 = text_bytes_limit;
+    let mut a4 = needle_lease.ptr;
+    let mut a5 = needle.len() as u64;
+    let mut a6 = u32::from(scalar_on_left);
+    let mut a7 = comparison;
+    let mut a8 = n;
+    let mut a9 = mask.ptr;
     let mut args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
         (&mut a2 as *mut u64).cast::<c_void>(),
         (&mut a3 as *mut u64).cast::<c_void>(),
         (&mut a4 as *mut u64).cast::<c_void>(),
-        (&mut a5 as *mut u32).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
         (&mut a6 as *mut u32).cast::<c_void>(),
-        (&mut a7 as *mut u64).cast::<c_void>(),
+        (&mut a7 as *mut u32).cast::<c_void>(),
         (&mut a8 as *mut u64).cast::<c_void>(),
+        (&mut a9 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         if !needle.is_empty() {
@@ -484,9 +582,6 @@ pub(super) fn launch_cuda_resident_text_compare_scalar_filter(
     compact_mask_with_validity(resident, mask.ptr, validity_offsets, n)
 }
 
-/// Evaluate `uuid[i] <cmp> needle` over a resident UUID column (16 raw bytes/row) to surviving row
-/// indices (the type matrix, doc 19): copy the 16 needle bytes H2D, run the byte-wise compare kernel
-/// to a mask, then the shared compactor.
 /// AND each nullable operand's NULL validity mask (1 = valid) into the i32 comparison `mask` ON THE GPU,
 /// then compact to surviving indices. For M3 (doc 21) WHERE 3VL over a nullable column whose compare
 /// kernel writes a plain mask but has no VM step (uuid memcmp): a NULL operand has validity bit 0, so the
@@ -504,6 +599,7 @@ fn compact_mask_with_validity(
     if validity_offsets.is_empty() || n == 0 {
         return compact_mask_i32_to_indices(resident, mask_ptr, n);
     }
+    validate_bitmap_windows(resident.metadata().allocated_bytes, validity_offsets, n)?;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -612,6 +708,9 @@ fn compact_mask_with_validity(
     compact_mask_i32_to_indices(resident, mask_ptr, n)
 }
 
+/// Evaluate `uuid[i] <cmp> needle` over a resident UUID column (16 raw bytes/row) to surviving row
+/// indices (the type matrix, doc 19): copy the 16 needle bytes H2D, run the byte-wise compare kernel
+/// to a mask, then the shared nullable-mask compactor.
 pub(super) fn launch_cuda_resident_uuid_compare_scalar_filter(
     resident: &CudaResidentDeviceMemory,
     byte_offset: u64,
@@ -639,6 +738,8 @@ pub(super) fn launch_cuda_resident_uuid_compare_scalar_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
+    validate_window(resident.metadata().allocated_bytes, byte_offset, n, 16)?;
+    validate_bitmap_windows(resident.metadata().allocated_bytes, validity_offsets, n)?;
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -741,6 +842,10 @@ pub(super) fn launch_cuda_resident_uuid_compare_columns_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
+    for offset in [a_byte_offset, b_byte_offset] {
+        validate_window(resident.metadata().allocated_bytes, offset, n, 16)?;
+    }
+    validate_bitmap_windows(resident.metadata().allocated_bytes, validity_offsets, n)?;
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -821,6 +926,11 @@ pub(super) fn launch_cuda_resident_bool_to_mask_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
+    validate_bitmap_windows(
+        resident.metadata().allocated_bytes,
+        &[bitmap_byte_offset],
+        n,
+    )?;
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -880,6 +990,7 @@ pub(super) fn launch_cuda_resident_text_like_scalar_filter(
     resident: &CudaResidentDeviceMemory,
     offsets_byte_offset: u64,
     bytes_byte_offset: u64,
+    bytes_len: u64,
     tokens: &[u32],
     n: u64,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
@@ -901,6 +1012,13 @@ pub(super) fn launch_cuda_resident_text_like_scalar_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
+    let text_bytes_limit = validate_text_windows(
+        resident.metadata().allocated_bytes,
+        offsets_byte_offset,
+        bytes_byte_offset,
+        bytes_len,
+        n,
+    )?;
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -936,10 +1054,11 @@ pub(super) fn launch_cuda_resident_text_like_scalar_filter(
     let mut a0 = resident.device_ptr();
     let mut a1 = offsets_byte_offset;
     let mut a2 = bytes_byte_offset;
-    let mut a3 = tokens_lease.ptr;
-    let mut a4 = tokens.len() as u64;
-    let mut a5 = n;
-    let mut a6 = mask.ptr;
+    let mut a3 = text_bytes_limit;
+    let mut a4 = tokens_lease.ptr;
+    let mut a5 = tokens.len() as u64;
+    let mut a6 = n;
+    let mut a7 = mask.ptr;
     let mut args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
@@ -948,6 +1067,7 @@ pub(super) fn launch_cuda_resident_text_like_scalar_filter(
         (&mut a4 as *mut u64).cast::<c_void>(),
         (&mut a5 as *mut u64).cast::<c_void>(),
         (&mut a6 as *mut u64).cast::<c_void>(),
+        (&mut a7 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         if !tokens.is_empty() {
@@ -1009,6 +1129,14 @@ pub(super) fn launch_cuda_resident_i128_compare_columns_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
+    for offset in [a_byte_offset, b_byte_offset] {
+        validate_window(
+            resident.metadata().allocated_bytes,
+            offset,
+            n,
+            std::mem::size_of::<i128>() as u64,
+        )?;
+    }
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -1061,4 +1189,33 @@ pub(super) fn launch_cuda_resident_i128_compare_columns_filter(
         )
     })?;
     compact_mask_i32_to_indices(resident, mask.ptr, n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_bitmap_windows, validate_text_windows, validate_window};
+
+    #[test]
+    fn typed_filter_window_validation_is_checked_and_boundary_exact() {
+        validate_window(64, 32, 2, 16).unwrap();
+        assert!(validate_window(63, 32, 2, 16).is_err());
+        assert!(validate_window(u64::MAX, u64::MAX - 1, 1, 8).is_err());
+        assert!(validate_window(u64::MAX, 0, u64::MAX, 16).is_err());
+    }
+
+    #[test]
+    fn typed_filter_bitmap_validation_covers_every_nullable_operand() {
+        validate_bitmap_windows(24, &[0, 16], 33).unwrap();
+        assert!(validate_bitmap_windows(23, &[0, 16], 33).is_err());
+        assert!(validate_bitmap_windows(u64::MAX, &[u64::MAX - 1], 33).is_err());
+    }
+
+    #[test]
+    fn typed_filter_text_validation_bounds_offsets_and_byte_base() {
+        assert_eq!(validate_text_windows(80, 0, 40, 20, 4).unwrap(), 20);
+        assert!(validate_text_windows(39, 0, 20, 1, 4).is_err());
+        assert!(validate_text_windows(80, 0, 81, 0, 4).is_err());
+        assert!(validate_text_windows(80, 0, 70, 11, 4).is_err());
+        assert!(validate_text_windows(u64::MAX, 0, 0, 0, u64::MAX).is_err());
+    }
 }

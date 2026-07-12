@@ -10186,6 +10186,7 @@ impl Engine {
                 .expr_text_like_scalar_filter(
                     layout.offsets_byte_offset,
                     layout.bytes_byte_offset,
+                    layout.bytes_len,
                     &tokens,
                     row_count,
                 )
@@ -10227,6 +10228,7 @@ impl Engine {
                 .expr_text_compare_scalar_filter(
                     layout.offsets_byte_offset,
                     layout.bytes_byte_offset,
+                    layout.bytes_len,
                     needle.as_bytes(),
                     scalar_on_left,
                     cmp,
@@ -10275,6 +10277,7 @@ impl Engine {
             .expr_text_eq_scalar_filter(
                 layout.offsets_byte_offset,
                 layout.bytes_byte_offset,
+                layout.bytes_len,
                 literal.as_bytes(),
                 negate,
                 row_count,

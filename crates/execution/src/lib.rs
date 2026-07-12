@@ -1161,6 +1161,7 @@ impl CudaResidentDeviceMemory {
         &self,
         offsets_byte_offset: u64,
         bytes_byte_offset: u64,
+        bytes_len: u64,
         needle: &[u8],
         negate: bool,
         row_count: u64,
@@ -1169,6 +1170,7 @@ impl CudaResidentDeviceMemory {
             self,
             offsets_byte_offset,
             bytes_byte_offset,
+            bytes_len,
             needle,
             negate,
             row_count,
@@ -1186,6 +1188,7 @@ impl CudaResidentDeviceMemory {
         &self,
         offsets_byte_offset: u64,
         bytes_byte_offset: u64,
+        bytes_len: u64,
         needle: &[u8],
         scalar_on_left: bool,
         comparison: u32,
@@ -1196,6 +1199,7 @@ impl CudaResidentDeviceMemory {
             self,
             offsets_byte_offset,
             bytes_byte_offset,
+            bytes_len,
             needle,
             scalar_on_left,
             comparison,
@@ -1212,6 +1216,7 @@ impl CudaResidentDeviceMemory {
         &self,
         offsets_byte_offset: u64,
         bytes_byte_offset: u64,
+        bytes_len: u64,
         tokens: &[u32],
         row_count: u64,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
@@ -1219,6 +1224,7 @@ impl CudaResidentDeviceMemory {
             self,
             offsets_byte_offset,
             bytes_byte_offset,
+            bytes_len,
             tokens,
             row_count,
         )
@@ -1275,7 +1281,8 @@ impl CudaResidentDeviceMemory {
     /// Surviving row indices of a `WHERE bool_col` predicate (the type matrix, doc 19): the bool
     /// column's 1-bit-per-row bitmap at `bitmap_byte_offset` is expanded to an i32 0/1 mask (bit i ->
     /// row i, XOR `negate` for `NOT flag` / `flag = false`), then the shared compactor selects the set
-    /// rows. The engine is non-null until M3, so this reads only the value bit (no validity bitmap).
+    /// rows. This primitive expands only the supplied value bitmap; nullable SQL lowering composes
+    /// the separate validity bitmap before selection.
     pub fn expr_bool_to_mask_filter(
         &self,
         bitmap_byte_offset: u64,

@@ -174,8 +174,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   bool gates passed 3× sequential and 2× concurrent (21/28 invocations) without CUDA safety errors. The final card
   kept i64/i128 1%-selectivity filters at 165.6/286.0 GB/s in-L2 and 363.7/594.6 GB/s out-of-L2, count at
   0.87x/1.00x roofline, and point reads at 248.0M/250.9M lookups/s with p50 138/131us. Independent audit found a
-  pre-existing safe-API device-window validation defect; its fix is **STRUCT-001T**. The execution root is 22,601
-  lines; further extraction remains **STRUCT-001**.
+  pre-existing safe-API device-window validation defect. It is now fixed: every fixed-width/bitmap/text descriptor
+  is checked with overflow-safe arithmetic before CUDA mutation; text APIs carry the exact resident byte extent,
+  and equality/order/LIKE PTX fails malformed spans closed before any byte load. Engine callers pass the descriptor
+  extent. Three pure validation tests and two GPU safety regressions raise the exact inventory to 106 tests, with
+  34 passing and 72 ignored. Nine safety/type/NULL gates passed 3× sequential and 2× concurrent (27/36 final-PTX
+  invocations) without CUDA errors. Independent audit's malformed-inequality HIGH and indentation LOW findings
+  were adopted. The final card kept i64/i128 filters at 165.6/285.6 GB/s in-L2 and 362.4/591.9 GB/s out-of-L2,
+  count at 0.86x/1.00x roofline, and point reads at 247.8M/251.9M lookups/s with p50 138/132us. The execution root
+  is 22,608 lines and `resident_filter` is 1,221 lines; further extraction remains **STRUCT-001**.
 
 ## Known boundaries
 

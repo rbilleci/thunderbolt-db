@@ -1135,37 +1135,206 @@
             .expect("retain resident device memory");
 
         let eq = resident
-            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"apple", false, N)
+            .expr_text_eq_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                b"apple",
+                false,
+                N,
+            )
             .expect("text = apple");
         assert_eq!(eq, vec![0, 2, 5], "text = 'apple' => rows 0,2,5");
 
         let ne = resident
-            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"apple", true, N)
+            .expr_text_eq_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                b"apple",
+                true,
+                N,
+            )
             .expect("text <> apple");
         assert_eq!(ne, vec![1, 3, 4], "text <> 'apple' => rows 1,3,4");
 
         let banana = resident
-            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"banana", false, N)
+            .expr_text_eq_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                b"banana",
+                false,
+                N,
+            )
             .expect("text = banana");
         assert_eq!(banana, vec![1, 4], "text = 'banana' => rows 1,4");
 
         let none = resident
-            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"grape", false, N)
+            .expr_text_eq_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                b"grape",
+                false,
+                N,
+            )
             .expect("text = grape");
         assert!(none.is_empty(), "text = 'grape' matches nothing");
 
         // length mismatches are NOT equal (equality is full-string, not prefix/contains)
         let prefix = resident
-            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"app", false, N)
+            .expr_text_eq_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                b"app",
+                false,
+                N,
+            )
             .expect("text = app");
         assert!(prefix.is_empty(), "text = 'app' (shorter) matches nothing");
         let longer = resident
-            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"apples", false, N)
+            .expr_text_eq_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                b"apples",
+                false,
+                N,
+            )
             .expect("text = apples");
         assert!(
             longer.is_empty(),
             "text = 'apples' (longer) matches nothing"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_typed_filters_reject_out_of_bounds_descriptors_before_launch() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let bytes = [0_u8; 64];
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                bytes.len() as u64,
+                &[CudaDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes: &bytes,
+                }],
+            )
+            .expect("retain resident device memory");
+
+        assert!(resident
+            .expr_i64_compare_scalar_filter(60, 0, false, 0, 1)
+            .is_err());
+        assert!(resident
+            .expr_i64_compare_columns_filter(0, 60, 0, 1)
+            .is_err());
+        assert!(resident
+            .expr_i128_compare_scalar_filter(56, 0, false, 0, 1)
+            .is_err());
+        assert!(resident
+            .expr_i128_compare_columns_filter(0, 56, 0, 1)
+            .is_err());
+        assert!(resident
+            .expr_uuid_compare_scalar_filter(56, &[0; 16], false, 0, 1, &[])
+            .is_err());
+        assert!(resident
+            .expr_uuid_compare_columns_filter(0, 56, 0, 1, &[])
+            .is_err());
+        assert!(resident.expr_bool_to_mask_filter(64, false, 1).is_err());
+        assert!(resident
+            .expr_uuid_compare_scalar_filter(0, &[0; 16], false, 0, 1, &[64])
+            .is_err());
+        assert!(resident
+            .expr_text_eq_scalar_filter(60, 0, 0, b"", false, 1)
+            .is_err());
+
+        assert_eq!(
+            resident
+                .expr_i64_compare_scalar_filter(0, 0, false, 0, 1)
+                .expect("valid filter after rejected descriptors"),
+            vec![0],
+            "rejected safe-API descriptors must not poison the CUDA context"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_text_filters_fail_closed_on_malformed_resident_spans() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        const N: u64 = 2;
+        let offsets_off = 8_u64;
+        let bytes_off = offsets_off + (N + 1) * 8;
+        let mut offsets = Vec::new();
+        for offset in [0_u64, u64::MAX, 0] {
+            offsets.extend_from_slice(&offset.to_le_bytes());
+        }
+        let blob = [b'x'];
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                bytes_off + blob.len() as u64,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: offsets_off,
+                        bytes: &offsets,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: bytes_off,
+                        bytes: &blob,
+                    },
+                ],
+            )
+            .expect("retain malformed text descriptor safely");
+
+        assert!(resident
+            .expr_text_eq_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                b"x",
+                false,
+                N,
+            )
+            .expect("malformed equality spans fail closed")
+            .is_empty());
+        assert!(resident
+            .expr_text_eq_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                b"x",
+                true,
+                N,
+            )
+            .expect("malformed inequality spans fail closed")
+            .is_empty());
+        assert!(resident
+            .expr_text_compare_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                b"x",
+                false,
+                0,
+                N,
+                &[],
+            )
+            .expect("malformed ordered-comparison spans fail closed")
+            .is_empty());
+        assert!(resident
+            .expr_text_like_scalar_filter(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                &[u32::from(b'x')],
+                N,
+            )
+            .expect("malformed LIKE spans fail closed")
+            .is_empty());
     }
 
     #[test]
@@ -1255,7 +1424,13 @@
         ] {
             let tokens = like_tokens(pattern);
             let got = resident
-                .expr_text_like_scalar_filter(offsets_off, bytes_off, &tokens, n)
+                .expr_text_like_scalar_filter(
+                    offsets_off,
+                    bytes_off,
+                    blob.len() as u64,
+                    &tokens,
+                    n,
+                )
                 .unwrap_or_else(|e| panic!("LIKE '{pattern}': {e:?}"));
             let expected: Vec<u32> = rows
                 .iter()
