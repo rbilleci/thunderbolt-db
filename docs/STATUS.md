@@ -65,9 +65,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 - **STRUCT-001** began with the execution facade. Device-routing policy now lives in `execution::routing`, and
   the RETIRE-001-owned host-reference iterator operators live in `execution::reference_operators`; stable
-  crate-root re-exports preserve downstream APIs. The first pure-move slice passed all 24 non-ignored execution
-  tests and downstream engine/planner/metrics/observability checks. Further execution-facade extraction remains
-  owned by **STRUCT-001B** and **STRUCT-001**.
+  crate-root re-exports preserve downstream APIs. The MVCC device-transfer layout and validation contract now
+  lives in `execution::mvcc_batch`, with its encoding tests. These pure-move slices passed all 24 non-ignored
+  execution tests and downstream engine/planner/metrics/observability checks. CUDA runtime/device snapshots,
+  device-memory proof, and the typed CUDA error taxonomy now live in `execution::runtime_contract`; exact
+  client-visible error text has a focused regression. The resulting 25 non-ignored execution tests pass.
+  The former 7,177-line inline execution tests now live under `execution/src/tests/`: full test names and the
+  94-test inventory are byte-for-byte stable, and every resulting test file is below 3,000 lines. The execution
+  root is 32,251 lines. Further execution-facade extraction remains owned by **STRUCT-001E** and **STRUCT-001**.
 
 ## Known boundaries
 

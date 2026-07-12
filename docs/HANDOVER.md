@@ -21,8 +21,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001B:** continue the audited execution-facade decomposition with the independent MVCC device-batch
-   encoding leaf; preserve byte layout, stable crate-root exports, and CUDA consumers.
+1. **STRUCT-001E:** extract the dependency-bottom CUDA primary-context/cache/pool/allocation substrate, preserving
+   unsafe ownership and drop order, then run the prescribed real-GPU HAZARD gates.
 2. **STRUCT-001:** continue disposition of the 29 source-size outliers after each promoted leaf closes.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
