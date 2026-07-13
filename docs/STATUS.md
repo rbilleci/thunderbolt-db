@@ -719,6 +719,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Full protocol and driver gates, all-target checks, warning-denied clippy, security preflight, focused default/
   domain/sequence/COPY/DML/catalog tests, formatting/diff checks, and independent audit are clean. The root is
   9,661 lines and STRUCT-001BZ is closed.
+  ACL policy, permission checks, role dependency scans, target validation, and all implemented GRANT/REVOKE
+  mutations now live in the private 740-line `acl_execution` owner. Eight production policy exports serve proven
+  sibling consumers; five mutation helpers are parent-visible only through test-only aliases, and command calls
+  are internal. PUBLIC/grantee/current-role precedence, composed schema/object checks, target errors, set cleanup,
+  dirty keys, arguments, persistence, and tags are normalized-exact. Inherited PRODUCT-002 debt remains: no role
+  membership graph or active-role dependency, no owner/grantor/grant-option authorization, an empty schema ACL
+  stands in for implicit PUBLIC USAGE and can change when unrelated entries appear, and function PUBLIC EXECUTE
+  defaults are not modeled. Full protocol and driver gates, all-target checks, warning-denied clippy, security
+  preflight, focused ACL/role/shared-catalog tests, formatting/diff checks, and independent audit are clean. The
+  root is 9,078 lines and STRUCT-001CA is closed.
 
 ## Known boundaries
 
