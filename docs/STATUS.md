@@ -1881,12 +1881,26 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   are clean. The canonical card remains healthy: IN-L2/OUT-OF-L2 rooflines are 1,405.1/1,449.9 GB/s, scalar compare
   count is 1,275.3/1,457.6 GB/s, grouped aggregation is 1,679.0M elements/s, and batch-65,536 point reads are 237.0M/s
   at p50 140us IN-L2 and 251.8M/s at p50 134us OUT-OF-L2.
+  STRUCT-001GF then completed the execution-root disposition. The sole product-live parallel LSD-radix argsort now
+  lives in the 1,206-line `resident_sort.rs` owner with byte-identical 490-line/four-entry
+  `resident_argsort.ptx`; independent bitonic and serial-radix parity oracles live only in the 768-line
+  `#[cfg(test)]` support owner. The typed radix boundary borrows a same-context pooled lease and validates the u32
+  permutation domain, checked `n*8` extent, alignment, capacity, and address range before CUDA; the host-slice facade
+  also rejects an oversized domain before context selection or allocation. Product-dead adaptive, ORDER-BY-LIMIT,
+  and raw-HAVING implementations, PTX, and self-only tests are deleted; production HAVING remains on the predicate
+  VM. The stable ORDER BY facade, crossover, direction, ties, stability, and results are unchanged, while host-key
+  H2D and permutation D2H remain explicit RETIRE-003 debt. Five GPU families passed 15 sequential plus ten concurrent
+  invocations; execution passed 56 ordinary/77 ignored-GPU tests and engine passed 505/487. The canonical card stayed
+  healthy at 1,478.8/1,444.3 GB/s roofline, 1,679.0M grouped elements/s, and 247.5M/252.8M batch-65,536 point reads at
+  p50 138/132us. Strict checks, clippy, exact PTX (`d940c475...`), `ptxas`, ASCII, deletion/reference, formatting,
+  diff, full-suite, and independent re-audit gates are clean. The execution root is now 1,660 lines and no longer an
+  outlier.
 
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
-| 26 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 25 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |

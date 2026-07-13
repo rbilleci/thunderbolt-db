@@ -1,0 +1,490 @@
+.version 6.3
+.target sm_70
+.address_size 64
+
+.visible .entry gpu_db_radix_init(
+    .param .u64 keys_src_ptr,
+    .param .u64 n,
+    .param .u64 mask,
+    .param .u64 keys_a_ptr,
+    .param .u64 idx_a_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %idxv;
+    .reg .u64 %src;
+    .reg .u64 %n;
+    .reg .u64 %mask;
+    .reg .u64 %ka;
+    .reg .u64 %ia;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o8;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+
+    ld.param.u64 %src, [keys_src_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %ka, [keys_a_ptr];
+    ld.param.u64 %ia, [idx_a_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+init_l:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra init_d;
+    mul.lo.u64 %o8, %i, 8;
+    add.u64 %addr, %src, %o8;
+    ld.global.u64 %key, [%addr];
+    xor.b64 %key, %key, %mask;
+    add.u64 %addr, %ka, %o8;
+    st.global.u64 [%addr], %key;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %ia, %o4;
+    cvt.u32.u64 %idxv, %i;
+    st.global.u32 [%addr], %idxv;
+    add.u64 %i, %i, %stride;
+    bra init_l;
+init_d:
+    ret;
+}
+
+.visible .entry gpu_db_radix_histogram(
+    .param .u64 keys_ptr,
+    .param .u64 n,
+    .param .u32 shift,
+    .param .u64 chunk,
+    .param .u64 ndiv,
+    .param .u64 block_hist_ptr
+)
+{
+    .shared .align 4 .b32 s_hist[16];
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %shift;
+    .reg .u32 %d;
+    .reg .u32 %c;
+    .reg .u32 %t32;
+    .reg .u64 %keys;
+    .reg .u64 %n;
+    .reg .u64 %chunk;
+    .reg .u64 %G;
+    .reg .u64 %bh;
+    .reg .u64 %bid64;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %row;
+    .reg .u64 %iter;
+    .reg .u64 %o8;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %dig;
+
+    ld.param.u64 %keys, [keys_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u32 %shift, [shift];
+    ld.param.u64 %chunk, [chunk];
+    ld.param.u64 %G, [ndiv];
+    ld.param.u64 %bh, [block_hist_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra zskip;
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_hist;
+    add.u64 %addr, %addr, %o4;
+    mov.u32 %t32, 0;
+    st.shared.u32 [%addr], %t32;
+zskip:
+    bar.sync 0;
+
+    cvt.u64.u32 %bid64, %bid;
+    mul.lo.u64 %start, %bid64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p, %end, %n;
+    @%p mov.u64 %end, %n;
+
+    mov.u64 %iter, %start;
+hloop:
+    setp.ge.u64 %p, %iter, %end;
+    @%p bra hdone;
+    cvt.u64.u32 %o8, %lane;
+    add.u64 %row, %iter, %o8;
+    setp.ge.u64 %p, %row, %end;
+    @%p bra hskip;
+    mul.lo.u64 %o8, %row, 8;
+    add.u64 %addr, %keys, %o8;
+    ld.global.u64 %key, [%addr];
+    shr.u64 %dig, %key, %shift;
+    and.b64 %dig, %dig, 15;
+    cvt.u32.u64 %d, %dig;
+    mul.wide.u32 %o4, %d, 4;
+    mov.u64 %addr, s_hist;
+    add.u64 %addr, %addr, %o4;
+    atom.shared.add.u32 %t32, [%addr], 1;
+hskip:
+    cvt.u64.u32 %o8, %bdim;
+    add.u64 %iter, %iter, %o8;
+    bra hloop;
+hdone:
+    bar.sync 0;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra wskip;
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_hist;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %c, [%addr];
+    cvt.u64.u32 %o8, %lane;
+    mul.lo.u64 %o8, %o8, %G;
+    add.u64 %o8, %o8, %bid64;
+    mul.lo.u64 %o8, %o8, 4;
+    add.u64 %addr, %bh, %o8;
+    st.global.u32 [%addr], %c;
+wskip:
+    ret;
+}
+
+// Single-block parallel exclusive prefix sum over block_hist[0..total): each tile of `bdim`
+// elements is inclusive-scanned in shared memory (Hillis-Steele), written back as carry +
+// (inclusive - own), and the running `carry` chains across tiles. Replaces the old single-thread
+// serial scan (a sequential dependent-global-load bottleneck).
+.visible .entry gpu_db_radix_scan(
+    .param .u64 block_hist_ptr,
+    .param .u64 total
+)
+{
+    .shared .align 4 .b32 s[1024];
+    .reg .pred %p;
+    .reg .pred %p_in;
+    .reg .u32 %thr;
+    .reg .u32 %bdim;
+    .reg .u32 %d;
+    .reg .u32 %v;
+    .reg .u32 %orig;
+    .reg .u32 %recv;
+    .reg .u32 %carry;
+    .reg .u32 %tot;
+    .reg .u32 %t32;
+    .reg .u64 %bh;
+    .reg .u64 %total;
+    .reg .u64 %base;
+    .reg .u64 %i;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+
+    mov.u32 %thr, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    ld.param.u64 %bh, [block_hist_ptr];
+    ld.param.u64 %total, [total];
+    mov.u32 %carry, 0;
+    mov.u64 %base, 0;
+tile_loop:
+    setp.ge.u64 %p, %base, %total;
+    @%p bra tile_done;
+    cvt.u64.u32 %o4, %thr;
+    add.u64 %i, %base, %o4;
+    setp.lt.u64 %p_in, %i, %total;
+    mov.u32 %v, 0;
+    @!%p_in bra loaded;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %bh, %o4;
+    ld.global.u32 %v, [%addr];
+loaded:
+    mov.u32 %orig, %v;
+    mul.wide.u32 %o4, %thr, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    st.shared.u32 [%addr], %v;
+    bar.sync 0;
+    mov.u32 %d, 1;
+hs_loop:
+    setp.ge.u32 %p, %d, %bdim;
+    @%p bra hs_done;
+    mov.u32 %recv, 0;
+    setp.lt.u32 %p, %thr, %d;
+    @%p bra hs_noread;
+    sub.u32 %t32, %thr, %d;
+    mul.wide.u32 %o4, %t32, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %recv, [%addr];
+hs_noread:
+    bar.sync 0;
+    setp.lt.u32 %p, %thr, %d;
+    @%p bra hs_nowrite;
+    mul.wide.u32 %o4, %thr, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %v, [%addr];
+    add.u32 %v, %v, %recv;
+    st.shared.u32 [%addr], %v;
+hs_nowrite:
+    bar.sync 0;
+    shl.b32 %d, %d, 1;
+    bra hs_loop;
+hs_done:
+    sub.u32 %t32, %bdim, 1;
+    mul.wide.u32 %o4, %t32, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %tot, [%addr];
+    @!%p_in bra skip_write;
+    mul.wide.u32 %o4, %thr, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %v, [%addr];
+    sub.u32 %v, %v, %orig;
+    add.u32 %v, %v, %carry;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %bh, %o4;
+    st.global.u32 [%addr], %v;
+skip_write:
+    add.u32 %carry, %carry, %tot;
+    bar.sync 0;
+    cvt.u64.u32 %o4, %bdim;
+    add.u64 %base, %base, %o4;
+    bra tile_loop;
+tile_done:
+    ret;
+}
+
+.visible .entry gpu_db_radix_scatter(
+    .param .u64 keys_src_ptr,
+    .param .u64 idx_src_ptr,
+    .param .u64 n,
+    .param .u32 shift,
+    .param .u64 chunk,
+    .param .u64 ndiv,
+    .param .u64 block_base_ptr,
+    .param .u64 keys_dst_ptr,
+    .param .u64 idx_dst_ptr
+)
+{
+    .shared .align 4 .b32 s_wh[128];
+    .shared .align 4 .b32 s_wb[128];
+    .shared .align 4 .b32 s_run[16];
+    .shared .align 4 .b32 s_tot[16];
+    .reg .pred %p;
+    .reg .pred %p_leader;
+    .reg .pred %p_valid;
+    .reg .pred %p_d16;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %warp;
+    .reg .u32 %nwarps;
+    .reg .u32 %lid;
+    .reg .u32 %lmlt;
+    .reg .u32 %shift;
+    .reg .u32 %d;
+    .reg .u32 %mask;
+    .reg .u32 %tmp;
+    .reg .u32 %wrank;
+    .reg .u32 %wcount;
+    .reg .u32 %run;
+    .reg .u32 %c;
+    .reg .u32 %base;
+    .reg .u32 %t32;
+    .reg .u32 %idxv;
+    .reg .u32 %bid;
+    .reg .u32 %w;
+    .reg .u64 %ks;
+    .reg .u64 %is;
+    .reg .u64 %n;
+    .reg .u64 %chunk;
+    .reg .u64 %G;
+    .reg .u64 %bb;
+    .reg .u64 %kd;
+    .reg .u64 %id;
+    .reg .u64 %bid64;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %iter;
+    .reg .u64 %row;
+    .reg .u64 %stride;
+    .reg .u64 %o8;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %dig;
+    .reg .u64 %pos;
+    .reg .u64 %digd;
+
+    ld.param.u64 %ks, [keys_src_ptr];
+    ld.param.u64 %is, [idx_src_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u32 %shift, [shift];
+    ld.param.u64 %chunk, [chunk];
+    ld.param.u64 %G, [ndiv];
+    ld.param.u64 %bb, [block_base_ptr];
+    ld.param.u64 %kd, [keys_dst_ptr];
+    ld.param.u64 %id, [idx_dst_ptr];
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %lid, %laneid;
+    mov.u32 %lmlt, %lanemask_lt;
+    shr.u32 %warp, %lane, 5;
+    add.u32 %tmp, %bdim, 31;
+    shr.u32 %nwarps, %tmp, 5;
+    cvt.u64.u32 %bid64, %bid;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra runzskip;
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_run;
+    add.u64 %addr, %addr, %o4;
+    mov.u32 %t32, 0;
+    st.shared.u32 [%addr], %t32;
+runzskip:
+    bar.sync 0;
+
+    mul.lo.u64 %start, %bid64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p, %end, %n;
+    @%p mov.u64 %end, %n;
+    cvt.u64.u32 %stride, %bdim;
+    mov.u64 %iter, %start;
+
+wave_loop:
+    setp.ge.u64 %p, %iter, %end;
+    @%p bra wave_done;
+    cvt.u64.u32 %o8, %lane;
+    add.u64 %row, %iter, %o8;
+    setp.lt.u64 %p_valid, %row, %end;
+
+    mov.u32 %d, 16;
+    @!%p_valid bra have_digit;
+    mul.lo.u64 %o8, %row, 8;
+    add.u64 %addr, %ks, %o8;
+    ld.global.u64 %key, [%addr];
+    shr.u64 %dig, %key, %shift;
+    and.b64 %dig, %dig, 15;
+    cvt.u32.u64 %d, %dig;
+have_digit:
+
+    setp.ge.u32 %p, %lid, 16;
+    @%p bra whz_skip;
+    mul.lo.u32 %tmp, %warp, 16;
+    add.u32 %tmp, %tmp, %lid;
+    mul.wide.u32 %o4, %tmp, 4;
+    mov.u64 %addr, s_wh;
+    add.u64 %addr, %addr, %o4;
+    mov.u32 %t32, 0;
+    st.shared.u32 [%addr], %t32;
+whz_skip:
+    bar.sync 0;
+
+    match.any.sync.b32 %mask, %d, 0xffffffff;
+    and.b32 %tmp, %mask, %lmlt;
+    popc.b32 %wrank, %tmp;
+    popc.b32 %wcount, %mask;
+    setp.eq.u32 %p_leader, %wrank, 0;
+    setp.lt.u32 %p_d16, %d, 16;
+    and.pred %p_leader, %p_leader, %p_d16;
+    @!%p_leader bra leader_skip;
+    mul.lo.u32 %tmp, %warp, 16;
+    add.u32 %tmp, %tmp, %d;
+    mul.wide.u32 %o4, %tmp, 4;
+    mov.u64 %addr, s_wh;
+    add.u64 %addr, %addr, %o4;
+    st.shared.u32 [%addr], %wcount;
+leader_skip:
+    bar.sync 0;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra combine_skip;
+    mov.u32 %run, 0;
+    mov.u32 %w, 0;
+ccol_loop:
+    setp.ge.u32 %p, %w, %nwarps;
+    @%p bra ccol_done;
+    mul.lo.u32 %t32, %w, 16;
+    add.u32 %t32, %t32, %lane;
+    mul.wide.u32 %o4, %t32, 4;
+    mov.u64 %addr, s_wh;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %c, [%addr];
+    mov.u64 %addr, s_wb;
+    add.u64 %addr, %addr, %o4;
+    st.shared.u32 [%addr], %run;
+    add.u32 %run, %run, %c;
+    add.u32 %w, %w, 1;
+    bra ccol_loop;
+ccol_done:
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_tot;
+    add.u64 %addr, %addr, %o4;
+    st.shared.u32 [%addr], %run;
+combine_skip:
+    bar.sync 0;
+
+    @!%p_valid bra after_scatter;
+    cvt.u64.u32 %digd, %d;
+    mul.lo.u64 %o8, %digd, %G;
+    add.u64 %o8, %o8, %bid64;
+    mul.lo.u64 %o8, %o8, 4;
+    add.u64 %addr, %bb, %o8;
+    ld.global.u32 %base, [%addr];
+    mul.wide.u32 %o4, %d, 4;
+    mov.u64 %addr, s_run;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %run, [%addr];
+    mul.lo.u32 %tmp, %warp, 16;
+    add.u32 %tmp, %tmp, %d;
+    mul.wide.u32 %o4, %tmp, 4;
+    mov.u64 %addr, s_wb;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %c, [%addr];
+    add.u32 %base, %base, %run;
+    add.u32 %base, %base, %c;
+    add.u32 %base, %base, %wrank;
+    cvt.u64.u32 %pos, %base;
+    mul.lo.u64 %o8, %pos, 8;
+    add.u64 %addr, %kd, %o8;
+    st.global.u64 [%addr], %key;
+    mul.lo.u64 %o8, %row, 4;
+    add.u64 %addr, %is, %o8;
+    ld.global.u32 %idxv, [%addr];
+    mul.lo.u64 %o8, %pos, 4;
+    add.u64 %addr, %id, %o8;
+    st.global.u32 [%addr], %idxv;
+after_scatter:
+    bar.sync 0;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra runupd_skip;
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_tot;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %c, [%addr];
+    mov.u64 %addr, s_run;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %run, [%addr];
+    add.u32 %run, %run, %c;
+    st.shared.u32 [%addr], %run;
+runupd_skip:
+    bar.sync 0;
+    add.u64 %iter, %iter, %stride;
+    bra wave_loop;
+wave_done:
+    ret;
+}

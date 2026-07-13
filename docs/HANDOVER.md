@@ -10,7 +10,7 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FR is closed. The deleted 9,745-line expression PTX hub is now 13 operator/type-owned leaves, each
   below 1,500 lines. All 67 live symbols/ABIs/bodies are normalized-exact; two unreferenced legacy compactors were
   deleted. Fifteen GPU routes, full execution gates, static gates, canonical report card, and independent audit pass.
-- The PTX-inclusive source inventory now has 26 outliers: 14 production, eight tests, and four examples/tools.
+- The PTX-inclusive source inventory now has 25 outliers: 13 production, eight tests, and four examples/tools.
   **STRUCT-001** owns every remaining disposition.
 - QUALITY-002 is closed. Integer SUM binding now agrees with its bigint materialized value and wire descriptor;
   the hidden join `ORDER BY` expectation and five recovery-era cold-tier fixtures now reflect their live routes.
@@ -61,14 +61,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   393-line private `expression_filter.rs` leaf; invalid-domain/window and post-error-reuse coverage, the 15+10 HAZARD
   matrix, complete 55/81 and 505/487 suites, canonical report card, static gates, and independent audit pass. The root
   is 3,502 lines; full-column expression D2H plus host selected gather remains explicit RETIRE-003 debt.
+- STRUCT-001GF is closed. The product radix argsort now has a typed, total, same-context pooled-lease boundary and
+  byte-identical four-entry external PTX; independent bitonic/serial parity is test-only. Obsolete adaptive,
+  ORDER-BY-LIMIT, and raw-HAVING implementations/PTX/tests are deleted. The 15+10 HAZARD matrix, complete 56/77 and
+  505/487 suites, canonical card, static/PTX gates, and independent re-audit pass. The execution root is 1,660 lines
+  and satisfies the production envelope; host-key H2D and permutation D2H remain RETIRE-003 debt.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GF:** disposition the remaining root argsort/HAVING block; type and isolate the product radix path,
-   preserve bounded parity oracles only where justified, and delete product-dead prototypes/PTX/tests.
+1. **STRUCT-001GG:** complete the `engine_expr.rs` analysis packet, then isolate only its standalone grouped-result
+   permutation owner behind the existing facade with exact behavior and RETIRE-003 debt documentation.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

@@ -1,5 +1,26 @@
     use super::*;
 
+    #[test]
+    fn radix_input_validation_is_total_before_cuda() {
+        let aligned = 0x1000_u64;
+        assert_eq!(validate_i64_argsort_host_len(2), Ok((2, 16)));
+        if let Ok(oversized) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(validate_i64_argsort_host_len(oversized).is_err());
+        }
+        assert_eq!(validate_i64_argsort_input(7, 7, aligned, 16, 2), Ok(2));
+        assert!(validate_i64_argsort_input(7, 8, aligned, 16, 2).is_err());
+        assert!(validate_i64_argsort_input(7, 7, aligned + 1, 16, 2).is_err());
+        assert!(validate_i64_argsort_input(7, 7, aligned, 8, 2).is_err());
+        assert!(validate_i64_argsort_input(7, 7, u64::MAX - 3, 16, 2).is_err());
+        assert!(
+            validate_i64_argsort_input(7, 7, aligned, usize::MAX, u64::from(u32::MAX) + 1)
+                .is_err()
+        );
+        // Empty work still validates ownership and alignment rather than bypassing the contract.
+        assert!(validate_i64_argsort_input(7, 8, aligned, 0, 0).is_err());
+        assert!(validate_i64_argsort_input(7, 7, aligned + 1, 0, 0).is_err());
+    }
+
     fn gpu_op(id: u16) -> PlannedOp {
         PlannedOp {
             name: "scan".to_string(),
@@ -859,6 +880,10 @@
                 include_bytes!("../resident_group_compact.ptx"),
             ),
             ("resident_sort.ptx", include_bytes!("../resident_sort.ptx")),
+            (
+                "resident_argsort.ptx",
+                include_bytes!("../resident_argsort.ptx"),
+            ),
             ("resident_group.ptx", include_bytes!("../resident_group.ptx")),
             (
                 "resident_group_extra.ptx",

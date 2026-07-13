@@ -63,7 +63,7 @@
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_order_by_sort_i64_dispatches_radix_and_matches_bitonic() {
-        // order_by_sort_i64 dispatches BITONIC below ADAPTIVE_SORT_CROSSOVER_ROWS (10_000) and RADIX
+        // order_by_sort_i64 dispatches BITONIC below RADIX_SORT_CROSSOVER_ROWS (10_000) and RADIX
         // at/above it. Across the crossover (and at the boundary +/-1) it must produce a CORRECT sort:
         // a valid permutation of 0..n with monotonic keys. For UNIQUE keys we additionally cross-check
         // byte-equality vs the proven bitonic_sort_i64 (identical perm); for duplicates both arms are

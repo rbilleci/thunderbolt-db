@@ -1,8 +1,8 @@
 use std::ffi::c_void;
 
 use super::{
-    check_cuda, launch_cuda_resident_i64_argsort_radix, launch_on_pooled_stream,
-    CudaResidentDeviceMemory, CudaRuntimeProbeError,
+    check_cuda, launch_on_pooled_stream, CudaResidentDeviceMemory, CudaRuntimeProbeError,
+    GpuPrimaryContext, PooledBufferLease, PooledStream,
 };
 
 /// GPU bitonic sort of `keys` -> the row positions (0..n) in ascending (or `descending`) key order.
@@ -161,11 +161,12 @@ pub(super) fn launch_cuda_bitonic_sort_i64(
         .collect())
 }
 
-/// The RADIX arm of `order_by_sort_i64` (n >= the adaptive crossover): upload the host `keys` to a
-/// device buffer with a SYNCHRONOUS HtoD (so the radix reads valid keys regardless of which stream it
-/// runs on), then reuse the proven resident LSD-radix argsort. The lease `keys_dev` MUST outlive the
-/// radix call -- the explicit `drop` AFTER it stops NLL from returning the buffer to the pool (where the
-/// radix could re-lease it as scratch) while the radix still reads it.
+/// The radix arm of `order_by_sort_i64` (n >= the measured radix crossover): upload the host `keys`
+/// to a device buffer with a SYNCHRONOUS HtoD (so the radix reads valid keys regardless of which
+/// stream it runs on), then reuse the proven resident LSD-radix argsort. The lease `keys_dev` MUST
+/// outlive the radix call -- the explicit `drop` AFTER it stops NLL from returning the buffer to the
+/// pool (where the radix could re-lease it as scratch) while the radix still reads it. The host-key
+/// H2D and returned-permutation D2H remain RETIRE-003 result-path debt.
 pub(super) fn launch_cuda_order_by_sort_i64_radix(
     resident: &CudaResidentDeviceMemory,
     keys: &[i64],
@@ -173,14 +174,14 @@ pub(super) fn launch_cuda_order_by_sort_i64_radix(
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     let n = keys.len();
+    // Validate the u32 permutation domain and exact byte size before touching CUDA. In particular,
+    // an oversized host slice must not select a context or attempt a multi-gigabyte allocation first.
+    let (n_u64, keys_bytes) = validate_i64_argsort_host_len(n)?;
     if n <= 1 {
         return Ok((0..n as u32).collect());
     }
     let primary = resident.primary();
     primary.set_current()?;
-    let keys_bytes = n
-        .checked_mul(std::mem::size_of::<i64>())
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
     let keys_dev = primary.lease_device_buffer(keys_bytes)?;
     let cu_memcpy_htod = unsafe {
         *primary
@@ -192,10 +193,369 @@ pub(super) fn launch_cuda_order_by_sort_i64_radix(
     check_cuda(unsafe {
         cu_memcpy_htod(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes)
     })?;
-    let result =
-        launch_cuda_resident_i64_argsort_radix(resident, keys_dev.ptr, n as u64, descending);
+    let result = launch_cuda_resident_i64_argsort_radix(resident, &keys_dev, n_u64, descending);
     drop(keys_dev);
     result
+}
+
+/// Validate a host-slice length for the u32-indexed radix contract without touching CUDA.
+pub(super) fn validate_i64_argsort_host_len(
+    n: usize,
+) -> Result<(u64, usize), CudaRuntimeProbeError> {
+    let n_u64 =
+        u64::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if n_u64 > u64::from(u32::MAX) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(n));
+    }
+    let required = n
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+    Ok((n_u64, required))
+}
+
+/// Validate the typed production radix input before CUDA setup. The permutation stores u32 row
+/// indices, and the four kernels read exactly the aligned i64 window `[keys.ptr, keys.ptr + n*8)`.
+pub(super) fn validate_i64_argsort_input(
+    expected_primary: usize,
+    input_primary: usize,
+    input_ptr: u64,
+    input_capacity: usize,
+    n: u64,
+) -> Result<usize, CudaRuntimeProbeError> {
+    if n > u64::from(u32::MAX) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(n).unwrap_or(usize::MAX),
+        ));
+    }
+    let n_usize =
+        usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let (_, required) = validate_i64_argsort_host_len(n_usize)?;
+    if input_primary != expected_primary
+        || !input_ptr.is_multiple_of(std::mem::align_of::<i64>() as u64)
+        || required > input_capacity
+        || input_ptr.checked_add(required as u64).is_none()
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(input_capacity));
+    }
+    Ok(n_usize)
+}
+
+/// Parallel GPU LSD-radix argsort over a resident i64 key column -- the production large-result
+/// ORDER BY arm. Returns a Vec<u32> permutation of 0..n ordering the rows by key (ascending when
+/// `descending=false`, descending when true), STABLE (equal keys keep ascending original index) in
+/// both directions. O(n), constant 16 LSD passes of 4 bits -- beats the bitonic arm's O(n log^2 n)
+/// launch count at large n.
+///
+/// Keys are mapped signed->unsigned-order by XOR with a direction mask (0x8000…0 ascending so i64
+/// order == u64 order; 0x7FFF…F descending = the complement, so one ascending radix yields
+/// descending keys with the SAME ascending-index tie-break). Each pass is three kernels on one
+/// pooled stream: (1) `radix_histogram` — each block counts its contiguous chunk's 4-bit digits
+/// into a bucket-major block_hist[d*G+b] via a shared per-digit histogram; (2) `radix_scan` —
+/// exclusive prefix sum over the whole 16*G matrix, so block_hist[d*G+b] becomes the global output
+/// offset where block b's digit-d run begins; (3) `radix_scatter` — each block STABLY scatters its
+/// chunk to keys_dst/idx_dst at base + per-digit-running + within-block rank, the within-block rank
+/// computed per grid-stride wave by `match.any.sync` warp ranking + a cross-warp per-digit combine,
+/// with a per-digit running offset carried across waves. Ping-pong (keys/idx a<->b) over 16 passes.
+pub(super) fn launch_cuda_resident_i64_argsort_radix(
+    resident: &CudaResidentDeviceMemory,
+    keys: &PooledBufferLease<'_>,
+    n: u64,
+    descending: bool,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const PTX: &[u8] = include_bytes!("resident_argsort.ptx");
+
+    let n_usize = validate_i64_argsort_input(
+        std::ptr::from_ref(resident.primary()).addr(),
+        keys.primary_identity(),
+        keys.ptr,
+        keys.capacity,
+        n,
+    )?;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Contiguous partition: block `b` owns rows [b*chunk, min(b*chunk+chunk, n)). `chunk` is sized
+    // so the block count G stays within the grid-x max (65_535) for any n.
+    const BLOCK: u32 = 256;
+    // The scatter kernel's shared arrays s_wh[128]/s_wb[128] are sized for nwarps = BLOCK/32 = 8
+    // (128 = 16 digits * 8 warps), and the scan kernel's s[1024] + its 1024-thread launch assume
+    // that block. Raising BLOCK without resizing those hard-coded PTX shared arrays would corrupt
+    // shared memory, so pin it at compile time.
+    const _: () = assert!(
+        BLOCK == 256,
+        "radix PTX shared-memory sizes are hard-coded for BLOCK=256"
+    );
+    const CHUNK_ROWS: u64 = 2_048;
+    const MAX_GRID: u64 = 65_535;
+    let chunk = CHUNK_ROWS.max(n.div_ceil(MAX_GRID));
+    let grid_g_u64 = n.div_ceil(chunk);
+    let grid_g = u32::try_from(grid_g_u64)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let hist_len = grid_g_u64
+        .checked_mul(16)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let hist_len_usize = usize::try_from(hist_len)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let init_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_radix_init", &ptx)?;
+    let hist_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_radix_histogram", &ptx)?;
+    let scan_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_radix_scan", &ptx)?;
+    let scatter_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_radix_scatter", &ptx)?;
+
+    let primary = resident.primary();
+    let bytes8 = n_usize
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let bytes4 = n_usize
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let hist_bytes = hist_len_usize
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let keys_a = primary.lease_device_buffer(bytes8)?;
+    let keys_b = primary.lease_device_buffer(bytes8)?;
+    let idx_a = primary.lease_device_buffer(bytes4)?;
+    let idx_b = primary.lease_device_buffer(bytes4)?;
+    let block_hist = primary.lease_device_buffer(hist_bytes)?;
+
+    primary.set_current()?;
+    struct StreamLease<'a> {
+        primary: &'a GpuPrimaryContext,
+        pooled: Option<PooledStream>,
+    }
+    impl Drop for StreamLease<'_> {
+        fn drop(&mut self) {
+            if let Some(pooled) = self.pooled.take() {
+                self.primary.release_pooled_stream(pooled);
+            }
+        }
+    }
+    let lease = StreamLease {
+        primary,
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let stream = lease
+        .pooled
+        .as_ref()
+        .expect("pooled stream just set")
+        .stream;
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    let src_keys_base = keys.ptr;
+    let mask: u64 = if descending {
+        0x7FFF_FFFF_FFFF_FFFF
+    } else {
+        0x8000_0000_0000_0000
+    };
+
+    // init: transform source keys into keys_a, idx_a = identity.
+    {
+        let mut src_arg = src_keys_base;
+        let mut n_arg = n;
+        let mut mask_arg = mask;
+        let mut ka_arg = keys_a.ptr;
+        let mut ia_arg = idx_a.ptr;
+        let mut init_args = [
+            (&mut src_arg as *mut u64).cast::<c_void>(),
+            (&mut n_arg as *mut u64).cast::<c_void>(),
+            (&mut mask_arg as *mut u64).cast::<c_void>(),
+            (&mut ka_arg as *mut u64).cast::<c_void>(),
+            (&mut ia_arg as *mut u64).cast::<c_void>(),
+        ];
+        let init_grid = n.div_ceil(u64::from(BLOCK)).clamp(1, MAX_GRID) as u32;
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                init_fn,
+                init_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                init_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+    }
+
+    // 16 LSD passes of 4 bits, ping-ponging (keys/idx) a<->b.
+    let mut keys_src = keys_a.ptr;
+    let mut keys_dst = keys_b.ptr;
+    let mut idx_src = idx_a.ptr;
+    let mut idx_dst = idx_b.ptr;
+    for pass in 0u32..16 {
+        let mut shift_arg = pass * 4;
+        let mut n_arg = n;
+        let mut chunk_arg = chunk;
+        let mut g_arg = grid_g_u64;
+        let mut bh_arg = block_hist.ptr;
+        let mut total_arg = hist_len;
+
+        // histogram (reads keys_src)
+        let mut ksrc_arg = keys_src;
+        let mut hist_args = [
+            (&mut ksrc_arg as *mut u64).cast::<c_void>(),
+            (&mut n_arg as *mut u64).cast::<c_void>(),
+            (&mut shift_arg as *mut u32).cast::<c_void>(),
+            (&mut chunk_arg as *mut u64).cast::<c_void>(),
+            (&mut g_arg as *mut u64).cast::<c_void>(),
+            (&mut bh_arg as *mut u64).cast::<c_void>(),
+        ];
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                hist_fn,
+                grid_g,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                hist_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+
+        // scan (single block, exclusive prefix over the 16*G matrix)
+        let mut scan_args = [
+            (&mut bh_arg as *mut u64).cast::<c_void>(),
+            (&mut total_arg as *mut u64).cast::<c_void>(),
+        ];
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                scan_fn,
+                1,
+                1,
+                1,
+                1_024,
+                1,
+                1,
+                0,
+                stream,
+                scan_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+
+        // scatter (reads keys_src/idx_src, writes keys_dst/idx_dst)
+        let mut isrc_arg = idx_src;
+        let mut kdst_arg = keys_dst;
+        let mut idst_arg = idx_dst;
+        let mut scatter_args = [
+            (&mut ksrc_arg as *mut u64).cast::<c_void>(),
+            (&mut isrc_arg as *mut u64).cast::<c_void>(),
+            (&mut n_arg as *mut u64).cast::<c_void>(),
+            (&mut shift_arg as *mut u32).cast::<c_void>(),
+            (&mut chunk_arg as *mut u64).cast::<c_void>(),
+            (&mut g_arg as *mut u64).cast::<c_void>(),
+            (&mut bh_arg as *mut u64).cast::<c_void>(),
+            (&mut kdst_arg as *mut u64).cast::<c_void>(),
+            (&mut idst_arg as *mut u64).cast::<c_void>(),
+        ];
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                scatter_fn,
+                grid_g,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                scatter_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+
+        std::mem::swap(&mut keys_src, &mut keys_dst);
+        std::mem::swap(&mut idx_src, &mut idx_dst);
+    }
+
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+    resident.record_kernel_event_elapsed_us(None);
+
+    // After 16 (even) passes the final result is in the buffer `idx_src` now points at.
+    let mut indices = vec![0_u32; n_usize];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            indices.as_mut_ptr().cast::<c_void>(),
+            idx_src,
+            n_usize * std::mem::size_of::<u32>(),
+        )
+    })
+    .map_err(drain_err)?;
+    drop(lease);
+    Ok(indices)
+}
+
+const RADIX_SORT_CROSSOVER_ROWS: u64 = 10_000;
+
+/// Production int4/int8-compatible ORDER BY dispatcher. Small host-key batches retain the existing
+/// bitonic route; large batches use the typed, stable LSD-radix owner above.
+pub(super) fn launch_cuda_order_by_sort_i64(
+    resident: &CudaResidentDeviceMemory,
+    keys: &[i64],
+    descending: bool,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    if keys.len() as u64 >= RADIX_SORT_CROSSOVER_ROWS {
+        launch_cuda_order_by_sort_i64_radix(resident, keys, descending)
+    } else {
+        launch_cuda_bitonic_sort_i64(resident, keys, descending)
+    }
 }
 
 /// GPU bitonic sort keyed by a resident TEXT column (lexicographic, unsigned bytes, a prefix sorts
