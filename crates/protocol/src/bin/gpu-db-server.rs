@@ -322,58 +322,6 @@ fn catalog_index_definition(index: &CatalogIndex) -> String {
     )
 }
 
-fn shared_catalog_contains_table(table: &str) -> bool {
-    shared_catalog()
-        .lock()
-        .expect("shared catalog mutex poisoned")
-        .tables
-        .contains_key(table)
-}
-
-fn shared_catalog_contains_view(view: &str) -> bool {
-    shared_catalog()
-        .lock()
-        .expect("shared catalog mutex poisoned")
-        .views
-        .contains_key(view)
-}
-
-fn shared_catalog_contains_sequence(sequence: &str) -> bool {
-    shared_catalog()
-        .lock()
-        .expect("shared catalog mutex poisoned")
-        .sequences
-        .contains_key(sequence)
-}
-
-fn shared_catalog_contains_live_index(index: &str) -> bool {
-    let catalog = shared_catalog()
-        .lock()
-        .expect("shared catalog mutex poisoned");
-    catalog
-        .indexes
-        .iter()
-        .any(|candidate| candidate.name == index && catalog.tables.contains_key(&candidate.table))
-}
-
-fn shared_catalog_contains_table_constraint(table: &str, constraint: &str) -> bool {
-    let catalog = shared_catalog()
-        .lock()
-        .expect("shared catalog mutex poisoned");
-    (catalog.tables.contains_key(table)
-        && catalog.indexes.iter().any(|candidate| {
-            candidate.table == table
-                && candidate.name == constraint
-                && (candidate.primary_key || candidate.unique_constraint)
-        }))
-        || catalog.tables.get(table).is_some_and(|table| {
-            table
-                .check_constraints
-                .iter()
-                .any(|candidate| candidate.name == constraint)
-        })
-}
-
 struct Session {
     in_transaction: bool,
     prepared: HashMap<String, PreparedStatement>,

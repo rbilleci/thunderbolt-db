@@ -737,6 +737,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   missing `IF EXISTS` names still mark object/comment keys dirty before the success snapshot. Full protocol and
   driver gates, all-target checks, warning-denied clippy, security preflight, comment/shared-catalog tests,
   formatting/diff checks, and independent audit are clean. The root is 8,889 lines and STRUCT-001CB is closed.
+  The five shared-catalog comment-target lookups now live as private helpers inside the existing 386-line
+  `catalog_comments` owner. Their mutex acquisition and poison handling, table/view/sequence membership,
+  live-index ownership, primary/unique/check constraint predicates, callers, evaluation order, and errors are
+  exact moves. Inherited PRODUCT-002 debt remains: shared-catalog foreign keys are omitted from the constraint
+  predicate, multi-kind checks can observe different catalog generations across separate lock acquisitions, and
+  mutex poison panics instead of producing a protocol error. Full protocol and driver gates, all-target checks,
+  warning-denied clippy, security preflight, four executing focused catalog tests, formatting/diff checks, and
+  independent audit are clean. The root is 8,837 lines and STRUCT-001CC is closed.
 
 ## Known boundaries
 

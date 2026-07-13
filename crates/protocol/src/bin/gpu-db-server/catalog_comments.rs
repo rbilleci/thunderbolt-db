@@ -1,13 +1,63 @@
 // Legacy catalog-comment ownership. This is not a product execution path.
 
 use super::{
-    database_exists, role_exists, shared_catalog_contains_live_index,
-    shared_catalog_contains_sequence, shared_catalog_contains_table,
-    shared_catalog_contains_table_constraint, shared_catalog_contains_view, tablespace_exists,
-    write_command_complete, write_error, CatalogCommentTarget, ErrorField, ReadWrite, Session,
+    database_exists, role_exists, shared_catalog, tablespace_exists, write_command_complete,
+    write_error, CatalogCommentTarget, ErrorField, ReadWrite, Session,
 };
 use gpu_db_protocol::{Command, CommentTarget};
 use std::io;
+
+fn shared_catalog_contains_table(table: &str) -> bool {
+    shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned")
+        .tables
+        .contains_key(table)
+}
+
+fn shared_catalog_contains_view(view: &str) -> bool {
+    shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned")
+        .views
+        .contains_key(view)
+}
+
+fn shared_catalog_contains_sequence(sequence: &str) -> bool {
+    shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned")
+        .sequences
+        .contains_key(sequence)
+}
+
+fn shared_catalog_contains_live_index(index: &str) -> bool {
+    let catalog = shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned");
+    catalog
+        .indexes
+        .iter()
+        .any(|candidate| candidate.name == index && catalog.tables.contains_key(&candidate.table))
+}
+
+fn shared_catalog_contains_table_constraint(table: &str, constraint: &str) -> bool {
+    let catalog = shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned");
+    (catalog.tables.contains_key(table)
+        && catalog.indexes.iter().any(|candidate| {
+            candidate.table == table
+                && candidate.name == constraint
+                && (candidate.primary_key || candidate.unique_constraint)
+        }))
+        || catalog.tables.get(table).is_some_and(|table| {
+            table
+                .check_constraints
+                .iter()
+                .any(|candidate| candidate.name == constraint)
+        })
+}
 
 pub(super) fn execute_catalog_comment(
     stream: &mut dyn ReadWrite,
