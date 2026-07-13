@@ -1163,3 +1163,97 @@
         }
     }
 
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_staged_hash_joins_validate_and_apply_validity_bitmaps() {
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let resident = runtime
+            .retain_device_memory_copy(0, &0_u64.to_le_bytes())
+            .expect("resident device memory");
+        macro_rules! assert_invalid {
+            ($result:expr) => {
+                assert!(
+                    matches!(
+                        $result,
+                        Err(CudaRuntimeProbeError::InvalidInputLength(_))
+                    ),
+                    "non-exact validity length must fail before a device launch"
+                )
+            };
+        }
+
+        assert_invalid!(resident.hash_join_inner_i64(&[1], &[1], Some(&[]), None));
+        assert_invalid!(resident.hash_join_inner_text(&[b"x"], &[b"x"], None, Some(&[])));
+        assert_invalid!(resident.hash_join_inner_i64_nn(
+            &[1, 1],
+            &[1],
+            Some(&[u32::MAX, u32::MAX]),
+            None,
+        ));
+        let thirty_three_texts = vec![&b"x"[..]; 33];
+        assert_invalid!(resident.hash_join_inner_text_nn(
+            &thirty_three_texts,
+            &[b"x"],
+            Some(&[u32::MAX]),
+            None,
+        ));
+
+        assert_eq!(
+            resident
+                .hash_join_inner_i64(&[], &[1], Some(&[]), None)
+                .expect("zero-row side accepts its exact zero-word bitmap"),
+            HashJoinOutcome::Pairs {
+                build_idxs: Vec::new(),
+                probe_idxs: Vec::new(),
+            }
+        );
+
+        let sorted_unique = |outcome: HashJoinOutcome| {
+            let HashJoinOutcome::Pairs {
+                build_idxs,
+                probe_idxs,
+            } = outcome
+            else {
+                panic!("exact validity must not produce a duplicate verdict");
+            };
+            let mut pairs: Vec<(u32, u32)> =
+                build_idxs.into_iter().zip(probe_idxs).collect();
+            pairs.sort_unstable();
+            pairs
+        };
+        assert_eq!(
+            sorted_unique(
+                resident
+                    .hash_join_inner_i64(&[1, 2], &[1, 2], Some(&[0b01]), Some(&[0b11]))
+                    .expect("exact i64 validity")
+            ),
+            vec![(0, 0)]
+        );
+        assert_eq!(
+            sorted_unique(
+                resident
+                    .hash_join_inner_text(
+                        &[b"x", b"y"],
+                        &[b"x", b"y"],
+                        Some(&[0b01]),
+                        Some(&[0b11]),
+                    )
+                    .expect("exact text validity")
+            ),
+            vec![(0, 0)]
+        );
+
+        let (build, probe) = resident
+            .hash_join_inner_i64_nn(&[7, 7], &[7, 7], Some(&[0b01]), Some(&[0b10]))
+            .expect("exact N:N i64 validity");
+        assert_eq!(build.into_iter().zip(probe).collect::<Vec<_>>(), vec![(0, 1)]);
+        let (build, probe) = resident
+            .hash_join_inner_text_nn(
+                &[b"z", b"z"],
+                &[b"z", b"z"],
+                Some(&[0b01]),
+                Some(&[0b10]),
+            )
+            .expect("exact N:N text validity");
+        assert_eq!(build.into_iter().zip(probe).collect::<Vec<_>>(), vec![(0, 1)]);
+    }

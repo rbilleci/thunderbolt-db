@@ -6,7 +6,7 @@
 
 use std::os::raw::c_void;
 
-use super::{check_cuda, launch_on_pooled_stream, CudaResidentDeviceMemory, CudaRuntimeProbeError};
+use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError, check_cuda, launch_on_pooled_stream};
 
 /// Outcome of [`CudaResidentDeviceMemory::hash_join_inner_i64`]: the matched row-index pairs, or a
 /// signal that the build-side join key is not unique (N:N many-to-many fan-out is a follow-up).
@@ -133,6 +133,19 @@ impl CudaResidentDeviceMemory {
     }
 }
 
+fn validate_validity_words(
+    words: Option<&[u32]>,
+    row_count: usize,
+) -> Result<Option<&[u32]>, CudaRuntimeProbeError> {
+    let expected = row_count.div_ceil(32);
+    if let Some(words) = words {
+        if words.len() != expected {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(words.len()));
+        }
+    }
+    Ok(words)
+}
+
 /// GPU inner equi-join (M5), int key, UNIQUE build key (see
 /// [`CudaResidentDeviceMemory::hash_join_inner_i64`]). Fills a b128 hash table to EMPTY128, uploads the
 /// two key columns, runs the build (atom.cas.b128 claim + dup detect) then the probe (lookup +
@@ -162,6 +175,8 @@ fn launch_cuda_hash_join_inner_i64(
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
     let build_n = build_keys.len();
     let probe_n = probe_keys.len();
+    let build_valid_words = validate_validity_words(build_validity, build_n)?;
+    let probe_valid_words = validate_validity_words(probe_validity, probe_n)?;
     // i64::MIN is the EMPTY128 hi sentinel -- a key of that value would read back as an empty slot
     // (a silent missed match). int4 join keys sign-extend into [-2^31, 2^31) and never reach it; an
     // int8 join key that IS i64::MIN needs the dedicated-slot route (like the GROUP BY i64::MIN key) --
@@ -234,11 +249,9 @@ fn launch_cuda_hash_join_inner_i64(
     let cursor = primary.lease_device_buffer(8)?;
     let pairs = primary.lease_device_buffer(pairs_bytes)?;
     // Optional validity bitmaps (V1b-wire): lease + (below) upload a dense LSB-first u32 bitmap per side;
-    // the kernel skips a NULL key (bit 0). An empty/None side passes the u64::MAX sentinel => no bitmap =>
-    // every key valid (byte-identical). The buffers outlive both launches (build reads build_valid in phase
+    // the kernel skips a NULL key (bit 0). A missing bitmap passes the u64::MAX sentinel => every key valid
+    // (byte-identical). The buffers outlive both launches (build reads build_valid in phase
     // 1, probe reads probe_valid in phase 2 -- both are uploaded in phase 1, before the BUILD).
-    let build_valid_words = build_validity.filter(|w| !w.is_empty());
-    let probe_valid_words = probe_validity.filter(|w| !w.is_empty());
     let build_valid_dev = match build_valid_words {
         Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
         None => None,
@@ -447,6 +460,8 @@ fn launch_cuda_hash_join_inner_text(
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
     let build_n = build_texts.len();
     let probe_n = probe_texts.len();
+    let build_valid_words = validate_validity_words(build_validity, build_n)?;
+    let probe_valid_words = validate_validity_words(probe_validity, probe_n)?;
     // Empty inputs -> no matches (an inner join with an empty side yields nothing).
     if build_n == 0 || probe_n == 0 {
         return Ok(HashJoinOutcome::Pairs {
@@ -538,9 +553,7 @@ fn launch_cuda_hash_join_inner_text(
     let cursor = primary.lease_device_buffer(8)?;
     let pairs = primary.lease_device_buffer(pairs_bytes)?;
     // Optional validity bitmaps (V1b-wire): dense LSB-first u32 per side; a 0 bit = a NULL key the kernel
-    // skips. None/empty => u64::MAX sentinel => no bitmap => byte-identical. Both buffers upload in phase 1.
-    let build_valid_words = build_validity.filter(|w| !w.is_empty());
-    let probe_valid_words = probe_validity.filter(|w| !w.is_empty());
+    // skips. None => u64::MAX sentinel => no bitmap => byte-identical. Both buffers upload in phase 1.
     let build_valid_dev = match build_valid_words {
         Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
         None => None,
@@ -754,6 +767,8 @@ fn launch_cuda_hash_join_inner_i64_nn(
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
     let build_n = build_keys.len();
     let probe_n = probe_keys.len();
+    let build_valid_words = validate_validity_words(build_validity, build_n)?;
+    let probe_valid_words = validate_validity_words(probe_validity, probe_n)?;
     if build_n == 0 || probe_n == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -816,10 +831,8 @@ fn launch_cuda_hash_join_inner_i64_nn(
     let probe_dev = primary.lease_device_buffer(probe_bytes)?;
     let cursor = primary.lease_device_buffer(8)?;
     // Optional validity bitmaps (V1b-wire): dense LSB-first u32 per side; a 0 build bit skips chaining that
-    // row, a 0 probe bit skips emitting for it. None/empty => u64::MAX sentinel (byte-identical). Both upload
+    // row, a 0 probe bit skips emitting for it. None => u64::MAX sentinel (byte-identical). Both upload
     // in phase 1; the probe bitmap is read by BOTH the count-emit (phase 1) and the real emit (phase 2).
-    let build_valid_words = build_validity.filter(|w| !w.is_empty());
-    let probe_valid_words = probe_validity.filter(|w| !w.is_empty());
     let build_valid_dev = match build_valid_words {
         Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
         None => None,
@@ -1074,6 +1087,8 @@ fn launch_cuda_hash_join_inner_text_nn(
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
     let build_n = build_texts.len();
     let probe_n = probe_texts.len();
+    let build_valid_words = validate_validity_words(build_validity, build_n)?;
+    let probe_valid_words = validate_validity_words(probe_validity, probe_n)?;
     if build_n == 0 || probe_n == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -1162,10 +1177,8 @@ fn launch_cuda_hash_join_inner_text_nn(
     let payload_dev = primary.lease_device_buffer(payload.len())?;
     let cursor = primary.lease_device_buffer(8)?;
     // Optional validity bitmaps (V1b-wire): dense LSB-first u32 per side; a 0 build bit skips chaining, a 0
-    // probe bit skips emitting. None/empty => u64::MAX sentinel (byte-identical). Both upload in phase 1; the
+    // probe bit skips emitting. None => u64::MAX sentinel (byte-identical). Both upload in phase 1; the
     // probe bitmap is read by BOTH the count emit (phase 1) and the real emit (phase 2) via emit_launch.
-    let build_valid_words = build_validity.filter(|w| !w.is_empty());
-    let probe_valid_words = probe_validity.filter(|w| !w.is_empty());
     let build_valid_dev = match build_valid_words {
         Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
         None => None,

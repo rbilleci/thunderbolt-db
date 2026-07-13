@@ -1609,6 +1609,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   check, strict execution/engine clippy, dependency/scoped source/reference/format checks are clean. Extraction
   audit found no moved-source/PTX/API regression and promoted the inherited undersized-validity device-read
   hazard as **STRUCT-001FK**; source-equivalent FJ itself did not require the report card.
+  STRUCT-001FK then enforced one exact staged validity contract before every early return, context access,
+  allocation, or launch across the unique/N:N int/text families: `None` means all valid and every present
+  bitmap contains exactly `row_count.div_ceil(32)` words, including exactly zero words for zero rows. The new
+  retained GPU gate rejects undersized, empty-for-nonempty, and oversized inputs and proves positive NULL
+  exclusion plus the zero-row boundary across all four APIs. It and the existing four-family matrix passed 15
+  sequential plus ten concurrent invocations without device faults. Both execution modes passed 48/79, both
+  engine modes passed 505/487, workspace all-target check, strict execution/engine clippy, dependency/scoped
+  format/diff checks, and independent re-audit are clean. The 1,403-line child remains within policy. Layer-1
+  was stable: staged `hash_join_inner_i64` moved from 256.0 to 257.8 M-element/s (+0.70%) and the resident
+  payload-join control from 6359.4 to 6313.5 M-element/s (-0.72%).
 
 ## Known boundaries
 
