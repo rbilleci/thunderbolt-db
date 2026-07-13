@@ -512,6 +512,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   current-schemas branch was removed. Sequential/concurrent 127-test runs, the full protocol package and driver
   smokes, all-target checks, warning-denied clippy, security preflight, touched formatting, diff checks, and
   independent audit are clean. The root is 15,797 lines and STRUCT-001BA is closed.
+  The contiguous pg_dump/pg_dumpall catalog compatibility prelude now lives in the private 568-line
+  `pg_dump_compat` owner behind one tri-state delegate immediately before parsed-command execution. All 48
+  handled branches preserve exact order, predicates, metadata/row/null construction, comments/ACL/dependency
+  behavior, errors, framing, and sequence setval/last-value state, dirty marking, and persistence. After
+  normalizing only `Some` wrapping and direct `&str` argument spelling, the complete moved body hashes identically
+  to its source. Sequential/concurrent 127-test runs, the full protocol package and driver smokes, all-target
+  checks, warning-denied clippy, security preflight, touched formatting, diff checks, and independent audit are
+  clean. The host's PostgreSQL 18.4 `pg_dump` class-metadata query and final `psql \db+` verification shape exceed
+  the repository's PostgreSQL 16 compatibility baseline: pg_dumpall generation/restore succeeds, while those
+  version-18 introspection probes still fail through the unchanged predicates; broader catalog-version coverage
+  remains PRODUCT-002. The root is 15,274 lines and STRUCT-001BB is closed.
 
 ## Known boundaries
 
