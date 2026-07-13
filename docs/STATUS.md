@@ -1020,6 +1020,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   SQL parsing, host registry lookup and display-name decisions, typmod ignored after shape validation, and absent
   GPU-resident type metadata. Full protocol/driver/security/formatting gates, the focused helper test, PostgreSQL
   16 scenario 69, and independent audit are clean. The root is 5,578 lines and STRUCT-001DD is closed.
+  The complete adjacent early table catalog family now executes from a new private 542-line `table_catalog`
+  owner behind one stage-preserving delegate: two direct public-table discovery reads, normal and verbose exact/
+  filtered psql table listings, and filtered relation-privilege listings. Five exact query constants, three
+  parsers, table-name/OID/normal/verbose/privilege row builders, four compatibility size helpers, and the table ACL
+  display helper are byte-identical moves. Only the filter record/fields gain parent-private visibility; they and
+  fifteen `cfg(test)` wrappers serve proven existing consumers. Exact post-`\gdesc`/pre-index stage and internal
+  branch order, equality/parser semantics, public-schema and relname filtering, table/view/materialized-view/
+  sequence privilege coverage, name/OID sorting, comment/ACL/null behavior, size estimates, 1-/2-/4-/8-/6-column
+  shapes, and writers are unchanged. Shared pattern matching and generic ACL rendering remain root-owned.
+  Inherited PRODUCT-002 debt remains exact generated SQL matching, host catalog iteration/filtering/sorting and
+  size estimation, public-only metadata, simplified ACL/policy fields, and absent GPU-resident system relations.
+  Full protocol/driver/security/formatting gates, focused catalog/ACL tests, all 17 PostgreSQL 16 scenarios 04/06/
+  13/14/17/18/19/34/35/37/75/79/80/326/333/334/341, and independent audit are clean. The root is 5,167 lines and
+  STRUCT-001DE is closed.
 
 ## Known boundaries
 
