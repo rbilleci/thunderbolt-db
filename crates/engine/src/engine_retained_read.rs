@@ -6,6 +6,26 @@
 
 use super::*;
 
+/// One generation-validated host PK-cache source. The cache key, resident owner, exact column
+/// offset, and live row extent travel together so probe helpers cannot mix shard generations.
+struct ShardPkCacheSource<'a> {
+    table_name: &'a str,
+    shard_id: u32,
+    col_idx: usize,
+    device_memory: &'a Arc<CudaResidentDeviceMemory>,
+    filter_offset: u64,
+    row_count: usize,
+}
+
+/// Device index key layout. The parallel slices are validated together before any device read.
+struct ShardDeviceIndexKey<'a> {
+    key_id: usize,
+    positions: &'a [usize],
+    offsets: &'a [u64],
+    blob_offsets: &'a [u64],
+    blob_lens: &'a [u64],
+}
+
 impl Engine {
     // Stage-0 (Thread-3 batched/async submission): this takes `&self`, not `&mut self`.
     // Its body only calls `plan_relational_resident_route`, `bind_relational_select_for_execution`,
@@ -875,12 +895,14 @@ impl Engine {
             // Sub-slice 3: probe the CACHED per-shard hash+bloom index (built once per shard generation,
             // ptr-validated) instead of a per-lookup DtoH + rebuild. Bloom-prunes then hash-probes.
             match self.probe_shard_pk_index_cached(
-                &table.name,
-                shard.shard_id,
-                filter_idx,
-                &device_memory,
-                filter_offset,
-                shard.row_count,
+                ShardPkCacheSource {
+                    table_name: &table.name,
+                    shard_id: shard.shard_id,
+                    col_idx: filter_idx,
+                    device_memory: &device_memory,
+                    filter_offset,
+                    row_count: shard.row_count,
+                },
                 key,
             ) {
                 ShardPkProbe::Hit(row) => {
@@ -1263,12 +1285,14 @@ impl Engine {
                     table,
                     &table.name,
                     shard.shard_id,
-                    key_id,
-                    &positions,
                     &device_memory,
-                    &offsets,
-                    &blob_offsets,
-                    &blob_lens,
+                    ShardDeviceIndexKey {
+                        key_id,
+                        positions: &positions,
+                        offsets: &offsets,
+                        blob_offsets: &blob_offsets,
+                        blob_lens: &blob_lens,
+                    },
                     shard.row_count,
                 )?;
             descs.push(WriteLocateShard {
@@ -1369,12 +1393,14 @@ impl Engine {
                     table,
                     &table.name,
                     shard.shard_id,
-                    key_id,
-                    &positions,
                     &device_memory,
-                    &offsets,
-                    &blob_offsets,
-                    &blob_lens,
+                    ShardDeviceIndexKey {
+                        key_id,
+                        positions: &positions,
+                        offsets: &offsets,
+                        blob_offsets: &blob_offsets,
+                        blob_lens: &blob_lens,
+                    },
                     shard.row_count,
                 )?;
             let (bound_memory, created_by, deleted_by) = if index_row_count == shard.row_count {
@@ -1556,12 +1582,14 @@ impl Engine {
                     table,
                     &table.name,
                     shard.shard_id,
-                    key_id,
-                    &positions,
                     &device_memory,
-                    &offsets,
-                    &blob_offsets,
-                    &blob_lens,
+                    ShardDeviceIndexKey {
+                        key_id,
+                        positions: &positions,
+                        offsets: &offsets,
+                        blob_offsets: &blob_offsets,
+                        blob_lens: &blob_lens,
+                    },
                     shard.row_count,
                 )?;
             descs.push(WriteLocateShard {
@@ -1894,14 +1922,17 @@ impl Engine {
     /// (duplicate / oversize key column) is CACHED as `index: None` so it is not rebuilt every lookup.
     fn probe_shard_pk_index_cached(
         &self,
-        table_name: &str,
-        shard_id: u32,
-        col_idx: usize,
-        device_memory: &Arc<CudaResidentDeviceMemory>,
-        filter_offset: u64,
-        row_count: usize,
+        source: ShardPkCacheSource<'_>,
         key: i32,
     ) -> ShardPkProbe {
+        let ShardPkCacheSource {
+            table_name,
+            shard_id,
+            col_idx,
+            device_memory,
+            filter_offset,
+            row_count,
+        } = source;
         let device_ptr = device_memory.device_ptr();
         let cache_key = (table_name.to_string(), shard_id, col_idx);
         // Fast path: a cached entry whose ptr still matches the live buffer -> probe under the lock.
@@ -1981,15 +2012,18 @@ impl Engine {
     /// `on_hit` before a decline.
     fn probe_shard_pk_index_cached_batch<F: FnMut(u32, u32)>(
         &self,
-        table_name: &str,
-        shard_id: u32,
-        col_idx: usize,
-        device_memory: &Arc<CudaResidentDeviceMemory>,
-        filter_offset: u64,
-        row_count: usize,
+        source: ShardPkCacheSource<'_>,
         needles: &[i32],
         mut on_hit: F,
     ) -> bool {
+        let ShardPkCacheSource {
+            table_name,
+            shard_id,
+            col_idx,
+            device_memory,
+            filter_offset,
+            row_count,
+        } = source;
         let device_ptr = device_memory.device_ptr();
         let cache_key = (table_name.to_string(), shard_id, col_idx);
         // Fast path: a COVERING cached entry -> probe ALL needles under ONE lock (ahead entries
@@ -2114,12 +2148,14 @@ impl Engine {
             let device_memory = shard.device_memory.clone()?;
             let mut hits: Vec<(u32, u32)> = Vec::new();
             let ok = self.probe_shard_pk_index_cached_batch(
-                &table.name,
-                shard.shard_id,
-                filter_idx,
-                &device_memory,
-                filter_offset,
-                shard.row_count,
+                ShardPkCacheSource {
+                    table_name: &table.name,
+                    shard_id: shard.shard_id,
+                    col_idx: filter_idx,
+                    device_memory: &device_memory,
+                    filter_offset,
+                    row_count: shard.row_count,
+                },
                 needles,
                 |ni, slot| hits.push((ni, slot)),
             );
@@ -2316,6 +2352,7 @@ impl Engine {
         table: &RelationalTable,
         table_name: &str,
         shard_id: u32,
+        device_memory: &Arc<CudaResidentDeviceMemory>,
         // COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): `key_id` identifies WHICH unique index this index
         // serves — a single-column key's catalog COLUMN INDEX (byte-compatible with every prior cache
         // entry), or `COMPOUND_KEY_ID_FLAG | ordinal` for a compound key. `positions` are the ordered
@@ -2327,16 +2364,16 @@ impl Engine {
         // would otherwise mis-address the buffer -> garbage fingerprints -> a missed duplicate). One
         // offset = single column (raw keys); >1 = compound (the per-row values FOLD into the surrogate
         // fingerprint the index stores as an opaque key).
-        key_id: usize,
-        positions: &[usize],
-        device_memory: &Arc<CudaResidentDeviceMemory>,
-        offsets: &[u64],
-        // COMPOUND KEYS (text): the per-key-column BLOB byte offsets, parallel to `offsets` — nonzero only
-        // for a TEXT column (its blob), 0 for fixed-width columns. Recomputed from the live shard under lanes.
-        blob_offsets: &[u64],
-        blob_lens: &[u64],
+        key: ShardDeviceIndexKey<'_>,
         row_count: usize,
     ) -> Option<(Arc<CudaResidentDeviceMemory>, u32, u32, usize)> {
+        let ShardDeviceIndexKey {
+            key_id,
+            positions,
+            offsets,
+            blob_offsets,
+            blob_lens,
+        } = key;
         if positions.len() != offsets.len()
             || positions.len() != blob_offsets.len()
             || positions.len() != blob_lens.len()
@@ -2716,12 +2753,15 @@ impl Engine {
                     table,
                     &table.name,
                     shard.shard_id,
-                    filter_idx,
-                    std::slice::from_ref(&filter_idx),
                     &device_memory,
-                    &[filter_offset],
-                    &[0], // single-column key -> blob offsets unused (fixed-width fold path)
-                    &[0], // single-column key -> blob lengths unused
+                    ShardDeviceIndexKey {
+                        key_id: filter_idx,
+                        positions: std::slice::from_ref(&filter_idx),
+                        offsets: &[filter_offset],
+                        // Single-column fixed-width key: blob offsets/lengths are unused.
+                        blob_offsets: &[0],
+                        blob_lens: &[0],
+                    },
                     shard.row_count,
                 )?;
             let mut projection_offsets: Vec<u64> = Vec::with_capacity(ncols);
@@ -2771,7 +2811,7 @@ impl Engine {
                 .submit_multi_shard_i32_index_probe_dense(
                     &probe_shards,
                     needles,
-                    read_boundary as u64,
+                    read_boundary,
                 )
                 .ok()?;
             let binary_mode = submission.multi_shard_binary_mode;

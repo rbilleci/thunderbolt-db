@@ -74,6 +74,10 @@ type WavePendingAppends = BTreeMap<
     ),
 >;
 
+/// One wave winner awaiting the ordered commit cut: batch position, table, applied values,
+/// pre-encoded WAL record, and the row-id patch offset within that record.
+type CommitWaveWinner = (usize, String, Vec<SqlValue>, Vec<u8>, usize);
+
 /// E2.4a — one shard worker's verdict for a wave position: either a retryable/duplicate abort
 /// (outcome set verbatim in the serial cut) or a Commit carrying the cloned row image and the
 /// cloned W5a WAL record (row id still the encode-time placeholder; the serial cut patches it with
@@ -1350,7 +1354,7 @@ impl Engine {
             let Command::Insert(insert) = &batch[pos].cmd else {
                 continue;
             };
-            if catalog.relational_catalog.get(&insert.table).is_none() {
+            if !catalog.relational_catalog.contains_key(&insert.table) {
                 continue;
             }
             let snapshot = self.dml_read_snapshot(batch[pos].read_snapshot);
@@ -1924,9 +1928,7 @@ impl Engine {
                 Some((table, rows, row_ids)) if self.auto_admit_on_commit_enabled() => {
                     let entry = pending_appends.entry(table).or_default();
                     // D3: one birth stamp per row of THIS item (the flush spans commit seqs).
-                    entry
-                        .3
-                        .extend(std::iter::repeat(commit_seq).take(rows.len()));
+                    entry.3.extend(std::iter::repeat_n(commit_seq, rows.len()));
                     entry.0.extend(rows);
                     entry.1.extend(row_ids);
                     entry.2.push((position, commit_seq, item_rows));
@@ -2154,8 +2156,7 @@ impl Engine {
         let mut pending_appends: WavePendingAppends = BTreeMap::new();
         let cut_started = hostphase.then(Instant::now);
         // Pass 1 — settle aborts, collect winners (position + payload parts) in wave order.
-        let mut winners: Vec<(usize, String, Vec<SqlValue>, Vec<u8>, usize)> =
-            Vec::with_capacity(n);
+        let mut winners: Vec<CommitWaveWinner> = Vec::with_capacity(n);
         for position in 0..n {
             match verdicts[position]
                 .take()

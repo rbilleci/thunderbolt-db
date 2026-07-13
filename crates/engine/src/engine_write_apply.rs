@@ -7,6 +7,21 @@
 
 use super::*;
 
+type AppliedDelete = (
+    String,
+    Vec<Vec<SqlValue>>,
+    WriteSet,
+    Option<(Vec<u64>, u64)>,
+);
+type AppliedUpdate = (
+    String,
+    Vec<Vec<SqlValue>>,
+    Vec<Vec<SqlValue>>,
+    Option<Vec<u64>>,
+    WriteSet,
+    Option<u64>,
+);
+
 impl Engine {
     /// Recover the host value-index entries an INSERT delta deferred under the elided-skip
     /// (`prepare_insert`): if `entries` is empty for a non-empty insert, the table was elided at
@@ -319,7 +334,7 @@ impl Engine {
         insert: Insert,
         txn_id: TxnId,
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, WriteSet, Vec<u64>)>, EngineError> {
+    ) -> Result<Option<crate::engine_dml_prepare::AppliedInsert>, EngineError> {
         // Stage 2 split: PURE prepare (preflight + encode + write-set) then a `&mut self` install,
         // both under the existing commit lock so the result is byte-identical to the old direct
         // apply. `txn_id` is the commit-seq (== `entry.index`), used as BOTH the read boundary and
@@ -374,16 +389,7 @@ impl Engine {
         cat: &mut DdlCatalogState,
         delete: Delete,
         txn_id: TxnId,
-    ) -> Result<
-        Option<(
-            String,
-            Vec<Vec<SqlValue>>,
-            WriteSet,
-            // P4-2b-ii: the class stamp inputs (packed coordinates + the entry epoch).
-            Option<(Vec<u64>, u64)>,
-        )>,
-        EngineError,
-    > {
+    ) -> Result<Option<AppliedDelete>, EngineError> {
         // Stage 2 split: PURE prepare (resolve matches + FK preflight + write-set) then a
         // `&mut self` tombstone install. `txn_id` is the commit-seq used as both the read boundary
         // and the version stamp, identical to the old direct apply (still under the commit lock).
@@ -416,18 +422,7 @@ impl Engine {
         cat: &mut DdlCatalogState,
         update: Update,
         txn_id: TxnId,
-    ) -> Result<
-        Option<(
-            String,
-            Vec<Vec<SqlValue>>,
-            Vec<Vec<SqlValue>>,
-            Option<Vec<u64>>,
-            WriteSet,
-            // P4-2b-ii: the class coordinate token.
-            Option<u64>,
-        )>,
-        EngineError,
-    > {
+    ) -> Result<Option<AppliedUpdate>, EngineError> {
         // Stage 2 split: PURE prepare (resolve matches + encode new images + preflight +
         // write-set) then a `&mut self` version-rewrite install. `txn_id` is the commit-seq used as
         // both the read boundary and the version stamp, identical to the old direct apply.

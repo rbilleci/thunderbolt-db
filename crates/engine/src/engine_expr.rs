@@ -20,6 +20,10 @@
 
 use super::*;
 
+/// One shard-to-unified TEXT offset rebase operation: destination offsets/base row/blob base,
+/// source allocation/offsets/blob/length, and row count.
+type TextRebaseOp = (u64, u32, u64, u64, u64, u64, u64, u32);
+
 /// A binary operator in the resident expression IR (arithmetic, comparison, or boolean). The
 /// interpreter pattern-matches these; callers (tests now, the parser/planner later) construct them.
 /// Not all variants have interpreter coverage yet (the device bytecode VM, design §2.3, adds
@@ -810,22 +814,23 @@ fn composite_group_count_reps(
             });
         }
     }
-    let _tdesc;
-    if text_sources.is_empty() {
-        _tdesc = None;
+    let _tdesc = if text_sources.is_empty() {
+        None
     } else {
-        _tdesc = Some(
+        Some(
             device_memory
                 .upload_group_text_descriptors(&text_sources)
                 .map_err(map_err)?,
-        );
-    }
+        )
+    };
     let key = gpu_db_execution::CudaGroupKeySource::Composite {
-        fixed: _kbuf.as_ref().map(|buf| gpu_db_execution::CudaGroupWideSource {
-            buffer: buf.group_view(),
-            row_width: comp_w,
-            row_count,
-        }),
+        fixed: _kbuf
+            .as_ref()
+            .map(|buf| gpu_db_execution::CudaGroupWideSource {
+                buffer: buf.group_view(),
+                row_width: comp_w,
+                row_count,
+            }),
         text: _tdesc.as_ref().map(|buf| buf.descriptors()),
         row_count,
     };
@@ -3668,7 +3673,7 @@ impl Engine {
             Vec::new();
         // (dst_offsets_byte_offset, dst_base_row, blob_base, src_ptr, src_offsets_byte_offset,
         //  src_bytes_byte_offset, src_blob_len, count).
-        let mut text_rebase_ops: Vec<(u64, u32, u64, u64, u64, u64, u64, u32)> = Vec::new();
+        let mut text_rebase_ops: Vec<TextRebaseOp> = Vec::new();
         {
             let text_names: Vec<String> = shards[0]
                 .resident_device_text_columns
@@ -3832,16 +3837,18 @@ impl Engine {
         let proof = unified_mem.metadata().clone();
         let snapshot = self.resident_snapshot_for_unified(
             table,
-            total_row_count,
-            gpu_id,
-            allocated_bytes,
-            proof,
-            int4_columns,
-            int8_columns,
-            numeric_columns,
-            unified_bool_columns,
-            unified_text_columns,
-            unified_null_columns,
+            crate::engine_residency::UnifiedResidentSnapshotParts {
+                total_row_count,
+                gpu_id,
+                resident_bytes: allocated_bytes,
+                proof,
+                int4_columns,
+                int8_columns,
+                numeric_columns,
+                bool_columns: unified_bool_columns,
+                text_columns: unified_text_columns,
+                null_columns: unified_null_columns,
+            },
         );
         Ok(ShardedUnifiedExecSource {
             src: ResidentExecSource {
@@ -4388,6 +4395,9 @@ impl Engine {
     /// Benchmark helper (tests only): time JUST the GROUP BY kernel (CUDA events, min of `runs`),
     /// isolating it from the alloc/H2D/D2H/host-compact overhead. Returns the min kernel milliseconds.
     #[cfg(test)]
+    // Benchmark-only facade: explicit dimensions keep call sites auditable without creating a
+    // product/runtime parameter object for a test-only kernel probe.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn group_by_i32_bench_kernel_ms(
         &self,
         table_name: &str,
@@ -4959,17 +4969,17 @@ impl Engine {
         let projection_aliases = self.join_projection_output_aliases(plan, &tables)?;
         let mut resolved_order = Vec::with_capacity(plan.order_by.len());
         for (order_idx, (column, descending)) in plan.order_by.iter().enumerate() {
-            let alias_matches = column
-                .qualifier
-                .is_none()
-                .then(|| {
-                    projection_aliases
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, alias)| (alias.as_deref() == Some(&column.column)).then_some(index))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let alias_matches = if column.qualifier.is_none() {
+                projection_aliases
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, alias)| {
+                        (alias.as_deref() == Some(&column.column)).then_some(index)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let resolved = if let [index] = alias_matches.as_slice() {
                 proj[*index]
             } else if alias_matches.len() > 1 {
@@ -8270,7 +8280,7 @@ impl Engine {
                 let key_nulls: Vec<Option<bool>> = vec![Some(true); key_types.len()];
                 for pass in passes.iter_mut() {
                     let key_rows: Vec<Vec<SqlValue>> =
-                        pass.groups.iter().map(|g| full_key(g)).collect();
+                        pass.groups.iter().map(&full_key).collect();
                     let perm = gpu_sort_permutation(
                         &key_rows,
                         &key_order,
@@ -8280,7 +8290,7 @@ impl Engine {
                     )?;
                     pass.groups = perm
                         .iter()
-                        .map(|&p| pass.groups[p as usize].clone())
+                        .map(|&p| pass.groups[p as usize])
                         .collect();
                 }
             }

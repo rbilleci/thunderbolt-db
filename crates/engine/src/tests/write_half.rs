@@ -822,10 +822,8 @@ fn commit_wave_mixed_fast_and_slow_items_stay_correct_and_recover() {
 #[test]
 fn dml_index_validators_match_scan_validators_oracle() {
     // Each scenario: (setup DDL/DML, statement, expect_err).
-    let run = |index_on: bool,
-               setup: &[&str],
-               stmt: &str|
-     -> (Result<(), String>, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>) {
+    type ValidatorOutcome = (Result<(), String>, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>);
+    let run = |index_on: bool, setup: &[&str], stmt: &str| -> ValidatorOutcome {
         let e = Engine::new_local_cpu_oracle();
         e.set_dml_value_index_resolve_enabled(index_on);
         for (i, sql) in setup.iter().enumerate() {

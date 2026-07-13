@@ -2385,7 +2385,7 @@ fn relational_catalog_truncates_table_and_replays_from_wal() {
     // rows. Accept either an invalidated single-buffer snapshot (legacy) or the shard representation.
     assert!(e
         .relational_residency_snapshot("people")
-        .map_or(true, |snapshot| !snapshot.is_valid()));
+        .is_none_or(|snapshot| !snapshot.is_valid()));
 
     e.execute_text(11, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
         .unwrap();

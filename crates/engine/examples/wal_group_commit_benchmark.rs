@@ -3,9 +3,9 @@
 //! N writer threads drive `execute_dml_concurrent` INSERTs against a crash-durable engine. With
 //! the designated-flusher group commit, committers that arrive while an fsync is in flight append
 //! + apply and then share the NEXT fsync — so fsyncs per commit drop toward 1/G (G = mean group
-//! size) instead of the strict 1 of the old flush-inside-the-commit-mutex path. The 1-writer run
-//! IS the old cost model (groups of 1, one fsync per commit): compare commits/sec at c=1 vs c=N
-//! and the reported mean group size.
+//!   size) instead of the strict 1 of the old flush-inside-the-commit-mutex path. The 1-writer run
+//!   IS the old cost model (groups of 1, one fsync per commit): compare commits/sec at c=1 vs c=N
+//!   and the reported mean group size.
 //!
 //! CPU + disk only — no GPU residency, no CUDA initialization.
 //!

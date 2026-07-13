@@ -237,7 +237,7 @@ fn percentile_999_us(w: &WallSamples) -> f64 {
     }
     let mut sorted = w.nanos.clone();
     sorted.sort_unstable();
-    let rank = ((999usize * sorted.len()) + 999) / 1000; // ceil(0.999 * n)
+    let rank = (999usize * sorted.len()).div_ceil(1000); // ceil(0.999 * n)
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)] as f64 / 1_000.0
 }
 

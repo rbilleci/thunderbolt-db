@@ -1310,8 +1310,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   root is 12,579 lines; production, visibility, payload bytes, CUDA calls, and routes are untouched, so the report
   card was not applicable. The broad ordinary suites exposed a pre-existing CUDA 700 in nullable-text `LIKE`
   count, reproduced on detached pre-slice HEAD; it poisoned later tests and caused the observed serial/16-thread
-  cascades. READ-004 subsequently closed that fault as described below. Strict clippy is independently baseline-
-  red in untouched WAL/engine code and is owned by QUALITY-001, the remaining gate before STRUCT-001EI.
+  cascades. READ-004 subsequently closed that fault as described below.
   READ-004 eliminated that pre-existing nullable-text `LIKE` fault in the resident general predicate VM. The
   VM launched `gpu_db_resident_text_like_scalar_to_mask` with seven arguments even though the PTX ABI requires
   eight: omitting `text_bytes_limit` shifted the token pointer/count/row-count fields and left the output-mask
@@ -1322,12 +1321,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   fails before launch. Nullable/non-null bridge/general/VM gates passed three sequential and two concurrent
   rounds with zero CUDA 700/716/717; the full 992-test engine inventory passed serial and 16-thread (505 passed,
   487 ignored); execution and engine all-target checks passed; execution strict clippy passed, and the changed
-  engine line has no new finding within the separately owned QUALITY-001 baseline. The direct roofline measured
+  engine line introduced no new lint finding. The direct roofline measured
   1,467/1,440 GB/s in-/out-of-L2 `sum_i32`, 1,288/1,463 GB/s COUNT, and 347/252/1,678 M-elem/s sort/join/grouped.
   The canonical card was likewise clean: in-/out-of-L2 rooflines 1,429/1,444 GB/s and the production batched
   point-read route reached 251.3M/256.6M lookups/s at batch 65,536 with 135/128 us p50. Independent audit found
-  no host fallback, ABI/lifetime/bounds defect, semantic drift, or regression. QUALITY-001 is now the only gate
-  before STRUCT-001EI.
+  no host fallback, ABI/lifetime/bounds defect, semantic drift, or regression.
+  QUALITY-001 restored the strict package lint baseline in two bounded commits. The WAL slice removed its two
+  transitive findings; the engine slice resolved all 54 package-local findings with mechanical rewrites, named
+  parameter/tuple shapes, and narrow documented exceptions at only allocation-sensitive or benchmark/test
+  boundaries. No host relational fallback or product-path allow was added. One baseline shard test was stale
+  after the production auto-admission flip; the same failure reproduced on pre-QUALITY commit `b2e0fc45`, and
+  its setup now disables auto-admit so the test continues to exercise explicit post-load admission. Engine
+  strict clippy with dependencies and all targets, all-target check, WAL tests, and both serial/16-thread
+  992-test engine runs are green (505 passed, 487 ignored). Five residency/text/binary/deletion/streaming GPU
+  routes passed three sequential and two concurrent rounds with zero CUDA 700/716/717. The direct roofline
+  measured 1,468/1,448 GB/s in-/out-of-L2 `sum_i32`, 1,292/1,459 GB/s COUNT, and 349/258/1,678 M-elem/s
+  sort/join/grouped. The canonical card measured 1,476/1,451 GB/s rooflines and 65,536-batch production point
+  reads at 246.5M/255.3M lookups/s with p50 136/130us. Independent audit found no semantic, ownership, API,
+  scheduler, or GPU-path drift. STRUCT-001EI is ready.
 
 ## Known boundaries
 
@@ -1346,7 +1357,6 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |
 | Two physical GPUs have not executed the scheduler, device-locate, or typed sidecar context gates | **MULTI-001**, **MULTI-002**, **MULTI-003** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |
-| Engine all-target strict clippy is baseline-red in transitive WAL and untouched engine sources | **QUALITY-001** |
 | Lane DELETE residuals and empty-aggregate pgwire NULL seam require focused disposition | **R3-005**, **READ-003** |
 | Lanes auto-checkpoint/PITR and full crash campaign | **DUR-001**, **DUR-002** |
 | Multi-node Raft/quorum serving is not integrated | **HA-001** |

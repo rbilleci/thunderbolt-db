@@ -9,7 +9,8 @@
 //!   - CURRENT      : the boxed `Vec<Vec<SqlValue>>` per needle (today's path)
 //!   - FLAT-SQLVALUE: one row-major `Vec<SqlValue>` + per-needle row ranges (drops the per-row Vec boxing)
 //!   - FLAT-I32     : one row-major `Vec<i32>` (also drops the SqlValue enum-wrap; the wire encoder would
-//!                    convert on the fly) — the "device->wire" lower bound on the host side
+//!     convert on the fly) — the "device->wire" lower bound on the host side
+//!
 //! Reports ns/row + implied lookups/s for each. The gap CURRENT->FLAT-* bounds the columnar-layer payoff.
 //!
 //! Run: cargo run --release --example result_materialization_probe -p gpu_db_engine   (no GPU needed)
@@ -81,8 +82,8 @@ fn high_output(m: usize, k: usize) {
         let total = acc as usize;
         let mut slot = vec![0u32; total];
         let mut cursor: Vec<u32> = ranges.iter().map(|&(s, _)| s).collect();
-        for i in 0..n {
-            let ni = needle_indices[i] as usize;
+        for (i, &needle_index) in needle_indices.iter().take(n).enumerate() {
+            let ni = needle_index as usize;
             slot[cursor[ni] as usize] = i as u32;
             cursor[ni] += 1;
         }

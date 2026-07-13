@@ -10,6 +10,10 @@ use super::*;
 /// the seq_scan produced. `None` from the resolver = index-ineligible -> the caller scans.
 pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
 
+/// Applied INSERT data surfaced to residency publication: table, stored row images, conflict
+/// write-set, and stable row identities.
+pub(crate) type AppliedInsert = (String, Vec<Vec<SqlValue>>, WriteSet, Vec<u64>);
+
 /// ADR-006 (FK child elision, all fk column types): the CANONICAL Eq literal for a device
 /// scan-probe of `value` against a column of type `ty` — one arm per device-scannable type,
 /// mirroring `dml_filter_groups_to_device_predicate`'s Eq lowering EXACTLY (Date/Uuid round-trip
@@ -213,6 +217,7 @@ pub(crate) fn dml_filter_groups_to_device_predicate(
 ///    off-lock prepare's in-batch check already rejected it;
 ///  - CHECK constraints are row-local and deterministic on the values: same verdict as the
 ///    off-lock pass.
+///
 /// FK re-validation is NOT covered (a parent provider deleted in (S, commit] writes the
 /// PARENT's row keys into the ledger, which the CHILD's write-set never claims — no
 /// conflict), so FK-bearing tables always validate fully. PK NOT-NULL (O(new), pure) runs
@@ -236,7 +241,7 @@ impl Engine {
         cat: &mut DdlCatalogState,
         insert: Insert,
         txn_id: TxnId,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, WriteSet, Vec<u64>)>, EngineError> {
+    ) -> Result<Option<AppliedInsert>, EngineError> {
         self.apply_insert_with_profile(cat, insert, txn_id, None)
     }
 
@@ -344,7 +349,7 @@ impl Engine {
         }
 
         // PG constraint order: not-null (23502) BEFORE unique — over the NEW rows only, O(new).
-        Self::validate_primary_key_not_null(&table, new_rows.iter().map(Vec::as_slice))?;
+        Self::validate_primary_key_not_null(table, new_rows.iter().map(Vec::as_slice))?;
         // TYPE-COVERAGE track 1 (ledger #17): INDEX-DRIVEN INSERT validation — O(new x constraints)
         // through the 1b-audited `validate_dml_constraints_via_index` (probe ladder: device index
         // first, value_index on decline), replacing the O(table) candidate materialization below.
@@ -429,7 +434,7 @@ impl Engine {
             let materialize_candidates =
                 |engine: &Self| -> Result<Vec<Vec<SqlValue>>, EngineError> {
                     let mut rows = engine.visible_relational_rows(
-                        &table,
+                        table,
                         StorageVisibility {
                             read_txn_id: txn_id,
                         },
@@ -443,7 +448,7 @@ impl Engine {
                     candidate_rows = Some(materialize_candidates(self)?);
                 }
                 Self::validate_unique_indexes_for_rows(
-                    &table,
+                    table,
                     candidate_rows.as_ref().expect("materialized above"),
                 )?;
                 if let Some(profile) = profile.as_mut() {
@@ -457,7 +462,7 @@ impl Engine {
                     candidate_rows = Some(materialize_candidates(self)?);
                 }
                 Self::validate_check_constraints_for_rows(
-                    &table,
+                    table,
                     candidate_rows.as_ref().expect("materialized above"),
                 )?;
                 if let Some(profile) = profile.as_mut() {
@@ -519,7 +524,7 @@ impl Engine {
             // key and FALSELY conflict. Inserts conflict ONLY on the unique-index slots they
             // occupy (the genuine first-committer-wins point); the row slot is intentionally NOT a
             // conflict dimension for inserts.
-            write_set.add_unique_slots(&table, values);
+            write_set.add_unique_slots(table, values);
         }
 
         Ok(WriteDelta {
@@ -614,7 +619,7 @@ impl Engine {
             // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);
             // any decline falls to the value-index resolve (slice 1), then the scan below.
             match self.resolve_dml_matches_via_device(
-                &table,
+                table,
                 &filter_groups,
                 visibility,
                 &table_rows,
@@ -630,7 +635,7 @@ impl Engine {
                     // LOSES the update (0 matches). RE-PIN before every fallback.
                     table_rows = self.read_state.mvcc.table_rows(&table.name);
                     match Self::resolve_dml_matches_via_value_index(
-                        &table,
+                        table,
                         &table_rows,
                         &filter_groups,
                         visibility,
@@ -693,7 +698,7 @@ impl Engine {
                     deletes.iter().map(|(_, _, row)| row.clone()).collect();
                 self.validate_dml_constraints_via_index(
                     &catalog,
-                    &table,
+                    table,
                     &[],
                     &removed,
                     &touched_keys,
@@ -740,7 +745,7 @@ impl Engine {
             });
             // A delete releases the row's unique-index slots; record them as written so a
             // concurrent insert reusing the value conflicts (Stage 4 first-committer-wins).
-            write_set.add_unique_slots(&table, row);
+            write_set.add_unique_slots(table, row);
         }
 
         Ok(WriteDelta {
@@ -1900,7 +1905,7 @@ impl Engine {
         let assignments = bind_update_assignments(table, update)
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
         let filter_groups = bind_delete_filter_groups(
-            &table,
+            table,
             &Delete {
                 table: update.table.clone(),
                 filter: update.filter.clone(),
@@ -2012,7 +2017,7 @@ impl Engine {
             // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);
             // any decline falls to the value-index resolve (slice 1), then the scan below.
             match self.resolve_dml_matches_via_device(
-                &table,
+                table,
                 &filter_groups,
                 visibility,
                 &table_rows,
@@ -2028,7 +2033,7 @@ impl Engine {
                     // LOSES the update (0 matches). RE-PIN before every fallback.
                     table_rows = self.read_state.mvcc.table_rows(&table.name);
                     match Self::resolve_dml_matches_via_value_index(
-                        &table,
+                        table,
                         &table_rows,
                         &filter_groups,
                         visibility,
@@ -2058,7 +2063,7 @@ impl Engine {
                     // Identical per-match processing to the scan arm below (old-image slots ->
                     // released; old image captured; assignments applied; install tuple pushed).
                     let mut old_slots = WriteSet::default();
-                    old_slots.add_unique_slots(&table, &row);
+                    old_slots.add_unique_slots(table, &row);
                     released_unique_slots.append(&mut old_slots.unique_slots);
                     updated_old_rows.push(row.clone());
                     for (idx, value) in &assignments {
@@ -2086,7 +2091,7 @@ impl Engine {
                     }) {
                         // Capture the old image's unique slots BEFORE the assignments overwrite them.
                         let mut old_slots = WriteSet::default();
-                        old_slots.add_unique_slots(&table, &row);
+                        old_slots.add_unique_slots(table, &row);
                         released_unique_slots.append(&mut old_slots.unique_slots);
                         // SV5: capture the OLD image before the assignments overwrite it (parallel to
                         // `updates`).
@@ -2114,7 +2119,7 @@ impl Engine {
                     updates.iter().map(|(_, _, row)| row.clone()).collect();
                 self.validate_dml_constraints_via_index(
                     &catalog,
-                    &table,
+                    table,
                     &new_images,
                     &updated_old_rows,
                     &touched_keys,
@@ -2126,17 +2131,17 @@ impl Engine {
             // images only, O(touched). (The index arm gets the identical check inside
             // `validate_dml_constraints_via_index`.)
             Self::validate_primary_key_not_null(
-                &table,
+                table,
                 updates.iter().map(|(_, _, row)| row.as_slice()),
             )?;
             if constrained {
                 candidate_rows.extend(updates.iter().map(|(_, _, row)| row.clone()));
             }
             if table.indexes.iter().any(|index| index.unique) {
-                Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
+                Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
             }
             if !table.check_constraints.is_empty() {
-                Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
+                Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
             }
             if !table.foreign_keys.is_empty()
                 || catalog.relational_catalog.values().any(|candidate| {
@@ -2170,7 +2175,7 @@ impl Engine {
                 row_key: key.clone(),
             });
             // The new image's unique-index slots are claimed by this txn.
-            write_set.add_unique_slots(&table, row);
+            write_set.add_unique_slots(table, row);
         }
         // The old images' RELEASED unique slots are also conflict points (prereq #2). Dedup so a
         // value carried unchanged through the UPDATE (same slot released and re-claimed) is recorded

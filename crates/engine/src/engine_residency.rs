@@ -7,6 +7,30 @@
 
 use super::*;
 
+/// Columnar payload bytes plus every typed section descriptor derived during construction.
+pub(crate) type RelationalDevicePayload = (
+    Vec<u8>,
+    Vec<ResidentDeviceTextColumnLayout>,
+    Vec<ResidentDeviceBoolColumnLayout>,
+    Vec<ResidentDeviceInt4ColumnStats>,
+    Vec<(String, u64)>,
+    Vec<ResidentDeviceNullBitmapLayout>,
+);
+
+/// Cohesive descriptor inputs for a device-recompacted unified shard snapshot.
+pub(crate) struct UnifiedResidentSnapshotParts {
+    pub(crate) total_row_count: usize,
+    pub(crate) gpu_id: u16,
+    pub(crate) resident_bytes: u64,
+    pub(crate) proof: CudaDeviceMemoryProof,
+    pub(crate) int4_columns: Vec<String>,
+    pub(crate) int8_columns: Vec<String>,
+    pub(crate) numeric_columns: Vec<String>,
+    pub(crate) bool_columns: Vec<ResidentDeviceBoolColumnLayout>,
+    pub(crate) text_columns: Vec<ResidentDeviceTextColumnLayout>,
+    pub(crate) null_columns: Vec<ResidentDeviceNullBitmapLayout>,
+}
+
 /// Build the GPU device payload for typed columns + their row values -- the columnar
 /// `[8-byte row_count header][int4/date/int2 i32][int8/timestamp i64][numeric/uuid 16B][bool bitmap]
 /// [text 8-aligned offsets + bytes]` layout (type-grouped, catalog order within each type; varlen text
@@ -15,25 +39,11 @@ use super::*;
 /// resident-table builder produces, so a non-table caller (e.g. the grouped-sort) can build a
 /// resident-like buffer without re-implementing the byte mappings. `column_names` / `column_types` /
 /// each row in `rows` are parallel by column index.
-#[allow(clippy::type_complexity)]
 pub(crate) fn build_relational_device_payload(
     column_names: &[String],
     column_types: &[SqlType],
     rows: &[Vec<SqlValue>],
-) -> Result<
-    (
-        Vec<u8>,
-        Vec<ResidentDeviceTextColumnLayout>,
-        Vec<ResidentDeviceBoolColumnLayout>,
-        Vec<ResidentDeviceInt4ColumnStats>,
-        // (column name, byte-offset) of each numeric/uuid 16-byte section -- so a non-table caller
-        // (the GPU grouped-sort) can address them without recomputing the layout by formula.
-        Vec<(String, u64)>,
-        // Per-column NULL validity bitmaps (M3 — doc 21), one per column that contains a NULL.
-        Vec<ResidentDeviceNullBitmapLayout>,
-    ),
-    ExecuteError,
-> {
+) -> Result<RelationalDevicePayload, ExecuteError> {
     // The unified-buffer / sealed-shard path is exactly `capacity == row_count` — every padding loop
     // in the capacity-aware builder is then zero-iteration, so the bytes are identical to before.
     build_relational_device_payload_with_capacity(column_names, column_types, rows, rows.len())
@@ -52,17 +62,7 @@ pub(crate) fn build_relational_device_payload_with_capacity(
     column_types: &[SqlType],
     rows: &[Vec<SqlValue>],
     capacity: usize,
-) -> Result<
-    (
-        Vec<u8>,
-        Vec<ResidentDeviceTextColumnLayout>,
-        Vec<ResidentDeviceBoolColumnLayout>,
-        Vec<ResidentDeviceInt4ColumnStats>,
-        Vec<(String, u64)>,
-        Vec<ResidentDeviceNullBitmapLayout>,
-    ),
-    ExecuteError,
-> {
+) -> Result<RelationalDevicePayload, ExecuteError> {
     let row_count = rows.len();
     if capacity < row_count {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -812,6 +812,9 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
 }
 
 #[cfg(test)]
+// STRUCT-001 keeps this parent-positioned include as a source-reconstruction boundary. Moving the
+// 6,819-line test owner after production items would obscure exact extraction history for no runtime gain.
+#[allow(clippy::items_after_test_module)]
 mod capacity_payload_tests {
     use super::*;
 
@@ -838,6 +841,10 @@ mod capacity_payload_tests {
     fn shard_residency_admit_reads_match_single_buffer() {
         let run = |shard: bool| -> (RowBlock, RowBlock, RowBlock, bool) {
             let mut e = Engine::new_local();
+            // This gate compares two EXPLICIT post-load admissions. Keep fixture construction in the
+            // host store so the production auto-admit/elision flip cannot make an earlier INSERT batch
+            // device-authoritative before the comparison snapshot is requested.
+            e.set_auto_admit_on_commit(false);
             e.set_shard_residency_enabled(shard);
             e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
                 .unwrap();
@@ -3649,6 +3656,7 @@ mod capacity_payload_tests {
     ///   - post-UPDATE churn probe: the SV5 append dups the id column in the open shard -> the
     ///     cached index DECLINES (monotone) -> the probe ladder REHYDRATES (sticky de-elision)
     ///     and must answer from the FRESH post-rehydration generation (the A5-flip SI-fix class).
+    ///
     /// NON-VACUITY: the ON twin is still ELIDED after the INSERT-only prefix with elisions > 0
     /// and device-validate answering; the flag-OFF-arm eligibility gate is asserted by the
     /// existing `a4e_elision_lifecycle_matches_install_twin` UNIQUE-never-elides check.
@@ -4550,7 +4558,6 @@ mod capacity_payload_tests {
         }
         // DELETE a row -> the shard becomes VERSIONED (a deleted_by region). Stays elided (U1).
         e.execute_text(seq, "DELETE FROM t WHERE id = 50").unwrap();
-        seq += 1;
         assert!(
             e.table_install_elided("t"),
             "an in-place tombstone must not de-elide"
@@ -4869,7 +4876,8 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn b128_and_bigint_filtered_rehydration_reads_from_device() {
         // (value-column DDL type, per-id value SQL). `id` is the INT PK; `val` is the rehydrated column.
-        let cases: [(&str, fn(i64) -> String); 6] = [
+        type RehydrationCase = (&'static str, fn(i64) -> String);
+        let cases: [RehydrationCase; 6] = [
             ("NUMERIC(20,4)", |k| format!("{k}.{:04}", (k * 7) % 10000)),
             // A NEGATIVE mantissa (i128 high bit): exercises from_le_bytes sign-correctness.
             ("NUMERIC(20,4)", |k| format!("-{k}.{:04}", (k * 7) % 10000)),
@@ -5585,7 +5593,7 @@ mod capacity_payload_tests {
             assert_eq!(rows.len(), 1, "id {key}");
             assert_eq!(
                 rows.row(0),
-                &[SqlValue::Int4(key as i32), SqlValue::Int4(-1)]
+                &[SqlValue::Int4(key), SqlValue::Int4(-1)]
             );
         }
         // The vacuum de-elided (rehydration is sticky); the next handled insert RE-ENTERS.
@@ -7500,7 +7508,7 @@ impl Engine {
             .budget_allocation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let device_memory = self.relational_residency_device_memory(gpu_id, &device_payload);
+        let mut device_memory = self.relational_residency_device_memory(gpu_id, &device_payload);
         #[cfg(not(test))]
         if device_memory.is_none() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -7597,10 +7605,14 @@ impl Engine {
         // single-buffer GPU paths to the CPU fallback — the opposite of the flip's goal (caught by the
         // burn-in: the single-buffer text-probe suite). Mixed-type tables keep the single-buffer layout
         // until shards carry every section (type-coverage ledger item).
-        if self.shard_residency_enabled()
-            && device_memory.is_some()
+        let shard_device_memory = if self.shard_residency_enabled()
             && (purely_int4 || fixed_width_sections || text_sectioned)
         {
+            device_memory.take()
+        } else {
+            None
+        };
+        if let Some(device_memory) = shard_device_memory {
             // Audit (S-d1) fix: this re-admit makes the SHARD representation authoritative — clear any prior
             // single-buffer cell for the table so a runtime flag flip (OFF->ON) cannot leave a stale
             // snapshot/device_memory shadowing the shards. Idempotent (a no-op when none exists).
@@ -7636,7 +7648,7 @@ impl Engine {
             }
             // Sub-slice 3b: this sharded re-admit replaces the table's shards -> purge stale cached indexes.
             read_state.residency.purge_shard_pk_index_for_table(table);
-            let dm = Arc::new(device_memory.expect("device_memory.is_some() checked"));
+            let dm = Arc::new(device_memory);
             let shard = RelationalResidentShard {
                 shard_id: 0,
                 row_start: 0,
@@ -9295,11 +9307,11 @@ impl Engine {
     ///         (a warmup/refresh has no invalidate), the BUDGET-EVICTION path (`RelationalResidentCache::
     ///         remove_table`, evicting a different table during admission), and `apply_drop_table` (a DROPped
     ///         table is gone for good — stronger than `shard_device_memory`, which leaves `None` cells on DROP).
-    ///     Gates (all sabotage-verified non-vacuous): `shard_deleted_by_region_released_on_invalidate_and_drop`
-    ///     (invalidate + DROP), `shard_deleted_by_region_released_on_warmup_readmit` (sharded re-admit with no
-    ///     preceding invalidate), and `resident_cache_remove_table_releases_deleted_by_region` (the eviction-
-    ///     cleanup method contract, currently defensive). This keeps a re-admit (rebuilt all-live from the host
-    ///     store) from inheriting a stale tombstone region and stops evicted/dropped tables leaking regions.
+    ///         Gates (all sabotage-verified non-vacuous): `shard_deleted_by_region_released_on_invalidate_and_drop`
+    ///         (invalidate + DROP), `shard_deleted_by_region_released_on_warmup_readmit` (sharded re-admit with no
+    ///         preceding invalidate), and `resident_cache_remove_table_releases_deleted_by_region` (the eviction-
+    ///         cleanup method contract, currently defensive). This keeps a re-admit (rebuilt all-live from the host
+    ///         store) from inheriting a stale tombstone region and stops evicted/dropped tables leaking regions.
     ///  2. **Concurrency:** hold the COMMIT LOCK across the get-or-allocate below, else two concurrent
     ///     first-deletes to the same shard both allocate + the losing region's `Arc` leaks (writes still land
     ///     safely; only the buffer leaks). SV4 runs this under the serialized commit lock, which is the fix.
@@ -9763,7 +9775,7 @@ impl Engine {
         else {
             return false;
         };
-        let mut bytes = Vec::with_capacity(k * std::mem::size_of::<u64>());
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(stamps));
         for stamp in stamps {
             bytes.extend_from_slice(&stamp.to_le_bytes());
         }
@@ -11225,28 +11237,20 @@ impl Engine {
     pub(crate) fn resident_snapshot_for_unified(
         &self,
         table: &RelationalTable,
-        total_row_count: usize,
-        gpu_id: u16,
-        resident_bytes: u64,
-        proof: CudaDeviceMemoryProof,
-        int4_columns: Vec<String>,
-        // TYPE-COVERAGE track 2 slice 2: the i64-section columns recompacted into the unified
-        // buffer (after every i32 section, total_row_count-strided). Empty pre-slice.
-        int8_columns: Vec<String>,
-        // TYPE-COVERAGE #14 (numeric): the b128 (Numeric/Uuid) columns recompacted into the unified
-        // buffer (after every i32 + i64 section, total_row_count-strided at 16 bytes). Empty pre-slice.
-        numeric_columns: Vec<String>,
-        // TYPE-COVERAGE #14 (bool): the per-column bool bitmaps recompacted into the unified buffer
-        // (offsets ABSOLUTE in that buffer). One entry per bool column (bool is dense — present on every
-        // shard). Empty for a bool-free table -> byte-identical to the pre-bool read.
-        bool_columns: Vec<ResidentDeviceBoolColumnLayout>,
-        // TYPE-COVERAGE #14 (text): the per-column text (offsets+blob) layouts recompacted into the unified
-        // buffer (offsets ABSOLUTE). One entry per text column (text is dense — present on every shard).
-        text_columns: Vec<ResidentDeviceTextColumnLayout>,
-        // M3-for-shards: the per-column NULL bitmaps recompacted into the unified buffer (offsets ABSOLUTE
-        // in that buffer). Empty when no surviving shard carries a NULL — byte-identical to the pre-M3 read.
-        null_columns: Vec<ResidentDeviceNullBitmapLayout>,
+        parts: UnifiedResidentSnapshotParts,
     ) -> RelationalResidencySnapshot {
+        let UnifiedResidentSnapshotParts {
+            total_row_count,
+            gpu_id,
+            resident_bytes,
+            proof,
+            int4_columns,
+            int8_columns,
+            numeric_columns,
+            bool_columns,
+            text_columns,
+            null_columns,
+        } = parts;
         let resident_device_int4_columns = int4_columns;
         RelationalResidencySnapshot {
             gpu_id,

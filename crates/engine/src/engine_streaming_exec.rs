@@ -32,6 +32,13 @@
 
 use super::*;
 
+/// Candidate chunk positions plus the optional retained device index owner that proves their
+/// generation remains live for the caller.
+type ChunkKeyCandidates = (
+    Vec<Vec<usize>>,
+    Option<Arc<gpu_db_execution::CudaResidentDeviceMemory>>,
+);
+
 use crate::engine_expr::{
     grouped_projection_to_aggregates, resident_predicate_from_bound_filters, ResidentExecSource,
     ResidentExpr,
@@ -822,19 +829,17 @@ impl Engine {
             .iter()
             .enumerate()
             .map(|(order_index, (key, descending))| {
-                let alias_matches = key
-                    .qualifier
-                    .is_none()
-                    .then(|| {
-                        aliases
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, alias)| {
-                                (alias.as_deref() == Some(&key.column)).then_some(index)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let alias_matches = if key.qualifier.is_none() {
+                    aliases
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, alias)| {
+                            (alias.as_deref() == Some(&key.column)).then_some(index)
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 let alias_column = match alias_matches.as_slice() {
                     [column] => Some(*column),
                     [] => None,
@@ -928,19 +933,17 @@ impl Engine {
         let mut sources = self.join_projection_sources(&run_plan, tables)?;
         let visible_aliases = self.join_projection_output_aliases(plan, tables)?;
         for (key, _) in &plan.order_by {
-            let alias_matches = key
-                .qualifier
-                .is_none()
-                .then(|| {
-                    visible_aliases
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, alias)| {
-                            (alias.as_deref() == Some(&key.column)).then_some(index)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let alias_matches = if key.qualifier.is_none() {
+                visible_aliases
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, alias)| {
+                        (alias.as_deref() == Some(&key.column)).then_some(index)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let source = match alias_matches.as_slice() {
                 [index] => sources[*index],
                 [] => {
@@ -7810,10 +7813,7 @@ impl Engine {
         key_positions: &[usize],
         key_id: usize,
         needles: &[i32],
-    ) -> Option<(
-        Vec<Vec<usize>>,
-        Option<Arc<gpu_db_execution::CudaResidentDeviceMemory>>,
-    )> {
+    ) -> Option<ChunkKeyCandidates> {
         if Self::chunk_key_exact_set_bytes(table, entry) <= chunk_key_index_cap_bytes() {
             if self.missing_chunk_key_candidates_require_spill(table, entry, true) {
                 return None;
@@ -8798,32 +8798,6 @@ fn select_streaming_execution_gpus(
     gpus
 }
 
-#[cfg(test)]
-mod streaming_scheduler_tests {
-    use super::select_streaming_execution_gpus;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn multi_gpu_scheduler_requires_physical_health_and_full_query_budget() {
-        let budgets = BTreeMap::from([(0, 4096), (1, 4096), (2, 2048), (3, 8192)]);
-        assert_eq!(
-            select_streaming_execution_gpus(0, 4096, &[0, 1, 2, 3], &[], &[3], &budgets),
-            vec![0, 1],
-            "under-budget and pressured devices must not receive a chunk"
-        );
-        assert_eq!(
-            select_streaming_execution_gpus(0, 4096, &[0, 1], &[1], &[], &budgets),
-            vec![0],
-            "an unavailable secondary must be excluded"
-        );
-        assert_eq!(
-            select_streaming_execution_gpus(7, 4096, &[0, 1], &[], &[], &budgets),
-            vec![7],
-            "the coordinator fallback preserves the existing error surface when no GPU is eligible"
-        );
-    }
-}
-
 // ---------------- P5: FINAL SLOT READBACK (one device-approved slot) ----------------
 //
 // Visibility and predicates have ALREADY been decided by `lower_resident_predicate`; this helper
@@ -9444,4 +9418,30 @@ pub(crate) fn decode_cold_descriptor<R: std::io::Read>(
         evicted_tables_on_admission: Vec::new(),
         device_memory_proof: None,
     })
+}
+
+#[cfg(test)]
+mod streaming_scheduler_tests {
+    use super::select_streaming_execution_gpus;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn multi_gpu_scheduler_requires_physical_health_and_full_query_budget() {
+        let budgets = BTreeMap::from([(0, 4096), (1, 4096), (2, 2048), (3, 8192)]);
+        assert_eq!(
+            select_streaming_execution_gpus(0, 4096, &[0, 1, 2, 3], &[], &[3], &budgets),
+            vec![0, 1],
+            "under-budget and pressured devices must not receive a chunk"
+        );
+        assert_eq!(
+            select_streaming_execution_gpus(0, 4096, &[0, 1], &[1], &[], &budgets),
+            vec![0],
+            "an unavailable secondary must be excluded"
+        );
+        assert_eq!(
+            select_streaming_execution_gpus(7, 4096, &[0, 1], &[], &[], &budgets),
+            vec![7],
+            "the coordinator fallback preserves the existing error surface when no GPU is eligible"
+        );
+    }
 }

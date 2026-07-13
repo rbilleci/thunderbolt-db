@@ -26,18 +26,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   physical cross-context safety gate is **MULTI-003**, likewise deferred to the end and blocked on a two-GPU host.
 - READ-004 is closed: nullable-text `LIKE` now uses the matcher kernel's exact eight-argument ABI with checked
   resident text windows; focused hazard gates, both 992-test ordinary-suite modes, and the canonical report card
-  are green without host fallback. The remaining strict-clippy baseline is isolated under **QUALITY-001**.
+  are green without host fallback.
+- QUALITY-001 is closed: WAL and engine all-target strict clippy are green, both engine suite modes and the
+  five-route GPU hazard matrix pass, the canonical report card is stable, and independent audit found no drift.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **QUALITY-001:** restore the engine all-target strict-clippy baseline in separate behavior-preserving slices.
-2. **STRUCT-001EI:** after that gate is green, externalize the exact five-test baseline shard family.
-3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
+1. **STRUCT-001EI:** externalize the exact five-test baseline shard family.
+2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
-4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-5. **MULTI-001/002/003:** only after every non-MULTI plan item is complete or the user explicitly promotes them,
+3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+4. **MULTI-001/002/003:** only after every non-MULTI plan item is complete or the user explicitly promotes them,
    run their mandatory non-vacuous physical multi-GPU gates; never replace them with host interpretations.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.

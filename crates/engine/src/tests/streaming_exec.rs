@@ -477,7 +477,7 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
         .execute_resident_expr_select_sql(nway_two_right_sql)
         .expect("streaming prefix replay across two RIGHT/FULL steps");
     assert!(streamed_nway_two_right.rows.iter().any(|row| {
-        row == &[SqlValue::Null, SqlValue::Int4(777), SqlValue::Int4(9)]
+        row == [SqlValue::Null, SqlValue::Int4(777), SqlValue::Int4(9)]
     }));
     e.set_relational_residency_budget_bytes(0, 4096);
     let outer_sql =
@@ -926,7 +926,7 @@ fn gpu_streaming_rank_windows_over_ordered_input() {
         .execute_resident_expr_select_sql(text_partition_window_sql)
         .expect("streaming LAG/LEAD with TEXT partition key");
     assert_eq!(
-        &streamed_text_partition_window.rows.row(0)[..],
+        streamed_text_partition_window.rows.row(0),
         &[
             SqlValue::Text("p0".to_string()),
             SqlValue::Int4(0),
@@ -2015,7 +2015,7 @@ fn gpu_streaming_ordered_unbounded_fits_or_defers() {
 /// default byte-identical behavior is gated everywhere.
 #[test]
 fn streaming_reduction_absent_without_budget_uses_host_path() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a) VALUES (1), (2), (3), (4)")
         .unwrap();
