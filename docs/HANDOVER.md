@@ -14,7 +14,7 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `STATUS.md`, not here.
 - Documentation was consolidated on 2026-07-12. Historical plans, handovers, proposals, reviews, and research
   logs are under `docs/archive/` and are never actionable.
-- Source-size governance is now explicit in `CODE_SIZE.md`; the full 29-file baseline and ordered disposition
+- Source-size governance is now explicit in `CODE_SIZE.md`; the corrected 30-file baseline and ordered disposition
   method are owned by **STRUCT-001**.
 - Device write/visible-locate now has typed same-context owners, exact extents, device slot bounds, bounded
   fail-closed errors, and launched-error drains. Its physical cross-context partition/merge gate is
@@ -58,13 +58,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FP is closed: the bounded `derived_column.rs` owns device-derived grouping views/buffers and nine
   launchers; stable APIs, the 15/10 GPU matrix, full/static gates, and audit pass. Audit promoted inherited raw/
   unchecked safe-API device access as STRUCT-001FQ; generic `upload_u64_device` needs no hardening.
+- STRUCT-001FQ is closed: expression, derived-column, and grouped safe APIs validate typed terminals, aligned
+  windows, same-context ownership, exact wide-key/validity/permutation geometry, and device text spans before byte
+  reads. The 24/16 final GPU matrix, both full-suite modes, static/policy gates, canonical report card, and
+  independent audit pass. Its audit found the previously untracked 9,745-line expression PTX hub and promoted
+  **STRUCT-001FR** first; the PTX-inclusive inventory command now prevents recurrence.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FQ:** make the derived-column API family total with checked VM/source/destination/validity windows,
-   typed same-context wide-key sources/descriptors, and validated fixed/text DISTINCT permutations and text offsets.
+1. **STRUCT-001FR:** produce the disposition packet for `crates/execution/src/expr_proto.ptx`, then decompose it by
+   kernel ownership or register a bounded exception while preserving symbols, ABIs, caching, and GPU behavior.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

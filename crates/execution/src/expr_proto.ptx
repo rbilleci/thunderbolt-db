@@ -3278,8 +3278,10 @@ done_tcmp:
     .param .u64 resident_ptr,
     .param .u64 a_offsets_byte_offset,
     .param .u64 a_bytes_byte_offset,
+    .param .u64 a_text_bytes_limit,
     .param .u64 b_offsets_byte_offset,
     .param .u64 b_bytes_byte_offset,
+    .param .u64 b_text_bytes_limit,
     .param .u32 comparison,
     .param .u64 n,
     .param .u64 out_mask_ptr
@@ -3314,8 +3316,10 @@ done_tcmp:
     .reg .b32 %mask;
     .reg .u64 %aoff_base;
     .reg .u64 %abytes_base;
+    .reg .u64 %abytes_limit;
     .reg .u64 %boff_base;
     .reg .u64 %bbytes_base;
+    .reg .u64 %bbytes_limit;
     .reg .u64 %n;
     .reg .u64 %out;
     .reg .u64 %i;
@@ -3342,12 +3346,14 @@ done_tcmp:
     ld.param.u64 %abytes_base, [resident_ptr];
     ld.param.u64 %addr, [a_bytes_byte_offset];
     add.u64 %abytes_base, %abytes_base, %addr;
+    ld.param.u64 %abytes_limit, [a_text_bytes_limit];
     ld.param.u64 %boff_base, [resident_ptr];
     ld.param.u64 %addr, [b_offsets_byte_offset];
     add.u64 %boff_base, %boff_base, %addr;
     ld.param.u64 %bbytes_base, [resident_ptr];
     ld.param.u64 %addr, [b_bytes_byte_offset];
     add.u64 %bbytes_base, %bbytes_base, %addr;
+    ld.param.u64 %bbytes_limit, [b_text_bytes_limit];
     ld.param.u32 %cmp, [comparison];
     ld.param.u64 %n, [n];
     ld.param.u64 %out, [out_mask_ptr];
@@ -3370,6 +3376,10 @@ loop_tcc:
     ld.global.u32 %w0, [%addr+8];
     ld.global.u32 %w1, [%addr+12];
     mov.b64 %aend, {%w0, %w1};
+    setp.gt.u64 %p, %astart, %aend;
+    @%p bra tcc_store_zero;
+    setp.gt.u64 %p, %aend, %abytes_limit;
+    @%p bra tcc_store_zero;
     sub.u64 %alen, %aend, %astart;
     add.u64 %a_rowbytes, %abytes_base, %astart;
     add.u64 %addr, %boff_base, %o8;
@@ -3379,6 +3389,10 @@ loop_tcc:
     ld.global.u32 %w0, [%addr+8];
     ld.global.u32 %w1, [%addr+12];
     mov.b64 %bend, {%w0, %w1};
+    setp.gt.u64 %p, %bstart, %bend;
+    @%p bra tcc_store_zero;
+    setp.gt.u64 %p, %bend, %bbytes_limit;
+    @%p bra tcc_store_zero;
     sub.u64 %blen, %bend, %bstart;
     add.u64 %b_rowbytes, %bbytes_base, %bstart;
     min.u64 %minlen, %alen, %blen;
@@ -3433,6 +3447,10 @@ tcc_after:
     and.pred %tmp, %cne, %rne;
     or.pred %match, %match, %tmp;
     selp.b32 %mask, 1, 0, %match;
+    bra tcc_store;
+tcc_store_zero:
+    mov.b32 %mask, 0;
+tcc_store:
     mul.lo.u64 %o4, %i, 4;
     add.u64 %addr, %out, %o4;
     st.global.b32 [%addr], %mask;
@@ -5936,6 +5954,83 @@ mark_store:
     add.u64 %i, %i, %stride;
     bra loop_mark_nd;
 done_mark_nd:
+    ret;
+}
+
+// Validate every resident text slice referenced by `indices` before the DISTINCT marker may compare
+// bytes. Host preflight owns the offsets-table/blob allocation windows and absolute-row domain; this
+// device pass owns the actual offset contents. Any reversed or beyond-blob interval sets error[0].
+.visible .entry gpu_db_validate_distinct_text_offsets(
+    .param .u64 resident_base_ptr,
+    .param .u64 text_off,
+    .param .u64 text_bytes_len,
+    .param .u64 indices_ptr,
+    .param .u64 n,
+    .param .u64 error_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %bad;
+    .reg .pred %reversed;
+    .reg .pred %past_end;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %old_error;
+    .reg .u64 %resb;
+    .reg .u64 %offb;
+    .reg .u64 %limit;
+    .reg .u64 %indp;
+    .reg .u64 %n;
+    .reg .u64 %err;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %abs;
+    .reg .u64 %start;
+    .reg .u64 %end;
+
+    ld.param.u64 %resb, [resident_base_ptr];
+    ld.param.u64 %offb, [text_off];
+    add.u64 %offb, %resb, %offb;
+    ld.param.u64 %limit, [text_bytes_len];
+    ld.param.u64 %indp, [indices_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %err, [error_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+vtxt_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra vtxt_done;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %indp, %o;
+    ld.global.u64 %abs, [%addr];
+    mul.lo.u64 %o, %abs, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %start, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %end, {%w0, %w1};
+    setp.gt.u64 %reversed, %start, %end;
+    setp.gt.u64 %past_end, %end, %limit;
+    or.pred %bad, %reversed, %past_end;
+    @%bad atom.global.exch.b32 %old_error, [%err], 1;
+    add.u64 %i, %i, %stride;
+    bra vtxt_loop;
+vtxt_done:
     ret;
 }
 

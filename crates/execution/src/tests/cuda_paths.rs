@@ -2177,7 +2177,7 @@
         let value_off = 12u64;
         let offsets_off = 24u64;
         let bytes_off = offsets_off + 4 * 8;
-        let numeric_off = bytes_off + 3;
+        let numeric_off = (bytes_off + 3).next_multiple_of(4);
         let mut payload = Vec::new();
         for value in [1i32, 1, 2, 10, 20, 30] {
             payload.extend_from_slice(&value.to_le_bytes());
@@ -2186,6 +2186,7 @@
             payload.extend_from_slice(&offset.to_le_bytes());
         }
         payload.extend_from_slice(b"abc");
+        payload.resize(numeric_off as usize, 0);
         for value in [1i128, 2, 3] {
             payload.extend_from_slice(&value.to_le_bytes());
         }
@@ -2211,6 +2212,64 @@
         assert!(resident
             .group_by_i32_count_sum_minmax_from_payload(
                 fixed_oob,
+                &indices,
+                grouped_agg_mask::COUNT,
+            )
+            .is_err());
+
+        let fixed_misaligned = CudaGroupByInput {
+            key: CudaGroupKeySource::Fixed(CudaGroupFixedSource::Resident {
+                byte_offset: 1,
+                width: 4,
+                row_count,
+            }),
+            value: CudaGroupValueSource::Unused { row_count },
+            key_validity_bitmap_offset: None,
+            value_validity_bitmap_offset: None,
+        };
+        assert!(resident
+            .group_by_i32_count_sum_minmax_from_payload(
+                fixed_misaligned,
+                &indices,
+                grouped_agg_mask::COUNT,
+            )
+            .is_err());
+
+        let text_misaligned = CudaGroupByInput {
+            key: CudaGroupKeySource::Text {
+                text: CudaGroupTextSource {
+                    offsets_byte_offset: 4,
+                    bytes_byte_offset: bytes_off,
+                    bytes_len: 3,
+                    row_count,
+                },
+                fixed_component: None,
+            },
+            value: CudaGroupValueSource::Unused { row_count },
+            key_validity_bitmap_offset: None,
+            value_validity_bitmap_offset: None,
+        };
+        assert!(resident
+            .group_by_i32_count_sum_minmax_from_payload(
+                text_misaligned,
+                &indices,
+                grouped_agg_mask::COUNT,
+            )
+            .is_err());
+
+        let bitmap_misaligned = CudaGroupByInput {
+            key: CudaGroupKeySource::Fixed(CudaGroupFixedSource::Resident {
+                byte_offset: key_off,
+                width: 4,
+                row_count,
+            }),
+            value: CudaGroupValueSource::Unused { row_count },
+            key_validity_bitmap_offset: Some(1),
+            value_validity_bitmap_offset: None,
+        };
+        assert!(resident
+            .group_by_i32_count_sum_minmax_from_payload(
+                bitmap_misaligned,
                 &indices,
                 grouped_agg_mask::COUNT,
             )
@@ -2329,6 +2388,163 @@
         groups.sort_unstable_by_key(|group| group.key);
         assert_eq!((groups[0].key, groups[0].count, groups[0].sum), (1, 2, 30));
         assert_eq!((groups[1].key, groups[1].count, groups[1].sum), (2, 1, 30));
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_derived_column_inputs_fail_closed_then_reuse_context() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let n = 3u64;
+        let fixed_off = 0u64;
+        let offsets_off = 16u64;
+        let bytes_off = offsets_off + 4 * 8;
+        let mut payload = Vec::new();
+        for value in [1i32, 2, 3] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload.resize(offsets_off as usize, 0);
+        // Rows 1 and 2 are malformed despite the offsets table itself being allocation-bounded:
+        // row 1 ends beyond bytes_len and row 2 is reversed. Device validation must reject these
+        // before the marker's byte loop can dereference either interval.
+        for offset in [0u64, 2, 9, 6] {
+            payload.extend_from_slice(&offset.to_le_bytes());
+        }
+        payload.extend_from_slice(b"abcdef");
+        let resident = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_chunks(
+                    0,
+                    payload.len() as u64,
+                    &[CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &payload,
+                    }],
+                )
+                .expect("derived safety payload"),
+        );
+
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter_with_text(
+                    &[ExprStep::TextCmpColumnsMask {
+                        a_offsets_byte_offset: offsets_off,
+                        a_bytes_byte_offset: bytes_off,
+                        a_bytes_len: 6,
+                        b_offsets_byte_offset: offsets_off,
+                        b_bytes_byte_offset: bytes_off,
+                        b_bytes_len: 6,
+                        cmp: 0,
+                    }],
+                    &[],
+                    n,
+                    ResidentElemType::I32,
+                )
+                .expect("malformed text intervals must return false without poisoning CUDA"),
+            vec![0],
+        );
+
+        assert!(resident
+            .arith_value_column_device(
+                &[ExprStep::LoadColumn {
+                    byte_offset: payload.len() as u64 - 1,
+                }],
+                n,
+                ResidentElemType::I32,
+            )
+            .is_err());
+        assert!(resident
+            .arith_value_column_device(
+                &[ExprStep::LoadColumn { byte_offset: 1 }],
+                n,
+                ResidentElemType::I32,
+            )
+            .is_err());
+        assert!(resident.bool_to_int4_column_device(1, n).is_err());
+        assert!(resident
+            .bool_to_int4_column_device(payload.len() as u64, n)
+            .is_err());
+        assert!(resident.pack_two_int4_cols_device(1, fixed_off, n).is_err());
+        assert!(resident
+            .pack_two_int4_cols_device(fixed_off, payload.len() as u64 - 1, n)
+            .is_err());
+        assert!(resident
+            .pack_two_cols_i128_device(1, 4, fixed_off, 4, n)
+            .is_err());
+        assert!(resident.widen_col_to_i64_device(1, 4, n).is_err());
+
+        let wide = [CudaWideKeyDescriptor {
+            source: CudaWideKeySource::ResidentI32 {
+                byte_offset: fixed_off,
+            },
+            destination_byte_offset: 0,
+        }];
+        assert!(resident
+            .build_wide_key_device(
+                &wide,
+                16,
+                n,
+                &[CudaWideKeyValidity::NonNullable, CudaWideKeyValidity::NonNullable],
+            )
+            .is_err());
+        let overlap = [wide[0], wide[0]];
+        assert!(resident
+            .build_wide_key_device(&overlap, 16, n, &[])
+            .is_err());
+        let fixed_keys = [1i64, 10, 1, 10, 2, 20];
+        assert!(resident
+            .mark_new_distinct_device(&fixed_keys, &[0, 0, 2], n, 2)
+            .is_err());
+
+        let text = CudaGroupTextSource {
+            offsets_byte_offset: offsets_off,
+            bytes_byte_offset: bytes_off,
+            bytes_len: 6,
+            row_count: n,
+        };
+        let perm = [0u32, 1, 2];
+        let indices = [0u64, 1, 2];
+        let groups = [1i64, 1, 2];
+        assert!(resident
+            .mark_new_distinct_text_device(&[0, 0, 2], &indices, &groups, text, n)
+            .is_err());
+        assert!(resident
+            .mark_new_distinct_text_device(&perm, &[0, 1, 3], &groups, text, n)
+            .is_err());
+        assert!(resident
+            .mark_new_distinct_text_device(&perm, &indices, &groups, text, n)
+            .is_err(), "device offsets outside the declared blob must fail closed");
+
+        const THREADS: usize = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let resident = std::sync::Arc::clone(&resident);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                resident
+                    .set_current_context()
+                    .expect("bind primary context on validator thread");
+                barrier.wait();
+                for _ in 0..8 {
+                    assert!(resident
+                        .mark_new_distinct_text_device(&perm, &indices, &groups, text, n)
+                        .is_err());
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("concurrent validator thread");
+        }
+
+        let (_group, _new_distinct) = resident
+            .mark_new_distinct_device(&fixed_keys, &perm, n, 2)
+            .expect("valid derived launch after host/device rejects");
+        assert_eq!(
+            resident
+                .count_i32_equal_from_payload(fixed_off, n, 2, None)
+                .expect("context remains reusable"),
+            1
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::os::raw::c_void;
 
 use super::{
     CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, ExprStep,
-    PooledDeviceBufferOwned, Probe, ResidentElemType, check_cuda,
+    ExprTerminal, PooledDeviceBufferOwned, Probe, ResidentElemType, check_cuda,
     launch_cuda_resident_i32_compare_ordered_core, run_resident_arith_program,
 };
 
@@ -128,7 +128,8 @@ fn launch_cuda_resident_expr_predicate_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let mut stack = run_resident_arith_program(resident, program, text_needles, n, elem)?;
+    let mut stack =
+        run_resident_arith_program(resident, program, text_needles, n, elem, ExprTerminal::Mask)?;
     let mask = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -153,7 +154,14 @@ fn launch_cuda_resident_expr_predicate_mask(
             row_count: 0,
         });
     }
-    let mut stack = run_resident_arith_program(resident, program, text_needles, n64, elem)?;
+    let mut stack = run_resident_arith_program(
+        resident,
+        program,
+        text_needles,
+        n64,
+        elem,
+        ExprTerminal::Mask,
+    )?;
     let mask = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;

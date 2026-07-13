@@ -1,6 +1,6 @@
 use std::os::raw::c_void;
 
-use super::resident_window::validate_text_windows;
+use super::resident_window::{validate_aligned_window, validate_text_windows, validate_window};
 use super::{
     CudaResidentDeviceMemory, CudaRuntimeProbeError, PooledBufferLease, check_cuda,
     launch_on_pooled_stream,
@@ -22,10 +22,8 @@ pub enum ExprStep {
     /// (`CompareScalarI64`) in ONE program: masks are width-agnostic, only the value buffers differ. An
     /// all-i32 / all-i64 program never emits this step, so those programs are byte-identical.
     ///
-    /// **CALLER CONTRACT (audit follow-up):** in a NON-I64 run, a `CompareScalarI64` MUST consume a buffer
-    /// produced by a preceding `LoadColumnI64` (its 8-byte operand) — the i64 compare kernel reads 8 bytes
-    /// per element, so pairing it with a 4-byte `LoadColumn` buffer is an out-of-bounds DEVICE read. The
-    /// program builder is responsible for this pairing (the VM does not structurally enforce it).
+    /// Typed preflight requires `CompareScalarI64` to consume exactly this I64 value kind, including
+    /// in a mixed-width run, before any CUDA setup or launch occurs.
     LoadColumnI64 { byte_offset: u64 },
     /// Pop b, pop a, push `a <op> b` (buffer x buffer).
     BufferBinary { op: u32 },
@@ -43,8 +41,9 @@ pub enum ExprStep {
         scalar_on_left: bool,
     },
     /// Like `CompareScalar` but with a full-width i64 scalar — for an i64 literal that exceeds `i32`
-    /// (a timestamp's microseconds, or a large int8 literal). ONLY valid in an I64 program (it launches
-    /// the i64 compare-scalar-to-mask kernel, which reads an s64 scalar). The dispatch errors otherwise.
+    /// (a timestamp's microseconds, or a large int8 literal). Valid after an I64 value in an all-I64
+    /// program or after `LoadColumnI64` in a mixed-width program; typed preflight rejects every other
+    /// pairing before launch.
     CompareScalarI64 {
         cmp: u32,
         scalar: i64,
@@ -110,8 +109,10 @@ pub enum ExprStep {
     TextCmpColumnsMask {
         a_offsets_byte_offset: u64,
         a_bytes_byte_offset: u64,
+        a_bytes_len: u64,
         b_offsets_byte_offset: u64,
         b_bytes_byte_offset: u64,
+        b_bytes_len: u64,
         cmp: u32,
     },
     /// Push the mask `(uuid_a[i] <cmp> uuid_b[i]) ? 1 : 0` for TWO resident UUID columns (16 raw
@@ -176,12 +177,272 @@ impl ResidentElemType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreflightValue {
+    Value(ResidentElemType),
+    Mask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExprTerminal {
+    Value,
+    Mask,
+    TwoValues,
+}
+
+fn invalid_step(step: usize) -> CudaRuntimeProbeError {
+    CudaRuntimeProbeError::InvalidInputLength(step)
+}
+
+fn pop_value(
+    stack: &mut Vec<PreflightValue>,
+    expected: ResidentElemType,
+    step: usize,
+) -> Result<(), CudaRuntimeProbeError> {
+    if stack.pop() != Some(PreflightValue::Value(expected)) {
+        return Err(invalid_step(step));
+    }
+    Ok(())
+}
+
+fn pop_mask(stack: &mut Vec<PreflightValue>, step: usize) -> Result<(), CudaRuntimeProbeError> {
+    if stack.pop() != Some(PreflightValue::Mask) {
+        return Err(invalid_step(step));
+    }
+    Ok(())
+}
+
+fn validate_resident_arith_program(
+    resident_bytes: u64,
+    program: &[ExprStep],
+    text_needles: &[Vec<u8>],
+    n: u64,
+    elem: ResidentElemType,
+    terminal: ExprTerminal,
+) -> Result<(), CudaRuntimeProbeError> {
+    let mut stack = Vec::with_capacity(program.len());
+    let bitmap_words = n
+        .checked_add(31)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?
+        / 32;
+    for (step_index, step) in program.iter().copied().enumerate() {
+        match step {
+            ExprStep::LoadColumn { byte_offset } => {
+                validate_aligned_window(
+                    resident_bytes,
+                    byte_offset,
+                    n,
+                    elem.elem_size() as u64,
+                    4,
+                )?;
+                stack.push(PreflightValue::Value(elem));
+            }
+            ExprStep::LoadColumnI64 { byte_offset } => {
+                validate_aligned_window(resident_bytes, byte_offset, n, 8, 4)?;
+                stack.push(PreflightValue::Value(ResidentElemType::I64));
+            }
+            ExprStep::BufferBinary { op } => {
+                if op > 2 {
+                    return Err(invalid_step(step_index));
+                }
+                pop_value(&mut stack, elem, step_index)?;
+                pop_value(&mut stack, elem, step_index)?;
+                stack.push(PreflightValue::Value(elem));
+            }
+            ExprStep::ScalarBinary { op, .. } => {
+                if op > 2 {
+                    return Err(invalid_step(step_index));
+                }
+                pop_value(&mut stack, elem, step_index)?;
+                stack.push(PreflightValue::Value(elem));
+            }
+            ExprStep::CompareScalar { cmp, .. } => {
+                if cmp > 5 {
+                    return Err(invalid_step(step_index));
+                }
+                pop_value(&mut stack, elem, step_index)?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::CompareScalarI64 { cmp, .. } => {
+                if cmp > 5 {
+                    return Err(invalid_step(step_index));
+                }
+                pop_value(&mut stack, ResidentElemType::I64, step_index)?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::CompareScalarI128 { cmp, .. } => {
+                if cmp > 5 || elem != ResidentElemType::I128 {
+                    return Err(invalid_step(step_index));
+                }
+                pop_value(&mut stack, ResidentElemType::I128, step_index)?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::CompareBuffers { cmp } => {
+                if cmp > 5 {
+                    return Err(invalid_step(step_index));
+                }
+                pop_value(&mut stack, elem, step_index)?;
+                pop_value(&mut stack, elem, step_index)?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::MaskBinary { op } => {
+                if op > 1 {
+                    return Err(invalid_step(step_index));
+                }
+                pop_mask(&mut stack, step_index)?;
+                pop_mask(&mut stack, step_index)?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::TextEqMask {
+                offsets_byte_offset,
+                bytes_byte_offset,
+                bytes_len,
+                needle_idx,
+                ..
+            } => {
+                validate_text_windows(
+                    resident_bytes,
+                    offsets_byte_offset,
+                    bytes_byte_offset,
+                    bytes_len,
+                    n,
+                )?;
+                text_needles
+                    .get(needle_idx as usize)
+                    .ok_or(invalid_step(step_index))?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::TextCmpMask {
+                offsets_byte_offset,
+                bytes_byte_offset,
+                bytes_len,
+                needle_idx,
+                cmp,
+                ..
+            } => {
+                if cmp > 5 {
+                    return Err(invalid_step(step_index));
+                }
+                validate_text_windows(
+                    resident_bytes,
+                    offsets_byte_offset,
+                    bytes_byte_offset,
+                    bytes_len,
+                    n,
+                )?;
+                text_needles
+                    .get(needle_idx as usize)
+                    .ok_or(invalid_step(step_index))?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::UuidCmpMask {
+                byte_offset,
+                needle_idx,
+                cmp,
+                ..
+            } => {
+                if cmp > 5 {
+                    return Err(invalid_step(step_index));
+                }
+                validate_window(resident_bytes, byte_offset, n, 16)?;
+                let needle = text_needles
+                    .get(needle_idx as usize)
+                    .ok_or(invalid_step(step_index))?;
+                if needle.len() != 16 {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(needle.len()));
+                }
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::TextCmpColumnsMask {
+                a_offsets_byte_offset,
+                a_bytes_byte_offset,
+                a_bytes_len,
+                b_offsets_byte_offset,
+                b_bytes_byte_offset,
+                b_bytes_len,
+                cmp,
+            } => {
+                if cmp > 5 {
+                    return Err(invalid_step(step_index));
+                }
+                validate_text_windows(
+                    resident_bytes,
+                    a_offsets_byte_offset,
+                    a_bytes_byte_offset,
+                    a_bytes_len,
+                    n,
+                )?;
+                validate_text_windows(
+                    resident_bytes,
+                    b_offsets_byte_offset,
+                    b_bytes_byte_offset,
+                    b_bytes_len,
+                    n,
+                )?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::UuidCmpColumnsMask {
+                a_byte_offset,
+                b_byte_offset,
+                cmp,
+            } => {
+                if cmp > 5 {
+                    return Err(invalid_step(step_index));
+                }
+                validate_window(resident_bytes, a_byte_offset, n, 16)?;
+                validate_window(resident_bytes, b_byte_offset, n, 16)?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::TextLikeMask {
+                offsets_byte_offset,
+                bytes_byte_offset,
+                bytes_len,
+                pattern_idx,
+            } => {
+                validate_text_windows(
+                    resident_bytes,
+                    offsets_byte_offset,
+                    bytes_byte_offset,
+                    bytes_len,
+                    n,
+                )?;
+                let pattern = text_needles
+                    .get(pattern_idx as usize)
+                    .ok_or(invalid_step(step_index))?;
+                if pattern.len() % std::mem::size_of::<u32>() != 0 {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(pattern.len()));
+                }
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::BoolMask {
+                bitmap_byte_offset, ..
+            } => {
+                validate_aligned_window(resident_bytes, bitmap_byte_offset, bitmap_words, 4, 4)?;
+                stack.push(PreflightValue::Mask);
+            }
+            ExprStep::ConstMask { .. } => stack.push(PreflightValue::Mask),
+        }
+    }
+    let terminal_is_valid = match terminal {
+        ExprTerminal::Value => stack.as_slice() == [PreflightValue::Value(elem)],
+        ExprTerminal::Mask => stack.as_slice() == [PreflightValue::Mask],
+        ExprTerminal::TwoValues => {
+            stack.as_slice() == [PreflightValue::Value(elem), PreflightValue::Value(elem)]
+        }
+    };
+    if !terminal_is_valid {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    Ok(())
+}
+
 pub(super) fn run_resident_arith_program<'r>(
     resident: &'r CudaResidentDeviceMemory,
     program: &[ExprStep],
     text_needles: &[Vec<u8>],
     n: u64,
     elem: ResidentElemType,
+    terminal: ExprTerminal,
 ) -> Result<Vec<PooledBufferLease<'r>>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -200,6 +461,15 @@ pub(super) fn run_resident_arith_program<'r>(
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     type CuMemsetD32Async = unsafe extern "C" fn(u64, u32, usize, *mut c_void) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    validate_resident_arith_program(
+        resident.metadata().allocated_bytes,
+        program,
+        text_needles,
+        n,
+        elem,
+        terminal,
+    )?;
 
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let byte_len = n_usize
@@ -899,34 +1169,40 @@ pub(super) fn run_resident_arith_program<'r>(
             ExprStep::TextCmpColumnsMask {
                 a_offsets_byte_offset,
                 a_bytes_byte_offset,
+                a_bytes_len,
                 b_offsets_byte_offset,
                 b_bytes_byte_offset,
+                b_bytes_len,
                 cmp,
             } => {
                 // text_a[i] <cmp> text_b[i] (per-row lexicographic unsigned byte memcmp, shorter
                 // sorts first) -> i32 mask pushed on the stack. ABI mirrors the kernel param
-                // order EXACTLY: (resident_ptr, a_offsets, a_bytes, b_offsets, b_bytes,
-                // comparison, n, out_mask_ptr).
+                // order EXACTLY: (resident_ptr, a_offsets, a_bytes, a_bytes_len, b_offsets,
+                // b_bytes, b_bytes_len, comparison, n, out_mask_ptr).
                 let function =
                     text_cmp_columns_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
                 let out = primary.lease_device_buffer(byte_len)?;
                 let mut a0 = resident_base;
                 let mut a1 = a_offsets_byte_offset;
                 let mut a2 = a_bytes_byte_offset;
-                let mut a3 = b_offsets_byte_offset;
-                let mut a4 = b_bytes_byte_offset;
-                let mut a5 = cmp;
-                let mut a6 = n;
-                let mut a7 = out.ptr;
+                let mut a3 = a_bytes_len;
+                let mut a4 = b_offsets_byte_offset;
+                let mut a5 = b_bytes_byte_offset;
+                let mut a6 = b_bytes_len;
+                let mut a7 = cmp;
+                let mut a8 = n;
+                let mut a9 = out.ptr;
                 let mut args = [
                     (&mut a0 as *mut u64).cast::<c_void>(),
                     (&mut a1 as *mut u64).cast::<c_void>(),
                     (&mut a2 as *mut u64).cast::<c_void>(),
                     (&mut a3 as *mut u64).cast::<c_void>(),
                     (&mut a4 as *mut u64).cast::<c_void>(),
-                    (&mut a5 as *mut u32).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
                     (&mut a6 as *mut u64).cast::<c_void>(),
-                    (&mut a7 as *mut u64).cast::<c_void>(),
+                    (&mut a7 as *mut u32).cast::<c_void>(),
+                    (&mut a8 as *mut u64).cast::<c_void>(),
+                    (&mut a9 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
                 stack.push(out);
@@ -1080,3 +1356,6 @@ pub(super) fn run_resident_arith_program<'r>(
 
     Ok(stack)
 }
+
+#[cfg(test)]
+mod tests;

@@ -62,8 +62,9 @@ use resident_count::{
     launch_cuda_resident_i32_compare_count_serial, launch_cuda_resident_i32_equal_count_serial,
 };
 mod resident_window;
+pub use resident_window::CudaGroupTextSource;
 mod expression_vm;
-use expression_vm::run_resident_arith_program;
+use expression_vm::{ExprTerminal, run_resident_arith_program};
 pub use expression_vm::{ExprStep, ResidentElemType};
 mod derived_column;
 use derived_column::{
@@ -73,7 +74,10 @@ use derived_column::{
     launch_cuda_pack_two_int4_cols_device, launch_cuda_upload_u64_device,
     launch_cuda_widen_col_to_i64_device,
 };
-pub use derived_column::{CudaGroupDeviceView, DeviceArithBuffer};
+pub use derived_column::{
+    CudaGroupDeviceView, CudaWideKeyDescriptor, CudaWideKeySource, CudaWideKeyValidity,
+    DeviceArithBuffer,
+};
 mod predicate_mask;
 use predicate_mask::compact_mask_i32_to_indices;
 pub use predicate_mask::CudaPredicateMaskI32;
@@ -107,7 +111,7 @@ mod group_input;
 use group_input::{ValidatedGroupInput, validate_group_input};
 pub use group_input::{
     CudaGroupByInput, CudaGroupFixedSource, CudaGroupKeySource, CudaGroupTextDescriptorBuffer,
-    CudaGroupTextDescriptors, CudaGroupTextSource, CudaGroupValueSource, CudaGroupWideSource,
+    CudaGroupTextDescriptors, CudaGroupValueSource, CudaGroupWideSource,
 };
 mod join_contract;
 pub use join_contract::{CudaJoinCoordinatesU32, CudaJoinOrderKey, CudaJoinPayloadKey};
@@ -433,9 +437,9 @@ impl CudaResidentDeviceMemory {
 
     /// Like [`Self::arith_value_column_at_indices`] but keeps the arith result RESIDENT: runs the
     /// program over all `n_rows`, returns the device value buffer (+ its pooled lease) instead of
-    /// D2H-gathering. cuCtxSynchronize'd so a LATER kernel launch (the GROUP BY group-key read via
-    /// `key_base_override`) sees valid keys, not a racing/stale buffer. The caller owns the returned
-    /// `DeviceArithBuffer`'s lifetime -- it MUST outlive every launch that reads `device_ptr()`.
+    /// D2H-gathering. cuCtxSynchronize'd so a later GROUP BY launch bound through the buffer's typed
+    /// `group_view()` sees valid keys, not a racing/stale buffer. The returned owner MUST outlive every
+    /// launch that borrows that view.
     /// Checked int4/int8 overflow -> PG error is inherited from the arith VM.
     pub fn arith_value_column_device(
         &self,
@@ -447,11 +451,11 @@ impl CudaResidentDeviceMemory {
     }
 
     /// Materialize a BOOL column (1-bit-per-row bitmap) into a derived int4 (0/1) device column. The
-    /// GROUP BY kernel reads it via `key_base_override` (a bool GROUP BY key) or `value_base_override`
-    /// (MIN/MAX over a bool value) -- grouped/aggregated on the AUDITED int4 path, which avoids a bool
+    /// GROUP BY kernel reads it through a typed derived-key/value source (a bool GROUP BY key or
+    /// MIN/MAX over a bool value) -- grouped/aggregated on the AUDITED int4 path, which avoids a bool
     /// GROUP BY kernel and the shared-state concurrency hazard that blocked it. Reuses
     /// `gpu_db_resident_bool_to_mask` (it already writes int4 0/1). The caller owns the returned buffer;
-    /// it MUST outlive every GROUP BY launch that reads `device_ptr()`.
+    /// it MUST outlive every GROUP BY launch that borrows its `group_view()`.
     pub fn bool_to_int4_column_device(
         &self,
         bitmap_byte_offset: u64,
@@ -462,8 +466,8 @@ impl CudaResidentDeviceMemory {
 
     /// Pack two int4-section columns (at byte offsets `off0`, `off1`) into one i64 derived key per row
     /// (col0 in the high 32 bits, col1 in the low 32 -- bijective) and return it RESIDENT
-    /// (cuCtxSynchronize'd) for a COMPOSITE GROUP BY key via key_base_override. The executor unpacks the
-    /// result slot key back into the two column values.
+    /// (cuCtxSynchronize'd) for a COMPOSITE GROUP BY key through its typed derived view. The executor
+    /// unpacks the result slot key back into the two column values.
     pub fn pack_two_int4_cols_device(
         &self,
         off0: u64,
@@ -477,7 +481,7 @@ impl CudaResidentDeviceMemory {
     /// fixed-width int columns into one i128 derived key per row (col0 = HIGH 64 bits, col1 = LOW 64).
     /// `w0`/`w1` are each member's read width in bytes (4 = int4 section, 8 = int8 section). Returns a
     /// leased [i128; n] device buffer (16 bytes/row) the caller holds alive; the b128 GROUP BY claim
-    /// (key_is_i128 + key_base_override) groups by it. cuCtxSynchronize'd so the GROUP BY launch reads
+    /// receives it through a typed derived-key view. cuCtxSynchronize'd so the GROUP BY launch reads
     /// the completed buffer.
     pub fn pack_two_cols_i128_device(
         &self,
@@ -491,8 +495,8 @@ impl CudaResidentDeviceMemory {
     }
 
     /// Widen a fixed-width int column (`w` = 4 or 8 bytes) to a per-row i64 derived buffer
-    /// (sign-extended). The fixed member of a composite (fixed-width, text) GROUP BY key, passed as
-    /// key_base_override so the text-key claim folds it into the hash + verifies it. cuCtxSynchronize'd.
+    /// (sign-extended). A typed derived-key view supplies the fixed member of a composite
+    /// (fixed-width, text) GROUP BY key. cuCtxSynchronize'd.
     pub fn widen_col_to_i64_device(
         &self,
         off: u64,
@@ -502,34 +506,18 @@ impl CudaResidentDeviceMemory {
         launch_cuda_widen_col_to_i64_device(self, off, w, n_rows)
     }
 
-    /// Build a fixed-width WIDE KEY buffer for a general all-fixed composite GROUP BY key (>2 columns,
-    /// or a numeric/uuid member, or a tuple wider than 128 bits). `descriptors` is one (kind, src_off,
-    /// dst_off) per member (kind: 0=int4-section, 1=int8-section, 2=numeric/uuid 16B); `wbytes` is the
-    /// per-row width (each int member 8 bytes, each numeric/uuid 16). Returns a leased [u8; wbytes*n]
-    /// buffer the caller holds alive + passes as key_base_override with comp_w=wbytes to the GROUP BY
-    /// kernel (which groups via a (rep_idx, hash) b128 claim that memcmps the wbytes). cuCtxSynchronize'd.
-    pub fn build_wide_key_device(
+    /// Build a fixed-width WIDE KEY buffer for a general all-fixed composite GROUP BY key. Typed
+    /// descriptors bind every resident/derived source to its width and CUDA context. Each destination
+    /// is 8-byte aligned, in-bounds, and non-overlapping. A non-empty `validity` slice must contain one
+    /// entry per descriptor (at most 64) and reserves the final u64 of each output row.
+    pub fn build_wide_key_device<'a>(
         &self,
-        descriptors: &[(u64, u64, u64)],
+        descriptors: &[CudaWideKeyDescriptor<'a>],
         wbytes: u64,
         n_rows: u64,
-        // A separate per-row buffer for a DERIVED wide-key member (the expression group key), read by
-        // descriptor kinds 4 (i32) / 5 (i64). 0 when the wide key has only column members.
-        derived_ptr: u64,
-        // M3 (doc 21) per-member NULL validity (nullable composite GROUP BY key). EMPTY = no validity (the
-        // wide key has no trailing validity word; byte-identical to the pre-M3 path). Else one u64 per
-        // member: u64::MAX = a non-nullable member; otherwise the member's validity-bitmap byte offset.
-        // The caller must size `wbytes` to include the trailing 8-byte validity word when this is non-empty.
-        validity_descs: &[u64],
+        validity: &[CudaWideKeyValidity],
     ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
-        launch_cuda_build_wide_key_device(
-            self,
-            descriptors,
-            wbytes,
-            n_rows,
-            derived_ptr,
-            validity_descs,
-        )
+        launch_cuda_build_wide_key_device(self, descriptors, wbytes, n_rows, validity)
     }
 
     /// Upload a small generic u64 array to device. Grouped TEXT descriptors must instead use
@@ -571,7 +559,7 @@ impl CudaResidentDeviceMemory {
     /// returns `(g_sorted, new_distinct)` RESIDENT (cuCtxSynchronize'd) -- `g_sorted[i]` = key0 at
     /// sorted position i, `new_distinct[i]` = 1 at each first-seen tuple else 0. SUM(new_distinct)
     /// grouped by g_sorted (via the GROUP BY kernel's key/value_base_override) = the per-group distinct
-    /// count. Both leases live in the result.
+    /// count. Both typed buffer owners live in the result.
     pub fn mark_new_distinct_device(
         &self,
         keys: &[i64],
@@ -585,23 +573,19 @@ impl CudaResidentDeviceMemory {
     /// COUNT(DISTINCT v) mark pass for a TEXT value (varlen -> cannot pack into i64 keys). `perm` is
     /// the positions 0..n from [`Self::bitonic_sort_hetero`] over the `(g, text_v)` tuple; `indices`
     /// the surviving absolute resident rows (by position); `g_keys` the int group key (by position,
-    /// like the hetero sort's `int_keys`). `text_off`/`text_bytes` are the value column's offsets/bytes
-    /// section byte offsets into the resident payload. Runs `gpu_db_mark_new_distinct_text` and returns
+    /// like the hetero sort's `int_keys`). `text` owns the value column's resident windows, blob
+    /// length, and logical row count. Runs `gpu_db_mark_new_distinct_text` and returns
     /// `(g_sorted, new_distinct)` RESIDENT (cuCtxSynchronize'd). SUM(new_distinct) grouped by g_sorted
-    /// (via the GROUP BY kernel's key/value_base_override) = the per-group distinct count.
-    #[allow(clippy::too_many_arguments)]
+    /// through typed derived-key/value views = the per-group distinct count.
     pub fn mark_new_distinct_text_device(
         &self,
         perm: &[u32],
         indices: &[u64],
         g_keys: &[i64],
-        text_off: u64,
-        text_bytes: u64,
+        text: CudaGroupTextSource,
         n: u64,
     ) -> Result<(DeviceArithBuffer<'_>, DeviceArithBuffer<'_>), CudaRuntimeProbeError> {
-        launch_cuda_mark_new_distinct_text_device(
-            self, perm, indices, g_keys, text_off, text_bytes, n,
-        )
+        launch_cuda_mark_new_distinct_text_device(self, perm, indices, g_keys, text, n)
     }
 
     pub fn count_i32_equal_from_payload(
@@ -3626,7 +3610,14 @@ fn launch_cuda_resident_expr_arith_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let mut stack = run_resident_arith_program(resident, program, &[], n, ResidentElemType::I32)?;
+    let mut stack = run_resident_arith_program(
+        resident,
+        program,
+        &[],
+        n,
+        ResidentElemType::I32,
+        ExprTerminal::Value,
+    )?;
     let value = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -3663,7 +3654,14 @@ fn launch_cuda_arith_value_column_at_indices(
     // VM checks the matching overflow bounds internally -> PG error, no wrap); the value buffer (lease)
     // is the single result + must stay alive through the D2H. Read it at that width, gather at the
     // survivor indices, widen to i64 (the universal sort-key width).
-    let mut stack = run_resident_arith_program(resident, program, &[], n_rows, elem)?;
+    let mut stack = run_resident_arith_program(
+        resident,
+        program,
+        &[],
+        n_rows,
+        elem,
+        ExprTerminal::Value,
+    )?;
     let value = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -3765,8 +3763,14 @@ fn launch_cuda_arith_value_column_at_indices_nullable(
     };
     // The arith VALUE (I32) and the VALIDITY mask (I32, 0/1) -- two independent VM runs over all rows; each
     // top-of-stack buffer is the single result and must stay alive through the blend.
-    let mut value_stack =
-        run_resident_arith_program(resident, program, &[], n_rows, ResidentElemType::I32)?;
+    let mut value_stack = run_resident_arith_program(
+        resident,
+        program,
+        &[],
+        n_rows,
+        ResidentElemType::I32,
+        ExprTerminal::Value,
+    )?;
     let value = value_stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -3779,6 +3783,7 @@ fn launch_cuda_arith_value_column_at_indices_nullable(
         &[],
         n_rows,
         ResidentElemType::I32,
+        ExprTerminal::Mask,
     )?;
     let mask = mask_stack
         .pop()
@@ -3853,7 +3858,14 @@ fn launch_cuda_resident_expr_compare_buffers_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let mut stack = run_resident_arith_program(resident, program, &[], n, ResidentElemType::I32)?;
+    let mut stack = run_resident_arith_program(
+        resident,
+        program,
+        &[],
+        n,
+        ResidentElemType::I32,
+        ExprTerminal::TwoValues,
+    )?;
     let rhs = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;

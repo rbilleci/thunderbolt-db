@@ -1671,12 +1671,30 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   PTX, seven symbols/arguments, layouts, extents, context identity, transfers, synchronization, errors, results, and
   leases are source-equivalent, so the report card was not applicable. Audit promoted inherited safe-API device OOB/
   raw-pointer risk across eight launcher families as STRUCT-001FQ; `upload_u64_device` alone is already total.
+  STRUCT-001FQ then closed that safe-API boundary. Expression preflight now checks aligned resident windows,
+  opcodes, needle contracts, typed stack transitions, and exact Value/Mask/TwoValues terminals before CUDA setup.
+  Two-column text comparisons carry both blob lengths through the engine and PTX; malformed device intervals write
+  false before byte loads. Derived and grouped inputs use checked 4-byte fixed/bitmap alignment and 8-byte text-
+  offset alignment, typed same-context views, exact initialized/source/destination/validity geometry, exact fixed/
+  text DISTINCT permutations, bounded row domains, and a drained device validator for actual text offsets. The
+  public derived buffer exposes only its typed group view; its raw pointer is crate-internal for the gather owner.
+  The rustfmt-clean leaves are `expression_vm.rs` (1,361 lines), `expression_vm/tests.rs` (222),
+  `derived_column.rs` (1,269), `resident_window.rs` (64), `group_input.rs` (636), and `predicate_mask.rs` (393);
+  the execution root is 9,750 lines. The final eight-route safety/arith/bool/composite/distinct/streaming GPU
+  matrix passed 24 sequential plus 16 concurrent invocations without CUDA 700/716/717. Both execution modes pass
+  53/80 and both engine modes pass 505/487; workspace all-target/all-feature check, strict execution/engine clippy,
+  dependency/read-policy/scoped source/format/diff gates, and independent audit are clean. The canonical report
+  card remained stable: IN-L2/OUT-OF-L2 rooflines were 1,482.7/1,446.7 GB/s, count was 0.91x/1.01x roofline,
+  grouped aggregation was 1,678.0 M elements/s, and batch-65,536 point reads were 236.8M at p50 140us IN-L2 and
+  254.8M at p50 128us OUT-OF-L2; the OUT-OF-L2 index route was 3.22x scan. Audit also exposed the omitted,
+  hand-maintained 9,745-line expression PTX dependency hub, now first in PLAN as **STRUCT-001FR**.
 
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
-| 26 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 27 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| The 9,745-line hand-maintained expression PTX hub needs an audited ownership disposition | **STRUCT-001FR** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |

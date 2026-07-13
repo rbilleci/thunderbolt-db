@@ -1,4 +1,5 @@
 use super::derived_column::{CudaGroupDeviceView, DeviceArithBuffer};
+use super::resident_window::{CudaGroupTextSource, validate_aligned_window, validate_text_windows};
 use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError};
 
 #[derive(Debug, Clone, Copy)]
@@ -26,14 +27,6 @@ impl CudaGroupFixedSource<'_> {
             Self::Resident { row_count, .. } | Self::Derived { row_count, .. } => row_count,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct CudaGroupTextSource {
-    pub offsets_byte_offset: u64,
-    pub bytes_byte_offset: u64,
-    pub bytes_len: u64,
-    pub row_count: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,7 +74,9 @@ pub enum CudaGroupKeySource<'a> {
 pub enum CudaGroupValueSource<'a> {
     /// COUNT-only input. The current PTX performs one bounded, ignored int4 placeholder load from
     /// resident offset zero before the aggregate mask suppresses value updates; preflight covers it.
-    Unused { row_count: u64 },
+    Unused {
+        row_count: u64,
+    },
     Fixed(CudaGroupFixedSource<'a>),
     Numeric(CudaGroupFixedSource<'a>),
     Uuid(CudaGroupFixedSource<'a>),
@@ -177,12 +172,7 @@ fn validate_fixed(
     let rows_end = checked_end(0, source.row_count(), width)?;
     match source {
         CudaGroupFixedSource::Resident { byte_offset, .. } => {
-            let end = byte_offset
-                .checked_add(rows_end)
-                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-            if end > resident_bytes {
-                return Err(invalid(end));
-            }
+            validate_aligned_window(resident_bytes, byte_offset, source.row_count(), width, 4)?;
             Ok((byte_offset, 0, width, source.row_count()))
         }
         CudaGroupFixedSource::Derived { buffer, .. } => {
@@ -202,18 +192,13 @@ fn validate_text(
             usize::try_from(max_index).unwrap_or(usize::MAX),
         ));
     }
-    let offsets = source
-        .row_count
-        .checked_add(1)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let offsets_end = checked_end(source.offsets_byte_offset, offsets, 8)?;
-    let bytes_end = source
-        .bytes_byte_offset
-        .checked_add(source.bytes_len)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if offsets_end > resident_bytes || bytes_end > resident_bytes {
-        return Err(invalid(offsets_end.max(bytes_end)));
-    }
+    validate_text_windows(
+        resident_bytes,
+        source.offsets_byte_offset,
+        source.bytes_byte_offset,
+        source.bytes_len,
+        source.row_count,
+    )?;
     Ok(())
 }
 
@@ -229,11 +214,7 @@ fn validate_bitmap(
         .checked_div(32)
         .and_then(|word| word.checked_add(1))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let end = checked_end(offset, words, 4)?;
-    if end > resident_bytes {
-        return Err(invalid(end));
-    }
-    Ok(())
+    validate_aligned_window(resident_bytes, offset, words, 4, 4)
 }
 
 pub(super) fn validate_group_input(
@@ -418,10 +399,10 @@ fn validate_group_input_parts(
 #[cfg(test)]
 mod tests {
     use super::{
+        CudaGroupByInput, CudaGroupDeviceView, CudaGroupFixedSource, CudaGroupKeySource,
+        CudaGroupTextDescriptors, CudaGroupTextSource, CudaGroupValueSource, CudaGroupWideSource,
         checked_end, validate_bitmap, validate_fixed, validate_group_input_parts, validate_text,
-        validate_view, CudaGroupByInput, CudaGroupDeviceView, CudaGroupFixedSource,
-        CudaGroupKeySource, CudaGroupTextDescriptors, CudaGroupTextSource, CudaGroupValueSource,
-        CudaGroupWideSource,
+        validate_view,
     };
 
     #[test]
@@ -435,6 +416,7 @@ mod tests {
     fn grouped_bitmap_extent_is_max_index_bounded() {
         validate_bitmap(12, Some(4), 32).unwrap();
         assert!(validate_bitmap(11, Some(4), 32).is_err());
+        assert!(validate_bitmap(12, Some(1), 32).is_err());
         validate_bitmap(0, None, u64::MAX).unwrap();
     }
 
@@ -452,28 +434,45 @@ mod tests {
             3,
         )
         .unwrap();
-        assert!(validate_fixed(
-            0,
-            7,
-            CudaGroupFixedSource::Derived {
-                buffer: view,
-                width: 8,
-                row_count: 5,
-            },
-            4,
-        )
-        .is_err());
-        assert!(validate_fixed(
-            64,
-            7,
-            CudaGroupFixedSource::Resident {
-                byte_offset: 60,
-                width: 4,
-                row_count: 2,
-            },
-            1,
-        )
-        .is_err());
+        assert!(
+            validate_fixed(
+                0,
+                7,
+                CudaGroupFixedSource::Derived {
+                    buffer: view,
+                    width: 8,
+                    row_count: 5,
+                },
+                4,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_fixed(
+                64,
+                7,
+                CudaGroupFixedSource::Resident {
+                    byte_offset: 60,
+                    width: 4,
+                    row_count: 2,
+                },
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_fixed(
+                64,
+                7,
+                CudaGroupFixedSource::Resident {
+                    byte_offset: 1,
+                    width: 4,
+                    row_count: 2,
+                },
+                1,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -495,6 +494,19 @@ mod tests {
         validate_text(32, source, 1).unwrap();
         assert!(validate_text(31, source, 1).is_err());
         assert!(validate_text(32, source, 2).is_err());
+        assert!(
+            validate_text(
+                40,
+                CudaGroupTextSource {
+                    offsets_byte_offset: 4,
+                    bytes_byte_offset: 28,
+                    bytes_len: 8,
+                    row_count: 2,
+                },
+                1,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -574,40 +586,46 @@ mod tests {
         )
         .unwrap();
 
-        assert!(validate_group_input_parts(
-            80,
-            7,
-            input(
-                CudaGroupKeySource::Composite {
-                    fixed: None,
-                    text: None,
-                    row_count: 2,
-                },
-                CudaGroupValueSource::Unused { row_count: 2 },
-            ),
-            &[1],
-        )
-        .is_err());
-        assert!(validate_group_input_parts(
-            80,
-            7,
-            input(
-                CudaGroupKeySource::Fixed(fixed4),
-                CudaGroupValueSource::Fixed(fixed16),
-            ),
-            &[1],
-        )
-        .is_err());
-        assert!(validate_group_input_parts(
-            80,
-            7,
-            input(
-                CudaGroupKeySource::Fixed(fixed4),
-                CudaGroupValueSource::Unused { row_count: 3 },
-            ),
-            &[1],
-        )
-        .is_err());
+        assert!(
+            validate_group_input_parts(
+                80,
+                7,
+                input(
+                    CudaGroupKeySource::Composite {
+                        fixed: None,
+                        text: None,
+                        row_count: 2,
+                    },
+                    CudaGroupValueSource::Unused { row_count: 2 },
+                ),
+                &[1],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_group_input_parts(
+                80,
+                7,
+                input(
+                    CudaGroupKeySource::Fixed(fixed4),
+                    CudaGroupValueSource::Fixed(fixed16),
+                ),
+                &[1],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_group_input_parts(
+                80,
+                7,
+                input(
+                    CudaGroupKeySource::Fixed(fixed4),
+                    CudaGroupValueSource::Unused { row_count: 3 },
+                ),
+                &[1],
+            )
+            .is_err()
+        );
         let mut nullable_unused = input(
             CudaGroupKeySource::Fixed(fixed4),
             CudaGroupValueSource::Unused { row_count: 2 },
