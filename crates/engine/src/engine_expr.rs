@@ -2246,6 +2246,7 @@ fn compile_text_eq_leaf(
             program.push(ExprStep::TextEqMask {
                 offsets_byte_offset: layout.offsets_byte_offset,
                 bytes_byte_offset: layout.bytes_byte_offset,
+                bytes_len: layout.bytes_len,
                 needle_idx,
                 negate: matches!(op, ResidentBinaryOp::Ne),
             });
@@ -2258,6 +2259,7 @@ fn compile_text_eq_leaf(
             program.push(ExprStep::TextCmpMask {
                 offsets_byte_offset: layout.offsets_byte_offset,
                 bytes_byte_offset: layout.bytes_byte_offset,
+                bytes_len: layout.bytes_len,
                 needle_idx,
                 // The kernel evaluates `scalar <cmp> textcol[i]` when scalar_on_left — i.e. when the
                 // COLUMN is on the RIGHT of the original comparison.
@@ -4524,6 +4526,8 @@ impl Engine {
                 Ok((entry, JoinDeviceMemory::Resident(memory), row_count, None))
             }
             Some(rows) => {
+                let _transient_scope =
+                    gpu_db_execution::Probe::scope("join_transient_side_upload");
                 let (snapshot, memory) = self.build_transient_relation_residency(table, &rows)?;
                 let row_count = rows.len();
                 let entry = RelationalResidencyEntry::new(std::sync::Arc::new(snapshot));
@@ -5057,6 +5061,11 @@ impl Engine {
         if let Some(visibility) = visibility {
             visibility.push_conjuncts(&mut program, predicate.is_some());
         }
+        #[cfg(feature = "probe-timing")]
+        eprintln!(
+            "[probe] predicate_mask table={} rows={} elem={elem:?} steps={program:?} needles={needles:?}",
+            table.name, row_count
+        );
         memory
             .run_expr_predicate_mask_with_text(&program, &needles, row_count, elem)
             .map(Some)
@@ -5894,6 +5903,7 @@ impl Engine {
         let mut pad_masks: Vec<Option<JoinNullPadMask>> =
             (0..sides.len()).map(|_| None).collect();
         for relation in 0..sides.len() {
+            let _mask_scope = gpu_db_execution::Probe::scope("join_input_mask");
             let pushed = (!outer_where)
                 .then_some(predicates[relation].as_ref())
                 .flatten();
@@ -6003,6 +6013,8 @@ impl Engine {
         let context = sides[0].1.mem();
         let mut coordinates: Option<gpu_db_execution::CudaJoinCoordinatesU32> = None;
         for (step_index, conjuncts) in step_keys.iter().enumerate() {
+            let _coordinate_scope =
+                gpu_db_execution::Probe::scope("join_fixed_payload_coordinates");
             let right_relation = step_index + 1;
             let left_keys = conjuncts
                 .iter()
@@ -6206,6 +6218,7 @@ impl Engine {
 
         let mut projected_values: Vec<Vec<SqlValue>> = Vec::with_capacity(projection.len());
         for &(relation, column) in projection {
+            let _projection_scope = gpu_db_execution::Probe::scope("join_projection_column");
             if sides[relation].2 == 0 {
                 projected_values.push(vec![
                     SqlValue::Null;

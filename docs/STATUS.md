@@ -1495,6 +1495,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   are clean. Values→birth/identity stamps→row-count/HWM/zone-map publication, sparse MVCC regions, fused apply,
   tombstone ordering, offsets, launches, counters, and fail-safe paths are source-equivalent, so the report card
   was not applicable. STRUCT-001FA is the next production ownership slice.
+  During STRUCT-001FA validation, `gpu_inner_join_catalog_relations_transient_payload` deterministically failed
+  with CUDA 700 while a known-safe append route remained healthy. A detached worktree at pre-FA HEAD
+  `43134442` reproduced the same CUDA 700, proving the ownership move did not introduce the fault; READ-005 is
+  promoted ahead of FA closure to repair the native GPU catalog-join path without a host fallback. READ-005 is
+  now closed: the compound predicate VM's `TextEqMask` and `TextCmpMask` launchers had retained the old CUDA ABI
+  after the kernels gained a bounded `text_bytes_limit`, shifting the needle and every later parameter and
+  causing the illegal access. Both bytecodes now carry descriptor `bytes_len`, validate offsets/blob windows
+  before launch, and pass the exact bounded-text ABI; no catalog, join, or host relational fallback was added.
+  A focused 4-mod-8 tiny-payload GPU regression proves equality, ordering, and pre-launch OOB rejection. The
+  catalog target passed three sequential and two concurrent runs with zero CUDA 700/716/717; adjacent per-side
+  WHERE, NULL-key 3VL, text-key, and catalog-metadata join gates passed. Both 992-test engine modes passed
+  505/487, workspace all-target check and strict execution/engine clippy are clean, and independent audit found
+  no issue. The direct roofline remained at baseline ratios (in-L2 `equal_any` 0.43, count compare 0.90, between
+  0.45, ordered project 0.12; sort/join/grouped 349/257/1678 M-elem/s). The canonical two-layer/two-regime card
+  also completed: raw out-of-L2 roofline 1,441 GB/s; point-read lpb-index p50/throughput at batch 32 was
+  20us/1.52M lookups/s in both regimes, and batch 65,536 was 1,625us/37.18M in-L2 versus 1,570us/38.60M
+  out-of-L2. STRUCT-001FA resumes as the first open task.
 
 ## Known boundaries
 

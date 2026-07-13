@@ -8326,6 +8326,7 @@ pub enum ExprStep {
     TextEqMask {
         offsets_byte_offset: u64,
         bytes_byte_offset: u64,
+        bytes_len: u64,
         needle_idx: u32,
         negate: bool,
     },
@@ -8340,6 +8341,7 @@ pub enum ExprStep {
     TextCmpMask {
         offsets_byte_offset: u64,
         bytes_byte_offset: u64,
+        bytes_len: u64,
         needle_idx: u32,
         scalar_on_left: bool,
         cmp: u32,
@@ -9075,6 +9077,7 @@ fn run_resident_arith_program<'r>(
             ExprStep::TextEqMask {
                 offsets_byte_offset,
                 bytes_byte_offset,
+                bytes_len,
                 needle_idx,
                 negate,
             } => {
@@ -9086,6 +9089,13 @@ fn run_resident_arith_program<'r>(
                 )?;
                 let function =
                     text_eq_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let text_bytes_limit = resident_filter::validate_text_windows(
+                    resident.metadata().allocated_bytes,
+                    offsets_byte_offset,
+                    bytes_byte_offset,
+                    bytes_len,
+                    n,
+                )?;
                 let needle_lease = primary.lease_device_buffer(needle.len().max(1))?;
                 if !needle.is_empty() {
                     check_cuda(unsafe {
@@ -9100,20 +9110,22 @@ fn run_resident_arith_program<'r>(
                 let mut a0 = resident_base;
                 let mut a1 = offsets_byte_offset;
                 let mut a2 = bytes_byte_offset;
-                let mut a3 = needle_lease.ptr;
-                let mut a4 = needle.len() as u64;
-                let mut a5 = u32::from(negate);
-                let mut a6 = n;
-                let mut a7 = out.ptr;
+                let mut a3 = text_bytes_limit;
+                let mut a4 = needle_lease.ptr;
+                let mut a5 = needle.len() as u64;
+                let mut a6 = u32::from(negate);
+                let mut a7 = n;
+                let mut a8 = out.ptr;
                 let mut args = [
                     (&mut a0 as *mut u64).cast::<c_void>(),
                     (&mut a1 as *mut u64).cast::<c_void>(),
                     (&mut a2 as *mut u64).cast::<c_void>(),
                     (&mut a3 as *mut u64).cast::<c_void>(),
                     (&mut a4 as *mut u64).cast::<c_void>(),
-                    (&mut a5 as *mut u32).cast::<c_void>(),
-                    (&mut a6 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
+                    (&mut a6 as *mut u32).cast::<c_void>(),
                     (&mut a7 as *mut u64).cast::<c_void>(),
+                    (&mut a8 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
                 stack.push(out);
@@ -9121,6 +9133,7 @@ fn run_resident_arith_program<'r>(
             ExprStep::TextCmpMask {
                 offsets_byte_offset,
                 bytes_byte_offset,
+                bytes_len,
                 needle_idx,
                 scalar_on_left,
                 cmp,
@@ -9133,6 +9146,13 @@ fn run_resident_arith_program<'r>(
                 )?;
                 let function =
                     text_cmp_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let text_bytes_limit = resident_filter::validate_text_windows(
+                    resident.metadata().allocated_bytes,
+                    offsets_byte_offset,
+                    bytes_byte_offset,
+                    bytes_len,
+                    n,
+                )?;
                 let needle_lease = primary.lease_device_buffer(needle.len().max(1))?;
                 if !needle.is_empty() {
                     check_cuda(unsafe {
@@ -9147,22 +9167,24 @@ fn run_resident_arith_program<'r>(
                 let mut a0 = resident_base;
                 let mut a1 = offsets_byte_offset;
                 let mut a2 = bytes_byte_offset;
-                let mut a3 = needle_lease.ptr;
-                let mut a4 = needle.len() as u64;
-                let mut a5 = u32::from(scalar_on_left);
-                let mut a6 = cmp;
-                let mut a7 = n;
-                let mut a8 = out.ptr;
+                let mut a3 = text_bytes_limit;
+                let mut a4 = needle_lease.ptr;
+                let mut a5 = needle.len() as u64;
+                let mut a6 = u32::from(scalar_on_left);
+                let mut a7 = cmp;
+                let mut a8 = n;
+                let mut a9 = out.ptr;
                 let mut args = [
                     (&mut a0 as *mut u64).cast::<c_void>(),
                     (&mut a1 as *mut u64).cast::<c_void>(),
                     (&mut a2 as *mut u64).cast::<c_void>(),
                     (&mut a3 as *mut u64).cast::<c_void>(),
                     (&mut a4 as *mut u64).cast::<c_void>(),
-                    (&mut a5 as *mut u32).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
                     (&mut a6 as *mut u32).cast::<c_void>(),
-                    (&mut a7 as *mut u64).cast::<c_void>(),
+                    (&mut a7 as *mut u32).cast::<c_void>(),
                     (&mut a8 as *mut u64).cast::<c_void>(),
+                    (&mut a9 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
                 stack.push(out);

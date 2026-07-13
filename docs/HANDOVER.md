@@ -88,8 +88,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FA:** isolate commit auto-admit, transient relation construction, and benchmark residency
-   installation behind unchanged inherent `Engine` APIs.
+1. **STRUCT-001FA:** finish auditing and closing the already-extracted commit auto-admit, transient relation,
+   and benchmark residency installation owner; READ-005 has repaired and gated the baseline catalog-join fault.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

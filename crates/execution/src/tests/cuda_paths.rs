@@ -1524,6 +1524,103 @@
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_text_predicate_vm_scalar_abi_matches_rows() {
+        // The compound-predicate VM must pass the exact bounded-text ABI used by the standalone
+        // equality and ordering launchers. Keep the offsets deliberately 4-mod-8 aligned and the
+        // payload tiny: transient catalog joins exercise precisely this shape.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let rows = ["r", "v", "r", ""];
+        let n = rows.len() as u64;
+        let offsets_off = 12_u64;
+        let bytes_off = offsets_off + (n + 1) * std::mem::size_of::<u64>() as u64;
+        let mut header = Vec::new();
+        header.extend_from_slice(&n.to_le_bytes());
+        let mut offsets = Vec::new();
+        let mut blob = Vec::new();
+        offsets.extend_from_slice(&0_u64.to_le_bytes());
+        for row in rows {
+            blob.extend_from_slice(row.as_bytes());
+            offsets.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        }
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                bytes_off + blob.len() as u64,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: offsets_off,
+                        bytes: &offsets,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: bytes_off,
+                        bytes: &blob,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        let text = |needle: &[u8], step| {
+            resident
+                .run_expr_predicate_filter_with_text(
+                    &[step],
+                    &[needle.to_vec()],
+                    n,
+                    ResidentElemType::I32,
+                )
+                .expect("bounded text predicate VM")
+        };
+        assert_eq!(
+            text(
+                b"r",
+                ExprStep::TextEqMask {
+                    offsets_byte_offset: offsets_off,
+                    bytes_byte_offset: bytes_off,
+                    bytes_len: blob.len() as u64,
+                    needle_idx: 0,
+                    negate: false,
+                },
+            ),
+            vec![0, 2]
+        );
+        assert_eq!(
+            text(
+                b"r",
+                ExprStep::TextCmpMask {
+                    offsets_byte_offset: offsets_off,
+                    bytes_byte_offset: bytes_off,
+                    bytes_len: blob.len() as u64,
+                    needle_idx: 0,
+                    scalar_on_left: false,
+                    cmp: 3,
+                },
+            ),
+            vec![1]
+        );
+        assert!(
+            resident
+                .run_expr_predicate_filter_with_text(
+                    &[ExprStep::TextEqMask {
+                        offsets_byte_offset: offsets_off,
+                        bytes_byte_offset: bytes_off,
+                        bytes_len: blob.len() as u64 + 1,
+                        needle_idx: 0,
+                        negate: false,
+                    }],
+                    &[b"r".to_vec()],
+                    n,
+                    ResidentElemType::I32,
+                )
+                .is_err(),
+            "the VM equality path must reject an out-of-bounds text blob before launch"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_resident_expr_compare_buffers_filter_evaluates_col_vs_col_on_gpu() {
         // Col-vs-col / expr-vs-expr comparisons: the comparison RHS is an arbitrary expression buffer,
         // not just a literal. GPU-NATIVE closed-form oracle: a[i]=i, b[i]=N-1-i (strictly decreasing),
