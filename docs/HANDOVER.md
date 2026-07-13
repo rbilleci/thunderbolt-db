@@ -29,8 +29,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BP:** isolate the complete parsed GRANT/REVOKE and default-table-privilege family in a private ACL
-   owner, preserving helper arguments/order, publication, persistence, exact errors/tags, and parse order.
+1. **STRUCT-001BQ:** isolate parsed simple-query INSERT/DELETE/UPDATE in a private DML owner, preserving defaults,
+   permissions, constraint validation/rollback, publication, exact errors/tags, and parse order without merging
+   the behaviorally distinct extended-query DML path.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

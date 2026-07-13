@@ -116,6 +116,9 @@ use role_ddl::execute_role_ddl;
 #[path = "gpu-db-server/catalog_comments.rs"]
 mod catalog_comments;
 use catalog_comments::execute_catalog_comment;
+#[path = "gpu-db-server/acl_execution.rs"]
+mod acl_execution;
+use acl_execution::execute_acl_command;
 #[path = "gpu-db-server/backend_adapter.rs"]
 mod backend_adapter;
 use backend_adapter::*;
@@ -4877,135 +4880,21 @@ fn execute_statement(
         Ok(command @ Command::CommentOn(_)) => {
             return execute_catalog_comment(stream, session, command);
         }
+        Ok(
+            command @ (Command::GrantTable(_)
+            | Command::RevokeTable(_)
+            | Command::GrantSchema(_)
+            | Command::RevokeSchema(_)
+            | Command::GrantDatabase(_)
+            | Command::RevokeDatabase(_)
+            | Command::GrantTablespace(_)
+            | Command::RevokeTablespace(_)
+            | Command::GrantFunction(_)
+            | Command::RevokeFunction(_)
+            | Command::GrantDefaultTablePrivileges(_)
+            | Command::RevokeDefaultTablePrivileges(_)),
+        ) => return execute_acl_command(stream, session, command),
         Ok(command) => match command {
-            Command::GrantTable(grant) => {
-                if let Err(error) = grant_relation_acl(
-                    session,
-                    &grant.relation,
-                    grant.kind,
-                    &grant.grantee,
-                    &grant.privileges,
-                ) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "GRANT");
-            }
-            Command::RevokeTable(revoke) => {
-                if let Err(error) = revoke_relation_acl(
-                    session,
-                    &revoke.relation,
-                    revoke.kind,
-                    &revoke.grantee,
-                    &revoke.privileges,
-                ) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "REVOKE");
-            }
-            Command::GrantSchema(grant) => {
-                if let Err(error) =
-                    grant_schema_acl(session, &grant.schema, &grant.grantee, &grant.privileges)
-                {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "GRANT");
-            }
-            Command::RevokeSchema(revoke) => {
-                if let Err(error) =
-                    revoke_schema_acl(session, &revoke.schema, &revoke.grantee, &revoke.privileges)
-                {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "REVOKE");
-            }
-            Command::GrantDatabase(grant) => {
-                if let Err(error) =
-                    grant_database_acl(session, &grant.database, &grant.grantee, &grant.privileges)
-                {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "GRANT");
-            }
-            Command::RevokeDatabase(revoke) => {
-                if let Err(error) = revoke_database_acl(
-                    session,
-                    &revoke.database,
-                    &revoke.grantee,
-                    &revoke.privileges,
-                ) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "REVOKE");
-            }
-            Command::GrantTablespace(grant) => {
-                if let Err(error) = grant_tablespace_acl(
-                    session,
-                    &grant.tablespace,
-                    &grant.grantee,
-                    &grant.privileges,
-                ) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "GRANT");
-            }
-            Command::RevokeTablespace(revoke) => {
-                if let Err(error) = revoke_tablespace_acl(
-                    session,
-                    &revoke.tablespace,
-                    &revoke.grantee,
-                    &revoke.privileges,
-                ) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "REVOKE");
-            }
-            Command::GrantFunction(grant) => {
-                if let Err(error) =
-                    grant_function_acl(session, &grant.function, &grant.grantee, &grant.privileges)
-                {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "GRANT");
-            }
-            Command::RevokeFunction(revoke) => {
-                if let Err(error) = revoke_function_acl(
-                    session,
-                    &revoke.function,
-                    &revoke.grantee,
-                    &revoke.privileges,
-                ) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "REVOKE");
-            }
-            Command::GrantDefaultTablePrivileges(grant) => {
-                if let Err(error) =
-                    grant_default_table_acl(session, &grant.grantee, &grant.privileges)
-                {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "ALTER DEFAULT PRIVILEGES");
-            }
-            Command::RevokeDefaultTablePrivileges(revoke) => {
-                if let Err(error) =
-                    revoke_default_table_acl(session, &revoke.grantee, &revoke.privileges)
-                {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "ALTER DEFAULT PRIVILEGES");
-            }
             Command::Insert(insert) => {
                 let table_name = insert.table;
                 let catalog_indexes = session.indexes.clone();
@@ -5355,6 +5244,20 @@ fn execute_statement(
             }
             Command::CommentOn(_) => {
                 unreachable!("catalog-comment commands are routed by the preceding parse arm")
+            }
+            Command::GrantTable(_)
+            | Command::RevokeTable(_)
+            | Command::GrantSchema(_)
+            | Command::RevokeSchema(_)
+            | Command::GrantDatabase(_)
+            | Command::RevokeDatabase(_)
+            | Command::GrantTablespace(_)
+            | Command::RevokeTablespace(_)
+            | Command::GrantFunction(_)
+            | Command::RevokeFunction(_)
+            | Command::GrantDefaultTablePrivileges(_)
+            | Command::RevokeDefaultTablePrivileges(_) => {
+                unreachable!("ACL commands are routed by the preceding parse arm")
             }
         },
     }

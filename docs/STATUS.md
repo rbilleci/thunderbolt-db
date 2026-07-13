@@ -622,6 +622,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   only its clippy-required tail expression differs. Sequential/concurrent 127-test runs, the full protocol
   package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched formatting,
   diff checks, and independent audit are clean. The root is 12,795 lines and STRUCT-001BO is closed.
+  Parsed ACL mutations now enter the private 146-line `acl_execution` owner through one exact successful-parse
+  family gate. Relation/table, schema, database, tablespace, function, and default-table-privilege GRANT/REVOKE
+  preserve helper selection and argument order, propagated errors, helper-owned dirty state, success-only
+  persistence, and command tags. The twelve-arm body is token-equivalent after only clippy-required tail
+  expressions and rustfmt normalization. Sequential/concurrent 127-test runs, the full protocol package and
+  driver smokes, all-target checks, warning-denied clippy, security preflight, focused ACL/shared-catalog tests,
+  touched formatting, diff checks, and independent audit are clean. The root is 12,698 lines and STRUCT-001BP
+  is closed.
 
 ## Known boundaries
 
