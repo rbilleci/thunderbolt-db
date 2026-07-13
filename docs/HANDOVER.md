@@ -28,6 +28,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   host geometry before transfer, binds the resident primary context before D2H, rejects a noncanonical first
   offset and malformed selected spans, and remains reusable after failure. Its HAZARD matrices, complete suites,
   report card, and audit pass.
+- STRUCT-001FW is closed. The two resident TEXT APIs, prefix launcher/PTX owner, and bounded selected-row
+  projection now live in the private 310-line `resident_text.rs` child with stable inherent method paths. The
+  complete suites, HAZARD matrices, static gates, and normalized-exact independent audit pass.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
@@ -35,8 +38,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 ## Resume here
 
 1. **STRUCT-001:** resume the ordered oversized-file inventory at `crates/execution/src/lib.rs`; the next coherent
-   boundary is resident TEXT projection/result ownership now that its adjacent prefix count is GPU-native. Do not
-   let structural extraction implicitly decide **R3-001**.
+   boundary to analyze is resident int4 scalar SUM/stats ownership. Do not let structural extraction implicitly
+   decide **R3-001**.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
 4. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.

@@ -1772,6 +1772,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   OUT-OF-L2 rooflines are 1,480.7/1,441.0 GB/s, count is 0.88x/1.01x roofline, grouped aggregation is 1,677.3M
   elements/s, and batch-65,536 point reads are 247.2M at p50 140us IN-L2 and 252.1M at p50 132us OUT-OF-L2;
   index/scan is 3.22x/3.19x. The execution root is 9,636 lines.
+  STRUCT-001FW then isolated both stable resident TEXT inherent APIs, the prefix-count launcher/PTX owner, and
+  bounded selected-row projection/readback into the rustfmt-clean 310-line `resident_text.rs` child, reducing the
+  execution root to 9,332 lines. All four moved segments are byte-exact against the prior root. The private child
+  adds no visibility bridge or cycle: its only dependencies are the neutral text-window validator and existing
+  parent context/stream services, while the stable crate-root method paths and every caller remain unchanged. The
+  direct TEXT contract passed three sequential plus two concurrent invocations; mixed retained, grouped-TEXT,
+  and ordered-TEXT consumer commands passed nine sequential plus six concurrent invocations without device
+  faults. Execution passes 54/81 and engine passes 505/487 with the GPU sweep serial; workspace
+  all-target/all-feature check, strict execution/engine clippy, source/reference/scoped-format/diff gates, and
+  independent audit are clean. The 181-line PTX file, symbol/ABI/body, checked geometry, primary-context binding,
+  pooled-stream and lease lifetime, bounded D2H, requested ordering/duplicates, UTF-8 assembly, and error behavior
+  are source-equivalent, so the report card was not applicable.
 
 ## Known boundaries
 
