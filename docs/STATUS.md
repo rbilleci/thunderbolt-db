@@ -674,6 +674,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   formatting/diff checks, and independent audit are clean. The root is 10,563 lines; `ddl_execution`,
   `index_ddl`, `sequence_execution`, and `function_execution` are 1,045, 216, 288, and 326 lines respectively;
   STRUCT-001BU is closed.
+  Legacy unique-index, check-constraint, and foreign-key validation now live in the private 109-line
+  `integrity_validation` owner, labeled host parity/bootstrap debt. Only the three validators are parent-private;
+  violation constructors remain internal, and all root, table/index DDL, simple-DML, and COPY consumers use the
+  same narrow aliases. Key comparison, predicate dispatch, missing-metadata skip behavior, FK parent sets,
+  validation order, and generic errors are exact moves. Inherited PRODUCT-002 compatibility debt remains: NULL
+  is an ordinary uniqueness/FK key rather than PostgreSQL NULL semantics; missing referenced metadata is skipped;
+  and violation messages omit object names. Full protocol and driver gates, all-target checks, warning-denied
+  clippy, security preflight, focused COPY/DML/index tests, formatting/diff checks, and independent audit are
+  clean. The root is 10,466 lines and STRUCT-001BV is closed.
 
 ## Known boundaries
 
