@@ -31,13 +31,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   full suites, 20 GPU route invocations, static gates, and independent audit are clean.
 - STRUCT-001FD is closed: normalized-exact join-coordinate window/rank/shift ownership now lives in bounded
   `join_window.rs`; all full/static gates, the nine-serial/six-concurrent GPU matrix, and audit are clean.
+- STRUCT-001FE is closed: exact device materialization/concatenation and final typed projection now live in
+  bounded explicit-import owners; full/static gates, the 12-serial/eight-concurrent GPU matrix, and audit pass.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FE:** isolate execution join-coordinate materialization, concatenation, and final typed projection
-   ownership without changing crate-root APIs, device layouts, PTX ABI, NULL semantics, or bounded readback.
+1. **STRUCT-001FF:** isolate stable device-coordinate sorting while keeping the shared order-key descriptor at
+   the facade seam and dependency direction one-way from sort to window.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

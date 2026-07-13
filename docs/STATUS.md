@@ -1548,6 +1548,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   checks, and independent audit are clean. PTX, ABI, geometry, partition/peer/NULL, shift, window, rank, error,
   synchronization, allocation, and bounded-readback behavior are source-equivalent, so the report card was not
   applicable.
+  STRUCT-001FE then isolated the normalized-exact device materialization/concatenation owner in the 904-line
+  `join_materialize.rs` child and bounded final fixed/bool/text projection in the 782-line
+  `join_projection.rs` child, reducing the execution root to 15,921 lines. A pre-edit size simulation rejected
+  one 1,668-line leaf; the final leaves use exact explicit imports with no visibility change or cycle. Four
+  direct/engine/streaming GPU gates passed 12 sequential plus eight concurrent invocations with zero CUDA
+  700/716/717. Both execution modes passed 48/78, both engine modes passed 505/487, and workspace all-target
+  check, strict execution/engine clippy, dependency/scoped source/reference/format checks, and independent re-
+  audit are clean. All five PTX blobs, APIs, layouts, validation, geometry, NULL/OUTER/type/empty/error/
+  allocation/ownership/readback behavior are source-equivalent, so the report card was not applicable.
 
 ## Known boundaries
 
