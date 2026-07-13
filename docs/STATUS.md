@@ -615,6 +615,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
   formatting, diff checks, and independent audit are clean. The root is 13,104 lines, `ddl_execution` is 914
   lines, and STRUCT-001BN is closed.
+  Parsed catalog comments now enter the private 336-line `catalog_comments` owner through one exact successful-
+  parse variant gate. All 16 supported targets preserve their kind/existence and shared-catalog precedence;
+  columns retain stored attnums and constraints retain primary/unique/check/foreign-key lookup. Comment insert/
+  removal, dirty publication, persistence, errors, and tag are unchanged. The complete arm is normalized-exact;
+  only its clippy-required tail expression differs. Sequential/concurrent 127-test runs, the full protocol
+  package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched formatting,
+  diff checks, and independent audit are clean. The root is 12,795 lines and STRUCT-001BO is closed.
 
 ## Known boundaries
 
