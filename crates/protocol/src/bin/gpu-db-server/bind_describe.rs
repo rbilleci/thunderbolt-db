@@ -1,7 +1,8 @@
+use super::sql_execute_syntax::{parse_sql_execute, split_sql_csv};
 use super::{
     canonical_sql, column_for_sql_type, column_type_oid, int8_column, numeric_column,
-    parse_sql_execute, split_sql_csv, sql_dollar_quote_tag_at, BindParameterError, CatalogColumn,
-    Column, ErrorField, PreparedQuery, PreparedStatement, Session, Table,
+    BindParameterError, CatalogColumn, Column, ErrorField, PreparedQuery, PreparedStatement,
+    Session, Table,
 };
 use gpu_db_protocol::{parse_command, Command, ParseError, SelectProjection, SqlType};
 
@@ -720,112 +721,6 @@ fn unquoted_sql_fragments(query: &str) -> Vec<&str> {
         fragments.push(&query[token_start..]);
     }
     fragments
-}
-
-pub(super) fn strip_sql_comments(query: &str) -> String {
-    let mut stripped = String::with_capacity(query.len());
-    let mut chars = query.char_indices().peekable();
-    let mut last_pushed = 0;
-    let mut in_quote = false;
-    let mut in_quoted_identifier = false;
-
-    while let Some((idx, ch)) = chars.next() {
-        if ch == '\'' {
-            if in_quoted_identifier {
-                continue;
-            }
-            if in_quote && matches!(chars.peek(), Some((_, '\''))) {
-                chars.next();
-                continue;
-            }
-            in_quote = !in_quote;
-            continue;
-        }
-        if ch == '"' {
-            if in_quote {
-                continue;
-            }
-            if in_quoted_identifier && matches!(chars.peek(), Some((_, '"'))) {
-                chars.next();
-                continue;
-            }
-            in_quoted_identifier = !in_quoted_identifier;
-            continue;
-        }
-        if in_quote || in_quoted_identifier {
-            continue;
-        }
-        if ch == '$' {
-            if let Some(tag) = sql_dollar_quote_tag_at(query, idx) {
-                let body_start = idx + tag.len();
-                if let Some(close_relative) = query[body_start..].find(tag) {
-                    let close_end = body_start + close_relative + tag.len();
-                    while chars
-                        .peek()
-                        .is_some_and(|(next_idx, _)| *next_idx < close_end)
-                    {
-                        chars.next();
-                    }
-                }
-            }
-            continue;
-        }
-        if ch != '-' && ch != '/' {
-            continue;
-        }
-
-        if ch == '-' && matches!(chars.peek(), Some((_, '-'))) {
-            stripped.push_str(&query[last_pushed..idx]);
-            chars.next();
-            let mut comment_end = query.len();
-            for (next_idx, next_ch) in chars.by_ref() {
-                if next_ch == '\n' {
-                    comment_end = next_idx + next_ch.len_utf8();
-                    stripped.push('\n');
-                    break;
-                }
-            }
-            if comment_end == query.len() {
-                stripped.push(' ');
-            }
-            last_pushed = comment_end;
-            continue;
-        }
-
-        if ch == '/' && matches!(chars.peek(), Some((_, '*'))) {
-            stripped.push_str(&query[last_pushed..idx]);
-            chars.next();
-            let mut comment_end = query.len();
-            let mut depth = 1usize;
-            let mut saw_newline = false;
-            let mut previous_char: Option<char> = None;
-            for (next_idx, next_ch) in chars.by_ref() {
-                if next_ch == '\n' {
-                    saw_newline = true;
-                }
-                if previous_char == Some('/') && next_ch == '*' {
-                    depth = depth.saturating_add(1);
-                    previous_char = None;
-                    continue;
-                }
-                if previous_char == Some('*') && next_ch == '/' {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        comment_end = next_idx + next_ch.len_utf8();
-                        break;
-                    }
-                    previous_char = None;
-                    continue;
-                }
-                previous_char = Some(next_ch);
-            }
-            stripped.push(if saw_newline { '\n' } else { ' ' });
-            last_pushed = comment_end;
-        }
-    }
-
-    stripped.push_str(&query[last_pushed..]);
-    stripped
 }
 
 fn replace_parameter_placeholders_with_dummy_literals(query: &str) -> String {

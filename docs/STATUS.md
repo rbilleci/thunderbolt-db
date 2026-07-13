@@ -418,6 +418,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and exact errors are unchanged. Sequential/concurrent 127-test runs, all-target/all-feature check,
   warning-denied clippy, the full 71-library-test protocol package and driver smokes, security preflight,
   formatting, and independent audit are clean. The root is 18,466 lines and STRUCT-001AP is closed.
+  SQL PREPARE/EXECUTE/DEALLOCATE compatibility is now split along an acyclic ownership boundary. The private
+  913-line `sql_execute_syntax` leaf owns comment stripping, keyword/name/list parsing, SQL EXECUTE argument and
+  literal/cast decoding, and exposes seven proven sibling/root helpers; all remaining helpers are private. The
+  private 301-line `sql_prepare` owner contains PREPARE/DEALLOCATE parsing plus describe and prepared-result
+  execution behind seven proven entry points. Both `bind_describe` and `sql_prepare` depend downward on the
+  syntax leaf; only `sql_prepare` depends on bind semantics, so no module cycle is hidden by the root facade.
+  The original 1,083-line root body and the 105-line comment-strip move are canonical-exact apart from required
+  visibility/formatting. Quote/comment/dollar-quote handling, literal/NULL/cast normalization, type validation,
+  replacement/deallocation behavior, result/error tags, and legacy host containment are unchanged. Sequential
+  and concurrent 127-test runs, the full 71-library-test protocol package and driver smokes, all-target checks,
+  warning-denied clippy, security preflight, formatting, and independent audit are clean. The root is 17,394
+  lines and STRUCT-001AQ is closed.
 
 ## Known boundaries
 

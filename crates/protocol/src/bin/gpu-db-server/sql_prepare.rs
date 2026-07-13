@@ -1,0 +1,301 @@
+// Legacy SQL PREPARE/EXECUTE compatibility ownership. This is not a product execution path.
+
+use super::sql_execute_syntax::{
+    parse_sql_execute, parse_supported_cursor_name, split_sql_csv,
+    split_sql_name_and_optional_parenthesized_list, sql_keyword_rest_start,
+    strip_leading_sql_comments, strip_sql_comments,
+};
+use super::{
+    bind_query_parameters, canonical_sql, describe_query_columns, execute_select_result,
+    expected_parameter_count, int4_column, is_supported_extended_copy, is_supported_extended_dml,
+    negative_limit_error_field, negative_offset_error_field, parse_command, parse_declare_cursor,
+    pg_dump_function_dump_columns, pg_dump_function_dump_rows,
+    sql_execute_argument_placeholder_index, sql_execute_parameter_error_field, BindParameterError,
+    Column, Command, ErrorField, ParseError, PreparedQuery, PreparedStatement, SelectResult,
+    Session, SqlDeallocateTarget, SqlType,
+};
+
+pub(super) fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
+    let trimmed = strip_leading_sql_comments(statement.trim().trim_end_matches(';').trim())?;
+    let rest_start = sql_keyword_rest_start(trimmed, "prepare")?;
+    let as_idx = find_sql_prepare_as_index(trimmed)?;
+    let original_target = strip_sql_comments(trimmed[rest_start..as_idx].trim());
+    let query_start = as_idx + " as ".len();
+    let query = trimmed[query_start..].trim();
+    if query.is_empty() {
+        return None;
+    }
+    let canonical_query = canonical_sql(query);
+    if !canonical_query.starts_with("select ") || !canonical_query.contains(" from ") {
+        return None;
+    }
+
+    let (name, type_oids) = {
+        let (name, type_list) = split_sql_name_and_optional_parenthesized_list(&original_target)?;
+        if let Some(type_list) = type_list {
+            let mut type_oids = Vec::new();
+            if !type_list.trim().is_empty() {
+                for ty in split_sql_csv(type_list)? {
+                    type_oids.push(sql_prepare_type_oid(ty.trim())?);
+                }
+            }
+            (name, type_oids)
+        } else {
+            (name, Vec::new())
+        }
+    };
+
+    Some((name, type_oids, query.to_string()))
+}
+
+pub(super) fn parse_sql_prepare_name(statement: &str) -> Option<String> {
+    let trimmed = strip_leading_sql_comments(statement.trim().trim_end_matches(';').trim())?;
+    let rest_start = sql_keyword_rest_start(trimmed, "prepare")?;
+    let as_idx = find_sql_prepare_as_index(trimmed)?;
+    let original_target = strip_sql_comments(trimmed[rest_start..as_idx].trim());
+    split_sql_name_and_optional_parenthesized_list(&original_target).map(|(name, _)| name)
+}
+
+fn find_sql_prepare_as_index(statement: &str) -> Option<usize> {
+    let mut in_quoted_identifier = false;
+    let mut paren_depth = 0usize;
+    let mut chars = statement.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if idx < "prepare ".len() {
+            continue;
+        }
+        if in_quoted_identifier {
+            if ch == '"' {
+                if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                    chars.next();
+                } else {
+                    in_quoted_identifier = false;
+                }
+            }
+            continue;
+        }
+        if ch == '-' && chars.peek().is_some_and(|(_, next)| *next == '-') {
+            chars.next();
+            for (_, next_ch) in chars.by_ref() {
+                if next_ch == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '*') {
+            chars.next();
+            let mut depth = 1usize;
+            let mut previous_char: Option<char> = None;
+            for (_, next_ch) in chars.by_ref() {
+                if previous_char == Some('/') && next_ch == '*' {
+                    depth = depth.saturating_add(1);
+                    previous_char = None;
+                    continue;
+                }
+                if previous_char == Some('*') && next_ch == '/' {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                    previous_char = None;
+                    continue;
+                }
+                previous_char = Some(next_ch);
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_quoted_identifier = true,
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            'a' | 'A'
+                if paren_depth == 0
+                    && statement[idx..]
+                        .get(..2)
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case("as"))
+                    && statement[..idx]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace)
+                    && statement[idx + 2..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace) =>
+            {
+                return statement[..idx]
+                    .char_indices()
+                    .next_back()
+                    .map(|(previous_idx, _)| previous_idx);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(super) fn describe_extended_query_columns(
+    session: &Session,
+    query: &str,
+) -> Option<Vec<Column>> {
+    if let Some((name, parameters)) = parse_sql_execute(query) {
+        return match session.prepared.get(&name) {
+            Some(PreparedStatement::AddTen)
+                if parameters.len() == 1 && parameters[0].as_deref() == Some("5") =>
+            {
+                Some(vec![int4_column("plus_ten")])
+            }
+            Some(PreparedStatement::Sql(prepared)) => {
+                bind_sql_execute_describe_parameters(prepared, &parameters)
+                    .ok()
+                    .and_then(|describe_parameters| {
+                        bind_query_parameters(prepared, &describe_parameters).ok()
+                    })
+                    .and_then(|bound_query| describe_query_columns(session, &bound_query))
+            }
+            Some(PreparedStatement::Extended(_)) | None => None,
+            _ => None,
+        };
+    }
+    describe_query_columns(session, query)
+}
+
+pub(super) fn extended_query_result_column_count(session: &Session, query: &str) -> Option<usize> {
+    if parse_declare_cursor(query).is_some()
+        || is_supported_extended_dml(session, query)
+        || is_supported_extended_copy(query)
+    {
+        Some(0)
+    } else {
+        describe_extended_query_columns(session, query).map(|columns| columns.len())
+    }
+}
+
+fn bind_sql_execute_describe_parameters(
+    prepared: &PreparedQuery,
+    parameters: &[Option<String>],
+) -> Result<Vec<Option<String>>, BindParameterError> {
+    if expected_parameter_count(prepared) != parameters.len() {
+        return Err(BindParameterError::CountMismatch);
+    }
+    parameters
+        .iter()
+        .enumerate()
+        .map(|(idx, parameter)| match parameter {
+            Some(value) if sql_execute_argument_placeholder_index(value).is_some() => {
+                let oid = prepared.parameter_type_oids.get(idx).copied().unwrap_or(0);
+                Ok(Some(sql_execute_describe_dummy_value(oid).to_string()))
+            }
+            parameter => Ok(parameter.clone()),
+        })
+        .collect()
+}
+
+pub(super) fn sql_execute_describe_error(session: &Session, query: &str) -> Option<ErrorField> {
+    let (name, parameters) = parse_sql_execute(query)?;
+    let Some(PreparedStatement::Sql(prepared)) = session.prepared.get(&name) else {
+        return None;
+    };
+    let describe_parameters = match bind_sql_execute_describe_parameters(prepared, &parameters) {
+        Ok(parameters) => parameters,
+        Err(error) => return Some(sql_execute_parameter_error_field(error)),
+    };
+    bind_query_parameters(prepared, &describe_parameters)
+        .err()
+        .map(sql_execute_parameter_error_field)
+}
+
+fn sql_execute_describe_dummy_value(type_oid: u32) -> &'static str {
+    match type_oid {
+        23 => "1",
+        25 => "text",
+        _ => "1",
+    }
+}
+
+pub(super) fn execute_sql_prepared_result(
+    session: &mut Session,
+    name: &str,
+    parameters: &[Option<String>],
+) -> Result<SelectResult, ErrorField> {
+    match session.prepared.get(name).cloned() {
+        Some(PreparedStatement::AddTen)
+            if parameters.len() == 1 && parameters[0].as_deref() == Some("5") =>
+        {
+            Ok(SelectResult {
+                columns: vec![int4_column("plus_ten")],
+                rows: vec![vec![Some(String::from("15"))]],
+            })
+        }
+        Some(PreparedStatement::PgDumpFunctionDump) => {
+            let oid = parameters
+                .first()
+                .and_then(|parameter| parameter.as_deref())
+                .and_then(|parameter| parameter.trim().parse::<u32>().ok());
+            Ok(SelectResult {
+                columns: pg_dump_function_dump_columns(),
+                rows: pg_dump_function_dump_rows(session, oid),
+            })
+        }
+        Some(PreparedStatement::Sql(query)) => {
+            let bound_query = bind_query_parameters(&query, parameters)
+                .map_err(sql_execute_parameter_error_field)?;
+            let select = match parse_command(&bound_query) {
+                Ok(Command::Select(select)) => select,
+                Err(ParseError::NegativeLimit) => return Err(negative_limit_error_field()),
+                Err(ParseError::NegativeOffset) => return Err(negative_offset_error_field()),
+                Ok(_) | Err(_) => {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "SQL EXECUTE only supports relational SELECT",
+                        position: None,
+                    });
+                }
+            };
+            execute_select_result(session, &select)
+        }
+        Some(PreparedStatement::AddTen) | Some(PreparedStatement::Extended(_)) | None => {
+            let message =
+                Box::leak(format!("prepared statement \"{name}\" does not exist").into_boxed_str());
+            Err(ErrorField {
+                code: "26000",
+                message,
+                position: None,
+            })
+        }
+    }
+}
+
+pub(super) fn parse_sql_deallocate(statement: &str) -> Option<SqlDeallocateTarget> {
+    let trimmed = strip_leading_sql_comments(statement.trim().trim_end_matches(';').trim())?;
+    let rest_start = sql_keyword_rest_start(trimmed, "deallocate")?;
+    let original_rest = strip_sql_comments(&trimmed[rest_start..]);
+    let mut target = original_rest.trim_start();
+    let lower_target = target.to_ascii_lowercase();
+    if lower_target == "prepare" || lower_target == "prepared" {
+        return None;
+    }
+    if let Some(after_keyword) = sql_keyword_rest_start(target, "prepare")
+        .or_else(|| sql_keyword_rest_start(target, "prepared"))
+    {
+        target = target[after_keyword..].trim_start();
+    }
+    if target.eq_ignore_ascii_case("all") {
+        return Some(SqlDeallocateTarget::All);
+    }
+    if target.is_empty() {
+        None
+    } else {
+        parse_supported_cursor_name(target).map(SqlDeallocateTarget::Named)
+    }
+}
+
+fn sql_prepare_type_oid(ty: &str) -> Option<u32> {
+    match canonical_sql(ty).as_str() {
+        "int" | "int4" | "integer" | "pg_catalog.int4" | "pg_catalog.integer" => {
+            Some(SqlType::Int4.postgres_oid())
+        }
+        "text" | "pg_catalog.text" => Some(SqlType::Text.postgres_oid()),
+        _ => None,
+    }
+}
