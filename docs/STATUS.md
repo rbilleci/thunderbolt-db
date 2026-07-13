@@ -1429,7 +1429,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and 12 concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target
   check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No production
   vacuum, gather, DML, materialization, or architectural behavior changed, so the report card was not applicable.
-  STRUCT-001ET is next.
+  STRUCT-001ET externalized the exact three-test A3/A2/A1 validation/update-chain/row-identity family into the
+  rustfmt-clean 377-line `tests/residency_identity_validation.rs` owner at the same parent position. Normalized
+  comparison differs only in rustfmt comment and panic/closure layouts; all bodies, attributes, names, and order
+  remain unchanged, and the adjacent mixed-type shard test remains at the parent boundary. The engine root is
+  6,985 lines, and the 992-test/76-family inventories remain exact. Three GPU gates passed nine sequential and
+  six concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target
+  check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No production
+  validation, update-chain, row-identity, or architectural behavior changed, so the report card was not
+  applicable. STRUCT-001EU is next.
 
 ## Known boundaries
 
