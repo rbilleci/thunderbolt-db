@@ -29,7 +29,7 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001CW:** move the psql procedural-language listing and effective pg-dump language discovery into the
+1. **STRUCT-001CX:** move the psql access-method listing and effective empty pg-dump `pg_am` response into the
    existing bootstrap owner behind two stage-preserving delegates, retaining exact metadata and output.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.

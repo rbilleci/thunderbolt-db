@@ -106,11 +106,12 @@ use bootstrap_ddl::{
     test_psql_describe_schemas_catalog_query as psql_describe_schemas_catalog_query,
     test_psql_describe_schemas_verbose_catalog_query_public_filter as psql_describe_schemas_verbose_catalog_query_public_filter,
     test_psql_list_extensions_catalog_query as psql_list_extensions_catalog_query,
+    test_psql_list_languages_catalog_query as psql_list_languages_catalog_query,
 };
 use bootstrap_ddl::{
     try_execute_bootstrap_ddl, try_execute_extension_catalog_query,
-    try_execute_information_schema_schemata_query, try_execute_namespace_catalog_query,
-    try_execute_psql_schema_catalog_query,
+    try_execute_information_schema_schemata_query, try_execute_language_catalog_query,
+    try_execute_namespace_catalog_query, try_execute_psql_schema_catalog_query,
 };
 #[path = "gpu-db-server/cluster_ddl.rs"]
 mod cluster_ddl;
@@ -1706,26 +1707,8 @@ fn execute_statement(
     if let Some(result) = try_execute_extension_catalog_query(stream, session, &canonical) {
         return result;
     }
-    if canonical
-        == "select tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl, acldefault('l', lanowner) as acldefault, lanowner from pg_language where lanispl order by oid"
-    {
-        return write_single_row(
-            stream,
-            &pg_language_discovery_columns(),
-            &pg_language_discovery_rows(),
-        );
-    }
-    if canonical == psql_list_languages_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Name"),
-                text_column("Owner"),
-                bool_column("Trusted"),
-                text_column("Description"),
-            ],
-            &catalog_psql_language_rows(),
-        );
+    if let Some(result) = try_execute_language_catalog_query(stream, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_domain_catalog_query(stream, session, &canonical) {
         return result;
@@ -2708,10 +2691,6 @@ fn psql_list_casts_catalog_query() -> &'static str {
 
 fn psql_list_default_access_privileges_catalog_query() -> &'static str {
     "select pg_catalog.pg_get_userbyid(d.defaclrole) as \"owner\", n.nspname as \"schema\", case d.defaclobjtype when 'r' then 'table' when 's' then 'sequence' when 'f' then 'function' when 't' then 'type' when 'n' then 'schema' end as \"type\", pg_catalog.array_to_string(d.defaclacl, e'\\n') as \"access privileges\" from pg_catalog.pg_default_acl d left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace order by 1, 2, 3"
-}
-
-fn psql_list_languages_catalog_query() -> &'static str {
-    "select l.lanname as \"name\", pg_catalog.pg_get_userbyid(l.lanowner) as \"owner\", l.lanpltrusted as \"trusted\", d.description as \"description\" from pg_catalog.pg_language l left join pg_catalog.pg_description d on d.classoid = l.tableoid and d.objoid = l.oid and d.objsubid = 0 where l.lanplcallfoid != 0 order by 1"
 }
 
 fn psql_list_access_methods_catalog_query() -> &'static str {
@@ -4238,11 +4217,6 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
             text_column("acldefault"),
         ]);
     }
-    if canonical
-        == "select tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl, acldefault('l', lanowner) as acldefault, lanowner from pg_language where lanispl order by oid"
-    {
-        return Some(pg_language_discovery_columns());
-    }
     if canonical.starts_with("select provider, label from pg_catalog.pg_shseclabel where ") {
         return Some(vec![text_column("provider"), text_column("label")]);
     }
@@ -5285,45 +5259,6 @@ fn catalog_empty_rows_for_relation_oid(_oid: u32) -> Vec<Vec<Option<String>>> {
 
 fn catalog_empty_rows() -> Vec<Vec<Option<String>>> {
     Vec::new()
-}
-
-fn catalog_psql_language_rows() -> Vec<Vec<Option<String>>> {
-    vec![vec![
-        Some("plpgsql".to_string()),
-        Some("postgres".to_string()),
-        Some("t".to_string()),
-        Some(PLPGSQL_DESCRIPTION.to_string()),
-    ]]
-}
-
-fn pg_language_discovery_columns() -> Vec<Column> {
-    vec![
-        int4_column("tableoid"),
-        int4_column("oid"),
-        text_column("lanname"),
-        bool_column("lanpltrusted"),
-        int4_column("lanplcallfoid"),
-        int4_column("laninline"),
-        int4_column("lanvalidator"),
-        text_column("lanacl"),
-        text_column("acldefault"),
-        int4_column("lanowner"),
-    ]
-}
-
-fn pg_language_discovery_rows() -> Vec<Vec<Option<String>>> {
-    vec![vec![
-        Some(PG_LANGUAGE_CLASS_OID.to_string()),
-        Some(PLPGSQL_LANGUAGE_OID.to_string()),
-        Some("plpgsql".to_string()),
-        Some("t".to_string()),
-        Some(PLPGSQL_CALL_HANDLER_OID.to_string()),
-        Some(PLPGSQL_INLINE_HANDLER_OID.to_string()),
-        Some(PLPGSQL_VALIDATOR_OID.to_string()),
-        None,
-        Some("postgres=U/postgres".to_string()),
-        Some("10".to_string()),
-    ]]
 }
 
 fn pg_catalog_tables_query() -> &'static str {

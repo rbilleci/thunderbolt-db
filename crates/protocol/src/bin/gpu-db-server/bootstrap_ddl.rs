@@ -2,9 +2,10 @@
 
 use super::{
     bool_column, int4_column, schema_acl_array_display, schema_acl_display, text_column,
-    write_command_complete, write_error, write_single_row, CatalogCommentTarget, Command,
-    ErrorField, ReadWrite, Session, PG_EXTENSION_CLASS_OID, PLPGSQL_DESCRIPTION,
-    PLPGSQL_EXTENSION_OID, PUBLIC_NAMESPACE_OID,
+    write_command_complete, write_error, write_single_row, CatalogCommentTarget, Column, Command,
+    ErrorField, ReadWrite, Session, PG_EXTENSION_CLASS_OID, PG_LANGUAGE_CLASS_OID,
+    PLPGSQL_CALL_HANDLER_OID, PLPGSQL_DESCRIPTION, PLPGSQL_EXTENSION_OID,
+    PLPGSQL_INLINE_HANDLER_OID, PLPGSQL_LANGUAGE_OID, PLPGSQL_VALIDATOR_OID, PUBLIC_NAMESPACE_OID,
 };
 use std::io;
 
@@ -501,4 +502,87 @@ pub(super) fn test_information_schema_schemata_query() -> &'static str {
 #[cfg(test)]
 pub(super) fn test_information_schema_schemata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     information_schema_schemata_rows(session)
+}
+
+pub(super) fn try_execute_language_catalog_query(
+    stream: &mut dyn ReadWrite,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != psql_list_languages_catalog_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[
+            text_column("Name"),
+            text_column("Owner"),
+            bool_column("Trusted"),
+            text_column("Description"),
+        ],
+        &catalog_psql_language_rows(),
+    ))
+}
+
+pub(super) fn try_execute_language_pg_dump_catalog_query(
+    stream: &mut dyn ReadWrite,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical
+        != "select tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl, acldefault('l', lanowner) as acldefault, lanowner from pg_language where lanispl order by oid"
+    {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &pg_language_discovery_columns(),
+        &pg_language_discovery_rows(),
+    ))
+}
+
+fn psql_list_languages_catalog_query() -> &'static str {
+    "select l.lanname as \"name\", pg_catalog.pg_get_userbyid(l.lanowner) as \"owner\", l.lanpltrusted as \"trusted\", d.description as \"description\" from pg_catalog.pg_language l left join pg_catalog.pg_description d on d.classoid = l.tableoid and d.objoid = l.oid and d.objsubid = 0 where l.lanplcallfoid != 0 order by 1"
+}
+
+fn catalog_psql_language_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("plpgsql".to_string()),
+        Some("postgres".to_string()),
+        Some("t".to_string()),
+        Some(PLPGSQL_DESCRIPTION.to_string()),
+    ]]
+}
+
+fn pg_language_discovery_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("lanname"),
+        bool_column("lanpltrusted"),
+        int4_column("lanplcallfoid"),
+        int4_column("laninline"),
+        int4_column("lanvalidator"),
+        text_column("lanacl"),
+        text_column("acldefault"),
+        int4_column("lanowner"),
+    ]
+}
+
+fn pg_language_discovery_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some(PG_LANGUAGE_CLASS_OID.to_string()),
+        Some(PLPGSQL_LANGUAGE_OID.to_string()),
+        Some("plpgsql".to_string()),
+        Some("t".to_string()),
+        Some(PLPGSQL_CALL_HANDLER_OID.to_string()),
+        Some(PLPGSQL_INLINE_HANDLER_OID.to_string()),
+        Some(PLPGSQL_VALIDATOR_OID.to_string()),
+        None,
+        Some("postgres=U/postgres".to_string()),
+        Some("10".to_string()),
+    ]]
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_languages_catalog_query() -> &'static str {
+    psql_list_languages_catalog_query()
 }

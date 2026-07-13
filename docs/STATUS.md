@@ -937,6 +937,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   row construction, and absent GPU-native catalog execution. Full gates, PostgreSQL 16 scenarios 09/46/47/312/
   340/342, all 18 pg-dump restore/metadata/privilege gates, and independent audit are clean. The root is 6,177
   lines and STRUCT-001CV is closed.
+  All effective psql and pg-dump procedural-language catalog reads now execute from the existing private 588-line
+  `bootstrap_ddl` owner behind two stage-preserving delegates; the 468-line `pg_dump_compat` consumes only the
+  language delegate. Four helpers are byte-identical private moves and one `cfg(test)` wrapper has a proven
+  consumer. Exact equality, post-extension/pre-domain and post-extension/pre-schema stages, 4-/10-column shapes,
+  `plpgsql` name, postgres owner, trust flag, fixed description, class/language/handler OIDs, ACL/default, nulls,
+  and writers are unchanged. The later root discovery and still-later empty-catalog classifier branches were
+  deleted only after both were proven dominated by unconditional earlier pg-dump compatibility. Inherited
+  PRODUCT-002 debt remains exact routing, one synthesized language, fixed metadata/OIDs, simplified ACL/default,
+  absent lifecycle-sensitive state, CPU row construction, and absent GPU-native catalog execution. Full gates,
+  PostgreSQL 16 scenario 56, all 18 pg-dump restore/metadata/privilege gates, and independent audit are clean. The
+  root is 6,112 lines and STRUCT-001CW is closed.
 
 ## Known boundaries
 

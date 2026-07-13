@@ -1,7 +1,8 @@
 // Legacy pg_dump compatibility ownership. This is not a product catalog execution path.
 
 use super::bootstrap_ddl::{
-    try_execute_extension_pg_dump_catalog_query, try_execute_schema_pg_dump_catalog_query,
+    try_execute_extension_pg_dump_catalog_query, try_execute_language_pg_dump_catalog_query,
+    try_execute_schema_pg_dump_catalog_query,
 };
 use super::catalog_comments::pg_dump_description_rows;
 use super::cluster_ddl::{
@@ -27,8 +28,8 @@ use super::{
     pg_dump_sequence_setval_query, pg_dump_table_oid_lookup_query_table,
     pg_dump_table_oid_lookup_rows, pg_dump_type_metadata_columns, pg_dump_type_metadata_query,
     pg_dump_type_metadata_rows, pg_dump_view_definition_query_oid, pg_dump_view_definition_rows,
-    pg_language_discovery_columns, pg_language_discovery_rows, text_column, write_error,
-    write_single_row, CatalogCommentTarget, ErrorField, ReadWrite, Session,
+    text_column, write_error, write_single_row, CatalogCommentTarget, ErrorField, ReadWrite,
+    Session,
 };
 use std::io;
 
@@ -52,14 +53,8 @@ pub(super) fn try_execute_pg_dump_compat_statement(
     if let Some(result) = try_execute_extension_pg_dump_catalog_query(stream, canonical) {
         return Some(result);
     }
-    if canonical
-        == "select tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl, acldefault('l', lanowner) as acldefault, lanowner from pg_language where lanispl order by oid"
-    {
-        return Some(write_single_row(
-            stream,
-            &pg_language_discovery_columns(),
-            &pg_language_discovery_rows(),
-        ));
+    if let Some(result) = try_execute_language_pg_dump_catalog_query(stream, canonical) {
+        return Some(result);
     }
     if let Some(result) = try_execute_schema_pg_dump_catalog_query(stream, session, canonical) {
         return Some(result);
