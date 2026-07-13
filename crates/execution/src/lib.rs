@@ -732,9 +732,8 @@ impl CudaResidentDeviceMemory {
     /// non-matching rows are SKIPPED; a NULL value (per `null_bitmap_offset`, 1 = valid; `None` = no
     /// bitmap) is ALSO skipped (3VL — a NULL contributes to no statistic). `count` is the count of
     /// SURVIVING (matching, non-NULL) rows; the caller maps `count == 0` (zero matches / all-NULL
-    /// survivors) to SQL NULL. Replaced the (now-removed) self-grouped filtered hash kernel and the
-    /// gather-to-host `filtered_stats_i32_compare_from_payload` path. Byte-identical to those for
-    /// non-empty results.
+    /// survivors) to SQL NULL. Replaced the now-removed self-grouped filtered hash kernel and
+    /// gather-to-host projection plus CPU-reduction path. Byte-identical to those for non-empty results.
     pub fn filtered_scalar_stats_i32_from_payload(
         &self,
         byte_offset: u64,
@@ -1346,23 +1345,6 @@ impl CudaResidentDeviceMemory {
             text_validity_bitmap_offset,
             row_count,
         )
-    }
-
-    pub fn filtered_stats_i32_compare_from_payload(
-        &self,
-        byte_offset: u64,
-        row_count: u64,
-        needle: i32,
-        comparison: CudaI32Comparison,
-    ) -> Result<CudaI32Stats, CudaRuntimeProbeError> {
-        let values = launch_cuda_resident_i32_compare_project(
-            self,
-            byte_offset,
-            row_count,
-            needle,
-            comparison,
-        )?;
-        Ok(CudaI32Stats::from_values(&values))
     }
 
     pub fn stats_i32_between_from_payload(

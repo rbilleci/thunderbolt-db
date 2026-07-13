@@ -1630,8 +1630,7 @@
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn gpu_filtered_nullable_scalar_stats_byte_identical_to_host_oracle() {
         // SLICE B (the direct (count,sum,min,max) reduction extended with an on-device FILTER + NULL-skip,
-        // which replaced the now-removed self-grouped hash path / the gather-to-host
-        // `filtered_stats_i32_compare_from_payload`).
+        // which replaced the now-removed self-grouped hash and gather-to-host CPU-reduction paths.
         //
         // The load-bearing CLAIM is BYTE-IDENTITY of the SURVIVING-row stats: the direct kernel's
         // (count, sum, min, max) over the rows passing `<col> <cmp> needle` AND the validity bitmap must

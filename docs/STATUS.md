@@ -1784,6 +1784,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   independent audit are clean. The 181-line PTX file, symbol/ABI/body, checked geometry, primary-context binding,
   pooled-stream and lease lifetime, bounded D2H, requested ordering/duplicates, UTF-8 assembly, and error behavior
   are source-equivalent, so the report card was not applicable.
+  STRUCT-001FX then deleted the unconsumed public `filtered_stats_i32_compare_from_payload` facade (17 production
+  lines) and removed its three stale live-source symbol references. The deleted wrapper launched compare-project,
+  copied every matching int4 to a host `Vec`, and reduced it on the CPU. Whole-tree and history audit proves its
+  sole engine caller moved in `6bc6b188` to `filtered_scalar_stats_i32_from_payload`, which performs filtering and
+  reduction on-device and reads back only count/sum/min/max; the direct route, row-project APIs, underlying
+  compare-project launcher, remaining `CudaI32Stats::from_values` uses, and archived history are unchanged.
+  Execution passes 54/81 and engine passes 505/487 with the GPU sweep serial; workspace all-target/all-feature
+  check, strict execution/engine clippy, source/diff/docs gates, and independent audit are clean. The execution
+  root is 9,314 lines. No live call path, kernel, layout, or result behavior changed, so HAZARD and report-card
+  gates were not applicable.
 
 ## Known boundaries
 

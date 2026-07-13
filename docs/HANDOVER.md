@@ -31,6 +31,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FW is closed. The two resident TEXT APIs, prefix launcher/PTX owner, and bounded selected-row
   projection now live in the private 310-line `resident_text.rs` child with stable inherent method paths. The
   complete suites, HAZARD matrices, static gates, and normalized-exact independent audit pass.
+- STRUCT-001FX is closed. The unconsumed host-reduced filtered-int4 stats facade and stale live references are
+  deleted; the sole former engine route has used the direct GPU scalar reducer since `6bc6b188`. Full suites,
+  static gates, source/history audit, and independent audit pass.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.

@@ -714,10 +714,10 @@ impl Engine {
             } => {
                 // DIRECT filtered scalar-stats reduction (non-nullable): one grid-stride pass evaluates
                 // the filter `<value> <cmp> needle` ON-DEVICE and reduces the matches to (count, sum,
-                // min, max). REPLACES `filtered_stats_i32_compare_from_payload`, which projected EVERY
-                // matching value to a host `Vec<i32>` and reduced on the CPU (`CudaI32Stats::from_values`)
-                // — O(matches) D2H + host work. Byte-identical to that for NON-empty results (same i64
-                // sum, same min/max, same AVG rounding). The ONLY result change is the empty corner:
+                // min, max). REPLACES the old projection of EVERY matching value to a host `Vec<i32>`
+                // followed by a CPU reduction — O(matches) D2H + host work. Byte-identical to that for
+                // NON-empty results (same i64 sum, same min/max, same AVG rounding). The ONLY result
+                // change is the empty corner:
                 // count == 0 (zero matches) now ⇒ SQL NULL (the deliberate SQL-spec correction), where
                 // the old path emitted the empty-text/Int8(0) sentinels for MIN/MAX/AVG.
                 let started = Instant::now();
