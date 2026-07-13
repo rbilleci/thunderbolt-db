@@ -29,7 +29,7 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DX:** externalize the exact 28-test AppendEntries family behind the unchanged parent test
+1. **STRUCT-001DY:** externalize the exact 24-test snapshot-identity family behind the unchanged parent test
    facade; preserve every body and harness name, and do not change production code or visibility.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.

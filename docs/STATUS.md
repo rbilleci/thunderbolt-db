@@ -1221,6 +1221,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   progress tests, both 187-test serial/16-thread runs, replication all-target check and strict clippy, scoped
   formatting/diff/reference checks, and independent audit are clean. The root is 16,648 lines with 683
   production lines; STRUCT-001DX is next.
+  STRUCT-001DX externalized the exact contiguous 28-test AppendEntries family into a bounded 1,029-line
+  `tests/append_entries.rs` owner through an `include!` at the same parent position. Every body is byte-identical
+  after parent deindent, all compiled harness names remain `tests::*`, and the owner coherently covers heartbeat
+  commit, term/role and previous-entry validation, batch/conflict handling, newer-leader repair, and snapshot-
+  boundary append invariants. Production, visibility, APIs, and semantics are untouched. Focused term, conflict,
+  heartbeat, repair, and snapshot-boundary tests, both 187-test serial/16-thread runs, replication all-target
+  check and strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. The root is
+  15,620 lines with 683 production lines; STRUCT-001DY is next.
 
 ## Known boundaries
 
