@@ -33,13 +33,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `join_window.rs`; all full/static gates, the nine-serial/six-concurrent GPU matrix, and audit are clean.
 - STRUCT-001FE is closed: exact device materialization/concatenation and final typed projection now live in
   bounded explicit-import owners; full/static gates, the 12-serial/eight-concurrent GPU matrix, and audit pass.
+- STRUCT-001FF is closed: stable device-coordinate sort ownership now lives in bounded `join_sort.rs` with an
+  explicit one-way dependency on `join_window`; full/static gates, the 9/6 GPU matrix, and audit pass.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FF:** isolate stable device-coordinate sorting while keeping the shared order-key descriptor at
-   the facade seam and dependency direction one-way from sort to window.
+1. **STRUCT-001FG:** isolate GPU OUTER-join match marking and unmatched-coordinate completion behind unchanged
+   public bitmap and inherent APIs, preserving on-device membership and padding decisions.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

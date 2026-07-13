@@ -1557,6 +1557,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   check, strict execution/engine clippy, dependency/scoped source/reference/format checks, and independent re-
   audit are clean. All five PTX blobs, APIs, layouts, validation, geometry, NULL/OUTER/type/empty/error/
   allocation/ownership/readback behavior are source-equivalent, so the report card was not applicable.
+  STRUCT-001FF then isolated the normalized-exact stable device-coordinate sort method and merge launcher/PTX in
+  the 417-line `join_sort.rs` child, reducing the execution root to 15,542 lines. The shared
+  `CudaJoinOrderKey` remains uniquely at the root facade to avoid a cycle; the former root window-launcher
+  bridge is now the explicit one-way `join_sort -> join_window` dependency, with no new visibility. Three
+  direct/engine/streaming GPU sort gates passed nine sequential plus six concurrent invocations with zero CUDA
+  700/716/717. Both execution modes passed 48/78, both engine modes passed 505/487, and workspace all-target
+  check, strict execution/engine clippy, dependency/scoped source/reference/format checks, and independent audit
+  are clean. Rust/PTX, comparator, stable-tie, NULL/OUTER, direction, descriptor, context, merge, geometry,
+  synchronization, allocation, error, and small/window behavior are source-equivalent, so the report card was
+  not applicable.
 
 ## Known boundaries
 
