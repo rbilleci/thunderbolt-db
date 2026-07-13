@@ -1567,6 +1567,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   are clean. Rust/PTX, comparator, stable-tie, NULL/OUTER, direction, descriptor, context, merge, geometry,
   synchronization, allocation, error, and small/window behavior are source-equivalent, so the report card was
   not applicable.
+  STRUCT-001FG then isolated the normalized-exact GPU OUTER-join match bitmap and unmatched-coordinate
+  completion owner in the rustfmt-clean 507-line `join_outer.rs` child, reducing the execution root to 15,144
+  lines. The bitmap fields use narrow `pub(super)` visibility so the unchanged parent fixed-join launcher can
+  retain its prior effective access; the crate-root public type and inherent APIs are unchanged, with no sibling
+  dependency or cycle. Five direct/LEFT/RIGHT/FULL/type-wide/streaming GPU gates passed 15 sequential plus ten
+  concurrent invocations with zero CUDA 700/716/717. Both execution modes passed 48/78, both engine modes passed
+  505/487, and workspace all-target check, strict execution/engine clippy, dependency/scoped source/reference/
+  format checks, and independent audit are clean. Match allocation/zeroing, atomic N:N collapse, two-pass
+  complement cardinality, bounded scalar D2H, accumulated coordinate D2D copy, OUTER `u32::MAX` pads,
+  validation, geometry, synchronization, errors, and allocation accounting are source-equivalent, so the report
+  card was not applicable.
 
 ## Known boundaries
 
