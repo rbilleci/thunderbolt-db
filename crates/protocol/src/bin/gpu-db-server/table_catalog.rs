@@ -167,6 +167,103 @@ pub(super) fn try_execute_filtered_plain_table_class_catalog_query(
     ))
 }
 
+pub(super) fn try_execute_information_schema_table_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical == information_schema_tables_query() {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+            ],
+            &information_schema_table_rows(session),
+        ));
+    }
+    if canonical == information_schema_base_table_discovery_query() {
+        return Some(write_single_row(
+            stream,
+            &[text_column("table_schema"), text_column("table_name")],
+            &information_schema_base_table_discovery_rows(session),
+        ));
+    }
+    if let Some(tables) = information_schema_tables_in_query_tables(canonical) {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+            ],
+            &information_schema_table_rows_for_tables(session, &tables),
+        ));
+    }
+    if canonical == information_schema_rich_tables_query() {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+                text_column("self_referencing_column_name"),
+                text_column("reference_generation"),
+                text_column("user_defined_type_catalog"),
+                text_column("user_defined_type_schema"),
+                text_column("user_defined_type_name"),
+                text_column("is_insertable_into"),
+                text_column("is_typed"),
+                text_column("commit_action"),
+            ],
+            &information_schema_rich_table_rows(session),
+        ));
+    }
+    if let Some(table) = information_schema_rich_tables_query_table(canonical) {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+                text_column("self_referencing_column_name"),
+                text_column("reference_generation"),
+                text_column("user_defined_type_catalog"),
+                text_column("user_defined_type_schema"),
+                text_column("user_defined_type_name"),
+                text_column("is_insertable_into"),
+                text_column("is_typed"),
+                text_column("commit_action"),
+            ],
+            &information_schema_rich_table_rows_for_table(session, &table),
+        ));
+    }
+    if let Some(table) = information_schema_rich_tables_catalog_query_table(canonical) {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+                text_column("self_referencing_column_name"),
+                text_column("reference_generation"),
+                text_column("user_defined_type_catalog"),
+                text_column("user_defined_type_schema"),
+                text_column("user_defined_type_name"),
+                text_column("is_insertable_into"),
+                text_column("is_typed"),
+                text_column("commit_action"),
+            ],
+            &information_schema_rich_table_rows_for_table(session, &table),
+        ));
+    }
+    None
+}
+
 fn catalog_table_name_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
@@ -585,6 +682,146 @@ fn pg_catalog_class_plain_table_rows_from_tables(tables: Vec<&Table>) -> Vec<Vec
         .collect()
 }
 
+fn information_schema_tables_query() -> &'static str {
+    "select table_schema, table_name, table_type from information_schema.tables where table_schema = 'public' order by table_name"
+}
+
+fn information_schema_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("BASE TABLE".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn information_schema_base_table_discovery_query() -> &'static str {
+    "select table_schema, table_name from information_schema.tables where table_type = 'base table' and table_schema not in ('pg_catalog', 'information_schema') order by table_schema, table_name"
+}
+
+fn information_schema_base_table_discovery_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| vec![Some("public".to_string()), Some(table.name.clone())])
+        .collect()
+}
+
+fn information_schema_tables_in_query_tables(canonical: &str) -> Option<Vec<String>> {
+    let prefix = "select table_schema, table_name, table_type from information_schema.tables where table_schema = 'public' and table_name in (";
+    let suffix = ") order by table_name";
+    let list = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let mut tables = Vec::new();
+    for raw_name in list.split(',') {
+        let name = raw_name.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+        if name.is_empty() {
+            return None;
+        }
+        tables.push(name.to_string());
+    }
+    if tables.is_empty() {
+        None
+    } else {
+        Some(tables)
+    }
+}
+
+fn information_schema_table_rows_for_tables(
+    session: &Session,
+    table_names: &[String],
+) -> Vec<Vec<Option<String>>> {
+    let requested_tables = table_names.iter().collect::<BTreeSet<_>>();
+    let mut tables = requested_tables
+        .iter()
+        .filter_map(|table_name| session.tables.get(table_name.as_str()))
+        .collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("BASE TABLE".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn information_schema_rich_tables_query() -> &'static str {
+    "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_schema = 'public' order by table_name"
+}
+
+fn information_schema_rich_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(information_schema_rich_table_row)
+        .collect()
+}
+
+fn information_schema_rich_tables_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_schema = 'public' and table_name = '";
+    let suffix = "' order by table_name";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn information_schema_rich_tables_catalog_query_table(canonical: &str) -> Option<String> {
+    let suffix = "' order by table_name";
+    let current_database_prefix = "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_catalog = current_database() and table_schema = 'public' and table_name = '";
+    if let Some(table) = canonical
+        .strip_prefix(current_database_prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+    {
+        return Some(table.to_string());
+    }
+    let literal_catalog_prefix = "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_catalog = 'postgres' and table_schema = 'public' and table_name = '";
+    canonical
+        .strip_prefix(literal_catalog_prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn information_schema_rich_table_rows_for_table(
+    session: &Session,
+    table: &str,
+) -> Vec<Vec<Option<String>>> {
+    session
+        .tables
+        .get(table)
+        .map(information_schema_rich_table_row)
+        .into_iter()
+        .collect()
+}
+
+fn information_schema_rich_table_row(table: &Table) -> Vec<Option<String>> {
+    vec![
+        Some("postgres".to_string()),
+        Some("public".to_string()),
+        Some(table.name.clone()),
+        Some("BASE TABLE".to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("YES".to_string()),
+        Some("NO".to_string()),
+        None,
+    ]
+}
+
 #[cfg(test)]
 pub(super) fn test_catalog_table_name_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     catalog_table_name_rows(session)
@@ -712,4 +949,68 @@ pub(super) fn test_pg_catalog_class_plain_table_rows_for_tables(
     table_names: &[String],
 ) -> Vec<Vec<Option<String>>> {
     pg_catalog_class_plain_table_rows_for_tables(session, table_names)
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    information_schema_table_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_base_table_discovery_query() -> &'static str {
+    information_schema_base_table_discovery_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_base_table_discovery_rows(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    information_schema_base_table_discovery_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_tables_in_query_tables(
+    canonical: &str,
+) -> Option<Vec<String>> {
+    information_schema_tables_in_query_tables(canonical)
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_table_rows_for_tables(
+    session: &Session,
+    table_names: &[String],
+) -> Vec<Vec<Option<String>>> {
+    information_schema_table_rows_for_tables(session, table_names)
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_rich_tables_query() -> &'static str {
+    information_schema_rich_tables_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_rich_table_rows(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    information_schema_rich_table_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_rich_tables_query_table(canonical: &str) -> Option<String> {
+    information_schema_rich_tables_query_table(canonical)
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_rich_tables_catalog_query_table(
+    canonical: &str,
+) -> Option<String> {
+    information_schema_rich_tables_catalog_query_table(canonical)
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_rich_table_rows_for_table(
+    session: &Session,
+    table: &str,
+) -> Vec<Vec<Option<String>>> {
+    information_schema_rich_table_rows_for_table(session, table)
 }

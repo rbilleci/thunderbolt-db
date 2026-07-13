@@ -1044,6 +1044,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   metadata, and absent GPU-resident system relations. Full protocol/driver/security/formatting gates, focused
   catalog tests, PostgreSQL 16 scenarios 22/23/29, and independent audit are clean. The root is 5,074 lines and
   STRUCT-001DF is closed.
+  The complete contiguous `information_schema.tables` family now executes from the existing private 1,016-line
+  `table_catalog` owner behind one additional stage-preserving delegate. Six exact public-table, base-table,
+  table-name `IN`, rich-table, exact-rich-table, and catalog-qualified-rich-table routes plus twelve query/parser/
+  row helpers are byte-identical moves. Ten `cfg(test)` wrappers retain only proven existing consumers. Exact
+  post-filtered-class/pre-column stage and internal branch order, equality/`IN`/catalog parser semantics,
+  requested-name deduplication, public-only tables, name sorting, fixed postgres/public/base-table/insertable/
+  typed fields and nulls, 3-/2-/3-/12-column shapes, writers, and fall-through are unchanged. Inherited
+  PRODUCT-002 debt remains exact generated-SQL routing, host table maps and CPU filtering/sorting, hard-coded
+  catalog/schema/type fields, and absent GPU-resident system relations. Full protocol/driver/security/formatting
+  gates, focused catalog tests, PostgreSQL 16 scenarios 08/20/27/38/45/73/324, and independent audit are clean.
+  The root is 4,861 lines and STRUCT-001DG is closed.
 
 ## Known boundaries
 
