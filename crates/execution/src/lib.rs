@@ -62,6 +62,7 @@ use resident_count::{
     launch_cuda_resident_i32_compare_count_serial, launch_cuda_resident_i32_equal_count_serial,
 };
 mod resident_window;
+use resident_window::validate_text_windows;
 pub use resident_window::CudaGroupTextSource;
 mod expression_vm;
 use expression_vm::{ExprTerminal, run_resident_arith_program};
@@ -1652,82 +1653,117 @@ fn launch_cuda_resident_text_prefix_count(
     row_count: u64,
     prefix: &[u8],
 ) -> Result<u64, CudaRuntimeProbeError> {
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("resident_text_prefix.ptx");
 
-    let offsets_len = row_count
-        .checked_add(1)
-        .and_then(|count| count.checked_mul(std::mem::size_of::<u64>() as u64))
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let offsets_end = offsets_byte_offset
-        .checked_add(offsets_len)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let bytes_end = bytes_byte_offset
-        .checked_add(bytes_len)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if offsets_end > resident.metadata().allocated_bytes
-        || bytes_end > resident.metadata().allocated_bytes
-    {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(
-            offsets_end.max(bytes_end) as usize,
-        ));
-    }
-    let offsets_len_usize = usize::try_from(offsets_len)
+    validate_text_windows(
+        resident.metadata().allocated_bytes,
+        offsets_byte_offset,
+        bytes_byte_offset,
+        bytes_len,
+        row_count,
+    )?;
+    let prefix_len = u64::try_from(prefix.len())
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let bytes_len_usize = usize::try_from(bytes_len)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let row_count_usize = usize::try_from(row_count)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-
-    let cu_memcpy_dtoh = unsafe {
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
         resident
             .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
+    let cu_memset_d8_async = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8Async>(b"cuMemsetD8Async\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_resident_text_prefix_count", &ptx)?;
+    let prefix_lease = primary.lease_device_buffer(prefix.len().max(1))?;
 
-    let mut raw_offsets = vec![0_u8; offsets_len_usize];
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            raw_offsets.as_mut_ptr().cast::<c_void>(),
-            resident.device_ptr() + offsets_byte_offset,
-            offsets_len_usize,
-        )
-    })?;
-    let mut bytes = vec![0_u8; bytes_len_usize];
-    if bytes_len_usize > 0 {
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                bytes.as_mut_ptr().cast::<c_void>(),
-                resident.device_ptr() + bytes_byte_offset,
-                bytes_len_usize,
+    const BLOCK: u32 = 256;
+    let grid = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 4096) as u32;
+    let mut output = [0_u8; 16];
+    launch_on_pooled_stream(resident, Some(&mut output), |stream, output_ptr| {
+        let memset_rc = unsafe { cu_memset_d8_async(output_ptr, 0, 16, stream) };
+        if memset_rc != 0 {
+            return memset_rc;
+        }
+        if !prefix.is_empty() {
+            let copy_rc = unsafe {
+                htod_async(
+                    prefix_lease.ptr,
+                    prefix.as_ptr().cast::<c_void>(),
+                    prefix.len(),
+                    stream,
+                )
+            };
+            if copy_rc != 0 {
+                return copy_rc;
+            }
+        }
+        let mut a0 = resident.device_ptr();
+        let mut a1 = offsets_byte_offset;
+        let mut a2 = bytes_byte_offset;
+        let mut a3 = bytes_len;
+        let mut a4 = prefix_lease.ptr;
+        let mut a5 = prefix_len;
+        let mut a6 = row_count;
+        let mut a7 = output_ptr;
+        let mut a8 = output_ptr + 8;
+        let mut args = [
+            (&mut a0 as *mut u64).cast::<c_void>(),
+            (&mut a1 as *mut u64).cast::<c_void>(),
+            (&mut a2 as *mut u64).cast::<c_void>(),
+            (&mut a3 as *mut u64).cast::<c_void>(),
+            (&mut a4 as *mut u64).cast::<c_void>(),
+            (&mut a5 as *mut u64).cast::<c_void>(),
+            (&mut a6 as *mut u64).cast::<c_void>(),
+            (&mut a7 as *mut u64).cast::<c_void>(),
+            (&mut a8 as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                function,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
-        })?;
-    }
+        }
+    })?;
 
-    let mut offsets = Vec::with_capacity(row_count_usize + 1);
-    for chunk in raw_offsets.chunks_exact(std::mem::size_of::<u64>()) {
-        offsets.push(u64::from_le_bytes(chunk.try_into().map_err(|_| {
-            CudaRuntimeProbeError::InvalidInputLength(raw_offsets.len())
-        })?));
+    let malformed = u32::from_le_bytes(output[8..12].try_into().unwrap());
+    if malformed != 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
     }
-    if offsets.len() != row_count_usize + 1 || offsets.first().copied() != Some(0) {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(offsets.len()));
-    }
-    let mut matches = 0_u64;
-    for pair in offsets.windows(2) {
-        let start = usize::try_from(pair[0])
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        let end = usize::try_from(pair[1])
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if start > end || end > bytes.len() {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(end));
-        }
-        if bytes[start..end].starts_with(prefix) {
-            matches = matches.saturating_add(1);
-        }
-    }
-    Ok(matches)
+    Ok(u64::from_le_bytes(output[..8].try_into().unwrap()))
 }
 
 fn launch_cuda_resident_text_project(

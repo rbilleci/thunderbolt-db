@@ -1723,6 +1723,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   stable in both layers and cache regimes: IN-L2/OUT-OF-L2 rooflines are 1,464.6/1,450.3 GB/s, count is
   0.92x/1.00x roofline, grouped aggregation is 1,678.3 M elements/s, and batch-65,536 point reads are 247.4M at
   p50 139us IN-L2 and 249.7M at p50 132us OUT-OF-L2; the OUT-OF-L2 index route is 3.20x scan.
+  STRUCT-001FS then removed the public resident TEXT-prefix route's full offsets/blob D2H and host predicate.
+  The 181-line ASCII PTX leaf compares prefix bytes and block-reduces the count on-device; the host receives only
+  a 16-byte count/error result. Checked host windows precede CUDA work, while the kernel validates the canonical
+  zero offset and every actual start/end pair before text loads. The shared primary context is bound before module
+  caching or buffer leasing; deleting that bind makes the first fresh-reader-thread regression fail with CUDA 201,
+  proving non-vacuity. Positive, empty-prefix, empty-relation, no-match, malformed-window, malformed-device-offset,
+  reuse, and fresh-thread coverage passed three sequential plus two concurrent final-tree invocations. The retained
+  512-row chunked-upload consumer passes with 256 prefix matches. Complete execution passes 135/135, ordinary
+  engine passes 505/487 and complete engine passes 992/992; workspace all-target/all-feature check, strict
+  execution/engine clippy, dependency boundary, `sm_90` assembly, ASCII/scoped-format/diff checks, and independent
+  audit are clean. The canonical card is stable: IN-L2/OUT-OF-L2 rooflines are 1,489.9/1,448.9 GB/s, count is
+  0.91x/1.00x roofline, grouped aggregation is 1,677.7 M elements/s, and batch-65,536 point reads are 252.6M at
+  p50 136us IN-L2 and 257.1M at p50 128us OUT-OF-L2; the OUT-OF-L2 index route is 3.22x scan.
 
 ## Known boundaries
 

@@ -15,14 +15,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - QUALITY-002 is closed. Integer SUM binding now agrees with its bigint materialized value and wire descriptor;
   the hidden join `ORDER BY` expectation and five recovery-era cold-tier fixtures now reflect their live routes.
   All seven focused matrices, the complete 992-test engine gate, static gates, report card, and audit pass.
+- STRUCT-001FS is closed. The public resident TEXT-prefix count now validates and compares on-device, block-reduces
+  to one scalar, fails malformed offsets closed, and self-binds the primary context on fresh reader threads. Its
+  HAZARD matrix, deletion sabotage, complete suites, report card, and independent audit pass.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001:** continue the ordered oversized-file inventory. The next critical ownership hub
-   is `crates/execution/src/lib.rs`; do not let structural extraction implicitly decide **R3-001**.
+1. **STRUCT-001:** resume the ordered oversized-file inventory at `crates/execution/src/lib.rs`; the next coherent
+   boundary is resident TEXT projection/result ownership now that its adjacent prefix count is GPU-native. Do not
+   let structural extraction implicitly decide **R3-001**.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
 4. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.

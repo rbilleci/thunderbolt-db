@@ -514,6 +514,8 @@
 
     include!("cuda_paths.rs");
 
+    include!("resident_text.rs");
+
     include!("context_aggregate.rs");
 
     #[test]
