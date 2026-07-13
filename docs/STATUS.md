@@ -658,6 +658,12 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   helper internally. Full protocol and driver gates, all-target checks, warning-denied clippy, security preflight,
   focused function/error/recovery tests, formatting/diff checks, and independent audit are clean. The root is
   10,887 lines and STRUCT-001BS is closed.
+  Recursive session-view dependency detection now lives inside the existing private 543-line `view_ddl` owner.
+  Direct target detection, cycle termination through the visited set, self exclusion in dependent scans, and all
+  CREATE OR REPLACE/rename/drop call sites and errors are exact moves. All three helpers remain module-private;
+  no new export or dependency edge was added. Full protocol and driver gates, all-target checks, warning-denied
+  clippy, security preflight, focused view/shared-catalog tests, formatting/diff checks, and independent audit are
+  clean. The root is 10,857 lines and STRUCT-001BT is closed.
 
 ## Known boundaries
 

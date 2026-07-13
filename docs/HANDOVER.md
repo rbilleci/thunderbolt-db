@@ -29,9 +29,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BT:** move recursive session-view dependency and dependent checks into the existing private
-   `view_ddl` owner, preserving cycle guards and CREATE OR REPLACE/rename/drop behavior with module-private
-   helpers only.
+1. **STRUCT-001BU:** move the sole-consumer table/index/sequence/function rename helpers into their existing
+   private command owners, preserving dependency and metadata/ACL/comment retargeting semantics and retaining
+   direct-test access through test-only root aliases only.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

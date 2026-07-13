@@ -2,12 +2,41 @@
 
 use super::{
     execute_select_result, materialize_select_rows, schema_permission_error,
-    session_view_depends_on, session_view_has_dependents, write_command_complete, write_error,
-    CatalogCommentTarget, Command, ErrorField, MaterializedView, ReadWrite, SchemaPrivilege,
-    Session, View,
+    write_command_complete, write_error, CatalogCommentTarget, Command, ErrorField,
+    MaterializedView, ReadWrite, SchemaPrivilege, Session, View,
 };
 use std::collections::BTreeSet;
 use std::io;
+
+fn session_view_depends_on(session: &Session, view: &str, target: &str) -> bool {
+    let mut seen = BTreeSet::new();
+    session_view_depends_on_inner(session, view, target, &mut seen)
+}
+
+fn session_view_depends_on_inner(
+    session: &Session,
+    view: &str,
+    target: &str,
+    seen: &mut BTreeSet<String>,
+) -> bool {
+    if view == target {
+        return true;
+    }
+    if !seen.insert(view.to_string()) {
+        return false;
+    }
+    let Some(view) = session.views.get(view) else {
+        return false;
+    };
+    session_view_depends_on_inner(session, &view.query.table, target, seen)
+}
+
+fn session_view_has_dependents(session: &Session, view: &str) -> bool {
+    session
+        .views
+        .keys()
+        .any(|candidate| candidate != view && session_view_depends_on(session, candidate, view))
+}
 
 pub(super) fn execute_view_ddl(
     stream: &mut dyn ReadWrite,

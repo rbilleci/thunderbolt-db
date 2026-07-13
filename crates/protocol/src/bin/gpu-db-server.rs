@@ -278,36 +278,6 @@ fn column_default_matches_type(value: &ColumnDefault, ty: gpu_db_protocol::SqlTy
     }
 }
 
-fn session_view_depends_on(session: &Session, view: &str, target: &str) -> bool {
-    let mut seen = BTreeSet::new();
-    session_view_depends_on_inner(session, view, target, &mut seen)
-}
-
-fn session_view_depends_on_inner(
-    session: &Session,
-    view: &str,
-    target: &str,
-    seen: &mut BTreeSet<String>,
-) -> bool {
-    if view == target {
-        return true;
-    }
-    if !seen.insert(view.to_string()) {
-        return false;
-    }
-    let Some(view) = session.views.get(view) else {
-        return false;
-    };
-    session_view_depends_on_inner(session, &view.query.table, target, seen)
-}
-
-fn session_view_has_dependents(session: &Session, view: &str) -> bool {
-    session
-        .views
-        .keys()
-        .any(|candidate| candidate != view && session_view_depends_on(session, candidate, view))
-}
-
 fn index_definition_prefix(unique: bool) -> &'static str {
     if unique {
         "CREATE UNIQUE INDEX"
