@@ -1,7 +1,8 @@
 //! SQL -> `ResidentExpr` binding via libpg_query (Charter rule 2;
 //! `docs/architecture/18-sql-to-expr-handoff.md`). The `pg_query` crate vendors libpg_query — the
 //! real PostgreSQL parser — so a SQL string is parsed by Postgres's own grammar and then walked into
-//! the engine's general `ResidentExpr` IR (`engine_expr.rs`) and executed by the general GPU executor.
+//! the engine's general `ResidentExpr` IR (`engine_expr_ir`, re-exported by the `engine_expr` facade) and
+//! executed by the general GPU executor.
 //! This is the "close the loop" path: SQL text -> general GPU execution. It deliberately does NOT
 //! extend the hand-rolled `gpu_db_sql` parser and is NOT a catalog of query shapes — coverage grows by
 //! node / type / operator (Charter rule 2). Today it binds a single-table `SELECT ... WHERE` over int4

@@ -1907,6 +1907,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   execution clippy, exact-source/consumer/scoped-format/diff/docs gates, and independent audit are clean. No runtime,
   kernel, residency, or result behavior changed, so the canonical report card was not applicable. The expression
   root is now 11,231 lines.
+  STRUCT-001GH then isolated the state-free scalar expression contract in the 63-line `engine_expr_ir.rs` leaf.
+  `ResidentBinaryOp` and `ResidentExpr` retain their exact derives, variants, fields, ordering, and variant-specific
+  docs; only inherited prose that still called production parser/operator coverage future work was corrected. Their
+  stable `crate::engine_expr` paths remain narrow crate-private re-exports. Dependencies now flow one-way from SQL
+  binding, DML predicate construction, streaming, tests, and the GPU executor toward the neutral IR and its sole
+  explicit `Decimal128` dependency; the leaf has no state, reverse engine dependency, feature gate, unsafe, PTX,
+  cycle, or visibility expansion. Focused SQL boolean, numeric lowering, mixed-width DML, and streaming type-matrix
+  GPU routes pass, as do both 505/487 engine modes, all-target check, strict clippy, exact-definition/consumer/
+  scoped-format/diff/docs gates, and independent re-audit. Runtime behavior did not change, so HAZARD and report-card
+  gates were not applicable. The expression root is now 11,168 lines.
 
 ## Known boundaries
 

@@ -71,14 +71,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   its stable crate-private path. Its six-family 18+12 HAZARD matrix, complete 505/487 suites, static gates, and
   independent audit pass; the report card was not applicable. The root is 11,231 lines, and host result-key/payload
   construction plus permutation transfers remain RETIRE-003 debt.
+- STRUCT-001GH is closed. The exact state-free `ResidentBinaryOp`/`ResidentExpr` contract now lives in the 63-line
+  `engine_expr_ir.rs` leaf behind unchanged crate-private paths; only stale capability/ownership prose changed. Four
+  focused GPU routes, complete 505/487 suites, static gates, and independent re-audit pass. The expression root is
+  11,168 lines; HAZARD and report card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GH:** isolate only `ResidentBinaryOp` and `ResidentExpr` into a neutral IR leaf behind their existing
-   crate-private paths; do not combine join, visibility, compiler, or lowering ownership.
+1. **STRUCT-001GI:** isolate only the five state-free join-plan types into a neutral leaf behind their existing
+   crate-private paths; keep sentinels, device/runtime state, parsing, projection, and execution in place.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

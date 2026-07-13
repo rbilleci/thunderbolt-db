@@ -4,13 +4,9 @@
 //! expression tree, lowered to a pipeline of device primitives, NOT matched against a fixed catalog
 //! of shapes.
 //!
-//! `ResidentExpr` is the general scalar IR (it can represent any int4 arithmetic/comparison/boolean
-//! tree). The interpreter's *coverage* grows node-by-node; today `lower_resident_predicate` lowers
-//! the prototype shape `Compare(arith(Column, Column), Int4Literal)` to the typed postfix VM plus
-//! ordered-compaction facade (`expr_filter_two_col_compare_from_payload`) and materializes projected int4
-//! columns by gathering the surviving rows. Fuller trees (deeper arithmetic, AND/OR over masks,
-//! column-vs-column compares) land as the device bytecode VM in §2.3 of the design doc — by
-//! extending this interpreter, never by adding a new shape method.
+//! `ResidentExpr` is the general scalar IR for the supported resident SQL types. Lowering compiles
+//! arithmetic, comparison, boolean, NULL, and text predicates into typed device VM/operators; coverage
+//! grows by expression node and type, never by adding another whole-query shape method.
 //!
 //! The IR + op-code maps + `execute_resident_expr_select_with_binding` are now the production path the
 //! SQL->Expr binding (`engine_sql_pg`) routes into; the GPU parity tests exercise the same lowering
@@ -24,66 +20,7 @@ use super::*;
 /// source allocation/offsets/blob/length, and row count.
 type TextRebaseOp = (u64, u32, u64, u64, u64, u64, u64, u32);
 
-/// A binary operator in the resident expression IR (arithmetic, comparison, or boolean). The
-/// interpreter pattern-matches these; callers (tests now, the parser/planner later) construct them.
-/// Not all variants have interpreter coverage yet (the device bytecode VM, design §2.3, adds
-/// AND/OR/Ne/col-vs-col).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResidentBinaryOp {
-    Add,
-    Sub,
-    Mul,
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    And,
-    Or,
-    /// SQL `LIKE`: the lhs is a text column, the rhs a [`ResidentExpr::TextLiteral`] pattern (`%` =
-    /// any run, `_` = any one character). Byte-wise / UTF-8-char-aware (the type matrix, doc 19).
-    Like,
-}
-
-/// The general scalar-expression IR the GPU interpreter evaluates. Column fields are table column
-/// indices; the interpreter resolves device byte-offsets. Grows by node (literals of other types,
-/// casts, unary ops, `LIKE`, ...), never by enumerating whole query shapes.
-#[derive(Debug, Clone)]
-pub(crate) enum ResidentExpr {
-    Column(usize),
-    Int4Literal(i32),
-    /// A full-width i64 literal — the comparison value for an `int8`/`timestamp` column whose literal may
-    /// exceed `i32` (a timestamp, a large bigint). Lowers to a `CompareScalarI64` VM step at `I64` element
-    /// width (an `Int4Literal` against an int8 column widens instead, so this is only needed for literals
-    /// outside the i32 range, but the DML predicate builder emits it for every int8 leaf for uniformity).
-    Int8Literal(i64),
-    /// A numeric (DECIMAL) literal as its [`Decimal128`] (mantissa + scale). Compared by rescaling to
-    /// the target column's scale at lowering time (the type matrix, doc 19). An integer literal
-    /// compared to a numeric column arrives as `Int4Literal` and is coerced to numeric on that path.
-    NumericLiteral(Decimal128),
-    /// A text (`text`/`varchar`) literal -- the comparison/LIKE value for a text column. Compared
-    /// byte-wise (deterministic-collation equality is byte-identity; the type matrix, doc 19).
-    TextLiteral(String),
-    /// A boolean literal (`true`/`false`) -- the comparison value for `flag = true` / `flag = false`
-    /// (the type matrix, doc 19). A bool column is a bitmap, so the comparison lowers to the
-    /// bitmap->mask kernel with the appropriate `negate`.
-    BoolLiteral(bool),
-    /// `col IS NULL` / `col IS NOT NULL` (`is_not_null` selects which). A unary predicate LEAF over a
-    /// column's NULL validity bitmap (M3 -- doc 21): it lowers to the SAME `gpu_db_resident_bool_to_mask`
-    /// kernel as a bool column, pointed at the column's validity bitmap (1 = valid/present), with
-    /// `negate = !is_not_null`. A column with no validity bitmap (no NULLs) lowers to an all-constant
-    /// mask. Not an arithmetic operand -- the arith/compare paths reject it.
-    IsNull {
-        col: usize,
-        is_not_null: bool,
-    },
-    Binary {
-        op: ResidentBinaryOp,
-        lhs: Box<ResidentExpr>,
-        rhs: Box<ResidentExpr>,
-    },
-}
+pub(crate) use crate::engine_expr_ir::{ResidentBinaryOp, ResidentExpr};
 
 /// A column reference inside a JOIN (ON condition or projection): a bare column (`qualifier: None`) or
 /// a qualified `alias.column` (`qualifier: Some(alias)`). Resolved to a specific relation + column
