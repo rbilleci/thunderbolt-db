@@ -1197,6 +1197,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   file with all original harness names. Focused progress/status/recovery tests, both 187-test serial/16-thread
   runs, replication all-target check and strict clippy, cluster smoke, targeted formatting/diff/reference checks,
   and independent audit are clean. The root is 18,111 lines with 972 production lines; STRUCT-001DU is next.
+  STRUCT-001DU isolated the exact `LocalReplicator` record, inherent behavior, and `LogReplicator`
+  implementation in a private 294-line `local` owner with the unchanged crate-root re-export. Role/term
+  transitions, indexing/compaction, commit/apply watermarks, snapshot identity/install, recovery/status
+  projection, public methods, errors, and trait behavior are exact; only `entry_at` is narrowly `pub(super)`
+  for its two pre-existing owner/parent consumers. Raft production is byte-identical. The selected exact 20-test
+  local family now lives in a bounded 354-line included file with all original harness names. Focused local,
+  snapshot, and progress tests, both 187-test serial/16-thread runs, replication all-target check and strict
+  clippy, downstream engine all-target check, targeted formatting/diff/reference checks, and independent audit
+  are clean. The root is 17,469 lines with 683 production lines; STRUCT-001DV is next.
 
 ## Known boundaries
 

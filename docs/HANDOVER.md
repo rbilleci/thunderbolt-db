@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DU:** isolate exact LocalReplicator state/trait behavior and its closest 20 tests behind the stable
-   root facade; preserve roles, indices, snapshots, recovery/status projection, errors, APIs, and test names.
+1. **STRUCT-001DV:** externalize the exact 11-test baseline Raft/progress family behind the unchanged parent test
+   facade; preserve every body and harness name, and do not change production code or visibility.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
