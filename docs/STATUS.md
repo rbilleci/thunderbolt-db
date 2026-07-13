@@ -1277,6 +1277,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   runs, replication all-target check and strict clippy, scoped formatting/diff/reference checks, and independent
   audit are clean. The file is 162 lines below the 3,000-line required-analysis threshold. The root is 3,545
   lines with 683 production lines; STRUCT-001EE is next.
+  STRUCT-001EE externalized the exact contiguous six-test stale-install unwind family into a cohesive
+  1,645-line `tests/repair_stale_unwind.rs` owner through an `include!` at the same parent position. Parent-
+  deindented source is byte-identical and rustfmt-clean; bodies, attributes, names, and semantics are unchanged.
+  The owner covers stale-install inertness at progressively unwound repair depths plus paired later-repair
+  commit/apply retirement. All six exact tests, both 187-test serial/16-thread runs, replication all-target
+  check and strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. The root
+  is 1,901 lines with 683 production lines, below the production-file analysis threshold; STRUCT-001EF is next.
 
 ## Known boundaries
 

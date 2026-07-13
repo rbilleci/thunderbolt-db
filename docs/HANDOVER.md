@@ -29,7 +29,7 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EE:** externalize the exact six-test stale-install unwind repair family behind the unchanged
+1. **STRUCT-001EF:** externalize the exact final six-test advanced repair cleanup family behind the unchanged
    parent test facade; preserve bodies/names and do not change production code or visibility.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
