@@ -1245,6 +1245,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   retirement. All seven exact tests, the broad repair filter, both 187-test serial/16-thread runs, replication
   all-target check and strict clippy, scoped formatting/diff/reference checks, and independent audit are clean.
   The root is 12,573 lines with 683 production lines; STRUCT-001EA is next.
+  STRUCT-001EA externalized the exact contiguous seven-test second-refresh advanced-replacement repair family
+  into a bounded 1,107-line `tests/repair_second_refresh.rs` owner through an `include!` at the same parent
+  position. Formatting-normalized source compares exactly; only one long declaration rewrapped, while bodies,
+  attributes, names, and semantics are unchanged. The owner covers later advanced replacement, replacement/
+  refresh identity, role discard, commit/apply retirement, rejection collapse, and subsequent repair. All seven
+  exact tests, both 187-test serial/16-thread runs, replication all-target check and strict clippy, scoped
+  formatting/diff/reference checks, and independent audit are clean. The root is 11,466 lines with 683
+  production lines; STRUCT-001EB is next.
 
 ## Known boundaries
 
