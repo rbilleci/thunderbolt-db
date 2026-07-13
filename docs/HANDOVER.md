@@ -50,12 +50,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001EO is closed: the exact four-test DATE/INT2 and INT8 shard/elision family now lives in the bounded
   426-line `tests/residency_type_coverage.rs` owner; exact inventories, 20 GPU invocations, full gates, and audit
   are clean with no production change.
+- STRUCT-001EP is closed: the exact three-test device locate/reinsert/versioned-scan family now lives in the
+  bounded 214-line `tests/residency_device_locate.rs` owner; exact inventories, 15 GPU invocations, full gates,
+  and audit are clean with no production change.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EP:** externalize the exact three-test device locate/reinsert/versioned-scan family.
+1. **STRUCT-001EQ:** externalize the exact five-test wide-type and grouped/versioned residency-read family.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

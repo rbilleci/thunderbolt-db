@@ -1395,7 +1395,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   passed 12 sequential and eight concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed
   505/487, and all-target check, strict clippy, scoped formatting/diff/reference checks, and independent audit
   are clean. No production encoding, append, elision, or architectural behavior changed, so the report card was
-  not applicable. STRUCT-001EP is next.
+  not applicable.
+  STRUCT-001EP externalized the exact three-test device locate/reinsert/versioned-scan family into the byte-
+  exact, rustfmt-clean 214-line `tests/residency_device_locate.rs` owner at the same parent position. All bodies,
+  attributes, names, and order remain unchanged, and the adjacent text-column test remains at the parent
+  boundary. The engine root is 8,911 lines, and the 992-test/76-family inventories remain exact. Three GPU gates
+  passed nine sequential and six concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed
+  505/487, and all-target check, strict clippy, scoped formatting/diff/reference checks, and independent audit
+  are clean. No production locate, reinsert, scan, or architectural behavior changed, so the report card was not
+  applicable. STRUCT-001EQ is next.
 
 ## Known boundaries
 
