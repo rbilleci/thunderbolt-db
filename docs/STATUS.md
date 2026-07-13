@@ -683,6 +683,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and violation messages omit object names. Full protocol and driver gates, all-target checks, warning-denied
   clippy, security preflight, focused COPY/DML/index tests, formatting/diff checks, and independent audit are
   clean. The root is 10,466 lines and STRUCT-001BV is closed.
+  Foreign-key addition and column/constraint drop/rename mutations now live inside the existing private
+  1,467-line `ddl_execution` owner, leaving 33 lines of headroom under the preferred limit. Self-FK, duplicate,
+  kind/existence, column/type and unique-parent precedence; `CatalogForeignKey` construction; insert/validate/pop
+  rollback; checked attnums and row mutation; index/check/FK/comment changes; dirty state; persistence; and errors
+  are token-exact moves. Inherited PRODUCT-002 name/dependency debt remains: referenced-column rename does not
+  retarget inbound FKs stored on other tables; column rename/drop neither blocks nor retargets view or
+  materialized-view column references; and dropping a serial/default-owned column leaves its implicit sequence
+  orphaned. Full protocol and driver gates, all-target checks, warning-denied clippy, security preflight, focused
+  table/comment persistence tests, formatting/diff checks, and independent audit are clean. The root is 10,043
+  lines and STRUCT-001BW is closed.
 
 ## Known boundaries
 

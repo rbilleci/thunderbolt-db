@@ -29,9 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BW:** move foreign-key addition and column/constraint drop/rename helpers into the existing private
-   `ddl_execution` owner, preserving validation/rollback and metadata/comment behavior while keeping it below
-   1,500 lines.
+1. **STRUCT-001BX:** isolate primary-key, unique, and check-constraint construction in a private owner, preserving
+   exact validation, OID/index/check state, rollback, errors, and publication through only three narrow exports.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
