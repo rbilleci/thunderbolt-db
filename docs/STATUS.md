@@ -449,6 +449,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   relational capability. Sequential/concurrent 127-test runs, the full protocol package and driver smokes,
   all-target checks, warning-denied clippy, security preflight, formatting, and independent audit are clean. The
   root is 16,809 lines and STRUCT-001AS is closed.
+  Legacy COPY state and execution now live in the private 283-line `copy_execution` module. The original
+  273-line body is normalized-exact and exposes exactly four proven entry points: COPY TO/FROM setup serves the
+  simple and extended paths, while data buffering and row application serve frontend dispatch. Text/CSV
+  delimiter, quote, escape, header and NULL encoding, wire framing, buffering/terminator handling, validation,
+  rollback/no-mutation behavior, dirty-table publication, snapshot persistence, CopyFail recovery, error
+  precedence, and completion tags are unchanged. Dependencies remain private and acyclic, and no host product
+  API or relational behavior was added. Sequential/concurrent 127-test runs, the full protocol package and
+  driver smokes, all-target checks, warning-denied clippy, security preflight, formatting, and independent audit
+  are clean. No read kernel, residency, or result path changed, so the GPU report card was not applicable. The
+  root is 16,541 lines and STRUCT-001AT is closed.
 
 ## Known boundaries
 

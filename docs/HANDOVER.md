@@ -33,10 +33,10 @@ The sole work ledger is `PLAN.md`.
    isolation matrix; never replace it with a host interpretation path.
 2. **MULTI-002:** on that host, partition write/visible-locate submissions by
    primary context and deterministically merge bounded metadata; never move lookup or visibility to the host.
-3. **STRUCT-001AT:** isolate COPY value encoding, COPY TO/FROM state, data application, recovery, dirty-table
-   publication, and protocol completion behind proven private callers. Preserve exact CSV/text/framing behavior;
-   keep statement parsing, DML, simple-query, catalog, and relational dispatch outside it. Aggregate slow-client
-   control remains **SCALE-001**.
+3. **STRUCT-001AU:** isolate the shared identifier grammar and TRUNCATE/DROP TABLE/ALTER TABLE DROP CONSTRAINT/
+   unsupported-FK-option parsers behind proven private callers. Preserve exact accepted forms and flags; keep DDL
+   mutation, catalog, COPY, and relational execution outside it. Aggregate slow-client control remains
+   **SCALE-001**.
 4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
