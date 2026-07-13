@@ -402,6 +402,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   columns are unchanged. Sequential and concurrent 127-test runs, full workspace/protocol checks, warning-denied
   clippy, driver smokes, TLS/SCRAM preflight, affected psql scenarios, formatting, and independent audit are
   clean. The root is 19,278 lines and STRUCT-001AN is closed.
+  The legacy ready loop and frontend-message state machine now live in the private 261-line
+  `frontend_dispatch` module. The production body is normalized-exact; only `handle_ready_client` is
+  parent-private, while direct tests use two `cfg(test)` delegates for the private message handler and
+  unsupported mapping. `ReadyLoopState`, transaction status, skip-until-Sync recovery, COPY data/done/fail,
+  Flush/Terminate, and exact errors are unchanged. Session/catalog/DML ownership stays in the root and the
+  module calls existing handlers rather than exposing host execution. Sequential/concurrent 127-test runs,
+  full protocol/driver/security gates, formatting, and independent audit are clean. Security source guards now
+  follow the moved unsupported-message owner. The root is 19,052 lines and STRUCT-001AO is closed.
 
 ## Known boundaries
 
