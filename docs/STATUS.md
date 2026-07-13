@@ -349,6 +349,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   protocol-library framing owner, and canonical STATUS fact. Independent audit is clean. STRUCT-001AH is closed;
   this is containment of the legacy host-backed compatibility endpoint pending **PRODUCT-001**, not a product
   relational path.
+  Legacy listener bootstrap and connection security now live in the private 754-line `server_bootstrap` module.
+  Root `main` delegates to its single `pub(super) run`; every config, TLS, and SCRAM type/function remains module-
+  private. The module calls only the existing ready loop, shared tagged-frame reader, and backend adapter, with
+  no session, catalog, DML, prepared, portal, or cursor type crossing the seam. Normalized production ranges and
+  the two moved argument tests hash exactly against the parent after the `main`-to-`run` rename. CLI/environment
+  precedence, thread-per-connection listener behavior, TLS upgrade/nested-SSL rejection, startup packet handling,
+  SCRAM crypto/error/wire order, and startup frame bounds are unchanged. The root is 30,966 lines and the exact
+  123-test inventory remains stable. Protocol full tests, all-target check, clippy with warnings denied,
+  tokio-postgres/SQLx smokes, full TLS/SCRAM preflight, formatting, diff, and independent audit are clean.
+  STRUCT-001AI is closed under the same **PRODUCT-001** containment boundary.
 
 ## Known boundaries
 
