@@ -1269,6 +1269,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   runs, replication all-target check and strict clippy, scoped formatting/diff/reference checks, and independent
   audit are clean. The file is 170 lines below the 3,000-line required-analysis threshold. The root is 6,382
   lines with 683 production lines; STRUCT-001ED is next.
+  STRUCT-001ED externalized the exact contiguous eight-test deep refresh/rejection cycle into a cohesive
+  2,838-line `tests/repair_deep_refresh.rs` owner through an `include!` at the same parent position. Parent-
+  deindented source is byte-identical and rustfmt-clean; bodies, attributes, names, and semantics are unchanged.
+  The owner covers the deepest later-repair cycle, role handoff, commit/apply retirement, subsequent refresh
+  identity/gap retirement, and stale-install inertness. All eight exact tests, both 187-test serial/16-thread
+  runs, replication all-target check and strict clippy, scoped formatting/diff/reference checks, and independent
+  audit are clean. The file is 162 lines below the 3,000-line required-analysis threshold. The root is 3,545
+  lines with 683 production lines; STRUCT-001EE is next.
 
 ## Known boundaries
 
