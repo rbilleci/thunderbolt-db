@@ -1134,6 +1134,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   security preflight, PostgreSQL 16 scenarios 18/19/68/333/334/341/342/347/349/350/351/352, all eighteen pg-dump
   restore variants, pg-dumpall globals restore, and independent audit are clean. The root is 2,543 lines and
   STRUCT-001DN is closed.
+  Pg-dump compatibility ownership is now complete in the existing private 1,031-line `pg_dump_compat` owner.
+  Nineteen exact helpers moved from the root: five sequence, six function, one bounded empty-catalog classifier,
+  and seven domain helpers. Eight remain owner-private, ten retain parent-private names for `sql_prepare`, and the
+  classifier retains its existing name through one `cfg(test)` parent import without a wrapper or new test alias.
+  The compatibility prelude executable body is byte-identical. Exact predicates/parsers, synthetic metadata/OIDs,
+  column names/types/row shapes, function/domain/type/ACL fields, sequence state/setval behavior, classification,
+  sorting, empty/null behavior, route order, sibling call sites, and output are unchanged. Inherited PRODUCT-002
+  debt remains exact host routing, CPU metadata/state construction, simplified catalog semantics, and absent GPU-
+  resident system relations. Formatting/diff checks, all-target check and clippy, six focused pg-dump/function/
+  sequence tests, 71 library tests, 127 binary tests serial and 16-thread, tokio-postgres/SQLx smokes, the connection-
+  security preflight, PostgreSQL 16 scenarios 295/330/332/336/341/348/352, all eighteen pg-dump restore variants,
+  pg-dumpall globals restore on a fresh dedicated port range, and independent audit are clean. The root is 1,993
+  lines and STRUCT-001DO is closed.
+  The legacy protocol root now satisfies the 2,000-line production envelope without an exception. Its remaining
+  400-line `execute_statement` is the ordered private orchestration facade over the extracted family owners; state
+  and shared type/helper ownership remain at the binary boundary. The protocol inventory disposition and the
+  sequencing parent STRUCT-001AV are closed; further work belongs to PRODUCT-001/PRODUCT-002 rather than source-
+  size remediation.
 
 ## Known boundaries
 

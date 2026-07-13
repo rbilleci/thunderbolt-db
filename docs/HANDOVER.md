@@ -29,15 +29,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DO:** move the nineteen remaining sequence/function/domain/empty-catalog pg-dump helpers into the
-   private compatibility owner, preserve the prelude body and existing parent-private consumers, and take the
-   legacy root below 2,000 lines.
-2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
-   owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
-3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
+1. **STRUCT-001DP:** analyze the 20,164-line replication facade and 18,143-line inline test module, then promote
+   one bounded invariant-owned slice with stable crate-root APIs and exact correctness/security/smoke gates.
+2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
-4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-5. **MULTI-001/002/003:** only after every non-MULTI plan item is complete or the user explicitly promotes them,
+3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+4. **MULTI-001/002/003:** only after every non-MULTI plan item is complete or the user explicitly promotes them,
    run their mandatory non-vacuous physical multi-GPU gates; never replace them with host interpretations.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
