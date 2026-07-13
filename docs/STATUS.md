@@ -394,6 +394,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   include fragment, cycle, catch-all, or numbered shard was introduced. Both sequential and default-concurrent
   127-test runs, full package/driver/security gates, formatting, and independent audit are clean. STRUCT-001AM
   is closed.
+  Legacy bind/describe ownership now lives in the private 1,179-line `bind_describe` module. The normalized
+  1,152-line/47-function production body is exact. Exactly 15 functions with proven external production callers
+  are parent-private; all 32 remaining helpers stay module-private. Three additional `cfg(test)` delegates keep
+  existing direct-helper tests without production-build visibility. Parameter error precedence/text and OIDs,
+  quoted/comment placeholder handling, SQL EXECUTE mapping, negative LIMIT/OFFSET describe behavior, and result
+  columns are unchanged. Sequential and concurrent 127-test runs, full workspace/protocol checks, warning-denied
+  clippy, driver smokes, TLS/SCRAM preflight, affected psql scenarios, formatting, and independent audit are
+  clean. The root is 19,278 lines and STRUCT-001AN is closed.
 
 ## Known boundaries
 
