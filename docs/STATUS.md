@@ -792,6 +792,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   of the encoded visibility predicates to the returned session maps, and legacy host-catalog execution. Full
   protocol/driver/security/formatting gates, focused view/comment/shared-catalog tests, fresh real-psql scenarios
   49/50/309/331, and independent audit are clean. The root is 8,068 lines and STRUCT-001CH is closed.
+  The normal/verbose psql function listings plus direct public `pg_proc` metadata and description reads now
+  execute from the existing private 508-line `function_execution` owner behind one tri-state delegate. The psql
+  query literal, four sorted row builders, ACL formatter, and all four routes are exact moves; helpers remain
+  private and the only new test exposure is three proven aliases. Dispatcher position, equality and broad verbose
+  structural predicates, columns, SQL types/OIDs/body, comments, ACL formatting, constants, nulls, and name order
+  are unchanged. Inherited PRODUCT-002 debt remains: exact client-version literals, broad verbose matching,
+  hard-coded metadata, omitted argument/internal-name values, no overload-aware identity or applied visibility
+  filtering, and legacy host-catalog execution. Full protocol/driver/security/formatting gates, focused function/
+  ACL/shared-catalog tests, fresh real-psql scenarios 51/348, and independent audit are clean. The root is 7,916
+  lines and STRUCT-001CI is closed.
 
 ## Known boundaries
 

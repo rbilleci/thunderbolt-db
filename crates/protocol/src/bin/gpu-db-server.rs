@@ -114,9 +114,14 @@ use view_ddl::{
 };
 #[path = "gpu-db-server/function_execution.rs"]
 mod function_execution;
-use function_execution::execute_function_command;
+use function_execution::{execute_function_command, try_execute_function_catalog_query};
 #[cfg(test)]
-use function_execution::{execute_function_result, rename_function_in_session};
+use function_execution::{
+    execute_function_result, rename_function_in_session,
+    test_pg_catalog_function_rows as pg_catalog_function_rows,
+    test_psql_describe_function_verbose_rows as psql_describe_function_verbose_rows,
+    test_psql_describe_functions_catalog_query as psql_describe_functions_catalog_query,
+};
 #[path = "gpu-db-server/sequence_execution.rs"]
 mod sequence_execution;
 use sequence_execution::{
@@ -1566,63 +1571,8 @@ fn execute_statement(
     if let Some(result) = try_execute_sequence_catalog_query(stream, session, &canonical) {
         return result;
     }
-    if canonical == psql_describe_functions_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Result data type"),
-                text_column("Argument data types"),
-                text_column("Type"),
-            ],
-            &psql_describe_function_rows(session),
-        );
-    }
-    if canonical.starts_with("select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.pg_get_function_result(p.oid) as \"result data type\"")
-        && canonical.contains("p.provolatile")
-        && canonical.contains("from pg_catalog.pg_proc p")
-    {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Result data type"),
-                text_column("Argument data types"),
-                text_column("Type"),
-                text_column("Volatility"),
-                text_column("Parallel"),
-                text_column("Owner"),
-                text_column("Security"),
-                text_column("Access privileges"),
-                text_column("Language"),
-                text_column("Internal name"),
-                text_column("Description"),
-            ],
-            &psql_describe_function_verbose_rows(session),
-        );
-    }
-    if canonical == "select p.oid, n.nspname, p.proname, p.prorettype, pg_catalog.pg_get_function_result(p.oid), p.prosrc from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' order by p.proname" {
-        return write_single_row(
-            stream,
-            &[
-                int4_column("oid"),
-                text_column("nspname"),
-                text_column("proname"),
-                int4_column("prorettype"),
-                text_column("pg_get_function_result"),
-                text_column("prosrc"),
-            ],
-            &pg_catalog_function_rows(session),
-        );
-    }
-    if canonical == "select p.proname, d.description from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace join pg_catalog.pg_description d on d.objoid = p.oid where n.nspname = 'public' order by p.proname" {
-        return write_single_row(
-            stream,
-            &[text_column("proname"), text_column("description")],
-            &pg_catalog_function_description_rows(session),
-        );
+    if let Some(result) = try_execute_function_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if canonical == psql_list_aggregates_catalog_query() {
         return write_single_row(
@@ -3073,10 +3023,6 @@ fn psql_describe_indexes_catalog_query_schema_filter(canonical: &str) -> Option<
     (namespace == "public").then(|| namespace.to_string())
 }
 
-fn psql_describe_functions_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.pg_get_function_result(p.oid) as \"result data type\", pg_catalog.pg_get_function_arguments(p.oid) as \"argument data types\", case p.prokind when 'a' then 'agg' when 'w' then 'window' when 'p' then 'proc' else 'func' end as \"type\" from pg_catalog.pg_proc p left join pg_catalog.pg_namespace n on n.oid = p.pronamespace where pg_catalog.pg_function_is_visible(p.oid) and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' order by 1, 2, 4"
-}
-
 fn psql_list_aggregates_catalog_query() -> &'static str {
     "select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.format_type(p.prorettype, null) as \"result data type\", case when p.pronargs = 0 then cast('*' as pg_catalog.text) else pg_catalog.pg_get_function_arguments(p.oid) end as \"argument data types\", pg_catalog.obj_description(p.oid, 'pg_proc') as \"description\" from pg_catalog.pg_proc p left join pg_catalog.pg_namespace n on n.oid = p.pronamespace where p.prokind = 'a' and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_function_is_visible(p.oid) order by 1, 2, 4"
 }
@@ -3902,23 +3848,6 @@ fn tablespace_privilege_letters(privileges: &BTreeSet<TablespacePrivilege>) -> S
         letters.push('C');
     }
     letters
-}
-
-fn function_acl_display(acl: &BTreeMap<String, BTreeSet<FunctionPrivilege>>) -> Option<String> {
-    let rows = acl
-        .iter()
-        .filter_map(|(grantee, privileges)| {
-            if privileges.is_empty() {
-                return None;
-            }
-            let grantee = if grantee == "public" { "" } else { grantee };
-            Some(format!(
-                "{grantee}={}/postgres",
-                function_privilege_letters(privileges)
-            ))
-        })
-        .collect::<Vec<_>>();
-    (!rows.is_empty()).then(|| rows.join("\n"))
 }
 
 fn function_acl_array_display(
@@ -7087,87 +7016,6 @@ fn pg_catalog_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| left[1].cmp(&right[1]));
-    rows
-}
-
-fn psql_describe_function_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .functions
-        .values()
-        .map(|function| {
-            vec![
-                Some("public".to_string()),
-                Some(function.name.clone()),
-                Some(sql_type_display_name(function.return_type).to_string()),
-                None,
-                Some("func".to_string()),
-            ]
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left[1].cmp(&right[1]));
-    rows
-}
-
-fn psql_describe_function_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .functions
-        .values()
-        .map(|function| {
-            vec![
-                Some("public".to_string()),
-                Some(function.name.clone()),
-                Some(sql_type_display_name(function.return_type).to_string()),
-                None,
-                Some("func".to_string()),
-                Some("volatile".to_string()),
-                Some("unsafe".to_string()),
-                Some("postgres".to_string()),
-                Some("invoker".to_string()),
-                function_acl_display(&function.acl),
-                Some("sql".to_string()),
-                None,
-                session
-                    .comments
-                    .get(&CatalogCommentTarget::Function {
-                        function: function.name.clone(),
-                    })
-                    .cloned(),
-            ]
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left[1].cmp(&right[1]));
-    rows
-}
-
-fn pg_catalog_function_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .functions
-        .values()
-        .map(|function| {
-            vec![
-                Some(function.oid.to_string()),
-                Some("public".to_string()),
-                Some(function.name.clone()),
-                Some(function.return_type.postgres_oid().to_string()),
-                Some(sql_type_display_name(function.return_type).to_string()),
-                Some(function.body.clone()),
-            ]
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left[2].cmp(&right[2]));
-    rows
-}
-
-fn pg_catalog_function_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = Vec::new();
-    for function in session.functions.values() {
-        if let Some(description) = session.comments.get(&CatalogCommentTarget::Function {
-            function: function.name.clone(),
-        }) {
-            rows.push(vec![Some(function.name.clone()), Some(description.clone())]);
-        }
-    }
-    rows.sort_by(|left, right| left[0].cmp(&right[0]));
     rows
 }
 
