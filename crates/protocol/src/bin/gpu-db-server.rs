@@ -81,7 +81,10 @@ use ddl_execution::rename_table_in_session;
 use ddl_execution::{execute_parsed_table_ddl, try_execute_ddl_statement};
 #[path = "gpu-db-server/session_compat.rs"]
 mod session_compat;
-use session_compat::{try_execute_session_compat_query, try_execute_session_control_statement};
+use session_compat::{
+    execute_session_compat_fallback, try_execute_session_compat_query,
+    try_execute_session_control_statement,
+};
 #[path = "gpu-db-server/pg_dump_compat.rs"]
 mod pg_dump_compat;
 use pg_dump_compat::try_execute_pg_dump_compat_statement;
@@ -3112,103 +3115,7 @@ fn execute_statement(
             &rows,
         );
     }
-    match canonical.as_str() {
-        "begin" => {
-            session.in_transaction = true;
-            write_command_complete(stream, "BEGIN")
-        }
-        "commit" => {
-            session.in_transaction = false;
-            write_command_complete(stream, "COMMIT")
-        }
-        "rollback" => {
-            session.in_transaction = false;
-            write_command_complete(stream, "ROLLBACK")
-        }
-        "reset all" => write_command_complete(stream, "RESET"),
-        "discard all" => write_command_complete(stream, "DISCARD ALL"),
-        "deallocate all" => {
-            session
-                .prepared
-                .retain(|_, statement| matches!(statement, PreparedStatement::Extended(_)));
-            write_command_complete(stream, "DEALLOCATE ALL")
-        }
-        "unlisten *" | "unlisten all" => write_command_complete(stream, "UNLISTEN"),
-        "show client_encoding" => write_single_row(
-            stream,
-            &[text_column("client_encoding")],
-            &[vec![Some(String::from("UTF8"))]],
-        ),
-        "show transaction isolation level" => write_single_row(
-            stream,
-            &[text_column("transaction_isolation")],
-            &[vec![Some(String::from("read committed"))]],
-        ),
-        "select current_schema()" => write_single_row(
-            stream,
-            &[text_column("current_schema")],
-            &[vec![Some(String::from("public"))]],
-        ),
-        "select 1 as one" => write_single_row(
-            stream,
-            &[int4_column("one")],
-            &[vec![Some(String::from("1"))]],
-        ),
-        "select 2 as in_tx" => write_single_row(
-            stream,
-            &[int4_column("in_tx")],
-            &[vec![Some(String::from("2"))]],
-        ),
-        "select 3 as rolled_back" => write_single_row(
-            stream,
-            &[int4_column("rolled_back")],
-            &[vec![Some(String::from("3"))]],
-        ),
-        "prepare golden_stmt(int) as select $1 + 10 as plus_ten" => {
-            session
-                .prepared
-                .insert(String::from("golden_stmt"), PreparedStatement::AddTen);
-            write_command_complete(stream, "PREPARE")
-        }
-        "execute golden_stmt(5)" => {
-            if session.prepared.contains_key("golden_stmt") {
-                write_single_row(
-                    stream,
-                    &[int4_column("plus_ten")],
-                    &[vec![Some(String::from("15"))]],
-                )
-            } else {
-                write_error(
-                    stream,
-                    &ErrorField {
-                        code: "26000",
-                        message: "prepared statement \"golden_stmt\" does not exist",
-                        position: None,
-                    },
-                )
-            }
-        }
-        "deallocate golden_stmt" => {
-            session.prepared.remove("golden_stmt");
-            write_command_complete(stream, "DEALLOCATE")
-        }
-        "select * from definitely_missing_relation_for_golden" => write_error(
-            stream,
-            &ErrorField {
-                code: "42P01",
-                message: "relation \"definitely_missing_relation_for_golden\" does not exist",
-                position: Some("15"),
-            },
-        ),
-        _ => write_error(
-            stream,
-            &ErrorField {
-                code: "0A000",
-                message: "query shape is not supported by the compatibility stub",
-                position: None,
-            },
-        ),
-    }
+    execute_session_compat_fallback(stream, session, &canonical)
 }
 
 fn catalog_table_name_rows(session: &Session) -> Vec<Vec<Option<String>>> {

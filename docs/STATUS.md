@@ -745,6 +745,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   mutex poison panics instead of producing a protocol error. Full protocol and driver gates, all-target checks,
   warning-denied clippy, security preflight, four executing focused catalog tests, formatting/diff checks, and
   independent audit are clean. The root is 8,837 lines and STRUCT-001CC is closed.
+  The final canonical session/golden compatibility match now lives behind one parent-visible delegate in the
+  existing private 205-line `session_compat` owner. Its branch order, transaction flags, extended-statement
+  retention on `DEALLOCATE ALL`, golden prepared-state mutations, rows, columns, tags, errors, positions, terminal
+  unsupported response, and final placement after every parsing/catalog route are exact. Inherited PRODUCT-002
+  debt remains: transaction state is shallow, `DEALLOCATE ALL` intentionally preserves extended statements,
+  golden execution checks only name existence, golden deallocation succeeds unconditionally, and the fallback is
+  an exact-string compatibility stub. All protocol/driver/security/formatting gates and independent audit are
+  clean; real-psql task scenarios 01/02 and 137-198 pass, while the complete suite still fails on the separately
+  tracked PostgreSQL 18 client query/render drift. The root is 8,744 lines and STRUCT-001CD is closed.
 
 ## Known boundaries
 
