@@ -1098,6 +1098,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   is untouched. Full protocol/driver/security/formatting and focused pg-dump/catalog gates, all eighteen
   PostgreSQL 16 pg-dump restore variants, the pg-dumpall globals restore, scenario 295, source/diff checks, and
   independent dominance audit are clean. The root is 4,043 lines and STRUCT-001DK is closed.
+  The complete remaining psql `\d` relation-introspection family now executes from a new private 800-line
+  `relation_introspection` owner behind one stage-preserving delegate. Fourteen branch arms and twenty-six query-
+  parser/row helpers are byte-identical moves; fifteen `cfg(test)` wrappers retain only proven existing consumers.
+  Shared relation-pattern, type display/storage, index/constraint/default/value dependencies remain narrow and
+  one-way. Exact post-built-in-type/pre-direct-table stage and internal order, lookup regex/public filtering and
+  per-kind sorting, relation flags, normal/verbose attribute default/comment/storage fields, index/check/foreign-
+  key definitions and sorting, trigger/policy/statistics/inheritance empty rows, all fixed/null fields, column
+  names/types/row shapes, writers, and fall-through are unchanged. Inherited PRODUCT-002 debt remains brittle
+  generated-SQL parsing, host catalog maps and CPU filtering/sorting, synthetic/hard-coded metadata, incomplete
+  psql object semantics, and absent GPU-resident system relations. Full protocol/driver/security/formatting gates,
+  three focused catalog tests, PostgreSQL 16 scenarios 07/11/12/33/36/76/305/307/308/311/319/320/321/322/323/
+  324/325/330/331/338/339/341, and independent audit are clean. The root is 3,376 lines and STRUCT-001DL is closed.
 
 ## Known boundaries
 
