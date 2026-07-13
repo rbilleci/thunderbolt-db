@@ -1206,6 +1206,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   snapshot, and progress tests, both 187-test serial/16-thread runs, replication all-target check and strict
   clippy, downstream engine all-target check, targeted formatting/diff/reference checks, and independent audit
   are clean. The root is 17,469 lines with 683 production lines; STRUCT-001DV is next.
+  STRUCT-001DV externalized the exact contiguous 11-test baseline Raft/progress family into a bounded 272-line
+  `tests/raft_baseline.rs` owner through an `include!` at the same parent position. Every body is byte-identical
+  after removing only parent indentation, all compiled harness names remain `tests::*`, and ownership is unique;
+  production, visibility, public APIs, and consensus behavior are untouched. Focused proposal, quorum, progress,
+  lagging-follower, recovery, and snapshot-boundary tests, both 187-test serial/16-thread runs, replication
+  all-target check and strict clippy, scoped formatting/diff/reference checks, and independent audit are clean.
+  The root is 17,198 lines with 683 production lines; STRUCT-001DW is next.
 
 ## Known boundaries
 
