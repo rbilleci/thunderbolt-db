@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DM:** move the twenty-three pg-dump relation-metadata helpers and local class record into a bounded
-   private owner, retarget `pg_dump_compat`, and retain exact metadata, sorting, columns, rows, and output.
+1. **STRUCT-001DN:** move the fifteen ACL rendering/privilege-letter helpers into the private ACL owner, re-export
+   their existing parent-private names, and retain exact defaults, ordering, empty/null behavior, and output.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

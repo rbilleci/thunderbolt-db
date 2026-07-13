@@ -1110,6 +1110,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   psql object semantics, and absent GPU-resident system relations. Full protocol/driver/security/formatting gates,
   three focused catalog tests, PostgreSQL 16 scenarios 07/11/12/33/36/76/305/307/308/311/319/320/321/322/323/
   324/325/330/331/338/339/341, and independent audit are clean. The root is 3,376 lines and STRUCT-001DL is closed.
+  Pg-dump relation metadata now lives in a new private 619-line `pg_dump_relation_metadata` owner: table OID,
+  class, attribute, index, foreign-key, view-definition, dependency, and attribute-default metadata. Twenty exact
+  helpers are parent-private for the sole production sibling, three helpers and the class-metadata record remain
+  module-private, and one `cfg(test)` index-row wrapper retains its sole proven consumer. The `pg_dump_compat`
+  executable body is byte-identical and only its imports are retargeted. Exact predicates/parsers, liveness/orphan
+  filtering, OID synthesis, ACL/default/type/domain fields, definitions, sorting, column names/types/row shapes,
+  and output are unchanged. Shared ACL/default/type, index/constraint/OID, foreign-key-definition and catalog-state
+  dependencies remain narrow and one-way. Inherited PRODUCT-002 debt remains exact generated-SQL matching,
+  host/synthetic metadata and OIDs, CPU filtering/sorting/construction, simplified catalog semantics, and absent
+  GPU-resident system relations. Full protocol/driver/security/formatting and focused pg-dump/index gates, all
+  eighteen PostgreSQL 16 pg-dump restore variants, pg-dumpall globals restore, scenario 295, and independent audit
+  are clean. The root is 2,780 lines and STRUCT-001DM is closed.
 
 ## Known boundaries
 

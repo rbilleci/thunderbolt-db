@@ -10,28 +10,29 @@ use super::cluster_ddl::{
     try_execute_database_pg_dump_catalog_query, try_execute_tablespace_pg_dump_catalog_query,
 };
 use super::function_execution::try_execute_aggregate_pg_dump_catalog_query;
+use super::pg_dump_relation_metadata::{
+    catalog_foreign_key_metadata_columns, catalog_foreign_key_metadata_rows,
+    is_catalog_foreign_key_metadata_query, is_pg_dump_class_metadata_query,
+    is_pg_dump_index_metadata_query, pg_dump_attrdef_metadata_columns,
+    pg_dump_attrdef_metadata_query_relation_oids, pg_dump_attrdef_metadata_rows,
+    pg_dump_attribute_metadata_columns, pg_dump_attribute_metadata_query_oids,
+    pg_dump_attribute_metadata_rows, pg_dump_class_metadata_columns, pg_dump_class_metadata_rows,
+    pg_dump_dependency_rows, pg_dump_index_metadata_columns, pg_dump_index_metadata_rows,
+    pg_dump_table_oid_lookup_query_table, pg_dump_table_oid_lookup_rows,
+    pg_dump_view_definition_query_oid, pg_dump_view_definition_rows,
+};
 use super::replication_catalog::try_execute_replication_pg_dump_query;
 use super::role_ddl::try_execute_role_pg_dump_catalog_query;
 use super::type_system_catalog::{
     try_execute_type_pg_dump_catalog_query, try_execute_type_system_pg_dump_catalog_query,
 };
 use super::{
-    bool_column, catalog_empty_rows, catalog_foreign_key_metadata_columns,
-    catalog_foreign_key_metadata_rows, int4_column, int8_column,
-    is_catalog_foreign_key_metadata_query, is_pg_dump_class_metadata_query,
-    is_pg_dump_function_metadata_query, is_pg_dump_index_metadata_query,
-    pg_dump_attrdef_metadata_columns, pg_dump_attrdef_metadata_query_relation_oids,
-    pg_dump_attrdef_metadata_rows, pg_dump_attribute_metadata_columns,
-    pg_dump_attribute_metadata_query_oids, pg_dump_attribute_metadata_rows,
-    pg_dump_class_metadata_columns, pg_dump_class_metadata_rows, pg_dump_dependency_rows,
+    bool_column, catalog_empty_rows, int4_column, int8_column, is_pg_dump_function_metadata_query,
     pg_dump_empty_catalog_query_columns, pg_dump_function_metadata_columns,
-    pg_dump_function_metadata_rows, pg_dump_index_metadata_columns, pg_dump_index_metadata_rows,
-    pg_dump_sequence_last_value_query_name, pg_dump_sequence_metadata_columns,
-    pg_dump_sequence_metadata_query_oid, pg_dump_sequence_metadata_rows,
-    pg_dump_sequence_setval_query, pg_dump_table_oid_lookup_query_table,
-    pg_dump_table_oid_lookup_rows, pg_dump_view_definition_query_oid, pg_dump_view_definition_rows,
-    text_column, write_error, write_single_row, CatalogCommentTarget, ErrorField, ReadWrite,
-    Session,
+    pg_dump_function_metadata_rows, pg_dump_sequence_last_value_query_name,
+    pg_dump_sequence_metadata_columns, pg_dump_sequence_metadata_query_oid,
+    pg_dump_sequence_metadata_rows, pg_dump_sequence_setval_query, text_column, write_error,
+    write_single_row, CatalogCommentTarget, ErrorField, ReadWrite, Session,
 };
 use std::io;
 
