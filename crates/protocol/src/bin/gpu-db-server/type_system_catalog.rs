@@ -1,6 +1,10 @@
-// Legacy empty type-system catalog ownership. This is not a product execution path.
+// Legacy type-system catalog ownership. This is not a product execution path.
 
-use super::{catalog_empty_rows, int4_column, text_column, write_single_row, ReadWrite};
+use super::{
+    bool_column, catalog_empty_rows, int4_column, sql_type_display_name, text_column,
+    write_single_row, Column, ReadWrite, Session, SqlType, PUBLIC_NAMESPACE_OID,
+    SUPPORTED_SQL_TYPES,
+};
 use std::io;
 
 pub(super) fn try_execute_type_system_catalog_query(
@@ -171,4 +175,238 @@ pub(super) fn test_psql_list_collations_catalog_query() -> &'static str {
 #[cfg(test)]
 pub(super) fn test_psql_list_casts_catalog_query() -> &'static str {
     psql_list_casts_catalog_query()
+}
+
+pub(super) fn try_execute_builtin_type_catalog_query(
+    stream: &mut dyn ReadWrite,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if let Some(type_name) = psql_describe_type_catalog_query_type(canonical) {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Description"),
+            ],
+            &catalog_psql_describe_type_rows(&type_name),
+        ));
+    }
+    if canonical == psql_describe_pg_catalog_types_query() {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Description"),
+            ],
+            &catalog_psql_describe_type_rows_for_supported_types(),
+        ));
+    }
+    if canonical == psql_describe_pg_catalog_types_verbose_query() {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Internal name"),
+                text_column("Size"),
+                text_column("Elements"),
+                text_column("Owner"),
+                text_column("Access privileges"),
+                text_column("Description"),
+            ],
+            &catalog_psql_describe_type_verbose_rows_for_supported_types(),
+        ));
+    }
+    None
+}
+
+pub(super) fn try_execute_type_pg_dump_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != pg_dump_type_metadata_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &pg_dump_type_metadata_columns(),
+        &pg_dump_type_metadata_rows(session),
+    ))
+}
+
+fn psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
+    let prefix = "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and (t.typname operator(pg_catalog.~) '^(";
+    let suffix = ")$' collate pg_catalog.default or pg_catalog.format_type(t.oid, null) operator(pg_catalog.~) '^(";
+    let final_suffix = ")$' collate pg_catalog.default) and n.nspname operator(pg_catalog.~) '^(pg_catalog)$' collate pg_catalog.default order by 1, 2";
+    let rest = canonical.strip_prefix(prefix)?;
+    let (type_name, rest) = rest.split_once(suffix)?;
+    let display_name = rest.strip_suffix(final_suffix)?;
+    let matched_type = sql_type_by_catalog_or_display_name(type_name)?;
+    (sql_type_by_catalog_or_display_name(display_name) == Some(matched_type))
+        .then(|| type_name.to_string())
+}
+
+fn psql_describe_pg_catalog_types_query() -> &'static str {
+    "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and n.nspname operator(pg_catalog.~) '^(pg_catalog)$' collate pg_catalog.default order by 1, 2"
+}
+
+fn psql_describe_pg_catalog_types_verbose_query() -> &'static str {
+    "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", t.typname as \"internal name\", case when t.typrelid != 0 then cast('tuple' as pg_catalog.text) when t.typlen < 0 then cast('var' as pg_catalog.text) else cast(t.typlen as pg_catalog.text) end as \"size\", pg_catalog.array_to_string( array( select e.enumlabel from pg_catalog.pg_enum e where e.enumtypid = t.oid order by e.enumsortorder ), e'\\n' ) as \"elements\", pg_catalog.pg_get_userbyid(t.typowner) as \"owner\", pg_catalog.array_to_string(t.typacl, e'\\n') as \"access privileges\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and n.nspname operator(pg_catalog.~) '^(pg_catalog)$' collate pg_catalog.default order by 1, 2"
+}
+
+fn sql_type_by_catalog_or_display_name(name: &str) -> Option<SqlType> {
+    SUPPORTED_SQL_TYPES
+        .into_iter()
+        .find(|ty| ty.catalog_name() == name || sql_type_display_name(*ty) == name)
+}
+
+fn catalog_psql_describe_type_rows(type_name: &str) -> Vec<Vec<Option<String>>> {
+    let Some(ty) = sql_type_by_catalog_or_display_name(type_name) else {
+        return Vec::new();
+    };
+    vec![vec![
+        Some("pg_catalog".to_string()),
+        Some(sql_type_display_name(ty).to_string()),
+        None,
+    ]]
+}
+
+fn supported_sql_types_by_display_name() -> Vec<SqlType> {
+    let mut types = SUPPORTED_SQL_TYPES.to_vec();
+    types.sort_by_key(|ty| sql_type_display_name(*ty));
+    types
+}
+
+fn catalog_psql_describe_type_rows_for_supported_types() -> Vec<Vec<Option<String>>> {
+    supported_sql_types_by_display_name()
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some("pg_catalog".to_string()),
+                Some(sql_type_display_name(ty).to_string()),
+                None,
+            ]
+        })
+        .collect()
+}
+
+fn catalog_psql_describe_type_verbose_rows_for_supported_types() -> Vec<Vec<Option<String>>> {
+    supported_sql_types_by_display_name()
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some("pg_catalog".to_string()),
+                Some(sql_type_display_name(ty).to_string()),
+                Some(ty.catalog_name().to_string()),
+                Some(sql_type_psql_size(ty).to_string()),
+                None,
+                Some("postgres".to_string()),
+                None,
+                None,
+            ]
+        })
+        .collect()
+}
+
+fn sql_type_psql_size(ty: SqlType) -> &'static str {
+    match ty.type_size() {
+        -1 => "var",
+        4 => "4",
+        _ => "",
+    }
+}
+
+fn pg_dump_type_metadata_query() -> &'static str {
+    "select tableoid, oid, typname, typnamespace, typacl, acldefault('t', typowner) as acldefault, typowner, typelem, typrelid, case when typrelid = 0 then ' '::\"char\" else (select relkind from pg_class where oid = typrelid) end as typrelkind, typtype, typisdefined, typname[0] = '_' and typelem != 0 and (select typarray from pg_type te where oid = pg_type.typelem) = oid as isarray from pg_type"
+}
+
+fn pg_dump_type_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("typname"),
+        int4_column("typnamespace"),
+        text_column("typacl"),
+        text_column("acldefault"),
+        int4_column("typowner"),
+        int4_column("typelem"),
+        int4_column("typrelid"),
+        text_column("typrelkind"),
+        text_column("typtype"),
+        bool_column("typisdefined"),
+        bool_column("isarray"),
+    ]
+}
+
+fn pg_dump_type_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = SUPPORTED_SQL_TYPES
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some("1247".to_string()),
+                Some(ty.postgres_oid().to_string()),
+                Some(ty.catalog_name().to_string()),
+                Some("11".to_string()),
+                None,
+                None,
+                Some("10".to_string()),
+                Some("0".to_string()),
+                Some("0".to_string()),
+                Some(" ".to_string()),
+                Some("b".to_string()),
+                Some("t".to_string()),
+                Some("f".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut domains = session.domains.values().collect::<Vec<_>>();
+    domains.sort_by_key(|domain| domain.oid);
+    for domain in domains {
+        rows.push(vec![
+            Some("1247".to_string()),
+            Some(domain.oid.to_string()),
+            Some(domain.name.clone()),
+            Some(PUBLIC_NAMESPACE_OID.to_string()),
+            None,
+            None,
+            Some("10".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some(" ".to_string()),
+            Some("d".to_string()),
+            Some("t".to_string()),
+            Some("f".to_string()),
+        ]);
+    }
+    rows
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
+    psql_describe_type_catalog_query_type(canonical)
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_describe_pg_catalog_types_query() -> &'static str {
+    psql_describe_pg_catalog_types_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_psql_describe_type_rows(type_name: &str) -> Vec<Vec<Option<String>>> {
+    catalog_psql_describe_type_rows(type_name)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_psql_describe_type_rows_for_supported_types() -> Vec<Vec<Option<String>>>
+{
+    catalog_psql_describe_type_rows_for_supported_types()
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_psql_describe_type_verbose_rows_for_supported_types(
+) -> Vec<Vec<Option<String>>> {
+    catalog_psql_describe_type_verbose_rows_for_supported_types()
 }

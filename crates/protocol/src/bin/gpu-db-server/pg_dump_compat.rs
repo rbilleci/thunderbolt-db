@@ -12,7 +12,9 @@ use super::cluster_ddl::{
 use super::function_execution::try_execute_aggregate_pg_dump_catalog_query;
 use super::replication_catalog::try_execute_replication_pg_dump_query;
 use super::role_ddl::try_execute_role_pg_dump_catalog_query;
-use super::type_system_catalog::try_execute_type_system_pg_dump_catalog_query;
+use super::type_system_catalog::{
+    try_execute_type_pg_dump_catalog_query, try_execute_type_system_pg_dump_catalog_query,
+};
 use super::{
     bool_column, catalog_empty_rows, catalog_foreign_key_metadata_columns,
     catalog_foreign_key_metadata_rows, int4_column, int8_column,
@@ -27,8 +29,7 @@ use super::{
     pg_dump_sequence_last_value_query_name, pg_dump_sequence_metadata_columns,
     pg_dump_sequence_metadata_query_oid, pg_dump_sequence_metadata_rows,
     pg_dump_sequence_setval_query, pg_dump_table_oid_lookup_query_table,
-    pg_dump_table_oid_lookup_rows, pg_dump_type_metadata_columns, pg_dump_type_metadata_query,
-    pg_dump_type_metadata_rows, pg_dump_view_definition_query_oid, pg_dump_view_definition_rows,
+    pg_dump_table_oid_lookup_rows, pg_dump_view_definition_query_oid, pg_dump_view_definition_rows,
     text_column, write_error, write_single_row, CatalogCommentTarget, ErrorField, ReadWrite,
     Session,
 };
@@ -81,12 +82,8 @@ pub(super) fn try_execute_pg_dump_compat_statement(
             &pg_dump_attribute_metadata_rows(session, &oids),
         ));
     }
-    if canonical == pg_dump_type_metadata_query() {
-        return Some(write_single_row(
-            stream,
-            &pg_dump_type_metadata_columns(),
-            &pg_dump_type_metadata_rows(session),
-        ));
+    if let Some(result) = try_execute_type_pg_dump_catalog_query(stream, session, canonical) {
+        return Some(result);
     }
     if let Some(result) = try_execute_database_pg_dump_catalog_query(stream, session, canonical) {
         return Some(result);

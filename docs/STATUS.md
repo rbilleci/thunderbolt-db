@@ -989,6 +989,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and absent GPU-resident type-system relations/operators. Full gates, PostgreSQL 16 scenarios 61/62/63/64, all
   18 pg-dump restore/metadata/privilege gates, and independent audit are clean. The root is 5,895 lines and
   STRUCT-001DA is closed.
+  Supported built-in psql type listings and effective pg-dump type metadata now execute from the existing private
+  412-line `type_system_catalog` owner behind two additional stage-preserving delegates; the 472-line
+  `pg_dump_compat` consumes only the type-metadata delegate. Twelve parser/query/registry/size/column/row helpers
+  are byte-identical private moves and five `cfg(test)` aliases have proven consumers. Exact post-namespace/pre-
+  table-OID and post-attribute/pre-database stages, parser and branch order, 3-/3-/8-/13-column shapes, supported-
+  type display ordering and sizes, built-in/domain OIDs/names/namespaces/kinds/flags, domain OID sorting, nulls,
+  and writers are unchanged. The later root pg-dump type route was deleted only after unconditional earlier
+  pg-dump dispatch proved it dominated. PostgreSQL 16 scenario 58's obsolete original two-type golden was
+  reconciled to the pre-existing nine-entry `SUPPORTED_SQL_TYPES` behavior; this slice made no runtime type
+  behavior change. Inherited PRODUCT-002 debt remains exact routing, host/synthetic type and domain metadata,
+  incomplete PostgreSQL size/ACL/array semantics, CPU row construction, and absent GPU-resident system relations.
+  Full protocol/driver/security/formatting gates, PostgreSQL 16 scenarios 10/58, and all 18 pg-dump restore/
+  metadata/privilege gates are clean. The root is 5,713 lines and STRUCT-001DB is closed.
 
 ## Known boundaries
 

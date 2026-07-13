@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DB:** move supported psql built-in type listings and effective pg-dump type metadata into the
-   private type-system owner behind separately positioned delegates, retaining exact registry/domain output.
+1. **STRUCT-001DC:** move the three later direct `pg_type` reads and their four registry row helpers into the
+   private type-system owner behind one separately positioned delegate, retaining exact literal filters/output.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
