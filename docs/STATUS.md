@@ -891,6 +891,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   null password/expiry metadata, and absent GPU-native catalog execution. Full gates, PostgreSQL 16 scenarios
   52/315/343/346, the pg-dumpall globals restore, and independent audit are clean. The root is 6,747 lines and
   STRUCT-001CR is closed.
+  All effective psql/direct/pg-dump database catalog reads now execute from the existing private 580-line
+  `cluster_ddl` owner behind two stage-preserving delegates; the 527-line `pg_dump_compat` consumes only the
+  database delegate. Ten query/column/row helpers are byte-identical private moves and eight `cfg(test)` aliases
+  have proven consumers. Exact normal/verbose/OID/ACL order, 9-/12-/2-/2-/19-column shapes, bootstrap/application
+  names and OIDs, owner/encoding/locale/size/tablespace fields, ACLs, comments, nulls, name sorting, and writers are
+  unchanged. The later root pg-dump metadata block was deleted as an exact duplicate proven dominated by earlier
+  unconditional dispatch. Inherited PRODUCT-002 debt remains exact routing, host/synthetic OIDs, name/OID-only
+  application database modeling, hard-coded metadata, simplified ACLs, null pg-dump ACL/default/ICU fields,
+  bootstrap-only pg-dump metadata, and absent GPU-native catalog execution. Full gates, PostgreSQL 16 scenarios
+  53/313/344/346, all 18 pg-dump restore/metadata/privilege gates, and independent audit are clean. The root is
+  6,544 lines and STRUCT-001CS is closed.
 
 ## Known boundaries
 

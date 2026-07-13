@@ -1,6 +1,7 @@
 // Legacy pg_dump compatibility ownership. This is not a product catalog execution path.
 
 use super::catalog_comments::pg_dump_description_rows;
+use super::cluster_ddl::try_execute_database_pg_dump_catalog_query;
 use super::replication_catalog::try_execute_replication_pg_dump_query;
 use super::role_ddl::try_execute_role_pg_dump_catalog_query;
 use super::{
@@ -13,11 +14,10 @@ use super::{
     pg_dump_attrdef_metadata_query_relation_oids, pg_dump_attrdef_metadata_rows,
     pg_dump_attribute_metadata_columns, pg_dump_attribute_metadata_query_oids,
     pg_dump_attribute_metadata_rows, pg_dump_class_metadata_columns, pg_dump_class_metadata_rows,
-    pg_dump_database_metadata_columns, pg_dump_database_metadata_query,
-    pg_dump_database_metadata_rows, pg_dump_default_acl_metadata_columns,
-    pg_dump_default_acl_metadata_rows, pg_dump_dependency_rows,
-    pg_dump_empty_catalog_query_columns, pg_dump_function_metadata_columns,
-    pg_dump_function_metadata_rows, pg_dump_index_metadata_columns, pg_dump_index_metadata_rows,
+    pg_dump_default_acl_metadata_columns, pg_dump_default_acl_metadata_rows,
+    pg_dump_dependency_rows, pg_dump_empty_catalog_query_columns,
+    pg_dump_function_metadata_columns, pg_dump_function_metadata_rows,
+    pg_dump_index_metadata_columns, pg_dump_index_metadata_rows,
     pg_dump_sequence_last_value_query_name, pg_dump_sequence_metadata_columns,
     pg_dump_sequence_metadata_query_oid, pg_dump_sequence_metadata_rows,
     pg_dump_sequence_setval_query, pg_dump_table_oid_lookup_query_table,
@@ -142,12 +142,8 @@ pub(super) fn try_execute_pg_dump_compat_statement(
             &pg_dump_type_metadata_rows(session),
         ));
     }
-    if canonical == pg_dump_database_metadata_query() {
-        return Some(write_single_row(
-            stream,
-            &pg_dump_database_metadata_columns(),
-            &pg_dump_database_metadata_rows(session),
-        ));
+    if let Some(result) = try_execute_database_pg_dump_catalog_query(stream, session, canonical) {
+        return Some(result);
     }
     if let Some(sequence_oid) = pg_dump_sequence_metadata_query_oid(canonical) {
         return Some(write_single_row(

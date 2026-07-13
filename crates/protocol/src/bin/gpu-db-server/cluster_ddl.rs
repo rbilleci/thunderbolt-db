@@ -1,11 +1,288 @@
 // Legacy cluster-object DDL ownership. This is not a product execution path.
 
 use super::{
-    database_exists, tablespace_exists, write_command_complete, write_error, CatalogCommentTarget,
-    Command, DatabaseInfo, ErrorField, ReadWrite, Session, TablespaceInfo,
+    bool_column, database_acl_display, database_exists, int4_column, tablespace_exists,
+    text_column, write_command_complete, write_error, write_single_row, CatalogCommentTarget,
+    Column, Command, DatabaseInfo, ErrorField, ReadWrite, Session, TablespaceInfo,
+    POSTGRES_DATABASE_OID,
 };
 use std::collections::BTreeSet;
 use std::io;
+
+fn pg_dump_database_metadata_query() -> &'static str {
+    "select tableoid, oid, datname, datdba, pg_encoding_to_char(encoding) as encoding, datcollate, datctype, datfrozenxid, datacl, acldefault('d', datdba) as acldefault, datistemplate, datconnlimit, datminmxid, datlocprovider, daticulocale, datcollversion, daticurules, (select spcname from pg_tablespace t where t.oid = dattablespace) as tablespace, shobj_description(oid, 'pg_database') as description from pg_database where datname = current_database()"
+}
+
+fn pg_dump_database_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("datname"),
+        int4_column("datdba"),
+        text_column("encoding"),
+        text_column("datcollate"),
+        text_column("datctype"),
+        text_column("datfrozenxid"),
+        text_column("datacl"),
+        text_column("acldefault"),
+        bool_column("datistemplate"),
+        int4_column("datconnlimit"),
+        text_column("datminmxid"),
+        text_column("datlocprovider"),
+        text_column("daticulocale"),
+        text_column("datcollversion"),
+        text_column("daticurules"),
+        text_column("tablespace"),
+        text_column("description"),
+    ]
+}
+
+fn pg_dump_database_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("1262".to_string()),
+        Some(POSTGRES_DATABASE_OID.to_string()),
+        Some("postgres".to_string()),
+        Some("10".to_string()),
+        Some("UTF8".to_string()),
+        Some("C.UTF-8".to_string()),
+        Some("C.UTF-8".to_string()),
+        Some("0".to_string()),
+        None,
+        None,
+        Some("f".to_string()),
+        Some("-1".to_string()),
+        Some("0".to_string()),
+        Some("c".to_string()),
+        None,
+        None,
+        None,
+        Some("pg_default".to_string()),
+        session
+            .comments
+            .get(&CatalogCommentTarget::Database {
+                database: "postgres".to_string(),
+            })
+            .cloned(),
+    ]]
+}
+
+fn psql_list_databases_catalog_query() -> &'static str {
+    "select d.datname as \"name\", pg_catalog.pg_get_userbyid(d.datdba) as \"owner\", pg_catalog.pg_encoding_to_char(d.encoding) as \"encoding\", case d.datlocprovider when 'c' then 'libc' when 'i' then 'icu' end as \"locale provider\", d.datcollate as \"collate\", d.datctype as \"ctype\", d.daticulocale as \"icu locale\", d.daticurules as \"icu rules\", pg_catalog.array_to_string(d.datacl, e'\\n') as \"access privileges\" from pg_catalog.pg_database d order by 1"
+}
+
+fn psql_list_databases_verbose_catalog_query() -> &'static str {
+    "select d.datname as \"name\", pg_catalog.pg_get_userbyid(d.datdba) as \"owner\", pg_catalog.pg_encoding_to_char(d.encoding) as \"encoding\", case d.datlocprovider when 'c' then 'libc' when 'i' then 'icu' end as \"locale provider\", d.datcollate as \"collate\", d.datctype as \"ctype\", d.daticulocale as \"icu locale\", d.daticurules as \"icu rules\", pg_catalog.array_to_string(d.datacl, e'\\n') as \"access privileges\", case when pg_catalog.has_database_privilege(d.datname, 'connect') then pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) else 'no access' end as \"size\", t.spcname as \"tablespace\", pg_catalog.shobj_description(d.oid, 'pg_database') as \"description\" from pg_catalog.pg_database d join pg_catalog.pg_tablespace t on d.dattablespace = t.oid order by 1"
+}
+
+fn database_catalog_base_row(name: &str) -> Vec<Option<String>> {
+    vec![
+        Some(name.to_string()),
+        Some("postgres".to_string()),
+        Some("UTF8".to_string()),
+        Some("libc".to_string()),
+        Some("C.UTF-8".to_string()),
+        Some("C.UTF-8".to_string()),
+        None,
+        None,
+        None,
+    ]
+}
+
+fn catalog_psql_list_database_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut names = vec!["postgres".to_string()];
+    names.extend(
+        session
+            .databases
+            .values()
+            .map(|database| database.name.clone()),
+    );
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut row = database_catalog_base_row(&name);
+            row[8] = database_acl_display(session, &name);
+            row
+        })
+        .collect()
+}
+
+fn catalog_psql_list_database_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut databases = vec![DatabaseInfo {
+        oid: POSTGRES_DATABASE_OID,
+        name: "postgres".to_string(),
+    }];
+    databases.extend(session.databases.values().cloned());
+    databases.sort_by_key(|database| database.name.clone());
+    databases
+        .into_iter()
+        .map(|database| {
+            vec![
+                Some(database.name.clone()),
+                Some("postgres".to_string()),
+                Some("UTF8".to_string()),
+                Some("libc".to_string()),
+                Some("C.UTF-8".to_string()),
+                Some("C.UTF-8".to_string()),
+                None,
+                None,
+                database_acl_display(session, &database.name),
+                Some("0 bytes".to_string()),
+                Some("pg_default".to_string()),
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Database {
+                        database: database.name.clone(),
+                    })
+                    .cloned(),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_database_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut databases = vec![DatabaseInfo {
+        oid: POSTGRES_DATABASE_OID,
+        name: "postgres".to_string(),
+    }];
+    databases.extend(session.databases.values().cloned());
+    databases.sort_by_key(|database| database.name.clone());
+    databases
+        .into_iter()
+        .map(|database| vec![Some(database.oid.to_string()), Some(database.name)])
+        .collect()
+}
+
+fn catalog_database_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut names = vec!["postgres".to_string()];
+    names.extend(
+        session
+            .databases
+            .values()
+            .map(|database| database.name.clone()),
+    );
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| vec![Some(name.clone()), database_acl_display(session, &name)])
+        .collect()
+}
+
+pub(super) fn try_execute_database_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical == psql_list_databases_catalog_query() {
+        Some(write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                text_column("Encoding"),
+                text_column("Locale Provider"),
+                text_column("Collate"),
+                text_column("Ctype"),
+                text_column("ICU Locale"),
+                text_column("ICU Rules"),
+                text_column("Access privileges"),
+            ],
+            &catalog_psql_list_database_rows(session),
+        ))
+    } else if canonical == psql_list_databases_verbose_catalog_query() {
+        Some(write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                text_column("Encoding"),
+                text_column("Locale Provider"),
+                text_column("Collate"),
+                text_column("Ctype"),
+                text_column("ICU Locale"),
+                text_column("ICU Rules"),
+                text_column("Access privileges"),
+                text_column("Size"),
+                text_column("Tablespace"),
+                text_column("Description"),
+            ],
+            &catalog_psql_list_database_verbose_rows(session),
+        ))
+    } else if canonical == "select oid, datname from pg_catalog.pg_database order by datname" {
+        Some(write_single_row(
+            stream,
+            &[int4_column("oid"), text_column("datname")],
+            &catalog_database_oid_rows(session),
+        ))
+    } else if canonical
+        == "select datname, pg_catalog.array_to_string(datacl, e'\\n') as acl from pg_catalog.pg_database order by datname"
+    {
+        Some(write_single_row(
+            stream,
+            &[text_column("datname"), text_column("acl")],
+            &catalog_database_acl_rows(session),
+        ))
+    } else {
+        None
+    }
+}
+
+pub(super) fn try_execute_database_pg_dump_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != pg_dump_database_metadata_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &pg_dump_database_metadata_columns(),
+        &pg_dump_database_metadata_rows(session),
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_databases_catalog_query() -> &'static str {
+    psql_list_databases_catalog_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_databases_verbose_catalog_query() -> &'static str {
+    psql_list_databases_verbose_catalog_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_psql_list_database_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    catalog_psql_list_database_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_psql_list_database_verbose_rows(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    catalog_psql_list_database_verbose_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_database_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    catalog_database_oid_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_database_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    catalog_database_acl_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_dump_database_metadata_query() -> &'static str {
+    pg_dump_database_metadata_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_dump_database_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    pg_dump_database_metadata_rows(session)
+}
 
 pub(super) fn execute_cluster_ddl(
     stream: &mut dyn ReadWrite,
