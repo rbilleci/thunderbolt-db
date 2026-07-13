@@ -1122,6 +1122,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   GPU-resident system relations. Full protocol/driver/security/formatting and focused pg-dump/index gates, all
   eighteen PostgreSQL 16 pg-dump restore variants, pg-dumpall globals restore, scenario 295, and independent audit
   are clean. The root is 2,780 lines and STRUCT-001DM is closed.
+  ACL display ownership is now complete in the existing private 1,084-line `acl_execution` owner. Fifteen exact
+  relation/schema/database/tablespace/function/table rendering and privilege-letter helpers moved from the root;
+  nine remain parent-private for proven sibling consumers and six are owner-private, with no new test alias.
+  The original 240-line helper block is byte-identical after intended visibility normalization. Grantee ordering,
+  PUBLIC empty-name rendering, privilege-letter order/case, bootstrap/default ACL strings, sequence-vs-relation
+  defaults, array braces/newlines, empty/null behavior, sibling call sites, and output are unchanged. Inherited
+  PRODUCT-002 debt remains simplified host ACL/membership/grant-option semantics, CPU metadata construction, and
+  absent GPU-resident system relations. Formatting/diff checks, all-target check and clippy, four focused ACL
+  tests, 71 library tests, 127 binary tests serial and 16-thread, tokio-postgres/SQLx smokes, the connection-
+  security preflight, PostgreSQL 16 scenarios 18/19/68/333/334/341/342/347/349/350/351/352, all eighteen pg-dump
+  restore variants, pg-dumpall globals restore, and independent audit are clean. The root is 2,543 lines and
+  STRUCT-001DN is closed.
 
 ## Known boundaries
 

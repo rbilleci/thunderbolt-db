@@ -1,12 +1,253 @@
 // Legacy ACL mutation ownership. This is not a product execution path.
 
 use super::{
-    acl_array_display, acl_display, int4_column, text_column, write_command_complete, write_error,
-    write_single_row, AclRelationKind, CatalogCommentTarget, Column, Command, DatabasePrivilege,
-    ErrorField, FunctionPrivilege, ReadWrite, SchemaPrivilege, Session, TablePrivilege,
-    TablespacePrivilege, PUBLIC_NAMESPACE_OID,
+    int4_column, text_column, write_command_complete, write_error, write_single_row,
+    AclRelationKind, CatalogCommentTarget, Column, Command, DatabasePrivilege, ErrorField,
+    FunctionPrivilege, ReadWrite, SchemaPrivilege, Session, TablePrivilege, TablespacePrivilege,
+    PUBLIC_NAMESPACE_OID,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+
+pub(super) fn relation_acl_array_display(session: &Session, relation: &str) -> Option<String> {
+    let acl = session.table_acls.get(relation)?;
+    let default = if session.sequences.contains_key(relation) {
+        "postgres=rwU/postgres"
+    } else {
+        "postgres=arwdDxt/postgres"
+    };
+    acl_array_display_with_default(acl, default)
+}
+
+pub(super) fn schema_acl_display(session: &Session) -> Option<String> {
+    let rows = session
+        .schema_acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                schema_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+pub(super) fn schema_acl_array_display(session: &Session) -> Option<String> {
+    let rows = session
+        .schema_acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                schema_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        None
+    } else {
+        let mut with_defaults = vec![
+            "postgres=UC/postgres".to_string(),
+            "=U/postgres".to_string(),
+        ];
+        with_defaults.extend(rows);
+        Some(format!("{{{}}}", with_defaults.join(",")))
+    }
+}
+
+pub(super) fn database_acl_display(session: &Session, database: &str) -> Option<String> {
+    let acl = session.database_acls.get(database)?;
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                database_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn database_privilege_letters(privileges: &BTreeSet<DatabasePrivilege>) -> String {
+    let mut letters = String::new();
+    for (privilege, letter) in [
+        (DatabasePrivilege::Connect, 'c'),
+        (DatabasePrivilege::Temporary, 'T'),
+    ] {
+        if privileges.contains(&privilege) {
+            letters.push(letter);
+        }
+    }
+    letters
+}
+
+pub(super) fn tablespace_acl_display(session: &Session, tablespace: &str) -> Option<String> {
+    let acl = session.tablespace_acls.get(tablespace)?;
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                tablespace_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+pub(super) fn tablespace_acl_array_display(session: &Session, tablespace: &str) -> Option<String> {
+    let acl = session.tablespace_acls.get(tablespace)?;
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                tablespace_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        None
+    } else {
+        let mut with_default = vec!["postgres=C/postgres".to_string()];
+        with_default.extend(rows);
+        Some(format!("{{{}}}", with_default.join(",")))
+    }
+}
+
+fn tablespace_privilege_letters(privileges: &BTreeSet<TablespacePrivilege>) -> String {
+    let mut letters = String::new();
+    if privileges.contains(&TablespacePrivilege::Create) {
+        letters.push('C');
+    }
+    letters
+}
+
+pub(super) fn function_acl_array_display(
+    acl: &BTreeMap<String, BTreeSet<FunctionPrivilege>>,
+) -> Option<String> {
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                function_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| format!("{{{}}}", rows.join(",")))
+}
+
+pub(super) fn function_privilege_letters(privileges: &BTreeSet<FunctionPrivilege>) -> String {
+    let mut letters = String::new();
+    if privileges.contains(&FunctionPrivilege::Execute) {
+        letters.push('X');
+    }
+    letters
+}
+
+fn schema_privilege_letters(privileges: &BTreeSet<SchemaPrivilege>) -> String {
+    let mut letters = String::new();
+    for (privilege, letter) in [
+        (SchemaPrivilege::Usage, 'U'),
+        (SchemaPrivilege::Create, 'C'),
+    ] {
+        if privileges.contains(&privilege) {
+            letters.push(letter);
+        }
+    }
+    letters
+}
+
+pub(super) fn acl_display(acl: &BTreeMap<String, BTreeSet<TablePrivilege>>) -> Option<String> {
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                table_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn acl_array_display(acl: &BTreeMap<String, BTreeSet<TablePrivilege>>) -> Option<String> {
+    acl_array_display_with_default(acl, "")
+}
+
+fn acl_array_display_with_default(
+    acl: &BTreeMap<String, BTreeSet<TablePrivilege>>,
+    default: &str,
+) -> Option<String> {
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                table_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    let mut all_rows = Vec::new();
+    if !default.is_empty() {
+        all_rows.push(default.to_string());
+    }
+    all_rows.extend(rows);
+    Some(format!("{{{}}}", all_rows.join(",")))
+}
+
+fn table_privilege_letters(privileges: &BTreeSet<TablePrivilege>) -> String {
+    let mut letters = String::new();
+    for (privilege, letter) in [
+        (TablePrivilege::Insert, 'a'),
+        (TablePrivilege::Select, 'r'),
+        (TablePrivilege::Update, 'w'),
+        (TablePrivilege::Delete, 'd'),
+    ] {
+        if privileges.contains(&privilege) {
+            letters.push(letter);
+        }
+    }
+    letters
+}
 
 fn acl_relation_kind(session: &Session, relation: &str) -> Option<AclRelationKind> {
     if session.tables.contains_key(relation) {

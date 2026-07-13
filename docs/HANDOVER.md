@@ -29,8 +29,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DN:** move the fifteen ACL rendering/privilege-letter helpers into the private ACL owner, re-export
-   their existing parent-private names, and retain exact defaults, ordering, empty/null behavior, and output.
+1. **STRUCT-001DO:** move the nineteen remaining sequence/function/domain/empty-catalog pg-dump helpers into the
+   private compatibility owner, preserve the prelude body and existing parent-private consumers, and take the
+   legacy root below 2,000 lines.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
