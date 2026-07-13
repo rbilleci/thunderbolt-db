@@ -99,10 +99,14 @@ mod cluster_ddl;
 use cluster_ddl::execute_cluster_ddl;
 #[path = "gpu-db-server/index_ddl.rs"]
 mod index_ddl;
-use index_ddl::{execute_index_ddl, try_execute_index_catalog_query};
+use index_ddl::{
+    execute_index_ddl, try_execute_index_catalog_query, try_execute_index_direct_catalog_query,
+};
 #[cfg(test)]
 use index_ddl::{
-    rename_index_in_session, test_psql_describe_index_rows as psql_describe_index_rows,
+    rename_index_in_session, test_pg_catalog_index_rows as pg_catalog_index_rows,
+    test_pg_catalog_indexes_query as pg_catalog_indexes_query,
+    test_psql_describe_index_rows as psql_describe_index_rows,
     test_psql_describe_index_verbose_rows as psql_describe_index_verbose_rows,
     test_psql_describe_indexes_catalog_query as psql_describe_indexes_catalog_query,
     test_psql_describe_indexes_catalog_query_schema_filter as psql_describe_indexes_catalog_query_schema_filter,
@@ -2220,28 +2224,8 @@ fn execute_statement(
             &pg_catalog_table_rows(session),
         );
     }
-    if canonical == pg_catalog_indexes_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("schemaname"),
-                text_column("tablename"),
-                text_column("indexname"),
-                text_column("indexdef"),
-            ],
-            &pg_catalog_index_rows(session),
-        );
-    }
-    if canonical == pg_catalog_indexes_without_schema_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("tablename"),
-                text_column("indexname"),
-                text_column("indexdef"),
-            ],
-            &pg_catalog_index_rows_without_schema(session),
-        );
+    if let Some(result) = try_execute_index_direct_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if canonical == pg_catalog_class_plain_tables_query() {
         return write_single_row(
@@ -6200,47 +6184,6 @@ fn pg_catalog_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some("postgres".to_string()),
             ]
         })
-        .collect()
-}
-
-fn pg_catalog_indexes_query() -> &'static str {
-    "select schemaname, tablename, indexname, indexdef from pg_catalog.pg_indexes where schemaname = 'public' order by tablename, indexname"
-}
-
-fn pg_catalog_indexes_without_schema_query() -> &'static str {
-    "select tablename, indexname, indexdef from pg_catalog.pg_indexes where schemaname = 'public' order by tablename, indexname"
-}
-
-fn pg_catalog_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .indexes
-        .iter()
-        .filter(|index| session.tables.contains_key(&index.table))
-        .map(|index| {
-            (
-                index.table.clone(),
-                index.name.clone(),
-                catalog_index_definition(index),
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    rows.into_iter()
-        .map(|(table, index, definition)| {
-            vec![
-                Some("public".to_string()),
-                Some(table),
-                Some(index),
-                Some(definition),
-            ]
-        })
-        .collect()
-}
-
-fn pg_catalog_index_rows_without_schema(session: &Session) -> Vec<Vec<Option<String>>> {
-    pg_catalog_index_rows(session)
-        .into_iter()
-        .map(|row| row.into_iter().skip(1).collect())
         .collect()
 }
 

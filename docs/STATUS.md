@@ -812,6 +812,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   metadata, hidden orphan indexes, null size, and legacy host-catalog execution. Full protocol/driver/security/
   formatting gates, focused index/comment/shared-catalog tests, fresh real-psql scenarios 21/305/306/323/327, and
   independent audit are clean. The root is 7,824 lines and STRUCT-001CJ is closed.
+  Both later direct `pg_indexes` reads now execute from the existing private 427-line `index_ddl` owner behind a
+  second, separately positioned tri-state delegate. Both exact query literals, the schema-bearing sorted row
+  builder, and the schema-dropping projection are byte-identical moves; helpers remain private and the only new
+  test exposure is two proven aliases. The post-`pg_tables`/pre-`pg_class` stage, route order, columns, live-table
+  filtering, public schema, table/index sorting, primary/unique definition formatting, and positional projection
+  are unchanged. Inherited PRODUCT-002 debt remains: exact-query routing, host/session-backed public-only data,
+  hidden orphan indexes, unquoted simple single-column btree definitions, and positional `skip(1)` projection.
+  Full protocol/driver/security/formatting gates, focused index/shared-catalog tests, fresh real-psql scenarios
+  306/323/327/329, and independent audit are clean. The root is 7,767 lines and STRUCT-001CK is closed.
 
 ## Known boundaries
 

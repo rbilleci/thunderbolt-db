@@ -1,9 +1,9 @@
 // Legacy index DDL ownership. This is not a product execution path.
 
 use super::{
-    schema_permission_error, text_column, validate_unique_indexes, write_command_complete,
-    write_error, write_single_row, CatalogCommentTarget, CatalogIndex, Command, ErrorField,
-    ReadWrite, SchemaPrivilege, Session,
+    catalog_index_definition, schema_permission_error, text_column, validate_unique_indexes,
+    write_command_complete, write_error, write_single_row, CatalogCommentTarget, CatalogIndex,
+    Command, ErrorField, ReadWrite, SchemaPrivilege, Session,
 };
 use std::collections::BTreeSet;
 use std::io;
@@ -135,6 +135,87 @@ pub(super) fn test_psql_describe_index_rows(session: &Session) -> Vec<Vec<Option
 #[cfg(test)]
 pub(super) fn test_psql_describe_index_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     psql_describe_index_verbose_rows(session)
+}
+
+fn pg_catalog_indexes_query() -> &'static str {
+    "select schemaname, tablename, indexname, indexdef from pg_catalog.pg_indexes where schemaname = 'public' order by tablename, indexname"
+}
+
+fn pg_catalog_indexes_without_schema_query() -> &'static str {
+    "select tablename, indexname, indexdef from pg_catalog.pg_indexes where schemaname = 'public' order by tablename, indexname"
+}
+
+fn pg_catalog_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .indexes
+        .iter()
+        .filter(|index| session.tables.contains_key(&index.table))
+        .map(|index| {
+            (
+                index.table.clone(),
+                index.name.clone(),
+                catalog_index_definition(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    rows.into_iter()
+        .map(|(table, index, definition)| {
+            vec![
+                Some("public".to_string()),
+                Some(table),
+                Some(index),
+                Some(definition),
+            ]
+        })
+        .collect()
+}
+
+fn pg_catalog_index_rows_without_schema(session: &Session) -> Vec<Vec<Option<String>>> {
+    pg_catalog_index_rows(session)
+        .into_iter()
+        .map(|row| row.into_iter().skip(1).collect())
+        .collect()
+}
+
+pub(super) fn try_execute_index_direct_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    let (columns, rows) = if canonical == pg_catalog_indexes_query() {
+        (
+            vec![
+                text_column("schemaname"),
+                text_column("tablename"),
+                text_column("indexname"),
+                text_column("indexdef"),
+            ],
+            pg_catalog_index_rows(session),
+        )
+    } else if canonical == pg_catalog_indexes_without_schema_query() {
+        (
+            vec![
+                text_column("tablename"),
+                text_column("indexname"),
+                text_column("indexdef"),
+            ],
+            pg_catalog_index_rows_without_schema(session),
+        )
+    } else {
+        return None;
+    };
+    Some(write_single_row(stream, &columns, &rows))
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_indexes_query() -> &'static str {
+    pg_catalog_indexes_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    pg_catalog_index_rows(session)
 }
 
 pub(super) fn rename_index_in_session(
