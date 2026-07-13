@@ -175,7 +175,13 @@ use replication_catalog::{
 };
 #[path = "gpu-db-server/role_ddl.rs"]
 mod role_ddl;
-use role_ddl::execute_role_ddl;
+use role_ddl::{execute_role_ddl, try_execute_role_catalog_query};
+#[cfg(test)]
+use role_ddl::{
+    test_catalog_psql_describe_role_rows as catalog_psql_describe_role_rows,
+    test_psql_describe_roles_catalog_query as psql_describe_roles_catalog_query,
+    test_psql_describe_roles_verbose_catalog_query as psql_describe_roles_verbose_catalog_query,
+};
 #[path = "gpu-db-server/catalog_comments.rs"]
 mod catalog_comments;
 use catalog_comments::{
@@ -1713,37 +1719,8 @@ fn execute_statement(
     if let Some(result) = try_execute_domain_catalog_query(stream, session, &canonical) {
         return result;
     }
-    if canonical == psql_describe_roles_catalog_query()
-        || canonical == psql_describe_roles_verbose_catalog_query()
-    {
-        let verbose = canonical == psql_describe_roles_verbose_catalog_query();
-        let mut columns = vec![
-            text_column("rolname"),
-            bool_column("rolsuper"),
-            bool_column("rolinherit"),
-            bool_column("rolcreaterole"),
-            bool_column("rolcreatedb"),
-            bool_column("rolcanlogin"),
-            int4_column("rolconnlimit"),
-            text_column("rolvaliduntil"),
-        ];
-        if verbose {
-            columns.push(text_column("Description"));
-        }
-        columns.push(bool_column("rolreplication"));
-        columns.push(bool_column("rolbypassrls"));
-        return write_single_row(
-            stream,
-            &columns,
-            &catalog_psql_describe_role_rows(session, verbose),
-        );
-    }
-    if canonical == "select oid, rolname from pg_catalog.pg_roles order by 1" {
-        return write_single_row(
-            stream,
-            &[int4_column("oid"), text_column("rolname")],
-            &catalog_role_oid_rows(session),
-        );
+    if let Some(result) = try_execute_role_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if canonical == psql_list_databases_catalog_query() {
         return write_single_row(
@@ -2897,149 +2874,6 @@ fn psql_list_extensions_catalog_query() -> &'static str {
 
 fn psql_list_languages_catalog_query() -> &'static str {
     "select l.lanname as \"name\", pg_catalog.pg_get_userbyid(l.lanowner) as \"owner\", l.lanpltrusted as \"trusted\", d.description as \"description\" from pg_catalog.pg_language l left join pg_catalog.pg_description d on d.classoid = l.tableoid and d.objoid = l.oid and d.objsubid = 0 where l.lanplcallfoid != 0 order by 1"
-}
-
-fn psql_describe_roles_catalog_query() -> &'static str {
-    "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil , r.rolreplication , r.rolbypassrls from pg_catalog.pg_roles r where r.rolname !~ '^pg_' order by 1"
-}
-
-fn psql_describe_roles_verbose_catalog_query() -> &'static str {
-    "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil , pg_catalog.shobj_description(r.oid, 'pg_authid') as description , r.rolreplication , r.rolbypassrls from pg_catalog.pg_roles r where r.rolname !~ '^pg_' order by 1"
-}
-
-fn pg_dumpall_role_metadata_query() -> &'static str {
-    "select oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolconnlimit, rolpassword, rolvaliduntil, rolreplication, rolbypassrls, pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, rolname = current_user as is_current_user from pg_roles where rolname !~ '^pg_' order by 2"
-}
-
-fn pg_dumpall_role_metadata_columns() -> Vec<Column> {
-    vec![
-        int4_column("oid"),
-        text_column("rolname"),
-        bool_column("rolsuper"),
-        bool_column("rolinherit"),
-        bool_column("rolcreaterole"),
-        bool_column("rolcreatedb"),
-        bool_column("rolcanlogin"),
-        int4_column("rolconnlimit"),
-        text_column("rolpassword"),
-        text_column("rolvaliduntil"),
-        bool_column("rolreplication"),
-        bool_column("rolbypassrls"),
-        text_column("rolcomment"),
-        bool_column("is_current_user"),
-    ]
-}
-
-fn pg_dumpall_role_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = vec![vec![
-        Some("10".to_string()),
-        Some("postgres".to_string()),
-        Some("t".to_string()),
-        Some("t".to_string()),
-        Some("t".to_string()),
-        Some("t".to_string()),
-        Some("t".to_string()),
-        Some("-1".to_string()),
-        None,
-        None,
-        Some("t".to_string()),
-        Some("t".to_string()),
-        session
-            .comments
-            .get(&CatalogCommentTarget::Role {
-                role: "postgres".to_string(),
-            })
-            .cloned(),
-        Some("t".to_string()),
-    ]];
-    let mut roles = session.roles.values().collect::<Vec<_>>();
-    roles.sort_by(|left, right| left.name.cmp(&right.name));
-    rows.extend(roles.into_iter().map(|role| {
-        vec![
-            Some(role.oid.to_string()),
-            Some(role.name.clone()),
-            Some("f".to_string()),
-            Some("t".to_string()),
-            Some("f".to_string()),
-            Some("f".to_string()),
-            Some(if role.login { "t" } else { "f" }.to_string()),
-            Some("-1".to_string()),
-            None,
-            None,
-            Some("f".to_string()),
-            Some("f".to_string()),
-            session
-                .comments
-                .get(&CatalogCommentTarget::Role {
-                    role: role.name.clone(),
-                })
-                .cloned(),
-            Some("f".to_string()),
-        ]
-    }));
-    rows
-}
-
-fn catalog_psql_describe_role_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
-    let mut rows = Vec::new();
-    let mut row = vec![
-        Some("postgres".to_string()),
-        Some("t".to_string()),
-        Some("t".to_string()),
-        Some("t".to_string()),
-        Some("t".to_string()),
-        Some("t".to_string()),
-        Some("-1".to_string()),
-        database_acl_display(session, "postgres"),
-    ];
-    if verbose {
-        row.push(
-            session
-                .comments
-                .get(&CatalogCommentTarget::Role {
-                    role: "postgres".to_string(),
-                })
-                .cloned(),
-        );
-    }
-    row.extend([Some("t".to_string()), Some("t".to_string())]);
-    rows.push(row);
-    for role in session.roles.values() {
-        let mut row = vec![
-            Some(role.name.clone()),
-            Some("f".to_string()),
-            Some("t".to_string()),
-            Some("f".to_string()),
-            Some("f".to_string()),
-            Some(if role.login { "t" } else { "f" }.to_string()),
-            Some("-1".to_string()),
-            None,
-        ];
-        if verbose {
-            row.push(
-                session
-                    .comments
-                    .get(&CatalogCommentTarget::Role {
-                        role: role.name.clone(),
-                    })
-                    .cloned(),
-            );
-        }
-        row.extend([Some("f".to_string()), Some("f".to_string())]);
-        rows.push(row);
-    }
-    rows
-}
-
-fn catalog_role_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = vec![vec![Some("10".to_string()), Some("postgres".to_string())]];
-    rows.extend(
-        session
-            .roles
-            .values()
-            .map(|role| vec![Some(role.oid.to_string()), Some(role.name.clone())]),
-    );
-    rows
 }
 
 fn psql_list_databases_catalog_query() -> &'static str {

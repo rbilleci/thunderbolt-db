@@ -2,32 +2,31 @@
 
 use super::catalog_comments::pg_dump_description_rows;
 use super::replication_catalog::try_execute_replication_pg_dump_query;
+use super::role_ddl::try_execute_role_pg_dump_catalog_query;
 use super::{
     bool_column, catalog_empty_rows, catalog_extension_discovery_rows,
-    catalog_foreign_key_metadata_columns, catalog_foreign_key_metadata_rows, catalog_role_oid_rows,
-    int4_column, int8_column, is_catalog_foreign_key_metadata_query,
-    is_pg_dump_class_metadata_query, is_pg_dump_default_acl_metadata_query,
-    is_pg_dump_function_metadata_query, is_pg_dump_index_metadata_query,
-    is_pg_dump_public_namespace_oid_lookup_query, is_pg_dumpall_tablespace_metadata_query,
-    pg_dump_attrdef_metadata_columns, pg_dump_attrdef_metadata_query_relation_oids,
-    pg_dump_attrdef_metadata_rows, pg_dump_attribute_metadata_columns,
-    pg_dump_attribute_metadata_query_oids, pg_dump_attribute_metadata_rows,
-    pg_dump_class_metadata_columns, pg_dump_class_metadata_rows, pg_dump_database_metadata_columns,
-    pg_dump_database_metadata_query, pg_dump_database_metadata_rows,
-    pg_dump_default_acl_metadata_columns, pg_dump_default_acl_metadata_rows,
-    pg_dump_dependency_rows, pg_dump_empty_catalog_query_columns,
-    pg_dump_function_metadata_columns, pg_dump_function_metadata_rows,
-    pg_dump_index_metadata_columns, pg_dump_index_metadata_rows,
+    catalog_foreign_key_metadata_columns, catalog_foreign_key_metadata_rows, int4_column,
+    int8_column, is_catalog_foreign_key_metadata_query, is_pg_dump_class_metadata_query,
+    is_pg_dump_default_acl_metadata_query, is_pg_dump_function_metadata_query,
+    is_pg_dump_index_metadata_query, is_pg_dump_public_namespace_oid_lookup_query,
+    is_pg_dumpall_tablespace_metadata_query, pg_dump_attrdef_metadata_columns,
+    pg_dump_attrdef_metadata_query_relation_oids, pg_dump_attrdef_metadata_rows,
+    pg_dump_attribute_metadata_columns, pg_dump_attribute_metadata_query_oids,
+    pg_dump_attribute_metadata_rows, pg_dump_class_metadata_columns, pg_dump_class_metadata_rows,
+    pg_dump_database_metadata_columns, pg_dump_database_metadata_query,
+    pg_dump_database_metadata_rows, pg_dump_default_acl_metadata_columns,
+    pg_dump_default_acl_metadata_rows, pg_dump_dependency_rows,
+    pg_dump_empty_catalog_query_columns, pg_dump_function_metadata_columns,
+    pg_dump_function_metadata_rows, pg_dump_index_metadata_columns, pg_dump_index_metadata_rows,
     pg_dump_sequence_last_value_query_name, pg_dump_sequence_metadata_columns,
     pg_dump_sequence_metadata_query_oid, pg_dump_sequence_metadata_rows,
     pg_dump_sequence_setval_query, pg_dump_table_oid_lookup_query_table,
     pg_dump_table_oid_lookup_rows, pg_dump_type_metadata_columns, pg_dump_type_metadata_query,
     pg_dump_type_metadata_rows, pg_dump_view_definition_query_oid, pg_dump_view_definition_rows,
-    pg_dumpall_role_metadata_columns, pg_dumpall_role_metadata_query,
-    pg_dumpall_role_metadata_rows, pg_dumpall_tablespace_metadata_columns,
-    pg_dumpall_tablespace_metadata_rows, pg_language_discovery_columns, pg_language_discovery_rows,
-    schema_acl_array_display, text_column, write_error, write_single_row, CatalogCommentTarget,
-    ErrorField, ReadWrite, Session, PUBLIC_NAMESPACE_OID,
+    pg_dumpall_tablespace_metadata_columns, pg_dumpall_tablespace_metadata_rows,
+    pg_language_discovery_columns, pg_language_discovery_rows, schema_acl_array_display,
+    text_column, write_error, write_single_row, CatalogCommentTarget, ErrorField, ReadWrite,
+    Session, PUBLIC_NAMESPACE_OID,
 };
 use std::io;
 
@@ -45,19 +44,8 @@ pub(super) fn try_execute_pg_dump_compat_statement(
             &[vec![Some(session.subscriptions.len().to_string())]],
         ));
     }
-    if canonical == "select oid, rolname from pg_catalog.pg_roles order by 1" {
-        return Some(write_single_row(
-            stream,
-            &[int4_column("oid"), text_column("rolname")],
-            &catalog_role_oid_rows(session),
-        ));
-    }
-    if canonical == pg_dumpall_role_metadata_query() {
-        return Some(write_single_row(
-            stream,
-            &pg_dumpall_role_metadata_columns(),
-            &pg_dumpall_role_metadata_rows(session),
-        ));
+    if let Some(result) = try_execute_role_pg_dump_catalog_query(stream, session, canonical) {
+        return Some(result);
     }
     if canonical
         == "select x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable, x.extversion, x.extconfig, x.extcondition from pg_extension x join pg_namespace n on n.oid = x.extnamespace"
