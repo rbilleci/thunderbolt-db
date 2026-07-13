@@ -80,13 +80,16 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001EY is closed: the byte-exact 60-method feature-policy, elision-eligibility, shard-sizing, and
   telemetry owner now lives in the bounded 624-line `engine_residency/policy.rs` child; the root is 4,176
   lines, all focused/full/GPU gates and audit are clean, and behavior is unchanged.
+- STRUCT-001EZ is closed: the normalized-exact eight-method append/rollover, sparse-version, row-identity,
+  tombstone, and fused-apply owner now lives in the bounded 1,230-line `engine_residency/mutation.rs` child; the
+  root is 2,952 lines, all focused/full/GPU gates and audit are clean, and behavior is unchanged.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EZ:** isolate production append/rollover, sparse version stamping, row identity, tombstone, and
-   fused-apply ownership behind unchanged inherent `Engine` APIs.
+1. **STRUCT-001FA:** isolate commit auto-admit, transient relation construction, and benchmark residency
+   installation behind unchanged inherent `Engine` APIs.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

@@ -1483,8 +1483,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   505/487, exact 992-test/76-family inventories are unchanged, and all-target check, strict clippy, scoped
   formatting/diff/reference checks, and independent audit are clean. Every method name/visibility, default,
   atomic ordering, predicate, cache/state mutation, and counter source is source-identical; there is no new
-  dependency cycle or CPU-first path, so the report card was not applicable. STRUCT-001EZ is the next
-  production ownership slice.
+  dependency cycle or CPU-first path, so the report card was not applicable.
+  STRUCT-001EZ then moved the normalized-exact eight-method append/rollover, sparse-version stamping,
+  row-identity, tombstone, and fused-apply owner into the rustfmt-clean 1,230-line
+  `engine_residency/mutation.rs` child, reducing the facade root to 2,952 lines. Rustfmt joined one offset
+  expression, and only `stamp_created_by_resident_shard_slots` gained the narrow `pub(super)` required by its
+  existing parent differential; public/crate APIs and production callers are unchanged. Four focused ordinary
+  gates passed, and five mutation-sensitive GPU routes passed 15 sequential plus ten concurrent invocations
+  with zero CUDA 700/716/717. Both ordinary modes pass 505/487, exact 992-test/76-family inventories are
+  unchanged, and all-target check, strict clippy, scoped formatting/diff/reference checks, and independent audit
+  are clean. Values→birth/identity stamps→row-count/HWM/zone-map publication, sparse MVCC regions, fused apply,
+  tombstone ordering, offsets, launches, counters, and fail-safe paths are source-equivalent, so the report card
+  was not applicable. STRUCT-001FA is the next production ownership slice.
 
 ## Known boundaries
 
