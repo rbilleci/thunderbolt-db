@@ -52,14 +52,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   exact 803-line PTX file; the stable crate-root facade and STRUCT-001GB safety boundary are unchanged. Its final
   HAZARD matrix, complete 55/81 and 505/487 suites, canonical report card, static gates, exact-source proofs, and
   independent audit pass. The execution root is 6,077 lines.
+- STRUCT-001GD is closed. The host-staged CUDA smoke/filter and generic MVCC compatibility family now lives in
+  bounded 1,447/592-line private leaves behind the unchanged `CudaDriverRuntime` facade. Exact-source proofs, all
+  seven families' 21+14 HAZARD matrix, complete 55/81 and 505/487 suites, static gates, and independent audit pass.
+  The fixed-device-0/per-call-context/host-transfer behavior remains explicit RETIRE-003 debt; the root is 4,067 lines.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GD:** isolate the host-staged CUDA smoke/filter and generic MVCC launchers in bounded private owners
-   behind `CudaDriverRuntime`, keeping this RETIRE-003 bootstrap debt visibly separate from resident execution.
+1. **STRUCT-001GE:** isolate the total resident expression-filter/materialization orchestration in a bounded private
+   owner with one-way dependencies on the VM and ordered-compaction leaves.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

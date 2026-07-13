@@ -1854,6 +1854,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   stable: IN-L2/OUT-OF-L2 rooflines are 1,484.6/1,425.4 GB/s, ordered compaction is 0.0236x roofline IN-L2, grouped
   aggregation is 1,678.3M elements/s, and batch-65,536 point reads are 247.5M at p50 139us IN-L2 and 253.6M at p50
   132us OUT-OF-L2. Valid-path behavior, safety validation, stream draining, and lease lifetimes are unchanged.
+  STRUCT-001GD then isolated the host-staged CUDA compatibility family in the rustfmt-clean 1,447-line
+  `staged_filter.rs` and 592-line `staged_mvcc.rs` leaves, reducing the execution root to 4,067 lines.
+  `CudaDriverRuntime` remains the stable public facade and now imports seven narrow `pub(super)` launchers directly;
+  dependency flow is one-way from that facade into the leaves, with no reverse edge, cycle, public child surface, or
+  old root ownership. Normalized reconstruction is exact apart from required visibility and import formatting. The
+  fixed device-0 selection, fresh per-call context/PTX load and allocation, host upload, synchronization, readback,
+  empty-input, and error behavior are intentionally unchanged. Both leaves explicitly identify this host-materialized
+  generic path as RETIRE-003 bootstrap debt rather than resident product execution. All seven direct GPU families pass
+  21 sequential plus 14 concurrent invocations; the full ignored GPU suites also pass. Execution passes 55/81 and
+  engine passes 505/487; workspace all-target/all-feature check, strict execution/engine clippy, source/reference/
+  Rust-2021-format/diff gates, and independent audit are clean. No runtime behavior changed, so the report card was
+  not applicable.
 
 ## Known boundaries
 

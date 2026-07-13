@@ -7,13 +7,16 @@ use crate::cuda_context::{
     check_cuda, gpu_primary_context, CudaDeviceAllocationGuard, GpuPrimaryContext,
     PendingCopyTransport,
 };
-use crate::{
+use crate::staged_filter::{
     launch_cuda_all_mask, launch_cuda_bytes_equal_mask, launch_cuda_bytes_range_mask,
-    launch_cuda_mvcc_row_batch_lengths, launch_cuda_mvcc_visibility_mask,
-    launch_cuda_smoke_add_one, launch_cuda_u32_equal_mask, CudaDeviceMemoryChunk,
-    CudaDeviceMemoryProof, CudaDeviceSnapshot, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk,
-    CudaResidentDeviceMemory, CudaRuntimeProbeError, CudaRuntimeSnapshot, GpuFallbackReason,
-    GpuRuntime, PendingCudaResidentDeviceCopy, PlannedOp, RecompactFill, RecompactSegment,
+    launch_cuda_smoke_add_one, launch_cuda_u32_equal_mask,
+};
+use crate::staged_mvcc::{launch_cuda_mvcc_row_batch_lengths, launch_cuda_mvcc_visibility_mask};
+use crate::{
+    CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDeviceSnapshot, CudaMvccRowBatch,
+    CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory, CudaRuntimeProbeError,
+    CudaRuntimeSnapshot, GpuFallbackReason, GpuRuntime, PendingCudaResidentDeviceCopy, PlannedOp,
+    RecompactFill, RecompactSegment,
 };
 
 #[derive(Debug, Clone)]
