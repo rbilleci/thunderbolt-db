@@ -246,12 +246,14 @@ mod acl_execution;
 use acl_execution::{
     database_exists, execute_acl_command, function_access_permission_error,
     object_access_permission_error, role_exists, role_has_dependencies, schema_permission_error,
-    schema_usage_permission_error, tablespace_exists,
+    schema_usage_permission_error, tablespace_exists, try_execute_default_acl_catalog_query,
 };
 #[cfg(test)]
 use acl_execution::{
     grant_default_table_acl, grant_function_acl, grant_relation_acl, grant_schema_acl,
     revoke_relation_acl,
+    test_catalog_psql_default_access_privilege_rows as catalog_psql_default_access_privilege_rows,
+    test_psql_list_default_access_privileges_catalog_query as psql_list_default_access_privileges_catalog_query,
 };
 #[path = "gpu-db-server/simple_dml.rs"]
 mod simple_dml;
@@ -1695,17 +1697,8 @@ fn execute_statement(
     if let Some(result) = try_execute_replication_catalog_query(stream, session, &canonical) {
         return result;
     }
-    if canonical == psql_list_default_access_privileges_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Owner"),
-                text_column("Schema"),
-                text_column("Type"),
-                text_column("Access privileges"),
-            ],
-            &catalog_psql_default_access_privilege_rows(session),
-        );
+    if let Some(result) = try_execute_default_acl_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_extension_catalog_query(stream, session, &canonical) {
         return result;
@@ -1834,13 +1827,6 @@ fn execute_statement(
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
         return write_single_row(stream, &columns, &catalog_empty_rows());
-    }
-    if is_pg_dump_default_acl_metadata_query(&canonical) {
-        return write_single_row(
-            stream,
-            &pg_dump_default_acl_metadata_columns(),
-            &pg_dump_default_acl_metadata_rows(session),
-        );
     }
     if catalog_describe_relation_lookup_query_all_schemas(&canonical)
         || catalog_describe_relation_lookup_query_public_namespace(&canonical)
@@ -2688,10 +2674,6 @@ fn psql_list_casts_catalog_query() -> &'static str {
     "select pg_catalog.format_type(castsource, null) as \"source type\", pg_catalog.format_type(casttarget, null) as \"target type\", case when c.castmethod = 'b' then '(binary coercible)' when c.castmethod = 'i' then '(with inout)' else p.proname end as \"function\", case when c.castcontext = 'e' then 'no' when c.castcontext = 'a' then 'in assignment' else 'yes' end as \"implicit?\" from pg_catalog.pg_cast c left join pg_catalog.pg_proc p on c.castfunc = p.oid left join pg_catalog.pg_type ts on c.castsource = ts.oid left join pg_catalog.pg_namespace ns on ns.oid = ts.typnamespace left join pg_catalog.pg_type tt on c.casttarget = tt.oid left join pg_catalog.pg_namespace nt on nt.oid = tt.typnamespace where ( (true and pg_catalog.pg_type_is_visible(ts.oid) ) or (true and pg_catalog.pg_type_is_visible(tt.oid) ) ) order by 1, 2"
 }
 
-fn psql_list_default_access_privileges_catalog_query() -> &'static str {
-    "select pg_catalog.pg_get_userbyid(d.defaclrole) as \"owner\", n.nspname as \"schema\", case d.defaclobjtype when 'r' then 'table' when 's' then 'sequence' when 'f' then 'function' when 't' then 'type' when 'n' then 'schema' end as \"type\", pg_catalog.array_to_string(d.defaclacl, e'\\n') as \"access privileges\" from pg_catalog.pg_default_acl d left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace order by 1, 2, 3"
-}
-
 fn psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
     let prefix = "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and (t.typname operator(pg_catalog.~) '^(";
     let suffix = ")$' collate pg_catalog.default or pg_catalog.format_type(t.oid, null) operator(pg_catalog.~) '^(";
@@ -3132,25 +3114,6 @@ fn schema_privilege_letters(privileges: &BTreeSet<SchemaPrivilege>) -> String {
         }
     }
     letters
-}
-
-fn catalog_psql_default_access_privilege_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    acl_display(&session.default_table_acl)
-        .map(|acl| {
-            vec![vec![
-                Some("postgres".to_string()),
-                Some("public".to_string()),
-                Some("table".to_string()),
-                Some(acl),
-            ]]
-        })
-        .unwrap_or_default()
-}
-
-fn pg_dump_default_table_acl_array_display(session: &Session) -> Option<String> {
-    let acl = acl_array_display(&session.default_table_acl)?;
-    let inner = acl.strip_prefix('{')?.strip_suffix('}')?;
-    Some(format!("{{postgres=arwdDxt/postgres,{inner}}}"))
 }
 
 fn acl_display(acl: &BTreeMap<String, BTreeSet<TablePrivilege>>) -> Option<String> {
@@ -4023,38 +3986,6 @@ fn pg_dump_sequence_setval_query(canonical: &str) -> Option<(String, i64, bool)>
         value,
         is_called,
     ))
-}
-
-fn is_pg_dump_default_acl_metadata_query(canonical: &str) -> bool {
-    canonical.starts_with("select oid, tableoid, defaclrole")
-        && canonical.contains("from pg_default_acl")
-}
-
-fn pg_dump_default_acl_metadata_columns() -> Vec<Column> {
-    vec![
-        int4_column("oid"),
-        int4_column("tableoid"),
-        int4_column("defaclrole"),
-        int4_column("defaclnamespace"),
-        text_column("defaclobjtype"),
-        text_column("defaclacl"),
-        text_column("acldefault"),
-    ]
-}
-
-fn pg_dump_default_acl_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let Some(acl) = pg_dump_default_table_acl_array_display(session) else {
-        return Vec::new();
-    };
-    vec![vec![
-        Some("82600".to_string()),
-        Some("826".to_string()),
-        Some("10".to_string()),
-        Some(PUBLIC_NAMESPACE_OID.to_string()),
-        Some("r".to_string()),
-        Some(acl),
-        Some("{postgres=arwdDxt/postgres}".to_string()),
-    ]]
 }
 
 fn sql_type_alignment_code(ty: SqlType) -> &'static str {

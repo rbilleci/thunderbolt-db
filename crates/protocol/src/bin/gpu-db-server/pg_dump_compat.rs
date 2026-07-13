@@ -1,5 +1,6 @@
 // Legacy pg_dump compatibility ownership. This is not a product catalog execution path.
 
+use super::acl_execution::try_execute_default_acl_pg_dump_catalog_query;
 use super::bootstrap_ddl::{
     try_execute_access_method_pg_dump_catalog_query, try_execute_extension_pg_dump_catalog_query,
     try_execute_language_pg_dump_catalog_query, try_execute_schema_pg_dump_catalog_query,
@@ -14,15 +15,13 @@ use super::{
     bool_column, catalog_empty_rows, catalog_foreign_key_metadata_columns,
     catalog_foreign_key_metadata_rows, int4_column, int8_column,
     is_catalog_foreign_key_metadata_query, is_pg_dump_class_metadata_query,
-    is_pg_dump_default_acl_metadata_query, is_pg_dump_function_metadata_query,
-    is_pg_dump_index_metadata_query, pg_dump_attrdef_metadata_columns,
-    pg_dump_attrdef_metadata_query_relation_oids, pg_dump_attrdef_metadata_rows,
-    pg_dump_attribute_metadata_columns, pg_dump_attribute_metadata_query_oids,
-    pg_dump_attribute_metadata_rows, pg_dump_class_metadata_columns, pg_dump_class_metadata_rows,
-    pg_dump_default_acl_metadata_columns, pg_dump_default_acl_metadata_rows,
-    pg_dump_dependency_rows, pg_dump_empty_catalog_query_columns,
-    pg_dump_function_metadata_columns, pg_dump_function_metadata_rows,
-    pg_dump_index_metadata_columns, pg_dump_index_metadata_rows,
+    is_pg_dump_function_metadata_query, is_pg_dump_index_metadata_query,
+    pg_dump_attrdef_metadata_columns, pg_dump_attrdef_metadata_query_relation_oids,
+    pg_dump_attrdef_metadata_rows, pg_dump_attribute_metadata_columns,
+    pg_dump_attribute_metadata_query_oids, pg_dump_attribute_metadata_rows,
+    pg_dump_class_metadata_columns, pg_dump_class_metadata_rows, pg_dump_dependency_rows,
+    pg_dump_empty_catalog_query_columns, pg_dump_function_metadata_columns,
+    pg_dump_function_metadata_rows, pg_dump_index_metadata_columns, pg_dump_index_metadata_rows,
     pg_dump_sequence_last_value_query_name, pg_dump_sequence_metadata_columns,
     pg_dump_sequence_metadata_query_oid, pg_dump_sequence_metadata_rows,
     pg_dump_sequence_setval_query, pg_dump_table_oid_lookup_query_table,
@@ -292,12 +291,9 @@ pub(super) fn try_execute_pg_dump_compat_statement(
     if let Some(columns) = pg_dump_empty_catalog_query_columns(canonical) {
         return Some(write_single_row(stream, &columns, &catalog_empty_rows()));
     }
-    if is_pg_dump_default_acl_metadata_query(canonical) {
-        return Some(write_single_row(
-            stream,
-            &pg_dump_default_acl_metadata_columns(),
-            &pg_dump_default_acl_metadata_rows(session),
-        ));
+    if let Some(result) = try_execute_default_acl_pg_dump_catalog_query(stream, session, canonical)
+    {
+        return Some(result);
     }
     if canonical.starts_with("with recursive w as ( select d1.objid") {
         return Some(write_single_row(

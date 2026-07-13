@@ -1,9 +1,10 @@
 // Legacy ACL mutation ownership. This is not a product execution path.
 
 use super::{
-    write_command_complete, write_error, AclRelationKind, CatalogCommentTarget, Command,
-    DatabasePrivilege, ErrorField, FunctionPrivilege, ReadWrite, SchemaPrivilege, Session,
-    TablePrivilege, TablespacePrivilege,
+    acl_array_display, acl_display, int4_column, text_column, write_command_complete, write_error,
+    write_single_row, AclRelationKind, CatalogCommentTarget, Column, Command, DatabasePrivilege,
+    ErrorField, FunctionPrivilege, ReadWrite, SchemaPrivilege, Session, TablePrivilege,
+    TablespacePrivilege, PUBLIC_NAMESPACE_OID,
 };
 use std::io;
 
@@ -737,4 +738,106 @@ pub(super) fn execute_acl_command(
         }
         _ => unreachable!("ACL executor received an unrelated command"),
     }
+}
+
+pub(super) fn try_execute_default_acl_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != psql_list_default_access_privileges_catalog_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[
+            text_column("Owner"),
+            text_column("Schema"),
+            text_column("Type"),
+            text_column("Access privileges"),
+        ],
+        &catalog_psql_default_access_privilege_rows(session),
+    ))
+}
+
+pub(super) fn try_execute_default_acl_pg_dump_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if !is_pg_dump_default_acl_metadata_query(canonical) {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &pg_dump_default_acl_metadata_columns(),
+        &pg_dump_default_acl_metadata_rows(session),
+    ))
+}
+
+fn psql_list_default_access_privileges_catalog_query() -> &'static str {
+    "select pg_catalog.pg_get_userbyid(d.defaclrole) as \"owner\", n.nspname as \"schema\", case d.defaclobjtype when 'r' then 'table' when 's' then 'sequence' when 'f' then 'function' when 't' then 'type' when 'n' then 'schema' end as \"type\", pg_catalog.array_to_string(d.defaclacl, e'\\n') as \"access privileges\" from pg_catalog.pg_default_acl d left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace order by 1, 2, 3"
+}
+
+fn catalog_psql_default_access_privilege_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    acl_display(&session.default_table_acl)
+        .map(|acl| {
+            vec![vec![
+                Some("postgres".to_string()),
+                Some("public".to_string()),
+                Some("table".to_string()),
+                Some(acl),
+            ]]
+        })
+        .unwrap_or_default()
+}
+
+fn pg_dump_default_table_acl_array_display(session: &Session) -> Option<String> {
+    let acl = acl_array_display(&session.default_table_acl)?;
+    let inner = acl.strip_prefix('{')?.strip_suffix('}')?;
+    Some(format!("{{postgres=arwdDxt/postgres,{inner}}}"))
+}
+
+fn is_pg_dump_default_acl_metadata_query(canonical: &str) -> bool {
+    canonical.starts_with("select oid, tableoid, defaclrole")
+        && canonical.contains("from pg_default_acl")
+}
+
+fn pg_dump_default_acl_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("oid"),
+        int4_column("tableoid"),
+        int4_column("defaclrole"),
+        int4_column("defaclnamespace"),
+        text_column("defaclobjtype"),
+        text_column("defaclacl"),
+        text_column("acldefault"),
+    ]
+}
+
+fn pg_dump_default_acl_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let Some(acl) = pg_dump_default_table_acl_array_display(session) else {
+        return Vec::new();
+    };
+    vec![vec![
+        Some("82600".to_string()),
+        Some("826".to_string()),
+        Some("10".to_string()),
+        Some(PUBLIC_NAMESPACE_OID.to_string()),
+        Some("r".to_string()),
+        Some(acl),
+        Some("{postgres=arwdDxt/postgres}".to_string()),
+    ]]
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_default_access_privileges_catalog_query() -> &'static str {
+    psql_list_default_access_privileges_catalog_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_psql_default_access_privilege_rows(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    catalog_psql_default_access_privilege_rows(session)
 }
