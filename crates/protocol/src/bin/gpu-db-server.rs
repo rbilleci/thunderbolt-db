@@ -107,6 +107,9 @@ use sequence_execution::execute_sequence_command;
 #[path = "gpu-db-server/domain_ddl.rs"]
 mod domain_ddl;
 use domain_ddl::execute_domain_ddl;
+#[path = "gpu-db-server/replication_catalog.rs"]
+mod replication_catalog;
+use replication_catalog::execute_replication_catalog_command;
 #[path = "gpu-db-server/backend_adapter.rs"]
 mod backend_adapter;
 use backend_adapter::*;
@@ -4851,50 +4854,13 @@ fn execute_statement(
         Ok(command @ (Command::CreateDomain(_) | Command::DropDomain(_))) => {
             return execute_domain_ddl(stream, session, command);
         }
+        Ok(
+            command @ (Command::CreatePublication(_)
+            | Command::DropPublication(_)
+            | Command::CreateSubscription(_)
+            | Command::DropSubscription(_)),
+        ) => return execute_replication_catalog_command(stream, session, command),
         Ok(command) => match command {
-            Command::CreatePublication(create) => {
-                if let Some(error) =
-                    schema_permission_error(session, "public", SchemaPrivilege::Create)
-                {
-                    return write_error(stream, &error);
-                }
-                if let Err(error) = create_publication(session, create.name, create.target) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "CREATE PUBLICATION");
-            }
-            Command::DropPublication(drop) => {
-                if let Err(error) = drop_publication(session, &drop.names, drop.if_exists) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "DROP PUBLICATION");
-            }
-            Command::CreateSubscription(create) => {
-                if let Some(error) =
-                    schema_permission_error(session, "public", SchemaPrivilege::Create)
-                {
-                    return write_error(stream, &error);
-                }
-                if let Err(error) = create_subscription(
-                    session,
-                    create.name,
-                    create.connection,
-                    create.publications,
-                ) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "CREATE SUBSCRIPTION");
-            }
-            Command::DropSubscription(drop) => {
-                if let Err(error) = drop_subscription(session, &drop.names, drop.if_exists) {
-                    return write_error(stream, &error);
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "DROP SUBSCRIPTION");
-            }
             Command::CreateRole(create) => {
                 if role_exists(session, &create.name) {
                     return write_error(
@@ -6168,6 +6134,12 @@ fn execute_statement(
             }
             Command::CreateDomain(_) | Command::DropDomain(_) => {
                 unreachable!("domain DDL commands are routed by the preceding parse arm")
+            }
+            Command::CreatePublication(_)
+            | Command::DropPublication(_)
+            | Command::CreateSubscription(_)
+            | Command::DropSubscription(_) => {
+                unreachable!("replication catalog commands are routed by the preceding parse arm")
             }
         },
     }

@@ -590,6 +590,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   is normalized-exact; only clippy-required tail expressions differ. Sequential/concurrent 127-test runs, the
   full protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
   formatting, diff checks, and independent audit are clean. The root is 13,608 lines and STRUCT-001BK is closed.
+  Parsed publication/subscription lifecycle commands now enter the private 56-line `replication_catalog` owner
+  through one exact successful-parse variant gate. CREATE/DROP PUBLICATION and SUBSCRIPTION preserve schema
+  checks, helper arguments/ownership/order, propagated errors, snapshot-persistence placement, and tags. The
+  four-arm body is token-equivalent after normalizing formatting and clippy-required tail expressions.
+  Sequential/concurrent 127-test runs, the full protocol package and driver smokes, all-target checks, warning-
+  denied clippy, security preflight, touched formatting, diff checks, and independent audit are clean. The root
+  is 13,580 lines and STRUCT-001BL is closed.
 
 ## Known boundaries
 
