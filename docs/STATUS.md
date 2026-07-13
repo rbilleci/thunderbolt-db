@@ -1629,6 +1629,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   dependency/scoped source/reference/format checks, and independent audit are clean. Type layout, derives,
   accessors, unsafe test readback, external consumers, runtime, kernels, synchronization, allocations, and
   result behavior are source-equivalent, so the report card was not applicable.
+  STRUCT-001FM then isolated predicate-mask ownership and execution in the rustfmt-clean 385-line
+  `predicate_mask.rs` child, reducing the execution root to 11,682 lines. The stable crate-root type and five
+  resident APIs remain unchanged and opaque externally; narrow `pub(super)` fields preserve fixed/filter join
+  consumers, while one root-private compact import preserves exactly nine typed-filter call sites without a
+  cycle. Direct predicate VM, OUTER-WHERE 3VL, and over-budget streaming-filter GPU routes passed nine
+  sequential plus six concurrent invocations with zero device faults. Both execution modes passed 48/79, both
+  engine modes passed 505/487, workspace all-target check, strict execution/engine clippy, dependency/scoped
+  source/reference/format checks, and independent audit are clean. Both PTX blobs, symbols/arguments,
+  arithmetic-VM calls, probe scope, retained-buffer ownership transfer, context/allocation/launch/
+  synchronization, empty/error behavior, and ordered results are source-equivalent, so the report card was not
+  applicable.
 
 ## Known boundaries
 
