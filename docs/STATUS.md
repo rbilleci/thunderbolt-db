@@ -1806,6 +1806,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   independent audit are clean. PTX symbols/ABIs/bodies, validation, NULL/empty/sentinel/overflow behavior,
   geometry, initialization, stream/lease/error lifetime, bounded scalar readback, and callers are
   source-equivalent, so the report card was not applicable.
+  STRUCT-001FZ then deleted the unconsumed public whole-column int4 D2H facade and private kernel-less transfer,
+  plus their sole remaining consumer: a test-only serial identity-copy launcher/embedded PTX and ignored
+  migration A/B gate. The deletion removes 312 lines from the execution root (8,244 to 7,932) and 94 lines from
+  `context_aggregate.rs` (2,602 to 2,508), leaving execution at 54 active and 80 GPU-ignored tests. Whole-tree and
+  history audit proves the last product consumers moved by 2026-06-25 to bounded selected-row gather or the
+  on-device GROUP BY/general-expression bridges; no engine, example, benchmark, roofline, script, or nonarchive
+  documentation consumer remained. The live selected-row gather and ordered compare/project families are
+  unchanged. Both execution modes pass 54/80 and both engine modes pass 505/487 with GPU sweeps serial; workspace
+  all-target/all-feature check, strict execution/engine clippy, source/history/diff/docs gates, and independent
+  audit are clean. No live path or surviving kernel/result behavior changed, so HAZARD and report-card gates were
+  not applicable.
 
 ## Known boundaries
 
