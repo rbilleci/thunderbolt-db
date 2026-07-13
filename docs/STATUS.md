@@ -1403,7 +1403,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   passed nine sequential and six concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed
   505/487, and all-target check, strict clippy, scoped formatting/diff/reference checks, and independent audit
   are clean. No production locate, reinsert, scan, or architectural behavior changed, so the report card was not
-  applicable. STRUCT-001EQ is next.
+  applicable.
+  STRUCT-001EQ externalized the exact five-test text/numeric/bool/b128 and grouped/versioned residency-read
+  family into the rustfmt-clean 448-line `tests/residency_wide_type_reads.rs` owner at the same parent position.
+  Normalized comparison differs only by one rustfmt brace-line collapse; all bodies, attributes, names, and
+  order remain unchanged, and the adjacent wave-batch validation test remains at the parent boundary. The
+  engine root is 8,463 lines, and the 992-test/76-family inventories remain exact. Five GPU gates passed 15
+  sequential and 10 concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and
+  all-target check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No
+  production type, rehydration, grouping, read-route, or architectural behavior changed, so the report card was
+  not applicable. STRUCT-001ER is next.
 
 ## Known boundaries
 
