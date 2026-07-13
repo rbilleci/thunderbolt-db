@@ -1213,6 +1213,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   lagging-follower, recovery, and snapshot-boundary tests, both 187-test serial/16-thread runs, replication
   all-target check and strict clippy, scoped formatting/diff/reference checks, and independent audit are clean.
   The root is 17,198 lines with 683 production lines; STRUCT-001DW is next.
+  STRUCT-001DW externalized the exact contiguous 27-test replicator lifecycle/progress family into a bounded
+  551-line `tests/replicator_lifecycle.rs` owner through an `include!` at the same parent position. Every body
+  is byte-identical after parent deindent, all compiled harness names remain `tests::*`, and the Local/Raft
+  wait tests coherently cover the root `LogReplicator::wait_committed` contract. Production, visibility, APIs,
+  and semantics are untouched. Focused recovery, single-node, acknowledgement, role/tail, wait, snapshot, and
+  progress tests, both 187-test serial/16-thread runs, replication all-target check and strict clippy, scoped
+  formatting/diff/reference checks, and independent audit are clean. The root is 16,648 lines with 683
+  production lines; STRUCT-001DX is next.
 
 ## Known boundaries
 
