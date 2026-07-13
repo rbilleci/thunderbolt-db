@@ -1950,6 +1950,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   benchmark logs, restored 566 GiB free, all 11 ENOSPC failures passed alone, the complete 487-test rerun passed, and
   fresh generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were not
   applicable. The expression root is now 10,668 lines.
+  STRUCT-001GL then isolated grouped-value reconstruction and representative-row grouping in the 174-line private
+  `engine_expr/grouped_values.rs` leaf. `narrow_ordered_value` and `composite_group_count_reps` retain exact bodies
+  and gained only `pub(super)` for parent use; dependencies explicitly name the relational offset/layout helpers,
+  snapshot/table, SQL/error, and typed execution contracts. The select orchestrator, predicate compiler/lowerers,
+  every `Engine` method, residency construction, runtime/device owners, and MULTI work remain in place. Inherited
+  prose was corrected to state that the representative route appends the DISTINCT value member, which may be int8
+  or bool, rather than an always-non-int member. Nine focused GPU routes cover int2/date/timestamp, bool, numeric,
+  UUID, int8, text, and composite COUNT(DISTINCT); both 505/487 engine modes, all-target check, strict clippy,
+  exact-source/consumer/visibility/scoped-format/diff/docs gates, and independent re-audit pass. Fresh generated
+  `gpu-db-*` test residue was removed after the suite. Runtime behavior did not change, so HAZARD and report-card
+  gates were not applicable. The expression root is now 10,510 lines.
 
 ## Known boundaries
 

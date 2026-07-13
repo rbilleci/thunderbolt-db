@@ -90,15 +90,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   work remain in place. Unit, focused GPU parity, complete 505/487, static, and independent audit gates pass. Scoped
   removal of 547.4 GiB of obsolete generated `target/tmp/gpu-db-*` residue resolved and disproved an ENOSPC-only
   false failure. The expression root is 10,668 lines; HAZARD and report card were not applicable.
+- STRUCT-001GL is closed. The exact two-helper grouped-value owner now lives in the 174-line private
+  `engine_expr/grouped_values.rs` leaf for parent use; orchestration, compiler/lowerers, residency, and runtime/device
+  work remain in place. Nine typed GPU routes, complete 505/487 suites, static gates, and independent re-audit pass.
+  The expression root is 10,510 lines; HAZARD and report card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GL:** isolate only the two grouped-value reconstruction/representative-grouping helpers into a nested
-   private leaf for parent use; keep the select orchestrator, compiler/lowerers, residency, and runtime/device work in
-   place.
+1. **STRUCT-001GM:** isolate only the three resident execution-source/visibility contracts and visibility-program
+   builder into a nested private leaf behind their existing crate-private paths; keep construction, routing,
+   orchestration, and runtime/device actions in place.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
