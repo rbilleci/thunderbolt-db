@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BG:** isolate parsed CREATE/RENAME/DROP INDEX arms behind a private index-DDL owner, preserving
-   validation, constraint guards, comments, dirty publication, exact errors/tags, and parse order.
+1. **STRUCT-001BH:** isolate CREATE/REFRESH/RENAME/DROP VIEW and MATERIALIZED VIEW arms behind a private owner,
+   preserving dependencies, materialized snapshots, comments, dirty publication, errors, tags, and parse order.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

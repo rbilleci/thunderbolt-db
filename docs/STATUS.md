@@ -553,6 +553,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied clippy, security
   preflight, touched formatting, diff checks, and independent audit are clean. The root is 14,573 lines,
   `ddl_execution` is 609 lines, and STRUCT-001BF is closed.
+  Parsed index DDL now enters the private 161-line `index_ddl` owner through one exact successful-parse variant
+  gate. CREATE/RENAME/DROP INDEX preserve permission and name/kind/existence precedence, column and unique-data
+  validation, constraint-backed guards, duplicate-list semantics, comment retarget/removal, dirty publication,
+  persistence, errors, and tags. The complete three-arm body is normalized-exact; CREATE retains its original
+  absence of relation-OID mutation. Sequential/concurrent 127-test runs, the full protocol package and driver
+  smokes, all-target checks, warning-denied clippy, security preflight, touched formatting, diff checks, and
+  independent audit are clean. The root is 14,440 lines and STRUCT-001BG is closed.
 
 ## Known boundaries
 

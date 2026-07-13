@@ -92,6 +92,9 @@ use bootstrap_ddl::try_execute_bootstrap_ddl;
 #[path = "gpu-db-server/cluster_ddl.rs"]
 mod cluster_ddl;
 use cluster_ddl::execute_cluster_ddl;
+#[path = "gpu-db-server/index_ddl.rs"]
+mod index_ddl;
+use index_ddl::execute_index_ddl;
 #[path = "gpu-db-server/backend_adapter.rs"]
 mod backend_adapter;
 use backend_adapter::*;
@@ -4801,89 +4804,12 @@ fn execute_statement(
             | Command::RenameConstraint(_)
             | Command::RenameTable(_)),
         ) => return execute_parsed_table_ddl(stream, session, command),
+        Ok(
+            command @ (Command::CreateIndex(_) | Command::RenameIndex(_) | Command::DropIndex(_)),
+        ) => {
+            return execute_index_ddl(stream, session, command);
+        }
         Ok(command) => match command {
-            Command::CreateIndex(create) => {
-                if let Some(error) =
-                    schema_permission_error(session, "public", SchemaPrivilege::Create)
-                {
-                    return write_error(stream, &error);
-                }
-                if session
-                    .indexes
-                    .iter()
-                    .any(|index| index.name == create.name)
-                    || session.tables.contains_key(&create.name)
-                    || session.views.contains_key(&create.name)
-                    || session.materialized_views.contains_key(&create.name)
-                    || session.sequences.contains_key(&create.name)
-                {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42P07",
-                            message: "relation already exists",
-                            position: None,
-                        },
-                    );
-                }
-                let Some(table) = session.tables.get_mut(&create.table) else {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42P01",
-                            message: "relation does not exist",
-                            position: None,
-                        },
-                    );
-                };
-                if !table
-                    .columns
-                    .iter()
-                    .any(|column| column.def.name == create.column)
-                {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42703",
-                            message: "column does not exist",
-                            position: None,
-                        },
-                    );
-                }
-                if create.unique {
-                    let mut candidate_indexes = session.indexes.clone();
-                    candidate_indexes.push(CatalogIndex {
-                        name: create.name.clone(),
-                        table: create.table.clone(),
-                        column: create.column.clone(),
-                        unique: true,
-                        primary_key: false,
-                        unique_constraint: false,
-                    });
-                    if let Err(error) = validate_unique_indexes(table, &candidate_indexes) {
-                        return write_error(stream, &error);
-                    }
-                }
-                session.indexes.push(CatalogIndex {
-                    name: create.name,
-                    table: create.table.clone(),
-                    column: create.column,
-                    unique: create.unique,
-                    primary_key: false,
-                    unique_constraint: false,
-                });
-                session.dirty_indexes = true;
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "CREATE INDEX");
-            }
-            Command::RenameIndex(rename) => {
-                if let Err(error) =
-                    rename_index_in_session(session, &rename.old_name, &rename.new_name)
-                {
-                    return write_error(stream, &error);
-                }
-                return write_command_complete(stream, "ALTER INDEX");
-            }
             Command::CreateView(create) => {
                 if !session.public_schema_exists {
                     return write_error(
@@ -6118,68 +6044,6 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP TABLE");
             }
-            Command::DropIndex(drop) => {
-                if !drop.if_exists {
-                    for name in &drop.names {
-                        if !session.indexes.iter().any(|index| index.name == *name) {
-                            return write_error(
-                                stream,
-                                &ErrorField {
-                                    code: "42704",
-                                    message: "index does not exist",
-                                    position: None,
-                                },
-                            );
-                        }
-                    }
-                }
-                let old_index_count = session.indexes.len();
-                let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
-                session
-                    .indexes
-                    .retain(|index| !drop_names.contains(&index.name));
-                session.dirty_indexes |= session.indexes.len() != old_index_count;
-                if session.indexes.len() != old_index_count {
-                    for name in &drop.names {
-                        let target = CatalogCommentTarget::Index {
-                            index: name.clone(),
-                        };
-                        session.comments.remove(&target);
-                        session.mark_comment_dirty(target);
-                    }
-                    let dropped_constraint_targets = session
-                        .comments
-                        .keys()
-                        .filter(|target| match target {
-                            CatalogCommentTarget::Constraint { constraint, .. } => {
-                                drop_names.contains(constraint)
-                            }
-                            CatalogCommentTarget::Database { .. }
-                            | CatalogCommentTarget::Role { .. }
-                            | CatalogCommentTarget::Schema { .. }
-                            | CatalogCommentTarget::Tablespace { .. }
-                            | CatalogCommentTarget::Table { .. }
-                            | CatalogCommentTarget::Column { .. }
-                            | CatalogCommentTarget::Index { .. }
-                            | CatalogCommentTarget::View { .. }
-                            | CatalogCommentTarget::MaterializedView { .. }
-                            | CatalogCommentTarget::Extension { .. }
-                            | CatalogCommentTarget::Function { .. }
-                            | CatalogCommentTarget::Sequence { .. }
-                            | CatalogCommentTarget::Domain { .. }
-                            | CatalogCommentTarget::Publication { .. }
-                            | CatalogCommentTarget::Subscription { .. } => false,
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for target in dropped_constraint_targets {
-                        session.comments.remove(&target);
-                        session.mark_comment_dirty(target);
-                    }
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "DROP INDEX");
-            }
             Command::AlterColumnDefault(alter) => {
                 if session.views.contains_key(&alter.table)
                     || session.materialized_views.contains_key(&alter.table)
@@ -7133,6 +6997,9 @@ fn execute_statement(
             | Command::RenameConstraint(_)
             | Command::RenameTable(_) => {
                 unreachable!("parsed table DDL commands are routed by the preceding parse arm")
+            }
+            Command::CreateIndex(_) | Command::RenameIndex(_) | Command::DropIndex(_) => {
+                unreachable!("index DDL commands are routed by the preceding parse arm")
             }
         },
     }
