@@ -377,6 +377,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   above 64 MiB are intentionally rejected; ordinary driver and COPY chunking pass. Aggregate pre-authentication
   DoS remains under **SCALE-001** because the legacy thread-per-connection endpoint lacks admission limits and
   read deadlines, so many slow clients can still pin bounded buffers concurrently. STRUCT-001AK is closed.
+  The legacy server's 121 root tests and five shared helpers now live behind the private external `tests` module.
+  After deindent and canonical formatting, the complete parent/current bodies are byte-identical; all 126
+  module-level functions occur once, all 121 attributes remain, and the exact 127-test binary inventory retains
+  every legacy `tests::...` name. The production root change is only a cfg/path declaration, with no visibility,
+  API, or non-test build expansion. Protocol full tests, all-target/all-feature check, warning-denied clippy,
+  driver smokes, security preflight, formatting, and independent audit are clean. The root is 20,413 lines.
+  STRUCT-001AL is closed; the intentionally intermediate 10,480-line test owner remains active under
+  **STRUCT-001AM** and is not a size exception.
 
 ## Known boundaries
 
