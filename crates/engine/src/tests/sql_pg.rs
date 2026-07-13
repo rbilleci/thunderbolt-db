@@ -4405,9 +4405,10 @@ fn gpu_join_result_nullable_value_columns_from_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_join_limit_offset_window_edges() {
-    // S7/V3: OFFSET/LIMIT on the join result now WINDOWS the device sort permutation (gpu_sort_permutation),
-    // gathering only the kept window -- no host drain/truncate on result data. Edge cases vs the old
-    // drain/truncate: OFFSET past the end -> empty, LIMIT 0 -> empty, OFFSET+LIMIT past the end -> clamped.
+    // S7/V3: the join result sorts device coordinates with `sort_join_coordinates`, then windows those
+    // coordinates with `window_join_coordinates` before materialization -- no host drain/truncate on result
+    // data. Edge cases vs the old drain/truncate: OFFSET past the end -> empty, LIMIT 0 -> empty,
+    // OFFSET+LIMIT past the end -> clamped.
     let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();

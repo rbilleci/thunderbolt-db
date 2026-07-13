@@ -66,14 +66,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   ORDER-BY-LIMIT, and raw-HAVING implementations/PTX/tests are deleted. The 15+10 HAZARD matrix, complete 56/77 and
   505/487 suites, canonical card, static/PTX gates, and independent re-audit pass. The execution root is 1,660 lines
   and satisfies the production envelope; host-key H2D and permutation D2H remain RETIRE-003 debt.
+- STRUCT-001GG is closed. The `engine_expr.rs` outlier has a complete responsibility/dependency/history/disposition
+  packet, and grouped-result permutation now lives source-exact in the 186-line `engine_result_sort.rs` leaf behind
+  its stable crate-private path. Its six-family 18+12 HAZARD matrix, complete 505/487 suites, static gates, and
+  independent audit pass; the report card was not applicable. The root is 11,231 lines, and host result-key/payload
+  construction plus permutation transfers remain RETIRE-003 debt.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GG:** complete the `engine_expr.rs` analysis packet, then isolate only its standalone grouped-result
-   permutation owner behind the existing facade with exact behavior and RETIRE-003 debt documentation.
+1. **STRUCT-001GH:** isolate only `ResidentBinaryOp` and `ResidentExpr` into a neutral IR leaf behind their existing
+   crate-private paths; do not combine join, visibility, compiler, or lowering ownership.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

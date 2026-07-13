@@ -1895,6 +1895,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   p50 138/132us. Strict checks, clippy, exact PTX (`d940c475...`), `ptxas`, ASCII, deletion/reference, formatting,
   diff, full-suite, and independent re-audit gates are clean. The execution root is now 1,660 lines and no longer an
   outlier.
+  STRUCT-001GG completed the full analysis packet for the handwritten `engine_expr.rs` hub and isolated its
+  standalone grouped-result GPU permutation in the 186-line `engine_result_sort.rs` leaf. The executable function
+  is source-exact, remains available at `crate::engine_expr::gpu_sort_permutation` through one narrow crate-private
+  re-export, and has exactly two callers: multi-pass group alignment and grouped final ORDER BY. Dependencies are
+  one-way to residency payload construction, typed execution sorting, and SQL/error types, with no unsafe, PTX,
+  cycle, or visibility expansion. Inherited comments that still attributed this owner to join sorting were removed
+  or corrected: joins now sort and window device coordinates directly. Host result-key/payload construction, H2D,
+  and permutation D2H remain explicit RETIRE-003 debt. Six affected GPU families passed 18 sequential plus 12
+  concurrent HAZARD invocations; engine passed 505 ordinary/487 ignored-GPU tests. All-target check, strict engine/
+  execution clippy, exact-source/consumer/scoped-format/diff/docs gates, and independent audit are clean. No runtime,
+  kernel, residency, or result behavior changed, so the canonical report card was not applicable. The expression
+  root is now 11,231 lines.
 
 ## Known boundaries
 
