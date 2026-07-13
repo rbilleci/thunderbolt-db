@@ -56,12 +56,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001EQ is closed: the exact five-test wide-type and grouped/versioned residency-read family now lives in
   the bounded 448-line `tests/residency_wide_type_reads.rs` owner; exact inventories, 25 GPU invocations, full
   gates, and audit are clean with no production change.
+- STRUCT-001ER is closed: the exact five-test write-wave validation/duplicate-race/multi-writer family now lives
+  in the bounded 407-line `tests/residency_elision_waves.rs` owner; exact inventories, 25 GPU invocations, full
+  gates, and audit are clean with no production change.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001ER:** externalize the exact five-test write-wave validation and duplicate-race family.
+1. **STRUCT-001ES:** externalize the exact six-test vacuum/gather/DML/materialization family.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
