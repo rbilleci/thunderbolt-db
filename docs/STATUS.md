@@ -1002,6 +1002,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   incomplete PostgreSQL size/ACL/array semantics, CPU row construction, and absent GPU-resident system relations.
   Full protocol/driver/security/formatting gates, PostgreSQL 16 scenarios 10/58, and all 18 pg-dump restore/
   metadata/privilege gates are clean. The root is 5,713 lines and STRUCT-001DB is closed.
+  The three later direct `pg_catalog.pg_type` reads now execute from the existing private 538-line
+  `type_system_catalog` owner behind one additional stage-preserving delegate. Four full/filtered OID/name
+  registry row helpers are byte-identical private moves; the two full helpers remain test-only fixtures through
+  two proven `cfg(test)` aliases. Exact post-relation-description/pre-attribute stage, branch order and equality,
+  literal `(23, 25)` / `('int4', 'text')` filtering, OID/name sorting, 3-/3-column names and types, the one-column
+  empty `hstore`/`geometry`/`vector` extension probe, and writers are unchanged. Inherited PRODUCT-002 debt
+  remains exact routing, hard-coded discovery literals, host registry filtering/sorting, the narrow empty
+  extension probe, and absent GPU-resident system relations. Full protocol/driver/security/formatting gates,
+  PostgreSQL 16 scenario 04, and independent audit are clean. The root is 5,610 lines and STRUCT-001DC is closed.
 
 ## Known boundaries
 

@@ -191,6 +191,8 @@ use type_system_catalog::{
     test_catalog_psql_describe_type_rows as catalog_psql_describe_type_rows,
     test_catalog_psql_describe_type_rows_for_supported_types as catalog_psql_describe_type_rows_for_supported_types,
     test_catalog_psql_describe_type_verbose_rows_for_supported_types as catalog_psql_describe_type_verbose_rows_for_supported_types,
+    test_catalog_type_rows_by_name as catalog_type_rows_by_name,
+    test_catalog_type_rows_by_oid as catalog_type_rows_by_oid,
     test_psql_describe_pg_catalog_types_query as psql_describe_pg_catalog_types_query,
     test_psql_describe_type_catalog_query_type as psql_describe_type_catalog_query_type,
     test_psql_list_casts_catalog_query as psql_list_casts_catalog_query,
@@ -199,7 +201,8 @@ use type_system_catalog::{
     test_psql_list_operators_catalog_query as psql_list_operators_catalog_query,
 };
 use type_system_catalog::{
-    try_execute_builtin_type_catalog_query, try_execute_type_system_catalog_query,
+    try_execute_builtin_type_catalog_query, try_execute_direct_type_catalog_query,
+    try_execute_type_system_catalog_query,
 };
 #[path = "gpu-db-server/sequence_execution.rs"]
 mod sequence_execution;
@@ -2318,36 +2321,8 @@ fn execute_statement(
     {
         return result;
     }
-    if canonical
-        == "select oid, typname, typlen from pg_catalog.pg_type where oid in (23, 25) order by oid"
-    {
-        return write_single_row(
-            stream,
-            &[
-                int4_column("oid"),
-                text_column("typname"),
-                int4_column("typlen"),
-            ],
-            &catalog_type_rows_by_oid_in(&[23, 25]),
-        );
-    }
-    if canonical
-        == "select typname, oid, typlen from pg_catalog.pg_type where typname in ('int4', 'text') order by typname"
-    {
-        return write_single_row(
-            stream,
-            &[
-                text_column("typname"),
-                int4_column("oid"),
-                int4_column("typlen"),
-            ],
-            &catalog_type_rows_by_name_in(&["int4", "text"]),
-        );
-    }
-    if canonical
-        == "select oid, * from pg_catalog.pg_type where typname in ('hstore','geometry','vector')"
-    {
-        return write_single_row(stream, &[int4_column("oid")], &[]);
+    if let Some(result) = try_execute_direct_type_catalog_query(stream, &canonical) {
+        return result;
     }
     if let Some(table) = catalog_attribute_query_table(&canonical) {
         let Some(rows) = catalog_attribute_rows(session, &table) else {
@@ -5518,84 +5493,6 @@ fn pg_catalog_attrdef_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                     ]
                 })
             })
-        })
-        .collect()
-}
-
-/// The full supported-type catalog ordered by OID. Test fixture documenting the
-/// complete `(oid, typname, typlen)` listing (the live `pg_type` handlers filter to the
-/// query's literal OID/name set via `catalog_type_rows_by_oid_in`/`_by_name_in`).
-#[cfg(test)]
-fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
-    let mut types = SUPPORTED_SQL_TYPES;
-    types.sort_by_key(|ty| ty.postgres_oid());
-    types
-        .into_iter()
-        .map(|ty| {
-            vec![
-                Some(ty.postgres_oid().to_string()),
-                Some(ty.catalog_name().to_string()),
-                Some(ty.type_size().to_string()),
-            ]
-        })
-        .collect()
-}
-
-/// The full supported-type catalog ordered by name (test fixture; see above).
-#[cfg(test)]
-fn catalog_type_rows_by_name() -> Vec<Vec<Option<String>>> {
-    let mut types = SUPPORTED_SQL_TYPES;
-    types.sort_by_key(|ty| ty.catalog_name());
-    types
-        .into_iter()
-        .map(|ty| {
-            vec![
-                Some(ty.catalog_name().to_string()),
-                Some(ty.postgres_oid().to_string()),
-                Some(ty.type_size().to_string()),
-            ]
-        })
-        .collect()
-}
-
-/// `(oid, typname, typlen)` rows for the supported types whose OID is in `oids`, in
-/// OID order. Backs the hardcoded `pg_type WHERE oid IN (...)` introspection query so it
-/// honors the literal OID set instead of dumping every supported type (a latent gap that
-/// only surfaced once the supported-type set grew past int4/text).
-fn catalog_type_rows_by_oid_in(oids: &[u32]) -> Vec<Vec<Option<String>>> {
-    let mut types: Vec<SqlType> = SUPPORTED_SQL_TYPES
-        .into_iter()
-        .filter(|ty| oids.contains(&ty.postgres_oid()))
-        .collect();
-    types.sort_by_key(|ty| ty.postgres_oid());
-    types
-        .into_iter()
-        .map(|ty| {
-            vec![
-                Some(ty.postgres_oid().to_string()),
-                Some(ty.catalog_name().to_string()),
-                Some(ty.type_size().to_string()),
-            ]
-        })
-        .collect()
-}
-
-/// `(typname, oid, typlen)` rows for the supported types named in `names`, in name order.
-/// Backs the hardcoded `pg_type WHERE typname IN (...)` introspection query.
-fn catalog_type_rows_by_name_in(names: &[&str]) -> Vec<Vec<Option<String>>> {
-    let mut types: Vec<SqlType> = SUPPORTED_SQL_TYPES
-        .into_iter()
-        .filter(|ty| names.contains(&ty.catalog_name()))
-        .collect();
-    types.sort_by_key(|ty| ty.catalog_name());
-    types
-        .into_iter()
-        .map(|ty| {
-            vec![
-                Some(ty.catalog_name().to_string()),
-                Some(ty.postgres_oid().to_string()),
-                Some(ty.type_size().to_string()),
-            ]
         })
         .collect()
 }
