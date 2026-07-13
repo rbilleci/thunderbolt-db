@@ -1961,6 +1961,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   exact-source/consumer/visibility/scoped-format/diff/docs gates, and independent re-audit pass. Fresh generated
   `gpu-db-*` test residue was removed after the suite. Runtime behavior did not change, so HAZARD and report-card
   gates were not applicable. The expression root is now 10,510 lines.
+  STRUCT-001GM then isolated resident device-source handles and on-device MVCC visibility-program contracts in the
+  76-line private `engine_expr/execution_source.rs` leaf. `ResidentExecSource`, `ShardedUnifiedExecSource`,
+  `ResidentVisibility`, and `ResidentVisibility::push_conjuncts` retain source-equivalent derives, field order,
+  visibility, instruction order, and comparison/mask opcodes; only explicit import/path normalization and durable
+  ownership prose differ. Their stable `crate::engine_expr` paths remain narrow crate-private re-exports.
+  Dependencies remain one-way to the relational snapshot and typed execution contracts; unified-source construction,
+  routing, join/source orchestration, every `Engine` method, runtime/device action, and MULTI work remain in place.
+  Three focused MVCC visibility GPU gates plus streaming injected-source and resident-select routes pass, as do both
+  505/487 engine modes, all-target check, strict clippy, dependency/source/consumer/visibility/scoped-format/diff/docs
+  gates, and independent re-audit. Another 513 MiB of fresh generated `gpu-db-*` test residue was removed. Runtime
+  behavior did not change, so HAZARD and report-card gates were not applicable. The expression root is now 10,441
+  lines.
 
 ## Known boundaries
 
