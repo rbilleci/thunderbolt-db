@@ -701,6 +701,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   even though rollback removes the catalog objects and no failing snapshot is persisted. Full protocol and driver
   gates, all-target checks, warning-denied clippy, security preflight, focused table/index/shared-catalog tests,
   formatting/diff checks, and independent audit are clean. The root is 9,841 lines and STRUCT-001BX is closed.
+  Sequence target validation, next-value state transition, and implicit creation now live inside the existing
+  private 357-line `sequence_execution` owner. Kind-before-missing precedence, overflow-before-mutation,
+  `last_value`/`is_called`, collision-before-OID behavior, checked allocation, inserted fields, dirty keys, and
+  errors are exact moves; command calls are internal and three parent-private aliases serve only default and DDL
+  consumers. Inherited PRODUCT-002 debt remains: sequence/default ownership is name-based across rename/drop and
+  column deletion, failed later table creation can consume OIDs/transient dirty state, and target/collision checks
+  omit indexes even though PostgreSQL puts indexes in the relation namespace. Full protocol and driver gates,
+  all-target checks, warning-denied clippy, security preflight, focused sequence/shared-catalog tests, formatting/
+  diff checks, and independent audit are clean. The root is 9,776 lines and STRUCT-001BY is closed.
 
 ## Known boundaries
 

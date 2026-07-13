@@ -109,9 +109,11 @@ use function_execution::execute_function_command;
 use function_execution::{execute_function_result, rename_function_in_session};
 #[path = "gpu-db-server/sequence_execution.rs"]
 mod sequence_execution;
-use sequence_execution::execute_sequence_command;
 #[cfg(test)]
 use sequence_execution::rename_sequence_in_session;
+use sequence_execution::{
+    create_implicit_sequence, execute_sequence_command, next_sequence_value, sequence_target_error,
+};
 #[path = "gpu-db-server/domain_ddl.rs"]
 mod domain_ddl;
 use domain_ddl::execute_domain_ddl;
@@ -970,73 +972,6 @@ struct Subscription {
     connection: String,
     publications: Vec<String>,
     enabled: bool,
-}
-
-fn sequence_target_error(session: &Session, name: &str) -> Option<ErrorField> {
-    if session.tables.contains_key(name)
-        || session.views.contains_key(name)
-        || session.materialized_views.contains_key(name)
-    {
-        return Some(ErrorField {
-            code: "42809",
-            message: "relation is not a sequence",
-            position: None,
-        });
-    }
-    if !session.sequences.contains_key(name) {
-        return Some(ErrorField {
-            code: "42P01",
-            message: "sequence does not exist",
-            position: None,
-        });
-    }
-    None
-}
-
-fn next_sequence_value(sequence: &mut Sequence) -> Result<i64, ErrorField> {
-    let value = if sequence.is_called {
-        sequence.last_value.checked_add(1).ok_or(ErrorField {
-            code: "2200H",
-            message: "sequence value overflow",
-            position: None,
-        })?
-    } else {
-        sequence.last_value
-    };
-    sequence.last_value = value;
-    sequence.is_called = true;
-    Ok(value)
-}
-
-fn create_implicit_sequence(session: &mut Session, name: &str) -> Result<(), ErrorField> {
-    if session.tables.contains_key(name)
-        || session.views.contains_key(name)
-        || session.materialized_views.contains_key(name)
-        || session.sequences.contains_key(name)
-    {
-        return Err(ErrorField {
-            code: "42P07",
-            message: "relation already exists",
-            position: None,
-        });
-    }
-    let oid = session.next_relation_oid;
-    session.next_relation_oid = session.next_relation_oid.checked_add(1).ok_or(ErrorField {
-        code: "54000",
-        message: "relation OID allocation exhausted",
-        position: None,
-    })?;
-    session.sequences.insert(
-        name.to_string(),
-        Sequence {
-            oid,
-            name: name.to_string(),
-            last_value: 1,
-            is_called: false,
-        },
-    );
-    session.mark_sequence_dirty(name.to_string());
-    Ok(())
 }
 
 fn preflight_column_default_target(
