@@ -21,6 +21,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FT is closed. The unconsumed public/private int4 BETWEEN selector and its full-column D2H plus host
   predicate are deleted; the historical sharded caller was already replaced by the general GPU
   expression/aggregate bridge.
+- STRUCT-001FU is closed. The unconsumed public full-column TEXT projector and private host-assembly
+  implementation are deleted; generic retained routes use the narrower final-readback projector and specialized
+  point-read/join routes retain their fused GPU projectors. RETIRE-003 owns the remaining generic result-path debt.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.

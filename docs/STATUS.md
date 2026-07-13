@@ -1745,6 +1745,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   finds no surviving reference. Execution passes 54/81, engine passes 505/487, workspace all-target/all-feature
   check, strict execution/engine clippy, dependency boundary, source/diff checks, and independent audit are clean.
   No runtime path changed, so GPU HAZARD and report-card gates were not applicable.
+  STRUCT-001FU then deleted the unconsumed public `project_text_from_payload` facade and private
+  `launch_cuda_resident_text_project`, which unconditionally copied the full resident offsets array and text blob
+  D2H before assembling every string on the host (101 production lines, plus three inherited surplus blank lines).
+  Commit `4aeaa14f` introduced the API and sole engine caller; `5c21cad8` moved that caller to
+  `project_text_rows_from_payload`, leaving no repository consumer. The surviving generic projector reads the
+  contiguous offset and text spans bounded by the requested row extrema and performs permitted final host result
+  assembly; sparse extrema can still approach a full-column readback, so existing RETIRE-003 owns that residual.
+  Specialized point-read and join routes retain their fused GPU projectors. Execution passes 54/81, engine passes
+  505/487 with the GPU sweep serial, and workspace all-target/all-feature check, strict execution/engine clippy,
+  dependency/source/diff checks, and independent audit are clean. The execution root is 9,609 lines. No live
+  runtime path changed, so GPU HAZARD and report-card gates were not applicable.
 
 ## Known boundaries
 

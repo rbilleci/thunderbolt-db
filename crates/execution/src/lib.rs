@@ -1339,22 +1339,6 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_equal_row_indices(self, filters, row_count)
     }
 
-    pub fn project_text_from_payload(
-        &self,
-        offsets_byte_offset: u64,
-        bytes_byte_offset: u64,
-        bytes_len: u64,
-        row_count: u64,
-    ) -> Result<Vec<String>, CudaRuntimeProbeError> {
-        launch_cuda_resident_text_project(
-            self,
-            offsets_byte_offset,
-            bytes_byte_offset,
-            bytes_len,
-            row_count,
-        )
-    }
-
     pub fn project_text_rows_from_payload(
         &self,
         offsets_byte_offset: u64,
@@ -1750,91 +1734,6 @@ fn launch_cuda_resident_text_prefix_count(
     Ok(u64::from_le_bytes(output[..8].try_into().unwrap()))
 }
 
-fn launch_cuda_resident_text_project(
-    resident: &CudaResidentDeviceMemory,
-    offsets_byte_offset: u64,
-    bytes_byte_offset: u64,
-    bytes_len: u64,
-    row_count: u64,
-) -> Result<Vec<String>, CudaRuntimeProbeError> {
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-
-    let offsets_len = row_count
-        .checked_add(1)
-        .and_then(|count| count.checked_mul(std::mem::size_of::<u64>() as u64))
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let offsets_end = offsets_byte_offset
-        .checked_add(offsets_len)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let bytes_end = bytes_byte_offset
-        .checked_add(bytes_len)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if offsets_end > resident.metadata().allocated_bytes
-        || bytes_end > resident.metadata().allocated_bytes
-    {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(
-            offsets_end.max(bytes_end) as usize,
-        ));
-    }
-    let offsets_len_usize = usize::try_from(offsets_len)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let bytes_len_usize = usize::try_from(bytes_len)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let row_count_usize = usize::try_from(row_count)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-
-    let mut raw_offsets = vec![0_u8; offsets_len_usize];
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            raw_offsets.as_mut_ptr().cast::<c_void>(),
-            resident.device_ptr() + offsets_byte_offset,
-            offsets_len_usize,
-        )
-    })?;
-    let mut bytes = vec![0_u8; bytes_len_usize];
-    if bytes_len_usize > 0 {
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                bytes.as_mut_ptr().cast::<c_void>(),
-                resident.device_ptr() + bytes_byte_offset,
-                bytes_len_usize,
-            )
-        })?;
-    }
-
-    let mut offsets = Vec::with_capacity(row_count_usize + 1);
-    for chunk in raw_offsets.chunks_exact(std::mem::size_of::<u64>()) {
-        offsets.push(u64::from_le_bytes(chunk.try_into().map_err(|_| {
-            CudaRuntimeProbeError::InvalidInputLength(raw_offsets.len())
-        })?));
-    }
-    if offsets.len() != row_count_usize + 1 || offsets.first().copied() != Some(0) {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(offsets.len()));
-    }
-    let mut values = Vec::with_capacity(row_count_usize);
-    for pair in offsets.windows(2) {
-        let start = usize::try_from(pair[0])
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        let end = usize::try_from(pair[1])
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if start > end || end > bytes.len() {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(end));
-        }
-        let value = std::str::from_utf8(&bytes[start..end])
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(end))?;
-        values.push(value.to_string());
-    }
-    Ok(values)
-}
-
 /// Queue ONE stream-ordered (async) D2H of `dst.len() * size_of::<T>()` bytes from `device_ptr`
 /// into a pooled pinned host staging buffer if one can be leased (truly-async + DMA-fast), else
 /// directly into `dst` (still async, just from pageable memory). Returns the pinned lease (kept
@@ -1878,9 +1777,6 @@ fn copy_pinned_into<T>(pinned: &Option<PinnedHostLease<'_>>, dst: &mut [T]) {
         }
     }
 }
-
-
-
 
 fn copy_cuda_resident_text_rows(
     resident: &CudaResidentDeviceMemory,
