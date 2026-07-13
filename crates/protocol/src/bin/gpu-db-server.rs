@@ -135,11 +135,12 @@ use function_execution::{
 mod sequence_execution;
 use sequence_execution::{
     create_implicit_sequence, execute_sequence_command, next_sequence_value, sequence_target_error,
-    try_execute_sequence_catalog_query,
+    try_execute_sequence_catalog_query, try_execute_sequence_class_catalog_query,
 };
 #[cfg(test)]
 use sequence_execution::{
     rename_sequence_in_session,
+    test_pg_catalog_class_sequence_rows as pg_catalog_class_sequence_rows,
     test_psql_describe_sequence_verbose_rows as psql_describe_sequence_verbose_rows,
     test_psql_describe_sequences_catalog_query as psql_describe_sequences_catalog_query,
     test_psql_describe_sequences_verbose_catalog_query as psql_describe_sequences_verbose_catalog_query,
@@ -2240,18 +2241,8 @@ fn execute_statement(
             &pg_catalog_class_plain_table_rows(session),
         );
     }
-    if canonical == pg_catalog_class_sequences_query() {
-        return write_single_row(
-            stream,
-            &[
-                int4_column("oid"),
-                text_column("nspname"),
-                text_column("relname"),
-                text_column("relkind"),
-                text_column("relpersistence"),
-            ],
-            &pg_catalog_class_sequence_rows(session),
-        );
+    if let Some(result) = try_execute_sequence_class_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if canonical == pg_catalog_class_materialized_views_query() {
         return write_single_row(
@@ -6244,29 +6235,8 @@ fn pg_catalog_class_plain_table_rows_from_tables(tables: Vec<&Table>) -> Vec<Vec
         .collect()
 }
 
-fn pg_catalog_class_sequences_query() -> &'static str {
-    "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 's' order by c.relname"
-}
-
 fn pg_catalog_class_materialized_views_query() -> &'static str {
     "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'm' order by c.relname"
-}
-
-fn pg_catalog_class_sequence_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut sequences = session.sequences.values().collect::<Vec<_>>();
-    sequences.sort_by(|left, right| left.name.cmp(&right.name));
-    sequences
-        .into_iter()
-        .map(|sequence| {
-            vec![
-                Some(sequence.oid.to_string()),
-                Some("public".to_string()),
-                Some(sequence.name.clone()),
-                Some("s".to_string()),
-                Some("p".to_string()),
-            ]
-        })
-        .collect()
 }
 
 fn pg_catalog_class_materialized_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {

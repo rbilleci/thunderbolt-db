@@ -1,7 +1,7 @@
 // Legacy sequence ownership. This is not a product execution path.
 
 use super::{
-    int8_column, object_access_permission_error, schema_permission_error, text_column,
+    int4_column, int8_column, object_access_permission_error, schema_permission_error, text_column,
     write_command_complete, write_error, write_select_rows, write_single_row, CatalogCommentTarget,
     Command, ErrorField, ReadWrite, SchemaPrivilege, Sequence, Session, TablePrivilege,
 };
@@ -108,6 +108,53 @@ pub(super) fn try_execute_sequence_catalog_query(
         ));
     }
     None
+}
+
+fn pg_catalog_class_sequences_query() -> &'static str {
+    "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 's' order by c.relname"
+}
+
+fn pg_catalog_class_sequence_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by(|left, right| left.name.cmp(&right.name));
+    sequences
+        .into_iter()
+        .map(|sequence| {
+            vec![
+                Some(sequence.oid.to_string()),
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
+                Some("s".to_string()),
+                Some("p".to_string()),
+            ]
+        })
+        .collect()
+}
+
+pub(super) fn try_execute_sequence_class_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != pg_catalog_class_sequences_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[
+            int4_column("oid"),
+            text_column("nspname"),
+            text_column("relname"),
+            text_column("relkind"),
+            text_column("relpersistence"),
+        ],
+        &pg_catalog_class_sequence_rows(session),
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_class_sequence_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    pg_catalog_class_sequence_rows(session)
 }
 
 pub(super) fn sequence_target_error(session: &Session, name: &str) -> Option<ErrorField> {
