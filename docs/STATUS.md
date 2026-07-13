@@ -459,6 +459,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   driver smokes, all-target checks, warning-denied clippy, security preflight, formatting, and independent audit
   are clean. No read kernel, residency, or result path changed, so the GPU report card was not applicable. The
   root is 16,541 lines and STRUCT-001AT is closed.
+  Legacy TRUNCATE/DROP syntax now lives in the private 154-line `ddl_syntax` leaf. The original 150-line body is
+  canonical-exact and exposes four proven parser/predicate entry points plus the three returned record types and
+  their required fields; shared identifier helpers remain private. TRUNCATE options, multi-table DROP ordering,
+  IF EXISTS and constraint flags, qualified-name restrictions, comment/case/semicolon handling, narrow rejection,
+  and unsupported foreign-key option recognition are unchanged. The leaf depends only on pure SQL normalizers;
+  DDL mutation and catalog execution remain in the root, with no sibling cycle or host product API. Sequential/
+  concurrent 127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied clippy,
+  security preflight, formatting, and independent audit are clean. The root is 16,398 lines and STRUCT-001AU is
+  closed.
 
 ## Known boundaries
 
