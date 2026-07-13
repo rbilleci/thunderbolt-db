@@ -91,7 +91,7 @@ fn gpu_resident_expr_select_evaluates_arithmetic_predicate_and_materializes_rows
 fn gpu_resident_expr_simple_int4_predicate_uses_ordered_index_route() {
     // The `int4col <cmp> literal` peephole (`compare_indices_ordered_from_payload`): the simple single-
     // column-vs-literal shape lowers to the ORDERED parallel compaction that emits surviving ROW INDICES
-    // ascending with NO host sort (replacing `run_expr_arith_filter`'s atomic-append + host-sort). This
+    // ascending with NO host sort (the general arithmetic route now shares that compactor). This
     // gate is the NON-VACUOUS proof that the new route is on the path AND ascending-correct: it uses a
     // MULTI-BLOCK payload (1000 rows >> the 256-row chunk, so matches span many blocks and exercise the
     // cross-block exclusive scan + intra-block prefix-sum scatter) with INTERLEAVED matches (a[i]=i%7),
@@ -1294,7 +1294,7 @@ fn gpu_resident_expr_order_by_nullable_text_numeric_uuid_keys_place_nulls() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_select_evaluates_deep_arithmetic_tree_via_vm() {
-    // A DEEPER arithmetic tree than the 2-col fast-path — `WHERE (a + b) * 2 - 5 > K` — routes
+    // A DEEPER arithmetic tree than the specialized two-column facade — `WHERE (a + b) * 2 - 5 > K` — routes
     // through the engine's Expr compiler -> device bytecode VM (not the peephole), evaluated and
     // materialized on the GPU. Closed-form oracle: a[i]=b[i]=i => value = 4*i - 5 (monotone), so
     // 4i-5 > K <=> i >= (K+5+3)/4 ; with K=395, 4i > 400 <=> i >= 101. Projected a[i]=i => the
@@ -1606,13 +1606,12 @@ fn gpu_resident_expr_checked_arithmetic_raises_integer_out_of_range_across_arith
     //   a*a      -> 46341 (46341^2 = 2147488281; 46340^2 = 2147395600 is in range)
     //   a*100000 -> 21475 (2147500000; 21474*100000 = 2147400000 is in range)
     //   a*a*a    -> 1291  (1291^3 = 2151685171; 1290^3 = 2146689000 is in range)
-    // Each predicate routes to a DIFFERENT arithmetic kernel — the 2-col peephole
-    // (gpu_db_resident_i32_binary_elementwise), the scalar-fold VM (gpu_db_buffer_i32_binary_scalar),
-    // and the buffer x buffer VM (gpu_db_buffer_i32_binary) — so an overflowing row in any of the
-    // three must surface the error. A safe row (a=2) is present too, proving the kernel scans the
-    // whole payload and the single overflowing row still aborts the query (PG per-row evaluation).
+    // The predicates cover the specialized two-column facade plus scalar-fold and buffer x buffer
+    // VM programs. STRUCT-001GE routes the first through the same checked buffer-binary primitive;
+    // every lowering must surface overflow. A safe row (a=2) is present too, proving the kernel
+    // scans the whole payload and one overflowing row still aborts the query (PG per-row evaluation).
 
-    // a*a -> 2-col peephole elementwise kernel.
+    // a*a -> specialized two-column facade over the typed VM.
     let a_sq = gt_zero(mul(column0(), column0()));
     if let Some(result) = eval_single_col_predicate("ovf_sq", &[2, 46341], &a_sq) {
         assert_integer_out_of_range(result, "a*a with a=46341");

@@ -39,7 +39,7 @@ with the pre-split source at `044ebf0c`.
 
 | PTX leaf | Lines / entries | Canonical symbols | Rust consumers / include sites |
 |---|---:|---|---|
-| `expression_i32.ptx` | 723 / 8 | `gpu_db_resident_i32_binary_elementwise`; `gpu_db_buffer_i32_compare_to_indices`; `gpu_db_resident_i32_load_column`; `gpu_db_buffer_i32_binary`; `gpu_db_buffer_i32_binary_scalar`; `gpu_db_buffer_i32_compare_scalar_to_mask`; `gpu_db_buffer_i32_compare_buffers_to_mask`; `gpu_db_mask_binary` | `lib.rs`, `expression_vm.rs`, `resident_filter.rs` / 3 |
+| `expression_i32.ptx` | 520 / 6 | `gpu_db_resident_i32_load_column`; `gpu_db_buffer_i32_binary`; `gpu_db_buffer_i32_binary_scalar`; `gpu_db_buffer_i32_compare_scalar_to_mask`; `gpu_db_buffer_i32_compare_buffers_to_mask`; `gpu_db_mask_binary` | `expression_vm.rs`, `resident_filter.rs` / 2 |
 | `resident_gather.ptx` | 271 / 4 | `gpu_db_resident_i32_gather_rows`; `gpu_db_resident_i64_gather_rows`; `gpu_db_resident_i128_gather_rows`; `gpu_db_resident_bool_gather_rows` | `resident_gather.rs` / 1 |
 | `expression_i64.ptx` | 717 / 7 | `gpu_db_resident_i64_compare_scalar_to_mask`; `gpu_db_resident_i64_compare_columns_to_mask`; `gpu_db_resident_i64_load_column`; `gpu_db_buffer_i64_binary`; `gpu_db_buffer_i64_binary_scalar`; `gpu_db_buffer_i64_compare_scalar_to_mask`; `gpu_db_buffer_i64_compare_buffers_to_mask` | `expression_vm.rs`, `resident_filter.rs` / 3 |
 | `expression_i128.ptx` | 1,113 / 9 | `gpu_db_resident_i128_compare_scalar_to_mask`; `gpu_db_resident_i128_compare_columns_to_mask`; `gpu_db_resident_i128_load_column`; `gpu_db_buffer_i128_binary`; `gpu_db_buffer_i128_binary_scalar`; `gpu_db_buffer_i128_compare_scalar_to_mask`; `gpu_db_buffer_i128_compare_buffers_to_mask`; `gpu_db_buffer_i128_mul_scalar`; `gpu_db_buffer_i128_mul` | `expression_vm.rs`, `resident_filter.rs` / 3 |
@@ -47,7 +47,7 @@ with the pre-split source at `044ebf0c`.
 | `derived_column.ptx` | 844 / 7 | `gpu_db_pack_two_int4_cols`; `gpu_db_pack_two_cols_i128`; `gpu_db_widen_col_to_i64`; `gpu_db_build_wide_key`; `gpu_db_mark_new_distinct`; `gpu_db_validate_distinct_text_offsets`; `gpu_db_mark_new_distinct_text` | `derived_column.rs` / 6 |
 | `staged_hash_join.ptx` | 1,398 / 8 | `gpu_db_hash_join_build_i32`; `gpu_db_hash_join_probe_i32`; `gpu_db_hash_join_build_text`; `gpu_db_hash_join_probe_text`; `gpu_db_hash_join_build_i64_nn`; `gpu_db_hash_join_emit_i64_nn`; `gpu_db_hash_join_build_text_nn`; `gpu_db_hash_join_emit_text_nn` | `staged_hash_join.rs` / 4 |
 | `resident_aggregate.ptx` | 552 / 6 | `gpu_db_resident_i32_sum_at_indices`; `gpu_db_resident_i32_minmax_at_indices`; `gpu_db_resident_i64_minmax_at_indices`; `gpu_db_resident_i64_sum_at_indices_i128`; `gpu_db_resident_i128_minmax_partials_at_indices`; `gpu_db_resident_i128_sum_partials_at_indices` | `resident_aggregate.rs` / 6 |
-| `device_fill.ptx` | 171 / 3 | `gpu_db_fill_i64`; `gpu_db_blend_widen_null_sentinel`; `gpu_db_fill_i128` | `resident_group.rs`, `staged_hash_join.rs`, `lib.rs` / 7 |
+| `device_fill.ptx` | 171 / 3 | `gpu_db_fill_i64`; `gpu_db_blend_widen_null_sentinel`; `gpu_db_fill_i128` | `resident_group.rs`, `staged_hash_join.rs`, `expression_filter.rs` / 7 |
 | `resident_group_compact.ptx` | 420 / 1 | `gpu_db_group_by_slot_compact` | `resident_group.rs` / 1 |
 | `resident_sort.ptx` | 831 / 4 | `gpu_db_bitonic_sort_i64_step`; `gpu_db_bitonic_sort_text_step`; `gpu_db_bitonic_sort_multikey_step`; `gpu_db_bitonic_sort_hetero_step` | `resident_sort.rs` / 4 |
 | `resident_group.ptx` | 1,150 / 1 | `gpu_db_group_by_i32_count_sum` | `resident_group.rs` / 2 |
@@ -65,14 +65,22 @@ Two entries had no `cached_function` call, launch handle, or other executable Ru
 - `gpu_db_mask_compact_to_indices` was the old atomic-append/host-sort mask compactor. The live predicate and
   filter routes already use `compact_mask_i32_to_indices`, backed by ordered compaction.
 
-Both definitions were deleted rather than duplicated into a new leaf. Historical comments that explain the route
-replacement may still name the former comparator as legacy behavior; there is no live symbol reference.
+STRUCT-001GE later deleted two more entries after the product-live two-column facade moved to the checked postfix
+VM plus ordered compaction:
+
+- `gpu_db_resident_i32_binary_elementwise` accepted unchecked resident offsets/opcodes in a special-case launcher.
+  The typed VM's load/buffer-binary primitives now provide the same checked arithmetic with aligned exact windows.
+- `gpu_db_buffer_i32_compare_to_indices` atomically appended row indices and required a host sort. The shared ordered
+  two-pass compactor now emits the same ascending indices by construction.
+
+All four definitions were deleted rather than retained as unreferenced prototypes. Historical comments that explain
+route replacement may still name former symbols as legacy behavior; there is no live executable reference.
 
 ## Normalized source and ABI proof
 
-The pre-split file has 69 entries; the new leaves have 67. A parser keyed by `.visible .entry` compared every
-surviving entry from its declaration through its closing brace against `044ebf0c`: 67 unchanged bodies, zero added
-symbols, and exactly the two obsolete symbols above removed. The declaration is part of that byte comparison, so
+The pre-split file has 69 entries; the new leaves now have 65. A parser keyed by `.visible .entry` compared every
+surviving entry from its declaration through its closing brace against `044ebf0c`: 65 unchanged bodies, zero added
+symbols, and exactly the four obsolete symbols above removed. The declaration is part of that byte comparison, so
 parameter order, width, signedness, and count are included. All 13 leaves also assemble independently with local
 `ptxas -arch=sm_90`, and the permanent ASCII test now enumerates every leaf.
 

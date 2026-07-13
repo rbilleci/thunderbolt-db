@@ -903,9 +903,9 @@
     fn cuda_resident_expr_two_col_filter_evaluates_arithmetic_predicate_on_gpu() {
         // PROTOTYPE for the general GPU executor (docs/architecture/17-general-gpu-executor.md §5):
         // prove a predicate the enumerated shape-path CANNOT express — an ARITHMETIC expression
-        // `(a <op> b) <cmp> k` — runs fully on the GPU by COMPOSING two buffer->buffer primitives
-        // (elementwise into an intermediate device buffer, then compare->matching-row-indices). This
-        // is the vectorized-interpreter model that replaces hand-coded per-shape kernels.
+        // `(a <op> b) <cmp> k` — runs fully on the GPU through typed VM column loads and buffer
+        // arithmetic followed by ordered compare-compaction. This is the vectorized-interpreter
+        // model that replaces hand-coded per-shape kernels.
         //
         // GPU-NATIVE oracle = CLOSED FORM, never a CPU re-implementation of the operator (project
         // rule). With a[i]=i and b[i]=i the intermediate is a+b = 2*i, MONOTONE in the row index, so
@@ -947,6 +947,58 @@
                 ],
             )
             .expect("retain resident device memory");
+
+        let assert_invalid = |result: Result<Vec<u32>, CudaRuntimeProbeError>| {
+            assert!(
+                matches!(
+                    result,
+                    Err(CudaRuntimeProbeError::InvalidInputLength(_))
+                        | Err(CudaRuntimeProbeError::UnsupportedComparison(_))
+                ),
+                "invalid two-column expression input must fail closed, got {result:?}"
+            );
+        };
+        // Codes and the u32 output-index domain are checked even when no kernel work is needed.
+        assert_invalid(
+            resident.expr_filter_two_col_compare_from_payload(a_off, b_off, 3, 0, 0, 0),
+        );
+        assert_invalid(
+            resident.expr_filter_two_col_compare_from_payload(a_off, b_off, 0, 0, 0, 5),
+        );
+        assert_invalid(resident.expr_filter_two_col_compare_from_payload(
+            a_off,
+            b_off,
+            0,
+            u64::from(u32::MAX) + 1,
+            0,
+            0,
+        ));
+        // Both raw resident offsets must be naturally aligned and their complete read windows must
+        // fit the allocation before the VM allocates or launches anything.
+        assert_invalid(resident.expr_filter_two_col_compare_from_payload(
+            a_off + 1,
+            b_off,
+            0,
+            ROW_COUNT,
+            0,
+            0,
+        ));
+        assert_invalid(resident.expr_filter_two_col_compare_from_payload(
+            a_off,
+            b_off + 1,
+            0,
+            ROW_COUNT,
+            0,
+            0,
+        ));
+        assert_invalid(resident.expr_filter_two_col_compare_from_payload(
+            a_off,
+            b_off + std::mem::size_of::<i32>() as u64,
+            0,
+            ROW_COUNT,
+            0,
+            0,
+        ));
 
         // op_code 0=add, comparison 3=gt. a+b = 2*i > K  <=>  i >= K/2 + 1  (K even).
         const K: i32 = 4000;

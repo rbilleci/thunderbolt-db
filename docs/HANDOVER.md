@@ -56,14 +56,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   bounded 1,447/592-line private leaves behind the unchanged `CudaDriverRuntime` facade. Exact-source proofs, all
   seven families' 21+14 HAZARD matrix, complete 55/81 and 505/487 suites, static gates, and independent audit pass.
   The fixed-device-0/per-call-context/host-transfer behavior remains explicit RETIRE-003 debt; the root is 4,067 lines.
+- STRUCT-001GE is closed. The unsafe two-column expression special path now lowers through the typed postfix VM and
+  ordered compaction, and its two obsolete PTX entries are deleted. The surviving orchestration lives in the bounded
+  393-line private `expression_filter.rs` leaf; invalid-domain/window and post-error-reuse coverage, the 15+10 HAZARD
+  matrix, complete 55/81 and 505/487 suites, canonical report card, static gates, and independent audit pass. The root
+  is 3,502 lines; full-column expression D2H plus host selected gather remains explicit RETIRE-003 debt.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GE:** isolate the total resident expression-filter/materialization orchestration in a bounded private
-   owner with one-way dependencies on the VM and ordered-compaction leaves.
+1. **STRUCT-001GF:** disposition the remaining root argsort/HAVING block; type and isolate the product radix path,
+   preserve bounded parity oracles only where justified, and delete product-dead prototypes/PTX/tests.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

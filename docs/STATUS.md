@@ -1866,6 +1866,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   engine passes 505/487; workspace all-target/all-feature check, strict execution/engine clippy, source/reference/
   Rust-2021-format/diff gates, and independent audit are clean. No runtime behavior changed, so the report card was
   not applicable.
+  STRUCT-001GE then made the product-live two-column int4 expression facade total and isolated its surviving owner.
+  The unchecked raw-offset/opcode elementwise kernel plus atomic index append and host sort are gone; the facade now
+  lowers through the typed postfix VM and ordered compaction, validating operation, comparison, `u32` row domain,
+  alignment, and exact allocation windows before CUDA. Permanent negative coverage proves malformed empty and
+  nonempty calls fail closed, misaligned/short inputs do not launch, and the context remains reusable; valid add,
+  multiply, zero/all-result, ordering, and checked-overflow semantics remain intact. The two obsolete PTX entries were
+  deleted, leaving `expression_i32.ptx` at 520 lines and six live entries. Expression filter and value-materialization
+  orchestration now lives in the rustfmt-clean 393-line private `expression_filter.rs` leaf behind five stable inherent
+  APIs and one-way dependencies on `expression_vm` and `resident_compare_ordered`; the execution root is 3,502 lines.
+  Full-column expression D2H plus host selected gather remains explicitly owned by RETIRE-003. Five GPU families pass
+  15 sequential plus ten concurrent invocations; execution passes 55/81 and engine passes 505/487. Workspace/static/
+  source/reference/scoped-format/diff gates, `ptxas`, ASCII and exact-entry audits, full suites, and independent audit
+  are clean. The canonical card remains healthy: IN-L2/OUT-OF-L2 rooflines are 1,405.1/1,449.9 GB/s, scalar compare
+  count is 1,275.3/1,457.6 GB/s, grouped aggregation is 1,679.0M elements/s, and batch-65,536 point reads are 237.0M/s
+  at p50 140us IN-L2 and 251.8M/s at p50 134us OUT-OF-L2.
 
 ## Known boundaries
 

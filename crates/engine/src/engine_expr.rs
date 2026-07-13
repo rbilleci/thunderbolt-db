@@ -6,8 +6,8 @@
 //!
 //! `ResidentExpr` is the general scalar IR (it can represent any int4 arithmetic/comparison/boolean
 //! tree). The interpreter's *coverage* grows node-by-node; today `lower_resident_predicate` lowers
-//! the prototype shape `Compare(arith(Column, Column), Int4Literal)` to the composed buffer->buffer
-//! primitive (`expr_filter_two_col_compare_from_payload`) and materializes the projected int4
+//! the prototype shape `Compare(arith(Column, Column), Int4Literal)` to the typed postfix VM plus
+//! ordered-compaction facade (`expr_filter_two_col_compare_from_payload`) and materializes projected int4
 //! columns by gathering the surviving rows. Fuller trees (deeper arithmetic, AND/OR over masks,
 //! column-vs-column compares) land as the device bytecode VM in §2.3 of the design doc — by
 //! extending this interpreter, never by adding a new shape method.
@@ -10679,8 +10679,8 @@ impl Engine {
     ///
     /// Coverage (grows by extending this method, per the design): the prototype shape
     /// `Compare(arith(Column a, Column b), Int4Literal k)` lowers to the composed buffer->buffer
-    /// primitive `expr_filter_two_col_compare_from_payload` (elementwise `a <arith> b` into an
-    /// intermediate device buffer, then compare-to-row-indices). Anything else is rejected with a
+    /// facade `expr_filter_two_col_compare_from_payload` (typed column loads and `a <arith> b` into
+    /// an intermediate device buffer, then ordered compare-to-row-indices). Anything else is rejected with a
     /// pointer to the device bytecode VM that generalizes it — NOT by falling back to a shape method
     /// or to the CPU.
     /// Lower a bare bool-column predicate (`WHERE flag`) to surviving row indices (the type matrix,
@@ -11168,8 +11168,8 @@ impl Engine {
         }
 
         // Boolean combinators (AND/OR) and `Ne` lower to the general mask-based predicate VM (each
-        // comparison -> a mask, MaskBinary combines, the terminal compacts). The fused 2-col / arith
-        // / col-vs-col fast paths below handle the single eq/lt/le/gt/ge comparisons.
+        // comparison -> a mask, MaskBinary combines, the terminal compacts). The specialized 2-col /
+        // arith / col-vs-col lowerings below handle the single eq/lt/le/gt/ge comparisons.
         if matches!(
             compare,
             ResidentBinaryOp::And | ResidentBinaryOp::Or | ResidentBinaryOp::Ne
@@ -11194,9 +11194,10 @@ impl Engine {
             )));
         };
 
-        // PEEPHOLE fast-path (design: tuned fused kernels live UNDER the general executor): the exact
-        // shape `Compare(arith(Column, Column), Int4Literal)` lowers to the single fused 2-col kernel
-        // instead of the 3-launch VM program. Behavior-identical to the VM; just fewer launches.
+        // Specialized facade for the exact `Compare(arith(Column, Column), Int4Literal)` shape. The
+        // execution crate constructs the same typed postfix VM program used by general expressions,
+        // then emits ascending indices through ordered compaction; this keeps one stable call surface
+        // without a raw-offset shape kernel.
         if let (
             ResidentExpr::Binary {
                 op: arith,
@@ -11224,8 +11225,7 @@ impl Engine {
         // PEEPHOLE fast-path (the `category = 0` shape): the exact predicate `int4col <cmp> literal`
         // (and the flipped `literal <cmp> int4col`, comparison flipped) lowers to the ORDERED parallel
         // compaction that emits surviving ROW INDICES ascending with NO host sort — replacing the
-        // general `run_expr_arith_filter` path (which atomic-appends matching indices and then
-        // host-`sort_unstable`s them; ~93% of that path's compaction cost is the host sort). The
+        // general `run_expr_arith_filter` path, which now uses the same ordered compactor. The
         // ordered compaction guarantees ascending output BY CONSTRUCTION (the contiguous block
         // partition + ordered intra-block prefix sum), which is exactly the contract the gather +
         // assembly depend on, so the result is byte-identical to the prior path. Only a PLAIN resident
