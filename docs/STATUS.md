@@ -1917,6 +1917,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   GPU routes pass, as do both 505/487 engine modes, all-target check, strict clippy, exact-definition/consumer/
   scoped-format/diff/docs gates, and independent re-audit. Runtime behavior did not change, so HAZARD and report-card
   gates were not applicable. The expression root is now 11,168 lines.
+  STRUCT-001GI then isolated the five state-free join-plan contract types in the 76-line `engine_join_ir.rs` leaf.
+  `JoinColRef`, `JoinProjItem`, `JoinRelationRef`, `JoinStep`, and `JoinPlan` retain their exact derives, variants,
+  fields, visibility, and order behind unchanged `crate::engine_expr` crate-private paths. Dependencies remain one-way
+  from SQL binding, resident/streaming execution, and tests to the prelude-only contract; `JOIN_NULL_ROW`, device
+  ownership, parsing, projection, device-coordinate sorting/windowing, and execution remain at their established
+  owners. Stale transient-intermediate and retired result-sort comments were corrected to the live coordinate
+  pipeline. Focused parsed, two-way, three-way user, three-way catalog, outer, and streaming GPU join routes pass, as
+  do both 505/487 engine modes, all-target check, strict clippy, exact-definition/consumer/scoped-format/diff/docs
+  gates, and independent re-audit. Runtime behavior did not change, so HAZARD and report-card gates were not
+  applicable. The expression root is now 11,097 lines.
 
 ## Known boundaries
 

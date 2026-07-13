@@ -75,14 +75,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `engine_expr_ir.rs` leaf behind unchanged crate-private paths; only stale capability/ownership prose changed. Four
   focused GPU routes, complete 505/487 suites, static gates, and independent re-audit pass. The expression root is
   11,168 lines; HAZARD and report card were not applicable.
+- STRUCT-001GI is closed. The exact five-type join-plan contract now lives in the 76-line `engine_join_ir.rs` leaf
+  behind unchanged crate-private paths; sentinels, device/runtime ownership, parsing, projection, coordinate
+  sorting/windowing, and execution remain in place. Focused parsed/user/catalog/outer/streaming GPU joins, complete
+  505/487 suites, static gates, and independent re-audit pass. The expression root is 11,097 lines; HAZARD and report
+  card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GI:** isolate only the five state-free join-plan types into a neutral leaf behind their existing
-   crate-private paths; keep sentinels, device/runtime state, parsing, projection, and execution in place.
+1. **STRUCT-001GJ:** isolate only the five state-free select/predicate normalization helpers into a nested private
+   leaf behind their existing crate-private facade; keep pruning, compilation/lowering, and runtime/device work in
+   place.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

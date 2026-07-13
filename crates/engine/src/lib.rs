@@ -105,6 +105,7 @@ mod engine_dml_prepare;
 pub(crate) use engine_dml_prepare::InsertPrepareValidation;
 mod engine_result_sort;
 mod engine_expr_ir;
+mod engine_join_ir;
 mod engine_expr;
 mod engine_introspection;
 mod engine_lifecycle;

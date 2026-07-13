@@ -9887,9 +9887,9 @@ fn audit_s4_resident_limit_zero_and_huge() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s4_grouped_nulls_override_with_limit_window() {
-    // RISK (claim #3): the explicit-ORDER-BY branch now threads `order_by_nulls_first.to_vec()` into
-    // gpu_sort_permutation instead of passing the slice into gpu_sort_result_rows. Identical contents must
-    // produce identical placement. A nullable INT group KEY forms a NULL group; with explicit NULLS LAST
+    // RISK (claim #3): the explicit-ORDER-BY branch threads `order_by_nulls_first.to_vec()` into the
+    // `gpu_sort_permutation` setup. The owned copy must preserve identical placement. A nullable INT group
+    // KEY forms a NULL group; with explicit NULLS LAST
     // the NULL group must sort LAST (overriding the ASC default of FIRST), then a LIMIT window must keep
     // the right groups. This is a MULTI-group result so the real sort runs (not the 1-row identity).
     let mut e = Engine::new_local_cpu_oracle();

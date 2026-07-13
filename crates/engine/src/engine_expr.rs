@@ -22,85 +22,14 @@ type TextRebaseOp = (u64, u32, u64, u64, u64, u64, u64, u32);
 
 pub(crate) use crate::engine_expr_ir::{ResidentBinaryOp, ResidentExpr};
 
-/// A column reference inside a JOIN (ON condition or projection): a bare column (`qualifier: None`) or
-/// a qualified `alias.column` (`qualifier: Some(alias)`). Resolved to a specific relation + column
-/// index in the join executor (against the two bound tables).
-#[derive(Debug, Clone)]
-pub(crate) struct JoinColRef {
-    pub qualifier: Option<String>,
-    pub column: String,
-}
-
-/// A SELECT-list item in a JOIN projection: a single column, or a `*` star expanded in the executor to
-/// every column of the named relation (`Star(Some(alias))` = `alias.*`) or of BOTH relations, left then
-/// right (`Star(None)` = bare `*`).
-#[derive(Debug, Clone)]
-pub(crate) enum JoinProjItem {
-    Column(JoinColRef),
-    Star(Option<String>),
-}
-
-/// One relation in a JOIN's FROM clause: its base name + the alias columns are qualified by (the alias,
-/// or the relation name when unaliased -- mirrors the single-table builder).
-#[derive(Debug, Clone)]
-pub(crate) struct JoinRelationRef {
-    pub table: String,
-    pub alias: String,
-}
+pub(crate) use crate::engine_join_ir::{
+    JoinColRef, JoinPlan, JoinProjItem, JoinRelationRef, JoinStep,
+};
 
 /// Sentinel carried in a join's per-relation index vectors meaning "no row -> emit NULL for this
 /// relation's columns" -- a LEFT OUTER join's NULL pad for an unmatched left row (M3 -- doc 21). A real
 /// absolute row index can never be `u32::MAX` (residency row counts are far smaller), so it is unambiguous.
 const JOIN_NULL_ROW: u32 = u32::MAX;
-
-/// One join step in a left-deep chain. Its condition is one of: explicit ON `conjuncts`
-/// (`a.k1=b.k1 [AND a.k2=b.k2]` -- in each pair one operand resolves to the newly joined relation
-/// `relations[k+1]`, the other to an accumulated one); `USING(cols)`, which the parser desugars to
-/// qualified `conjuncts` AND records the join column names in `coalesce` (they appear ONCE in `*`); or
-/// `NATURAL` (`natural=true`, `conjuncts` empty), where the executor joins on -- and coalesces -- the
-/// relations' common column names. A single join column is a plain equi-join; 2 are a composite key
-/// (packed into one i64); >2 (a key wider than 64 bits) are a follow-up. USING/NATURAL are 2-relation only.
-#[derive(Debug, Clone)]
-pub(crate) struct JoinStep {
-    pub conjuncts: Vec<(JoinColRef, JoinColRef)>,
-    /// `true` for a NATURAL join (the executor derives the conjuncts + coalesce from common columns).
-    pub natural: bool,
-    /// USING/NATURAL join column names -- emitted ONCE in `*` and resolvable unqualified (else empty).
-    pub coalesce: Vec<String>,
-    /// OUTER-join flags (M3 -- doc 21), as a pair: `(outer_left, outer_right)` = (F,F) INNER, (T,F) LEFT,
-    /// (F,T) RIGHT, (T,T) FULL. `outer_left` keeps every ACCUMULATED (left) row -- unmatched ones get the
-    /// NEW relation NULL-padded; `outer_right` keeps every NEW (right) row -- unmatched ones get the
-    /// accumulated relations NULL-padded. Streaming N-way RIGHT/FULL completion uses bounded recursive
-    /// prefix replay, so earlier complements participate in later left-deep steps without host tuples.
-    pub outer_left: bool,
-    pub outer_right: bool,
-}
-
-/// A LEFT-DEEP chain of equi-joins parsed from the libpg_query FROM clause (M5). `relations` are in
-/// left-deep order (`a JOIN b ON.. JOIN c ON..` => `[a, b, c]`); `steps[k]` is the ON that folds
-/// `relations[k+1]` into the accumulated set `relations[0..=k]` (so `steps.len() == relations.len()-1`).
-/// `projection` is the SELECT list (qualified/unqualified columns + `*` / `alias.*`). The executor
-/// pipelines the chain: each intermediate result is materialized as a transient relation (the J5a bridge)
-/// that the next step's GPU hash join probes -- no CPU relational join. A 2-relation join is the N=2 case
-/// (one relation pair, one step), byte-identical to the original 2-way path.
-#[derive(Debug, Clone)]
-pub(crate) struct JoinPlan {
-    pub relations: Vec<JoinRelationRef>,
-    pub steps: Vec<JoinStep>,
-    pub projection: Vec<JoinProjItem>,
-    /// Output aliases parallel to SELECT-list `projection` items. Stars always carry `None`; a column
-    /// alias is preserved through device materialization and may be referenced by ORDER BY.
-    pub projection_aliases: Vec<Option<String>>,
-    /// ORDER BY keys (plain columns only, each `(column, descending)`) applied to the join RESULT via a
-    /// GPU sort. Hidden non-projected keys are appended to the device run and removed at final framing.
-    pub order_by: Vec<(JoinColRef, bool)>,
-    /// Parallel to `order_by`: the explicit NULLS FIRST/LAST override per key (M3 -- doc 21; `None` = PG
-    /// default). Honored ON-DEVICE by the join-result GPU sort.
-    pub order_by_nulls_first: Vec<Option<bool>>,
-    /// LIMIT / OFFSET sliced off the (sorted) join result. `None` = unbounded / from row 0.
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
-}
 
 /// The device memory backing a join relation: a RESIDENT user table's published `Arc` (shared), or a
 /// SYNTHESIZED catalog relation's freshly-uploaded TRANSIENT payload (owned for the query). `.mem()`
@@ -8520,7 +8449,7 @@ impl Engine {
             // relational drain/truncate on result data. gpu_sort_permutation returns the sort index vector
             // (identity for <=1 row / empty order); we slice it to [OFFSET, OFFSET+LIMIT) and gather ONLY
             // that window from the materialized group rows. With no LIMIT the window is the full range, so
-            // this is byte-identical to the prior gpu_sort_result_rows reorder.
+            // this is byte-identical to applying the same permutation to the materialized rows.
             if rows.len() > 1 || select.offset.is_some() || select.limit.is_some() {
                 let col_types: Vec<SqlType> = bound.selected_columns.iter().map(|c| c.ty).collect();
                 // The GROUP-KEY result columns (emitted first by the merge): result columns 0..n_group_cols.

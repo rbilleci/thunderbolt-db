@@ -2053,9 +2053,8 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
-    // M3 (doc 21): explicit NULLS FIRST/LAST on a GROUP BY result ORDER BY, honored ON-DEVICE in
-    // gpu_sort_result_rows (an int result key's NULL sentinel value is chosen per the request). The NULL
-    // group's key renders SqlValue::Null and places per the override.
+    // M3 (doc 21): explicit NULLS FIRST/LAST on a GROUP BY result ORDER BY is honored ON-DEVICE by
+    // `gpu_sort_permutation`; the validity bitmap and per-key nulls-first mask place the NULL group.
     let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
@@ -2146,9 +2145,9 @@ fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_join_order_by_explicit_nulls_first_last_on_device() {
-    // M3 (doc 21): explicit NULLS FIRST/LAST on a JOIN-result ORDER BY, honored ON-DEVICE via
-    // gpu_sort_result_rows (the override is threaded through JoinPlan.order_by_nulls_first). A LEFT join
-    // pads the unmatched row's x to NULL; the override places it.
+    // M3 (doc 21): explicit NULLS FIRST/LAST on a JOIN-result ORDER BY is honored ON-DEVICE by
+    // `sort_join_coordinates` (the override is threaded through `JoinPlan::order_by_nulls_first`). A LEFT
+    // join pads the unmatched row's x to NULL; the override places it.
     let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, n TEXT)")
         .unwrap();
