@@ -1652,6 +1652,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   error, and result behavior are source-equivalent, so the report card was not applicable. Audit found inherited
   `ConstMask` GPU-native debt—its docs claim device fill while it builds and uploads an O(n) host vector—now owned
   by STRUCT-001FO.
+  STRUCT-001FO then removed that host materialization: constant masks now use `cuMemsetD32Async` on a leased,
+  individually synchronized pooled stream, filling exactly `n` i32 words with FALSE=0 or TRUE=1 before the output
+  lease can be reused. The symbol is loaded only for programs containing `ConstMask`; every other VM branch keeps
+  its former driver contract. A permanent two-cache Layer-1 line now measures the synchronized on-device fill
+  without compaction or result D2H. Direct before/after moved IN-L2 from 10,106us/3.3 GB/s to 37us/905.1 GB/s
+  (~274x) and OUT-OF-L2 from 80,271us/3.3 GB/s to 188us/1428.0 GB/s (~427x), while the read roofline remained
+  stable. The canonical card confirmed 36us/944.9 GB/s and 187us/1431.8 GB/s and completed both production
+  point-read cache regimes. The production TRUE/FALSE SQL route passed three sequential plus two concurrent GPU
+  invocations; both full suite modes, all static/boundary gates, and independent runtime/benchmark audit are clean.
 
 ## Known boundaries
 

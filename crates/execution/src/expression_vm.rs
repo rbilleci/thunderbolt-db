@@ -198,6 +198,7 @@ pub(super) fn run_resident_arith_program<'r>(
     ) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemsetD32Async = unsafe extern "C" fn(u64, u32, usize, *mut c_void) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -226,6 +227,21 @@ pub(super) fn run_resident_arith_program<'r>(
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
             .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    // Only constant-mask programs require this symbol. Keep every other VM route's driver contract
+    // unchanged while ensuring the constant path never materializes or uploads an O(rows) host vector.
+    let cu_memset_d32_async = if program
+        .iter()
+        .any(|step| matches!(step, ExprStep::ConstMask { .. }))
+    {
+        Some(unsafe {
+            *resident
+                .lib()
+                .get::<CuMemsetD32Async>(b"cuMemsetD32Async\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        })
+    } else {
+        None
     };
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
@@ -1029,17 +1045,14 @@ pub(super) fn run_resident_arith_program<'r>(
                 stack.push(out);
             }
             ExprStep::ConstMask { value } => {
-                // A constant per-row i32 mask (no kernel) -- `col IS NULL`/`IS NOT NULL` on a column with
-                // no validity bitmap (no NULLs). Fill a fresh buffer from the host: each VM launch syncs
-                // and this buffer is only read by a later (syncing) MaskBinary / compaction step, so the
-                // blocking HtoD is correctly ordered (same idiom as the overflow flag's zero-init above).
+                // A constant per-row i32 mask (no kernel, no host materialization) -- `col IS NULL`/
+                // `IS NOT NULL` on a column with no validity bitmap. Fill exactly `n` i32 words with 0/1
+                // on a pooled stream; the helper drains before this lease can return to the buffer pool.
                 let out = primary.lease_device_buffer(byte_len)?;
-                let mask_bytes = n_usize
-                    .checked_mul(std::mem::size_of::<i32>())
-                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
-                let fill = vec![i32::from(value); n_usize];
-                check_cuda(unsafe {
-                    cu_memcpy_htod(out.ptr, fill.as_ptr().cast::<c_void>(), mask_bytes)
+                let memset =
+                    cu_memset_d32_async.ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+                launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+                    memset(out.ptr, u32::from(value), n_usize, stream)
                 })?;
                 stack.push(out);
             }
