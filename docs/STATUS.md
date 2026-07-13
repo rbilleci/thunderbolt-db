@@ -1301,6 +1301,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   leaf production target plus seven bounded test families, visibility discipline, and exact structural versus
   device-changing gates. The disposition is decompose behind the stable private facade and public inherent
   `Engine` APIs. STRUCT-001EH is the first bounded pure test-ownership slice.
+  STRUCT-001EH externalized the exact contiguous four-test payload layout/capacity/append family into a
+  rustfmt-clean 386-line `tests/residency_payload.rs` owner through an `include!` at the same parent position.
+  Parent-deindented source is byte-identical, all attributes and `capacity_payload_tests::*` names are unchanged,
+  and expanding the include reconstructs the prior 12,964-line source exactly. The three ordinary exact tests,
+  992-name/76-family inventory, moved ignored GPU gate 3× sequential and 2× concurrent with zero CUDA
+  700/716/717, all-target check, scoped formatting/diff/reference checks, and independent audit are clean. The
+  root is 12,579 lines; production, visibility, payload bytes, CUDA calls, and routes are untouched, so the report
+  card was not applicable. The broad ordinary suites exposed a pre-existing CUDA 700 in nullable-text `LIKE`
+  count, reproduced on detached pre-slice HEAD; it poisons later tests and causes the observed serial/16-thread
+  cascades, now owned by READ-004. Strict clippy is independently baseline-red in untouched WAL/engine code and
+  is owned by QUALITY-001. STRUCT-001EI remains sequenced after those gates.
 
 ## Known boundaries
 
@@ -1319,6 +1330,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |
 | Two physical GPUs have not executed the scheduler, device-locate, or typed sidecar context gates | **MULTI-001**, **MULTI-002**, **MULTI-003** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |
+| Nullable-text `LIKE` COUNT reproducibly raises CUDA 700 and poisons later in-process engine tests | **READ-004** |
+| Engine all-target strict clippy is baseline-red in transitive WAL and untouched engine sources | **QUALITY-001** |
 | Lane DELETE residuals and empty-aggregate pgwire NULL seam require focused disposition | **R3-005**, **READ-003** |
 | Lanes auto-checkpoint/PITR and full crash campaign | **DUR-001**, **DUR-002** |
 | Multi-node Raft/quorum serving is not integrated | **HA-001** |

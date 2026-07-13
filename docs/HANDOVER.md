@@ -29,12 +29,14 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EH:** externalize the exact first four payload/append residency tests behind the unchanged
-   `capacity_payload_tests` facade; preserve harness names and run the exact ignored GPU HAZARD gate.
-2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
+1. **READ-004:** root-cause and eliminate the pre-existing nullable-text `LIKE` CUDA 700; restore the broad
+   serial/16-thread engine suites before another residency extraction.
+2. **QUALITY-001:** restore the engine all-target strict-clippy baseline in separate behavior-preserving slices.
+3. **STRUCT-001EI:** after both gates are green, externalize the exact five-test baseline shard family.
+4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
-3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-4. **MULTI-001/002/003:** only after every non-MULTI plan item is complete or the user explicitly promotes them,
+5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+6. **MULTI-001/002/003:** only after every non-MULTI plan item is complete or the user explicitly promotes them,
    run their mandatory non-vacuous physical multi-GPU gates; never replace them with host interpretations.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
