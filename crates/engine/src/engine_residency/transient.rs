@@ -49,7 +49,8 @@ impl Engine {
 
     /// Build a TRANSIENT resident-like relation from already-materialized host `rows` -- a `RelationalTable`
     /// descriptor + an uploaded device payload that the GPU join path consumes EXACTLY like a published
-    /// resident table (`lower_resident_predicate`, `project_*_rows_from_payload`, `hash_join_inner_i64`),
+    /// resident table (`lower_resident_predicate`, `project_*_rows_from_payload`,
+    /// `join_fixed_payload_coordinates`),
     /// but WITHOUT publishing/admitting/evicting anything (the descriptor + device memory live only for the
     /// caller's query). This is the M5 J5 bridge for a SYNTHESIZED `pg_catalog`/`information_schema`
     /// relation, which has no residency snapshot: synthesize its rows -> this helper -> the existing int4

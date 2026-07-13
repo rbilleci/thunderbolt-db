@@ -1600,6 +1600,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   eligibility and NULL exclusion, hash build/probe, owned/persistent match marking, INNER/OUTER count-and-emit,
   padding, bounded scalar readback, emitted-count verification, geometry, ordering, errors, synchronization,
   and allocation lifetime are source-equivalent, so the report card was not applicable.
+  STRUCT-001FJ then isolated the normalized-exact host-staged unique/N:N int/text hash-join benchmark/reference
+  owner in the rustfmt-clean 1,390-line `staged_hash_join.rs` child, reducing the execution root to 12,112
+  lines. `HashJoinOutcome` remains root-re-exported; the only non-test consumer is the standard Layer-1
+  roofline example, and a stale transient-residency comment now names the actual production resident-coordinate
+  API. Four direct GPU families passed 12 sequential plus eight concurrent invocations with zero CUDA
+  700/716/717. Both execution modes passed 48/78, both engine modes passed 505/487, and workspace all-target
+  check, strict execution/engine clippy, dependency/scoped source/reference/format checks are clean. Extraction
+  audit found no moved-source/PTX/API regression and promoted the inherited undersized-validity device-read
+  hazard as **STRUCT-001FK**; source-equivalent FJ itself did not require the report card.
 
 ## Known boundaries
 
