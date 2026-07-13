@@ -229,6 +229,111 @@ pub(super) fn try_execute_materialized_view_class_catalog_query(
     ))
 }
 
+fn information_schema_views_query() -> &'static str {
+    "select table_catalog, table_schema, table_name, view_definition, check_option, is_updatable, is_insertable_into, is_trigger_updatable, is_trigger_deletable, is_trigger_insertable from information_schema.views where table_schema = 'public' order by table_name"
+}
+
+fn information_schema_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .views
+        .values()
+        .map(|view| {
+            vec![
+                Some("postgres".to_string()),
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some(view.definition.clone()),
+                Some("NONE".to_string()),
+                Some("NO".to_string()),
+                Some("NO".to_string()),
+                Some("NO".to_string()),
+                Some("NO".to_string()),
+                Some("NO".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[2].cmp(&right[2]));
+    rows
+}
+
+fn pg_catalog_views_query() -> &'static str {
+    "select schemaname, viewname, viewowner, definition from pg_catalog.pg_views where schemaname = 'public' order by viewname"
+}
+
+fn pg_catalog_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .views
+        .values()
+        .map(|view| {
+            vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("postgres".to_string()),
+                Some(view.definition.clone()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+pub(super) fn try_execute_view_relation_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    let (columns, rows) = if canonical == information_schema_views_query() {
+        (
+            vec![
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("view_definition"),
+                text_column("check_option"),
+                text_column("is_updatable"),
+                text_column("is_insertable_into"),
+                text_column("is_trigger_updatable"),
+                text_column("is_trigger_deletable"),
+                text_column("is_trigger_insertable"),
+            ],
+            information_schema_view_rows(session),
+        )
+    } else if canonical == pg_catalog_views_query() {
+        (
+            vec![
+                text_column("schemaname"),
+                text_column("viewname"),
+                text_column("viewowner"),
+                text_column("definition"),
+            ],
+            pg_catalog_view_rows(session),
+        )
+    } else {
+        return None;
+    };
+    Some(write_single_row(stream, &columns, &rows))
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_views_query() -> &'static str {
+    information_schema_views_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_information_schema_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    information_schema_view_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_views_query() -> &'static str {
+    pg_catalog_views_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    pg_catalog_view_rows(session)
+}
+
 fn session_view_depends_on(session: &Session, view: &str, target: &str) -> bool {
     let mut seen = BTreeSet::new();
     session_view_depends_on_inner(session, view, target, &mut seen)

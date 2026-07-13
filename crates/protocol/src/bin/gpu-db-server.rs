@@ -115,10 +115,14 @@ use index_ddl::{
 mod view_ddl;
 use view_ddl::{
     execute_view_ddl, try_execute_materialized_view_class_catalog_query,
-    try_execute_view_catalog_query,
+    try_execute_view_catalog_query, try_execute_view_relation_catalog_query,
 };
 #[cfg(test)]
 use view_ddl::{
+    test_information_schema_view_rows as information_schema_view_rows,
+    test_information_schema_views_query as information_schema_views_query,
+    test_pg_catalog_view_rows as pg_catalog_view_rows,
+    test_pg_catalog_views_query as pg_catalog_views_query,
     test_psql_describe_materialized_views_catalog_query as psql_describe_materialized_views_catalog_query,
     test_psql_describe_materialized_views_verbose_catalog_query as psql_describe_materialized_views_verbose_catalog_query,
     test_psql_describe_views_catalog_query as psql_describe_views_catalog_query,
@@ -2567,35 +2571,8 @@ fn execute_statement(
             &information_schema_key_column_usage_rows(session),
         );
     }
-    if canonical == information_schema_views_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("table_catalog"),
-                text_column("table_schema"),
-                text_column("table_name"),
-                text_column("view_definition"),
-                text_column("check_option"),
-                text_column("is_updatable"),
-                text_column("is_insertable_into"),
-                text_column("is_trigger_updatable"),
-                text_column("is_trigger_deletable"),
-                text_column("is_trigger_insertable"),
-            ],
-            &information_schema_view_rows(session),
-        );
-    }
-    if canonical == pg_catalog_views_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("schemaname"),
-                text_column("viewname"),
-                text_column("viewowner"),
-                text_column("definition"),
-            ],
-            &pg_catalog_view_rows(session),
-        );
+    if let Some(result) = try_execute_view_relation_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if canonical == pg_catalog_constraints_query() {
         return write_single_row(
@@ -6763,54 +6740,6 @@ fn information_schema_key_column_usage_rows(session: &Session) -> Vec<Vec<Option
         }
     }
     rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[4].cmp(&right[4])));
-    rows
-}
-
-fn information_schema_views_query() -> &'static str {
-    "select table_catalog, table_schema, table_name, view_definition, check_option, is_updatable, is_insertable_into, is_trigger_updatable, is_trigger_deletable, is_trigger_insertable from information_schema.views where table_schema = 'public' order by table_name"
-}
-
-fn information_schema_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .views
-        .values()
-        .map(|view| {
-            vec![
-                Some("postgres".to_string()),
-                Some("public".to_string()),
-                Some(view.name.clone()),
-                Some(view.definition.clone()),
-                Some("NONE".to_string()),
-                Some("NO".to_string()),
-                Some("NO".to_string()),
-                Some("NO".to_string()),
-                Some("NO".to_string()),
-                Some("NO".to_string()),
-            ]
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left[2].cmp(&right[2]));
-    rows
-}
-
-fn pg_catalog_views_query() -> &'static str {
-    "select schemaname, viewname, viewowner, definition from pg_catalog.pg_views where schemaname = 'public' order by viewname"
-}
-
-fn pg_catalog_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .views
-        .values()
-        .map(|view| {
-            vec![
-                Some("public".to_string()),
-                Some(view.name.clone()),
-                Some("postgres".to_string()),
-                Some(view.definition.clone()),
-            ]
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left[1].cmp(&right[1]));
     rows
 }
 
