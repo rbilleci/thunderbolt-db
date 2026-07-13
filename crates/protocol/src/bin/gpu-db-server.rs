@@ -95,10 +95,23 @@ use session_commands::try_execute_session_command;
 mod bootstrap_ddl;
 #[cfg(test)]
 use bootstrap_ddl::{
+    test_catalog_psql_describe_schema_rows as catalog_psql_describe_schema_rows,
+    test_catalog_psql_describe_schema_verbose_rows as catalog_psql_describe_schema_verbose_rows,
     test_catalog_psql_extension_rows as catalog_psql_extension_rows,
+    test_information_schema_schemata_query as information_schema_schemata_query,
+    test_information_schema_schemata_rows as information_schema_schemata_rows,
+    test_is_pg_dump_public_namespace_oid_lookup_query as is_pg_dump_public_namespace_oid_lookup_query,
+    test_pg_catalog_namespace_query as pg_catalog_namespace_query,
+    test_pg_catalog_namespace_rows as pg_catalog_namespace_rows,
+    test_psql_describe_schemas_catalog_query as psql_describe_schemas_catalog_query,
+    test_psql_describe_schemas_verbose_catalog_query_public_filter as psql_describe_schemas_verbose_catalog_query_public_filter,
     test_psql_list_extensions_catalog_query as psql_list_extensions_catalog_query,
 };
-use bootstrap_ddl::{try_execute_bootstrap_ddl, try_execute_extension_catalog_query};
+use bootstrap_ddl::{
+    try_execute_bootstrap_ddl, try_execute_extension_catalog_query,
+    try_execute_information_schema_schemata_query, try_execute_namespace_catalog_query,
+    try_execute_psql_schema_catalog_query,
+};
 #[path = "gpu-db-server/cluster_ddl.rs"]
 mod cluster_ddl;
 use cluster_ddl::{
@@ -1733,75 +1746,15 @@ fn execute_statement(
             &catalog_psql_list_access_method_rows(),
         );
     }
-    if canonical == psql_describe_schemas_catalog_query() {
-        return write_single_row(
-            stream,
-            &[text_column("Name"), text_column("Owner")],
-            &catalog_psql_describe_schema_rows(session),
-        );
-    }
-    if psql_describe_schemas_verbose_catalog_query_public_filter(&canonical) {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Name"),
-                text_column("Owner"),
-                text_column("Access privileges"),
-                text_column("Description"),
-            ],
-            &catalog_psql_describe_schema_verbose_rows(session),
-        );
+    if let Some(result) = try_execute_psql_schema_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_schema_description_catalog_query(stream, session, &canonical)
     {
         return result;
     }
-    if canonical == pg_catalog_namespace_query() {
-        return write_single_row(
-            stream,
-            &[int4_column("oid"), text_column("nspname")],
-            &pg_catalog_namespace_rows(session),
-        );
-    }
-    if canonical == pg_catalog_namespace_acl_query() {
-        return write_single_row(
-            stream,
-            &[text_column("nspname"), text_column("nspacl")],
-            &pg_catalog_namespace_acl_rows(session),
-        );
-    }
-    if canonical
-        == "select n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl, acldefault('n', n.nspowner) as acldefault from pg_namespace n"
-    {
-        return write_single_row(
-            stream,
-            &[
-                int4_column("tableoid"),
-                int4_column("oid"),
-                text_column("nspname"),
-                int4_column("nspowner"),
-                text_column("nspacl"),
-                text_column("acldefault"),
-            ],
-            &[
-                vec![
-                    Some("2615".to_string()),
-                    Some("11".to_string()),
-                    Some("pg_catalog".to_string()),
-                    Some("10".to_string()),
-                    None,
-                    None,
-                ],
-                vec![
-                    Some("2615".to_string()),
-                    Some(PUBLIC_NAMESPACE_OID.to_string()),
-                    Some("public".to_string()),
-                    Some("10".to_string()),
-                    schema_acl_array_display(session),
-                    Some("{postgres=UC/postgres,=U/postgres}".to_string()),
-                ],
-            ],
-        );
+    if let Some(result) = try_execute_namespace_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if let Some(type_name) = psql_describe_type_catalog_query_type(&canonical) {
         return write_single_row(
@@ -1839,13 +1792,6 @@ fn execute_statement(
                 text_column("Description"),
             ],
             &catalog_psql_describe_type_verbose_rows_for_supported_types(),
-        );
-    }
-    if is_pg_dump_public_namespace_oid_lookup_query(&canonical) {
-        return write_single_row(
-            stream,
-            &[int4_column("oid")],
-            &[vec![Some(PUBLIC_NAMESPACE_OID.to_string())]],
         );
     }
     if let Some(table) = pg_dump_table_oid_lookup_query_table(&canonical) {
@@ -2426,12 +2372,9 @@ fn execute_statement(
             &information_schema_extended_column_rows_for_tables(session, &tables),
         );
     }
-    if canonical == information_schema_schemata_query() {
-        return write_single_row(
-            stream,
-            &[text_column("schema_name"), text_column("schema_owner")],
-            &information_schema_schemata_rows(session),
-        );
+    if let Some(result) = try_execute_information_schema_schemata_query(stream, session, &canonical)
+    {
+        return result;
     }
     if canonical == information_schema_table_constraints_query() {
         return write_single_row(
@@ -2777,15 +2720,6 @@ fn psql_list_access_methods_catalog_query() -> &'static str {
 
 fn catalog_psql_list_access_method_rows() -> Vec<Vec<Option<String>>> {
     vec![vec![Some("heap".to_string()), Some("Table".to_string())]]
-}
-
-fn psql_describe_schemas_catalog_query() -> &'static str {
-    "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\" from pg_catalog.pg_namespace n where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' order by 1"
-}
-
-fn psql_describe_schemas_verbose_catalog_query_public_filter(canonical: &str) -> bool {
-    canonical
-        == "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\", pg_catalog.array_to_string(n.nspacl, e'\\n') as \"access privileges\", pg_catalog.obj_description(n.oid, 'pg_namespace') as \"description\" from pg_catalog.pg_namespace n where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 1"
 }
 
 fn psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
@@ -3324,61 +3258,6 @@ fn psql_relname_pattern_matches(pattern: &str, table_name: &str) -> bool {
     table_name == pattern
 }
 
-fn catalog_psql_describe_schema_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    if !session.public_schema_exists {
-        return Vec::new();
-    }
-    vec![vec![
-        Some("public".to_string()),
-        Some("postgres".to_string()),
-    ]]
-}
-
-fn catalog_psql_describe_schema_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    if !session.public_schema_exists {
-        return Vec::new();
-    }
-    vec![vec![
-        Some("public".to_string()),
-        Some("postgres".to_string()),
-        schema_acl_display(session),
-        session
-            .comments
-            .get(&CatalogCommentTarget::Schema {
-                schema: "public".to_string(),
-            })
-            .cloned(),
-    ]]
-}
-
-fn pg_catalog_namespace_query() -> &'static str {
-    "select oid, nspname from pg_catalog.pg_namespace where nspname = 'public' order by oid"
-}
-
-fn pg_catalog_namespace_acl_query() -> &'static str {
-    "select n.nspname, n.nspacl from pg_catalog.pg_namespace n where n.nspname = 'public' order by n.nspname"
-}
-
-fn pg_catalog_namespace_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    if !session.public_schema_exists {
-        return Vec::new();
-    }
-    vec![vec![
-        Some(PUBLIC_NAMESPACE_OID.to_string()),
-        Some("public".to_string()),
-    ]]
-}
-
-fn pg_catalog_namespace_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    if !session.public_schema_exists {
-        return Vec::new();
-    }
-    vec![vec![
-        Some("public".to_string()),
-        schema_acl_display(session),
-    ]]
-}
-
 fn catalog_describe_relation_lookup_query_table(canonical: &str) -> Option<String> {
     let prefix = "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(";
     let visible_suffix =
@@ -3417,11 +3296,6 @@ fn pg_dump_table_oid_lookup_query_table(canonical: &str) -> Option<String> {
         .strip_prefix(prefix)?
         .strip_suffix(suffix)
         .map(str::to_string)
-}
-
-fn is_pg_dump_public_namespace_oid_lookup_query(canonical: &str) -> bool {
-    canonical
-        == "select oid from pg_catalog.pg_namespace n where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default"
 }
 
 fn pg_dump_table_oid_lookup_rows(
@@ -5978,20 +5852,6 @@ fn information_schema_numeric_metadata(ty: SqlType) -> (Option<i32>, Option<i32>
         SqlType::Timestamp => (None, None, None),
         SqlType::Uuid => (None, None, None),
     }
-}
-
-fn information_schema_schemata_query() -> &'static str {
-    "select schema_name, schema_owner from information_schema.schemata where schema_name = 'public' order by schema_name"
-}
-
-fn information_schema_schemata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    if !session.public_schema_exists {
-        return Vec::new();
-    }
-    vec![vec![
-        Some("public".to_string()),
-        Some("postgres".to_string()),
-    ]]
 }
 
 fn information_schema_table_constraints_query() -> &'static str {

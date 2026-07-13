@@ -925,6 +925,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   relocatability, null configuration, fallback description masking absent stored metadata, CPU-built host rows,
   and absent GPU-native catalog execution. Full gates, PostgreSQL 16 scenario 54, all 18 pg-dump restore/metadata/
   privilege gates, and independent audit are clean. The root is 6,317 lines and STRUCT-001CU is closed.
+  All effective psql, direct, pg-dump, and bounded information-schema schema/namespace catalog reads now execute
+  from the existing private 504-line `bootstrap_ddl` owner behind four stage-preserving delegates; the 473-line
+  `pg_dump_compat` consumes only the schema delegate. Eleven helpers are byte-identical private moves and nine
+  `cfg(test)` wrappers have proven consumers; shared ACL rendering remains at its unchanged owner boundary. Exact
+  stage and branch order, predicates, 2-/4-/2-/2-/6-/1-/2-column shapes, public-existence filtering, namespace
+  table/OIDs/names/owners, ACL display/array/defaults, optional comments, nulls, and writers are unchanged. The
+  two later root pg-dump routes were deleted only after both were proven dominated by unconditional earlier
+  pg-dump compatibility. Inherited PRODUCT-002 debt remains exact routing, public-only schema modeling, fixed
+  namespace OIDs/owners, simplified ACLs, pg-dump exposing public metadata after public-schema deletion, CPU host
+  row construction, and absent GPU-native catalog execution. Full gates, PostgreSQL 16 scenarios 09/46/47/312/
+  340/342, all 18 pg-dump restore/metadata/privilege gates, and independent audit are clean. The root is 6,177
+  lines and STRUCT-001CV is closed.
 
 ## Known boundaries
 
