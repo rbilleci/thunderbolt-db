@@ -1475,8 +1475,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inventories are unchanged, and all-target check, strict clippy, scoped formatting/diff/reference checks, and
   independent audit are clean after correcting the two child-module ownership comments. Allocation-before-
   eviction, deterministic admission, payload/layout/NULL/MVCC semantics, publication order, errors, and device
-  behavior are source-equivalent, so the report card was not applicable. STRUCT-001EY is the next production
-  ownership slice.
+  behavior are source-equivalent, so the report card was not applicable.
+  STRUCT-001EY then moved the byte-exact 60-method feature-policy, elision-eligibility, shard-sizing, and
+  telemetry owner into the rustfmt-clean 624-line `engine_residency/policy.rs` child, reducing the facade root
+  to 4,176 lines. Four focused ordinary policy/telemetry tests passed, and four policy-sensitive GPU routes
+  passed 12 sequential plus eight concurrent invocations with zero CUDA 700/716/717. Both ordinary modes pass
+  505/487, exact 992-test/76-family inventories are unchanged, and all-target check, strict clippy, scoped
+  formatting/diff/reference checks, and independent audit are clean. Every method name/visibility, default,
+  atomic ordering, predicate, cache/state mutation, and counter source is source-identical; there is no new
+  dependency cycle or CPU-first path, so the report card was not applicable. STRUCT-001EZ is the next
+  production ownership slice.
 
 ## Known boundaries
 
