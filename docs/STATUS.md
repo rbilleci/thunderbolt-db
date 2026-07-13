@@ -1229,6 +1229,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   heartbeat, repair, and snapshot-boundary tests, both 187-test serial/16-thread runs, replication all-target
   check and strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. The root is
   15,620 lines with 683 production lines; STRUCT-001DY is next.
+  STRUCT-001DY externalized the exact contiguous 24-test snapshot-identity family into a bounded 2,133-line
+  `tests/snapshot_identity.rs` owner through an `include!` at the same parent position. Formatting-normalized
+  source compares exactly; only two long declarations rewrapped after parent deindent, while bodies, attributes,
+  names, and semantics are unchanged. The owner coherently covers stale/incompatible installs, same/advanced-
+  frontier identity, compatible suffixes, recovery bundle/gap projection, stale refresh, and role/newer-leader
+  transitions. Focused snapshot/refresh/suffix/recovery/role tests, both 187-test serial/16-thread runs,
+  replication all-target check and strict clippy, scoped formatting/diff/reference checks, and independent audit
+  are clean. The root is 13,486 lines with 683 production lines; STRUCT-001DZ is next.
 
 ## Known boundaries
 

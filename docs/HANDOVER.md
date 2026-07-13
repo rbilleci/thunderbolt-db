@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DY:** externalize the exact 24-test snapshot-identity family behind the unchanged parent test
-   facade; preserve every body and harness name, and do not change production code or visibility.
+1. **STRUCT-001DZ:** externalize the exact seven-test advanced-snapshot repair family behind the unchanged
+   parent test facade; preserve bodies and harness names, and do not change production code or visibility.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
