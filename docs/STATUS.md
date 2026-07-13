@@ -1293,6 +1293,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Raft orchestration, and cross-type request-application seam are cohesive; forcing the previously sketched
   `raft` leaf would add artificial visibility/cycle risk. The replication outlier disposition is complete and
   STRUCT-001EG is next.
+  STRUCT-001EG completed the required analysis packet for the 12,964-line handwritten
+  `engine_residency.rs` outlier without changing runtime code. It contains 6,145 production/support lines and a
+  6,819-line inline 76-test residency matrix; 132 file-touching commits co-change distinct expression, state,
+  retained-read, lifecycle, commit, DML, execution, and resident-storage owners. PLAN now records the complete
+  responsibility/caller/state/CUDA/history map, native-GPU publication and layout invariants, an acyclic seven-
+  leaf production target plus seven bounded test families, visibility discipline, and exact structural versus
+  device-changing gates. The disposition is decompose behind the stable private facade and public inherent
+  `Engine` APIs. STRUCT-001EH is the first bounded pure test-ownership slice.
 
 ## Known boundaries
 

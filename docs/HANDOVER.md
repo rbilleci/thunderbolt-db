@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EG:** analyze and disposition `engine_residency.rs`; record the complete dependency/ownership
-   packet and audited first slice before changing runtime code.
+1. **STRUCT-001EH:** externalize the exact first four payload/append residency tests behind the unchanged
+   `capacity_payload_tests` facade; preserve harness names and run the exact ignored GPU HAZARD gate.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
