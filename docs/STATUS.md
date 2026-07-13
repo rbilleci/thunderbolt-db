@@ -1619,6 +1619,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   format/diff checks, and independent re-audit are clean. The 1,403-line child remains within policy. Layer-1
   was stable: staged `hash_join_inner_i64` moved from 256.0 to 257.8 M-element/s (+0.70%) and the resident
   payload-join control from 6359.4 to 6313.5 M-element/s (-0.72%).
+  STRUCT-001FL then isolated the shared payload-key/order-key descriptors and opaque device-coordinate owner
+  in the rustfmt-clean 85-line `join_contract.rs` child, reducing the execution root to 12,035 lines. The
+  private module re-exports all three unchanged crate-root public names; narrow `pub(super)` coordinate fields
+  and test readback preserve their former root-private effective scope. `CudaPredicateMaskI32` remains with
+  expression execution. Direct composite-coordinate, production three-way SQL, and over-budget streaming GPU
+  joins passed nine sequential plus six concurrent invocations with zero device faults. Both execution modes
+  passed 48/79, both engine modes passed 505/487, workspace all-target check, strict execution/engine clippy,
+  dependency/scoped source/reference/format checks, and independent audit are clean. Type layout, derives,
+  accessors, unsafe test readback, external consumers, runtime, kernels, synchronization, allocations, and
+  result behavior are source-equivalent, so the report card was not applicable.
 
 ## Known boundaries
 

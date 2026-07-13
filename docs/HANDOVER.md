@@ -45,13 +45,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `staged_hash_join.rs`; extraction gates pass and its audit promoted validity hardening as STRUCT-001FK.
 - STRUCT-001FK is closed: every staged validity descriptor is exact before device work; the 15/10 GPU matrix,
   both suite regimes, static gates, stable Layer-1 comparison, and independent re-audit pass.
+- STRUCT-001FL is closed: shared join descriptors and opaque coordinate ownership now live in the bounded
+  `join_contract.rs` leaf; stable root APIs, the 9/6 GPU matrix, full/static gates, and audit pass.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FL:** isolate the shared payload-key, order-key, and opaque coordinate contracts behind stable
-   crate-root re-exports; keep the expression predicate mask with its current root execution owner.
+1. **STRUCT-001FM:** isolate predicate-mask ownership, compaction, retained/range/AND construction, and its five
+   resident APIs behind the unchanged root type/API without changing the arithmetic VM or device behavior.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
