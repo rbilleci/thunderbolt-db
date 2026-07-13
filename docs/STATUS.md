@@ -1346,8 +1346,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   family inventories remain exact. All five GPU gates passed 15 sequential and 10 concurrent invocations with
   zero CUDA 700/716/717; both ordinary suite modes passed 505/487, and all-target check, restored strict clippy,
   scoped formatting/diff/reference checks, and independent audit are clean. Production code, visibility,
-  residency, routing, and architecture are untouched, so the report card was not applicable. STRUCT-001EJ is
-  the next bounded ownership slice.
+  residency, routing, and architecture are untouched, so the report card was not applicable.
+  STRUCT-001EJ externalized the exact eight-test sparse `deleted_by` visibility family into the rustfmt-clean
+  524-line `tests/residency_sparse_visibility.rs` owner through an `include!` at the same parent position. The
+  parent-deindented source comparison is byte-exact, all bodies/attributes/names/order are unchanged, and the
+  five shared sparse-region helpers remain at the parent facade for later slices. The engine root is 11,631
+  lines, and the 992-test/76-family inventories remain exact. The eight GPU gates passed 24 sequential and 16
+  concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target check,
+  strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No production or
+  architectural behavior changed, so the report card was not applicable. STRUCT-001EK is next.
 
 ## Known boundaries
 
