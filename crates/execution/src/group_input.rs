@@ -1,25 +1,5 @@
-use std::marker::PhantomData;
-
-use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError, DeviceArithBuffer};
-
-#[derive(Debug, Clone, Copy)]
-pub struct CudaGroupDeviceView<'a> {
-    pub(super) ptr: u64,
-    pub(super) initialized_bytes: u64,
-    pub(super) context_identity: usize,
-    _owner: PhantomData<&'a ()>,
-}
-
-impl CudaGroupDeviceView<'_> {
-    pub(super) fn new(ptr: u64, initialized_bytes: u64, context_identity: usize) -> Self {
-        Self {
-            ptr,
-            initialized_bytes,
-            context_identity,
-            _owner: PhantomData,
-        }
-    }
-}
+use super::derived_column::{CudaGroupDeviceView, DeviceArithBuffer};
+use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError};
 
 #[derive(Debug, Clone, Copy)]
 pub enum CudaGroupFixedSource<'a> {
@@ -34,7 +14,6 @@ pub enum CudaGroupFixedSource<'a> {
         row_count: u64,
     },
 }
-
 impl CudaGroupFixedSource<'_> {
     fn width(self) -> u64 {
         match self {

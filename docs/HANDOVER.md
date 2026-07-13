@@ -55,13 +55,16 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FO is closed: `ConstMask` is a pooled-stream i32 device fill with exact 0/1 words and no O(rows) host
   vector/H2D. Its permanent two-cache benchmark improved ~274x/~427x, the canonical card and 3/2 production GPU
   gate pass, and independent audit found no further task.
+- STRUCT-001FP is closed: the bounded `derived_column.rs` owns device-derived grouping views/buffers and nine
+  launchers; stable APIs, the 15/10 GPU matrix, full/static gates, and audit pass. Audit promoted inherited raw/
+  unchecked safe-API device access as STRUCT-001FQ; generic `upload_u64_device` needs no hardening.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FP:** isolate the device-derived grouping view/buffer and arith/bool/composite/wide/distinct launch
-   family behind stable root exports/imports, with `group_input` depending one-way on the new leaf.
+1. **STRUCT-001FQ:** make the derived-column API family total with checked VM/source/destination/validity windows,
+   typed same-context wide-key sources/descriptors, and validated fixed/text DISTINCT permutations and text offsets.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

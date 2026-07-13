@@ -1661,6 +1661,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   stable. The canonical card confirmed 36us/944.9 GB/s and 187us/1431.8 GB/s and completed both production
   point-read cache regimes. The production TRUE/FALSE SQL route passed three sequential plus two concurrent GPU
   invocations; both full suite modes, all static/boundary gates, and independent runtime/benchmark audit are clean.
+  STRUCT-001FP then isolated `CudaGroupDeviceView`, `DeviceArithBuffer`, and the nine arith/bool/pack/widen/upload/
+  wide-key/distinct device-derived launchers in the rustfmt-clean 920-line `derived_column.rs` child, reducing the
+  execution root to 9,738 lines and `group_input.rs` to 618. Both public type paths and inherent APIs remain stable;
+  `group_input -> derived_column` is the sole child edge and there is no reverse dependency. Six focused validation
+  tests and five arith/bool/composite/text-distinct/streaming GPU routes passed 15 sequential plus ten concurrent
+  invocations. Both execution modes passed 48/79, both engine modes passed 505/487, workspace all-target check,
+  strict execution/engine clippy, dependency/scoped source/reference/format checks, and independent audit are clean.
+  PTX, seven symbols/arguments, layouts, extents, context identity, transfers, synchronization, errors, results, and
+  leases are source-equivalent, so the report card was not applicable. Audit promoted inherited safe-API device OOB/
+  raw-pointer risk across eight launcher families as STRUCT-001FQ; `upload_u64_device` alone is already total.
 
 ## Known boundaries
 
