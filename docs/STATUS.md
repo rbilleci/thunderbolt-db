@@ -1338,7 +1338,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   measured 1,468/1,448 GB/s in-/out-of-L2 `sum_i32`, 1,292/1,459 GB/s COUNT, and 349/258/1,678 M-elem/s
   sort/join/grouped. The canonical card measured 1,476/1,451 GB/s rooflines and 65,536-batch production point
   reads at 246.5M/255.3M lookups/s with p50 136/130us. Independent audit found no semantic, ownership, API,
-  scheduler, or GPU-path drift. STRUCT-001EI is ready.
+  scheduler, or GPU-path drift. This unblocked STRUCT-001EI.
+  STRUCT-001EI externalized the exact contiguous five-test baseline shard family into the rustfmt-clean 429-line
+  `tests/residency_shard_baseline.rs` owner through an `include!` at the same parent position. Normalizing the
+  prior parent-indented source leaves no difference beyond one rustfmt line wrap; all bodies, attributes, order,
+  and `capacity_payload_tests::*` names are unchanged. The engine root is 12,154 lines, and the 992-test/76-
+  family inventories remain exact. All five GPU gates passed 15 sequential and 10 concurrent invocations with
+  zero CUDA 700/716/717; both ordinary suite modes passed 505/487, and all-target check, restored strict clippy,
+  scoped formatting/diff/reference checks, and independent audit are clean. Production code, visibility,
+  residency, routing, and architecture are untouched, so the report card was not applicable. STRUCT-001EJ is
+  the next bounded ownership slice.
 
 ## Known boundaries
 

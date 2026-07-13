@@ -29,12 +29,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   are green without host fallback.
 - QUALITY-001 is closed: WAL and engine all-target strict clippy are green, both engine suite modes and the
   five-route GPU hazard matrix pass, the canonical report card is stable, and independent audit found no drift.
+- STRUCT-001EI is closed: the exact five-test baseline shard family now lives in the bounded 429-line
+  `tests/residency_shard_baseline.rs` owner; exact inventories, 25 GPU invocations, both ordinary suites, strict
+  clippy, and independent audit are clean with no production change.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EI:** externalize the exact five-test baseline shard family.
+1. **STRUCT-001EJ:** externalize the exact eight-test sparse-visibility shard family.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
