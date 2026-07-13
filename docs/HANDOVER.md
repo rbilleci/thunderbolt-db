@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BD:** isolate bounded plpgsql-extension and public-schema CREATE/DROP arms behind a private
-   bootstrap-DDL delegate, preserving dependencies, ACL/comment cleanup, dirty publication, errors, and tags.
+1. **STRUCT-001BE:** isolate database and tablespace create/drop/rename arms behind a private cluster-DDL owner,
+   preserving dependencies, OIDs, ACL/comment state, rename retargeting, publication, errors, and tags.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

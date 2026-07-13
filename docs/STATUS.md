@@ -530,6 +530,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied clippy, security
   preflight, touched formatting, diff checks, and independent audit are clean. The root is 15,255 lines and
   STRUCT-001BC is closed.
+  Parsed bootstrap catalog DDL now enters the private 165-line `bootstrap_ddl` owner through one successful-
+  parse variant delegate. The bounded plpgsql extension and public-schema CREATE/DROP arms preserve exact name
+  and schema restrictions, IF EXISTS/IF NOT EXISTS precedence, public-schema state, non-empty dependency checks,
+  ACL/comment cleanup, dirty flags, persistence, SQLSTATEs/messages, and tags. The complete moved body hashes
+  identically after normalizing only tri-state wrapping and clippy-required tail expressions. Sequential/
+  concurrent 127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied
+  clippy, security preflight, touched formatting, diff checks, and independent audit are clean. The root is
+  15,125 lines and STRUCT-001BD is closed.
 
 ## Known boundaries
 
