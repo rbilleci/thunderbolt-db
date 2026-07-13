@@ -1179,6 +1179,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   target check and strict clippy, cluster output smoke, targeted formatting/diff/reference checks, and independent
   audit are clean. The root is 19,374 lines with 1,571 production lines before the test facade; STRUCT-001DS is
   the next acyclic RPC ownership leaf.
+  STRUCT-001DS isolated the four public RequestVote/AppendEntries records, both exact AppendEntries frame codecs,
+  and all private framing primitives in a private 202-line `rpc` owner that depends only on `gpu_db_types`.
+  The byte-identical `AppendEntriesRequest::apply_to` adapter remains at the root beside Raft orchestration, so
+  RPC has no reverse consensus/transport dependency; all four public root paths and transport consumers remain
+  unchanged. The two exact frame tests now live in a 55-line included file while retaining their original harness
+  names; request-application and TCP loopback tests remain in the transport test owner. Focused frame/election
+  tests, both 187-test serial/16-thread runs, replication all-target check and strict clippy, cluster/multiprocess/
+  service/channel-security smokes, targeted formatting/diff/reference checks, and independent audit are clean.
+  The root is 19,180 lines with 1,376 production lines before the test facade; STRUCT-001DT is next.
 
 ## Known boundaries
 
