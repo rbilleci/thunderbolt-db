@@ -1,9 +1,9 @@
 // Legacy bootstrap catalog DDL ownership. This is not a product execution path.
 
 use super::{
-    bool_column, int4_column, schema_acl_array_display, schema_acl_display, text_column,
-    write_command_complete, write_error, write_single_row, CatalogCommentTarget, Column, Command,
-    ErrorField, ReadWrite, Session, PG_EXTENSION_CLASS_OID, PG_LANGUAGE_CLASS_OID,
+    bool_column, catalog_empty_rows, int4_column, schema_acl_array_display, schema_acl_display,
+    text_column, write_command_complete, write_error, write_single_row, CatalogCommentTarget,
+    Column, Command, ErrorField, ReadWrite, Session, PG_EXTENSION_CLASS_OID, PG_LANGUAGE_CLASS_OID,
     PLPGSQL_CALL_HANDLER_OID, PLPGSQL_DESCRIPTION, PLPGSQL_EXTENSION_OID,
     PLPGSQL_INLINE_HANDLER_OID, PLPGSQL_LANGUAGE_OID, PLPGSQL_VALIDATOR_OID, PUBLIC_NAMESPACE_OID,
 };
@@ -585,4 +585,58 @@ fn pg_language_discovery_rows() -> Vec<Vec<Option<String>>> {
 #[cfg(test)]
 pub(super) fn test_psql_list_languages_catalog_query() -> &'static str {
     psql_list_languages_catalog_query()
+}
+
+pub(super) fn try_execute_access_method_catalog_query(
+    stream: &mut dyn ReadWrite,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != psql_list_access_methods_catalog_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[text_column("Name"), text_column("Type")],
+        &catalog_psql_list_access_method_rows(),
+    ))
+}
+
+pub(super) fn try_execute_access_method_pg_dump_catalog_query(
+    stream: &mut dyn ReadWrite,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical
+        != "select tableoid, oid, amname, amtype, amhandler::pg_catalog.regproc as amhandler from pg_am"
+    {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("amname"),
+            text_column("amtype"),
+            text_column("amhandler"),
+        ],
+        &catalog_empty_rows(),
+    ))
+}
+
+fn psql_list_access_methods_catalog_query() -> &'static str {
+    "select amname as \"name\", case amtype when 'i' then 'index' when 't' then 'table' end as \"type\" from pg_catalog.pg_am order by 1"
+}
+
+fn catalog_psql_list_access_method_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![Some("heap".to_string()), Some("Table".to_string())]]
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_access_methods_catalog_query() -> &'static str {
+    psql_list_access_methods_catalog_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_psql_list_access_method_rows() -> Vec<Vec<Option<String>>> {
+    catalog_psql_list_access_method_rows()
 }

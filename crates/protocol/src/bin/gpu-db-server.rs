@@ -98,6 +98,7 @@ use bootstrap_ddl::{
     test_catalog_psql_describe_schema_rows as catalog_psql_describe_schema_rows,
     test_catalog_psql_describe_schema_verbose_rows as catalog_psql_describe_schema_verbose_rows,
     test_catalog_psql_extension_rows as catalog_psql_extension_rows,
+    test_catalog_psql_list_access_method_rows as catalog_psql_list_access_method_rows,
     test_information_schema_schemata_query as information_schema_schemata_query,
     test_information_schema_schemata_rows as information_schema_schemata_rows,
     test_is_pg_dump_public_namespace_oid_lookup_query as is_pg_dump_public_namespace_oid_lookup_query,
@@ -105,13 +106,15 @@ use bootstrap_ddl::{
     test_pg_catalog_namespace_rows as pg_catalog_namespace_rows,
     test_psql_describe_schemas_catalog_query as psql_describe_schemas_catalog_query,
     test_psql_describe_schemas_verbose_catalog_query_public_filter as psql_describe_schemas_verbose_catalog_query_public_filter,
+    test_psql_list_access_methods_catalog_query as psql_list_access_methods_catalog_query,
     test_psql_list_extensions_catalog_query as psql_list_extensions_catalog_query,
     test_psql_list_languages_catalog_query as psql_list_languages_catalog_query,
 };
 use bootstrap_ddl::{
-    try_execute_bootstrap_ddl, try_execute_extension_catalog_query,
-    try_execute_information_schema_schemata_query, try_execute_language_catalog_query,
-    try_execute_namespace_catalog_query, try_execute_psql_schema_catalog_query,
+    try_execute_access_method_catalog_query, try_execute_bootstrap_ddl,
+    try_execute_extension_catalog_query, try_execute_information_schema_schemata_query,
+    try_execute_language_catalog_query, try_execute_namespace_catalog_query,
+    try_execute_psql_schema_catalog_query,
 };
 #[path = "gpu-db-server/cluster_ddl.rs"]
 mod cluster_ddl;
@@ -1722,12 +1725,8 @@ fn execute_statement(
     if let Some(result) = try_execute_tablespace_catalog_query(stream, session, &canonical) {
         return result;
     }
-    if canonical == psql_list_access_methods_catalog_query() {
-        return write_single_row(
-            stream,
-            &[text_column("Name"), text_column("Type")],
-            &catalog_psql_list_access_method_rows(),
-        );
+    if let Some(result) = try_execute_access_method_catalog_query(stream, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_psql_schema_catalog_query(stream, session, &canonical) {
         return result;
@@ -2691,14 +2690,6 @@ fn psql_list_casts_catalog_query() -> &'static str {
 
 fn psql_list_default_access_privileges_catalog_query() -> &'static str {
     "select pg_catalog.pg_get_userbyid(d.defaclrole) as \"owner\", n.nspname as \"schema\", case d.defaclobjtype when 'r' then 'table' when 's' then 'sequence' when 'f' then 'function' when 't' then 'type' when 'n' then 'schema' end as \"type\", pg_catalog.array_to_string(d.defaclacl, e'\\n') as \"access privileges\" from pg_catalog.pg_default_acl d left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace order by 1, 2, 3"
-}
-
-fn psql_list_access_methods_catalog_query() -> &'static str {
-    "select amname as \"name\", case amtype when 'i' then 'index' when 't' then 'table' end as \"type\" from pg_catalog.pg_am order by 1"
-}
-
-fn catalog_psql_list_access_method_rows() -> Vec<Vec<Option<String>>> {
-    vec![vec![Some("heap".to_string()), Some("Table".to_string())]]
 }
 
 fn psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
@@ -4262,17 +4253,6 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
             int4_column("oprleft"),
             int4_column("oprright"),
             int4_column("oprcode"),
-        ]);
-    }
-    if canonical
-        == "select tableoid, oid, amname, amtype, amhandler::pg_catalog.regproc as amhandler from pg_am"
-    {
-        return Some(vec![
-            int4_column("tableoid"),
-            int4_column("oid"),
-            text_column("amname"),
-            text_column("amtype"),
-            text_column("amhandler"),
         ]);
     }
     if canonical

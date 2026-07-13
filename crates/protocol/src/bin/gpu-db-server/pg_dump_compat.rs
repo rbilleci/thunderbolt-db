@@ -1,8 +1,8 @@
 // Legacy pg_dump compatibility ownership. This is not a product catalog execution path.
 
 use super::bootstrap_ddl::{
-    try_execute_extension_pg_dump_catalog_query, try_execute_language_pg_dump_catalog_query,
-    try_execute_schema_pg_dump_catalog_query,
+    try_execute_access_method_pg_dump_catalog_query, try_execute_extension_pg_dump_catalog_query,
+    try_execute_language_pg_dump_catalog_query, try_execute_schema_pg_dump_catalog_query,
 };
 use super::catalog_comments::pg_dump_description_rows;
 use super::cluster_ddl::{
@@ -284,6 +284,9 @@ pub(super) fn try_execute_pg_dump_compat_statement(
         ));
     }
     if let Some(result) = try_execute_tablespace_pg_dump_catalog_query(stream, session, canonical) {
+        return Some(result);
+    }
+    if let Some(result) = try_execute_access_method_pg_dump_catalog_query(stream, canonical) {
         return Some(result);
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(canonical) {

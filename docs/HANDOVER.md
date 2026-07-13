@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001CX:** move the psql access-method listing and effective empty pg-dump `pg_am` response into the
-   existing bootstrap owner behind two stage-preserving delegates, retaining exact metadata and output.
+1. **STRUCT-001CY:** move the psql default-access-privilege listing and effective pg-dump default-ACL metadata
+   read into the existing ACL owner behind two stage-preserving delegates, retaining exact ACLs and output.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
