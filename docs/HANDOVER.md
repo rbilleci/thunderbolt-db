@@ -74,13 +74,16 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001EW is closed: the normalized-exact typed payload/key/open-append production owner now lives in the
   bounded 806-line `engine_residency/payload.rs` child; the root is 5,478 lines, all focused/full/GPU gates and
   audit are clean, facade compatibility is complete, and runtime/layout behavior is unchanged.
+- STRUCT-001EX is closed: the normalized-exact six-method snapshot admission/publication owner now lives in the
+  bounded 691-line `engine_residency/admission.rs` child; the root is 4,793 lines, all focused/full/GPU gates and
+  audit are clean, and allocation/publication/runtime behavior is unchanged.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EX:** isolate snapshot build/admit/publication production ownership behind the unchanged
-   inherent `Engine` API.
+1. **STRUCT-001EY:** isolate production feature policy, elision eligibility, and telemetry behind unchanged
+   inherent `Engine` APIs.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

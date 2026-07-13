@@ -1465,7 +1465,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   992-test/76-family inventories are unchanged, and all-target check, strict clippy, scoped formatting/diff/
   reference checks, and independent audit are clean. Payload bytes/offsets/NULL layouts, key codecs,
   fingerprints, MVCC fills, append ordering, and device behavior are source-identical, so the report card was
-  not applicable. STRUCT-001EX is the next production ownership slice.
+  not applicable.
+  STRUCT-001EX then moved the six snapshot construction/admission/publication methods into the rustfmt-clean
+  691-line `engine_residency/admission.rs` child, reducing the facade root to 4,793 lines. The moved methods are
+  normalized-exact: rustfmt changed four layouts, and only the three methods with proven existing parent
+  consumers gained narrow `pub(super)` visibility; all public/crate APIs and call sites are unchanged. Six
+  focused ordinary tests passed, and four admission-sensitive GPU routes passed 12 sequential plus eight
+  concurrent invocations with zero CUDA 700/716/717. Both ordinary modes pass 505/487, exact 992-test/76-family
+  inventories are unchanged, and all-target check, strict clippy, scoped formatting/diff/reference checks, and
+  independent audit are clean after correcting the two child-module ownership comments. Allocation-before-
+  eviction, deterministic admission, payload/layout/NULL/MVCC semantics, publication order, errors, and device
+  behavior are source-equivalent, so the report card was not applicable. STRUCT-001EY is the next production
+  ownership slice.
 
 ## Known boundaries
 
