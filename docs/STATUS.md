@@ -1454,8 +1454,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   two concurrent rounds with zero CUDA 700/716/717. The engine root is 6,267 lines, both ordinary modes pass
   505/487, and the exact 992-test/76-family inventories, all-target check, strict clippy, scoped formatting/diff/
   reference checks, and independent audit are clean. No production capacity, payload, budget, or architectural
-  behavior changed, so the report card was not applicable. All 76 residency tests now live in bounded owners;
-  STRUCT-001EW begins production ownership extraction.
+  behavior changed, so the report card was not applicable. All 76 residency tests now live in bounded owners.
+  STRUCT-001EW then moved the normalized-exact typed payload/key/open-append production owner into the
+  rustfmt-clean 806-line `engine_residency/payload.rs` child, reducing the facade root to 5,478 lines. Comparing
+  the former root range with the child finds exactly one required change: `AppendCreatedBy::stamps_for` is now
+  the narrow `pub(super)` needed by its existing parent consumer. Explicit crate-visible re-exports preserve
+  every proven facade path, while the unconsumed `RelationalDevicePayload` alias and `fnv1a_bytes` helper remain
+  private to the leaf. Five focused ordinary tests passed; four representative GPU routes passed 12 sequential
+  and eight concurrent invocations with zero CUDA 700/716/717. Both ordinary modes pass 505/487, the exact
+  992-test/76-family inventories are unchanged, and all-target check, strict clippy, scoped formatting/diff/
+  reference checks, and independent audit are clean. Payload bytes/offsets/NULL layouts, key codecs,
+  fingerprints, MVCC fills, append ordering, and device behavior are source-identical, so the report card was
+  not applicable. STRUCT-001EX is the next production ownership slice.
 
 ## Known boundaries
 
