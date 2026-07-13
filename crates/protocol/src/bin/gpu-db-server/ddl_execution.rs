@@ -5,8 +5,12 @@ use super::ddl_syntax::{
     DropTable, ParsedTruncateTable,
 };
 use super::{
-    validate_foreign_keys, write_command_complete, write_error, CatalogCommentTarget,
-    ColumnDefault, ErrorField, ReadWrite, Session,
+    add_check_constraint_to_session, add_foreign_key_to_session, add_primary_key_to_session,
+    add_unique_constraint_to_session, create_implicit_sequence, preflight_column_default_target,
+    rename_constraint_in_session, rename_table_in_session, resolve_column_domain_type,
+    schema_permission_error, validate_foreign_keys, write_command_complete, write_error,
+    CatalogColumn, CatalogCommentTarget, ColumnDefault, Command, ErrorField, ReadWrite,
+    SchemaPrivilege, Session, Table,
 };
 use std::collections::BTreeSet;
 use std::io;
@@ -288,4 +292,318 @@ fn execute_drop_constraint(
     }
     session.persist_catalog_snapshot();
     write_command_complete(stream, "ALTER TABLE")
+}
+
+pub(super) fn execute_parsed_table_ddl(
+    stream: &mut dyn ReadWrite,
+    session: &mut Session,
+    command: Command,
+) -> io::Result<()> {
+    match command {
+        Command::CreateTable(create) => {
+            if !session.public_schema_exists {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "3F000",
+                        message: "schema does not exist",
+                        position: None,
+                    },
+                );
+            }
+            if let Some(error) = schema_permission_error(session, "public", SchemaPrivilege::Create)
+            {
+                return write_error(stream, &error);
+            }
+            if session.tables.contains_key(&create.table)
+                || session.views.contains_key(&create.table)
+                || session.materialized_views.contains_key(&create.table)
+                || session.sequences.contains_key(&create.table)
+                || session.domains.contains_key(&create.table)
+            {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42P07",
+                        message: "relation already exists",
+                        position: None,
+                    },
+                );
+            }
+            let mut columns = Vec::with_capacity(create.columns.len());
+            for (idx, mut def) in create.columns.into_iter().enumerate() {
+                let Ok(attnum) = i16::try_from(idx + 1) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "54000",
+                            message: "too many columns for bootstrap catalog",
+                            position: None,
+                        },
+                    );
+                };
+                if let Err(error) = resolve_column_domain_type(session, &mut def) {
+                    return write_error(stream, &error);
+                }
+                columns.push(CatalogColumn { attnum, def });
+            }
+            let primary_key = create.primary_key.clone();
+            let check_constraints = create.check_constraints.clone();
+            let name = create.table;
+            let table_name = name.clone();
+            for column in &columns {
+                if let Some(default) = column.def.default.as_ref() {
+                    if let Some(error) = preflight_column_default_target(session, default) {
+                        return write_error(stream, &error);
+                    }
+                }
+            }
+            let oid = session.next_relation_oid;
+            session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "54000",
+                            message: "relation OID allocation exhausted",
+                            position: None,
+                        },
+                    );
+                }
+            };
+            let implicit_sequences = columns
+                .iter()
+                .filter_map(|column| match &column.def.default {
+                    Some(ColumnDefault::SequenceNextVal {
+                        sequence,
+                        create_if_missing: true,
+                    }) => Some(sequence.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for sequence in &implicit_sequences {
+                if let Err(error) = create_implicit_sequence(session, sequence) {
+                    return write_error(stream, &error);
+                }
+            }
+            session.tables.insert(
+                table_name.clone(),
+                Table {
+                    oid,
+                    name,
+                    columns,
+                    rows: Vec::new(),
+                    check_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                },
+            );
+            if let Some(primary_key) = primary_key {
+                let constraint_name = primary_key
+                    .name
+                    .unwrap_or_else(|| format!("{}_pkey", table_name));
+                if let Err(error) = add_primary_key_to_session(
+                    session,
+                    &table_name,
+                    constraint_name,
+                    primary_key.column,
+                ) {
+                    session.tables.remove(&table_name);
+                    session.indexes.retain(|index| index.table != table_name);
+                    for sequence in &implicit_sequences {
+                        session.sequences.remove(sequence);
+                        session.mark_sequence_dirty(sequence.clone());
+                    }
+                    return write_error(stream, &error);
+                }
+            }
+            for unique in create.unique_constraints {
+                let constraint_name = unique
+                    .name
+                    .unwrap_or_else(|| format!("{}_{}_key", table_name, unique.column));
+                if let Err(error) = add_unique_constraint_to_session(
+                    session,
+                    &table_name,
+                    constraint_name,
+                    unique.column,
+                ) {
+                    session.tables.remove(&table_name);
+                    session.indexes.retain(|index| index.table != table_name);
+                    for sequence in &implicit_sequences {
+                        session.sequences.remove(sequence);
+                        session.mark_sequence_dirty(sequence.clone());
+                    }
+                    return write_error(stream, &error);
+                }
+            }
+            for check in check_constraints {
+                let constraint_name = check
+                    .name
+                    .unwrap_or_else(|| format!("{}_{}_check", table_name, check.filter.column));
+                if let Err(error) = add_check_constraint_to_session(
+                    session,
+                    &table_name,
+                    constraint_name,
+                    check.filter,
+                ) {
+                    session.tables.remove(&table_name);
+                    session.indexes.retain(|index| index.table != table_name);
+                    for sequence in &implicit_sequences {
+                        session.sequences.remove(sequence);
+                        session.mark_sequence_dirty(sequence.clone());
+                    }
+                    return write_error(stream, &error);
+                }
+            }
+            if !session.default_table_acl.is_empty() {
+                session
+                    .table_acls
+                    .insert(table_name.clone(), session.default_table_acl.clone());
+                session.mark_table_acl_dirty(table_name.clone());
+            }
+            session.mark_table_dirty(table_name);
+            session.persist_catalog_snapshot();
+            write_command_complete(stream, "CREATE TABLE")
+        }
+        Command::AddPrimaryKey(add) => {
+            if let Err(error) = add_primary_key_to_session(
+                session,
+                &add.table,
+                add.name.clone(),
+                add.column.clone(),
+            ) {
+                return write_error(stream, &error);
+            }
+            session.persist_catalog_snapshot();
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::AddUniqueConstraint(add) => {
+            if let Err(error) = add_unique_constraint_to_session(
+                session,
+                &add.table,
+                add.name.clone(),
+                add.column.clone(),
+            ) {
+                return write_error(stream, &error);
+            }
+            session.persist_catalog_snapshot();
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::AddCheckConstraint(add) => {
+            if let Err(error) =
+                add_check_constraint_to_session(session, &add.table, add.name, add.filter)
+            {
+                return write_error(stream, &error);
+            }
+            session.persist_catalog_snapshot();
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::AddForeignKey(add) => {
+            if let Err(error) = add_foreign_key_to_session(
+                session,
+                &add.table,
+                add.name,
+                add.column,
+                add.referenced_table,
+                add.referenced_column,
+            ) {
+                return write_error(stream, &error);
+            }
+            session.persist_catalog_snapshot();
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::DropConstraint(drop) => {
+            if !session.tables.contains_key(&drop.table) {
+                if drop.table_if_exists {
+                    return write_command_complete(stream, "ALTER TABLE");
+                }
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42P01",
+                        message: "relation does not exist",
+                        position: None,
+                    },
+                );
+            }
+            let old_index_count = session.indexes.len();
+            session.indexes.retain(|index| {
+                !(index.table == drop.table
+                    && index.name == drop.name
+                    && (index.primary_key || index.unique_constraint))
+            });
+            let mut dropped_check = false;
+            let mut dropped_foreign_key = false;
+            if let Some(table) = session.tables.get_mut(&drop.table) {
+                let old_check_count = table.check_constraints.len();
+                table
+                    .check_constraints
+                    .retain(|constraint| constraint.name != drop.name);
+                dropped_check = table.check_constraints.len() != old_check_count;
+                let old_foreign_key_count = table.foreign_keys.len();
+                table
+                    .foreign_keys
+                    .retain(|constraint| constraint.name != drop.name);
+                dropped_foreign_key = table.foreign_keys.len() != old_foreign_key_count;
+                if dropped_check || dropped_foreign_key {
+                    session.mark_table_dirty(drop.table.clone());
+                }
+            }
+            if session.indexes.len() == old_index_count
+                && !dropped_check
+                && !dropped_foreign_key
+                && !drop.if_exists
+            {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42704",
+                        message: "constraint does not exist",
+                        position: None,
+                    },
+                );
+            }
+            session.dirty_indexes |= session.indexes.len() != old_index_count;
+            if session.indexes.len() != old_index_count || dropped_check || dropped_foreign_key {
+                for target in [
+                    CatalogCommentTarget::Index {
+                        index: drop.name.clone(),
+                    },
+                    CatalogCommentTarget::Constraint {
+                        table: drop.table.clone(),
+                        constraint: drop.name.clone(),
+                    },
+                ] {
+                    session.comments.remove(&target);
+                    session.mark_comment_dirty(target);
+                }
+            }
+            session.persist_catalog_snapshot();
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::RenameConstraint(rename) => {
+            if let Err(error) = rename_constraint_in_session(
+                session,
+                &rename.table,
+                &rename.old_name,
+                &rename.new_name,
+                rename.table_if_exists,
+            ) {
+                return write_error(stream, &error);
+            }
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::RenameTable(rename) => {
+            if let Err(error) = rename_table_in_session(
+                session,
+                &rename.old_name,
+                &rename.new_name,
+                rename.if_exists,
+            ) {
+                return write_error(stream, &error);
+            }
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        _ => unreachable!("parsed table DDL executor called with an unrelated command"),
+    }
 }

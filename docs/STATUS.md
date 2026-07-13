@@ -545,6 +545,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   only clippy-required tail expressions differ. Sequential/concurrent 127-test runs, the full protocol package
   and driver smokes, all-target checks, warning-denied clippy, security preflight, touched formatting, diff
   checks, and independent audit are clean. The root is 14,859 lines and STRUCT-001BE is closed.
+  Parsed table-definition DDL now enters the existing private `ddl_execution` owner through one exact
+  successful-parse variant gate. CREATE TABLE, ADD PRIMARY KEY/UNIQUE/CHECK/FOREIGN KEY, DROP/RENAME CONSTRAINT,
+  and RENAME TABLE preserve schema permissions, type/domain/default and implicit-sequence/OID preflight,
+  validation/rollback, indexes/constraints/comments/ACLs, dirty flags, persistence, errors, and tags. The full
+  eight-arm body is normalized-exact; only clippy-required tail expressions differ. Sequential/concurrent
+  127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied clippy, security
+  preflight, touched formatting, diff checks, and independent audit are clean. The root is 14,573 lines,
+  `ddl_execution` is 609 lines, and STRUCT-001BF is closed.
 
 ## Known boundaries
 
