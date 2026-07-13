@@ -1578,6 +1578,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   complement cardinality, bounded scalar D2H, accumulated coordinate D2D copy, OUTER `u32::MAX` pads,
   validation, geometry, synchronization, errors, and allocation accounting are source-equivalent, so the report
   card was not applicable.
+  STRUCT-001FH then isolated the normalized-exact device-resident join-coordinate identity and post-join filter
+  owner in the rustfmt-clean 428-line `join_filter.rs` child, reducing the execution root to 14,761 lines.
+  Shared `CudaJoinCoordinatesU32` and `CudaPredicateMaskI32` contracts remain uniquely at the root because
+  fixed-join, expression, and other coordinate owners consume them; the child uses explicit imports with no
+  visibility bridge, sibling dependency, or cycle. Five direct/OUTER-WHERE/Kleene/real-NULL-versus-pad/
+  streaming GPU gates passed 15 sequential plus ten concurrent invocations with zero CUDA 700/716/717. Both
+  execution modes passed 48/78, both engine modes passed 505/487, and workspace all-target check, strict
+  execution/engine clippy, dependency/scoped source/reference/format checks, and independent audit are clean.
+  Identity eligibility, real/pad mask descriptors, descriptor H2D, two-pass coordinate compaction, bounded
+  scalar D2H, coordinate D2D, validation, empty paths, ordering, geometry, synchronization, errors, and
+  allocation accounting are source-equivalent, so the report card was not applicable.
 
 ## Known boundaries
 

@@ -37,13 +37,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   explicit one-way dependency on `join_window`; full/static gates, the 9/6 GPU matrix, and audit pass.
 - STRUCT-001FG is closed: GPU OUTER-join bitmap marking and unmatched-coordinate completion now live in bounded
   `join_outer.rs`; full/static gates, the 15/10 GPU matrix, and independent audit pass.
+- STRUCT-001FH is closed: device coordinate identity and post-join real/pad filtering now live in bounded
+  `join_filter.rs`; full/static gates, the 15/10 GPU matrix, and independent audit pass.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FH:** isolate initial join-coordinate construction and post-join GPU filtering behind unchanged
-   APIs. Keep shared coordinate and predicate-mask contracts at the root to preserve acyclic ownership.
+1. **STRUCT-001FI:** isolate the accumulated fixed/text/composite coordinate-join core and its two public
+   wrappers behind unchanged APIs. Keep cross-owner join descriptors and coordinate contracts at the root.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
