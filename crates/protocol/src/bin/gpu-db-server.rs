@@ -99,9 +99,14 @@ mod cluster_ddl;
 use cluster_ddl::execute_cluster_ddl;
 #[path = "gpu-db-server/index_ddl.rs"]
 mod index_ddl;
-use index_ddl::execute_index_ddl;
+use index_ddl::{execute_index_ddl, try_execute_index_catalog_query};
 #[cfg(test)]
-use index_ddl::rename_index_in_session;
+use index_ddl::{
+    rename_index_in_session, test_psql_describe_index_rows as psql_describe_index_rows,
+    test_psql_describe_index_verbose_rows as psql_describe_index_verbose_rows,
+    test_psql_describe_indexes_catalog_query as psql_describe_indexes_catalog_query,
+    test_psql_describe_indexes_catalog_query_schema_filter as psql_describe_indexes_catalog_query_schema_filter,
+};
 #[path = "gpu-db-server/view_ddl.rs"]
 mod view_ddl;
 use view_ddl::{execute_view_ddl, try_execute_view_catalog_query};
@@ -1533,37 +1538,8 @@ fn execute_statement(
             &catalog_psql_describe_table_privilege_rows_filtered(session, &filter),
         );
     }
-    if canonical == psql_describe_indexes_verbose_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Type"),
-                text_column("Owner"),
-                text_column("Table"),
-                text_column("Persistence"),
-                text_column("Access method"),
-                text_column("Size"),
-                text_column("Description"),
-            ],
-            &psql_describe_index_verbose_rows(session),
-        );
-    }
-    if canonical == psql_describe_indexes_catalog_query()
-        || psql_describe_indexes_catalog_query_schema_filter(&canonical).is_some()
-    {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Type"),
-                text_column("Owner"),
-                text_column("Table"),
-            ],
-            &psql_describe_index_rows(session),
-        );
+    if let Some(result) = try_execute_index_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_view_catalog_query(stream, session, &canonical) {
         return result;
@@ -3006,21 +2982,6 @@ fn psql_describe_table_privileges_catalog_query_filter(
         namespace: namespace.to_string(),
         relname_pattern: Some(relname_pattern.to_string()),
     })
-}
-
-fn psql_describe_indexes_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", c2.relname as \"table\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam left join pg_catalog.pg_index i on i.indexrelid = c.oid left join pg_catalog.pg_class c2 on i.indrelid = c2.oid where c.relkind in ('i','i','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
-}
-
-fn psql_describe_indexes_verbose_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", c2.relname as \"table\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", am.amname as \"access method\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam left join pg_catalog.pg_index i on i.indexrelid = c.oid left join pg_catalog.pg_class c2 on i.indrelid = c2.oid where c.relkind in ('i','i','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
-}
-
-fn psql_describe_indexes_catalog_query_schema_filter(canonical: &str) -> Option<String> {
-    let prefix = "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", c2.relname as \"table\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam left join pg_catalog.pg_index i on i.indexrelid = c.oid left join pg_catalog.pg_class c2 on i.indrelid = c2.oid where c.relkind in ('i','i','s','') and n.nspname operator(pg_catalog.~) '^(";
-    let suffix = ")$' collate pg_catalog.default order by 1,2";
-    let namespace = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
-    (namespace == "public").then(|| namespace.to_string())
 }
 
 fn psql_list_aggregates_catalog_query() -> &'static str {
@@ -6281,59 +6242,6 @@ fn pg_catalog_index_rows_without_schema(session: &Session) -> Vec<Vec<Option<Str
         .into_iter()
         .map(|row| row.into_iter().skip(1).collect())
         .collect()
-}
-
-fn psql_describe_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .indexes
-        .iter()
-        .filter(|index| session.tables.contains_key(&index.table))
-        .map(|index| {
-            (
-                index.name.clone(),
-                vec![
-                    Some("public".to_string()),
-                    Some(index.name.clone()),
-                    Some("index".to_string()),
-                    Some("postgres".to_string()),
-                    Some(index.table.clone()),
-                ],
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    rows.into_iter().map(|(_, row)| row).collect()
-}
-
-fn psql_describe_index_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .indexes
-        .iter()
-        .filter(|index| session.tables.contains_key(&index.table))
-        .map(|index| {
-            (
-                index.name.clone(),
-                vec![
-                    Some("public".to_string()),
-                    Some(index.name.clone()),
-                    Some("index".to_string()),
-                    Some("postgres".to_string()),
-                    Some(index.table.clone()),
-                    Some("permanent".to_string()),
-                    Some("btree".to_string()),
-                    None,
-                    session
-                        .comments
-                        .get(&CatalogCommentTarget::Index {
-                            index: index.name.clone(),
-                        })
-                        .cloned(),
-                ],
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 fn pg_catalog_class_plain_tables_query() -> &'static str {

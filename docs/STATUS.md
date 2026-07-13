@@ -802,6 +802,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   filtering, and legacy host-catalog execution. Full protocol/driver/security/formatting gates, focused function/
   ACL/shared-catalog tests, fresh real-psql scenarios 51/348, and independent audit are clean. The root is 7,916
   lines and STRUCT-001CI is closed.
+  The normal/verbose psql index listings now execute from the existing private 346-line `index_ddl` owner behind
+  one tri-state delegate. Both query literals, the public-schema filter parser, both sorted row builders, and both
+  routes are exact moves; all five helpers remain private and the only new test exposure is four proven aliases.
+  Dispatcher position, verbose-first predicate order, exact-or-filter normal match, live-table filtering, columns,
+  public/index/postgres/table/permanent/btree constants, null size, comments, and name order are unchanged. The
+  separately positioned direct `pg_indexes` stage is untouched. Inherited PRODUCT-002 debt remains: exact client-
+  version literals, unusual fixed relkind lists, public-only filtering, unapplied visibility predicates, hard-coded
+  metadata, hidden orphan indexes, null size, and legacy host-catalog execution. Full protocol/driver/security/
+  formatting gates, focused index/comment/shared-catalog tests, fresh real-psql scenarios 21/305/306/323/327, and
+  independent audit are clean. The root is 7,824 lines and STRUCT-001CJ is closed.
 
 ## Known boundaries
 
