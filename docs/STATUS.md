@@ -1589,6 +1589,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Identity eligibility, real/pad mask descriptors, descriptor H2D, two-pass coordinate compaction, bounded
   scalar D2H, coordinate D2D, validation, empty paths, ordering, geometry, synchronization, errors, and
   allocation accounting are source-equivalent, so the report card was not applicable.
+  STRUCT-001FI then isolated the normalized-exact accumulated fixed/text/composite coordinate join in the
+  rustfmt-clean 1,309-line `join_fixed.rs` child, reducing the execution root to 13,489 lines. Shared key,
+  coordinate, and predicate contracts remain uniquely root-owned, and the existing root re-export supplies the
+  match-bitmap contract without a sibling path; the private child adds no visibility bridge or cycle. Five
+  direct/typed-NULL/N:N-text-numeric/streaming GPU gates passed 15 sequential plus ten concurrent invocations
+  with zero CUDA 700/716/717. Both execution modes passed 48/78, both engine modes passed 505/487, and workspace
+  all-target check, strict execution/engine clippy, dependency/scoped source/reference/format checks, and
+  independent audit are clean. Rust/PTX, same-context and descriptor validation, 4/8/16/text/composite keys,
+  eligibility and NULL exclusion, hash build/probe, owned/persistent match marking, INNER/OUTER count-and-emit,
+  padding, bounded scalar readback, emitted-count verification, geometry, ordering, errors, synchronization,
+  and allocation lifetime are source-equivalent, so the report card was not applicable.
 
 ## Known boundaries
 
