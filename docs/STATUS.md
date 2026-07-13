@@ -1530,13 +1530,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   eight concurrent invocations, all with zero CUDA 700/716/717. Both ordinary modes passed 505/487 with the
   exact 992-test inventory; all-target check, strict clippy, dependency-boundary/scoped source/reference/format
   checks, and independent re-audit are clean. Lock/catalog/snapshot, NULL/MVCC/identity, repair, and fail-loud
-  behavior are source-identical, so the report card was not applicable. STRUCT-001FC is next.
+  behavior are source-identical, so the report card was not applicable. STRUCT-001FC then isolated the byte-
+  exact nine-method warmup/maintenance-policy, cache-state readiness, single/sharded route-planning, rejection-
+  evidence, and status owner in the rustfmt-clean 988-line `engine_residency/routes.rs` child, reducing the
+  facade root to 609 lines and completing its disposition. Eight focused ordinary gates passed. Four
+  representative single/sharded GPU routes passed 12 sequential plus eight concurrent invocations with zero
+  CUDA 700/716/717; both ordinary modes passed 505/487 with the exact 992-test inventory. All-target check,
+  strict clippy, dependency-boundary/scoped source/reference/format checks, and independent audit are clean.
+  Route decisions, reasons, estimates, counters, status, fallback, runtime, layout, and result behavior are byte-
+  identical, so the report card was not applicable.
 
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
-| 29 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 26 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
