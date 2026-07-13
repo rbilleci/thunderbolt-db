@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BK:** isolate CREATE/DROP DOMAIN arms behind a private owner, preserving supported type/default
-   validation, table-column dependencies, comments, dirty publication, exact errors/tags, and parse order.
+1. **STRUCT-001BL:** isolate CREATE/DROP PUBLICATION and SUBSCRIPTION arms behind a private replication-catalog
+   owner, preserving helper behavior, persistence, exact errors/tags, and parse order.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

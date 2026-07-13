@@ -583,6 +583,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   PostgreSQL catalog/dependency compatibility remains PRODUCT-002. Sequential/concurrent 127-test runs, the full
   protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
   formatting, diff checks, and independent audit are clean. The root is 13,709 lines and STRUCT-001BJ is closed.
+  Parsed domain lifecycle commands now enter the private 127-line `domain_ddl` owner through one exact
+  successful-parse variant gate. CREATE/DROP DOMAIN preserve schema permission, name/kind/existence and supported
+  base-type/default validation, checked OIDs, duplicate-list/IF EXISTS behavior, whole-list table-column dependency
+  rejection before mutation, comment cleanup, dirty publication, persistence, errors, and tags. The two-arm body
+  is normalized-exact; only clippy-required tail expressions differ. Sequential/concurrent 127-test runs, the
+  full protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
+  formatting, diff checks, and independent audit are clean. The root is 13,608 lines and STRUCT-001BK is closed.
 
 ## Known boundaries
 
