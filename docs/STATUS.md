@@ -693,6 +693,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   orphaned. Full protocol and driver gates, all-target checks, warning-denied clippy, security preflight, focused
   table/comment persistence tests, formatting/diff checks, and independent audit are clean. The root is 10,043
   lines and STRUCT-001BW is closed.
+  Primary-key, unique, and check-constraint construction now live in the private 213-line `table_constraints`
+  owner with exactly three parent-private helpers consumed by `ddl_execution`. Relation/duplicate precedence,
+  table/column/type checks, candidate validation, constructed index/check fields, dirty state, arguments, errors,
+  and publication order are exact moves. Inherited PRODUCT-002 rollback artifacts remain: failed later CREATE
+  TABLE constraints do not rewind allocated relation OIDs, and earlier helpers can leave transient dirty flags
+  even though rollback removes the catalog objects and no failing snapshot is persisted. Full protocol and driver
+  gates, all-target checks, warning-denied clippy, security preflight, focused table/index/shared-catalog tests,
+  formatting/diff checks, and independent audit are clean. The root is 9,841 lines and STRUCT-001BX is closed.
 
 ## Known boundaries
 
