@@ -1842,6 +1842,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   The 8M-row ordered-compaction control remains at 0.0248x roofline; the reproducible 64M-row/50%-selectivity line
   returns roughly 134MB of host indices and remains result-path dominated, an existing boundary already owned by
   RETIRE-003. PTX, ABI, launch geometry, ordering, and valid results are unchanged. The root is 7,951 lines.
+  STRUCT-001GC then isolated that total ordered-compaction boundary in the rustfmt-clean 1,088-line
+  `resident_compare_ordered.rs` child and byte-exact 803-line `resident_compare_ordered.ptx`, reducing the execution
+  root to 6,077 lines. The inherent public methods and `CudaI32Comparison` path remain at the crate root; nine narrow
+  production/test `pub(super)` bridges preserve the former effective scope with no public child surface, reverse
+  sibling dependency, or cycle. Independent reconstruction proves the four PTX entry symbols, parameter order, and
+  complete 29,242-byte payload exact; normalized Rust differs only by those bridges and rustfmt wrapping. The final
+  five-family matrix passes 15 sequential plus ten concurrent invocations without CUDA 700/716/717. Execution passes
+  55/81 and engine passes 505/487 with GPU sweeps serial; workspace all-target/all-feature check, strict execution/
+  engine clippy, source/reference/scoped-format/diff gates, and independent audit are clean. The canonical card remains
+  stable: IN-L2/OUT-OF-L2 rooflines are 1,484.6/1,425.4 GB/s, ordered compaction is 0.0236x roofline IN-L2, grouped
+  aggregation is 1,678.3M elements/s, and batch-65,536 point reads are 247.5M at p50 139us IN-L2 and 253.6M at p50
+  132us OUT-OF-L2. Valid-path behavior, safety validation, stream draining, and lease lifetimes are unchanged.
 
 ## Known boundaries
 

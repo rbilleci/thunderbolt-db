@@ -48,14 +48,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   consumes typed same-context leases for every intermediate. Permanent fail-closed/context-reuse coverage, the
   final 15+10 HAZARD matrix, complete 55/81 and 505/487 suites, canonical report card, static gates, and independent
   re-audit pass. The execution root is 7,951 lines; RETIRE-003 already owns the measured large host-result boundary.
+- STRUCT-001GC is closed. Ordered int4 compaction now lives in a rustfmt-clean 1,088-line private Rust owner plus an
+  exact 803-line PTX file; the stable crate-root facade and STRUCT-001GB safety boundary are unchanged. Its final
+  HAZARD matrix, complete 55/81 and 505/487 suites, canonical report card, static gates, exact-source proofs, and
+  independent audit pass. The execution root is 6,077 lines.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GC:** extract the now-total ordered int4 compare-compaction Rust/PTX ownership into bounded private
-   files without changing its stable APIs, safety contract, PTX, or device behavior.
+1. **STRUCT-001GD:** isolate the host-staged CUDA smoke/filter and generic MVCC launchers in bounded private owners
+   behind `CudaDriverRuntime`, keeping this RETIRE-003 bootstrap debt visibly separate from resident execution.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
