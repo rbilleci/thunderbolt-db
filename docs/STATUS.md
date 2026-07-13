@@ -1161,6 +1161,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   co-change tail is a Raft snapshot-repair test family rather than production coupling. The accepted module/test
   dependency map and bounded test-family ranges are recorded in PLAN’s replication inventory; STRUCT-001DQ is the
   first exact leaf and multi-GPU remains deferred.
+  STRUCT-001DQ isolated the exact TCP/TLS/mTLS AppendEntries transport body in a private 259-line `transport`
+  owner. Seven public send/serve/configuration functions remain at the unchanged crate-root facade; seven private
+  helpers plus the private stream trait now own TCP connection/accept, timeout/shutdown ordering, frame I/O,
+  certificate/root/key parsing, client-auth configuration, and error construction. AppendEntries data, codec
+  primitives, request application, and all Raft state remain in the root. The four exact transport tests live in
+  a bounded 131-line included file and retain their original `tests::append_entries_transport_*` harness names.
+  Both 187-test serial/16-thread runs, workspace all-target check, replication all-target strict clippy, cluster/
+  multiprocess/service/channel-security smokes, targeted formatting/diff/reference checks, and independent
+  re-audit are clean. The root is 19,785 lines, with 1,773 production lines before the test facade; STRUCT-001DR
+  is the next behavior-preserving ownership leaf.
 
 ## Known boundaries
 
