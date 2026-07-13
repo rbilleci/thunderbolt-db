@@ -1067,6 +1067,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   hard-coded catalog/schema fields, and absent GPU-resident system relations. Full protocol/driver/security/
   formatting gates, focused catalog/default tests, PostgreSQL 16 scenarios 08/15/16/25/26/30/31/39/44/74/304/
   319/320/321/324/332/336, and independent audit are clean. The root is 4,387 lines and STRUCT-001DH is closed.
+  The four constraint/default catalog routes now execute from a new private 248-line `constraint_catalog` owner
+  behind two stage-preserving delegates around the interleaved view-relation route: information-schema table/
+  key constraints before the view route, and `pg_constraint`/`pg_attrdef` after it. Eight query/row helpers are
+  byte-identical private moves and eight `cfg(test)` wrappers retain only proven existing consumers. Shared
+  constraint-entry/type/contype and default-format dependencies remain narrow and one-way. Exact stage/internal
+  order, public/index/check/foreign-key coverage, table/name/ordinal sorting, schema/type/contype/default fields,
+  4-/5-/4-/4-column shapes, writers, and fall-through are unchanged. Inherited PRODUCT-002 debt remains exact
+  generated-SQL routing, host constraint/index/table maps and CPU construction/sorting, simplified ordinal and
+  constraint metadata, and absent GPU-resident system relations. Full protocol/driver/security/formatting gates,
+  focused catalog/default tests, PostgreSQL 16 scenarios 40/41/42/304/307/308/319/320/321/322/324/332/338/339,
+  and independent audit are clean. The root is 4,231 lines and STRUCT-001DI is closed.
 
 ## Known boundaries
 
