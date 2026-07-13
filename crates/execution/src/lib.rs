@@ -8390,6 +8390,7 @@ pub enum ExprStep {
     TextLikeMask {
         offsets_byte_offset: u64,
         bytes_byte_offset: u64,
+        bytes_len: u64,
         pattern_idx: u32,
     },
     /// Push the mask `bitmap[i] ^ negate ? 1 : 0` for the resident BOOL column whose 1-bit-per-row
@@ -9278,6 +9279,7 @@ fn run_resident_arith_program<'r>(
             ExprStep::TextLikeMask {
                 offsets_byte_offset,
                 bytes_byte_offset,
+                bytes_len,
                 pattern_idx,
             } => {
                 // (textcol[i] LIKE pattern) -> i32 mask pushed on the stack; the VM combines it with AND/OR
@@ -9290,6 +9292,17 @@ fn run_resident_arith_program<'r>(
                 if pattern.len() % std::mem::size_of::<u32>() != 0 {
                     return Err(CudaRuntimeProbeError::InvalidInputLength(pattern.len()));
                 }
+                // ABI/window discipline must match the standalone LIKE launcher exactly. The VM used
+                // to omit `text_bytes_limit`, shifting every following argument left by one: the token
+                // pointer was interpreted as a byte limit and the final output pointer was read from an
+                // absent eighth parameter, causing a deterministic CUDA 700 on nullable-text LIKE.
+                let text_bytes_limit = resident_filter::validate_text_windows(
+                    resident.metadata().allocated_bytes,
+                    offsets_byte_offset,
+                    bytes_byte_offset,
+                    bytes_len,
+                    n,
+                )?;
                 let ntok = (pattern.len() / std::mem::size_of::<u32>()) as u64;
                 let function =
                     text_like_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -9307,10 +9320,11 @@ fn run_resident_arith_program<'r>(
                 let mut a0 = resident_base;
                 let mut a1 = offsets_byte_offset;
                 let mut a2 = bytes_byte_offset;
-                let mut a3 = pattern_lease.ptr;
-                let mut a4 = ntok;
-                let mut a5 = n;
-                let mut a6 = out.ptr;
+                let mut a3 = text_bytes_limit;
+                let mut a4 = pattern_lease.ptr;
+                let mut a5 = ntok;
+                let mut a6 = n;
+                let mut a7 = out.ptr;
                 let mut args = [
                     (&mut a0 as *mut u64).cast::<c_void>(),
                     (&mut a1 as *mut u64).cast::<c_void>(),
@@ -9319,6 +9333,7 @@ fn run_resident_arith_program<'r>(
                     (&mut a4 as *mut u64).cast::<c_void>(),
                     (&mut a5 as *mut u64).cast::<c_void>(),
                     (&mut a6 as *mut u64).cast::<c_void>(),
+                    (&mut a7 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
                 stack.push(out);

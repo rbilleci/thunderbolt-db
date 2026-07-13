@@ -1480,7 +1480,46 @@
                 .map(|(i, _)| i as u32)
                 .collect();
             assert_eq!(got, expected, "LIKE '{pattern}' mismatch vs oracle");
+
+            // The general predicate VM must use the exact same eight-argument matcher ABI, including
+            // the checked text-byte limit. This is the nullable/compound-LIKE path; omitting the limit
+            // shifts the token/count/output arguments and deterministically faults the CUDA context.
+            let token_bytes = tokens
+                .iter()
+                .flat_map(|token| token.to_le_bytes())
+                .collect::<Vec<_>>();
+            let vm_got = resident
+                .run_expr_predicate_filter_with_text(
+                    &[ExprStep::TextLikeMask {
+                        offsets_byte_offset: offsets_off,
+                        bytes_byte_offset: bytes_off,
+                        bytes_len: blob.len() as u64,
+                        pattern_idx: 0,
+                    }],
+                    &[token_bytes],
+                    n,
+                    ResidentElemType::I32,
+                )
+                .unwrap_or_else(|e| panic!("VM LIKE '{pattern}': {e:?}"));
+            assert_eq!(vm_got, expected, "VM LIKE '{pattern}' mismatch vs oracle");
         }
+
+        assert!(
+            resident
+                .run_expr_predicate_filter_with_text(
+                    &[ExprStep::TextLikeMask {
+                        offsets_byte_offset: offsets_off,
+                        bytes_byte_offset: bytes_off,
+                        bytes_len: blob.len() as u64 + 1,
+                        pattern_idx: 0,
+                    }],
+                    &[Vec::new()],
+                    n,
+                    ResidentElemType::I32,
+                )
+                .is_err(),
+            "the VM LIKE path must reject an out-of-bounds text blob before launch"
+        );
     }
 
     #[test]

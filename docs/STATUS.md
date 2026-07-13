@@ -1309,9 +1309,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   700/716/717, all-target check, scoped formatting/diff/reference checks, and independent audit are clean. The
   root is 12,579 lines; production, visibility, payload bytes, CUDA calls, and routes are untouched, so the report
   card was not applicable. The broad ordinary suites exposed a pre-existing CUDA 700 in nullable-text `LIKE`
-  count, reproduced on detached pre-slice HEAD; it poisons later tests and causes the observed serial/16-thread
-  cascades, now owned by READ-004. Strict clippy is independently baseline-red in untouched WAL/engine code and
-  is owned by QUALITY-001. STRUCT-001EI remains sequenced after those gates.
+  count, reproduced on detached pre-slice HEAD; it poisoned later tests and caused the observed serial/16-thread
+  cascades. READ-004 subsequently closed that fault as described below. Strict clippy is independently baseline-
+  red in untouched WAL/engine code and is owned by QUALITY-001, the remaining gate before STRUCT-001EI.
+  READ-004 eliminated that pre-existing nullable-text `LIKE` fault in the resident general predicate VM. The
+  VM launched `gpu_db_resident_text_like_scalar_to_mask` with seven arguments even though the PTX ABI requires
+  eight: omitting `text_bytes_limit` shifted the token pointer/count/row-count fields and left the output-mask
+  pointer absent, deterministically raising CUDA 700. `ExprStep::TextLikeMask` now carries the resident text
+  blob length, applies the same overflow-safe offsets/blob window validation as the standalone LIKE launcher,
+  and passes the exact eight-argument ABI; matching and nullable validity-mask 3VL remain entirely on-device.
+  The existing CUDA LIKE oracle now also executes the VM route for every pattern and proves an oversized blob
+  fails before launch. Nullable/non-null bridge/general/VM gates passed three sequential and two concurrent
+  rounds with zero CUDA 700/716/717; the full 992-test engine inventory passed serial and 16-thread (505 passed,
+  487 ignored); execution and engine all-target checks passed; execution strict clippy passed, and the changed
+  engine line has no new finding within the separately owned QUALITY-001 baseline. The direct roofline measured
+  1,467/1,440 GB/s in-/out-of-L2 `sum_i32`, 1,288/1,463 GB/s COUNT, and 347/252/1,678 M-elem/s sort/join/grouped.
+  The canonical card was likewise clean: in-/out-of-L2 rooflines 1,429/1,444 GB/s and the production batched
+  point-read route reached 251.3M/256.6M lookups/s at batch 65,536 with 135/128 us p50. Independent audit found
+  no host fallback, ABI/lifetime/bounds defect, semantic drift, or regression. QUALITY-001 is now the only gate
+  before STRUCT-001EI.
 
 ## Known boundaries
 
@@ -1330,7 +1346,6 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |
 | Two physical GPUs have not executed the scheduler, device-locate, or typed sidecar context gates | **MULTI-001**, **MULTI-002**, **MULTI-003** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |
-| Nullable-text `LIKE` COUNT reproducibly raises CUDA 700 and poisons later in-process engine tests | **READ-004** |
 | Engine all-target strict clippy is baseline-red in transitive WAL and untouched engine sources | **QUALITY-001** |
 | Lane DELETE residuals and empty-aggregate pgwire NULL seam require focused disposition | **R3-005**, **READ-003** |
 | Lanes auto-checkpoint/PITR and full crash campaign | **DUR-001**, **DUR-002** |

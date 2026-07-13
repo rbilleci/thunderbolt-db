@@ -24,19 +24,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - Resident sidecar scatter, bool/validity bitmap maintenance, and text rebase now use total typed APIs with
   exact spans, explicit bit states, device text validation, alias rejection, and launched-error drains. The
   physical cross-context safety gate is **MULTI-003**, likewise deferred to the end and blocked on a two-GPU host.
+- READ-004 is closed: nullable-text `LIKE` now uses the matcher kernel's exact eight-argument ABI with checked
+  resident text windows; focused hazard gates, both 992-test ordinary-suite modes, and the canonical report card
+  are green without host fallback. The remaining strict-clippy baseline is isolated under **QUALITY-001**.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **READ-004:** root-cause and eliminate the pre-existing nullable-text `LIKE` CUDA 700; restore the broad
-   serial/16-thread engine suites before another residency extraction.
-2. **QUALITY-001:** restore the engine all-target strict-clippy baseline in separate behavior-preserving slices.
-3. **STRUCT-001EI:** after both gates are green, externalize the exact five-test baseline shard family.
-4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
+1. **QUALITY-001:** restore the engine all-target strict-clippy baseline in separate behavior-preserving slices.
+2. **STRUCT-001EI:** after that gate is green, externalize the exact five-test baseline shard family.
+3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
-5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-6. **MULTI-001/002/003:** only after every non-MULTI plan item is complete or the user explicitly promotes them,
+4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+5. **MULTI-001/002/003:** only after every non-MULTI plan item is complete or the user explicitly promotes them,
    run their mandatory non-vacuous physical multi-GPU gates; never replace them with host interpretations.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.

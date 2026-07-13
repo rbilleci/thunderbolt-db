@@ -2361,6 +2361,7 @@ fn compile_text_like_leaf(
     program.push(ExprStep::TextLikeMask {
         offsets_byte_offset: layout.offsets_byte_offset,
         bytes_byte_offset: layout.bytes_byte_offset,
+        bytes_len: layout.bytes_len,
         pattern_idx,
     });
     // 3VL: a NULL text operand makes `LIKE` UNKNOWN ⇒ the row is excluded. A NULL's placeholder is an

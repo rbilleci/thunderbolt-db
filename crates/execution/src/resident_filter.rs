@@ -42,7 +42,7 @@ fn validate_bitmap_windows(
     Ok(())
 }
 
-fn validate_text_windows(
+pub(super) fn validate_text_windows(
     allocated_bytes: u64,
     offsets_byte_offset: u64,
     bytes_byte_offset: u64,
