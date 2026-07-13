@@ -574,6 +574,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   normalized-exact; only clippy-required tail expressions differ. Sequential/concurrent 127-test runs, the full
   protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
   formatting, diff checks, and independent audit are clean. The root is 13,888 lines and STRUCT-001BI is closed.
+  Parsed sequence lifecycle and value-function commands now enter the private 220-line `sequence_execution`
+  owner through one exact successful-parse variant gate. CREATE/RENAME/DROP plus nextval/currval/setval preserve
+  permission, name/kind/existence, option/range/OID and overflow ordering, last-value/is-called/currval state,
+  returned rows, comments/ACLs, dirty publication, persistence, errors, and tags. The six-arm body is normalized-
+  exact; only clippy-required tail expressions differ. This does not strengthen inherited dependency semantics:
+  DROP does not scan table defaults and rename does not retarget stored `SequenceNextVal` defaults; broader
+  PostgreSQL catalog/dependency compatibility remains PRODUCT-002. Sequential/concurrent 127-test runs, the full
+  protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
+  formatting, diff checks, and independent audit are clean. The root is 13,709 lines and STRUCT-001BJ is closed.
 
 ## Known boundaries
 

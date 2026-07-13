@@ -101,6 +101,9 @@ use view_ddl::execute_view_ddl;
 #[path = "gpu-db-server/function_execution.rs"]
 mod function_execution;
 use function_execution::execute_function_command;
+#[path = "gpu-db-server/sequence_execution.rs"]
+mod sequence_execution;
+use sequence_execution::execute_sequence_command;
 #[path = "gpu-db-server/backend_adapter.rs"]
 mod backend_adapter;
 use backend_adapter::*;
@@ -4832,66 +4835,17 @@ fn execute_statement(
         ) => {
             return execute_function_command(stream, session, command, include_row_description);
         }
+        Ok(
+            command @ (Command::CreateSequence(_)
+            | Command::SequenceNextVal(_)
+            | Command::SequenceCurrVal(_)
+            | Command::SequenceSetVal(_)
+            | Command::RenameSequence(_)
+            | Command::DropSequence(_)),
+        ) => {
+            return execute_sequence_command(stream, session, command, include_row_description);
+        }
         Ok(command) => match command {
-            Command::CreateSequence(create) => {
-                if !session.public_schema_exists {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "3F000",
-                            message: "schema does not exist",
-                            position: None,
-                        },
-                    );
-                }
-                if let Some(error) =
-                    schema_permission_error(session, "public", SchemaPrivilege::Create)
-                {
-                    return write_error(stream, &error);
-                }
-                if session.tables.contains_key(&create.name)
-                    || session.views.contains_key(&create.name)
-                    || session.materialized_views.contains_key(&create.name)
-                    || session.sequences.contains_key(&create.name)
-                    || session.domains.contains_key(&create.name)
-                {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42P07",
-                            message: "relation already exists",
-                            position: None,
-                        },
-                    );
-                }
-                let oid = session.next_relation_oid;
-                session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
-                    Some(next) => next,
-                    None => {
-                        return write_error(
-                            stream,
-                            &ErrorField {
-                                code: "54000",
-                                message: "relation OID allocation exhausted",
-                                position: None,
-                            },
-                        );
-                    }
-                };
-                let name = create.name;
-                session.sequences.insert(
-                    name.clone(),
-                    Sequence {
-                        oid,
-                        name: name.clone(),
-                        last_value: 1,
-                        is_called: false,
-                    },
-                );
-                session.mark_sequence_dirty(name);
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "CREATE SEQUENCE");
-            }
             Command::CreateDomain(create) => {
                 if !session.public_schema_exists {
                     return write_error(
@@ -4949,147 +4903,6 @@ fn execute_statement(
                 session.mark_domain_dirty(name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE DOMAIN");
-            }
-            Command::SequenceNextVal(nextval) => {
-                if let Some(error) = sequence_target_error(session, &nextval.name) {
-                    return write_error(stream, &error);
-                }
-                if let Some(error) =
-                    object_access_permission_error(session, &nextval.name, TablePrivilege::Update)
-                {
-                    return write_error(stream, &error);
-                }
-                let sequence = session
-                    .sequences
-                    .get_mut(&nextval.name)
-                    .expect("sequence target checked");
-                let value = match next_sequence_value(sequence) {
-                    Ok(value) => value,
-                    Err(error) => return write_error(stream, &error),
-                };
-                session
-                    .currval_sequences
-                    .insert(nextval.name.clone(), value);
-                session.mark_sequence_dirty(nextval.name);
-                session.persist_catalog_snapshot();
-                return write_select_rows(
-                    stream,
-                    &[int8_column("nextval")],
-                    &[vec![Some(value.to_string())]],
-                    include_row_description,
-                );
-            }
-            Command::SequenceCurrVal(currval) => {
-                if let Some(error) = sequence_target_error(session, &currval.name) {
-                    return write_error(stream, &error);
-                }
-                if let Some(error) =
-                    object_access_permission_error(session, &currval.name, TablePrivilege::Select)
-                {
-                    return write_error(stream, &error);
-                }
-                let Some(value) = session.currval_sequences.get(&currval.name).copied() else {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "55000",
-                            message: "currval of sequence is not yet defined in this session",
-                            position: None,
-                        },
-                    );
-                };
-                return write_select_rows(
-                    stream,
-                    &[int8_column("currval")],
-                    &[vec![Some(value.to_string())]],
-                    include_row_description,
-                );
-            }
-            Command::SequenceSetVal(setval) => {
-                if let Some(error) = sequence_target_error(session, &setval.name) {
-                    return write_error(stream, &error);
-                }
-                if let Some(error) =
-                    object_access_permission_error(session, &setval.name, TablePrivilege::Update)
-                {
-                    return write_error(stream, &error);
-                }
-                let value = setval.value;
-                let sequence = session
-                    .sequences
-                    .get_mut(&setval.name)
-                    .expect("sequence target checked");
-                sequence.last_value = value;
-                sequence.is_called = setval.is_called;
-                session.mark_sequence_dirty(setval.name);
-                session.persist_catalog_snapshot();
-                return write_select_rows(
-                    stream,
-                    &[int8_column("setval")],
-                    &[vec![Some(value.to_string())]],
-                    include_row_description,
-                );
-            }
-            Command::RenameSequence(rename) => {
-                if let Err(error) =
-                    rename_sequence_in_session(session, &rename.old_name, &rename.new_name)
-                {
-                    return write_error(stream, &error);
-                }
-                return write_command_complete(stream, "ALTER SEQUENCE");
-            }
-            Command::DropSequence(drop) => {
-                let mut seen = BTreeSet::new();
-                for name in &drop.names {
-                    if !seen.insert(name) {
-                        return write_error(
-                            stream,
-                            &ErrorField {
-                                code: "42710",
-                                message: "sequence specified more than once",
-                                position: None,
-                            },
-                        );
-                    }
-                    if session.tables.contains_key(name)
-                        || session.views.contains_key(name)
-                        || session.materialized_views.contains_key(name)
-                    {
-                        return write_error(
-                            stream,
-                            &ErrorField {
-                                code: "42809",
-                                message: "relation is not a sequence",
-                                position: None,
-                            },
-                        );
-                    }
-                    if !drop.if_exists && !session.sequences.contains_key(name) {
-                        return write_error(
-                            stream,
-                            &ErrorField {
-                                code: "42P01",
-                                message: "sequence does not exist",
-                                position: None,
-                            },
-                        );
-                    }
-                }
-                for name in &drop.names {
-                    if session.sequences.remove(name).is_some() {
-                        session.table_acls.remove(name);
-                        session.mark_table_acl_dirty(name.clone());
-                        let target = CatalogCommentTarget::Sequence {
-                            sequence: name.clone(),
-                        };
-                        session.comments.remove(&target);
-                        session.mark_comment_dirty(target);
-                        session.currval_sequences.remove(name);
-                    }
-                    session.mark_sequence_dirty(name.clone());
-                }
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "DROP SEQUENCE");
             }
             Command::DropDomain(drop) => {
                 let mut seen = BTreeSet::new();
@@ -6448,6 +6261,14 @@ fn execute_statement(
             | Command::DropFunction(_)
             | Command::SelectFunction(_) => {
                 unreachable!("function commands are routed by the preceding parse arm")
+            }
+            Command::CreateSequence(_)
+            | Command::SequenceNextVal(_)
+            | Command::SequenceCurrVal(_)
+            | Command::SequenceSetVal(_)
+            | Command::RenameSequence(_)
+            | Command::DropSequence(_) => {
+                unreachable!("sequence commands are routed by the preceding parse arm")
             }
         },
     }
