@@ -215,7 +215,7 @@ fn wal_prealloc_chunk_bytes() -> u64 {
 /// fsync persists it so later group syncs can stay `fdatasync`-fast inside written extents).
 fn zero_fill_extend(file: &File, from: u64, to: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
-    const ZEROS: [u8; 1024 * 1024] = [0; 1024 * 1024];
+    static ZEROS: [u8; 1024 * 1024] = [0; 1024 * 1024];
     let mut offset = from;
     while offset < to {
         let n = ((to - offset) as usize).min(ZEROS.len());

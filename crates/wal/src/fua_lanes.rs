@@ -331,7 +331,7 @@ impl FuaWalLaneSet {
             .push_back((first_seq, end));
         lane_ref
             .backend
-            .append_frame(&payload, first_seq, seq_count)?;
+            .append_frame(payload, first_seq, seq_count)?;
         Ok(())
     }
 
