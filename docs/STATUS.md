@@ -1237,6 +1237,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   transitions. Focused snapshot/refresh/suffix/recovery/role tests, both 187-test serial/16-thread runs,
   replication all-target check and strict clippy, scoped formatting/diff/reference checks, and independent audit
   are clean. The root is 13,486 lines with 683 production lines; STRUCT-001DZ is next.
+  STRUCT-001DZ externalized the exact contiguous seven-test advanced-snapshot repair family into a bounded
+  913-line `tests/repair_advanced_snapshot.rs` owner through an `include!` at the same parent position.
+  Formatting-normalized source compares exactly; only two long declarations rewrapped, while bodies, attributes,
+  names, and semantics are unchanged. The owner coherently covers durable identity replacement, compatible fresh
+  suffixes, same-frontier/second refresh, role discard, newer-leader rejection collapse, and commit/apply
+  retirement. All seven exact tests, the broad repair filter, both 187-test serial/16-thread runs, replication
+  all-target check and strict clippy, scoped formatting/diff/reference checks, and independent audit are clean.
+  The root is 12,573 lines with 683 production lines; STRUCT-001EA is next.
 
 ## Known boundaries
 
