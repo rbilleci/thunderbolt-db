@@ -597,6 +597,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Sequential/concurrent 127-test runs, the full protocol package and driver smokes, all-target checks, warning-
   denied clippy, security preflight, touched formatting, diff checks, and independent audit are clean. The root
   is 13,580 lines and STRUCT-001BL is closed.
+  Parsed role lifecycle commands now enter the private 203-line `role_ddl` owner through one exact successful-
+  parse variant gate. CREATE/DROP/RENAME ROLE preserve reserved/bootstrap, duplicate/existence/dependency and
+  checked-OID behavior, all implemented ACL/comment cleanup or retargeting, dirty keys, persistence, errors, and
+  tags. The three-arm body is normalized-exact; only clippy-required tail expressions differ. This does not
+  strengthen inherited identity semantics: rename does not update `session.current_role`, active-role identity is
+  not a DROP dependency, and this endpoint stores no membership graph; the stale identity normally fails closed
+  and broader role/catalog compatibility remains PRODUCT-002. Sequential/concurrent 127-test runs, the full
+  protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
+  formatting, diff checks, and independent audit are clean. The root is 13,404 lines and STRUCT-001BM is closed.
 
 ## Known boundaries
 
