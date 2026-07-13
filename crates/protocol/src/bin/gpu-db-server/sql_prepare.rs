@@ -6,13 +6,226 @@ use super::sql_execute_syntax::{
     strip_leading_sql_comments, strip_sql_comments,
 };
 use super::{
-    bind_query_parameters, canonical_sql, describe_query_columns, execute_select_result,
-    expected_parameter_count, int4_column, negative_limit_error_field, negative_offset_error_field,
-    parse_command, pg_dump_function_dump_columns, pg_dump_function_dump_rows,
-    sql_execute_argument_placeholder_index, sql_execute_parameter_error_field, BindParameterError,
-    Column, Command, ErrorField, ParseError, PreparedQuery, PreparedStatement, SelectResult,
-    Session, SqlDeallocateTarget, SqlType,
+    bind_query_parameters, canonical_sql, contains_zero_placeholder, describe_query_columns,
+    execute_select_result, expected_parameter_count, int4_column,
+    is_pg_dump_domain_constraints_execute, is_pg_dump_domain_constraints_prepare,
+    is_pg_dump_domain_dump_prepare, is_pg_dump_function_dump_prepare, max_placeholder_index,
+    negative_limit_error_field, negative_offset_error_field, parse_command,
+    pg_dump_domain_constraints_columns, pg_dump_domain_dump_columns,
+    pg_dump_domain_dump_execute_oid, pg_dump_domain_dump_rows, pg_dump_function_dump_columns,
+    pg_dump_function_dump_rows, resolve_prepared_parameter_type_oids,
+    sql_execute_argument_placeholder_index, sql_execute_parameter_error_field,
+    write_command_complete, write_error, write_select_rows, write_single_row, BindParameterError,
+    Column, Command, ErrorField, ParseError, PreparedQuery, PreparedStatement, ReadWrite,
+    SelectResult, Session, SqlType,
 };
+use std::io;
+
+pub(super) enum SqlDeallocateTarget {
+    All,
+    Named(String),
+}
+
+pub(super) fn try_execute_sql_prepared_statement(
+    stream: &mut dyn ReadWrite,
+    session: &mut Session,
+    statement: &str,
+    canonical: &str,
+    include_row_description: bool,
+) -> Option<io::Result<()>> {
+    if let Some(name) = parse_sql_prepare_name(statement) {
+        if session.prepared.contains_key(&name) {
+            return Some(write_error(
+                stream,
+                &ErrorField {
+                    code: "42P05",
+                    message: "prepared statement already exists",
+                    position: None,
+                },
+            ));
+        }
+    }
+
+    if is_pg_dump_domain_constraints_prepare(canonical) || is_pg_dump_domain_dump_prepare(canonical)
+    {
+        return Some(write_command_complete(stream, "PREPARE"));
+    }
+    if is_pg_dump_function_dump_prepare(canonical) {
+        session.prepared.insert(
+            "dumpfunc".to_string(),
+            PreparedStatement::PgDumpFunctionDump,
+        );
+        return Some(write_command_complete(stream, "PREPARE"));
+    }
+
+    if let Some((name, parameter_type_oids, query)) = parse_sql_prepare(statement) {
+        let query = strip_sql_comments(&query);
+        if contains_zero_placeholder(&query) {
+            return Some(write_error(
+                stream,
+                &ErrorField {
+                    code: "42P02",
+                    message: "there is no parameter $0",
+                    position: None,
+                },
+            ));
+        }
+        if parameter_type_oids.len() > max_placeholder_index(&query) {
+            return Some(write_error(
+                stream,
+                &ErrorField {
+                    code: "08P01",
+                    message: "prepared statement has too many parameter types",
+                    position: None,
+                },
+            ));
+        }
+        if describe_query_columns(session, &query).is_none() {
+            return Some(write_error(
+                stream,
+                &ErrorField {
+                    code: "0A000",
+                    message: "SQL PREPARE only supports relational SELECT",
+                    position: None,
+                },
+            ));
+        }
+        let parameter_type_oids =
+            resolve_prepared_parameter_type_oids(session, &query, parameter_type_oids);
+        session.prepared.insert(
+            name,
+            PreparedStatement::Sql(PreparedQuery {
+                query,
+                parameter_type_oids,
+            }),
+        );
+        return Some(write_command_complete(stream, "PREPARE"));
+    }
+
+    if is_pg_dump_domain_constraints_execute(canonical) {
+        return Some(write_single_row(
+            stream,
+            &pg_dump_domain_constraints_columns(),
+            &Vec::<Vec<Option<String>>>::new(),
+        ));
+    }
+
+    if let Some(oid) = pg_dump_domain_dump_execute_oid(canonical) {
+        return Some(write_single_row(
+            stream,
+            &pg_dump_domain_dump_columns(),
+            &pg_dump_domain_dump_rows(session, oid),
+        ));
+    }
+
+    if let Some((name, parameters)) = parse_sql_execute(statement) {
+        match session.prepared.get(&name).cloned() {
+            Some(PreparedStatement::AddTen) => {
+                if parameters.len() == 1 && parameters[0].as_deref() == Some("5") {
+                    return Some(write_single_row(
+                        stream,
+                        &[int4_column("plus_ten")],
+                        &[vec![Some(String::from("15"))]],
+                    ));
+                }
+            }
+            Some(PreparedStatement::PgDumpFunctionDump) => {
+                let oid = parameters
+                    .first()
+                    .and_then(|parameter| parameter.as_deref())
+                    .and_then(|parameter| parameter.trim().parse::<u32>().ok());
+                return Some(write_single_row(
+                    stream,
+                    &pg_dump_function_dump_columns(),
+                    &pg_dump_function_dump_rows(session, oid),
+                ));
+            }
+            Some(PreparedStatement::Sql(query)) => {
+                let bound_query = match bind_query_parameters(&query, &parameters) {
+                    Ok(query) => query,
+                    Err(error) => {
+                        return Some(write_error(
+                            stream,
+                            &sql_execute_parameter_error_field(error),
+                        ));
+                    }
+                };
+                let select = match parse_command(&bound_query) {
+                    Ok(Command::Select(select)) => select,
+                    Err(ParseError::NegativeLimit) => {
+                        return Some(write_error(stream, &negative_limit_error_field()));
+                    }
+                    Err(ParseError::NegativeOffset) => {
+                        return Some(write_error(stream, &negative_offset_error_field()));
+                    }
+                    Ok(_) | Err(_) => {
+                        return Some(write_error(
+                            stream,
+                            &ErrorField {
+                                code: "0A000",
+                                message: "SQL EXECUTE only supports relational SELECT",
+                                position: None,
+                            },
+                        ));
+                    }
+                };
+                let result = match execute_select_result(session, &select) {
+                    Ok(result) => result,
+                    Err(error) => return Some(write_error(stream, &error)),
+                };
+                return Some(write_select_rows(
+                    stream,
+                    &result.columns,
+                    &result.rows,
+                    include_row_description,
+                ));
+            }
+            Some(PreparedStatement::Extended(_)) | None => {}
+        }
+        let message =
+            Box::leak(format!("prepared statement \"{name}\" does not exist").into_boxed_str());
+        return Some(write_error(
+            stream,
+            &ErrorField {
+                code: "26000",
+                message,
+                position: None,
+            },
+        ));
+    }
+
+    if let Some(target) = parse_sql_deallocate(statement) {
+        match target {
+            SqlDeallocateTarget::All => {
+                session
+                    .prepared
+                    .retain(|_, statement| matches!(statement, PreparedStatement::Extended(_)));
+                return Some(write_command_complete(stream, "DEALLOCATE ALL"));
+            }
+            SqlDeallocateTarget::Named(name) => {
+                if matches!(
+                    session.prepared.get(&name),
+                    Some(PreparedStatement::AddTen | PreparedStatement::Sql(_))
+                ) {
+                    session.prepared.remove(&name);
+                    return Some(write_command_complete(stream, "DEALLOCATE"));
+                }
+                let message = Box::leak(
+                    format!("prepared statement \"{name}\" does not exist").into_boxed_str(),
+                );
+                return Some(write_error(
+                    stream,
+                    &ErrorField {
+                        code: "26000",
+                        message,
+                        position: None,
+                    },
+                ));
+            }
+        }
+    }
+    None
+}
 
 pub(super) fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
     let trimmed = strip_leading_sql_comments(statement.trim().trim_end_matches(';').trim())?;

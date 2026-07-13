@@ -485,6 +485,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   the full protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight,
   touched formatting, diff checks, and independent audit are clean. The root is 16,322 lines, `cursor` is 479
   lines, and STRUCT-001AX is closed.
+  Simple-query SQL prepared routing now enters the existing private `sql_prepare` owner through one tri-state
+  delegate. Duplicate-name precheck, pg_dump domain/function PREPARE and EXECUTE cases, relational SQL PREPARE
+  validation/type resolution/install, AddTen/function/SQL EXECUTE results, and DEALLOCATE ALL/named mutations
+  retain exact precedence, map effects, row-description timing, errors, and tags. The already-computed canonical
+  statement is passed unchanged; unhandled statements fall through. `SqlDeallocateTarget` moved into its owner,
+  with parse helpers and the enum crossing the root only under `cfg(test)`. Sequential/concurrent 127-test runs,
+  the full protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight,
+  touched formatting, diff checks, and independent audit are clean. The root is 16,139 lines, `sql_prepare` is
+  502 lines, and STRUCT-001AY is closed.
 
 ## Known boundaries
 

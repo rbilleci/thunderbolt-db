@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001AY:** move SQL PREPARE/EXECUTE/DEALLOCATE and their pg_dump compatibility cases into the existing
-   SQL prepare owner behind one tri-state delegate; preserve exact precedence, map mutation, results, and errors.
+1. **STRUCT-001AZ:** isolate TRUNCATE, DROP TABLE, and ALTER TABLE DROP CONSTRAINT execution in a private DDL
+   owner behind one tri-state delegate; preserve exact catalog/session mutation, rollback, errors, and tags.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
