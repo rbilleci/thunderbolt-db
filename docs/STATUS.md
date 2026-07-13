@@ -1362,7 +1362,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   root is 10,886 lines, and the 992-test/76-family inventories remain exact. Seven GPU gates passed 21 sequential
   and 14 concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target
   check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No production
-  or architectural behavior changed, so the report card was not applicable. STRUCT-001EL is next.
+  or architectural behavior changed, so the report card was not applicable.
+  STRUCT-001EL externalized the exact seven-test cross-shard primary-key index/cache/route family into the
+  rustfmt-clean 568-line `tests/residency_pk_index.rs` owner at the same parent position. Normalized comparison
+  differs only by two rustfmt closure layouts; all bodies, attributes, names, and order remain unchanged, no
+  helpers moved, and the adjacent NULL/3VL test remains at the parent boundary. The engine root is 10,317 lines,
+  and the 992-test/76-family inventories remain exact. Seven GPU gates passed 21 sequential and 14 concurrent
+  invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target check, strict clippy,
+  scoped formatting/diff/reference checks, and independent audit are clean. No production cache, route, or
+  architectural behavior changed, so the report card was not applicable. STRUCT-001EM is next.
 
 ## Known boundaries
 
