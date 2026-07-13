@@ -29,18 +29,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001AF:** make ordered-index result ownership allocation-free and restore the parent report-card
-   ratio; the current PTX is unchanged, but an optimizer-sensitive host recast regressed after source movement.
-2. **STRUCT-001AE:** close the otherwise exact, gated, independently clean unique-coordinate extraction after
-   AF restores the report card.
-3. **MULTI-003:** when a physical two-GPU host is available, run the non-vacuous resident-sidecar context-
+1. **MULTI-003:** when a physical two-GPU host is available, run the non-vacuous resident-sidecar context-
    isolation matrix; never replace it with a host interpretation path.
-4. **MULTI-002:** on that host, partition write/visible-locate submissions by
+2. **MULTI-002:** on that host, partition write/visible-locate submissions by
    primary context and deterministically merge bounded metadata; never move lookup or visibility to the host.
-5. **STRUCT-001:** continue disposition of the 29 source-size outliers with the sidecar leaf now closed.
-6. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
+3. **STRUCT-001:** continue disposition of the 29 source-size outliers with the sidecar and unique-verdict
+   leaves closed.
+4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
-7. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 

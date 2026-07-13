@@ -7,6 +7,20 @@
         }
     }
 
+    #[test]
+    fn ordered_index_result_retyping_preserves_allocation_and_bits() {
+        let mut signed = Vec::with_capacity(8);
+        signed.extend_from_slice(&[0, 1, i32::MAX, i32::MIN, -1]);
+        let ptr = signed.as_ptr().cast::<u32>();
+        let capacity = signed.capacity();
+
+        let unsigned = i32_bits_into_u32(signed);
+
+        assert_eq!(unsigned.as_ptr(), ptr);
+        assert_eq!(unsigned.capacity(), capacity);
+        assert_eq!(unsigned, [0, 1, i32::MAX as u32, 1 << 31, u32::MAX]);
+    }
+
     /// Build an int4 PK hash table in the kernel's format: open-addressing `(key<<32)|(row+1)`,
     /// 0 = empty, size = next_pow2(2*n), fib hash `(key*0x9E3779B1) >> shift`, linear probe.
     /// Returns `(index_words, table_mask, hash_shift)` — mirrors the engine's host builder byte-for-byte.

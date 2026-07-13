@@ -314,10 +314,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   facade, and engine callers are unchanged. The exact 124-test execution inventory and 47/77 suite remain
   stable. Five keyed INSERT/self-excluding UPDATE/collision/NULL/compound-NULL gates passed 15 sequential and
   10 concurrent invocations; workspace check, execution clippy, and independent audit are clean. The root is
-  18,017 lines. The post-move card exposed a source-layout-sensitive host result conversion: identical PTX
-  measured ~34.7 GB/s in the parent image but ~23.7 GB/s after extraction at 50% selectivity, while roofline,
-  grouped, gather, and point-read layers stayed stable. **STRUCT-001AF** owns the explicit allocation-preserving
-  row-index reinterpretation and AE remains open until that ratio is restored.
+  18,029 lines. The post-move card exposed a source-layout-sensitive host result conversion: identical PTX
+  measured ~34.7 GB/s in the parent image but ~23.7 GB/s after extraction at 50% selectivity because a
+  4M-element `Vec<i32>` to `Vec<u32>` allocation/copy was only optimizer-elided in some code layouts.
+  STRUCT-001AF made that ownership transfer explicit: identical size/alignment and all-bit-valid scalar types
+  permit one documented allocation-preserving reinterpretation, with pointer/length/capacity and boundary-bit
+  unit coverage. The execution inventory is now 125 tests, with 48 active and 77 GPU-ignored. Three ordered
+  multi-block/pool-reuse/engine-route gates passed 9 sequential and 6 concurrent
+  invocations, and independent unsafe-code audit is clean. The final card restores ordered compaction to
+  34.4 GB/s (0.0234x same-run roofline) in-L2 and 3.7 GB/s out-of-L2; count is 0.87x/1.02x roofline, grouped is
+  1,678.3 M elements/s, and 65,536-batch point reads are 246.2M/253.2M lookups/s at p50 139/132us. Both AE and
+  AF are closed.
 
 ## Known boundaries
 

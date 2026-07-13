@@ -14840,6 +14840,17 @@ fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
     )
 }
 
+fn i32_bits_into_u32(values: Vec<i32>) -> Vec<u32> {
+    // SAFETY: i32 and u32 have identical size/alignment and every 32-bit pattern is valid for both.
+    // ManuallyDrop transfers the allocation exactly once; the reconstructed Vec retains the same
+    // pointer, length, and capacity, so the index path does not allocate/copy millions of result slots.
+    let mut values = std::mem::ManuallyDrop::new(values);
+    let ptr = values.as_mut_ptr().cast::<u32>();
+    let len = values.len();
+    let capacity = values.capacity();
+    unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+}
+
 /// INDEX-emit launch: returns the surviving ROW INDICES (`Vec<u32>`) in ASCENDING ORDER via the SAME
 /// ordered parallel compaction, with the scatter kernel storing each match's row index (u32) instead
 /// of its value (`out_is_index = 1`). The ascending-by-construction guarantee is identical to the
@@ -14874,7 +14885,7 @@ fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
     // is `Vec<i32>` 4-byte slots, so reinterpret each slot's bits back to u32 (bit-exact — a row index
     // is `< row_count`, always non-negative, and fits u32 since row_count <= u32::MAX in every sized
     // grid). The order is already ascending by construction (no host sort).
-    Ok(slots.into_iter().map(|slot| slot as u32).collect())
+    Ok(i32_bits_into_u32(slots))
 }
 
 /// TWO-INPUT (col-vs-col / expr-vs-expr) ordered compare-compaction: compare `lhs[i] <cmp> rhs[i]`
