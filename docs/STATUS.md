@@ -630,6 +630,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   driver smokes, all-target checks, warning-denied clippy, security preflight, focused ACL/shared-catalog tests,
   touched formatting, diff checks, and independent audit are clean. The root is 12,698 lines and STRUCT-001BP
   is closed.
+  Parsed simple-query relational DML now enters the private 274-line `simple_dml` owner through one exact
+  successful-parse family gate. INSERT/DELETE/UPDATE preserve existence and ACL precedence, mapping/type/default
+  evaluation, filters/assignments, candidate construction, unique/check/foreign-key validation and rollback,
+  counts, dirty publication, persistence, errors, and tags. The three-arm body is normalized-exact; only clippy-
+  required tail expressions differ. It intentionally remains separate from behaviorally different
+  `extended_dml`. Inherited compatibility debt remains: duplicate INSERT target columns are not rejected and
+  the last supplied value wins; broader PostgreSQL parser/catalog compatibility remains PRODUCT-002.
+  Sequential/concurrent 127-test runs, the full protocol package and driver smokes, all-target checks, warning-
+  denied clippy, security preflight, focused DML tests, touched formatting, diff checks, and independent audit
+  are clean. The root is 12,451 lines and STRUCT-001BQ is closed.
 
 ## Known boundaries
 
