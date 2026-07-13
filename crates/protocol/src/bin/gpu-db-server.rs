@@ -150,6 +150,12 @@ mod table_constraints;
 use table_constraints::{
     add_check_constraint_to_session, add_primary_key_to_session, add_unique_constraint_to_session,
 };
+#[path = "gpu-db-server/column_defaults.rs"]
+mod column_defaults;
+use column_defaults::{
+    add_column_default_supported, column_default_matches_type, evaluate_column_default,
+    format_column_default_expr, preflight_column_default_target, resolve_column_domain_type,
+};
 #[path = "gpu-db-server/backend_adapter.rs"]
 mod backend_adapter;
 use backend_adapter::*;
@@ -289,13 +295,6 @@ fn sql_value_matches_type(value: &SqlValue, ty: gpu_db_protocol::SqlType) -> boo
     )
 }
 
-fn column_default_matches_type(value: &ColumnDefault, ty: gpu_db_protocol::SqlType) -> bool {
-    match value {
-        ColumnDefault::Literal(value) => sql_value_matches_type(value, ty),
-        ColumnDefault::SequenceNextVal { .. } => ty == gpu_db_protocol::SqlType::Int4,
-    }
-}
-
 fn index_definition_prefix(unique: bool) -> &'static str {
     if unique {
         "CREATE UNIQUE INDEX"
@@ -364,35 +363,6 @@ fn shared_catalog_contains_table_constraint(table: &str, constraint: &str) -> bo
                 .iter()
                 .any(|candidate| candidate.name == constraint)
         })
-}
-
-fn format_default_expr(value: &SqlValue) -> String {
-    match value {
-        SqlValue::Null => "NULL".to_string(),
-        SqlValue::Int2(value) => format!("{value}::smallint"),
-        SqlValue::Int4(value) => value.to_string(),
-        SqlValue::Text(value) => format!("'{}'::text", value.replace('\'', "''")),
-        SqlValue::Int8(value) => value.to_string(),
-        SqlValue::Numeric(value) => value.to_decimal_string(),
-        SqlValue::Bool(value) => bool_text(*value),
-        SqlValue::Date(value) => {
-            format!("'{}'::date", gpu_db_protocol::datetime::format_date(*value))
-        }
-        SqlValue::Timestamp(value) => format!(
-            "'{}'::timestamp",
-            gpu_db_protocol::datetime::format_timestamp(*value)
-        ),
-        SqlValue::Uuid(value) => format!("'{}'::uuid", gpu_db_protocol::uuid::format_uuid(value)),
-    }
-}
-
-fn format_column_default_expr(value: &ColumnDefault) -> String {
-    match value {
-        ColumnDefault::Literal(value) => format_default_expr(value),
-        ColumnDefault::SequenceNextVal { sequence, .. } => {
-            format!("nextval('{}'::regclass)", sequence.replace('\'', "''"))
-        }
-    }
 }
 
 struct Session {
@@ -972,63 +942,6 @@ struct Subscription {
     connection: String,
     publications: Vec<String>,
     enabled: bool,
-}
-
-fn preflight_column_default_target(
-    session: &Session,
-    default: &ColumnDefault,
-) -> Option<ErrorField> {
-    match default {
-        ColumnDefault::Literal(_) => None,
-        ColumnDefault::SequenceNextVal {
-            sequence,
-            create_if_missing: true,
-        } => {
-            if session.tables.contains_key(sequence)
-                || session.views.contains_key(sequence)
-                || session.materialized_views.contains_key(sequence)
-                || session.sequences.contains_key(sequence)
-            {
-                Some(ErrorField {
-                    code: "42P07",
-                    message: "relation already exists",
-                    position: None,
-                })
-            } else {
-                None
-            }
-        }
-        ColumnDefault::SequenceNextVal {
-            sequence,
-            create_if_missing: false,
-        } => sequence_target_error(session, sequence),
-    }
-}
-
-fn resolve_column_domain_type(
-    session: &Session,
-    def: &mut gpu_db_protocol::ColumnDef,
-) -> Result<u32, ErrorField> {
-    if let Some(domain_name) = def.domain.as_ref() {
-        let domain = session.domains.get(domain_name).ok_or(ErrorField {
-            code: "42704",
-            message: "type does not exist",
-            position: None,
-        })?;
-        def.ty = domain.base_type;
-        Ok(domain.oid)
-    } else {
-        Ok(def.ty.postgres_oid())
-    }
-}
-
-fn add_column_default_supported(default: &ColumnDefault) -> bool {
-    match default {
-        ColumnDefault::Literal(_) => true,
-        ColumnDefault::SequenceNextVal {
-            create_if_missing, ..
-        } => !create_if_missing,
-    }
 }
 
 fn acl_relation_kind(session: &Session, relation: &str) -> Option<AclRelationKind> {
@@ -1810,34 +1723,6 @@ fn drop_subscription(
         session.mark_subscription_dirty(name.clone());
     }
     Ok(())
-}
-
-fn evaluate_column_default(
-    session: &mut Session,
-    default: &ColumnDefault,
-) -> Result<SqlValue, ErrorField> {
-    match default {
-        ColumnDefault::Literal(value) => Ok(value.clone()),
-        ColumnDefault::SequenceNextVal { sequence, .. } => {
-            if let Some(error) = sequence_target_error(session, sequence) {
-                return Err(error);
-            }
-            let sequence_state = session
-                .sequences
-                .get_mut(sequence)
-                .expect("sequence target checked");
-            let value = next_sequence_value(sequence_state)?;
-            session.currval_sequences.insert(sequence.clone(), value);
-            session.mark_sequence_dirty(sequence.clone());
-            i32::try_from(value)
-                .map(SqlValue::Int4)
-                .map_err(|_| ErrorField {
-                    code: "22003",
-                    message: "sequence value is out of range for int4 default",
-                    position: None,
-                })
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

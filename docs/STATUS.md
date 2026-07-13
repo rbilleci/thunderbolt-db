@@ -710,6 +710,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   omit indexes even though PostgreSQL puts indexes in the relation namespace. Full protocol and driver gates,
   all-target checks, warning-denied clippy, security preflight, focused sequence/shared-catalog tests, formatting/
   diff checks, and independent audit are clean. The root is 9,776 lines and STRUCT-001BY is closed.
+  Column-default validation, formatting, sequence/domain preflight, ADD support policy, and runtime evaluation now
+  live in the private 130-line `column_defaults` owner. Six narrow exports serve DDL, simple-DML, COPY, and root
+  catalog formatting; literal formatting remains internal. All value types and escaping, domain OID/type mutation,
+  sequence target/value/currval/dirty behavior, int4 conversion, and errors are exact moves. Inherited PRODUCT-002
+  debt remains: literal compatibility uses the narrow legacy type policy, and sequence-default evaluation advances
+  and records `currval` before int4 conversion, so an int4 overflow returns `22003` after consuming the value.
+  Full protocol and driver gates, all-target checks, warning-denied clippy, security preflight, focused default/
+  domain/sequence/COPY/DML/catalog tests, formatting/diff checks, and independent audit are clean. The root is
+  9,661 lines and STRUCT-001BZ is closed.
 
 ## Known boundaries
 
