@@ -1420,7 +1420,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   passed 15 sequential and 10 concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed
   505/487, and all-target check, strict clippy, scoped formatting/diff/reference checks, and independent audit
   are clean. No production validation, elision, write-wave, concurrency, or architectural behavior changed, so
-  the report card was not applicable. STRUCT-001ES is next.
+  the report card was not applicable.
+  STRUCT-001ES externalized the exact six-test vacuum/gather/multi-row DML/concurrency/materialization family
+  into the rustfmt-clean 695-line `tests/residency_maintenance_materialization.rs` owner at the same parent
+  position. Normalized comparison differs only by one rustfmt assertion collapse; all bodies, attributes, names,
+  and order remain unchanged, and the adjacent A3 validation test remains at the parent boundary. The engine
+  root is 7,360 lines, and the 992-test/76-family inventories remain exact. Six GPU gates passed 18 sequential
+  and 12 concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target
+  check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No production
+  vacuum, gather, DML, materialization, or architectural behavior changed, so the report card was not applicable.
+  STRUCT-001ET is next.
 
 ## Known boundaries
 
