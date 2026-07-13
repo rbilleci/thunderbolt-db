@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DP:** analyze the 20,164-line replication facade and 18,143-line inline test module, then promote
-   one bounded invariant-owned slice with stable crate-root APIs and exact correctness/security/smoke gates.
+1. **STRUCT-001DQ:** move the exact replication TCP/TLS transport leaf and four closest tests behind stable crate-
+   root re-exports; preserve framing, timeout, certificate, mTLS, error, and request-application behavior.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

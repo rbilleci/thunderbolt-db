@@ -1152,6 +1152,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and shared type/helper ownership remain at the binary boundary. The protocol inventory disposition and the
   sequencing parent STRUCT-001AV are closed; further work belongs to PRODUCT-001/PRODUCT-002 rather than source-
   size remediation.
+  STRUCT-001DP completed the required replication outlier packet. `crates/replication/src/lib.rs` is 20,164
+  handwritten lines: 2,021 production plus an 18,143-line inline module with exactly 187 tests; it has no generated,
+  feature-gated, or unsafe code. Production ownership separates into operational reports, RPC data/codec, TCP/TLS
+  transport, progress/status/recovery invariants, stable replication/state-machine traits, and local/Raft owners.
+  Engine consumers use only the local owner and traits; operational examples/scripts consume the public Raft/RPC/
+  transport/report facade. I/O/rustls/certificate/timeouts are confined to transport, while the large April 2026
+  co-change tail is a Raft snapshot-repair test family rather than production coupling. The accepted module/test
+  dependency map and bounded test-family ranges are recorded in PLAN’s replication inventory; STRUCT-001DQ is the
+  first exact leaf and multi-GPU remains deferred.
 
 ## Known boundaries
 
