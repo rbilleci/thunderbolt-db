@@ -430,6 +430,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and concurrent 127-test runs, the full 71-library-test protocol package and driver smokes, all-target checks,
   warning-denied clippy, security preflight, formatting, and independent audit are clean. The root is 17,394
   lines and STRUCT-001AQ is closed.
+  Cursor compatibility now lives in the private 407-line `cursor` module. The two original parser/execution
+  blocks are normalized-exact and expose exactly ten proven entry points; name/direction/count parsing and all
+  other helpers remain private. The result-column-count helper moved byte-exactly to its sole `extended_query`
+  owner, removing a potential reverse dependency: `cursor` depends on the lower SQL syntax/PREPARE owners, while
+  neither depends on cursor. DECLARE duplicate and parameter errors, SQL EXECUTE/SELECT result ownership,
+  transaction-local lifetime, FETCH/MOVE forward-only position and ALL/count behavior, missing-cursor errors,
+  rows, tags, and exact messages are unchanged. Sequential/concurrent 127-test runs, the full protocol package
+  and driver smokes, all-target checks, warning-denied clippy, security preflight, formatting, and independent
+  audit are clean. The root is 17,003 lines and STRUCT-001AR is closed.
 
 ## Known boundaries
 

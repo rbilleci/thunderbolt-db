@@ -7,9 +7,8 @@ use super::sql_execute_syntax::{
 };
 use super::{
     bind_query_parameters, canonical_sql, describe_query_columns, execute_select_result,
-    expected_parameter_count, int4_column, is_supported_extended_copy, is_supported_extended_dml,
-    negative_limit_error_field, negative_offset_error_field, parse_command, parse_declare_cursor,
-    pg_dump_function_dump_columns, pg_dump_function_dump_rows,
+    expected_parameter_count, int4_column, negative_limit_error_field, negative_offset_error_field,
+    parse_command, pg_dump_function_dump_columns, pg_dump_function_dump_rows,
     sql_execute_argument_placeholder_index, sql_execute_parameter_error_field, BindParameterError,
     Column, Command, ErrorField, ParseError, PreparedQuery, PreparedStatement, SelectResult,
     Session, SqlDeallocateTarget, SqlType,
@@ -158,17 +157,6 @@ pub(super) fn describe_extended_query_columns(
         };
     }
     describe_query_columns(session, query)
-}
-
-pub(super) fn extended_query_result_column_count(session: &Session, query: &str) -> Option<usize> {
-    if parse_declare_cursor(query).is_some()
-        || is_supported_extended_dml(session, query)
-        || is_supported_extended_copy(query)
-    {
-        Some(0)
-    } else {
-        describe_extended_query_columns(session, query).map(|columns| columns.len())
-    }
 }
 
 fn bind_sql_execute_describe_parameters(

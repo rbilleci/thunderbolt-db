@@ -4,21 +4,32 @@ use super::{
     contains_zero_placeholder, describe_extended_query_columns, describe_query_columns,
     execute_copy_to_stdout, execute_declare_cursor, execute_extended_delete,
     execute_extended_insert, execute_extended_update, execute_select_result,
-    execute_sql_prepared_result, expected_parameter_count, extended_query_result_column_count,
-    format_code_count_is_valid, is_supported_extended_dml, is_unsupported_declare_cursor_statement,
-    max_placeholder_index, negative_limit_error_field, negative_offset_error_field,
-    parse_declare_cursor, parse_sql_execute, resolve_prepared_parameter_type_oids,
-    sql_execute_describe_error, sql_execute_parameter_type_mapping_error, strip_sql_comments,
-    write_bind_complete, write_close_complete, write_command_complete, write_data_row_with_formats,
-    write_error, write_no_data, write_parameter_description, write_parse_complete,
-    write_portal_suspended, write_row_description, write_row_description_with_formats,
-    BindParameterError, ErrorField, Portal, PreparedQuery, PreparedStatement, Session,
+    execute_sql_prepared_result, expected_parameter_count, format_code_count_is_valid,
+    is_supported_extended_dml, is_unsupported_declare_cursor_statement, max_placeholder_index,
+    negative_limit_error_field, negative_offset_error_field, parse_declare_cursor,
+    parse_sql_execute, resolve_prepared_parameter_type_oids, sql_execute_describe_error,
+    sql_execute_parameter_type_mapping_error, strip_sql_comments, write_bind_complete,
+    write_close_complete, write_command_complete, write_data_row_with_formats, write_error,
+    write_no_data, write_parameter_description, write_parse_complete, write_portal_suspended,
+    write_row_description, write_row_description_with_formats, BindParameterError, ErrorField,
+    Portal, PreparedQuery, PreparedStatement, Session,
 };
 use gpu_db_protocol::{
     is_copy_statement, is_supported_extended_copy, parse_command, parse_copy_from_stdin,
     parse_copy_to_stdout_table, Command, DescribeTarget, ParseError,
 };
 use std::io;
+
+fn extended_query_result_column_count(session: &Session, query: &str) -> Option<usize> {
+    if parse_declare_cursor(query).is_some()
+        || is_supported_extended_dml(session, query)
+        || is_supported_extended_copy(query)
+    {
+        Some(0)
+    } else {
+        describe_extended_query_columns(session, query).map(|columns| columns.len())
+    }
+}
 
 pub(super) fn handle_parse(
     stream: &mut dyn ReadWrite,
