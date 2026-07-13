@@ -1736,6 +1736,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   audit are clean. The canonical card is stable: IN-L2/OUT-OF-L2 rooflines are 1,489.9/1,448.9 GB/s, count is
   0.91x/1.00x roofline, grouped aggregation is 1,677.7 M elements/s, and batch-65,536 point reads are 252.6M at
   p50 136us IN-L2 and 257.1M at p50 128us OUT-OF-L2; the OUT-OF-L2 index route is 3.22x scan.
+  STRUCT-001FT then deleted the unconsumed `match_i32_between_row_indices_from_payload` facade and its private
+  full-column D2H plus host BETWEEN filter (73 production lines). They were introduced for the old partitioned
+  BETWEEN-AVG probe in `8381e7f7`; its last engine caller was retired in `8da01cb6` when the route moved to the
+  general GPU expression/aggregate bridge. That bridge rebuilds the BETWEEN predicate, evaluates it through the
+  device expression path, and runs AVG on-device; the specialized `stats_i32_between[_nullable]_from_payload`
+  reductions remain live for a separate single-resident probe. Repository source, build, example, and test audit
+  finds no surviving reference. Execution passes 54/81, engine passes 505/487, workspace all-target/all-feature
+  check, strict execution/engine clippy, dependency boundary, source/diff checks, and independent audit are clean.
+  No runtime path changed, so GPU HAZARD and report-card gates were not applicable.
 
 ## Known boundaries
 

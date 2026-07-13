@@ -1339,22 +1339,6 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_equal_row_indices(self, filters, row_count)
     }
 
-    pub fn match_i32_between_row_indices_from_payload(
-        &self,
-        byte_offset: u64,
-        row_count: u64,
-        lower_inclusive: i32,
-        upper_inclusive: i32,
-    ) -> Result<Vec<u64>, CudaRuntimeProbeError> {
-        launch_cuda_resident_i32_between_row_indices(
-            self,
-            byte_offset,
-            row_count,
-            lower_inclusive,
-            upper_inclusive,
-        )
-    }
-
     pub fn project_text_from_payload(
         &self,
         offsets_byte_offset: u64,
@@ -1897,63 +1881,6 @@ fn copy_pinned_into<T>(pinned: &Option<PinnedHostLease<'_>>, dst: &mut [T]) {
 
 
 
-
-fn launch_cuda_resident_i32_between_row_indices(
-    resident: &CudaResidentDeviceMemory,
-    byte_offset: u64,
-    row_count: u64,
-    lower_inclusive: i32,
-    upper_inclusive: i32,
-) -> Result<Vec<u64>, CudaRuntimeProbeError> {
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-
-    if lower_inclusive > upper_inclusive || row_count == 0 {
-        return Ok(Vec::new());
-    }
-    let bytes = row_count
-        .checked_mul(std::mem::size_of::<i32>() as u64)
-        .and_then(|bytes| byte_offset.checked_add(bytes))
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if bytes > resident.metadata().allocated_bytes {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
-    }
-    let bytes_usize = usize::try_from(bytes - byte_offset)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let mut raw_values = vec![0_u8; bytes_usize];
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            raw_values.as_mut_ptr().cast::<c_void>(),
-            resident.device_ptr() + byte_offset,
-            bytes_usize,
-        )
-    })?;
-
-    let mut indices = Vec::new();
-    for (idx, chunk) in raw_values
-        .chunks_exact(std::mem::size_of::<i32>())
-        .enumerate()
-    {
-        let value = i32::from_le_bytes(
-            chunk
-                .try_into()
-                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(raw_values.len()))?,
-        );
-        if value >= lower_inclusive && value <= upper_inclusive {
-            indices.push(
-                u64::try_from(idx)
-                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
-            );
-        }
-    }
-    Ok(indices)
-}
 
 fn copy_cuda_resident_text_rows(
     resident: &CudaResidentDeviceMemory,
