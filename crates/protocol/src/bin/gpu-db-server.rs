@@ -83,6 +83,9 @@ use session_compat::{try_execute_session_compat_query, try_execute_session_contr
 #[path = "gpu-db-server/pg_dump_compat.rs"]
 mod pg_dump_compat;
 use pg_dump_compat::try_execute_pg_dump_compat_statement;
+#[path = "gpu-db-server/session_commands.rs"]
+mod session_commands;
+use session_commands::try_execute_session_command;
 #[path = "gpu-db-server/backend_adapter.rs"]
 mod backend_adapter;
 use backend_adapter::*;
@@ -4753,6 +4756,18 @@ fn execute_statement(
             );
         }
         Err(_) => {}
+        Ok(
+            command @ (Command::SetRole { .. }
+            | Command::Begin
+            | Command::Commit { .. }
+            | Command::Rollback { .. }
+            | Command::ResetAll),
+        ) => {
+            if let Some(result) = try_execute_session_command(stream, session, &command, &canonical)
+            {
+                return result;
+            }
+        }
         Ok(command) => match command {
             Command::CreateExtension(create) => {
                 if create.name != "plpgsql" {
@@ -7789,51 +7804,17 @@ fn execute_statement(
                     include_row_description,
                 );
             }
-            Command::SetRole { role } => {
-                if let Some(role) = role {
-                    if !role_exists(session, &role) {
-                        return write_error(
-                            stream,
-                            &ErrorField {
-                                code: "42704",
-                                message: "role does not exist",
-                                position: None,
-                            },
-                        );
-                    }
-                    session.current_role = Some(role);
-                } else {
-                    session.current_role = None;
-                }
-                return write_command_complete(stream, "SET");
-            }
-            Command::Begin => {
-                session.in_transaction = true;
-                return write_command_complete(stream, "BEGIN");
-            }
-            Command::Commit { chain } => {
-                session.cursors.clear();
-                session.in_transaction = chain;
-                return write_command_complete(stream, "COMMIT");
-            }
-            Command::Rollback { chain } => {
-                session.cursors.clear();
-                session.in_transaction = chain;
-                return write_command_complete(stream, "ROLLBACK");
-            }
             Command::Flush
             | Command::TruncateTable(_)
             | Command::SetKv { .. }
             | Command::DeleteKv { .. }
             | Command::GetKv { .. } => {}
-            Command::ResetAll => {
-                if matches!(
-                    canonical.as_str(),
-                    "reset role" | "reset session role" | "reset local role"
-                ) {
-                    session.current_role = None;
-                    return write_command_complete(stream, "RESET");
-                }
+            Command::SetRole { .. }
+            | Command::Begin
+            | Command::Commit { .. }
+            | Command::Rollback { .. }
+            | Command::ResetAll => {
+                unreachable!("session commands are routed by the preceding parse arm")
             }
         },
     }

@@ -523,6 +523,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   the repository's PostgreSQL 16 compatibility baseline: pg_dumpall generation/restore succeeds, while those
   version-18 introspection probes still fail through the unchanged predicates; broader catalog-version coverage
   remains PRODUCT-002. The root is 15,274 lines and STRUCT-001BB is closed.
+  Parsed session and transaction commands now enter the private 58-line `session_commands` owner through one
+  borrowed-command tri-state delegate in a preceding successful-parse arm. SET/RESET ROLE validation and state,
+  BEGIN, COMMIT/ROLLBACK chain state, transaction-end cursor cleanup, exact errors, and tags are unchanged;
+  non-role ResetAll falls through as before. The one role-name clone is ownership-only. Sequential/concurrent
+  127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied clippy, security
+  preflight, touched formatting, diff checks, and independent audit are clean. The root is 15,255 lines and
+  STRUCT-001BC is closed.
 
 ## Known boundaries
 

@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BC:** isolate SET/RESET ROLE and BEGIN/COMMIT/ROLLBACK handling behind a private parsed-session
-   delegate, preserving role validation, cursor cleanup, transaction state, exact errors/tags, and fallthrough.
+1. **STRUCT-001BD:** isolate bounded plpgsql-extension and public-schema CREATE/DROP arms behind a private
+   bootstrap-DDL delegate, preserving dependencies, ACL/comment cleanup, dirty publication, errors, and tags.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
