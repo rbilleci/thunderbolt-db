@@ -650,6 +650,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   files are rustfmt-clean. Sequential/concurrent 127-test runs, the full protocol package and driver smokes,
   all-target checks, warning-denied clippy, security preflight, focused query/view/DML/ACL tests, diff checks,
   and independent audit are clean. The root is 11,053 lines and STRUCT-001BR is closed.
+  Bounded SQL-function result evaluation and its body parser now live inside the existing private 282-line
+  `function_execution` owner. Schema USAGE, lookup, function EXECUTE ACL order, all supported return-type literal
+  branches, numeric scale, quote and keyword boundaries, unsupported-body errors, column/value construction,
+  and result rows are exact moves. Only `execute_function_result` gained parent visibility for three existing
+  direct tests, with a test-only root import; the parser helpers remain private and the command calls the result
+  helper internally. Full protocol and driver gates, all-target checks, warning-denied clippy, security preflight,
+  focused function/error/recovery tests, formatting/diff checks, and independent audit are clean. The root is
+  10,887 lines and STRUCT-001BS is closed.
 
 ## Known boundaries
 

@@ -29,9 +29,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BS:** move bounded SQL-function result and body parser/evaluator helpers into the existing private
-   `function_execution` owner, preserving schema/function ACL checks, supported value/type behavior, exact errors,
-   and result rows without adding a generalized host execution surface.
+1. **STRUCT-001BT:** move recursive session-view dependency and dependent checks into the existing private
+   `view_ddl` owner, preserving cycle guards and CREATE OR REPLACE/rename/drop behavior with module-private
+   helpers only.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
