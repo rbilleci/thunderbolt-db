@@ -33,8 +33,9 @@ The sole work ledger is `PLAN.md`.
    isolation matrix; never replace it with a host interpretation path.
 2. **MULTI-002:** on that host, partition write/visible-locate submissions by
    primary context and deterministically merge bounded metadata; never move lookup or visibility to the host.
-3. **STRUCT-001AK:** bound startup/tagged frame declarations before allocation and remove tagged payload double-
-   allocation; then continue protocol-server decomposition behind the **PRODUCT-001** containment boundary.
+3. **STRUCT-001:** continue protocol-server decomposition after closing bounded frontend frames; keep the legacy
+   endpoint behind the **PRODUCT-001** containment boundary and leave aggregate slow-client control to
+   **SCALE-001**.
 4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

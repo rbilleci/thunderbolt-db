@@ -367,6 +367,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   clippy, TLS/SCRAM preflight, touched-module formatting, and independent audit are clean. STRUCT-001AJ is
   closed. Its audit exposed inherited unbounded attacker-declared frame allocation, now owned by
   **STRUCT-001AK**.
+  Frontend frame allocation is now explicitly bounded before allocation: startup declarations include their
+  four-byte length and are capped at 64 KiB; tagged declarations include their four-byte length and are capped
+  at 64 MiB. Accepted frames are read directly into one exact buffer, removing the former tagged payload
+  allocation and copy. Four focused tests cover both readers' clean EOF/partial reads, minimum, ordinary
+  reconstruction, allocation-free exact-limit validation, and one-byte-over rejection. The binary inventory is
+  now 127 tests; all pass alongside the 71 library tests, driver smokes, all-target/clippy gates, and full
+  TLS/SCRAM preflight. Independent security audit is clean for this per-frame contract. Legal single messages
+  above 64 MiB are intentionally rejected; ordinary driver and COPY chunking pass. Aggregate pre-authentication
+  DoS remains under **SCALE-001** because the legacy thread-per-connection endpoint lacks admission limits and
+  read deadlines, so many slow clients can still pin bounded buffers concurrently. STRUCT-001AK is closed.
 
 ## Known boundaries
 

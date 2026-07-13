@@ -1,4 +1,6 @@
-use super::frontend_transport::{read_tagged_frame, ReadWrite};
+use super::frontend_transport::{
+    read_tagged_frame, validate_declared_frame_len, ReadWrite, MAX_STARTUP_FRAME_BYTES,
+};
 use super::{
     handle_ready_client, write_authentication_ok, write_authentication_sasl,
     write_authentication_sasl_continue, write_authentication_sasl_final, write_backend_key_data,
@@ -603,25 +605,66 @@ fn read_startup_frame(stream: &mut dyn ReadWrite) -> io::Result<Vec<u8>> {
         };
     }
 
-    let frame_len = u32::from_be_bytes(len_bytes) as usize;
-    if frame_len < 8 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("invalid startup frame length: {frame_len}"),
-        ));
-    }
-
-    let mut rest = vec![0_u8; frame_len - 4];
-    stream.read_exact(&mut rest)?;
-
-    let mut frame = len_bytes.to_vec();
-    frame.extend_from_slice(&rest);
+    let frame_len = validate_declared_frame_len(
+        u32::from_be_bytes(len_bytes),
+        8,
+        MAX_STARTUP_FRAME_BYTES,
+        "startup",
+    )?;
+    let mut frame = vec![0_u8; frame_len];
+    frame[..4].copy_from_slice(&len_bytes);
+    stream.read_exact(&mut frame[4..])?;
     Ok(frame)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn startup_frame_bounds_precede_allocation_and_partial_payloads_fail() {
+        assert_eq!(
+            validate_declared_frame_len(8, 8, MAX_STARTUP_FRAME_BYTES, "startup").unwrap(),
+            8
+        );
+        assert_eq!(
+            validate_declared_frame_len(
+                MAX_STARTUP_FRAME_BYTES as u32,
+                8,
+                MAX_STARTUP_FRAME_BYTES,
+                "startup",
+            )
+            .unwrap(),
+            MAX_STARTUP_FRAME_BYTES
+        );
+        assert!(validate_declared_frame_len(7, 8, MAX_STARTUP_FRAME_BYTES, "startup").is_err());
+        let over = (MAX_STARTUP_FRAME_BYTES as u32 + 1).to_be_bytes();
+        assert_eq!(
+            read_startup_frame(&mut Cursor::new(over))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_startup_frame(&mut Cursor::new(vec![0, 0]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+        let partial = [8_u32.to_be_bytes().to_vec(), vec![0, 3, 0]].concat();
+        assert_eq!(
+            read_startup_frame(&mut Cursor::new(partial))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+        let valid = [8_u32.to_be_bytes().to_vec(), vec![0, 3, 0, 0]].concat();
+        assert_eq!(
+            read_startup_frame(&mut Cursor::new(valid.clone())).unwrap(),
+            valid
+        );
+    }
 
     #[test]
     fn args_default_listen_and_shared_catalog_opt_in() {
