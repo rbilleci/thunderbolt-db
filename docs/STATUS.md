@@ -1284,6 +1284,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   commit/apply retirement. All six exact tests, both 187-test serial/16-thread runs, replication all-target
   check and strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. The root
   is 1,901 lines with 683 production lines, below the production-file analysis threshold; STRUCT-001EF is next.
+  STRUCT-001EF externalized the exact final six-test advanced repair cleanup family into a cohesive 1,023-line
+  `tests/repair_advanced_cleanup.rs` owner through the last `include!` in the unchanged parent test facade.
+  Formatting-normalized source compares exactly; only two long function declarations rewrapped, while bodies,
+  attributes, names, and semantics are unchanged. All six exact tests, both 187-test serial/16-thread runs,
+  replication all-target check and strict clippy, scoped formatting/diff/reference checks, and independent
+  audit are clean. The root is now 877 lines with 683 production lines. Its stable traits, public re-exports,
+  Raft orchestration, and cross-type request-application seam are cohesive; forcing the previously sketched
+  `raft` leaf would add artificial visibility/cycle risk. The replication outlier disposition is complete and
+  STRUCT-001EG is next.
 
 ## Known boundaries
 
