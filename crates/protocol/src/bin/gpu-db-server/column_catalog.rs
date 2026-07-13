@@ -1,8 +1,9 @@
 // Legacy information-schema column catalog ownership. This is not a product execution path.
 
 use super::{
-    column_type_display_name, format_column_default_expr, int4_column, text_column,
-    write_single_row, CatalogColumn, ReadWrite, Session, SqlType, Table,
+    column_type_display_name, column_type_oid, column_type_size, format_column_default_expr,
+    int4_column, text_column, write_error, write_single_row, CatalogColumn, ErrorField, ReadWrite,
+    Session, SqlType, Table,
 };
 use std::collections::BTreeSet;
 use std::io;
@@ -191,6 +192,75 @@ pub(super) fn try_execute_information_schema_column_catalog_query(
                 text_column("udt_name"),
             ],
             &information_schema_extended_column_rows_for_tables(session, &tables),
+        ));
+    }
+    None
+}
+
+pub(super) fn try_execute_direct_attribute_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if let Some(table) = catalog_attribute_query_table(canonical) {
+        let Some(rows) = catalog_attribute_rows(session, &table) else {
+            return Some(write_error(
+                stream,
+                &ErrorField {
+                    code: "42P01",
+                    message: "relation does not exist",
+                    position: None,
+                },
+            ));
+        };
+        return Some(write_single_row(
+            stream,
+            &[text_column("attname"), int4_column("atttypid")],
+            &rows,
+        ));
+    }
+    if let Some(table) = catalog_attribute_detail_query_table(canonical) {
+        let Some(rows) = catalog_attribute_detail_rows(session, &table) else {
+            return Some(write_error(
+                stream,
+                &ErrorField {
+                    code: "42P01",
+                    message: "relation does not exist",
+                    position: None,
+                },
+            ));
+        };
+        return Some(write_single_row(
+            stream,
+            &[
+                int4_column("attnum"),
+                text_column("attname"),
+                int4_column("atttypid"),
+                int4_column("attlen"),
+            ],
+            &rows,
+        ));
+    }
+    if let Some(table) = pg_catalog_class_attribute_type_query_table(canonical) {
+        let Some(rows) = pg_catalog_class_attribute_type_rows(session, &table) else {
+            return Some(write_error(
+                stream,
+                &ErrorField {
+                    code: "42P01",
+                    message: "relation does not exist",
+                    position: None,
+                },
+            ));
+        };
+        return Some(write_single_row(
+            stream,
+            &[
+                int4_column("attnum"),
+                text_column("attname"),
+                text_column("data_type"),
+                text_column("attnotnull"),
+            ],
+            &rows,
         ));
     }
     None
@@ -519,6 +589,92 @@ fn information_schema_numeric_metadata(ty: SqlType) -> (Option<i32>, Option<i32>
     }
 }
 
+fn catalog_attribute_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select attname, atttypid from pg_catalog.pg_attribute where attrelid = '";
+    let suffix = "'::regclass and attnum > 0 order by attnum";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn catalog_attribute_detail_query_table(canonical: &str) -> Option<String> {
+    let prefix =
+        "select attnum, attname, atttypid, attlen from pg_catalog.pg_attribute where attrelid = '";
+    let suffix = "'::regclass and attnum > 0 order by attnum";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn catalog_attribute_rows(session: &Session, table: &str) -> Option<Vec<Vec<Option<String>>>> {
+    let table = session.tables.get(table)?;
+    Some(
+        table
+            .columns
+            .iter()
+            .map(|column| {
+                vec![
+                    Some(column.def.name.clone()),
+                    Some(column_type_oid(session, column).to_string()),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn catalog_attribute_detail_rows(
+    session: &Session,
+    table: &str,
+) -> Option<Vec<Vec<Option<String>>>> {
+    let table = session.tables.get(table)?;
+    Some(
+        table
+            .columns
+            .iter()
+            .map(|column| {
+                vec![
+                    Some(column.attnum.to_string()),
+                    Some(column.def.name.clone()),
+                    Some(column_type_oid(session, column).to_string()),
+                    Some(column_type_size(column).to_string()),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn pg_catalog_class_attribute_type_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select a.attnum, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type, a.attnotnull from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relname = '";
+    let suffix = "' and a.attnum > 0 and not a.attisdropped order by a.attnum";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn pg_catalog_class_attribute_type_rows(
+    session: &Session,
+    table: &str,
+) -> Option<Vec<Vec<Option<String>>>> {
+    let table = session.tables.get(table)?;
+    Some(
+        table
+            .columns
+            .iter()
+            .map(|column| {
+                vec![
+                    Some(column.attnum.to_string()),
+                    Some(column.def.name.clone()),
+                    Some(column_type_display_name(column)),
+                    Some("f".to_string()),
+                ]
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 pub(super) fn test_information_schema_columns_query_table(canonical: &str) -> Option<String> {
     information_schema_columns_query_table(canonical)
@@ -645,4 +801,43 @@ pub(super) fn test_information_schema_numeric_metadata(
     ty: SqlType,
 ) -> (Option<i32>, Option<i32>, Option<i32>) {
     information_schema_numeric_metadata(ty)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_attribute_query_table(canonical: &str) -> Option<String> {
+    catalog_attribute_query_table(canonical)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_attribute_detail_query_table(canonical: &str) -> Option<String> {
+    catalog_attribute_detail_query_table(canonical)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_attribute_rows(
+    session: &Session,
+    table: &str,
+) -> Option<Vec<Vec<Option<String>>>> {
+    catalog_attribute_rows(session, table)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_attribute_detail_rows(
+    session: &Session,
+    table: &str,
+) -> Option<Vec<Vec<Option<String>>>> {
+    catalog_attribute_detail_rows(session, table)
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_class_attribute_type_query_table(canonical: &str) -> Option<String> {
+    pg_catalog_class_attribute_type_query_table(canonical)
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_class_attribute_type_rows(
+    session: &Session,
+    table: &str,
+) -> Option<Vec<Vec<Option<String>>>> {
+    pg_catalog_class_attribute_type_rows(session, table)
 }

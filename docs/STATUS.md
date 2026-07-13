@@ -1078,6 +1078,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   constraint metadata, and absent GPU-resident system relations. Full protocol/driver/security/formatting gates,
   focused catalog/default tests, PostgreSQL 16 scenarios 40/41/42/304/307/308/319/320/321/322/324/332/338/339,
   and independent audit are clean. The root is 4,231 lines and STRUCT-001DI is closed.
+  The three final direct `pg_catalog.pg_attribute` routes now execute from the existing private 843-line
+  `column_catalog` owner behind one additional stage-preserving delegate. Six query-parser/row helpers are byte-
+  identical private moves and six `cfg(test)` wrappers retain only proven existing consumers. Shared type-OID/
+  type-size/type-display dependencies remain narrow and one-way. Exact post-direct-type/pre-session-fallback
+  stage and internal branch order, regclass/public-table parsers, missing-relation `42P01` errors/messages,
+  session-domain OIDs, declared type sizes/display, column iteration/ordinal order, fixed false not-null field,
+  2-/4-/4-column shapes, writers, and fall-through are unchanged. Inherited PRODUCT-002 debt remains exact
+  generated-SQL routing, host table/column/domain maps and CPU construction, simplified not-null metadata, and
+  absent GPU-resident system relations. Full protocol/driver/security/formatting gates, focused attribute/catalog
+  tests, PostgreSQL 16 scenarios 04/24/42/43/304/305/311/319/320/321/323/324/325/328/330/331/332/336, and
+  independent audit are clean. The root is 4,095 lines and STRUCT-001DJ is closed.
 
 ## Known boundaries
 
