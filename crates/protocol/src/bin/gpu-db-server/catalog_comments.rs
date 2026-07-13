@@ -1,11 +1,513 @@
 // Legacy catalog-comment ownership. This is not a product execution path.
 
 use super::{
-    database_exists, role_exists, shared_catalog, tablespace_exists, write_command_complete,
-    write_error, CatalogCommentTarget, ErrorField, ReadWrite, Session,
+    catalog_constraint_entries, database_exists, role_exists, shared_catalog, tablespace_exists,
+    text_column, write_command_complete, write_error, write_single_row, CatalogCommentTarget,
+    ErrorField, ReadWrite, Session,
 };
 use gpu_db_protocol::{Command, CommentTarget};
 use std::io;
+
+fn pg_catalog_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','v') order by c.relname, d.objsubid"
+}
+
+fn pg_catalog_descriptions_with_sequences_query() -> &'static str {
+    "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','v','s') order by c.relname, d.objsubid"
+}
+
+fn pg_catalog_descriptions_with_materialized_views_query() -> &'static str {
+    "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','v','m','s') order by c.relname, d.objsubid"
+}
+
+fn pg_catalog_table_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
+}
+
+fn pg_catalog_constraint_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, con.conname, d.description from pg_catalog.pg_description d join pg_catalog.pg_constraint con on con.oid = d.objoid join pg_catalog.pg_class c on c.oid = con.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' order by c.relname, con.conname"
+}
+
+fn pg_catalog_table_index_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i','v') order by c.relkind, c.relname, d.objsubid"
+}
+
+fn pg_catalog_table_index_sequence_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i','v','s') order by c.relkind, c.relname, d.objsubid"
+}
+
+fn pg_catalog_table_index_sequence_matview_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i','v','m','s') order by c.relkind, c.relname, d.objsubid"
+}
+
+fn pg_catalog_table_index_descriptions_without_views_query() -> &'static str {
+    "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i') order by c.relkind, c.relname, d.objsubid"
+}
+
+fn pg_catalog_table_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    for table in tables {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Table {
+            table: table.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+        for column in &table.columns {
+            if let Some(description) = session.comments.get(&CatalogCommentTarget::Column {
+                table: table.name.clone(),
+                attnum: column.attnum,
+            }) {
+                rows.push(vec![
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(column.def.name.clone()),
+                    Some(description.clone()),
+                ]);
+            }
+        }
+    }
+    rows
+}
+
+fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = pg_catalog_table_description_rows(session);
+    let mut views = session.views.values().collect::<Vec<_>>();
+    views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in views {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::View {
+            view: view.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in materialized_views {
+        if let Some(description) = session
+            .comments
+            .get(&CatalogCommentTarget::MaterializedView {
+                materialized_view: view.name.clone(),
+            })
+        {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by(|left, right| left.name.cmp(&right.name));
+    for sequence in sequences {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Sequence {
+            sequence: sequence.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+    }
+    rows
+}
+
+fn pg_catalog_constraint_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    for entry in catalog_constraint_entries(session) {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Constraint {
+            table: entry.index.table.clone(),
+            constraint: entry.index.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(entry.index.table),
+                Some(entry.index.name),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    for table in session.tables.values() {
+        for constraint in &table.check_constraints {
+            if let Some(description) = session.comments.get(&CatalogCommentTarget::Constraint {
+                table: table.name.clone(),
+                constraint: constraint.name.clone(),
+            }) {
+                rows.push(vec![
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(constraint.name.clone()),
+                    Some(description.clone()),
+                ]);
+            }
+        }
+        for constraint in &table.foreign_keys {
+            if let Some(description) = session.comments.get(&CatalogCommentTarget::Constraint {
+                table: table.name.clone(),
+                constraint: constraint.name.clone(),
+            }) {
+                rows.push(vec![
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(constraint.name.clone()),
+                    Some(description.clone()),
+                ]);
+            }
+        }
+    }
+    rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
+    rows
+}
+
+fn pg_catalog_table_index_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut indexes = session
+        .indexes
+        .iter()
+        .filter(|index| session.tables.contains_key(&index.table))
+        .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.name.cmp(&right.name));
+    for index in indexes {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Index {
+            index: index.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(index.name.clone()),
+                Some("i".to_string()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+    }
+    for row in pg_catalog_description_rows(session) {
+        let name = row[1].as_deref().unwrap_or_default();
+        let relkind = if session.views.contains_key(name) {
+            "v"
+        } else if session.materialized_views.contains_key(name) {
+            "m"
+        } else if session.sequences.contains_key(name) {
+            "s"
+        } else {
+            "r"
+        };
+        rows.push(vec![
+            row[0].clone(),
+            row[1].clone(),
+            Some(relkind.to_string()),
+            row[2].clone(),
+            row[3].clone(),
+        ]);
+    }
+    rows
+}
+
+fn pg_catalog_table_index_description_rows_without_views(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut indexes = session
+        .indexes
+        .iter()
+        .filter(|index| session.tables.contains_key(&index.table))
+        .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.name.cmp(&right.name));
+    for index in indexes {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Index {
+            index: index.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(index.name.clone()),
+                Some("i".to_string()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+    }
+    for row in pg_catalog_table_description_rows(session) {
+        rows.push(vec![
+            row[0].clone(),
+            row[1].clone(),
+            Some("r".to_string()),
+            row[2].clone(),
+            row[3].clone(),
+        ]);
+    }
+    rows
+}
+
+fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    if let Some(description) = session.comments.get(&CatalogCommentTarget::Extension {
+        extension: "plpgsql".to_string(),
+    }) {
+        rows.push(vec![
+            Some("pg_catalog".to_string()),
+            Some("plpgsql".to_string()),
+            Some("extension".to_string()),
+            Some(description.clone()),
+        ]);
+    }
+    if let Some(description) = session.comments.get(&CatalogCommentTarget::Schema {
+        schema: "public".to_string(),
+    }) {
+        rows.push(vec![
+            Some("public".to_string()),
+            Some("public".to_string()),
+            Some("schema".to_string()),
+            Some(description.clone()),
+        ]);
+    }
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    for table in tables {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Table {
+            table: table.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("table".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut views = session.views.values().collect::<Vec<_>>();
+    views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in views {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::View {
+            view: view.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("view".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in materialized_views {
+        if let Some(description) = session
+            .comments
+            .get(&CatalogCommentTarget::MaterializedView {
+                materialized_view: view.name.clone(),
+            })
+        {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("materialized view".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by(|left, right| left.name.cmp(&right.name));
+    for sequence in sequences {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Sequence {
+            sequence: sequence.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
+                Some("sequence".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut publications = session.publications.values().collect::<Vec<_>>();
+    publications.sort_by(|left, right| left.name.cmp(&right.name));
+    for publication in publications {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Publication {
+            publication: publication.name.clone(),
+        }) {
+            rows.push(vec![
+                None,
+                Some(publication.name.clone()),
+                Some("publication".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut subscriptions = session.subscriptions.values().collect::<Vec<_>>();
+    subscriptions.sort_by(|left, right| left.name.cmp(&right.name));
+    for subscription in subscriptions {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Subscription {
+            subscription: subscription.name.clone(),
+        }) {
+            rows.push(vec![
+                None,
+                Some(subscription.name.clone()),
+                Some("subscription".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut constraints = catalog_constraint_entries(session);
+    constraints.sort_by(|left, right| {
+        left.index
+            .table
+            .cmp(&right.index.table)
+            .then_with(|| left.index.name.cmp(&right.index.name))
+    });
+    for entry in constraints {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Constraint {
+            table: entry.index.table.clone(),
+            constraint: entry.index.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(entry.index.name),
+                Some("table constraint".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    rows
+}
+
+fn psql_list_object_descriptions_query(canonical: &str) -> bool {
+    canonical.starts_with(
+        "select distinct tt.nspname as \"schema\", tt.name as \"name\", tt.object as \"object\", d.description as \"description\" from ( select pgc.oid as oid, pgc.tableoid as tableoid",
+    ) && canonical.contains("cast('table constraint' as pg_catalog.text) as object")
+        && canonical.contains("cast('domain constraint' as pg_catalog.text) as object")
+        && canonical.contains("cast('operator class' as pg_catalog.text) as object")
+        && canonical.contains("cast('operator family' as pg_catalog.text) as object")
+        && canonical.contains("cast('rule' as pg_catalog.text) as object")
+        && canonical.contains("cast('trigger' as pg_catalog.text) as object")
+        && canonical.contains("join pg_catalog.pg_description d on (tt.oid = d.objoid and tt.tableoid = d.classoid and d.objsubid = 0)")
+        && canonical.ends_with("order by 1, 2, 3")
+}
+
+pub(super) fn try_execute_relation_description_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    let (columns, rows) = if canonical == pg_catalog_descriptions_query()
+        || canonical == pg_catalog_descriptions_with_sequences_query()
+        || canonical == pg_catalog_descriptions_with_materialized_views_query()
+    {
+        (
+            vec![
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("attname"),
+                text_column("description"),
+            ],
+            pg_catalog_description_rows(session),
+        )
+    } else if canonical == pg_catalog_table_descriptions_query() {
+        (
+            vec![
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("attname"),
+                text_column("description"),
+            ],
+            pg_catalog_table_description_rows(session),
+        )
+    } else if canonical == pg_catalog_constraint_descriptions_query() {
+        (
+            vec![
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("conname"),
+                text_column("description"),
+            ],
+            pg_catalog_constraint_description_rows(session),
+        )
+    } else if canonical == pg_catalog_table_index_descriptions_query()
+        || canonical == pg_catalog_table_index_sequence_descriptions_query()
+        || canonical == pg_catalog_table_index_sequence_matview_descriptions_query()
+    {
+        (
+            vec![
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("relkind"),
+                text_column("attname"),
+                text_column("description"),
+            ],
+            pg_catalog_table_index_description_rows(session),
+        )
+    } else if canonical == pg_catalog_table_index_descriptions_without_views_query() {
+        (
+            vec![
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("relkind"),
+                text_column("attname"),
+                text_column("description"),
+            ],
+            pg_catalog_table_index_description_rows_without_views(session),
+        )
+    } else if psql_list_object_descriptions_query(canonical) {
+        (
+            vec![
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Object"),
+                text_column("Description"),
+            ],
+            psql_object_description_rows(session),
+        )
+    } else {
+        return None;
+    };
+    Some(write_single_row(stream, &columns, &rows))
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    pg_catalog_description_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_table_description_rows(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    pg_catalog_table_description_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_constraint_description_rows(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    pg_catalog_constraint_description_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_table_descriptions_query() -> &'static str {
+    pg_catalog_table_descriptions_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    psql_object_description_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_object_descriptions_query(canonical: &str) -> bool {
+    psql_list_object_descriptions_query(canonical)
+}
 
 fn shared_catalog_contains_table(table: &str) -> bool {
     shared_catalog()

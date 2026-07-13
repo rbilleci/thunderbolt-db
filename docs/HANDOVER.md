@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001CO:** move the five contiguous later relation-description route blocks plus private query/row
-   helpers into the existing comment owner, preserving exact predicates, metadata, and stage precedence.
+1. **STRUCT-001CP:** move the direct public-schema description route plus its private query/row helpers into the
+   existing comment owner, preserving exact existence behavior, metadata, and its earlier stage precedence.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

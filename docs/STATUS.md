@@ -848,6 +848,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   hard-coded database/schema/owner/capability fields, limited visibility semantics, and absent GPU-native catalog
   execution. Full protocol/driver/security/formatting gates, focused view/catalog tests, fresh real-psql scenario
   309, and independent audit are clean. The root is 7,640 lines and STRUCT-001CN is closed.
+  The six later relation-description routes now execute from the existing private 888-line `catalog_comments`
+  owner behind one tri-state delegate. Nine exact query literals, one structural psql predicate, and six row
+  builders are byte-identical moves; all implementation helpers remain private and the only new exposure is the
+  production delegate plus six proven `cfg(test)` aliases. The exact post-attrdef/pre-type stage, branch order,
+  columns, row widths, null positions, relation/object labels, table/column/index/view/materialized-view/sequence/
+  publication/subscription/constraint comment coverage, family sorting, and live-index filtering are unchanged.
+  Inherited PRODUCT-002 debt remains: brittle exact/structural SQL matching, host/session-backed comments and CPU
+  sorting, public-only metadata, query variants sharing broader row builders, incomplete psql object-class
+  emulation, hidden orphan-index comments, and absent GPU-native catalog execution. Full protocol/driver/security/
+  formatting gates, focused comment/constraint/shared-catalog tests, PostgreSQL 16 scenarios 43/305/311/330/331,
+  and independent audit are clean. The root is 7,186 lines and STRUCT-001CO is closed.
 
 ## Known boundaries
 
