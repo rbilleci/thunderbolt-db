@@ -783,6 +783,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   filtering, and comments only in the verbose projection. Full protocol/driver/security/formatting gates and
   independent audit are clean. Fresh PostgreSQL 18 scenarios 50/330 retain exact sequence rows/comments/state
   and differ only in known client wording/query drift. The root is 8,214 lines and STRUCT-001CG is closed.
+  The normal/verbose psql stored-view and materialized-view listings now execute from the existing private
+  722-line `view_ddl` owner behind one tri-state delegate. All four query literals, all four sorted row builders,
+  and all four route bodies are exact moves; helpers remain private and the only new test exposure is four query
+  aliases. Dispatcher position, equality, columns, public/type/owner/persistence/access-method/size constants,
+  null stored-view size, comment targets, and name order are unchanged. Inherited PRODUCT-002 debt remains:
+  exact client-version literals, hard-coded public/postgres/permanent/heap/static-size metadata, no application
+  of the encoded visibility predicates to the returned session maps, and legacy host-catalog execution. Full
+  protocol/driver/security/formatting gates, focused view/comment/shared-catalog tests, fresh real-psql scenarios
+  49/50/309/331, and independent audit are clean. The root is 8,068 lines and STRUCT-001CH is closed.
 
 ## Known boundaries
 

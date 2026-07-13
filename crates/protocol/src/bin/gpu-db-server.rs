@@ -104,7 +104,14 @@ use index_ddl::execute_index_ddl;
 use index_ddl::rename_index_in_session;
 #[path = "gpu-db-server/view_ddl.rs"]
 mod view_ddl;
-use view_ddl::execute_view_ddl;
+use view_ddl::{execute_view_ddl, try_execute_view_catalog_query};
+#[cfg(test)]
+use view_ddl::{
+    test_psql_describe_materialized_views_catalog_query as psql_describe_materialized_views_catalog_query,
+    test_psql_describe_materialized_views_verbose_catalog_query as psql_describe_materialized_views_verbose_catalog_query,
+    test_psql_describe_views_catalog_query as psql_describe_views_catalog_query,
+    test_psql_describe_views_verbose_catalog_query as psql_describe_views_verbose_catalog_query,
+};
 #[path = "gpu-db-server/function_execution.rs"]
 mod function_execution;
 use function_execution::execute_function_command;
@@ -1553,60 +1560,8 @@ fn execute_statement(
             &psql_describe_index_rows(session),
         );
     }
-    if canonical == psql_describe_views_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Type"),
-                text_column("Owner"),
-            ],
-            &psql_describe_view_rows(session),
-        );
-    }
-    if canonical == psql_describe_views_verbose_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Type"),
-                text_column("Owner"),
-                text_column("Persistence"),
-                text_column("Size"),
-                text_column("Description"),
-            ],
-            &psql_describe_view_verbose_rows(session),
-        );
-    }
-    if canonical == psql_describe_materialized_views_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Type"),
-                text_column("Owner"),
-            ],
-            &psql_describe_materialized_view_rows(session),
-        );
-    }
-    if canonical == psql_describe_materialized_views_verbose_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Type"),
-                text_column("Owner"),
-                text_column("Persistence"),
-                text_column("Access method"),
-                text_column("Size"),
-                text_column("Description"),
-            ],
-            &psql_describe_materialized_view_verbose_rows(session),
-        );
+    if let Some(result) = try_execute_view_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_sequence_catalog_query(stream, session, &canonical) {
         return result;
@@ -3116,22 +3071,6 @@ fn psql_describe_indexes_catalog_query_schema_filter(canonical: &str) -> Option<
     let suffix = ")$' collate pg_catalog.default order by 1,2";
     let namespace = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
     (namespace == "public").then(|| namespace.to_string())
-}
-
-fn psql_describe_views_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind in ('v','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
-}
-
-fn psql_describe_views_verbose_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind in ('v','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
-}
-
-fn psql_describe_materialized_views_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('m','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
-}
-
-fn psql_describe_materialized_views_verbose_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", am.amname as \"access method\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('m','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
 }
 
 fn psql_describe_functions_catalog_query() -> &'static str {
@@ -7144,91 +7083,6 @@ fn pg_catalog_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some(view.name.clone()),
                 Some("postgres".to_string()),
                 Some(view.definition.clone()),
-            ]
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left[1].cmp(&right[1]));
-    rows
-}
-
-fn psql_describe_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .views
-        .values()
-        .map(|view| {
-            vec![
-                Some("public".to_string()),
-                Some(view.name.clone()),
-                Some("view".to_string()),
-                Some("postgres".to_string()),
-            ]
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left[1].cmp(&right[1]));
-    rows
-}
-
-fn psql_describe_view_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .views
-        .values()
-        .map(|view| {
-            vec![
-                Some("public".to_string()),
-                Some(view.name.clone()),
-                Some("view".to_string()),
-                Some("postgres".to_string()),
-                Some("permanent".to_string()),
-                None,
-                session
-                    .comments
-                    .get(&CatalogCommentTarget::View {
-                        view: view.name.clone(),
-                    })
-                    .cloned(),
-            ]
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left[1].cmp(&right[1]));
-    rows
-}
-
-fn psql_describe_materialized_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .materialized_views
-        .values()
-        .map(|view| {
-            vec![
-                Some("public".to_string()),
-                Some(view.name.clone()),
-                Some("materialized view".to_string()),
-                Some("postgres".to_string()),
-            ]
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left[1].cmp(&right[1]));
-    rows
-}
-
-fn psql_describe_materialized_view_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = session
-        .materialized_views
-        .values()
-        .map(|view| {
-            vec![
-                Some("public".to_string()),
-                Some(view.name.clone()),
-                Some("materialized view".to_string()),
-                Some("postgres".to_string()),
-                Some("permanent".to_string()),
-                Some("heap".to_string()),
-                Some("0 bytes".to_string()),
-                session
-                    .comments
-                    .get(&CatalogCommentTarget::MaterializedView {
-                        materialized_view: view.name.clone(),
-                    })
-                    .cloned(),
             ]
         })
         .collect::<Vec<_>>();
