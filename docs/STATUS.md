@@ -1794,6 +1794,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   check, strict execution/engine clippy, source/diff/docs gates, and independent audit are clean. The execution
   root is 9,314 lines. No live call path, kernel, layout, or result behavior changed, so HAZARD and report-card
   gates were not applicable.
+  STRUCT-001FY then isolated the six resident int4 SUM/scalar-statistics APIs, `CudaI32Stats` and its raw result
+  layout, and the three reduction launcher/PTX owners in the rustfmt-clean 1,083-line `resident_scalar.rs` child,
+  reducing the execution root to 8,244 lines. All four source spans are normalized-exact against the prior root.
+  The private child preserves the crate-root `CudaI32Stats` re-export and inherent method paths; shared
+  `CudaI32Comparison` remains root-owned for both scalar and count consumers, and scalar depends one-way on the
+  existing resident-count bitmap validator with no reverse edge, cycle, or visibility expansion. The five direct
+  SUM/unfiltered/filtered/nullable/BETWEEN GPU families passed 15 sequential plus ten concurrent invocations
+  without device faults. Execution passes 54/81 and engine passes 505/487 with the GPU sweep serial; workspace
+  all-target/all-feature check, strict execution/engine clippy, source/reference/scoped-format/diff gates, and
+  independent audit are clean. PTX symbols/ABIs/bodies, validation, NULL/empty/sentinel/overflow behavior,
+  geometry, initialization, stream/lease/error lifetime, bounded scalar readback, and callers are
+  source-equivalent, so the report card was not applicable.
 
 ## Known boundaries
 

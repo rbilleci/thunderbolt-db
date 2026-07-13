@@ -34,15 +34,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FX is closed. The unconsumed host-reduced filtered-int4 stats facade and stale live references are
   deleted; the sole former engine route has used the direct GPU scalar reducer since `6bc6b188`. Full suites,
   static gates, source/history audit, and independent audit pass.
+- STRUCT-001FY is closed. The six resident int4 SUM/statistics APIs, result contract, and three reduction
+  launcher/PTX owners now live in the private 1,083-line `resident_scalar.rs` child; the execution root is 8,244
+  lines. Its five-family HAZARD matrix, complete suites, static gates, and normalized-exact audit pass.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001:** resume the ordered oversized-file inventory at `crates/execution/src/lib.rs`; the next coherent
-   boundary to analyze is resident int4 scalar SUM/stats ownership. Do not let structural extraction implicitly
-   decide **R3-001**.
+1. **STRUCT-001:** resume the ordered oversized-file inventory at `crates/execution/src/lib.rs`; analyze the
+   remaining resident int4 projection and ordered-compaction ownership without letting structural extraction
+   implicitly decide **R3-001**.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
 4. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
