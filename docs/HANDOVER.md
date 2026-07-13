@@ -29,13 +29,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - The `engine_residency` disposition is complete. Its 76 tests and all production responsibilities now live in
   bounded invariant-owned modules; the stable facade root is 609 lines. STRUCT-001FC's exact route/control move,
   full suites, 20 GPU route invocations, static gates, and independent audit are clean.
+- STRUCT-001FD is closed: normalized-exact join-coordinate window/rank/shift ownership now lives in bounded
+  `join_window.rs`; all full/static gates, the nine-serial/six-concurrent GPU matrix, and audit are clean.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FD:** isolate execution join-coordinate window/rank/shift ownership in `join_window.rs` without
-   changing crate-root APIs, device semantics, PTX ABI, launch geometry, or bounded final readback.
+1. **STRUCT-001FE:** isolate execution join-coordinate materialization, concatenation, and final typed projection
+   ownership without changing crate-root APIs, device layouts, PTX ABI, NULL semantics, or bounded readback.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

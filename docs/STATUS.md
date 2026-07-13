@@ -1539,6 +1539,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   strict clippy, dependency-boundary/scoped source/reference/format checks, and independent audit are clean.
   Route decisions, reasons, estimates, counters, status, fallback, runtime, layout, and result behavior are byte-
   identical, so the report card was not applicable.
+  STRUCT-001FD then isolated the normalized-exact join-coordinate window/rank/shift owner in the rustfmt-clean
+  1,076-line `join_window.rs` child, reducing the execution root to 17,032 lines. The only visibility change is
+  the narrow `pub(super)` window-launcher bridge required by the existing root sort owner; crate-root public
+  types and inherent APIs are unchanged. The three core GPU gates passed nine sequential plus six concurrent
+  invocations with zero CUDA 700/716/717. Both execution modes passed 48/78, both engine modes passed 505/487,
+  and workspace all-target check, strict execution/engine clippy, dependency/scoped source/reference/format
+  checks, and independent audit are clean. PTX, ABI, geometry, partition/peer/NULL, shift, window, rank, error,
+  synchronization, allocation, and bounded-readback behavior are source-equivalent, so the report card was not
+  applicable.
 
 ## Known boundaries
 
