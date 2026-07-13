@@ -1,12 +1,67 @@
 // Legacy index DDL ownership. This is not a product execution path.
 
 use super::{
-    rename_index_in_session, schema_permission_error, validate_unique_indexes,
-    write_command_complete, write_error, CatalogCommentTarget, CatalogIndex, Command, ErrorField,
-    ReadWrite, SchemaPrivilege, Session,
+    schema_permission_error, validate_unique_indexes, write_command_complete, write_error,
+    CatalogCommentTarget, CatalogIndex, Command, ErrorField, ReadWrite, SchemaPrivilege, Session,
 };
 use std::collections::BTreeSet;
 use std::io;
+
+pub(super) fn rename_index_in_session(
+    session: &mut Session,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), ErrorField> {
+    if session.indexes.iter().any(|index| index.name == new_name)
+        || session.tables.contains_key(new_name)
+        || session.views.contains_key(new_name)
+        || session.materialized_views.contains_key(new_name)
+        || session.sequences.contains_key(new_name)
+    {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    let Some(index) = session
+        .indexes
+        .iter_mut()
+        .find(|index| index.name == old_name)
+    else {
+        return Err(ErrorField {
+            code: "42704",
+            message: "index does not exist",
+            position: None,
+        });
+    };
+    if index.primary_key || index.unique_constraint {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "cannot rename constraint-backed index with ALTER INDEX",
+            position: None,
+        });
+    }
+    let table_name = index.table.clone();
+    index.name = new_name.to_string();
+    session.dirty_indexes = true;
+    session.mark_table_dirty(table_name);
+
+    let old_target = CatalogCommentTarget::Index {
+        index: old_name.to_string(),
+    };
+    if let Some(comment) = session.comments.remove(&old_target) {
+        let new_target = CatalogCommentTarget::Index {
+            index: new_name.to_string(),
+        };
+        session.comments.insert(new_target.clone(), comment);
+        session.mark_comment_dirty(old_target);
+        session.mark_comment_dirty(new_target);
+    }
+
+    session.persist_catalog_snapshot();
+    Ok(())
+}
 
 pub(super) fn execute_index_ddl(
     stream: &mut dyn ReadWrite,

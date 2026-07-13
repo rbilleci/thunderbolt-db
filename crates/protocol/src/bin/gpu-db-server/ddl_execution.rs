@@ -9,13 +9,144 @@ use super::{
     add_primary_key_to_session, add_unique_constraint_to_session, column_default_matches_type,
     create_implicit_sequence, drop_column_from_session, evaluate_column_default,
     preflight_column_default_target, rename_column_in_session, rename_constraint_in_session,
-    rename_table_in_session, resolve_column_domain_type, schema_permission_error,
-    validate_foreign_keys, write_command_complete, write_error, CatalogColumn,
-    CatalogCommentTarget, ColumnDefault, Command, ErrorField, ReadWrite, SchemaPrivilege, Session,
-    Table,
+    resolve_column_domain_type, schema_permission_error, validate_foreign_keys,
+    write_command_complete, write_error, CatalogColumn, CatalogCommentTarget, ColumnDefault,
+    Command, ErrorField, ReadWrite, SchemaPrivilege, Session, Table,
 };
 use std::collections::BTreeSet;
 use std::io;
+
+pub(super) fn rename_table_in_session(
+    session: &mut Session,
+    old_name: &str,
+    new_name: &str,
+    if_exists: bool,
+) -> Result<(), ErrorField> {
+    if session.views.contains_key(old_name)
+        || session.materialized_views.contains_key(old_name)
+        || session.sequences.contains_key(old_name)
+    {
+        return Err(ErrorField {
+            code: "42809",
+            message: "relation is not a table",
+            position: None,
+        });
+    }
+    if !session.tables.contains_key(old_name) {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    }
+    if session.tables.contains_key(new_name)
+        || session.views.contains_key(new_name)
+        || session.materialized_views.contains_key(new_name)
+        || session.sequences.contains_key(new_name)
+    {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    if session
+        .views
+        .values()
+        .any(|view| view.query.table == old_name)
+    {
+        return Err(ErrorField {
+            code: "2BP01",
+            message: "cannot rename relation because a view depends on it",
+            position: None,
+        });
+    }
+    let Some(mut table) = session.tables.remove(old_name) else {
+        return Ok(());
+    };
+    table.name = new_name.to_string();
+    session.tables.insert(new_name.to_string(), table);
+    if let Some(acl) = session.table_acls.remove(old_name) {
+        session.table_acls.insert(new_name.to_string(), acl);
+        session.mark_table_acl_dirty(old_name.to_string());
+        session.mark_table_acl_dirty(new_name.to_string());
+    }
+    for index in &mut session.indexes {
+        if index.table == old_name {
+            index.table = new_name.to_string();
+            session.dirty_indexes = true;
+        }
+    }
+    let mut dirty_fk_tables = Vec::new();
+    for table in session.tables.values_mut() {
+        let mut changed = false;
+        for foreign_key in &mut table.foreign_keys {
+            if foreign_key.table == old_name {
+                foreign_key.table = new_name.to_string();
+                changed = true;
+            }
+            if foreign_key.referenced_table == old_name {
+                foreign_key.referenced_table = new_name.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            dirty_fk_tables.push(table.name.clone());
+        }
+    }
+    for table in dirty_fk_tables {
+        session.mark_table_dirty(table);
+    }
+
+    let mut retargeted_comments = Vec::new();
+    let old_targets = session
+        .comments
+        .iter()
+        .filter_map(|(target, comment)| match target {
+            CatalogCommentTarget::Table { table } if table == old_name => Some((
+                target.clone(),
+                CatalogCommentTarget::Table {
+                    table: new_name.to_string(),
+                },
+                comment.clone(),
+            )),
+            CatalogCommentTarget::Column { table, attnum } if table == old_name => Some((
+                target.clone(),
+                CatalogCommentTarget::Column {
+                    table: new_name.to_string(),
+                    attnum: *attnum,
+                },
+                comment.clone(),
+            )),
+            CatalogCommentTarget::Constraint { table, constraint } if table == old_name => Some((
+                target.clone(),
+                CatalogCommentTarget::Constraint {
+                    table: new_name.to_string(),
+                    constraint: constraint.clone(),
+                },
+                comment.clone(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (old_target, new_target, comment) in old_targets {
+        session.comments.remove(&old_target);
+        retargeted_comments.push((old_target, new_target, comment));
+    }
+    for (old_target, new_target, comment) in retargeted_comments {
+        session.comments.insert(new_target.clone(), comment);
+        session.mark_comment_dirty(old_target);
+        session.mark_comment_dirty(new_target);
+    }
+
+    session.mark_table_dirty(old_name.to_string());
+    session.mark_table_dirty(new_name.to_string());
+    session.persist_catalog_snapshot();
+    Ok(())
+}
 
 pub(super) fn try_execute_ddl_statement(
     stream: &mut dyn ReadWrite,

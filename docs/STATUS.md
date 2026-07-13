@@ -664,6 +664,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   no new export or dependency edge was added. Full protocol and driver gates, all-target checks, warning-denied
   clippy, security preflight, focused view/shared-catalog tests, formatting/diff checks, and independent audit are
   clean. The root is 10,857 lines and STRUCT-001BT is closed.
+  Table, index, sequence, and function rename mutations now live in their sole existing private command owners;
+  each helper is visible to the parent only for unchanged direct tests, and root aliases are `cfg(test)` only.
+  Kind/existence/dependency precedence; table, foreign-key, index, ACL, currval and comment retargeting; dirty
+  state; persistence; errors; and no-op paths are exact moves. Inherited PRODUCT-002 debt is not strengthened:
+  sequence rename still does not retarget stored `SequenceNextVal` defaults, and table rename neither blocks nor
+  retargets dependent materialized-view source names, which can make later refresh fail. Full protocol and driver
+  gates, all-target checks, warning-denied clippy, security preflight, four focused rename persistence tests,
+  formatting/diff checks, and independent audit are clean. The root is 10,563 lines; `ddl_execution`,
+  `index_ddl`, `sequence_execution`, and `function_execution` are 1,045, 216, 288, and 326 lines respectively;
+  STRUCT-001BU is closed.
 
 ## Known boundaries
 

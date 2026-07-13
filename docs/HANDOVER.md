@@ -29,9 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BU:** move the sole-consumer table/index/sequence/function rename helpers into their existing
-   private command owners, preserving dependency and metadata/ACL/comment retargeting semantics and retaining
-   direct-test access through test-only root aliases only.
+1. **STRUCT-001BV:** isolate shared unique-index, check-constraint, and foreign-key validation plus exact violation
+   constructors in a private owner with only three narrow validator exports for existing DDL/DML/COPY callers.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

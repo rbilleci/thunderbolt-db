@@ -2,12 +2,56 @@
 
 use super::{
     column_for_sql_type, format_sql_value, function_access_permission_error,
-    rename_function_in_session, schema_permission_error, schema_usage_permission_error,
-    write_command_complete, write_error, write_select_rows, CatalogCommentTarget, Command,
-    ErrorField, FunctionInfo, ReadWrite, SchemaPrivilege, SelectResult, Session, SqlType, SqlValue,
+    schema_permission_error, schema_usage_permission_error, write_command_complete, write_error,
+    write_select_rows, CatalogCommentTarget, Command, ErrorField, FunctionInfo, ReadWrite,
+    SchemaPrivilege, SelectResult, Session, SqlType, SqlValue,
 };
 use std::collections::BTreeMap;
 use std::io;
+
+pub(super) fn rename_function_in_session(
+    session: &mut Session,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), ErrorField> {
+    if !session.functions.contains_key(old_name) {
+        return Err(ErrorField {
+            code: "42883",
+            message: "function does not exist",
+            position: None,
+        });
+    }
+    if session.functions.contains_key(new_name) {
+        return Err(ErrorField {
+            code: "42723",
+            message: "function already exists with same argument types",
+            position: None,
+        });
+    }
+    let mut function = session
+        .functions
+        .remove(old_name)
+        .expect("function existence validated");
+    function.name = new_name.to_string();
+    session.functions.insert(new_name.to_string(), function);
+    session.mark_function_dirty(old_name.to_string());
+    session.mark_function_dirty(new_name.to_string());
+
+    let old_target = CatalogCommentTarget::Function {
+        function: old_name.to_string(),
+    };
+    if let Some(comment) = session.comments.remove(&old_target) {
+        let new_target = CatalogCommentTarget::Function {
+            function: new_name.to_string(),
+        };
+        session.comments.insert(new_target.clone(), comment);
+        session.mark_comment_dirty(old_target);
+        session.mark_comment_dirty(new_target);
+    }
+
+    session.persist_catalog_snapshot();
+    Ok(())
+}
 
 pub(super) fn execute_function_command(
     stream: &mut dyn ReadWrite,

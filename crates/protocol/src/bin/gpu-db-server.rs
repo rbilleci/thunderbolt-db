@@ -76,6 +76,8 @@ use ddl_syntax::{
 };
 #[path = "gpu-db-server/ddl_execution.rs"]
 mod ddl_execution;
+#[cfg(test)]
+use ddl_execution::rename_table_in_session;
 use ddl_execution::{execute_parsed_table_ddl, try_execute_ddl_statement};
 #[path = "gpu-db-server/session_compat.rs"]
 mod session_compat;
@@ -95,6 +97,8 @@ use cluster_ddl::execute_cluster_ddl;
 #[path = "gpu-db-server/index_ddl.rs"]
 mod index_ddl;
 use index_ddl::execute_index_ddl;
+#[cfg(test)]
+use index_ddl::rename_index_in_session;
 #[path = "gpu-db-server/view_ddl.rs"]
 mod view_ddl;
 use view_ddl::execute_view_ddl;
@@ -102,10 +106,12 @@ use view_ddl::execute_view_ddl;
 mod function_execution;
 use function_execution::execute_function_command;
 #[cfg(test)]
-use function_execution::execute_function_result;
+use function_execution::{execute_function_result, rename_function_in_session};
 #[path = "gpu-db-server/sequence_execution.rs"]
 mod sequence_execution;
 use sequence_execution::execute_sequence_command;
+#[cfg(test)]
+use sequence_execution::rename_sequence_in_session;
 #[path = "gpu-db-server/domain_ddl.rs"]
 mod domain_ddl;
 use domain_ddl::execute_domain_ddl;
@@ -817,306 +823,6 @@ fn rename_constraint_in_session(
         session.mark_comment_dirty(new_constraint_target);
     }
 
-    session.persist_catalog_snapshot();
-    Ok(())
-}
-
-fn rename_index_in_session(
-    session: &mut Session,
-    old_name: &str,
-    new_name: &str,
-) -> Result<(), ErrorField> {
-    if session.indexes.iter().any(|index| index.name == new_name)
-        || session.tables.contains_key(new_name)
-        || session.views.contains_key(new_name)
-        || session.materialized_views.contains_key(new_name)
-        || session.sequences.contains_key(new_name)
-    {
-        return Err(ErrorField {
-            code: "42P07",
-            message: "relation already exists",
-            position: None,
-        });
-    }
-    let Some(index) = session
-        .indexes
-        .iter_mut()
-        .find(|index| index.name == old_name)
-    else {
-        return Err(ErrorField {
-            code: "42704",
-            message: "index does not exist",
-            position: None,
-        });
-    };
-    if index.primary_key || index.unique_constraint {
-        return Err(ErrorField {
-            code: "0A000",
-            message: "cannot rename constraint-backed index with ALTER INDEX",
-            position: None,
-        });
-    }
-    let table_name = index.table.clone();
-    index.name = new_name.to_string();
-    session.dirty_indexes = true;
-    session.mark_table_dirty(table_name);
-
-    let old_target = CatalogCommentTarget::Index {
-        index: old_name.to_string(),
-    };
-    if let Some(comment) = session.comments.remove(&old_target) {
-        let new_target = CatalogCommentTarget::Index {
-            index: new_name.to_string(),
-        };
-        session.comments.insert(new_target.clone(), comment);
-        session.mark_comment_dirty(old_target);
-        session.mark_comment_dirty(new_target);
-    }
-
-    session.persist_catalog_snapshot();
-    Ok(())
-}
-
-fn rename_sequence_in_session(
-    session: &mut Session,
-    old_name: &str,
-    new_name: &str,
-) -> Result<(), ErrorField> {
-    if session.tables.contains_key(old_name)
-        || session.views.contains_key(old_name)
-        || session.materialized_views.contains_key(old_name)
-    {
-        return Err(ErrorField {
-            code: "42809",
-            message: "relation is not a sequence",
-            position: None,
-        });
-    }
-    if !session.sequences.contains_key(old_name) {
-        return Err(ErrorField {
-            code: "42P01",
-            message: "sequence does not exist",
-            position: None,
-        });
-    }
-    if session.tables.contains_key(new_name)
-        || session.views.contains_key(new_name)
-        || session.materialized_views.contains_key(new_name)
-        || session.sequences.contains_key(new_name)
-    {
-        return Err(ErrorField {
-            code: "42P07",
-            message: "relation already exists",
-            position: None,
-        });
-    }
-    let mut sequence = session
-        .sequences
-        .remove(old_name)
-        .expect("sequence existence validated");
-    sequence.name = new_name.to_string();
-    session.sequences.insert(new_name.to_string(), sequence);
-    if let Some(value) = session.currval_sequences.remove(old_name) {
-        session
-            .currval_sequences
-            .insert(new_name.to_string(), value);
-    }
-    if let Some(acl) = session.table_acls.remove(old_name) {
-        session.table_acls.insert(new_name.to_string(), acl);
-        session.mark_table_acl_dirty(old_name.to_string());
-        session.mark_table_acl_dirty(new_name.to_string());
-    }
-    session.mark_sequence_dirty(old_name.to_string());
-    session.mark_sequence_dirty(new_name.to_string());
-
-    let old_target = CatalogCommentTarget::Sequence {
-        sequence: old_name.to_string(),
-    };
-    if let Some(comment) = session.comments.remove(&old_target) {
-        let new_target = CatalogCommentTarget::Sequence {
-            sequence: new_name.to_string(),
-        };
-        session.comments.insert(new_target.clone(), comment);
-        session.mark_comment_dirty(old_target);
-        session.mark_comment_dirty(new_target);
-    }
-
-    session.persist_catalog_snapshot();
-    Ok(())
-}
-
-fn rename_function_in_session(
-    session: &mut Session,
-    old_name: &str,
-    new_name: &str,
-) -> Result<(), ErrorField> {
-    if !session.functions.contains_key(old_name) {
-        return Err(ErrorField {
-            code: "42883",
-            message: "function does not exist",
-            position: None,
-        });
-    }
-    if session.functions.contains_key(new_name) {
-        return Err(ErrorField {
-            code: "42723",
-            message: "function already exists with same argument types",
-            position: None,
-        });
-    }
-    let mut function = session
-        .functions
-        .remove(old_name)
-        .expect("function existence validated");
-    function.name = new_name.to_string();
-    session.functions.insert(new_name.to_string(), function);
-    session.mark_function_dirty(old_name.to_string());
-    session.mark_function_dirty(new_name.to_string());
-
-    let old_target = CatalogCommentTarget::Function {
-        function: old_name.to_string(),
-    };
-    if let Some(comment) = session.comments.remove(&old_target) {
-        let new_target = CatalogCommentTarget::Function {
-            function: new_name.to_string(),
-        };
-        session.comments.insert(new_target.clone(), comment);
-        session.mark_comment_dirty(old_target);
-        session.mark_comment_dirty(new_target);
-    }
-
-    session.persist_catalog_snapshot();
-    Ok(())
-}
-
-fn rename_table_in_session(
-    session: &mut Session,
-    old_name: &str,
-    new_name: &str,
-    if_exists: bool,
-) -> Result<(), ErrorField> {
-    if session.views.contains_key(old_name)
-        || session.materialized_views.contains_key(old_name)
-        || session.sequences.contains_key(old_name)
-    {
-        return Err(ErrorField {
-            code: "42809",
-            message: "relation is not a table",
-            position: None,
-        });
-    }
-    if !session.tables.contains_key(old_name) {
-        if if_exists {
-            return Ok(());
-        }
-        return Err(ErrorField {
-            code: "42P01",
-            message: "relation does not exist",
-            position: None,
-        });
-    }
-    if session.tables.contains_key(new_name)
-        || session.views.contains_key(new_name)
-        || session.materialized_views.contains_key(new_name)
-        || session.sequences.contains_key(new_name)
-    {
-        return Err(ErrorField {
-            code: "42P07",
-            message: "relation already exists",
-            position: None,
-        });
-    }
-    if session
-        .views
-        .values()
-        .any(|view| view.query.table == old_name)
-    {
-        return Err(ErrorField {
-            code: "2BP01",
-            message: "cannot rename relation because a view depends on it",
-            position: None,
-        });
-    }
-    let Some(mut table) = session.tables.remove(old_name) else {
-        return Ok(());
-    };
-    table.name = new_name.to_string();
-    session.tables.insert(new_name.to_string(), table);
-    if let Some(acl) = session.table_acls.remove(old_name) {
-        session.table_acls.insert(new_name.to_string(), acl);
-        session.mark_table_acl_dirty(old_name.to_string());
-        session.mark_table_acl_dirty(new_name.to_string());
-    }
-    for index in &mut session.indexes {
-        if index.table == old_name {
-            index.table = new_name.to_string();
-            session.dirty_indexes = true;
-        }
-    }
-    let mut dirty_fk_tables = Vec::new();
-    for table in session.tables.values_mut() {
-        let mut changed = false;
-        for foreign_key in &mut table.foreign_keys {
-            if foreign_key.table == old_name {
-                foreign_key.table = new_name.to_string();
-                changed = true;
-            }
-            if foreign_key.referenced_table == old_name {
-                foreign_key.referenced_table = new_name.to_string();
-                changed = true;
-            }
-        }
-        if changed {
-            dirty_fk_tables.push(table.name.clone());
-        }
-    }
-    for table in dirty_fk_tables {
-        session.mark_table_dirty(table);
-    }
-
-    let mut retargeted_comments = Vec::new();
-    let old_targets = session
-        .comments
-        .iter()
-        .filter_map(|(target, comment)| match target {
-            CatalogCommentTarget::Table { table } if table == old_name => Some((
-                target.clone(),
-                CatalogCommentTarget::Table {
-                    table: new_name.to_string(),
-                },
-                comment.clone(),
-            )),
-            CatalogCommentTarget::Column { table, attnum } if table == old_name => Some((
-                target.clone(),
-                CatalogCommentTarget::Column {
-                    table: new_name.to_string(),
-                    attnum: *attnum,
-                },
-                comment.clone(),
-            )),
-            CatalogCommentTarget::Constraint { table, constraint } if table == old_name => Some((
-                target.clone(),
-                CatalogCommentTarget::Constraint {
-                    table: new_name.to_string(),
-                    constraint: constraint.clone(),
-                },
-                comment.clone(),
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    for (old_target, new_target, comment) in old_targets {
-        session.comments.remove(&old_target);
-        retargeted_comments.push((old_target, new_target, comment));
-    }
-    for (old_target, new_target, comment) in retargeted_comments {
-        session.comments.insert(new_target.clone(), comment);
-        session.mark_comment_dirty(old_target);
-        session.mark_comment_dirty(new_target);
-    }
-
-    session.mark_table_dirty(old_name.to_string());
-    session.mark_table_dirty(new_name.to_string());
     session.persist_catalog_snapshot();
     Ok(())
 }

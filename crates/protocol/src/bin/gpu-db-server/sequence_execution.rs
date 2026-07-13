@@ -1,13 +1,81 @@
 // Legacy sequence ownership. This is not a product execution path.
 
 use super::{
-    int8_column, next_sequence_value, object_access_permission_error, rename_sequence_in_session,
-    schema_permission_error, sequence_target_error, write_command_complete, write_error,
-    write_select_rows, CatalogCommentTarget, Command, ErrorField, ReadWrite, SchemaPrivilege,
-    Sequence, Session, TablePrivilege,
+    int8_column, next_sequence_value, object_access_permission_error, schema_permission_error,
+    sequence_target_error, write_command_complete, write_error, write_select_rows,
+    CatalogCommentTarget, Command, ErrorField, ReadWrite, SchemaPrivilege, Sequence, Session,
+    TablePrivilege,
 };
 use std::collections::BTreeSet;
 use std::io;
+
+pub(super) fn rename_sequence_in_session(
+    session: &mut Session,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), ErrorField> {
+    if session.tables.contains_key(old_name)
+        || session.views.contains_key(old_name)
+        || session.materialized_views.contains_key(old_name)
+    {
+        return Err(ErrorField {
+            code: "42809",
+            message: "relation is not a sequence",
+            position: None,
+        });
+    }
+    if !session.sequences.contains_key(old_name) {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "sequence does not exist",
+            position: None,
+        });
+    }
+    if session.tables.contains_key(new_name)
+        || session.views.contains_key(new_name)
+        || session.materialized_views.contains_key(new_name)
+        || session.sequences.contains_key(new_name)
+    {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    let mut sequence = session
+        .sequences
+        .remove(old_name)
+        .expect("sequence existence validated");
+    sequence.name = new_name.to_string();
+    session.sequences.insert(new_name.to_string(), sequence);
+    if let Some(value) = session.currval_sequences.remove(old_name) {
+        session
+            .currval_sequences
+            .insert(new_name.to_string(), value);
+    }
+    if let Some(acl) = session.table_acls.remove(old_name) {
+        session.table_acls.insert(new_name.to_string(), acl);
+        session.mark_table_acl_dirty(old_name.to_string());
+        session.mark_table_acl_dirty(new_name.to_string());
+    }
+    session.mark_sequence_dirty(old_name.to_string());
+    session.mark_sequence_dirty(new_name.to_string());
+
+    let old_target = CatalogCommentTarget::Sequence {
+        sequence: old_name.to_string(),
+    };
+    if let Some(comment) = session.comments.remove(&old_target) {
+        let new_target = CatalogCommentTarget::Sequence {
+            sequence: new_name.to_string(),
+        };
+        session.comments.insert(new_target.clone(), comment);
+        session.mark_comment_dirty(old_target);
+        session.mark_comment_dirty(new_target);
+    }
+
+    session.persist_catalog_snapshot();
+    Ok(())
+}
 
 pub(super) fn execute_sequence_command(
     stream: &mut dyn ReadWrite,
