@@ -560,6 +560,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   absence of relation-OID mutation. Sequential/concurrent 127-test runs, the full protocol package and driver
   smokes, all-target checks, warning-denied clippy, security preflight, touched formatting, diff checks, and
   independent audit are clean. The root is 14,440 lines and STRUCT-001BG is closed.
+  Parsed view/materialized-view lifecycle commands now enter the private 514-line `view_ddl` owner through one
+  exact successful-parse variant gate. CREATE/REFRESH/RENAME/DROP preserve schema permissions, name/kind/
+  existence ordering, SELECT and dependency validation, materialized rows and checked OIDs, ACL/comment movement
+  or removal, dirty keys, persistence, errors, and tags. The seven-arm body is normalized-exact; only clippy-
+  required tail expressions differ. Sequential/concurrent 127-test runs, the full protocol package and driver
+  smokes, all-target checks, warning-denied clippy, security preflight, touched formatting, diff checks, and
+  independent audit are clean. The root is 13,965 lines and STRUCT-001BH is closed.
 
 ## Known boundaries
 
