@@ -1171,6 +1171,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   multiprocess/service/channel-security smokes, targeted formatting/diff/reference checks, and independent
   re-audit are clean. The root is 19,785 lines, with 1,773 production lines before the test facade; STRUCT-001DR
   is the next behavior-preserving ownership leaf.
+  STRUCT-001DR isolated the five operational cluster/transport/election/package/preflight report contracts in a
+  private 208-line `operational` owner with only `Index`, `Role`, and `Term` dependencies. All derives,
+  public fields/types, readiness predicates, operator strings/order, and five crate-root APIs are byte-identical.
+  The exact three-node operational smoke test now lives in a bounded 208-line included file and retains its
+  original fully qualified harness name. The focused test, both 187-test serial/16-thread runs, replication all-
+  target check and strict clippy, cluster output smoke, targeted formatting/diff/reference checks, and independent
+  audit are clean. The root is 19,374 lines with 1,571 production lines before the test facade; STRUCT-001DS is
+  the next acyclic RPC ownership leaf.
 
 ## Known boundaries
 

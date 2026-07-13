@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DR:** move the exact five replication operational-report contracts and their closest smoke test
-   behind stable crate-root re-exports; preserve all fields, predicates, operator output, APIs, and test names.
+1. **STRUCT-001DS:** isolate exact replication RPC data/framing behind stable crate-root re-exports while keeping
+   request application at the Raft orchestration boundary; preserve bytes, validation/errors, APIs, and test names.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
