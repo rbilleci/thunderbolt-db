@@ -35,12 +35,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001EJ is closed: the exact eight-test sparse `deleted_by` family now lives in the bounded 524-line
   `tests/residency_sparse_visibility.rs` owner; exact inventories, 40 GPU invocations, full gates, and audit are
   clean with no production change.
+- STRUCT-001EK is closed: the exact seven-test SQL DELETE/UPDATE and `created_by` family plus its dedicated
+  helper now live in the bounded 748-line `tests/residency_update_visibility.rs` owner; exact inventories, 35
+  GPU invocations, full gates, and audit are clean with no production change.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EK:** externalize the exact seven-test SQL DELETE/UPDATE and `created_by` visibility family.
+1. **STRUCT-001EL:** externalize the exact seven-test cross-shard primary-key index/cache/route family.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

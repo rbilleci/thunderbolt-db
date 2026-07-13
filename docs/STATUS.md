@@ -1354,7 +1354,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   lines, and the 992-test/76-family inventories remain exact. The eight GPU gates passed 24 sequential and 16
   concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target check,
   strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No production or
-  architectural behavior changed, so the report card was not applicable. STRUCT-001EK is next.
+  architectural behavior changed, so the report card was not applicable.
+  STRUCT-001EK externalized the exact seven-test SQL DELETE/UPDATE and `created_by` visibility family plus its
+  sole `device_row_id_for` helper into the rustfmt-clean 748-line `tests/residency_update_visibility.rs` owner at
+  the same parent position. Normalized comparison differs only by one rustfmt wrap; all bodies, attributes,
+  names, and order remain unchanged, while shared sparse-region helpers stay at the parent facade. The engine
+  root is 10,886 lines, and the 992-test/76-family inventories remain exact. Seven GPU gates passed 21 sequential
+  and 14 concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target
+  check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No production
+  or architectural behavior changed, so the report card was not applicable. STRUCT-001EL is next.
 
 ## Known boundaries
 
