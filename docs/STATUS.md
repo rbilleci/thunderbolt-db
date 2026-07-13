@@ -307,6 +307,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   `sum_i32` measured 1,430.2/1,439.1 GB/s, `count_i32_compare` measured 0.92x/1.02x same-run roofline,
   grouped aggregation measured 1,676.6 M elements/s, and 65,536-batch point reads measured 243.4M/251.4M
   lookups/s at p50 139/132us.
+  The bounded device-final uniqueness authorization kernel now lives in the private 195-line
+  `execution::unique_coordinate` module. Its normalized source is byte-identical apart from required
+  `pub(super)` visibility (independent hashes match); PTX/symbol/ABI, candidate and exclusion H2D marshaling,
+  threshold semantics, cached function, pooled lifetimes/error draining, one-u32 readback, public inherent
+  facade, and engine callers are unchanged. The exact 124-test execution inventory and 47/77 suite remain
+  stable. Five keyed INSERT/self-excluding UPDATE/collision/NULL/compound-NULL gates passed 15 sequential and
+  10 concurrent invocations; workspace check, execution clippy, and independent audit are clean. The root is
+  18,017 lines. The post-move card exposed a source-layout-sensitive host result conversion: identical PTX
+  measured ~34.7 GB/s in the parent image but ~23.7 GB/s after extraction at 50% selectivity, while roofline,
+  grouped, gather, and point-read layers stayed stable. **STRUCT-001AF** owns the explicit allocation-preserving
+  row-index reinterpretation and AE remains open until that ratio is restored.
 
 ## Known boundaries
 

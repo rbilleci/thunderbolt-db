@@ -18,18 +18,25 @@ task ID here or be explicitly historical.
 
 ## Current focus
 
-1. **MULTI-003 — prove resident-sidecar context isolation on physical multi-GPU.** This newly promoted safety
+1. **STRUCT-001AF — make ordered-index result typing allocation-free.** The AE report card exposed that the
+   50%-selectivity index path relies on optimizer elimination of a `Vec<i32>` to `Vec<u32>` recast: source
+   layout alone moved it from ~34.7 to ~23.7 GB/s while PTX stayed exact. Make the bit-preserving ownership
+   transfer explicit and stable, then restore the card ratio before closing AE.
+2. **STRUCT-001AE — isolate the device unique-coordinate verdict.** Move the bounded GPU uniqueness
+   authorization kernel into one private owner without changing its public method, PTX, marshaling, pooled
+   lifecycle, status readback, or GPU-only verdict semantics.
+3. **MULTI-003 — prove resident-sidecar context isolation on physical multi-GPU.** This newly promoted safety
    gate is blocked on a physical two-GPU host; every typed sidecar owner must reject a foreign primary context
    before CUDA work and leave both contexts reusable.
-2. **MULTI-002 — partition device-locate work by CUDA context.** This GPU-native boundary is
+4. **MULTI-002 — partition device-locate work by CUDA context.** This GPU-native boundary is
    blocked on a physical two-GPU host for its non-vacuous acceptance gate; descriptors must never cross a
    primary context and bounded result metadata must merge deterministically without host relational probing.
-3. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
+5. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
    reduce the highest context risks before broad implementation work expands them further.
-4. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
+6. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
    architecture decision needed before wider write work or host-store deletion; structural extraction may
    precede it, but must not make the decision implicitly.
-5. **BENCH-001 — complete the open-loop OLTP comparison.** Run in parallel when benchmark capacity is
+7. **BENCH-001 — complete the open-loop OLTP comparison.** Run in parallel when benchmark capacity is
    available; it remains the evidence gate for ordering performance work.
 
 ## STRUCT-001 — oversized-file remediation method
@@ -129,6 +136,8 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
+| **STRUCT-001AF** | NOW | P0 | Replace the optimizer-sensitive allocating `Vec<i32>`→`Vec<u32>` row-index conversion with an explicit allocation-preserving bit reinterpretation whose size/alignment/ownership safety is documented and unit-tested. Preserve row order and all u32 bits; run ordered-compaction multi-warp/concurrency gates 3x sequential and 2x concurrent plus the canonical report card. Close only when the in-L2 50%-selectivity ratio returns to the parent image's ~0.024 roofline class without harming either cache regime or the point-read layer. | STRUCT-001AE report-card regression | Bounded GPU result ownership |
+| **STRUCT-001AE** | NOW | P0 | Extract the single-thread bounded unique-coordinate threshold PTX and launcher into a private `execution::unique_coordinate` owner. Preserve the crate-root inherent method facade, exact candidate/exclusion H2D marshaling, `reject_at` semantics, cached symbol, pooled-stream/buffer lifecycle, one u32 verdict readback, and device-only constraint decision. Prove the normalized move exact; run the exact execution suite plus keyed INSERT, UPDATE self-exclusion, collision, NULL, and compound-NULL GPU gates 3x sequential and 2x concurrent; obtain independent audit. Acceptance is waiting only on **STRUCT-001AF** restoring the report-card result-path ratio exposed by the otherwise exact move. | STRUCT-001, STRUCT-001AF | GPU-native uniqueness authorization seam |
 | **MULTI-003** | BLOCKED | P0 | Run a non-vacuous physical multi-GPU isolation matrix for the typed resident-sidecar APIs. Allocate valid bool/validity/text sources and destinations on at least two primary contexts; prove valid work fires on each device, every crossed owner is rejected before launch, and both contexts remain reusable after each rejection. Recompaction stays device-local and GPU-only; do not introduce peer copies or host bitmap/text interpretation merely to satisfy the gate. | Access to a >=2-GPU host | ADR-013; STRUCT-001AD audit |
 | **MULTI-002** | BLOCKED | P0 | Partition write/visible-locate descriptor sets by owning CUDA primary context, issue one launch per GPU while retaining the exact index/version generation, and deterministically merge only bounded coordinate/count/error metadata in the host control plane. Key lookup, MVCC visibility, duplicate decisions, and mutation targeting remain device decisions; any device failure fails the whole operation and leaves every context reusable, with no host relational probe/fallback. A non-vacuous gate on at least two physical GPUs must prove both devices perform work, no descriptor crosses context, input order and duplicate/visibility semantics survive the merge, and one-device injected failure cannot yield a partial result. | Access to a >=2-GPU host | ARCHITECTURE §5–6; ADR-013; STRUCT-001Z audit |
 | **STRUCT-001** | NOW | P0 | Analyze and disposition every source-size outlier through the method and ordered inventory above. Decompose by ownership, register a bounded exception, or prove generated/archive/delete status; update all references and pass targeted gates. Close only when a fresh inventory has no unowned outlier. | None | `docs/CODE_SIZE.md` |
