@@ -194,6 +194,7 @@ use type_system_catalog::{
     test_catalog_type_rows_by_name as catalog_type_rows_by_name,
     test_catalog_type_rows_by_oid as catalog_type_rows_by_oid,
     test_psql_describe_pg_catalog_types_query as psql_describe_pg_catalog_types_query,
+    test_psql_describe_query_type_rows as psql_describe_query_type_rows,
     test_psql_describe_type_catalog_query_type as psql_describe_type_catalog_query_type,
     test_psql_list_casts_catalog_query as psql_list_casts_catalog_query,
     test_psql_list_collations_catalog_query as psql_list_collations_catalog_query,
@@ -202,7 +203,7 @@ use type_system_catalog::{
 };
 use type_system_catalog::{
     try_execute_builtin_type_catalog_query, try_execute_direct_type_catalog_query,
-    try_execute_type_system_catalog_query,
+    try_execute_psql_describe_result_type_catalog_query, try_execute_type_system_catalog_query,
 };
 #[path = "gpu-db-server/sequence_execution.rs"]
 mod sequence_execution;
@@ -1542,8 +1543,8 @@ fn execute_statement(
         },
     }
 
-    if let Some(rows) = psql_describe_query_type_rows(&canonical) {
-        return write_single_row(stream, &[text_column("Column"), text_column("Type")], &rows);
+    if let Some(result) = try_execute_psql_describe_result_type_catalog_query(stream, &canonical) {
+        return result;
     }
     if canonical
         == "select relname from pg_catalog.pg_class where relnamespace = 'public'::regnamespace and relkind = 'r' order by relname"
@@ -4754,39 +4755,6 @@ fn information_schema_udt_metadata(column: &CatalogColumn) -> (String, String) {
             column.def.ty.catalog_name().to_string(),
         )
     }
-}
-
-fn sql_type_by_oid(oid: u32) -> Option<SqlType> {
-    SUPPORTED_SQL_TYPES
-        .into_iter()
-        .find(|ty| ty.postgres_oid() == oid)
-}
-
-fn psql_describe_query_type_rows(canonical: &str) -> Option<Vec<Vec<Option<String>>>> {
-    let prefix =
-        "select name as \"column\", pg_catalog.format_type(tp, tpm) as \"type\" from (values ";
-    let suffix = ") s(name, tp, tpm)";
-    let values = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
-    let mut rows = Vec::new();
-    for raw_value in values.split("),(") {
-        let value = raw_value
-            .trim()
-            .trim_start_matches('(')
-            .trim_end_matches(')');
-        let fields = value.split(',').map(str::trim).collect::<Vec<_>>();
-        let [name, oid, _typmod] = fields.as_slice() else {
-            return None;
-        };
-        let name = name.strip_prefix('\'')?.strip_suffix('\'')?;
-        let oid = oid.strip_prefix('\'')?.strip_suffix("'::pg_catalog.oid")?;
-        let oid = oid.parse::<u32>().ok()?;
-        let ty = sql_type_by_oid(oid)?;
-        rows.push(vec![
-            Some(name.to_string()),
-            Some(sql_type_display_name(ty).to_string()),
-        ]);
-    }
-    Some(rows)
 }
 
 fn catalog_describe_policy_query_oid(canonical: &str) -> Option<u32> {

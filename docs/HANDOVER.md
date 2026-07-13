@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DD:** move the early psql `\gdesc` type-format route and its OID/parser helpers into the private
-   type-system owner behind one separately positioned delegate, retaining exact parse/fall-through behavior.
+1. **STRUCT-001DE:** isolate the complete adjacent direct/psql table-list and privilege catalog family in a
+   private coherent table-catalog owner, retaining exact route/filter/size/ACL behavior and stage ordering.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

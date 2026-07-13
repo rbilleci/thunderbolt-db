@@ -260,6 +260,18 @@ pub(super) fn try_execute_direct_type_catalog_query(
     None
 }
 
+pub(super) fn try_execute_psql_describe_result_type_catalog_query(
+    stream: &mut dyn ReadWrite,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    let rows = psql_describe_query_type_rows(canonical)?;
+    Some(write_single_row(
+        stream,
+        &[text_column("Column"), text_column("Type")],
+        &rows,
+    ))
+}
+
 pub(super) fn try_execute_type_pg_dump_catalog_query(
     stream: &mut dyn ReadWrite,
     session: &Session,
@@ -355,6 +367,39 @@ fn sql_type_psql_size(ty: SqlType) -> &'static str {
         4 => "4",
         _ => "",
     }
+}
+
+fn sql_type_by_oid(oid: u32) -> Option<SqlType> {
+    SUPPORTED_SQL_TYPES
+        .into_iter()
+        .find(|ty| ty.postgres_oid() == oid)
+}
+
+fn psql_describe_query_type_rows(canonical: &str) -> Option<Vec<Vec<Option<String>>>> {
+    let prefix =
+        "select name as \"column\", pg_catalog.format_type(tp, tpm) as \"type\" from (values ";
+    let suffix = ") s(name, tp, tpm)";
+    let values = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let mut rows = Vec::new();
+    for raw_value in values.split("),(") {
+        let value = raw_value
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        let fields = value.split(',').map(str::trim).collect::<Vec<_>>();
+        let [name, oid, _typmod] = fields.as_slice() else {
+            return None;
+        };
+        let name = name.strip_prefix('\'')?.strip_suffix('\'')?;
+        let oid = oid.strip_prefix('\'')?.strip_suffix("'::pg_catalog.oid")?;
+        let oid = oid.parse::<u32>().ok()?;
+        let ty = sql_type_by_oid(oid)?;
+        rows.push(vec![
+            Some(name.to_string()),
+            Some(sql_type_display_name(ty).to_string()),
+        ]);
+    }
+    Some(rows)
 }
 
 /// The full supported-type catalog ordered by OID. Test fixture documenting the
@@ -535,4 +580,11 @@ pub(super) fn test_catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
 #[cfg(test)]
 pub(super) fn test_catalog_type_rows_by_name() -> Vec<Vec<Option<String>>> {
     catalog_type_rows_by_name()
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_describe_query_type_rows(
+    canonical: &str,
+) -> Option<Vec<Vec<Option<String>>>> {
+    psql_describe_query_type_rows(canonical)
 }

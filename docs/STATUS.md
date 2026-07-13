@@ -1011,6 +1011,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   remains exact routing, hard-coded discovery literals, host registry filtering/sorting, the narrow empty
   extension probe, and absent GPU-resident system relations. Full protocol/driver/security/formatting gates,
   PostgreSQL 16 scenario 04, and independent audit are clean. The root is 5,610 lines and STRUCT-001DC is closed.
+  The early psql `\gdesc` result-type formatter now executes from the existing private 590-line
+  `type_system_catalog` owner behind one additional stage-preserving delegate. The exact OID lookup and values-
+  parser/row helper are byte-identical private moves, and one `cfg(test)` alias retains its proven consumer.
+  Exact post-parsed-command/pre-table-discovery stage, prefix/suffix and three-field tuple parsing, whitespace
+  trimming, comma/input ordering, name/OID decoding, two text columns, SQL-type display mapping, malformed or
+  unsupported-OID fall-through, and writer are unchanged. Inherited PRODUCT-002 debt remains brittle generated-
+  SQL parsing, host registry lookup and display-name decisions, typmod ignored after shape validation, and absent
+  GPU-resident type metadata. Full protocol/driver/security/formatting gates, the focused helper test, PostgreSQL
+  16 scenario 69, and independent audit are clean. The root is 5,578 lines and STRUCT-001DD is closed.
 
 ## Known boundaries
 
