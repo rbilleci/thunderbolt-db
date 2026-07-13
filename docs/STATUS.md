@@ -765,6 +765,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   filtering, and broad pg-dump prefix predicates. Full protocol/driver/security/formatting gates and independent
   audit are clean. Fresh PostgreSQL 18 scenarios 65, 66, and 337 pass; scenario 335's publication rows pass and
   only its known `\d` query drift fails. The root is 8,373 lines and STRUCT-001CE is closed.
+  The normal/verbose psql domain listings and direct `pg_type` domain query now execute from the existing private
+  245-line `domain_ddl` owner behind one tri-state delegate. Both query literals, both row builders, and all three
+  route bodies are exact moves; helpers remain private and only two `cfg(test)` query aliases were added. The
+  original post-language/pre-role dispatcher position, columns, name order, base-type display/OIDs, comments,
+  null placeholders, and `typtype` are unchanged. Inherited PRODUCT-002 debt remains: exact client-version query
+  literals, public-only domains, null collation/nullability/default/check/ACL metadata, base-type-only domain
+  representation, and no visibility filtering. Full protocol/driver/security/formatting gates and independent
+  audit are clean. Fresh PostgreSQL 18 scenarios 59/336 fail only on known `\dD` query drift while scenario 336's
+  direct domain OID/type rows pass. The root is 8,282 lines and STRUCT-001CF is closed.
 
 ## Known boundaries
 

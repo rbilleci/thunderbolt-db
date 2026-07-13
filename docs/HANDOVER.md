@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001CF:** move the three domain catalog-read shapes and their private query/row helpers into the
-   existing domain owner behind one tri-state delegate, preserving exact psql/direct metadata output.
+1. **STRUCT-001CG:** move the normal/verbose psql sequence-list shapes and their private query/row helpers into
+   the existing sequence owner behind one tri-state delegate, preserving exact sorted metadata output.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

@@ -119,7 +119,12 @@ use sequence_execution::{
 };
 #[path = "gpu-db-server/domain_ddl.rs"]
 mod domain_ddl;
-use domain_ddl::execute_domain_ddl;
+use domain_ddl::{execute_domain_ddl, try_execute_domain_catalog_query};
+#[cfg(test)]
+use domain_ddl::{
+    test_psql_list_domains_catalog_query as psql_list_domains_catalog_query,
+    test_psql_list_domains_verbose_catalog_query as psql_list_domains_verbose_catalog_query,
+};
 #[path = "gpu-db-server/replication_catalog.rs"]
 mod replication_catalog;
 use replication_catalog::{
@@ -1816,51 +1821,8 @@ fn execute_statement(
             &catalog_psql_language_rows(),
         );
     }
-    if canonical == psql_list_domains_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Type"),
-                text_column("Collation"),
-                text_column("Nullable"),
-                text_column("Default"),
-                text_column("Check"),
-            ],
-            &catalog_domain_rows(session, false),
-        );
-    }
-    if canonical == psql_list_domains_verbose_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Type"),
-                text_column("Collation"),
-                text_column("Nullable"),
-                text_column("Default"),
-                text_column("Check"),
-                text_column("Access privileges"),
-                text_column("Description"),
-            ],
-            &catalog_domain_rows(session, true),
-        );
-    }
-    if canonical
-        == "select oid, typname, typbasetype, typtype from pg_catalog.pg_type where typtype = 'd' order by typname"
-    {
-        return write_single_row(
-            stream,
-            &[
-                int4_column("oid"),
-                text_column("typname"),
-                int4_column("typbasetype"),
-                text_column("typtype"),
-            ],
-            &catalog_domain_type_rows(session),
-        );
+    if let Some(result) = try_execute_domain_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if canonical == psql_describe_roles_catalog_query()
         || canonical == psql_describe_roles_verbose_catalog_query()
@@ -3232,59 +3194,6 @@ fn psql_list_extensions_catalog_query() -> &'static str {
 
 fn psql_list_languages_catalog_query() -> &'static str {
     "select l.lanname as \"name\", pg_catalog.pg_get_userbyid(l.lanowner) as \"owner\", l.lanpltrusted as \"trusted\", d.description as \"description\" from pg_catalog.pg_language l left join pg_catalog.pg_description d on d.classoid = l.tableoid and d.objoid = l.oid and d.objsubid = 0 where l.lanplcallfoid != 0 order by 1"
-}
-
-fn psql_list_domains_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", t.typname as \"name\", pg_catalog.format_type(t.typbasetype, t.typtypmod) as \"type\", (select c.collname from pg_catalog.pg_collation c, pg_catalog.pg_type bt where c.oid = t.typcollation and bt.oid = t.typbasetype and t.typcollation <> bt.typcollation) as \"collation\", case when t.typnotnull then 'not null' end as \"nullable\", t.typdefault as \"default\", pg_catalog.array_to_string(array( select pg_catalog.pg_get_constraintdef(r.oid, true) from pg_catalog.pg_constraint r where t.oid = r.contypid ), ' ') as \"check\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where t.typtype = 'd' and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_type_is_visible(t.oid) order by 1, 2"
-}
-
-fn psql_list_domains_verbose_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", t.typname as \"name\", pg_catalog.format_type(t.typbasetype, t.typtypmod) as \"type\", (select c.collname from pg_catalog.pg_collation c, pg_catalog.pg_type bt where c.oid = t.typcollation and bt.oid = t.typbasetype and t.typcollation <> bt.typcollation) as \"collation\", case when t.typnotnull then 'not null' end as \"nullable\", t.typdefault as \"default\", pg_catalog.array_to_string(array( select pg_catalog.pg_get_constraintdef(r.oid, true) from pg_catalog.pg_constraint r where t.oid = r.contypid ), ' ') as \"check\", pg_catalog.array_to_string(t.typacl, e'\\n') as \"access privileges\", d.description as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace left join pg_catalog.pg_description d on d.classoid = t.tableoid and d.objoid = t.oid and d.objsubid = 0 where t.typtype = 'd' and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_type_is_visible(t.oid) order by 1, 2"
-}
-
-fn catalog_domain_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
-    session
-        .domains
-        .values()
-        .map(|domain| {
-            let mut row = vec![
-                Some("public".to_string()),
-                Some(domain.name.clone()),
-                Some(sql_type_display_name(domain.base_type).to_string()),
-                None,
-                None,
-                None,
-                None,
-            ];
-            if verbose {
-                row.push(None);
-                row.push(
-                    session
-                        .comments
-                        .get(&CatalogCommentTarget::Domain {
-                            domain: domain.name.clone(),
-                        })
-                        .cloned(),
-                );
-            }
-            row
-        })
-        .collect()
-}
-
-fn catalog_domain_type_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    session
-        .domains
-        .values()
-        .map(|domain| {
-            vec![
-                Some(domain.oid.to_string()),
-                Some(domain.name.clone()),
-                Some(domain.base_type.postgres_oid().to_string()),
-                Some("d".to_string()),
-            ]
-        })
-        .collect()
 }
 
 fn psql_describe_roles_catalog_query() -> &'static str {
