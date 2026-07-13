@@ -439,6 +439,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   rows, tags, and exact messages are unchanged. Sequential/concurrent 127-test runs, the full protocol package
   and driver smokes, all-target checks, warning-denied clippy, security preflight, formatting, and independent
   audit are clean. The root is 17,003 lines and STRUCT-001AR is closed.
+  Legacy extended INSERT/DELETE/UPDATE application now lives in the private 205-line `extended_dml` leaf. The
+  original 197-line body is normalized-exact and exposes exactly three entry points, each consumed once by the
+  extended-query owner. Relation-before-permission precedence, column/type/duplicate validation, precomputed
+  DELETE/UPDATE masks, mutation order, dirty-table publication, exact error fields, and completion tags are
+  unchanged. This is preserved compatibility behavior, not a new integrity guarantee: these handlers do not
+  themselves call not-null/unique/foreign-key/check validators, and multi-row INSERT retains its inherited
+  possibility of partial mutation when a later row fails validation. The extraction adds no host product API or
+  relational capability. Sequential/concurrent 127-test runs, the full protocol package and driver smokes,
+  all-target checks, warning-denied clippy, security preflight, formatting, and independent audit are clean. The
+  root is 16,809 lines and STRUCT-001AS is closed.
 
 ## Known boundaries
 
