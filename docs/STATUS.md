@@ -538,6 +538,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   concurrent 127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied
   clippy, security preflight, touched formatting, diff checks, and independent audit are clean. The root is
   15,125 lines and STRUCT-001BD is closed.
+  Parsed cluster-object DDL now enters the private 303-line `cluster_ddl` owner through one exact successful-
+  parse variant gate that consumes the owned command. Database and tablespace CREATE/DROP/RENAME preserve
+  duplicate/protected/missing/target precedence, checked OID publication, maps, ACL/comment cleanup or retargeting,
+  dirty old/new keys, snapshot persistence, errors, and tags. The complete six-arm body is normalized-exact;
+  only clippy-required tail expressions differ. Sequential/concurrent 127-test runs, the full protocol package
+  and driver smokes, all-target checks, warning-denied clippy, security preflight, touched formatting, diff
+  checks, and independent audit are clean. The root is 14,859 lines and STRUCT-001BE is closed.
 
 ## Known boundaries
 

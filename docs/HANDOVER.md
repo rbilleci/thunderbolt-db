@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BE:** isolate database and tablespace create/drop/rename arms behind a private cluster-DDL owner,
-   preserving dependencies, OIDs, ACL/comment state, rename retargeting, publication, errors, and tags.
+1. **STRUCT-001BF:** extend `ddl_execution` with parsed CREATE TABLE, constraint add/drop/rename, and RENAME TABLE
+   arms; preserve preflight/rollback, indexes/comments/ACLs, publication, exact errors, tags, and parse order.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
