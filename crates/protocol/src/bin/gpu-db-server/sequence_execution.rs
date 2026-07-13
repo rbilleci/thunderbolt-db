@@ -1,12 +1,114 @@
 // Legacy sequence ownership. This is not a product execution path.
 
 use super::{
-    int8_column, object_access_permission_error, schema_permission_error, write_command_complete,
-    write_error, write_select_rows, CatalogCommentTarget, Command, ErrorField, ReadWrite,
-    SchemaPrivilege, Sequence, Session, TablePrivilege,
+    int8_column, object_access_permission_error, schema_permission_error, text_column,
+    write_command_complete, write_error, write_select_rows, write_single_row, CatalogCommentTarget,
+    Command, ErrorField, ReadWrite, SchemaPrivilege, Sequence, Session, TablePrivilege,
 };
 use std::collections::BTreeSet;
 use std::io;
+
+fn psql_describe_sequences_catalog_query() -> &'static str {
+    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind in ('s','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
+}
+
+fn psql_describe_sequences_verbose_catalog_query() -> &'static str {
+    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind in ('s','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
+}
+
+fn psql_describe_sequence_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .sequences
+        .values()
+        .map(|sequence| {
+            vec![
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
+                Some("sequence".to_string()),
+                Some("postgres".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+fn psql_describe_sequence_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .sequences
+        .values()
+        .map(|sequence| {
+            vec![
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
+                Some("sequence".to_string()),
+                Some("postgres".to_string()),
+                Some("permanent".to_string()),
+                Some("0 bytes".to_string()),
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Sequence {
+                        sequence: sequence.name.clone(),
+                    })
+                    .cloned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_describe_sequences_catalog_query() -> &'static str {
+    psql_describe_sequences_catalog_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_describe_sequences_verbose_catalog_query() -> &'static str {
+    psql_describe_sequences_verbose_catalog_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_describe_sequence_verbose_rows(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    psql_describe_sequence_verbose_rows(session)
+}
+
+pub(super) fn try_execute_sequence_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical == psql_describe_sequences_catalog_query() {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Type"),
+                text_column("Owner"),
+            ],
+            &psql_describe_sequence_rows(session),
+        ));
+    }
+    if canonical == psql_describe_sequences_verbose_catalog_query() {
+        return Some(write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Type"),
+                text_column("Owner"),
+                text_column("Persistence"),
+                text_column("Size"),
+                text_column("Description"),
+            ],
+            &psql_describe_sequence_verbose_rows(session),
+        ));
+    }
+    None
+}
 
 pub(super) fn sequence_target_error(session: &Session, name: &str) -> Option<ErrorField> {
     if session.tables.contains_key(name)

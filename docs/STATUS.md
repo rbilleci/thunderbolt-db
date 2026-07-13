@@ -774,6 +774,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   representation, and no visibility filtering. Full protocol/driver/security/formatting gates and independent
   audit are clean. Fresh PostgreSQL 18 scenarios 59/336 fail only on known `\dD` query drift while scenario 336's
   direct domain OID/type rows pass. The root is 8,282 lines and STRUCT-001CF is closed.
+  The normal and verbose psql sequence listings now execute from the existing private 459-line
+  `sequence_execution` owner behind one tri-state delegate. Both query literals, both sorted row builders, and
+  both route bodies are exact moves; helpers remain private and the only new test exposure is two query aliases
+  plus the verbose row alias required by shared-catalog persistence coverage. Dispatcher position, columns,
+  public/type/owner/persistence/size constants, comments, and order are unchanged. Inherited PRODUCT-002 debt
+  remains: exact client-version literals, hard-coded public/postgres/permanent/zero-size metadata, no visibility
+  filtering, and comments only in the verbose projection. Full protocol/driver/security/formatting gates and
+  independent audit are clean. Fresh PostgreSQL 18 scenarios 50/330 retain exact sequence rows/comments/state
+  and differ only in known client wording/query drift. The root is 8,214 lines and STRUCT-001CG is closed.
 
 ## Known boundaries
 
