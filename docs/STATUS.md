@@ -1379,7 +1379,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   zero CUDA 700/716/717 and explicitly reported GPU execution for the filtered shapes; both ordinary modes
   passed 505/487, and all-target check, strict clippy, scoped formatting/diff/reference checks, and independent
   audit are clean. No production predicate, join, route, or architectural behavior changed, so the report card
-  was not applicable. STRUCT-001EN is next.
+  was not applicable.
+  STRUCT-001EN externalized the exact six-test device-resolve and core elision lifecycle/concurrency family into
+  the rustfmt-clean 611-line `tests/residency_elision_core.rs` owner at the same parent position. Normalized
+  comparison differs only in two rustfmt-aligned array comments; all bodies, attributes, names, and order remain
+  unchanged, no helper moved, and the adjacent DATE/INT2 test remains at the parent boundary. The engine root is
+  9,549 lines, and the 992-test/76-family inventories remain exact. Six GPU gates passed 18 sequential and 12
+  concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target check,
+  strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No production
+  resolver, elision, concurrency, or architectural behavior changed, so the report card was not applicable.
+  STRUCT-001EO is next.
 
 ## Known boundaries
 

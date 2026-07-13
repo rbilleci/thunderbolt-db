@@ -44,12 +44,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001EM is closed: the exact three-test sharded NULL/filter/join route-parity family now lives in the
   bounded 159-line `tests/residency_route_parity.rs` owner; exact inventories, 15 GPU invocations, full gates,
   and audit are clean with no production change.
+- STRUCT-001EN is closed: the exact six-test device-resolve and core elision lifecycle/concurrency family now
+  lives in the bounded 611-line `tests/residency_elision_core.rs` owner; exact inventories, 30 GPU invocations,
+  full gates, and audit are clean with no production change.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EN:** externalize the exact six-test device-resolve and core elision lifecycle/concurrency family.
+1. **STRUCT-001EO:** externalize the exact four-test DATE/INT2 and INT8 shard/elision family.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
