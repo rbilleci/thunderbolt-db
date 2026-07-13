@@ -9,6 +9,7 @@ use super::catalog_comments::pg_dump_description_rows;
 use super::cluster_ddl::{
     try_execute_database_pg_dump_catalog_query, try_execute_tablespace_pg_dump_catalog_query,
 };
+use super::function_execution::try_execute_aggregate_pg_dump_catalog_query;
 use super::replication_catalog::try_execute_replication_pg_dump_query;
 use super::role_ddl::try_execute_role_pg_dump_catalog_query;
 use super::{
@@ -286,6 +287,9 @@ pub(super) fn try_execute_pg_dump_compat_statement(
         return Some(result);
     }
     if let Some(result) = try_execute_access_method_pg_dump_catalog_query(stream, canonical) {
+        return Some(result);
+    }
+    if let Some(result) = try_execute_aggregate_pg_dump_catalog_query(stream, canonical) {
         return Some(result);
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(canonical) {

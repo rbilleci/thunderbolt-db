@@ -172,13 +172,17 @@ use view_ddl::{
 };
 #[path = "gpu-db-server/function_execution.rs"]
 mod function_execution;
-use function_execution::{execute_function_command, try_execute_function_catalog_query};
+use function_execution::{
+    execute_function_command, try_execute_aggregate_catalog_query,
+    try_execute_function_catalog_query,
+};
 #[cfg(test)]
 use function_execution::{
     execute_function_result, rename_function_in_session,
     test_pg_catalog_function_rows as pg_catalog_function_rows,
     test_psql_describe_function_verbose_rows as psql_describe_function_verbose_rows,
     test_psql_describe_functions_catalog_query as psql_describe_functions_catalog_query,
+    test_psql_list_aggregates_catalog_query as psql_list_aggregates_catalog_query,
 };
 #[path = "gpu-db-server/sequence_execution.rs"]
 mod sequence_execution;
@@ -1626,18 +1630,8 @@ fn execute_statement(
     if let Some(result) = try_execute_function_catalog_query(stream, session, &canonical) {
         return result;
     }
-    if canonical == psql_list_aggregates_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Result data type"),
-                text_column("Argument data types"),
-                text_column("Description"),
-            ],
-            &catalog_empty_rows(),
-        );
+    if let Some(result) = try_execute_aggregate_catalog_query(stream, &canonical) {
+        return result;
     }
     if canonical == psql_list_conversions_catalog_query() {
         return write_single_row(
@@ -2652,10 +2646,6 @@ fn psql_describe_table_privileges_catalog_query_filter(
         namespace: namespace.to_string(),
         relname_pattern: Some(relname_pattern.to_string()),
     })
-}
-
-fn psql_list_aggregates_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.format_type(p.prorettype, null) as \"result data type\", case when p.pronargs = 0 then cast('*' as pg_catalog.text) else pg_catalog.pg_get_function_arguments(p.oid) end as \"argument data types\", pg_catalog.obj_description(p.oid, 'pg_proc') as \"description\" from pg_catalog.pg_proc p left join pg_catalog.pg_namespace n on n.oid = p.pronamespace where p.prokind = 'a' and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_function_is_visible(p.oid) order by 1, 2, 4"
 }
 
 fn psql_list_conversions_catalog_query() -> &'static str {
@@ -4123,21 +4113,6 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
     }
     if is_pg_dump_function_metadata_query(canonical) {
         return Some(pg_dump_function_metadata_columns());
-    }
-    if canonical.starts_with("select p.tableoid, p.oid, p.proname as aggname")
-        && canonical.contains("from pg_proc p")
-    {
-        return Some(vec![
-            int4_column("tableoid"),
-            int4_column("oid"),
-            text_column("aggname"),
-            int4_column("aggnamespace"),
-            int4_column("pronargs"),
-            text_column("proargtypes"),
-            int4_column("proowner"),
-            text_column("aggacl"),
-            text_column("acldefault"),
-        ]);
     }
     if canonical.starts_with("select provider, label from pg_catalog.pg_shseclabel where ") {
         return Some(vec![text_column("provider"), text_column("label")]);

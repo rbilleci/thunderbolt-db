@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001CZ:** move the empty psql aggregate listing and effective empty pg-dump aggregate metadata
-   response into the existing function owner behind two stage-preserving delegates, retaining exact output.
+1. **STRUCT-001DA:** move adjacent empty conversion/operator/collation/cast psql and pg-dump catalog reads into a
+   coherent private type-system owner behind two stage-preserving delegates, retaining exact empty output.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

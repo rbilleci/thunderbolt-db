@@ -1,7 +1,7 @@
 // Legacy bounded-function ownership. This is not a product execution path.
 
 use super::{
-    column_for_sql_type, format_sql_value, function_access_permission_error,
+    catalog_empty_rows, column_for_sql_type, format_sql_value, function_access_permission_error,
     function_privilege_letters, int4_column, schema_permission_error,
     schema_usage_permission_error, sql_type_display_name, text_column, write_command_complete,
     write_error, write_select_rows, write_single_row, CatalogCommentTarget, Command, ErrorField,
@@ -505,4 +505,59 @@ fn unsupported_function_body_error() -> ErrorField {
         message: "only literal SELECT bodies are supported for SQL function execution",
         position: None,
     }
+}
+
+pub(super) fn try_execute_aggregate_catalog_query(
+    stream: &mut dyn ReadWrite,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != psql_list_aggregates_catalog_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[
+            text_column("Schema"),
+            text_column("Name"),
+            text_column("Result data type"),
+            text_column("Argument data types"),
+            text_column("Description"),
+        ],
+        &catalog_empty_rows(),
+    ))
+}
+
+pub(super) fn try_execute_aggregate_pg_dump_catalog_query(
+    stream: &mut dyn ReadWrite,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if !(canonical.starts_with("select p.tableoid, p.oid, p.proname as aggname")
+        && canonical.contains("from pg_proc p"))
+    {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("aggname"),
+            int4_column("aggnamespace"),
+            int4_column("pronargs"),
+            text_column("proargtypes"),
+            int4_column("proowner"),
+            text_column("aggacl"),
+            text_column("acldefault"),
+        ],
+        &catalog_empty_rows(),
+    ))
+}
+
+fn psql_list_aggregates_catalog_query() -> &'static str {
+    "select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.format_type(p.prorettype, null) as \"result data type\", case when p.pronargs = 0 then cast('*' as pg_catalog.text) else pg_catalog.pg_get_function_arguments(p.oid) end as \"argument data types\", pg_catalog.obj_description(p.oid, 'pg_proc') as \"description\" from pg_catalog.pg_proc p left join pg_catalog.pg_namespace n on n.oid = p.pronamespace where p.prokind = 'a' and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_function_is_visible(p.oid) order by 1, 2, 4"
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_aggregates_catalog_query() -> &'static str {
+    psql_list_aggregates_catalog_query()
 }
