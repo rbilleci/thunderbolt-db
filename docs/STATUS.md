@@ -494,6 +494,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   the full protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight,
   touched formatting, diff checks, and independent audit are clean. The root is 16,139 lines, `sql_prepare` is
   502 lines, and STRUCT-001AY is closed.
+  Legacy DDL mutation routing now enters the private 291-line `ddl_execution` owner through one tri-state
+  delegate. TRUNCATE (including restart-identity state), DROP TABLE dependency/index/comment cleanup, and ALTER
+  TABLE DROP CONSTRAINT retain exact branch order, relation-kind/existence precedence, foreign-key preflight and
+  rollback, dirty publication, catalog persistence, errors, and command tags. The three private bodies are
+  normalized byte-equivalent to their prior root bodies; `ddl_syntax` remains a one-way dependency and only the
+  parent-private delegate is exposed for production. Sequential/concurrent 127-test runs, the full protocol
+  package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched formatting,
+  diff checks, and independent audit are clean. No read kernel, residency, or result path changed, so the GPU
+  report card was not applicable. The root is 15,898 lines and STRUCT-001AZ is closed.
 
 ## Known boundaries
 
