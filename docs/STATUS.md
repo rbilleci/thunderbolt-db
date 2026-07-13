@@ -38,6 +38,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   dump/restore surfaces. Broader type/protocol breadth is **PRODUCT-002**.
 - The facade and pgwire server expose the engine, including the production point-lookup batcher. Server
   consolidation remains **PRODUCT-001**.
+- The legacy compatibility endpoint's opt-in production security profile requires TLS plus a SCRAM-SHA-256
+  verifier; plaintext password input is restricted to its explicit local/test credential bootstrap. The
+  connection-security preflight exercises valid, invalid-password, recovery, and non-TLS rejection paths.
 
 ## Write path, durability, and recovery
 
@@ -337,6 +340,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   `count_i32_compare` measured 0.873x/1.000x same-run roofline, ordered compaction measured 34.8 GB/s
   (0.0235x roofline)/3.7 GB/s, grouped aggregation measured 1,678.0 M elements/s, and 65,536-batch point reads
   measured 246.6M/252.6M lookups/s at p50 139/131us. STRUCT-001AG is closed.
+  The legacy compatibility server now has an explicit private 194-line `backend_adapter` leaf. Its 28 moved
+  definitions normalize exactly to the parent after visibility/format normalization; `BackendWriter` delegation,
+  authentication and command framing, row tags, text/binary format codes, and `Column`/`ErrorField` conversion
+  remain unchanged. The root is 31,698 lines. Protocol all-target check and clippy with warnings denied, the
+  exact 123-test binary suite, tokio-postgres and SQLx end-to-end smokes, and the complete TLS/SCRAM connection-
+  security preflight pass. The preflight's stale owner and removed-document checks now follow the adapter,
+  protocol-library framing owner, and canonical STATUS fact. Independent audit is clean. STRUCT-001AH is closed;
+  this is containment of the legacy host-backed compatibility endpoint pending **PRODUCT-001**, not a product
+  relational path.
 
 ## Known boundaries
 

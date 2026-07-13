@@ -25,13 +25,10 @@ require_line crates/protocol/src/bin/gpu-db-server.rs "write_authentication_sasl
 require_line crates/protocol/src/bin/gpu-db-server.rs "write_authentication_ok(stream)"
 require_line crates/protocol/src/bin/gpu-db-server.rs "FrontendMessage::PasswordMessage(_) => \"password messages are not supported after startup\""
 require_line crates/protocol/src/bin/gpu-db-server.rs "\"SASL authentication is not supported\""
-require_line crates/protocol/src/bin/gpu-db-server.rs "fn write_authentication_ok(stream: &mut dyn ReadWrite) -> io::Result<()>"
-require_line crates/protocol/src/bin/gpu-db-server.rs "write_message(stream, b'R', &0_i32.to_be_bytes())"
+require_line crates/protocol/src/bin/gpu-db-server/backend_adapter.rs "fn write_authentication_ok(stream: &mut dyn ReadWrite) -> io::Result<()>"
+require_line crates/protocol/src/lib.rs "self.message(b'R', &0_i32.to_be_bytes())"
 require_line crates/protocol/src/bin/gpu-db-server.rs "text_column(\"rolpassword\")"
-require_line README.md "production security profile"
-require_line docs/compatibility/matrix.md "Production security profile v1"
-require_line docs/architecture/07-security-and-compliance.md "Production security profile v1"
-require_line docs/operations/runbooks.md "production security profile v1"
+require_line docs/STATUS.md "opt-in production security profile requires TLS plus a SCRAM-SHA-256"
 
 cargo build -p gpu_db_protocol --bin gpu-db-server >/dev/null
 
