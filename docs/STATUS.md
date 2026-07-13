@@ -869,6 +869,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   result construction, and absent GPU-native catalog execution. Full protocol/driver/security/formatting gates,
   focused schema/comment/catalog tests, PostgreSQL 16 scenarios 312/340, and independent audit are clean. The root
   is 7,168 lines and STRUCT-001CP is closed.
+  The remaining pg-dump description row builder now lives in the existing private 1,192-line `catalog_comments`
+  owner and is consumed directly by the 543-line sibling `pg_dump_compat`; the latter's predicate, columns, writer,
+  route order, and dispatcher stage are byte-identical. The builder itself is byte-identical apart from required
+  private visibility; one `cfg(test)` alias serves all three existing test consumers. Every existing comment
+  family, class/object/subobject value, per-family order, final numeric tuple sort, null, and index/constraint
+  liveness check is unchanged. Inherited PRODUCT-002 debt remains brittle exact routing, host/synthetic OIDs, CPU
+  construction, orphan and non-index-backed constraint suppression, the legacy function-comment tuple shape, and
+  absent GPU-native catalog execution. Full protocol/driver/security/formatting gates, focused catalog/comment/
+  shared tests, all 18 PostgreSQL 16 pg-dump restore/metadata/privilege gates, and independent audit are clean. The
+  root is 6,913 lines and STRUCT-001CQ is closed.
 
 ## Known boundaries
 

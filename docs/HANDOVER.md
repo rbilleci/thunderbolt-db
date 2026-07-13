@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001CQ:** move the remaining pg-dump description row builder into the existing comment owner while
-   preserving its exact private pg-dump consumer, OID projection, legacy row shapes, and route precedence.
+1. **STRUCT-001CR:** move normal/verbose/direct/pg_dumpall role catalog reads into the existing role owner behind
+   two stage-preserving delegates, retaining exact metadata, comments, dynamic columns, ordering, and output.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

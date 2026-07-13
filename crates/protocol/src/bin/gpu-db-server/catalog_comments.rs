@@ -1,12 +1,270 @@
 // Legacy catalog-comment ownership. This is not a product execution path.
 
 use super::{
-    catalog_constraint_entries, database_exists, role_exists, shared_catalog, tablespace_exists,
-    text_column, write_command_complete, write_error, write_single_row, CatalogCommentTarget,
-    ErrorField, ReadWrite, Session,
+    catalog_constraint_entries, catalog_constraint_oid, catalog_index_oid, database_exists,
+    role_exists, shared_catalog, tablespace_exists, text_column, write_command_complete,
+    write_error, write_single_row, CatalogCommentTarget, ErrorField, ReadWrite, Session,
+    PG_EXTENSION_CLASS_OID, PG_PUBLICATION_CLASS_OID, PG_SUBSCRIPTION_CLASS_OID,
+    PLPGSQL_EXTENSION_OID, PUBLIC_NAMESPACE_OID,
 };
 use gpu_db_protocol::{Command, CommentTarget};
 use std::io;
+
+pub(super) fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    if let Some(description) = session.comments.get(&CatalogCommentTarget::Extension {
+        extension: "plpgsql".to_string(),
+    }) {
+        rows.push(vec![
+            Some(description.clone()),
+            Some(PG_EXTENSION_CLASS_OID.to_string()),
+            Some(PLPGSQL_EXTENSION_OID.to_string()),
+            Some("0".to_string()),
+        ]);
+    }
+    if let Some(description) = session.comments.get(&CatalogCommentTarget::Schema {
+        schema: "public".to_string(),
+    }) {
+        rows.push(vec![
+            Some(description.clone()),
+            Some("2615".to_string()),
+            Some(PUBLIC_NAMESPACE_OID.to_string()),
+            Some("0".to_string()),
+        ]);
+    }
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by_key(|table| table.oid);
+    for table in tables {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Table {
+            table: table.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(table.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+        for column in &table.columns {
+            if let Some(description) = session.comments.get(&CatalogCommentTarget::Column {
+                table: table.name.clone(),
+                attnum: column.attnum,
+            }) {
+                rows.push(vec![
+                    Some(description.clone()),
+                    Some("1259".to_string()),
+                    Some(table.oid.to_string()),
+                    Some(column.attnum.to_string()),
+                ]);
+            }
+        }
+    }
+    let mut views = session.views.values().collect::<Vec<_>>();
+    views.sort_by_key(|view| view.oid);
+    for view in views {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::View {
+            view: view.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(view.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by_key(|sequence| sequence.oid);
+    for sequence in sequences {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Sequence {
+            sequence: sequence.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(sequence.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by_key(|view| view.oid);
+    for view in materialized_views {
+        if let Some(description) = session
+            .comments
+            .get(&CatalogCommentTarget::MaterializedView {
+                materialized_view: view.name.clone(),
+            })
+        {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(view.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut domains = session.domains.values().collect::<Vec<_>>();
+    domains.sort_by_key(|domain| domain.oid);
+    for domain in domains {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Domain {
+            domain: domain.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1247".to_string()),
+                Some(domain.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut functions = session.functions.values().collect::<Vec<_>>();
+    functions.sort_by(|left, right| left.name.cmp(&right.name));
+    for function in functions {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Function {
+            function: function.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(function.name.clone()),
+                Some("function".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut publications = session.publications.values().collect::<Vec<_>>();
+    publications.sort_by_key(|publication| publication.oid);
+    for publication in publications {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Publication {
+            publication: publication.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some(PG_PUBLICATION_CLASS_OID.to_string()),
+                Some(publication.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut subscriptions = session.subscriptions.values().collect::<Vec<_>>();
+    subscriptions.sort_by_key(|subscription| subscription.oid);
+    for subscription in subscriptions {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Subscription {
+            subscription: subscription.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some(PG_SUBSCRIPTION_CLASS_OID.to_string()),
+                Some(subscription.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut index_comments = session
+        .comments
+        .iter()
+        .filter_map(|(target, description)| match target {
+            CatalogCommentTarget::Index { index } => Some((index, description)),
+            CatalogCommentTarget::Database { .. }
+            | CatalogCommentTarget::Role { .. }
+            | CatalogCommentTarget::Schema { .. }
+            | CatalogCommentTarget::Tablespace { .. }
+            | CatalogCommentTarget::Table { .. }
+            | CatalogCommentTarget::Column { .. }
+            | CatalogCommentTarget::View { .. }
+            | CatalogCommentTarget::MaterializedView { .. }
+            | CatalogCommentTarget::Extension { .. }
+            | CatalogCommentTarget::Function { .. }
+            | CatalogCommentTarget::Sequence { .. }
+            | CatalogCommentTarget::Domain { .. }
+            | CatalogCommentTarget::Publication { .. }
+            | CatalogCommentTarget::Subscription { .. }
+            | CatalogCommentTarget::Constraint { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    index_comments.sort_by(|left, right| left.0.cmp(right.0));
+    for (index, description) in index_comments {
+        if let Some(oid) = catalog_index_oid(session, index) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut constraint_comments = session
+        .comments
+        .iter()
+        .filter_map(|(target, description)| match target {
+            CatalogCommentTarget::Constraint { table, constraint } => {
+                Some((table, constraint, description))
+            }
+            CatalogCommentTarget::Database { .. }
+            | CatalogCommentTarget::Role { .. }
+            | CatalogCommentTarget::Schema { .. }
+            | CatalogCommentTarget::Tablespace { .. }
+            | CatalogCommentTarget::Table { .. }
+            | CatalogCommentTarget::Column { .. }
+            | CatalogCommentTarget::View { .. }
+            | CatalogCommentTarget::MaterializedView { .. }
+            | CatalogCommentTarget::Extension { .. }
+            | CatalogCommentTarget::Function { .. }
+            | CatalogCommentTarget::Sequence { .. }
+            | CatalogCommentTarget::Domain { .. }
+            | CatalogCommentTarget::Publication { .. }
+            | CatalogCommentTarget::Subscription { .. }
+            | CatalogCommentTarget::Index { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    constraint_comments
+        .sort_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
+    for (table_name, constraint_name, description) in constraint_comments {
+        if let Some(entry) = catalog_constraint_entries(session)
+            .into_iter()
+            .find(|entry| &entry.index.table == table_name && &entry.index.name == constraint_name)
+        {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("2606".to_string()),
+                Some(catalog_constraint_oid(&entry).to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    rows.sort_by(|left, right| {
+        let left_key = (
+            left[1]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+            left[2]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+            left[3]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+        );
+        let right_key = (
+            right[1]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+            right[2]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+            right[3]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+        );
+        left_key.cmp(&right_key)
+    });
+    rows
+}
 
 fn pg_catalog_schema_description_query() -> &'static str {
     "select n.nspname, pg_catalog.obj_description(n.oid, 'pg_namespace') as description from pg_catalog.pg_namespace n where n.nspname = 'public' order by n.nspname"
@@ -507,6 +765,11 @@ pub(super) fn try_execute_relation_description_catalog_query(
         return None;
     };
     Some(write_single_row(stream, &columns, &rows))
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    pg_dump_description_rows(session)
 }
 
 #[cfg(test)]
