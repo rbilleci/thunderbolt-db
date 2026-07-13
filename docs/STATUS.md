@@ -1370,7 +1370,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and the 992-test/76-family inventories remain exact. Seven GPU gates passed 21 sequential and 14 concurrent
   invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target check, strict clippy,
   scoped formatting/diff/reference checks, and independent audit are clean. No production cache, route, or
-  architectural behavior changed, so the report card was not applicable. STRUCT-001EM is next.
+  architectural behavior changed, so the report card was not applicable.
+  STRUCT-001EM externalized the exact three-test sharded NULL/filter/join route-parity family into the rustfmt-
+  clean 159-line `tests/residency_route_parity.rs` owner at the same parent position. Normalized comparison
+  differs only by one rustfmt wrap; all bodies, attributes, names, and order remain unchanged, and the adjacent
+  A2 device-resolve test remains at the parent boundary. The engine root is 10,159 lines, and the 992-test/76-
+  family inventories remain exact. Three GPU gates passed nine sequential and six concurrent invocations with
+  zero CUDA 700/716/717 and explicitly reported GPU execution for the filtered shapes; both ordinary modes
+  passed 505/487, and all-target check, strict clippy, scoped formatting/diff/reference checks, and independent
+  audit are clean. No production predicate, join, route, or architectural behavior changed, so the report card
+  was not applicable. STRUCT-001EN is next.
 
 ## Known boundaries
 
