@@ -902,6 +902,29 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   bootstrap-only pg-dump metadata, and absent GPU-native catalog execution. Full gates, PostgreSQL 16 scenarios
   53/313/344/346, all 18 pg-dump restore/metadata/privilege gates, and independent audit are clean. The root is
   6,544 lines and STRUCT-001CS is closed.
+  All effective psql/direct/pg_dumpall tablespace catalog reads now execute from the existing private 820-line
+  `cluster_ddl` owner behind two stage-preserving delegates; the 524-line `pg_dump_compat` consumes only the
+  tablespace delegate. Eight query/column/row helpers are byte-identical private moves and seven `cfg(test)`
+  aliases have proven consumers. Exact normal/verbose/OID-location/ACL order, 3-/7-/3-/2-/8-column shapes,
+  bootstrap and application OIDs/names/locations, owner and fixed-size fields, ACL display/array/defaults,
+  comments, options/nulls, name sorting, OID sorting, and writers are unchanged. The later root pg_dumpall route
+  and its still-later empty-catalog classifier branch were deleted only after both were proven dominated by
+  unconditional earlier pg-dump compatibility. Inherited PRODUCT-002 debt remains structural/exact routing,
+  host/synthetic OIDs, hard-coded ownership and zero-byte sizing, metadata-only locations, simplified ACLs and
+  defaults, bootstrap tablespaces omitted from pg_dumpall metadata, and absent GPU-native catalog execution. Full
+  gates, PostgreSQL 16 scenarios 55/315/345/346, the pg-dumpall globals restore, and independent audit are clean.
+  The root is 6,375 lines and STRUCT-001CT is closed.
+  All effective psql and pg-dump extension catalog reads now execute from the existing private 257-line
+  `bootstrap_ddl` owner behind two stage-preserving delegates; the 510-line `pg_dump_compat` consumes only the
+  extension delegate. Four helpers are byte-identical private moves and two `cfg(test)` wrapper aliases have
+  proven consumers. Exact equality predicates, post-default-ACL/pre-language and post-role/pre-language stages,
+  4-/8-column shapes, `plpgsql` name/version/schema, class/object OIDs, relocatable flag, stored-comment or
+  fallback description, null configuration fields, and writers are unchanged. The later root pg-dump discovery
+  route was deleted only after it was proven dominated by unconditional earlier pg-dump compatibility. Inherited
+  PRODUCT-002 debt remains exact routing, a single synthesized bootstrap extension, fixed OIDs/version/schema/
+  relocatability, null configuration, fallback description masking absent stored metadata, CPU-built host rows,
+  and absent GPU-native catalog execution. Full gates, PostgreSQL 16 scenario 54, all 18 pg-dump restore/metadata/
+  privilege gates, and independent audit are clean. The root is 6,317 lines and STRUCT-001CU is closed.
 
 ## Known boundaries
 

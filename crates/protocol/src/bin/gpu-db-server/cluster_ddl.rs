@@ -1,10 +1,10 @@
 // Legacy cluster-object DDL ownership. This is not a product execution path.
 
 use super::{
-    bool_column, database_acl_display, database_exists, int4_column, tablespace_exists,
-    text_column, write_command_complete, write_error, write_single_row, CatalogCommentTarget,
-    Column, Command, DatabaseInfo, ErrorField, ReadWrite, Session, TablespaceInfo,
-    POSTGRES_DATABASE_OID,
+    bool_column, database_acl_display, database_exists, int4_column, tablespace_acl_array_display,
+    tablespace_acl_display, tablespace_exists, text_column, write_command_complete, write_error,
+    write_single_row, CatalogCommentTarget, Column, Command, DatabaseInfo, ErrorField, ReadWrite,
+    Session, TablespaceInfo, POSTGRES_DATABASE_OID,
 };
 use std::collections::BTreeSet;
 use std::io;
@@ -282,6 +282,246 @@ pub(super) fn test_pg_dump_database_metadata_query() -> &'static str {
 #[cfg(test)]
 pub(super) fn test_pg_dump_database_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     pg_dump_database_metadata_rows(session)
+}
+
+fn psql_list_tablespaces_catalog_query() -> &'static str {
+    "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\" from pg_catalog.pg_tablespace order by 1"
+}
+
+fn psql_list_tablespaces_verbose_catalog_query() -> &'static str {
+    "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\", pg_catalog.array_to_string(spcacl, e'\\n') as \"access privileges\", spcoptions as \"options\", pg_catalog.pg_size_pretty(pg_catalog.pg_tablespace_size(oid)) as \"size\", pg_catalog.shobj_description(oid, 'pg_tablespace') as \"description\" from pg_catalog.pg_tablespace order by 1"
+}
+
+fn catalog_psql_list_tablespace_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
+    let mut spaces = vec![
+        TablespaceInfo {
+            oid: 1663,
+            name: "pg_default".to_string(),
+            location: String::new(),
+        },
+        TablespaceInfo {
+            oid: 1664,
+            name: "pg_global".to_string(),
+            location: String::new(),
+        },
+    ];
+    spaces.extend(session.tablespaces.values().cloned());
+    spaces.sort_by_key(|space| space.name.clone());
+    let mut rows = Vec::new();
+    for space in spaces {
+        let mut row = vec![
+            Some(space.name.clone()),
+            Some("postgres".to_string()),
+            Some(space.location.clone()),
+        ];
+        if verbose {
+            row.push(tablespace_acl_display(session, &space.name));
+            row.push(None);
+            row.push(Some("0 bytes".to_string()));
+            row.push(
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Tablespace {
+                        tablespace: space.name.clone(),
+                    })
+                    .cloned(),
+            );
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+fn catalog_tablespace_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut spaces = vec![
+        TablespaceInfo {
+            oid: 1663,
+            name: "pg_default".to_string(),
+            location: String::new(),
+        },
+        TablespaceInfo {
+            oid: 1664,
+            name: "pg_global".to_string(),
+            location: String::new(),
+        },
+    ];
+    spaces.extend(session.tablespaces.values().cloned());
+    spaces.sort_by_key(|space| space.name.clone());
+    spaces
+        .into_iter()
+        .map(|space| {
+            vec![
+                Some(space.oid.to_string()),
+                Some(space.name),
+                Some(space.location),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_tablespace_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut spaces = vec!["pg_default".to_string(), "pg_global".to_string()];
+    spaces.extend(session.tablespaces.values().map(|space| space.name.clone()));
+    spaces.sort();
+    spaces
+        .into_iter()
+        .map(|space| vec![Some(space.clone()), tablespace_acl_display(session, &space)])
+        .collect()
+}
+
+fn pg_dumpall_tablespace_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("oid"),
+        text_column("spcname"),
+        text_column("spcowner"),
+        text_column("pg_tablespace_location"),
+        text_column("spcacl"),
+        text_column("acldefault"),
+        text_column("array_to_string"),
+        text_column("shobj_description"),
+    ]
+}
+
+fn pg_dumpall_tablespace_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut spaces = session.tablespaces.values().cloned().collect::<Vec<_>>();
+    spaces.sort_by_key(|space| space.oid);
+    spaces
+        .into_iter()
+        .map(|space| {
+            vec![
+                Some(space.oid.to_string()),
+                Some(space.name.clone()),
+                Some("postgres".to_string()),
+                Some(space.location.clone()),
+                tablespace_acl_array_display(session, &space.name),
+                Some("{postgres=C/postgres}".to_string()),
+                None,
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Tablespace {
+                        tablespace: space.name,
+                    })
+                    .cloned(),
+            ]
+        })
+        .collect()
+}
+
+fn is_pg_dumpall_tablespace_metadata_query(canonical: &str) -> bool {
+    (canonical.contains("from pg_catalog.pg_tablespace")
+        || canonical.contains("from pg_tablespace"))
+        && canonical.contains("spcacl")
+        && canonical.contains("acldefault")
+        && canonical.contains("shobj_description")
+}
+
+pub(super) fn try_execute_tablespace_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical == psql_list_tablespaces_catalog_query() {
+        Some(write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                text_column("Location"),
+            ],
+            &catalog_psql_list_tablespace_rows(session, false),
+        ))
+    } else if canonical == psql_list_tablespaces_verbose_catalog_query() {
+        Some(write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                text_column("Location"),
+                text_column("Access privileges"),
+                text_column("Options"),
+                text_column("Size"),
+                text_column("Description"),
+            ],
+            &catalog_psql_list_tablespace_rows(session, true),
+        ))
+    } else if canonical
+        == "select oid, spcname, pg_catalog.pg_tablespace_location(oid) as location from pg_catalog.pg_tablespace order by spcname"
+    {
+        Some(write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("spcname"),
+                text_column("location"),
+            ],
+            &catalog_tablespace_oid_rows(session),
+        ))
+    } else if canonical
+        == "select spcname, pg_catalog.array_to_string(spcacl, e'\\n') as acl from pg_catalog.pg_tablespace order by spcname"
+    {
+        Some(write_single_row(
+            stream,
+            &[text_column("spcname"), text_column("acl")],
+            &catalog_tablespace_acl_rows(session),
+        ))
+    } else {
+        None
+    }
+}
+
+pub(super) fn try_execute_tablespace_pg_dump_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if !is_pg_dumpall_tablespace_metadata_query(canonical) {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &pg_dumpall_tablespace_metadata_columns(),
+        &pg_dumpall_tablespace_metadata_rows(session),
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_tablespaces_catalog_query() -> &'static str {
+    psql_list_tablespaces_catalog_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_tablespaces_verbose_catalog_query() -> &'static str {
+    psql_list_tablespaces_verbose_catalog_query()
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_psql_list_tablespace_rows(
+    session: &Session,
+    verbose: bool,
+) -> Vec<Vec<Option<String>>> {
+    catalog_psql_list_tablespace_rows(session, verbose)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_tablespace_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    catalog_tablespace_oid_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_tablespace_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    catalog_tablespace_acl_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_dumpall_tablespace_metadata_rows(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    pg_dumpall_tablespace_metadata_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_is_pg_dumpall_tablespace_metadata_query(canonical: &str) -> bool {
+    is_pg_dumpall_tablespace_metadata_query(canonical)
 }
 
 pub(super) fn execute_cluster_ddl(

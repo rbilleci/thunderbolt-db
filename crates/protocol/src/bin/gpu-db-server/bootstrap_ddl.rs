@@ -1,8 +1,9 @@
 // Legacy bootstrap catalog DDL ownership. This is not a product execution path.
 
 use super::{
-    write_command_complete, write_error, CatalogCommentTarget, Command, ErrorField, ReadWrite,
-    Session,
+    bool_column, int4_column, text_column, write_command_complete, write_error, write_single_row,
+    CatalogCommentTarget, Command, ErrorField, ReadWrite, Session, PG_EXTENSION_CLASS_OID,
+    PLPGSQL_DESCRIPTION, PLPGSQL_EXTENSION_OID,
 };
 use std::io;
 
@@ -162,4 +163,95 @@ pub(super) fn try_execute_bootstrap_ddl(
         }
         _ => None,
     }
+}
+
+pub(super) fn try_execute_extension_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != psql_list_extensions_catalog_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[
+            text_column("Name"),
+            text_column("Version"),
+            text_column("Schema"),
+            text_column("Description"),
+        ],
+        &catalog_psql_extension_rows(session),
+    ))
+}
+
+pub(super) fn try_execute_extension_pg_dump_catalog_query(
+    stream: &mut dyn ReadWrite,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical
+        != "select x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable, x.extversion, x.extconfig, x.extcondition from pg_extension x join pg_namespace n on n.oid = x.extnamespace"
+    {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("extname"),
+            text_column("nspname"),
+            bool_column("extrelocatable"),
+            text_column("extversion"),
+            text_column("extconfig"),
+            text_column("extcondition"),
+        ],
+        &catalog_extension_discovery_rows(),
+    ))
+}
+
+fn psql_list_extensions_catalog_query() -> &'static str {
+    "select e.extname as \"name\", e.extversion as \"version\", n.nspname as \"schema\", c.description as \"description\" from pg_catalog.pg_extension e left join pg_catalog.pg_namespace n on n.oid = e.extnamespace left join pg_catalog.pg_description c on c.objoid = e.oid and c.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass order by 1"
+}
+
+fn bootstrap_extension_description(session: &Session) -> String {
+    session
+        .comments
+        .get(&CatalogCommentTarget::Extension {
+            extension: "plpgsql".to_string(),
+        })
+        .cloned()
+        .unwrap_or_else(|| PLPGSQL_DESCRIPTION.to_string())
+}
+
+fn catalog_psql_extension_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("plpgsql".to_string()),
+        Some("1.0".to_string()),
+        Some("pg_catalog".to_string()),
+        Some(bootstrap_extension_description(session)),
+    ]]
+}
+
+fn catalog_extension_discovery_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some(PG_EXTENSION_CLASS_OID.to_string()),
+        Some(PLPGSQL_EXTENSION_OID.to_string()),
+        Some("plpgsql".to_string()),
+        Some("pg_catalog".to_string()),
+        Some("f".to_string()),
+        Some("1.0".to_string()),
+        None,
+        None,
+    ]]
+}
+
+#[cfg(test)]
+pub(super) fn test_catalog_psql_extension_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    catalog_psql_extension_rows(session)
+}
+
+#[cfg(test)]
+pub(super) fn test_psql_list_extensions_catalog_query() -> &'static str {
+    psql_list_extensions_catalog_query()
 }

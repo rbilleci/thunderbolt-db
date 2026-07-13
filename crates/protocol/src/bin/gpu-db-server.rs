@@ -93,20 +93,34 @@ mod session_commands;
 use session_commands::try_execute_session_command;
 #[path = "gpu-db-server/bootstrap_ddl.rs"]
 mod bootstrap_ddl;
-use bootstrap_ddl::try_execute_bootstrap_ddl;
+#[cfg(test)]
+use bootstrap_ddl::{
+    test_catalog_psql_extension_rows as catalog_psql_extension_rows,
+    test_psql_list_extensions_catalog_query as psql_list_extensions_catalog_query,
+};
+use bootstrap_ddl::{try_execute_bootstrap_ddl, try_execute_extension_catalog_query};
 #[path = "gpu-db-server/cluster_ddl.rs"]
 mod cluster_ddl;
-use cluster_ddl::{execute_cluster_ddl, try_execute_database_catalog_query};
+use cluster_ddl::{
+    execute_cluster_ddl, try_execute_database_catalog_query, try_execute_tablespace_catalog_query,
+};
 #[cfg(test)]
 use cluster_ddl::{
     test_catalog_database_acl_rows as catalog_database_acl_rows,
     test_catalog_database_oid_rows as catalog_database_oid_rows,
     test_catalog_psql_list_database_rows as catalog_psql_list_database_rows,
     test_catalog_psql_list_database_verbose_rows as catalog_psql_list_database_verbose_rows,
+    test_catalog_psql_list_tablespace_rows as catalog_psql_list_tablespace_rows,
+    test_catalog_tablespace_acl_rows as catalog_tablespace_acl_rows,
+    test_catalog_tablespace_oid_rows as catalog_tablespace_oid_rows,
+    test_is_pg_dumpall_tablespace_metadata_query as is_pg_dumpall_tablespace_metadata_query,
     test_pg_dump_database_metadata_query as pg_dump_database_metadata_query,
     test_pg_dump_database_metadata_rows as pg_dump_database_metadata_rows,
+    test_pg_dumpall_tablespace_metadata_rows as pg_dumpall_tablespace_metadata_rows,
     test_psql_list_databases_catalog_query as psql_list_databases_catalog_query,
     test_psql_list_databases_verbose_catalog_query as psql_list_databases_verbose_catalog_query,
+    test_psql_list_tablespaces_catalog_query as psql_list_tablespaces_catalog_query,
+    test_psql_list_tablespaces_verbose_catalog_query as psql_list_tablespaces_verbose_catalog_query,
 };
 #[path = "gpu-db-server/index_ddl.rs"]
 mod index_ddl;
@@ -1676,35 +1690,8 @@ fn execute_statement(
             &catalog_psql_default_access_privilege_rows(session),
         );
     }
-    if canonical == psql_list_extensions_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Name"),
-                text_column("Version"),
-                text_column("Schema"),
-                text_column("Description"),
-            ],
-            &catalog_psql_extension_rows(session),
-        );
-    }
-    if canonical
-        == "select x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable, x.extversion, x.extconfig, x.extcondition from pg_extension x join pg_namespace n on n.oid = x.extnamespace"
-    {
-        return write_single_row(
-            stream,
-            &[
-                int4_column("tableoid"),
-                int4_column("oid"),
-                text_column("extname"),
-                text_column("nspname"),
-                bool_column("extrelocatable"),
-                text_column("extversion"),
-                text_column("extconfig"),
-                text_column("extcondition"),
-            ],
-            &catalog_extension_discovery_rows(),
-        );
+    if let Some(result) = try_execute_extension_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if canonical
         == "select tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl, acldefault('l', lanowner) as acldefault, lanowner from pg_language where lanispl order by oid"
@@ -1736,52 +1723,8 @@ fn execute_statement(
     if let Some(result) = try_execute_database_catalog_query(stream, session, &canonical) {
         return result;
     }
-    if is_pg_dumpall_tablespace_metadata_query(&canonical) {
-        return write_single_row(
-            stream,
-            &pg_dumpall_tablespace_metadata_columns(),
-            &pg_dumpall_tablespace_metadata_rows(session),
-        );
-    }
-    if canonical == psql_list_tablespaces_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Name"),
-                text_column("Owner"),
-                text_column("Location"),
-            ],
-            &catalog_psql_list_tablespace_rows(session, false),
-        );
-    }
-    if canonical == psql_list_tablespaces_verbose_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Name"),
-                text_column("Owner"),
-                text_column("Location"),
-                text_column("Access privileges"),
-                text_column("Options"),
-                text_column("Size"),
-                text_column("Description"),
-            ],
-            &catalog_psql_list_tablespace_rows(session, true),
-        );
-    }
-    if canonical == "select oid, spcname, pg_catalog.pg_tablespace_location(oid) as location from pg_catalog.pg_tablespace order by spcname" {
-        return write_single_row(
-            stream,
-            &[int4_column("oid"), text_column("spcname"), text_column("location")],
-            &catalog_tablespace_oid_rows(session),
-        );
-    }
-    if canonical == "select spcname, pg_catalog.array_to_string(spcacl, e'\\n') as acl from pg_catalog.pg_tablespace order by spcname" {
-        return write_single_row(
-            stream,
-            &[text_column("spcname"), text_column("acl")],
-            &catalog_tablespace_acl_rows(session),
-        );
+    if let Some(result) = try_execute_tablespace_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if canonical == psql_list_access_methods_catalog_query() {
         return write_single_row(
@@ -2824,143 +2767,8 @@ fn psql_list_default_access_privileges_catalog_query() -> &'static str {
     "select pg_catalog.pg_get_userbyid(d.defaclrole) as \"owner\", n.nspname as \"schema\", case d.defaclobjtype when 'r' then 'table' when 's' then 'sequence' when 'f' then 'function' when 't' then 'type' when 'n' then 'schema' end as \"type\", pg_catalog.array_to_string(d.defaclacl, e'\\n') as \"access privileges\" from pg_catalog.pg_default_acl d left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace order by 1, 2, 3"
 }
 
-fn psql_list_extensions_catalog_query() -> &'static str {
-    "select e.extname as \"name\", e.extversion as \"version\", n.nspname as \"schema\", c.description as \"description\" from pg_catalog.pg_extension e left join pg_catalog.pg_namespace n on n.oid = e.extnamespace left join pg_catalog.pg_description c on c.objoid = e.oid and c.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass order by 1"
-}
-
 fn psql_list_languages_catalog_query() -> &'static str {
     "select l.lanname as \"name\", pg_catalog.pg_get_userbyid(l.lanowner) as \"owner\", l.lanpltrusted as \"trusted\", d.description as \"description\" from pg_catalog.pg_language l left join pg_catalog.pg_description d on d.classoid = l.tableoid and d.objoid = l.oid and d.objsubid = 0 where l.lanplcallfoid != 0 order by 1"
-}
-
-fn psql_list_tablespaces_catalog_query() -> &'static str {
-    "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\" from pg_catalog.pg_tablespace order by 1"
-}
-
-fn psql_list_tablespaces_verbose_catalog_query() -> &'static str {
-    "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\", pg_catalog.array_to_string(spcacl, e'\\n') as \"access privileges\", spcoptions as \"options\", pg_catalog.pg_size_pretty(pg_catalog.pg_tablespace_size(oid)) as \"size\", pg_catalog.shobj_description(oid, 'pg_tablespace') as \"description\" from pg_catalog.pg_tablespace order by 1"
-}
-
-fn catalog_psql_list_tablespace_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
-    let mut spaces = vec![
-        TablespaceInfo {
-            oid: 1663,
-            name: "pg_default".to_string(),
-            location: String::new(),
-        },
-        TablespaceInfo {
-            oid: 1664,
-            name: "pg_global".to_string(),
-            location: String::new(),
-        },
-    ];
-    spaces.extend(session.tablespaces.values().cloned());
-    spaces.sort_by_key(|space| space.name.clone());
-    let mut rows = Vec::new();
-    for space in spaces {
-        let mut row = vec![
-            Some(space.name.clone()),
-            Some("postgres".to_string()),
-            Some(space.location.clone()),
-        ];
-        if verbose {
-            row.push(tablespace_acl_display(session, &space.name));
-            row.push(None);
-            row.push(Some("0 bytes".to_string()));
-            row.push(
-                session
-                    .comments
-                    .get(&CatalogCommentTarget::Tablespace {
-                        tablespace: space.name.clone(),
-                    })
-                    .cloned(),
-            );
-        }
-        rows.push(row);
-    }
-    rows
-}
-
-fn catalog_tablespace_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut spaces = vec![
-        TablespaceInfo {
-            oid: 1663,
-            name: "pg_default".to_string(),
-            location: String::new(),
-        },
-        TablespaceInfo {
-            oid: 1664,
-            name: "pg_global".to_string(),
-            location: String::new(),
-        },
-    ];
-    spaces.extend(session.tablespaces.values().cloned());
-    spaces.sort_by_key(|space| space.name.clone());
-    spaces
-        .into_iter()
-        .map(|space| {
-            vec![
-                Some(space.oid.to_string()),
-                Some(space.name),
-                Some(space.location),
-            ]
-        })
-        .collect()
-}
-
-fn catalog_tablespace_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut spaces = vec!["pg_default".to_string(), "pg_global".to_string()];
-    spaces.extend(session.tablespaces.values().map(|space| space.name.clone()));
-    spaces.sort();
-    spaces
-        .into_iter()
-        .map(|space| vec![Some(space.clone()), tablespace_acl_display(session, &space)])
-        .collect()
-}
-
-fn pg_dumpall_tablespace_metadata_columns() -> Vec<Column> {
-    vec![
-        int4_column("oid"),
-        text_column("spcname"),
-        text_column("spcowner"),
-        text_column("pg_tablespace_location"),
-        text_column("spcacl"),
-        text_column("acldefault"),
-        text_column("array_to_string"),
-        text_column("shobj_description"),
-    ]
-}
-
-fn pg_dumpall_tablespace_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut spaces = session.tablespaces.values().cloned().collect::<Vec<_>>();
-    spaces.sort_by_key(|space| space.oid);
-    spaces
-        .into_iter()
-        .map(|space| {
-            vec![
-                Some(space.oid.to_string()),
-                Some(space.name.clone()),
-                Some("postgres".to_string()),
-                Some(space.location.clone()),
-                tablespace_acl_array_display(session, &space.name),
-                Some("{postgres=C/postgres}".to_string()),
-                None,
-                session
-                    .comments
-                    .get(&CatalogCommentTarget::Tablespace {
-                        tablespace: space.name,
-                    })
-                    .cloned(),
-            ]
-        })
-        .collect()
-}
-
-fn is_pg_dumpall_tablespace_metadata_query(canonical: &str) -> bool {
-    (canonical.contains("from pg_catalog.pg_tablespace")
-        || canonical.contains("from pg_tablespace"))
-        && canonical.contains("spcacl")
-        && canonical.contains("acldefault")
-        && canonical.contains("shobj_description")
 }
 
 fn psql_list_access_methods_catalog_query() -> &'static str {
@@ -4595,9 +4403,6 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
             text_column("acldefault"),
         ]);
     }
-    if is_pg_dumpall_tablespace_metadata_query(canonical) {
-        return Some(pg_dumpall_tablespace_metadata_columns());
-    }
     if canonical == "select tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid as oprcode from pg_operator" {
         return Some(vec![
             int4_column("tableoid"),
@@ -5606,38 +5411,6 @@ fn catalog_empty_rows_for_relation_oid(_oid: u32) -> Vec<Vec<Option<String>>> {
 
 fn catalog_empty_rows() -> Vec<Vec<Option<String>>> {
     Vec::new()
-}
-
-fn bootstrap_extension_description(session: &Session) -> String {
-    session
-        .comments
-        .get(&CatalogCommentTarget::Extension {
-            extension: "plpgsql".to_string(),
-        })
-        .cloned()
-        .unwrap_or_else(|| PLPGSQL_DESCRIPTION.to_string())
-}
-
-fn catalog_psql_extension_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    vec![vec![
-        Some("plpgsql".to_string()),
-        Some("1.0".to_string()),
-        Some("pg_catalog".to_string()),
-        Some(bootstrap_extension_description(session)),
-    ]]
-}
-
-fn catalog_extension_discovery_rows() -> Vec<Vec<Option<String>>> {
-    vec![vec![
-        Some(PG_EXTENSION_CLASS_OID.to_string()),
-        Some(PLPGSQL_EXTENSION_OID.to_string()),
-        Some("plpgsql".to_string()),
-        Some("pg_catalog".to_string()),
-        Some("f".to_string()),
-        Some("1.0".to_string()),
-        None,
-        None,
-    ]]
 }
 
 fn catalog_psql_language_rows() -> Vec<Vec<Option<String>>> {

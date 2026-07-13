@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001CT:** move normal/verbose/direct/pg_dumpall tablespace catalog reads into the existing cluster owner
-   behind two stage-preserving delegates, retaining exact metadata, ACLs, comments, ordering, and output.
+1. **STRUCT-001CV:** move psql schema listings, direct namespace reads, effective pg-dump namespace discovery,
+   and bounded schemata introspection into the existing bootstrap owner behind stage-preserving delegates.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
