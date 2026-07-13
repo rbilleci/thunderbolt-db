@@ -1511,7 +1511,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   0.45, ordered project 0.12; sort/join/grouped 349/257/1678 M-elem/s). The canonical two-layer/two-regime card
   also completed: raw out-of-L2 roofline 1,441 GB/s; point-read lpb-index p50/throughput at batch 32 was
   20us/1.52M lookups/s in both regimes, and batch 65,536 was 1,625us/37.18M in-L2 versus 1,570us/38.60M
-  out-of-L2. STRUCT-001FA resumes as the first open task.
+  out-of-L2. STRUCT-001FA then closed the source-equivalent nine-method auto-admit/transient/benchmark-install
+  owner in the 765-line `engine_residency/transient.rs` child, reducing the facade root to 2,188 lines. The only
+  visibility change is the required narrow `pub(super)` bridge for `relational_residency_device_memory`; two
+  final shard-install calls were rustfmt-wrapped. Five focused ordinary admission/proof gates passed. The sync
+  transient catalog route passed its three sequential/two concurrent READ-005 matrix; five additional auto-admit,
+  async transient, installer fail-safe, and sharded installer/read routes passed 15 sequential plus ten concurrent
+  invocations with zero CUDA 700/716/717. Both ordinary engine modes passed 505/487 with the exact 992-test
+  inventory; all-target check, strict clippy, dependency-boundary/scoped source/reference/format checks, and
+  independent audit are clean. Runtime, layout, admission, residency, transient, and result-path behavior are
+  unchanged, so the report card was not applicable. STRUCT-001FB is the next ownership slice.
 
 ## Known boundaries
 
