@@ -859,6 +859,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   emulation, hidden orphan-index comments, and absent GPU-native catalog execution. Full protocol/driver/security/
   formatting gates, focused comment/constraint/shared-catalog tests, PostgreSQL 16 scenarios 43/305/311/330/331,
   and independent audit are clean. The root is 7,186 lines and STRUCT-001CO is closed.
+  The direct public-schema description read now executes from the existing private 929-line `catalog_comments`
+  owner behind a second, separately positioned tri-state delegate. Its exact query literal and row builder are
+  byte-identical moves; both implementation helpers remain private and the only new exposure is the production
+  delegate plus one proven `cfg(test)` row alias. The post-psql-schema/pre-namespace stage, equality, two columns,
+  public-schema existence behavior, optional comment/null output, and writer are unchanged; adjacent psql schema,
+  namespace/ACL, later relation-description, and pg-dump handling remain untouched. Inherited PRODUCT-002 debt
+  remains exact-query matching, hard-coded public-schema metadata, host/session-backed optional comments, CPU
+  result construction, and absent GPU-native catalog execution. Full protocol/driver/security/formatting gates,
+  focused schema/comment/catalog tests, PostgreSQL 16 scenarios 312/340, and independent audit are clean. The root
+  is 7,168 lines and STRUCT-001CP is closed.
 
 ## Known boundaries
 

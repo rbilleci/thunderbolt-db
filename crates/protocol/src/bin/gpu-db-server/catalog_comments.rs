@@ -8,6 +8,40 @@ use super::{
 use gpu_db_protocol::{Command, CommentTarget};
 use std::io;
 
+fn pg_catalog_schema_description_query() -> &'static str {
+    "select n.nspname, pg_catalog.obj_description(n.oid, 'pg_namespace') as description from pg_catalog.pg_namespace n where n.nspname = 'public' order by n.nspname"
+}
+
+fn pg_catalog_schema_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    if !session.public_schema_exists {
+        return Vec::new();
+    }
+    vec![vec![
+        Some("public".to_string()),
+        session
+            .comments
+            .get(&CatalogCommentTarget::Schema {
+                schema: "public".to_string(),
+            })
+            .cloned(),
+    ]]
+}
+
+pub(super) fn try_execute_schema_description_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != pg_catalog_schema_description_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[text_column("nspname"), text_column("description")],
+        &pg_catalog_schema_description_rows(session),
+    ))
+}
+
 fn pg_catalog_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','v') order by c.relname, d.objsubid"
 }
@@ -473,6 +507,13 @@ pub(super) fn try_execute_relation_description_catalog_query(
         return None;
     };
     Some(write_single_row(stream, &columns, &rows))
+}
+
+#[cfg(test)]
+pub(super) fn test_pg_catalog_schema_description_rows(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    pg_catalog_schema_description_rows(session)
 }
 
 #[cfg(test)]

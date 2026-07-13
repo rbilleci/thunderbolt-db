@@ -178,11 +178,15 @@ mod role_ddl;
 use role_ddl::execute_role_ddl;
 #[path = "gpu-db-server/catalog_comments.rs"]
 mod catalog_comments;
-use catalog_comments::{execute_catalog_comment, try_execute_relation_description_catalog_query};
+use catalog_comments::{
+    execute_catalog_comment, try_execute_relation_description_catalog_query,
+    try_execute_schema_description_catalog_query,
+};
 #[cfg(test)]
 use catalog_comments::{
     test_pg_catalog_constraint_description_rows as pg_catalog_constraint_description_rows,
     test_pg_catalog_description_rows as pg_catalog_description_rows,
+    test_pg_catalog_schema_description_rows as pg_catalog_schema_description_rows,
     test_pg_catalog_table_description_rows as pg_catalog_table_description_rows,
     test_pg_catalog_table_descriptions_query as pg_catalog_table_descriptions_query,
     test_psql_list_object_descriptions_query as psql_list_object_descriptions_query,
@@ -1864,12 +1868,9 @@ fn execute_statement(
             &catalog_psql_describe_schema_verbose_rows(session),
         );
     }
-    if canonical == pg_catalog_schema_description_query() {
-        return write_single_row(
-            stream,
-            &[text_column("nspname"), text_column("description")],
-            &pg_catalog_schema_description_rows(session),
-        );
+    if let Some(result) = try_execute_schema_description_catalog_query(stream, session, &canonical)
+    {
+        return result;
     }
     if canonical == pg_catalog_namespace_query() {
         return write_single_row(
@@ -3878,25 +3879,6 @@ fn pg_catalog_namespace_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> 
     vec![vec![
         Some("public".to_string()),
         schema_acl_display(session),
-    ]]
-}
-
-fn pg_catalog_schema_description_query() -> &'static str {
-    "select n.nspname, pg_catalog.obj_description(n.oid, 'pg_namespace') as description from pg_catalog.pg_namespace n where n.nspname = 'public' order by n.nspname"
-}
-
-fn pg_catalog_schema_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    if !session.public_schema_exists {
-        return Vec::new();
-    }
-    vec![vec![
-        Some("public".to_string()),
-        session
-            .comments
-            .get(&CatalogCommentTarget::Schema {
-                schema: "public".to_string(),
-            })
-            .cloned(),
     ]]
 }
 
