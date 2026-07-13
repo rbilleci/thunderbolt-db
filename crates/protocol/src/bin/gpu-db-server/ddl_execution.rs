@@ -5,12 +5,14 @@ use super::ddl_syntax::{
     DropTable, ParsedTruncateTable,
 };
 use super::{
-    add_check_constraint_to_session, add_foreign_key_to_session, add_primary_key_to_session,
-    add_unique_constraint_to_session, create_implicit_sequence, preflight_column_default_target,
-    rename_constraint_in_session, rename_table_in_session, resolve_column_domain_type,
-    schema_permission_error, validate_foreign_keys, write_command_complete, write_error,
-    CatalogColumn, CatalogCommentTarget, ColumnDefault, Command, ErrorField, ReadWrite,
-    SchemaPrivilege, Session, Table,
+    add_check_constraint_to_session, add_column_default_supported, add_foreign_key_to_session,
+    add_primary_key_to_session, add_unique_constraint_to_session, column_default_matches_type,
+    create_implicit_sequence, drop_column_from_session, evaluate_column_default,
+    preflight_column_default_target, rename_column_in_session, rename_constraint_in_session,
+    rename_table_in_session, resolve_column_domain_type, schema_permission_error,
+    validate_foreign_keys, write_command_complete, write_error, CatalogColumn,
+    CatalogCommentTarget, ColumnDefault, Command, ErrorField, ReadWrite, SchemaPrivilege, Session,
+    Table,
 };
 use std::collections::BTreeSet;
 use std::io;
@@ -600,6 +602,309 @@ pub(super) fn execute_parsed_table_ddl(
                 &rename.new_name,
                 rename.if_exists,
             ) {
+                return write_error(stream, &error);
+            }
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::DropTable(drop) => {
+            let mut seen = BTreeSet::new();
+            for name in &drop.names {
+                if !seen.insert(name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42710",
+                            message: "table specified more than once",
+                            position: None,
+                        },
+                    );
+                }
+                if session.views.contains_key(name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a table",
+                            position: None,
+                        },
+                    );
+                }
+                if session.materialized_views.contains_key(name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a table",
+                            position: None,
+                        },
+                    );
+                }
+                if session.sequences.contains_key(name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a table",
+                            position: None,
+                        },
+                    );
+                }
+                if !drop.if_exists && !session.tables.contains_key(name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                }
+            }
+            let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
+            let dropped_index_names = session
+                .indexes
+                .iter()
+                .filter(|index| drop_names.contains(&index.table))
+                .map(|index| index.name.clone())
+                .collect::<BTreeSet<_>>();
+            for name in &drop.names {
+                session.tables.remove(name);
+                session.table_acls.remove(name);
+                session.mark_table_dirty(name.clone());
+                session.mark_table_acl_dirty(name.clone());
+            }
+            let old_index_count = session.indexes.len();
+            session
+                .indexes
+                .retain(|index| !drop_names.contains(&index.table));
+            session.dirty_indexes |= session.indexes.len() != old_index_count;
+            let dropped_comment_targets = session
+                .comments
+                .keys()
+                .filter(|target| match target {
+                    CatalogCommentTarget::Table { table }
+                    | CatalogCommentTarget::Column { table, .. }
+                    | CatalogCommentTarget::Constraint { table, .. } => drop_names.contains(table),
+                    CatalogCommentTarget::Index { index } => dropped_index_names.contains(index),
+                    CatalogCommentTarget::Database { .. }
+                    | CatalogCommentTarget::Role { .. }
+                    | CatalogCommentTarget::Schema { .. }
+                    | CatalogCommentTarget::Tablespace { .. }
+                    | CatalogCommentTarget::View { .. }
+                    | CatalogCommentTarget::MaterializedView { .. }
+                    | CatalogCommentTarget::Extension { .. }
+                    | CatalogCommentTarget::Function { .. }
+                    | CatalogCommentTarget::Sequence { .. }
+                    | CatalogCommentTarget::Domain { .. }
+                    | CatalogCommentTarget::Publication { .. }
+                    | CatalogCommentTarget::Subscription { .. } => false,
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for target in dropped_comment_targets {
+                session.comments.remove(&target);
+                session.mark_comment_dirty(target);
+            }
+            session.persist_catalog_snapshot();
+            write_command_complete(stream, "DROP TABLE")
+        }
+        Command::AlterColumnDefault(alter) => {
+            if session.views.contains_key(&alter.table)
+                || session.materialized_views.contains_key(&alter.table)
+                || session.sequences.contains_key(&alter.table)
+            {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42809",
+                        message: "relation is not a table",
+                        position: None,
+                    },
+                );
+            }
+            let Some(table) = session.tables.get(&alter.table) else {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42P01",
+                        message: "relation does not exist",
+                        position: None,
+                    },
+                );
+            };
+            let Some(column) = table
+                .columns
+                .iter()
+                .find(|column| column.def.name == alter.column)
+            else {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42703",
+                        message: "column does not exist",
+                        position: None,
+                    },
+                );
+            };
+            let Some(default) = alter.default.clone() else {
+                session
+                    .tables
+                    .get_mut(&alter.table)
+                    .expect("table existence checked")
+                    .columns
+                    .iter_mut()
+                    .find(|column| column.def.name == alter.column)
+                    .expect("column existence checked")
+                    .def
+                    .default = None;
+                session.mark_table_dirty(alter.table);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            };
+            if !column_default_matches_type(&default, column.def.ty) {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42804",
+                        message: "column default type mismatch",
+                        position: None,
+                    },
+                );
+            }
+            if let Some(error) = preflight_column_default_target(session, &default) {
+                return write_error(stream, &error);
+            }
+            session
+                .tables
+                .get_mut(&alter.table)
+                .expect("table existence checked")
+                .columns
+                .iter_mut()
+                .find(|column| column.def.name == alter.column)
+                .expect("column existence checked")
+                .def
+                .default = Some(default);
+            session.mark_table_dirty(alter.table);
+            session.persist_catalog_snapshot();
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::AddColumn(add) => {
+            if session.views.contains_key(&add.table)
+                || session.materialized_views.contains_key(&add.table)
+                || session.sequences.contains_key(&add.table)
+            {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42809",
+                        message: "relation is not a table",
+                        position: None,
+                    },
+                );
+            }
+            let Some(default) = add.column.default.clone() else {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "0A000",
+                        message: "ADD COLUMN requires a supported DEFAULT",
+                        position: None,
+                    },
+                );
+            };
+            if !add_column_default_supported(&default) {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "0A000",
+                        message: "ADD COLUMN SERIAL is unsupported",
+                        position: None,
+                    },
+                );
+            }
+            if !column_default_matches_type(&default, add.column.ty) {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42804",
+                        message: "column default type mismatch",
+                        position: None,
+                    },
+                );
+            }
+            let Some(table) = session.tables.get(&add.table) else {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42P01",
+                        message: "relation does not exist",
+                        position: None,
+                    },
+                );
+            };
+            if table
+                .columns
+                .iter()
+                .any(|column| column.def.name == add.column.name)
+            {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42701",
+                        message: "column already exists",
+                        position: None,
+                    },
+                );
+            }
+            if let Some(error) = preflight_column_default_target(session, &default) {
+                return write_error(stream, &error);
+            }
+            let row_count = table.rows.len();
+            let attnum = match i16::try_from(table.columns.len() + 1) {
+                Ok(attnum) => attnum,
+                Err(_) => {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "54000",
+                            message: "too many columns for bootstrap catalog",
+                            position: None,
+                        },
+                    );
+                }
+            };
+            let mut default_values = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
+                match evaluate_column_default(session, &default) {
+                    Ok(default_value) => default_values.push(default_value),
+                    Err(error) => return write_error(stream, &error),
+                }
+            }
+            let table = session
+                .tables
+                .get_mut(&add.table)
+                .expect("table existence checked");
+            table.columns.push(CatalogColumn {
+                attnum,
+                def: add.column,
+            });
+            for (row, default_value) in table.rows.iter_mut().zip(default_values) {
+                row.push(default_value);
+            }
+            session.mark_table_dirty(add.table);
+            session.persist_catalog_snapshot();
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::RenameColumn(rename) => {
+            if let Err(error) =
+                rename_column_in_session(session, &rename.table, &rename.old_name, &rename.new_name)
+            {
+                return write_error(stream, &error);
+            }
+            write_command_complete(stream, "ALTER TABLE")
+        }
+        Command::DropColumn(drop) => {
+            if let Err(error) = drop_column_from_session(session, &drop.table, &drop.column) {
                 return write_error(stream, &error);
             }
             write_command_complete(stream, "ALTER TABLE")

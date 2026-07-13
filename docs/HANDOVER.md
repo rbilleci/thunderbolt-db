@@ -29,8 +29,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BN:** extend `ddl_execution` with parsed DROP TABLE and column default/add/rename/drop arms,
-   preserving dependencies, validation/rollback, ACL/comments, publication, exact errors/tags, and parse order.
+1. **STRUCT-001BO:** isolate the complete parsed `COMMENT ON` target family in a private catalog-comment owner,
+   preserving kind/existence precedence, shared-catalog checks, attnums, publication, exact errors/tags, and
+   parse order.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

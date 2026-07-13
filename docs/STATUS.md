@@ -606,6 +606,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and broader role/catalog compatibility remains PRODUCT-002. Sequential/concurrent 127-test runs, the full
   protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
   formatting, diff checks, and independent audit are clean. The root is 13,404 lines and STRUCT-001BM is closed.
+  The remaining parsed table-definition mutation commands now enter the existing private `ddl_execution` owner
+  through the same exact successful-parse gate. DROP TABLE, ALTER COLUMN SET/DROP DEFAULT, ADD COLUMN, RENAME
+  COLUMN, and DROP COLUMN preserve relation kind/existence and permission precedence, default/domain/type
+  preflight, checked attnums and implicit sequences, candidate validation/rollback, indexes, constraints, ACLs,
+  comments, dirty publication, persistence, errors, and tags. The five-arm body is token-equivalent after only
+  clippy-required tail expressions and rustfmt normalization. Sequential/concurrent 127-test runs, the full
+  protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
+  formatting, diff checks, and independent audit are clean. The root is 13,104 lines, `ddl_execution` is 914
+  lines, and STRUCT-001BN is closed.
 
 ## Known boundaries
 
