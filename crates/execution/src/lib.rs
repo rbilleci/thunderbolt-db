@@ -101,6 +101,7 @@ pub use write_apply::{
     CudaCompoundFoldColumn, CudaWriteDestination, CudaWriteIndex, FusedApplyRequest,
 };
 mod resident_sidecar;
+pub use resident_sidecar::{CudaSidecarSource, CudaTextOffsetSource};
 mod point_read_submit;
 use point_read_submit::{
     launch_cuda_resident_i32_equal_project, submit_cuda_resident_i32_equal_any_project,

@@ -3508,13 +3508,27 @@ impl Engine {
         // by ABSOLUTE offset (`resident_device_null_column_offset`) and materializes `SqlValue::Null` for a
         // 0 bit, so the sharded scan stops reading a NULL-stored-0 placeholder as `0`. ADR-006 (NULL coverage):
         // a null-bearing table is now MULTI-shard (a NULL insert rolls a dense shard), so the region is
-        // PRE-FILLED 0xFF (all valid) and each null-bearing shard's bits are repacked with the ALIGNMENT-FREE
-        // per-bit gather kernel (`gather_null_bitmap_from_shard`, which CLEARS only NULL bits) — the same
+        // PRE-FILLED 0xFF for shards that elide an all-valid bitmap; each null-bearing shard's bits are
+        // explicitly set/cleared with the ALIGNMENT-FREE per-bit gather kernel — the same
         // strategy as the bool bitmaps, since a shard's `rows_before` is generally not 32-row aligned and a
         // byte-copy would land its bits in the wrong destination word. No null-bearing shard -> zero extra
         // bytes, byte-identical read.
         let mut unified_null_columns: Vec<crate::relational_model::ResidentDeviceNullBitmapLayout> =
             Vec::new();
+        let sidecar_u32 = |value: u64, field: &str| {
+            u32::try_from(value).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "sharded resident sidecar {field} exceeds the CUDA u32 geometry"
+                )))
+            })
+        };
+        let sidecar_add = |left: u64, right: u64, field: &str| {
+            left.checked_add(right).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "sharded resident sidecar {field} overflow"
+                )))
+            })
+        };
         // (dst_bitmap_offset, dst_base_row, src_device_ptr, src_bitmap_offset, count) per (column, shard).
         let mut null_gather_ops: Vec<(u64, u32, u64, u64, u32)> = Vec::new();
         {
@@ -3552,19 +3566,21 @@ impl Engine {
                         .find(|n| &n.name == name)
                     {
                         // Alignment-free per-bit repack (like bool): the kernel places source local row `l`
-                        // at unified row `rows_before + l`, clearing only NULL bits — no 32-row-alignment
+                        // at unified row `rows_before + l`, writing both validity states — no 32-row-alignment
                         // requirement on `rows_before`, so a null-bearing shard at any offset is correct.
                         if row_count > 0 {
+                            let dst_base = sidecar_u32(rows_before, "NULL destination base")?;
+                            let count = sidecar_u32(row_count, "NULL row count")?;
                             null_gather_ops.push((
                                 col_offset,
-                                rows_before as u32,
+                                dst_base,
                                 *device_ptr,
                                 layout.bitmap_byte_offset,
-                                row_count as u32,
+                                count,
                             ));
                         }
                     }
-                    rows_before = rows_before.saturating_add(row_count);
+                    rows_before = sidecar_add(rows_before, row_count, "NULL row base")?;
                 }
                 unified_null_columns.push(
                     crate::relational_model::ResidentDeviceNullBitmapLayout {
@@ -3580,9 +3596,9 @@ impl Engine {
         // bool bitmap CANNOT be byte-concatenated across shards: shards seal at ARBITRARY row counts (the
         // first dense admit seals at exactly its row count, e.g. 100), so a shard's `rows_before` is
         // generally not 32-row aligned and its bits would land in the wrong destination word. So the region
-        // is only PRE-ZEROED here (RecompactFill 0x00); after the DtoD recompaction each shard's bits are
+        // is defensively PRE-ZEROED here (RecompactFill 0x00); after DtoD recompaction each shard's bits are
         // repacked into place by a per-bit gather KERNEL (`gather_bool_bitmap_from_shard`) that reads source
-        // bit `l` and atomic-ORs destination bit `rows_before + l` — alignment-free. The executor reads the
+        // bit `l` and atomically writes that state at `rows_before + l` — alignment-free. The executor reads the
         // region by ABSOLUTE offset (`resident_device_bool_column_offset`), like the NULL bitmaps.
         let mut unified_bool_columns: Vec<crate::relational_model::ResidentDeviceBoolColumnLayout> =
             Vec::new();
@@ -3620,15 +3636,17 @@ impl Engine {
                         ))));
                     };
                     if row_count > 0 {
+                        let dst_base = sidecar_u32(rows_before, "bool destination base")?;
+                        let count = sidecar_u32(row_count, "bool row count")?;
                         bool_gather_ops.push((
                             col_offset,
-                            rows_before as u32,
+                            dst_base,
                             *device_ptr,
                             layout.bitmap_byte_offset,
-                            row_count as u32,
+                            count,
                         ));
                     }
-                    rows_before = rows_before.saturating_add(row_count);
+                    rows_before = sidecar_add(rows_before, row_count, "bool row base")?;
                 }
                 unified_bool_columns.push(
                     crate::relational_model::ResidentDeviceBoolColumnLayout {
@@ -3647,8 +3665,9 @@ impl Engine {
         // offset helper (offsets_byte_offset + bytes_byte_offset), same layout as the single buffer.
         let mut unified_text_columns: Vec<crate::relational_model::ResidentDeviceTextColumnLayout> =
             Vec::new();
-        // (dst_offsets_byte_offset, dst_base_row, blob_base, src_ptr, src_offsets_byte_offset, count).
-        let mut text_rebase_ops: Vec<(u64, u32, u64, u64, u64, u32)> = Vec::new();
+        // (dst_offsets_byte_offset, dst_base_row, blob_base, src_ptr, src_offsets_byte_offset,
+        //  src_bytes_byte_offset, src_blob_len, count).
+        let mut text_rebase_ops: Vec<(u64, u32, u64, u64, u64, u64, u64, u32)> = Vec::new();
         {
             let text_names: Vec<String> = shards[0]
                 .resident_device_text_columns
@@ -3696,17 +3715,22 @@ impl Engine {
                             });
                         }
                         // Rebase this shard's (row_count+1) offsets into [rows_before .. +row_count].
+                        let dst_base = sidecar_u32(rows_before, "text destination base")?;
+                        let offset_count = sidecar_add(row_count, 1, "text offset count")?;
+                        let count = sidecar_u32(offset_count, "text offset count")?;
                         text_rebase_ops.push((
                             offsets_byte_offset,
-                            rows_before as u32,
+                            dst_base,
                             blob_base,
                             *device_ptr,
                             layout.offsets_byte_offset,
-                            (row_count + 1) as u32,
+                            layout.bytes_byte_offset,
+                            layout.bytes_len,
+                            count,
                         ));
                     }
-                    rows_before = rows_before.saturating_add(row_count);
-                    blob_base = blob_base.saturating_add(layout.bytes_len);
+                    rows_before = sidecar_add(rows_before, row_count, "text row base")?;
+                    blob_base = sidecar_add(blob_base, layout.bytes_len, "text blob base")?;
                 }
                 allocated_bytes = allocated_bytes.saturating_add(blob_base);
                 unified_text_columns.push(
@@ -3731,23 +3755,43 @@ impl Engine {
                     "sharded resident recompaction into a unified device buffer failed: {err}"
                 )))
             })?;
-        // TYPE-COVERAGE #14 (bool): repack each shard's bool bits into the pre-zeroed unified regions with
+        let sidecar_source = |device_ptr: u64, byte_offset: u64| {
+            shards
+                .iter()
+                .find_map(|shard| {
+                    shard.device_memory.as_ref().and_then(|memory| {
+                        (memory.device_ptr() == device_ptr).then(|| CudaSidecarSource {
+                            memory: Arc::clone(memory),
+                            byte_offset,
+                        })
+                    })
+                })
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "sidecar source generation is no longer owned".to_string(),
+                    ))
+                })
+        };
+        // TYPE-COVERAGE #14 (bool): repack each shard's bool bits into the unified regions with
         // the alignment-free per-bit gather kernel (DtoD, no HtoD). Runs after the DtoD recompaction so the
         // unified buffer + shard buffers are both live; a failure declines the whole sharded read.
         for (dst_off, dst_base, src_ptr, src_off, count) in &bool_gather_ops {
+            let source = sidecar_source(*src_ptr, *src_off)?;
             unified_mem
-                .gather_bool_bitmap_from_shard(*dst_off, *dst_base, *src_ptr, *src_off, *count)
+                .gather_bool_bitmap_from_shard(*dst_off, *dst_base, &source, *count)
                 .map_err(|err| {
                     ExecuteError::Engine(EngineError::ApplyFailed(format!(
                         "sharded bool bitmap gather kernel failed: {err}"
                     )))
                 })?;
         }
-        // ADR-006 (NULL coverage): repack each null-bearing shard's validity bits into the pre-filled-0xFF
-        // unified regions with the alignment-free per-bit gather kernel (DtoD). A failure declines the read.
+        // ADR-006 (NULL coverage): repack each null-bearing shard's validity bits into the unified regions
+        // with the alignment-free per-bit gather kernel (DtoD). The 0xFF fill covers shards that elide an
+        // all-valid bitmap. A failure declines the read.
         for (dst_off, dst_base, src_ptr, src_off, count) in &null_gather_ops {
+            let source = sidecar_source(*src_ptr, *src_off)?;
             unified_mem
-                .gather_null_bitmap_from_shard(*dst_off, *dst_base, *src_ptr, *src_off, *count)
+                .gather_null_bitmap_from_shard(*dst_off, *dst_base, &source, *count)
                 .map_err(|err| {
                     ExecuteError::Engine(EngineError::ApplyFailed(format!(
                         "sharded null bitmap gather kernel failed: {err}"
@@ -3756,10 +3800,27 @@ impl Engine {
         }
         // TYPE-COVERAGE #14 (text): rebase each shard's offsets into the unified offsets section (DtoD,
         // after the blob byte-copies above). A failure declines the whole sharded read.
-        for (dst_off, dst_base, blob_base, src_ptr, src_off, count) in &text_rebase_ops {
+        for (
+            dst_off,
+            dst_base,
+            blob_base,
+            src_ptr,
+            src_off,
+            src_bytes_off,
+            src_blob_len,
+            count,
+        ) in &text_rebase_ops
+        {
+            let source = sidecar_source(*src_ptr, *src_off)?;
+            let source = CudaTextOffsetSource {
+                memory: source.memory,
+                offsets_byte_offset: source.byte_offset,
+                bytes_byte_offset: *src_bytes_off,
+                bytes_len: *src_blob_len,
+            };
             unified_mem
                 .rebase_text_offsets_from_shard(
-                    *dst_off, *dst_base, *blob_base, *src_ptr, *src_off, *count,
+                    *dst_off, *dst_base, *blob_base, &source, *count,
                 )
                 .map_err(|err| {
                     ExecuteError::Engine(EngineError::ApplyFailed(format!(

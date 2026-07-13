@@ -291,6 +291,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   clean and exposed pre-existing raw source ownership/context/extent, unbounded scatter/bitmap destinations,
   and implicit semantic preconditions, promoted as **STRUCT-001AD** ahead of further decomposition. The execution
   root is 18,207 lines.
+  That sidecar hardening is complete. `CudaSidecarSource` and `CudaTextOffsetSource` retain the exact source
+  allocation and originating primary context; checked 4/8-byte windows bound every source and destination before
+  context selection or CUDA work, same-allocation gather/rebase aliasing fails closed, and engine row/blob
+  geometry uses checked conversions and accumulation. Scatter bounds its maximum slot and rejects mismatched
+  empty inputs. Bool set/gather and NULL gather atomically write both logical states, independent of destination
+  prefill. Text rebase validates a real owned blob span and checks zero start, monotonicity, exact terminal blob
+  length, and rebase overflow on-device before publication. Every launched failure drains before owners or pooled
+  leases drop. Three pure arithmetic tests and one direct retained-GPU malformed/prefill/alias/reuse test raise
+  the exact execution inventory to 124 tests, with 47 active and 77 GPU-ignored. Six sidecar/DELETE/bool/NULL/text
+  gates passed 18 sequential and 12 concurrent final-PTX invocations without CUDA 700/716/717; workspace check,
+  execution clippy, and independent re-audit are clean. `resident_sidecar.rs` is 1,102 lines and the root is
+  18,208 lines. The one-GPU host leaves the physical cross-context branch vacuous, explicitly owned by
+  **MULTI-003**. The final canonical card is green in both layers and cache regimes: in-L2/out-of-L2
+  `sum_i32` measured 1,430.2/1,439.1 GB/s, `count_i32_compare` measured 0.92x/1.02x same-run roofline,
+  grouped aggregation measured 1,676.6 M elements/s, and 65,536-batch point reads measured 243.4M/251.4M
+  lookups/s at p50 139/132us.
 
 ## Known boundaries
 
@@ -307,7 +323,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Generic CUDA-MVCC host compaction, ordering, projection, and result assembly | **RETIRE-003** |
 | Host `CachedShardPkIndex` and DML/constraint probe fallback | **R3-002**, **R3-004** |
 | Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |
-| Two physical GPUs have not executed the existing scheduler or device-locate context gates | **MULTI-001**, **MULTI-002** |
+| Two physical GPUs have not executed the scheduler, device-locate, or typed sidecar context gates | **MULTI-001**, **MULTI-002**, **MULTI-003** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |
 | Lane DELETE residuals and empty-aggregate pgwire NULL seam require focused disposition | **R3-005**, **READ-003** |
 | Lanes auto-checkpoint/PITR and full crash campaign | **DUR-001**, **DUR-002** |

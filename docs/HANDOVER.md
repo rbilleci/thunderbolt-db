@@ -21,16 +21,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   **MULTI-002**, promoted ahead of further work and blocked on a two-GPU host.
 - Device fused apply, index insert, and compound fold likewise use typed owners and exact geometry/spans;
   stamp/index work is fenced before device row-count publication and malformed text fails closed on-device.
+- Resident sidecar scatter, bool/validity bitmap maintenance, and text rebase now use total typed APIs with
+  exact spans, explicit bit states, device text validation, alias rejection, and launched-error drains. The
+  physical cross-context safety gate is **MULTI-003**, blocked on a two-GPU host.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001AD:** make the extracted sidecar APIs total with typed same-context sources, exact slot/bitmap/
-   text extents, alignment/arithmetic preflight, and launched-error draining.
-2. **MULTI-002:** when a physical two-GPU host is available, partition write/visible-locate submissions by
+1. **MULTI-003:** when a physical two-GPU host is available, run the non-vacuous resident-sidecar context-
+   isolation matrix; never replace it with a host interpretation path.
+2. **MULTI-002:** on that host, partition write/visible-locate submissions by
    primary context and deterministically merge bounded metadata; never move lookup or visibility to the host.
-3. **STRUCT-001:** continue disposition of the 29 source-size outliers after the promoted leaf closes.
+3. **STRUCT-001:** continue disposition of the 29 source-size outliers with the sidecar leaf now closed.
 4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

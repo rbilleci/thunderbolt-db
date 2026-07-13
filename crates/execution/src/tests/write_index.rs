@@ -490,3 +490,188 @@
             .expect("context reusable after rejected and device-reported inputs");
         assert_eq!(fingerprints.len(), 1);
     }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn resident_sidecar_inputs_fail_closed_and_leave_context_reusable() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let mut owner_bytes = vec![0_u8; 64];
+        owner_bytes[32..36].fill(0xff);
+        let owner = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &owner_bytes)
+                .expect("sidecar destination"),
+        );
+        owner
+            .scatter_u64_slots(&[1, 3], &[9, 11])
+            .expect("bounded scatter");
+        assert_eq!(
+            owner
+                .read_resident_u64_column(0, 4)
+                .expect("scatter readback"),
+            vec![0, 9, 0, 11]
+        );
+        assert!(owner.scatter_u64_slots(&[8], &[1]).is_err());
+        assert!(owner.scatter_u64_slots(&[0, 1], &[1]).is_err());
+        assert!(owner.scatter_u64_slots(&[], &[1]).is_err());
+
+        owner
+            .set_bool_bitmap_range(32, 0, &[1, 0, 1])
+            .expect("bounded bool set");
+        assert_eq!(
+            owner.read_resident_bytes(32, 4).expect("bool readback"),
+            0xffff_fffd_u32.to_le_bytes()
+        );
+        assert!(owner.set_bool_bitmap_range(32, 0, &[2]).is_err());
+        assert!(owner.set_bool_bitmap_range(63, 0, &[1]).is_err());
+
+        let bool_source = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &5_u32.to_le_bytes())
+                .expect("bool source"),
+        );
+        let bool_source = CudaSidecarSource {
+            memory: bool_source,
+            byte_offset: 0,
+        };
+        let bool_dst = runtime
+            .retain_device_memory_copy(0, &[0xff_u8; 8])
+            .expect("bool gather destination");
+        bool_dst
+            .gather_bool_bitmap_from_shard(0, 3, &bool_source, 3)
+            .expect("bool gather");
+        assert_eq!(
+            bool_dst
+                .read_resident_bytes(0, 4)
+                .expect("bool gather readback"),
+            0xffff_ffef_u32.to_le_bytes()
+        );
+        assert!(
+            bool_dst
+                .gather_bool_bitmap_from_shard(5, 0, &bool_source, 3)
+                .is_err()
+        );
+
+        let null_dst = runtime
+            .retain_device_memory_copy(0, &[0_u8; 8])
+            .expect("null gather destination");
+        null_dst
+            .gather_null_bitmap_from_shard(0, 3, &bool_source, 3)
+            .expect("null gather");
+        assert_eq!(
+            null_dst
+                .read_resident_bytes(0, 4)
+                .expect("null gather readback"),
+            40_u32.to_le_bytes()
+        );
+        let alias_source = CudaSidecarSource {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 32,
+        };
+        assert!(owner
+            .gather_bool_bitmap_from_shard(32, 1, &alias_source, 3)
+            .is_err());
+
+        let text_bytes = [0_u64, 2, 3]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut text_payload = text_bytes;
+        text_payload.extend_from_slice(b"abc");
+        let text_source = CudaTextOffsetSource {
+            memory: std::sync::Arc::new(
+                runtime
+                    .retain_device_memory_copy(0, &text_payload)
+                    .expect("text offsets"),
+            ),
+            offsets_byte_offset: 0,
+            bytes_byte_offset: 24,
+            bytes_len: 3,
+        };
+        let text_dst = std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &[0_u8; 32])
+                .expect("text rebase destination"),
+        );
+        text_dst
+            .rebase_text_offsets_from_shard(0, 0, 5, &text_source, 3)
+            .expect("valid text rebase");
+        assert_eq!(
+            text_dst
+                .read_resident_u64_column(0, 3)
+                .expect("text readback"),
+            vec![5, 7, 8]
+        );
+
+        for malformed in [[1_u64, 2, 3], [0, 3, 2], [0, 2, 4], [0, 1, 2]] {
+            let bytes = malformed
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect::<Vec<_>>();
+            let mut payload = bytes;
+            payload.extend_from_slice(b"abc");
+            let source = CudaTextOffsetSource {
+                memory: std::sync::Arc::new(
+                    runtime
+                        .retain_device_memory_copy(0, &payload)
+                        .expect("malformed text offsets"),
+                ),
+                offsets_byte_offset: 0,
+                bytes_byte_offset: 24,
+                bytes_len: 3,
+            };
+            assert!(
+                text_dst
+                    .rebase_text_offsets_from_shard(0, 0, 0, &source, 3)
+                    .is_err()
+            );
+        }
+        assert!(
+            text_dst
+                .rebase_text_offsets_from_shard(0, 0, u64::MAX, &text_source, 3)
+                .is_err()
+        );
+        let missing_blob = CudaTextOffsetSource {
+            memory: std::sync::Arc::new(
+                runtime
+                    .retain_device_memory_copy(0, &[0_u8; 24])
+                    .expect("offsets-only allocation"),
+            ),
+            offsets_byte_offset: 0,
+            bytes_byte_offset: 24,
+            bytes_len: 3,
+        };
+        assert!(text_dst
+            .rebase_text_offsets_from_shard(0, 0, 0, &missing_blob, 3)
+            .is_err());
+        let aliased_text = CudaTextOffsetSource {
+            memory: std::sync::Arc::clone(&text_dst),
+            offsets_byte_offset: 0,
+            bytes_byte_offset: 24,
+            bytes_len: 0,
+        };
+        assert!(text_dst
+            .rebase_text_offsets_from_shard(0, 0, 0, &aliased_text, 3)
+            .is_err());
+
+        if runtime.snapshot().device_count > 1 {
+            let foreign = CudaSidecarSource {
+                memory: std::sync::Arc::new(
+                    runtime
+                        .retain_device_memory_copy(1, &5_u32.to_le_bytes())
+                        .expect("foreign sidecar source"),
+                ),
+                byte_offset: 0,
+            };
+            assert!(
+                bool_dst
+                    .gather_bool_bitmap_from_shard(0, 0, &foreign, 3)
+                    .is_err()
+            );
+        }
+
+        text_dst
+            .rebase_text_offsets_from_shard(0, 0, 0, &text_source, 3)
+            .expect("context reusable after rejected sidecar inputs");
+    }
