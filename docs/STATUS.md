@@ -1937,6 +1937,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   DML, and streaming GPU/active routes pass, as do both 505/487 engine modes, all-target check, strict clippy,
   exact-source/consumer/visibility/scoped-format/diff/docs gates, and independent re-audit. Runtime behavior did not
   change, so HAZARD and report-card gates were not applicable. The expression root is now 10,872 lines.
+  STRUCT-001GK then isolated the pure shard-pruning and cross-shard point-shape owner in the 213-line private
+  `engine_expr/shard_pruning.rs` leaf. `mandatory_int4_equalities`, `shard_point_lookup_int4_eq`,
+  `shard_zone_map_excludes`, and both colocated unit tests retain exact bodies, docs, names, and attributes; only the
+  two parent-used helpers gained `pub(super)`, while the existing `crate::engine_expr::shard_point_lookup_int4_eq`
+  crate-private facade remains one narrow re-export. Dependencies flow one-way to scalar IR, bound-select,
+  relational table/stat, and SQL filter/type/value contracts; unified-source construction, lookup execution,
+  device/runtime state, and MULTI work remain in place. Both unit gates, three focused GPU zone-map/index/locate
+  parity routes, final 505/487 engine modes, all-target check, strict clippy, exact-source/test/consumer/visibility/
+  scoped-format/diff/docs gates, and independent re-audit pass. The first ignored sweep exposed 9,062 obsolete
+  generated `target/tmp/gpu-db-*` files and 342 directories consuming 547.4 GiB; scoped cleanup preserved audit and
+  benchmark logs, restored 566 GiB free, all 11 ENOSPC failures passed alone, the complete 487-test rerun passed, and
+  fresh generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were not
+  applicable. The expression root is now 10,668 lines.
 
 ## Known boundaries
 
