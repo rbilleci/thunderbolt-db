@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001BA:** isolate the bounded session-compatibility controls/queries behind two delegates on their
-   existing sides of DDL routing, then delete only the identical post-parse copies proven unreachable.
+1. **STRUCT-001BB:** isolate the contiguous pg_dump/pg_dumpall catalog compatibility prelude through sequence
+   restore/readback behind one private tri-state delegate before parsed-command execution.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

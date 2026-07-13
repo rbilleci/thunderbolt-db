@@ -77,6 +77,9 @@ use ddl_syntax::{
 #[path = "gpu-db-server/ddl_execution.rs"]
 mod ddl_execution;
 use ddl_execution::try_execute_ddl_statement;
+#[path = "gpu-db-server/session_compat.rs"]
+mod session_compat;
+use session_compat::{try_execute_session_compat_query, try_execute_session_control_statement};
 #[path = "gpu-db-server/backend_adapter.rs"]
 mod backend_adapter;
 use backend_adapter::*;
@@ -4717,59 +4720,14 @@ fn execute_statement(
     ) {
         return result;
     }
-    if is_pg_dump_session_set_statement(&canonical) {
-        return write_command_complete(stream, "SET");
-    }
-    if canonical == "reset search_path" {
-        return write_command_complete(stream, "RESET");
-    }
-    if canonical.starts_with("lock table ") && canonical.ends_with(" in access share mode") {
-        return write_command_complete(stream, "LOCK TABLE");
+    if let Some(result) = try_execute_session_control_statement(stream, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_ddl_statement(stream, session, statement) {
         return result;
     }
-    if canonical == "select pg_catalog.set_config('search_path', '', false)" {
-        return write_single_row(
-            stream,
-            &[text_column("set_config")],
-            &[vec![Some(String::new())]],
-        );
-    }
-    if canonical == "select pg_catalog.set_config('search_path', 'public', false)" {
-        return write_single_row(
-            stream,
-            &[text_column("set_config")],
-            &[vec![Some("public".to_string())]],
-        );
-    }
-    if canonical == "select pg_advisory_unlock_all()"
-        || canonical == "select pg_catalog.pg_advisory_unlock_all()"
-    {
-        return write_single_row(
-            stream,
-            &[text_column("pg_advisory_unlock_all")],
-            &[vec![None]],
-        );
-    }
-    if canonical
-        == "select set_config(name, 'view, foreign-table', false) from pg_settings where name = 'restrict_nonsystem_relation_kind'"
-    {
-        return write_select_rows(stream, &[text_column("set_config")], &[], true);
-    }
-    if canonical == "select pg_catalog.pg_is_in_recovery()" {
-        return write_single_row(
-            stream,
-            &[bool_column("pg_is_in_recovery")],
-            &[vec![Some("f".to_string())]],
-        );
-    }
-    if canonical == "select pg_catalog.current_schemas(false)" {
-        return write_single_row(
-            stream,
-            &[text_column("current_schemas")],
-            &[vec![Some("{public}".to_string())]],
-        );
+    if let Some(result) = try_execute_session_compat_query(stream, &canonical) {
+        return result;
     }
     if canonical
         == "select count(*) from pg_subscription where subdbid = (select oid from pg_database where datname = current_database())"
@@ -8401,43 +8359,6 @@ fn execute_statement(
         },
     }
 
-    if is_pg_dump_session_set_statement(&canonical) {
-        return write_command_complete(stream, "SET");
-    }
-    if canonical == "reset search_path" {
-        return write_command_complete(stream, "RESET");
-    }
-    if canonical.starts_with("lock table ") && canonical.ends_with(" in access share mode") {
-        return write_command_complete(stream, "LOCK TABLE");
-    }
-    if canonical == "select pg_catalog.set_config('search_path', '', false)" {
-        return write_single_row(
-            stream,
-            &[text_column("set_config")],
-            &[vec![Some(String::new())]],
-        );
-    }
-    if canonical == "select pg_advisory_unlock_all()"
-        || canonical == "select pg_catalog.pg_advisory_unlock_all()"
-    {
-        return write_single_row(
-            stream,
-            &[text_column("pg_advisory_unlock_all")],
-            &[vec![None]],
-        );
-    }
-    if canonical
-        == "select set_config(name, 'view, foreign-table', false) from pg_settings where name = 'restrict_nonsystem_relation_kind'"
-    {
-        return write_select_rows(stream, &[text_column("set_config")], &[], true);
-    }
-    if canonical == "select pg_catalog.pg_is_in_recovery()" {
-        return write_single_row(
-            stream,
-            &[bool_column("pg_is_in_recovery")],
-            &[vec![Some("f".to_string())]],
-        );
-    }
     if let Some(rows) = psql_describe_query_type_rows(&canonical) {
         return write_single_row(stream, &[text_column("Column"), text_column("Type")], &rows);
     }
@@ -15867,30 +15788,6 @@ fn canonical_sql(input: &str) -> String {
         }
     }
     canonical.trim().to_owned()
-}
-
-fn is_pg_dump_session_set_statement(canonical: &str) -> bool {
-    let normalized = canonical.replace(" to ", " = ");
-    matches!(
-        normalized.as_str(),
-        "set datestyle = iso"
-            | "set intervalstyle = postgres"
-            | "set extra_float_digits = 3"
-            | "set statement_timeout = 0"
-            | "set lock_timeout = 0"
-            | "set idle_in_transaction_session_timeout = 0"
-            | "set client_encoding = 'utf8'"
-            | "set standard_conforming_strings = on"
-            | "set synchronize_seqscans = off"
-            | "set check_function_bodies = false"
-            | "set xmloption = content"
-            | "set client_min_messages = warning"
-            | "set row_security = off"
-            | "set default_tablespace = ''"
-            | "set default_table_access_method = heap"
-            | "set default_transaction_read_only = off"
-            | "set transaction isolation level repeatable read, read only"
-    )
 }
 
 #[cfg(test)]

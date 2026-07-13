@@ -503,6 +503,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched formatting,
   diff checks, and independent audit are clean. No read kernel, residency, or result path changed, so the GPU
   report card was not applicable. The root is 15,898 lines and STRUCT-001AZ is closed.
+  Legacy session compatibility now lives in the private 101-line `session_compat` owner. One tri-state delegate
+  preserves pg_dump SET normalization plus RESET search_path and ACCESS SHARE LOCK acknowledgement before DDL;
+  a second preserves the fixed search-path/restrict-kind set_config, advisory-unlock, recovery-status, and
+  current-schemas queries after DDL. Exact predicates, columns, rows/nulls, row-description behavior, tags, and
+  fallthrough are unchanged. A later 37-line subset was deleted after independent audit proved every predicate
+  byte-identical to and dominated by these earlier unconditional-return branches; no unique public-path or
+  current-schemas branch was removed. Sequential/concurrent 127-test runs, the full protocol package and driver
+  smokes, all-target checks, warning-denied clippy, security preflight, touched formatting, diff checks, and
+  independent audit are clean. The root is 15,797 lines and STRUCT-001BA is closed.
 
 ## Known boundaries
 
