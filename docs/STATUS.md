@@ -410,6 +410,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   module calls existing handlers rather than exposing host execution. Sequential/concurrent 127-test runs,
   full protocol/driver/security gates, formatting, and independent audit are clean. Security source guards now
   follow the moved unsupported-message owner. The root is 19,052 lines and STRUCT-001AO is closed.
+  Legacy Parse/Bind/Describe/Execute/Close handling now lives in the private 622-line `extended_query` module.
+  Its 590-line production body is normalized-exact; exactly five handler entry points are parent-private, all
+  portal batching and format/decode helpers remain private, and one `cfg(test)` delegate preserves direct batch
+  testing. Statement/portal replacement, skip-until-Sync signaling, parameter/result format arity, binary
+  int4/text errors, describe timing, suspension/resume positions and completion tags, COPY/cursor/DML delegation,
+  and exact errors are unchanged. Sequential/concurrent 127-test runs, all-target/all-feature check,
+  warning-denied clippy, the full 71-library-test protocol package and driver smokes, security preflight,
+  formatting, and independent audit are clean. The root is 18,466 lines and STRUCT-001AP is closed.
 
 ## Known boundaries
 
