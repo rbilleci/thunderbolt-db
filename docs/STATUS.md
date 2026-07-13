@@ -383,8 +383,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   every legacy `tests::...` name. The production root change is only a cfg/path declaration, with no visibility,
   API, or non-test build expansion. Protocol full tests, all-target/all-feature check, warning-denied clippy,
   driver smokes, security preflight, formatting, and independent audit are clean. The root is 20,413 lines.
-  STRUCT-001AL is closed; the intentionally intermediate 10,480-line test owner remains active under
-  **STRUCT-001AM** and is not a size exception.
+  STRUCT-001AL is closed; the intentionally intermediate 10,480-line test owner remained explicitly owned by
+  **STRUCT-001AM** and was not treated as a size exception.
+  That intermediate owner is now split into a 120-line support parent and seven real invariant child modules:
+  `shared_catalog` (1,324 lines/18 tests), `copy_dml` (1,700/28), `catalog_introspection` (1,981/5),
+  `extended_lifecycle` (2,125/30), `extended_bind` (1,629/25), `cursor_prepare` (1,263/8), and
+  `catalog_metadata` (360/6). All are below the 3,000-line test envelope. Parent support is byte-exact and every
+  child canonically reconstructs the parent source. All 121 tests occur exactly once: the support asyncpg name
+  is unchanged, while each other `tests::<leaf>` is exactly `tests::<group>::<leaf>`. No production visibility,
+  include fragment, cycle, catch-all, or numbered shard was introduced. Both sequential and default-concurrent
+  127-test runs, full package/driver/security gates, formatting, and independent audit are clean. STRUCT-001AM
+  is closed.
 
 ## Known boundaries
 
