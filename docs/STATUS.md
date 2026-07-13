@@ -1446,7 +1446,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   sequential and 14 concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and
   all-target check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. The
   inherited CPU-pinned mixed-type oracle remains test-only; no production route or architectural behavior
-  changed, so the report card was not applicable. STRUCT-001EV is next.
+  changed, so the report card was not applicable.
+  STRUCT-001EV externalized the final three-test capacity/open-payload/residency-budget family into the rustfmt-
+  clean 87-line `tests/residency_capacity_budget.rs` owner immediately before the parent module close. Normalized
+  comparison differs only in two rustfmt binding layouts; all bodies, attributes, names, and order remain
+  unchanged. Both focused ordinary tests passed, and the budget GPU gate passed three sequential invocations and
+  two concurrent rounds with zero CUDA 700/716/717. The engine root is 6,267 lines, both ordinary modes pass
+  505/487, and the exact 992-test/76-family inventories, all-target check, strict clippy, scoped formatting/diff/
+  reference checks, and independent audit are clean. No production capacity, payload, budget, or architectural
+  behavior changed, so the report card was not applicable. All 76 residency tests now live in bounded owners;
+  STRUCT-001EW begins production ownership extraction.
 
 ## Known boundaries
 

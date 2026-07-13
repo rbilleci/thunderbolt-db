@@ -68,12 +68,15 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001EU is closed: the exact seven-test mixed-type/NULL/batched-point-read family now lives in the bounded
   625-line `tests/residency_sharded_point_reads.rs` owner; exact inventories, 35 GPU invocations, full gates, and
   audit are clean with no production change or new CPU-first path.
+- STRUCT-001EV is closed: the final three-test capacity/open-payload/residency-budget family now lives in the
+  bounded 87-line `tests/residency_capacity_budget.rs` owner; all 76 residency tests are partitioned, exact
+  inventories/full gates/audit are clean, and production is unchanged.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001EV:** externalize the exact final three-test capacity/open-payload/residency-budget family.
+1. **STRUCT-001EW:** isolate typed payload/key/open-append production ownership behind the stable facade.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
