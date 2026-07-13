@@ -176,6 +176,8 @@ use function_execution::{
     execute_function_command, try_execute_aggregate_catalog_query,
     try_execute_function_catalog_query,
 };
+#[path = "gpu-db-server/type_system_catalog.rs"]
+mod type_system_catalog;
 #[cfg(test)]
 use function_execution::{
     execute_function_result, rename_function_in_session,
@@ -183,6 +185,14 @@ use function_execution::{
     test_psql_describe_function_verbose_rows as psql_describe_function_verbose_rows,
     test_psql_describe_functions_catalog_query as psql_describe_functions_catalog_query,
     test_psql_list_aggregates_catalog_query as psql_list_aggregates_catalog_query,
+};
+use type_system_catalog::try_execute_type_system_catalog_query;
+#[cfg(test)]
+use type_system_catalog::{
+    test_psql_list_casts_catalog_query as psql_list_casts_catalog_query,
+    test_psql_list_collations_catalog_query as psql_list_collations_catalog_query,
+    test_psql_list_conversions_catalog_query as psql_list_conversions_catalog_query,
+    test_psql_list_operators_catalog_query as psql_list_operators_catalog_query,
 };
 #[path = "gpu-db-server/sequence_execution.rs"]
 mod sequence_execution;
@@ -1633,60 +1643,8 @@ fn execute_statement(
     if let Some(result) = try_execute_aggregate_catalog_query(stream, &canonical) {
         return result;
     }
-    if canonical == psql_list_conversions_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Source"),
-                text_column("Destination"),
-                text_column("Default?"),
-            ],
-            &catalog_empty_rows(),
-        );
-    }
-    if canonical == psql_list_operators_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Left arg type"),
-                text_column("Right arg type"),
-                text_column("Result type"),
-                text_column("Description"),
-            ],
-            &catalog_empty_rows(),
-        );
-    }
-    if canonical == psql_list_collations_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Schema"),
-                text_column("Name"),
-                text_column("Provider"),
-                text_column("Collate"),
-                text_column("Ctype"),
-                text_column("ICU Locale"),
-                text_column("ICU Rules"),
-                text_column("Deterministic?"),
-            ],
-            &catalog_empty_rows(),
-        );
-    }
-    if canonical == psql_list_casts_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Source type"),
-                text_column("Target type"),
-                text_column("Function"),
-                text_column("Implicit?"),
-            ],
-            &catalog_empty_rows(),
-        );
+    if let Some(result) = try_execute_type_system_catalog_query(stream, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_replication_catalog_query(stream, session, &canonical) {
         return result;
@@ -2646,22 +2604,6 @@ fn psql_describe_table_privileges_catalog_query_filter(
         namespace: namespace.to_string(),
         relname_pattern: Some(relname_pattern.to_string()),
     })
-}
-
-fn psql_list_conversions_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", c.conname as \"name\", pg_catalog.pg_encoding_to_char(c.conforencoding) as \"source\", pg_catalog.pg_encoding_to_char(c.contoencoding) as \"destination\", case when c.condefault then 'yes' else 'no' end as \"default?\" from pg_catalog.pg_conversion c join pg_catalog.pg_namespace n on n.oid = c.connamespace where true and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_conversion_is_visible(c.oid) order by 1, 2"
-}
-
-fn psql_list_operators_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", o.oprname as \"name\", case when o.oprkind='l' then null else pg_catalog.format_type(o.oprleft, null) end as \"left arg type\", case when o.oprkind='r' then null else pg_catalog.format_type(o.oprright, null) end as \"right arg type\", pg_catalog.format_type(o.oprresult, null) as \"result type\", coalesce(pg_catalog.obj_description(o.oid, 'pg_operator'), pg_catalog.obj_description(o.oprcode, 'pg_proc')) as \"description\" from pg_catalog.pg_operator o left join pg_catalog.pg_namespace n on n.oid = o.oprnamespace where n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_operator_is_visible(o.oid) order by 1, 2, 3, 4"
-}
-
-fn psql_list_collations_catalog_query() -> &'static str {
-    "select n.nspname as \"schema\", c.collname as \"name\", case c.collprovider when 'd' then 'default' when 'c' then 'libc' when 'i' then 'icu' end as \"provider\", c.collcollate as \"collate\", c.collctype as \"ctype\", c.colliculocale as \"icu locale\", c.collicurules as \"icu rules\", case when c.collisdeterministic then 'yes' else 'no' end as \"deterministic?\" from pg_catalog.pg_collation c, pg_catalog.pg_namespace n where n.oid = c.collnamespace and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and c.collencoding in (-1, pg_catalog.pg_char_to_encoding(pg_catalog.getdatabaseencoding())) and pg_catalog.pg_collation_is_visible(c.oid) order by 1, 2"
-}
-
-fn psql_list_casts_catalog_query() -> &'static str {
-    "select pg_catalog.format_type(castsource, null) as \"source type\", pg_catalog.format_type(casttarget, null) as \"target type\", case when c.castmethod = 'b' then '(binary coercible)' when c.castmethod = 'i' then '(with inout)' else p.proname end as \"function\", case when c.castcontext = 'e' then 'no' when c.castcontext = 'a' then 'in assignment' else 'yes' end as \"implicit?\" from pg_catalog.pg_cast c left join pg_catalog.pg_proc p on c.castfunc = p.oid left join pg_catalog.pg_type ts on c.castsource = ts.oid left join pg_catalog.pg_namespace ns on ns.oid = ts.typnamespace left join pg_catalog.pg_type tt on c.casttarget = tt.oid left join pg_catalog.pg_namespace nt on nt.oid = tt.typnamespace where ( (true and pg_catalog.pg_type_is_visible(ts.oid) ) or (true and pg_catalog.pg_type_is_visible(tt.oid) ) ) order by 1, 2"
 }
 
 fn psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
@@ -4148,19 +4090,6 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
             text_column("acldefault"),
         ]);
     }
-    if canonical == "select tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid as oprcode from pg_operator" {
-        return Some(vec![
-            int4_column("tableoid"),
-            int4_column("oid"),
-            text_column("oprname"),
-            int4_column("oprnamespace"),
-            int4_column("oprowner"),
-            text_column("oprkind"),
-            int4_column("oprleft"),
-            int4_column("oprright"),
-            int4_column("oprcode"),
-        ]);
-    }
     if canonical
         == "select tableoid, oid, opcmethod, opcname, opcnamespace, opcowner from pg_opclass"
     {
@@ -4264,38 +4193,6 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
             text_column("srvacl"),
             text_column("acldefault"),
             text_column("srvoptions"),
-        ]);
-    }
-    if canonical == "select tableoid, oid, collname, collnamespace, collowner, collencoding from pg_collation" {
-        return Some(vec![
-            int4_column("tableoid"),
-            int4_column("oid"),
-            text_column("collname"),
-            int4_column("collnamespace"),
-            int4_column("collowner"),
-            int4_column("collencoding"),
-        ]);
-    }
-    if canonical == "select tableoid, oid, conname, connamespace, conowner from pg_conversion" {
-        return Some(vec![
-            int4_column("tableoid"),
-            int4_column("oid"),
-            text_column("conname"),
-            int4_column("connamespace"),
-            int4_column("conowner"),
-        ]);
-    }
-    if canonical.starts_with("select tableoid, oid, castsource, casttarget")
-        && canonical.contains("from pg_cast")
-    {
-        return Some(vec![
-            int4_column("tableoid"),
-            int4_column("oid"),
-            int4_column("castsource"),
-            int4_column("casttarget"),
-            int4_column("castfunc"),
-            text_column("castcontext"),
-            text_column("castmethod"),
         ]);
     }
     if canonical == "select tableoid, oid, trftype, trflang, trffromsql::oid, trftosql::oid from pg_transform order by 3,4" {

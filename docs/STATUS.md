@@ -979,6 +979,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   native aggregate metadata, and absent GPU-native catalog execution. Full gates, PostgreSQL 16 scenario 60, all
   18 pg-dump restore/metadata/privilege gates, and independent audit are clean. The root is 5,998 lines and
   STRUCT-001CZ is closed.
+  The four adjacent empty psql conversion/operator/collation/cast catalog reads and their four pg-dump metadata
+  responses now execute from a bounded private 174-line `type_system_catalog` owner behind two stage-preserving
+  delegates; the 475-line `pg_dump_compat` consumes the pg-dump delegate immediately before its remaining empty
+  classifier. Four psql query helpers are byte-identical private moves and four `cfg(test)` wrappers have proven
+  consumers. Exact psql and pg-dump branch order, equality/structural predicates, 5-/6-/8-/4- and 9-/6-/5-/7-
+  column names/types, empty rows, and writers are unchanged. Only those four old classifier branches were deleted.
+  Inherited PRODUCT-002 debt remains exact/broad routing, eight always-empty catalogs, CPU compatibility metadata,
+  and absent GPU-resident type-system relations/operators. Full gates, PostgreSQL 16 scenarios 61/62/63/64, all
+  18 pg-dump restore/metadata/privilege gates, and independent audit are clean. The root is 5,895 lines and
+  STRUCT-001DA is closed.
 
 ## Known boundaries
 

@@ -12,6 +12,7 @@ use super::cluster_ddl::{
 use super::function_execution::try_execute_aggregate_pg_dump_catalog_query;
 use super::replication_catalog::try_execute_replication_pg_dump_query;
 use super::role_ddl::try_execute_role_pg_dump_catalog_query;
+use super::type_system_catalog::try_execute_type_system_pg_dump_catalog_query;
 use super::{
     bool_column, catalog_empty_rows, catalog_foreign_key_metadata_columns,
     catalog_foreign_key_metadata_rows, int4_column, int8_column,
@@ -290,6 +291,9 @@ pub(super) fn try_execute_pg_dump_compat_statement(
         return Some(result);
     }
     if let Some(result) = try_execute_aggregate_pg_dump_catalog_query(stream, canonical) {
+        return Some(result);
+    }
+    if let Some(result) = try_execute_type_system_pg_dump_catalog_query(stream, canonical) {
         return Some(result);
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(canonical) {
