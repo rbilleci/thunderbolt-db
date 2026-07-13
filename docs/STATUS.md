@@ -1520,7 +1520,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   invocations with zero CUDA 700/716/717. Both ordinary engine modes passed 505/487 with the exact 992-test
   inventory; all-target check, strict clippy, dependency-boundary/scoped source/reference/format checks, and
   independent audit are clean. Runtime, layout, admission, residency, transient, and result-path behavior are
-  unchanged, so the report card was not applicable. STRUCT-001FB is the next ownership slice.
+  unchanged, so the report card was not applicable. STRUCT-001FB then isolated the normalized-exact 14-method
+  vacuum/churn, serialized rehydration, int4 identity resolution, host-store reconciliation, and typed device
+  gather owner in the 607-line `engine_residency/maintenance.rs` child, reducing the facade root to 1,590 lines.
+  Audit found and the slice corrected one ownership cycle by retaining the byte-exact shared
+  `reset_tombstone_churn` helper at the parent facade; all other moved source reconstructs HEAD exactly and no
+  visibility changed. Six vacuum/gather/rehydration routes passed 18 sequential plus 12 concurrent GPU
+  invocations; after the placement correction, the minimal four-route matrix passed another 12 sequential plus
+  eight concurrent invocations, all with zero CUDA 700/716/717. Both ordinary modes passed 505/487 with the
+  exact 992-test inventory; all-target check, strict clippy, dependency-boundary/scoped source/reference/format
+  checks, and independent re-audit are clean. Lock/catalog/snapshot, NULL/MVCC/identity, repair, and fail-loud
+  behavior are source-identical, so the report card was not applicable. STRUCT-001FC is next.
 
 ## Known boundaries
 

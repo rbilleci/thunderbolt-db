@@ -88,8 +88,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FB:** isolate vacuum/churn, serialized rehydration, identity resolution, and typed device gather
-   into `engine_residency/maintenance.rs` without changing the existing repair boundary or GPU-authoritative data.
+1. **STRUCT-001FC:** isolate warmup/maintenance policy, readiness and single/sharded route planning, and residency
+   status into `engine_residency/routes.rs` without changing route acceptance, reasons, estimates, or counters.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
