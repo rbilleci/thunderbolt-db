@@ -1486,6 +1486,7 @@ impl Engine {
                                 layout.offsets_byte_offset,
                                 layout.bytes_byte_offset,
                                 layout.bytes_len,
+                                row_count,
                                 &matched_row_indices,
                             )
                             .map_err(|err| {

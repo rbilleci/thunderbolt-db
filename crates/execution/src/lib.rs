@@ -1344,6 +1344,7 @@ impl CudaResidentDeviceMemory {
         offsets_byte_offset: u64,
         bytes_byte_offset: u64,
         bytes_len: u64,
+        row_count: u64,
         row_indices: &[u64],
     ) -> Result<Vec<String>, CudaRuntimeProbeError> {
         copy_cuda_resident_text_rows(
@@ -1351,6 +1352,7 @@ impl CudaResidentDeviceMemory {
             offsets_byte_offset,
             bytes_byte_offset,
             bytes_len,
+            row_count,
             row_indices,
         )
     }
@@ -1783,10 +1785,43 @@ fn copy_cuda_resident_text_rows(
     offsets_byte_offset: u64,
     bytes_byte_offset: u64,
     bytes_len: u64,
+    row_count: u64,
     row_indices: &[u64],
 ) -> Result<Vec<String>, CudaRuntimeProbeError> {
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
 
+    validate_text_windows(
+        resident.metadata().allocated_bytes,
+        offsets_byte_offset,
+        bytes_byte_offset,
+        bytes_len,
+        row_count,
+    )?;
+    if row_indices.iter().any(|&row_idx| row_idx >= row_count) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut first_offset = 0_u64;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut first_offset as *mut u64).cast::<c_void>(),
+            resident.device_ptr() + offsets_byte_offset,
+            std::mem::size_of::<u64>(),
+        )
+    })?;
+    if first_offset != 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(first_offset).unwrap_or(usize::MAX),
+        ));
+    }
     if row_indices.is_empty() {
         return Ok(Vec::new());
     }
@@ -1819,14 +1854,6 @@ fn copy_cuda_resident_text_rows(
             offsets_end.max(bytes_end) as usize,
         ));
     }
-
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
 
     let mut offsets = vec![
         0_u64;

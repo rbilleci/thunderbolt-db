@@ -9,7 +9,7 @@ fn resident_text_prefix_ptx_is_pure_ascii() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn cuda_resident_text_prefix_count_reduces_on_device_and_fails_malformed_closed() {
+fn cuda_resident_text_prefix_and_projection_are_total_and_context_safe() {
     let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
     let rows = ["alpha", "alphabet", "beta", "", "alpine", "omega"];
     let row_count = rows.len() as u64;
@@ -41,8 +41,51 @@ fn cuda_resident_text_prefix_count_reduces_on_device_and_fails_malformed_closed(
             .expect("resident text payload"),
     );
 
-    let reader = std::sync::Arc::clone(&resident);
     let blob_len = blob.len() as u64;
+    let projection_reader = std::sync::Arc::clone(&resident);
+    assert_eq!(
+        std::thread::spawn(move || {
+            projection_reader.project_text_rows_from_payload(
+                offsets_off,
+                bytes_off,
+                blob_len,
+                row_count,
+                &[5, 0, 1, 1, 3],
+            )
+        })
+        .join()
+        .expect("fresh projection reader thread")
+        .expect("the row projector binds its primary context before D2H"),
+        ["omega", "alpha", "alphabet", "alphabet", ""]
+    );
+
+    assert!(
+        matches!(
+            resident.project_text_rows_from_payload(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                row_count - 1,
+                &[row_count - 1],
+            ),
+            Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))
+        ),
+        "an index at the declared logical row bound must fail before D2H even when the allocation contains a valid extra row"
+    );
+    assert!(
+        resident
+            .project_text_rows_from_payload(
+                offsets_off + 4,
+                bytes_off,
+                blob.len() as u64,
+                row_count,
+                &[],
+            )
+            .is_err(),
+        "even an empty projection must reject a misaligned offsets window"
+    );
+
+    let reader = std::sync::Arc::clone(&resident);
     assert_eq!(
         std::thread::spawn(move || {
             reader.count_text_prefix_from_payload(
@@ -129,6 +172,18 @@ fn cuda_resident_text_prefix_count_reduces_on_device_and_fails_malformed_closed(
             .is_err(),
         "device-reported malformed offsets must fail closed"
     );
+    assert!(
+        malformed
+            .project_text_rows_from_payload(
+                8,
+                malformed_bytes_off,
+                malformed_blob.len() as u64,
+                2,
+                &[1],
+            )
+            .is_err(),
+        "a malformed selected span must fail closed"
+    );
 
     let nonzero_first_offsets = [1_u64, 1]
         .into_iter()
@@ -157,23 +212,51 @@ fn cuda_resident_text_prefix_count_reduces_on_device_and_fails_malformed_closed(
             .is_err(),
         "the canonical offsets vector must begin at zero"
     );
+    assert!(
+        nonzero_first
+            .project_text_rows_from_payload(8, nonzero_first_bytes_off, 1, 1, &[0])
+            .is_err(),
+        "the row projector must enforce the canonical zero first offset"
+    );
+    assert!(
+        nonzero_first
+            .project_text_rows_from_payload(8, nonzero_first_bytes_off, 1, 1, &[])
+            .is_err(),
+        "an empty selection must still reject a noncanonical first offset"
+    );
+    assert!(
+        nonzero_first
+            .project_text_rows_from_payload(8, nonzero_first_bytes_off, 0, 0, &[])
+            .is_err(),
+        "a malformed zero-row payload must fail canonical-offset validation"
+    );
 
     let zero_offset = 0_u64.to_le_bytes();
-    let empty = runtime
-        .retain_device_memory_chunks(
-            0,
-            16,
-            &[CudaDeviceMemoryChunk {
-                byte_offset: 8,
-                bytes: &zero_offset,
-            }],
-        )
-        .expect("empty resident text payload");
+    let empty = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_chunks(
+                0,
+                16,
+                &[CudaDeviceMemoryChunk {
+                    byte_offset: 8,
+                    bytes: &zero_offset,
+                }],
+            )
+            .expect("empty resident text payload"),
+    );
     assert_eq!(
         empty
             .count_text_prefix_from_payload(8, 16, 0, 0, b"anything")
             .expect("zero-row device prefix reduction"),
         0
+    );
+    let empty_reader = std::sync::Arc::clone(&empty);
+    assert!(
+        std::thread::spawn(move || empty_reader.project_text_rows_from_payload(8, 16, 0, 0, &[]))
+            .join()
+            .expect("fresh zero-row reader thread")
+            .expect("zero-row projection binds its primary context and validates offset zero")
+            .is_empty()
     );
 
     assert_eq!(
@@ -187,5 +270,17 @@ fn cuda_resident_text_prefix_count_reduces_on_device_and_fails_malformed_closed(
             )
             .expect("context reusable after rejected and device-reported inputs"),
         3
+    );
+    assert_eq!(
+        resident
+            .project_text_rows_from_payload(
+                offsets_off,
+                bytes_off,
+                blob.len() as u64,
+                row_count,
+                &[4, 2],
+            )
+            .expect("context reusable after rejected and malformed projection inputs"),
+        ["alpine", "beta"]
     );
 }

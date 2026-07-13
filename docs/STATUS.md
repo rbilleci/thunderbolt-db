@@ -1756,6 +1756,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   505/487 with the GPU sweep serial, and workspace all-target/all-feature check, strict execution/engine clippy,
   dependency/source/diff checks, and independent audit are clean. The execution root is 9,609 lines. No live
   runtime path changed, so GPU HAZARD and report-card gates were not applicable.
+  STRUCT-001FV then made the surviving generic retained TEXT projector total. Its public API now accepts the exact
+  logical `row_count`; all five engine consumers pass the count paired with their resident snapshot/source. It
+  validates an aligned offset window, a bounded blob window, and every selected index before transfer, binds the
+  owning primary CUDA context before every D2H, verifies canonical `offset[0] == 0` even for empty/zero-row
+  results, rejects malformed selected spans, and preserves requested order, duplicates, empty strings, and final
+  host string assembly. The
+  permanent GPU contract covers a fresh nonempty and zero-row reader thread, a physically present row beyond a
+  smaller declared logical extent, misalignment, malformed/noncanonical offsets, empty selection, and post-error
+  reuse. Before the fix that fresh-thread assertion failed with CUDA 201; the final direct matrix passes three
+  sequential plus two concurrent runs, while mixed retained, grouped TEXT, and ordered TEXT consumers pass nine
+  sequential plus six concurrent runs without CUDA 700/716/717/201. Execution passes 54/81 and engine passes
+  505/487 with the GPU sweep serial; workspace all-target/all-feature check, strict execution/engine clippy,
+  source/diff/single-plan gates, and independent audit are clean. The canonical report card is stable: IN-L2/
+  OUT-OF-L2 rooflines are 1,480.7/1,441.0 GB/s, count is 0.88x/1.01x roofline, grouped aggregation is 1,677.3M
+  elements/s, and batch-65,536 point reads are 247.2M at p50 140us IN-L2 and 252.1M at p50 132us OUT-OF-L2;
+  index/scan is 3.22x/3.19x. The execution root is 9,636 lines.
 
 ## Known boundaries
 

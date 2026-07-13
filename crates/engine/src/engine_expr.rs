@@ -8088,6 +8088,7 @@ impl Engine {
                             layout.offsets_byte_offset,
                             layout.bytes_byte_offset,
                             layout.bytes_len,
+                            row_count,
                             &reps,
                         )
                         .map_err(map_err)?;
@@ -8186,6 +8187,7 @@ impl Engine {
                                     layout.offsets_byte_offset,
                                     layout.bytes_byte_offset,
                                     layout.bytes_len,
+                                    row_count,
                                     reps,
                                 )
                                 .map_err(map_err)?
@@ -8387,6 +8389,7 @@ impl Engine {
                                     layout.offsets_byte_offset,
                                     layout.bytes_byte_offset,
                                     layout.bytes_len,
+                                    row_count,
                                     reps,
                                 )
                                 .map_err(map_err)
@@ -9467,6 +9470,7 @@ impl Engine {
                             layout.offsets_byte_offset,
                             layout.bytes_byte_offset,
                             layout.bytes_len,
+                            row_count,
                             &indices_u64,
                         )
                         .map_err(|err| {

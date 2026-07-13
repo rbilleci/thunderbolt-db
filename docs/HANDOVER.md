@@ -24,6 +24,10 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FU is closed. The unconsumed public full-column TEXT projector and private host-assembly
   implementation are deleted; generic retained routes use the narrower final-readback projector and specialized
   point-read/join routes retain their fused GPU projectors. RETIRE-003 owns the remaining generic result-path debt.
+- STRUCT-001FV is closed. Generic retained TEXT projection now owns the exact logical row extent, validates all
+  host geometry before transfer, binds the resident primary context before D2H, rejects a noncanonical first
+  offset and malformed selected spans, and remains reusable after failure. Its HAZARD matrices, complete suites,
+  report card, and audit pass.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
