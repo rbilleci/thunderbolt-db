@@ -40,14 +40,17 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FZ is closed. The obsolete whole-column int4 D2H facade, its private transfer, and the test-only
   serial identity-copy PTX/A-B gate are deleted; all product consumers had already moved to bounded gather or
   GPU-native bridges. The execution root is 7,932 lines, and full suites, static gates, and audit pass.
+- STRUCT-001GA is closed. The unconsumed host-sorted int4 compare/project facade is deleted; its sole engine
+  consumer had already moved to the general GPU expression/sort route. The execution root is 7,903 lines, and
+  full suites, static/history gates, and audit pass.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001:** continue the ordered oversized-file inventory at the surviving int4 ordered compare-compaction
-   owner without letting structural extraction implicitly decide **R3-001**.
+1. **STRUCT-001:** isolate the surviving ordered int4 compare-compaction Rust/PTX owner without letting
+   extraction decide **R3-001**.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
 4. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.

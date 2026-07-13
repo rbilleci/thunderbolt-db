@@ -1817,6 +1817,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   all-target/all-feature check, strict execution/engine clippy, source/history/diff/docs gates, and independent
   audit are clean. No live path or surviving kernel/result behavior changed, so HAZARD and report-card gates were
   not applicable.
+  STRUCT-001GA then deleted the unconsumed public `project_i32_compare_ordered_from_payload` facade (29 root
+  lines), which materialized every matching int4 value to a host vector, CPU-sorted it, and host-windowed
+  OFFSET/LIMIT. History proves `36470be8` moved `int4_ordered_projection` to the general GPU expression/sort route
+  and `24ebe8cf` deleted the sole engine probe; only archived implementation-log facts remain. The standard
+  Layer-1 compare/project benchmark, production device-ordered index compaction, and selected-row gathers are
+  unchanged. The execution root is 7,903 lines. Both execution modes pass 54/80 and both engine modes pass
+  505/487 with GPU sweeps serial; workspace all-target/all-feature check, strict execution/engine clippy,
+  source/history/diff/docs gates, and independent audit are clean. No live caller, kernel, or surviving result
+  behavior changed, so HAZARD and report-card gates were not applicable.
 
 ## Known boundaries
 

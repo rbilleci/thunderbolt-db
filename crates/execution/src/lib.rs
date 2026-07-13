@@ -1333,35 +1333,6 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_expr_compare_buffers_filter(self, program, row_count, comparison)
     }
 
-    pub fn project_i32_compare_ordered_from_payload(
-        &self,
-        byte_offset: u64,
-        row_count: u64,
-        needle: i32,
-        comparison: CudaI32Comparison,
-        descending: bool,
-        window: (u64, u64),
-    ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
-        let mut values = launch_cuda_resident_i32_compare_project(
-            self,
-            byte_offset,
-            row_count,
-            needle,
-            comparison,
-        )?;
-        if descending {
-            values.sort_unstable_by(|left, right| right.cmp(left));
-        } else {
-            values.sort_unstable();
-        }
-        let (offset, limit) = window;
-        let offset = usize::try_from(offset)
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        let limit = usize::try_from(limit)
-            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        Ok(values.into_iter().skip(offset).take(limit).collect())
-    }
-
     /// Evaluate a SIMPLE `int4col <cmp> needle` predicate over a resident int4 column and return the
     /// surviving ROW INDICES in ASCENDING ORDER, with NO host sort. Runs the same ordered parallel
     /// compaction as the value path (`project_i32_compare_*`), but the scatter kernel stores each
