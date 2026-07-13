@@ -6,11 +6,83 @@ use super::sql_execute_syntax::{
 use super::sql_prepare::execute_sql_prepared_result;
 use super::{
     canonical_sql, execute_select_result, max_placeholder_index, negative_limit_error_field,
-    negative_offset_error_field, write_command_complete, write_error, write_rows_with_tag,
-    CloseCursorTarget, Cursor, ErrorField, ReadWrite, Session,
+    negative_offset_error_field, write_command_complete, write_error, write_rows_with_tag, Cursor,
+    ErrorField, ReadWrite, Session,
 };
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use std::io;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CloseCursorTarget {
+    All,
+    Named(String),
+}
+
+pub(super) fn try_execute_cursor_statement(
+    stream: &mut dyn ReadWrite,
+    session: &mut Session,
+    statement: &str,
+) -> Option<io::Result<()>> {
+    if let Some((name, query)) = parse_declare_cursor(statement) {
+        return Some(execute_declare_cursor(stream, session, name, &query).map(|_| ()));
+    }
+    if is_unsupported_declare_cursor_statement(statement) {
+        return Some(write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message:
+                    "cursor declaration options are not supported by the compatibility endpoint",
+                position: None,
+            },
+        ));
+    }
+    if let Some((name, count)) = parse_fetch_forward(statement) {
+        return Some(execute_fetch_forward(stream, session, &name, count));
+    }
+    if is_unsupported_fetch_cursor_statement(statement) {
+        return Some(write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "cursor fetch direction is not supported by the compatibility endpoint",
+                position: None,
+            },
+        ));
+    }
+    if let Some((name, count)) = parse_move_forward(statement) {
+        return Some(execute_move_forward(stream, session, &name, count));
+    }
+    if is_unsupported_move_cursor_statement(statement) {
+        return Some(write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "cursor move direction is not supported by the compatibility endpoint",
+                position: None,
+            },
+        ));
+    }
+    if let Some(target) = parse_close_cursor(statement) {
+        match target {
+            CloseCursorTarget::All => session.cursors.clear(),
+            CloseCursorTarget::Named(name) => {
+                if session.cursors.remove(&name).is_none() {
+                    return Some(write_error(
+                        stream,
+                        &ErrorField {
+                            code: "34000",
+                            message: "cursor does not exist",
+                            position: None,
+                        },
+                    ));
+                }
+            }
+        }
+        return Some(write_command_complete(stream, "CLOSE CURSOR"));
+    }
+    None
+}
 
 pub(super) fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
     let stripped = strip_sql_comments(statement);

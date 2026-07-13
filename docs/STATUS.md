@@ -476,6 +476,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied clippy, security
   preflight, touched formatting, diff checks, and independent audit are clean. The root is 16,380 lines,
   `copy_execution` is 322 lines, and STRUCT-001AW is closed.
+  Simple-query cursor routing now enters the existing private `cursor` owner through one tri-state delegate.
+  DECLARE, unsupported DECLARE, FETCH, unsupported FETCH, MOVE, unsupported MOVE, CLOSE, then unhandled fallthrough
+  retain exact order, errors, tags, count/ALL and position behavior, and state mutation. DECLARE still discards the
+  extended-path boolean while propagating I/O failure. `CloseCursorTarget` moved intact from the root to its owner;
+  direct parse/FETCH/MOVE/CLOSE helpers and the enum now cross the root only under `cfg(test)`, while the three
+  production cursor facades remain solely for extended-query consumers. Sequential/concurrent 127-test runs,
+  the full protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight,
+  touched formatting, diff checks, and independent audit are clean. The root is 16,322 lines, `cursor` is 479
+  lines, and STRUCT-001AX is closed.
 
 ## Known boundaries
 
