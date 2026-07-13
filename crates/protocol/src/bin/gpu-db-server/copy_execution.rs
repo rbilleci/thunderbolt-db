@@ -6,8 +6,47 @@ use super::{
     write_copy_done, write_copy_in_response, write_copy_out_response, write_error, CopyInState,
     ErrorField, ReadWrite, Session,
 };
-use gpu_db_protocol::{parse_copy_row, CopyColumn, CopyFormat, CopyOptions, SqlValue};
+use gpu_db_protocol::{
+    is_copy_statement, parse_copy_from_stdin, parse_copy_row, parse_copy_to_stdout_table,
+    CopyColumn, CopyFormat, CopyOptions, SqlValue,
+};
 use std::io;
+
+pub(super) fn try_execute_copy_statement(
+    stream: &mut dyn ReadWrite,
+    session: &mut Session,
+    statement: &str,
+) -> Option<io::Result<()>> {
+    if let Some(copy) = parse_copy_to_stdout_table(statement) {
+        return Some(execute_copy_to_stdout(
+            stream,
+            session,
+            &copy.table,
+            copy.options,
+        ));
+    }
+    if let Some(copy) = parse_copy_from_stdin(statement) {
+        return Some(begin_copy_from_stdin(
+            stream,
+            session,
+            &copy.table,
+            copy.columns,
+            copy.options,
+            true,
+        ));
+    }
+    if is_copy_statement(statement) {
+        return Some(write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "COPY is not supported by the compatibility endpoint",
+                position: None,
+            },
+        ));
+    }
+    None
+}
 
 fn copy_text_value(value: &SqlValue) -> String {
     format_sql_value(value)

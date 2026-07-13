@@ -468,6 +468,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   concurrent 127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied clippy,
   security preflight, formatting, and independent audit are clean. The root is 16,398 lines and STRUCT-001AU is
   closed.
+  Simple-query COPY routing now enters the existing private `copy_execution` owner through one tri-state
+  `try_execute_copy_statement` delegate. Parsed COPY TO, parsed COPY FROM with `simple_query=true`, and recognized-
+  but-unsupported COPY retain their exact precedence, arguments, wire/state effects, `0A000` error, and return
+  behavior; empty-query/canonicalization and all non-COPY routing remain in `execute_statement`. Protocol parse
+  helpers are imported directly by the owner and remain test-only at the root facade. Sequential/concurrent
+  127-test runs, the full protocol package and driver smokes, all-target checks, warning-denied clippy, security
+  preflight, touched formatting, diff checks, and independent audit are clean. The root is 16,380 lines,
+  `copy_execution` is 322 lines, and STRUCT-001AW is closed.
 
 ## Known boundaries
 

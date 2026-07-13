@@ -18,27 +18,26 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   method are owned by **STRUCT-001**.
 - Device write/visible-locate now has typed same-context owners, exact extents, device slot bounds, bounded
   fail-closed errors, and launched-error drains. Its physical cross-context partition/merge gate is
-  **MULTI-002**, promoted ahead of further work and blocked on a two-GPU host.
+  **MULTI-002**, user-deferred to the end of the non-MULTI plan and blocked on a two-GPU host.
 - Device fused apply, index insert, and compound fold likewise use typed owners and exact geometry/spans;
   stamp/index work is fenced before device row-count publication and malformed text fails closed on-device.
 - Resident sidecar scatter, bool/validity bitmap maintenance, and text rebase now use total typed APIs with
   exact spans, explicit bit states, device text validation, alias rejection, and launched-error drains. The
-  physical cross-context safety gate is **MULTI-003**, blocked on a two-GPU host.
+  physical cross-context safety gate is **MULTI-003**, likewise deferred to the end and blocked on a two-GPU host.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **MULTI-003:** when a physical two-GPU host is available, run the non-vacuous resident-sidecar context-
-   isolation matrix; never replace it with a host interpretation path.
-2. **MULTI-002:** on that host, partition write/visible-locate submissions by
-   primary context and deterministically merge bounded metadata; never move lookup or visibility to the host.
-3. **STRUCT-001AV:** analyze the remaining `execute_statement` branch families, state dependencies, tests, and
-   co-change history; promote concrete bounded extraction children in `PLAN.md` before editing it. Do not create
-   arbitrary branch-range shards or a new host execution API. Aggregate slow-client control remains **SCALE-001**.
-4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
+1. **STRUCT-001AX:** move simple DECLARE/FETCH/MOVE/CLOSE routing into the existing cursor owner behind one
+   tri-state delegate; preserve exact precedence, state changes, tags, and errors.
+2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
+   owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
+3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
-5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+5. **MULTI-001/002/003:** only after every non-MULTI plan item is complete or the user explicitly promotes them,
+   run their mandatory non-vacuous physical multi-GPU gates; never replace them with host interpretations.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 

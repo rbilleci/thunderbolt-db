@@ -3,10 +3,11 @@ use std::io;
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(test)]
-use gpu_db_protocol::CopyOptions;
-#[cfg(test)]
 use gpu_db_protocol::FrontendMessage;
-use gpu_db_protocol::{is_copy_statement, parse_copy_from_stdin, parse_copy_to_stdout_table};
+#[cfg(test)]
+use gpu_db_protocol::{
+    is_copy_statement, parse_copy_from_stdin, parse_copy_to_stdout_table, CopyOptions,
+};
 use gpu_db_protocol::{
     parse_command, AclRelationKind, ColumnDefault, Command, CommentTarget, CopyFormat,
     CopyParseError, DatabasePrivilege, FunctionPrivilege, ParseError, PublicationTarget,
@@ -55,6 +56,7 @@ use extended_dml::{execute_extended_delete, execute_extended_insert, execute_ext
 mod copy_execution;
 use copy_execution::{
     apply_copy_in_rows, begin_copy_from_stdin, execute_copy_to_stdout, handle_copy_data,
+    try_execute_copy_statement,
 };
 #[path = "gpu-db-server/ddl_syntax.rs"]
 mod ddl_syntax;
@@ -4699,28 +4701,8 @@ fn execute_statement(
         return write_empty_query_response(stream);
     }
     let canonical = canonical_sql(statement);
-    if let Some(copy) = parse_copy_to_stdout_table(statement) {
-        return execute_copy_to_stdout(stream, session, &copy.table, copy.options);
-    }
-    if let Some(copy) = parse_copy_from_stdin(statement) {
-        return begin_copy_from_stdin(
-            stream,
-            session,
-            &copy.table,
-            copy.columns,
-            copy.options,
-            true,
-        );
-    }
-    if is_copy_statement(statement) {
-        return write_error(
-            stream,
-            &ErrorField {
-                code: "0A000",
-                message: "COPY is not supported by the compatibility endpoint",
-                position: None,
-            },
-        );
+    if let Some(result) = try_execute_copy_statement(stream, session, statement) {
+        return result;
     }
     if let Some((name, query)) = parse_declare_cursor(statement) {
         execute_declare_cursor(stream, session, name, &query)?;
