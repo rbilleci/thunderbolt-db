@@ -1640,6 +1640,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   arithmetic-VM calls, probe scope, retained-buffer ownership transfer, context/allocation/launch/
   synchronization, empty/error behavior, and ordered results are source-equivalent, so the report card was not
   applicable.
+  STRUCT-001FN then isolated the normalized-exact resident postfix expression VM in the rustfmt-clean 1,069-line
+  `expression_vm.rs` child and moved its shared checked text-window validation into the 41-line neutral
+  `resident_window.rs` leaf, reducing the execution root to 10,624 lines. The neutral leaf removes the otherwise
+  hidden `expression_vm -> resident_filter -> predicate_mask -> expression_vm` cycle while preserving the stable
+  crate-root `ExprStep`/`ResidentElemType` re-exports and one root-private runner import. The i32/i64/i128/varlen/
+  production GPU matrix passed 15 sequential plus ten concurrent invocations without device faults. Both
+  execution modes passed 48/79, both engine modes passed 505/487, workspace all-target check, strict execution/
+  engine clippy, dependency/scoped source/reference/format checks, and independent audit are clean. The PTX bytes,
+  25 referenced symbols, typed/scalar ABIs, dispatch, stack/lease/overflow, uploads/readback, synchronization,
+  error, and result behavior are source-equivalent, so the report card was not applicable. Audit found inherited
+  `ConstMask` GPU-native debt—its docs claim device fill while it builds and uploads an O(n) host vector—now owned
+  by STRUCT-001FO.
 
 ## Known boundaries
 

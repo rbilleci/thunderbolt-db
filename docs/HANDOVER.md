@@ -49,13 +49,16 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `join_contract.rs` leaf; stable root APIs, the 9/6 GPU matrix, full/static gates, and audit pass.
 - STRUCT-001FM is closed: predicate-mask type/API, compaction, retained/range/AND construction, and PTX now
   live in `predicate_mask.rs`; the 9/6 GPU matrix, full/static gates, and independent audit pass.
+- STRUCT-001FN is closed: the postfix expression VM now lives in bounded `expression_vm.rs`, shared window
+  validation lives in an acyclic neutral leaf, and the 15/10 GPU matrix, full/static gates, and audit pass. Its
+  audit promoted the inherited constant-mask host materialization as STRUCT-001FO.
 
 ## Resume here
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001FN:** isolate the resident postfix expression VM types/interpreter behind stable root re-exports
-   and a private runner import; keep its downstream compaction/projection/aggregate operators separate.
+1. **STRUCT-001FO:** replace `ConstMask`'s inherited O(n) host vector/H2D path with a device i32 fill, retain the
+   mask contract, and capture permanent before/after plus canonical performance evidence.
 2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
