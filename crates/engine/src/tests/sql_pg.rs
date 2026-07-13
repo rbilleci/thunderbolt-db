@@ -4291,15 +4291,23 @@ fn gpu_inner_join_order_by_limit_offset() {
         vec![("bob".to_string(), 70), ("charlie".to_string(), 50)],
         "OFFSET 1 LIMIT 2 slices the sorted result"
     );
-    // A non-projected ORDER BY key is a follow-up -> a clear error, not a wrong/partial answer.
-    let err = e
+    // PostgreSQL permits a non-projected ORDER BY key for a non-DISTINCT SELECT. The join sorter keeps
+    // that device column through ordering and drops it only at final projection.
+    let hidden_key = e
         .execute_resident_expr_select_sql(
             "SELECT l.name FROM l JOIN r ON l.id = r.lid ORDER BY r.score DESC",
         )
-        .expect_err("non-projected ORDER BY key must be rejected, not silently dropped");
-    assert!(
-        format!("{err:?}").contains("must appear in the SELECT list"),
-        "got: {err:?}"
+        .expect("non-projected ORDER BY key");
+    assert_eq!(hidden_key.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        hidden_key.rows,
+        vec![
+            vec![SqlValue::Text("alice".to_string())],
+            vec![SqlValue::Text("bob".to_string())],
+            vec![SqlValue::Text("charlie".to_string())],
+            vec![SqlValue::Text("charlie".to_string())],
+        ],
+        "the hidden score column orders on-device before final projection"
     );
 }
 

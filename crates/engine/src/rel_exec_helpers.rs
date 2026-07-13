@@ -1211,8 +1211,9 @@ pub(crate) fn bind_relational_select(
             SelectProjection::CountAll
             | SelectProjection::GroupedCount { .. }
             | SelectProjection::CountDistinct { .. } => (SqlType::Int8, 20, 8),
-            // SUM: PG SUM(int8) -> numeric (the bigint sum can exceed int8); SUM(int4) keeps the
-            // pre-existing (Int4 ty, oid 20, size 8) declaration (value widened to int8). NB:
+            // SUM: PG SUM(int8) -> numeric (the bigint sum can exceed int8); SUM(int2/int4) ->
+            // bigint. The declared SqlType must match the materialized SqlValue as well as the OID:
+            // materialized views and transient GPU relations consume this type to lay out payload bytes. NB:
             // aggregate_source_column intentionally returns None for SUM, so look the source column
             // up directly here -- relying on it silently fell through to the int4 default for int8.
             SelectProjection::Sum { column }
@@ -1234,7 +1235,7 @@ pub(crate) fn bind_relational_select(
                     SqlType::Numeric { precision, scale } => {
                         (SqlType::Numeric { precision, scale }, 1700, -1)
                     }
-                    _ => (SqlType::Int4, 20, 8),
+                    _ => (SqlType::Int8, 20, 8),
                 }
             }
             // MIN/MAX inherit the source column's wire type (PG preserves the type).
@@ -1258,7 +1259,7 @@ pub(crate) fn bind_relational_select(
     }
     // The general grouped form projects the group column (already in selected_columns) plus one result
     // column per aggregate. Each aggregate's wire type follows PG: COUNT->int8, AVG->numeric@16,
-    // SUM(int8/numeric)->numeric, SUM(int*)->int4(bigint oid), MIN/MAX-> the source column's type.
+    // SUM(int8/numeric)->numeric, SUM(int2/int4)->int8, MIN/MAX-> the source column's type.
     if let SelectProjection::GroupedAggregates { aggregates, .. } = &select.projection {
         for aggregate in aggregates {
             let (name, ty, type_oid, type_size) = match aggregate.kind {
@@ -1292,7 +1293,7 @@ pub(crate) fn bind_relational_select(
                         SqlType::Numeric { precision, scale } => {
                             ("sum", SqlType::Numeric { precision, scale }, 1700, -1)
                         }
-                        _ => ("sum", SqlType::Int4, 20, 8),
+                        _ => ("sum", SqlType::Int8, 20, 8),
                     }
                 }
                 GroupedAggKind::Min | GroupedAggKind::Max => {

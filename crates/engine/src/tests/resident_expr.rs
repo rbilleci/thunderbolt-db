@@ -4872,6 +4872,8 @@ fn gpu_group_by_composite_two_columns() {
     assert_eq!(g.columns[0].ty, SqlType::Int4);
     assert_eq!(g.columns[1].name, "b");
     assert_eq!(g.columns[1].ty, SqlType::Int4);
+    assert_eq!(g.columns[2].ty, SqlType::Int8);
+    assert_eq!(g.columns[3].ty, SqlType::Int8);
 }
 
 #[test]
@@ -7240,8 +7242,8 @@ fn gpu_grouped_having_and_combined() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_having_sum_and_dnf_runs_on_gpu() {
-    // Regression coverage (audit-found): a HAVING over a SUM(int4) result -- DECLARED Int4 but VALUED
-    // Int8 -- and a DNF mixing an int4 group key with an int8 COUNT must RUN on the GPU, not error.
+    // Regression coverage (audit-found): a HAVING over an int8 SUM(int4) result and a DNF mixing an int4
+    // group key with an int8 COUNT must RUN on the GPU, not error.
     let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
@@ -10321,6 +10323,10 @@ fn audit_s8_grouped_materialized_view_via_bridge() {
         "CREATE MATERIALIZED VIEW mg AS SELECT k, SUM(v) FROM base GROUP BY k ORDER BY k WITH DATA",
     )
     .unwrap();
+    let mg = e.relational_catalog_materialized_view("mg").unwrap();
+    assert_eq!(mg.columns[0].ty, SqlType::Int4);
+    assert_eq!(mg.columns[1].ty, SqlType::Int8);
+    assert_eq!(mg.columns[1].type_oid, 20);
     assert_eq!(
         readback(&e, "SELECT * FROM mg"),
         vec![

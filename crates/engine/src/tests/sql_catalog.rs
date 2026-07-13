@@ -3626,6 +3626,22 @@ fn relational_catalog_select_binding_uses_catalog_descriptors() {
     );
     assert_eq!(bound.order, Some((1, true)));
 
+    // SUM(int4) emits an Int8 value and PostgreSQL bigint metadata. Keep all three descriptors in
+    // agreement so persisted/transient result relations select the i64 payload section.
+    for sql in [
+        "SELECT SUM(id) FROM people",
+        "SELECT name, SUM(id) FROM people GROUP BY name",
+    ] {
+        let Command::Select(sum_select) = parse_command(sql).unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        let sum_bound = bind_relational_select(&table, &sum_select).unwrap();
+        let sum = sum_bound.selected_columns.last().unwrap();
+        assert_eq!(sum.ty, SqlType::Int8, "{sql}");
+        assert_eq!(sum.type_oid, 20, "{sql}");
+        assert_eq!(sum.type_size, 8, "{sql}");
+    }
+
     let Command::Select(bad_select) =
         parse_command("SELECT missing FROM people ORDER BY name").unwrap()
     else {

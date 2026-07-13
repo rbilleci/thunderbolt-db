@@ -12,22 +12,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   deleted. Fifteen GPU routes, full execution gates, static gates, canonical report card, and independent audit pass.
 - The PTX-inclusive source inventory now has 26 outliers: 14 production, eight tests, and four examples/tools.
   **STRUCT-001** owns every remaining disposition.
-- The complete ignored engine sweep exposed seven deterministic failures outside the FR PTX surface: one bridge
-  materialized-view route, one join ORDER BY/LIMIT/OFFSET route, and five cold-checkpoint routes. **QUALITY-002**
-  is promoted first to classify and close them.
+- QUALITY-002 is closed. Integer SUM binding now agrees with its bigint materialized value and wire descriptor;
+  the hidden join `ORDER BY` expectation and five recovery-era cold-tier fixtures now reflect their live routes.
+  All seven focused matrices, the complete 992-test engine gate, static gates, report card, and audit pass.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **QUALITY-002:** reproduce and disposition the seven failing ignored engine tests; leave the full charter gate
-   green without host fallback and remove obsolete fixtures/content where that is the proven cause.
-2. **STRUCT-001:** continue the ordered oversized-file inventory after QUALITY-002. The next critical ownership hub
+1. **STRUCT-001:** continue the ordered oversized-file inventory. The next critical ownership hub
    is `crates/execution/src/lib.rs`; do not let structural extraction implicitly decide **R3-001**.
-3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
-4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-5. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
+2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
+3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+4. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 

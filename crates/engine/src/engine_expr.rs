@@ -8581,9 +8581,8 @@ impl Engine {
             if !select.having_groups.is_empty() && !rows.is_empty() {
                 // HAVING on the GPU (charter: no host relational filter). Build a TRANSIENT device relation
                 // from the grouped result and evaluate the HAVING DNF via the SAME device predicate VM as
-                // WHERE. The VM is SINGLE-WIDTH per program, and a result column's catalog type can disagree
-                // with its materialized value (a `SUM(int*)` result is DECLARED Int4 but VALUED Int8). So
-                // PROMOTE every integer-family column (and value) to ONE comparable width: if the HAVING
+                // WHERE. The VM is SINGLE-WIDTH per program, so PROMOTE every integer-family column (and
+                // value) to ONE comparable width: if the HAVING
                 // touches a NUMERIC column/constant the whole predicate is NUMERIC (i128) -> promote integers
                 // to Numeric(scale 0); else it is INT (i64) -> promote integers to Int8. This makes int-key +
                 // int8-COUNT, and numeric-SUM + int-COUNT, a single width the VM can lower.

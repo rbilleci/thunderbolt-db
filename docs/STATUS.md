@@ -51,17 +51,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Crash-durable replay exists; the broader fault campaign, automatic lane checkpointing, PITR timestamps, and
   multi-node quorum integration are **DUR-001**, **DUR-002**, and **HA-001**.
 
-## Verification snapshot — 2026-07-12
+## Verification snapshot — 2026-07-13
 
-- Engine library: **505 passed, 0 failed, 485 GPU-ignored**.
+- Engine library: ordinary mode **505 passed, 0 failed, 487 GPU-ignored**; complete serial mode
+  **992 passed, 0 failed, 0 ignored**.
 - Production transient GPU integrations: catalog and bounded-function routes pass.
 - Pgwire: ordinary suite **3 passed** plus the ignored non-vacuous sharded/NULL GPU golden passes.
 - Production mixed gate: **116.2k reads/s**, p50 **246us**, p99 **501us**, p99.9 **671us**; zero host gathers,
   zero fallback groups, and 160/160 host-install-elided writes.
-- Read roofline: in-L2 `count_i32_compare` approximately **0.91x** the same-run `sum_i32` roofline; grouped
+- Read roofline: in-L2 `count_i32_compare` approximately **0.92x** the same-run `sum_i32` roofline; grouped
   kernel approximately **1,678 M elements/s**.
-- Canonical report card: 48M-row out-of-L2 batched route **252.4M lookups/s at batch 65,536, p50 131us**;
-  indexed single-flight route **3.23x** the scan.
+- Canonical report card: 48M-row out-of-L2 batched route **249.7M lookups/s at batch 65,536, p50 132us**;
+  indexed single-flight route **3.20x** the scan.
 - Production release check, engine/facade examples, static host-row-removal guard, and diff whitespace check pass.
 
 ## Structural decomposition
@@ -1706,13 +1707,28 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   point reads are 227.1M at p50 139us IN-L2 and 253.2M at p50 131us OUT-OF-L2; the OUT-OF-L2 index route is 3.25x
   scan. A broader charter sweep also found seven independently reproducible ignored engine failures unrelated to
   the unchanged PTX bodies; their disposition is promoted first as **QUALITY-002**.
+  QUALITY-002 then restored the complete ignored engine gate. The bridge materialized-view failure exposed a real
+  descriptor invariant defect: `SUM(int2/int4)` materialized `Int8` values while scalar and grouped binding still
+  declared `SqlType::Int4`; both forms now consistently use `Int8`, bigint OID 20, and size 8, with ordinary
+  catalog-binding plus persisted materialized-view regressions. The join failure was an obsolete expectation:
+  PostgreSQL permits a hidden `ORDER BY` key for a non-DISTINCT projection, and the existing route already kept
+  the key on-device through sorting before final projection; the test now asserts that GPU result. Recovery now
+  eagerly publishes a resident snapshot, so five cold-checkpoint fixtures no longer reached their intended
+  over-budget streaming tier. Their shared setup now sets the tiny budget and explicitly evicts only that eager
+  resident-cache entry; the independently owned cold artifact remains intact and the restore, forward-patch,
+  checksum, boundary, and lane-frontier assertions execute again. The seven routes passed 21 sequential plus 14
+  concurrent final-tree invocations. The complete engine gate passes 992/992, ordinary engine passes 505/487,
+  ordinary execution passes 53/80, workspace all-target/all-feature check, strict execution/engine clippy,
+  dependency boundary, scoped format/diff checks, and independent audit are clean. The canonical report card is
+  stable in both layers and cache regimes: IN-L2/OUT-OF-L2 rooflines are 1,464.6/1,450.3 GB/s, count is
+  0.92x/1.00x roofline, grouped aggregation is 1,678.3 M elements/s, and batch-65,536 point reads are 247.4M at
+  p50 139us IN-L2 and 249.7M at p50 132us OUT-OF-L2; the OUT-OF-L2 index route is 3.20x scan.
 
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
 | 26 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
-| Seven ignored bridge/join/cold-checkpoint engine tests fail the complete charter gate | **QUALITY-002** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
