@@ -1437,7 +1437,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   six concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and all-target
   check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. No production
   validation, update-chain, row-identity, or architectural behavior changed, so the report card was not
-  applicable. STRUCT-001EU is next.
+  applicable.
+  STRUCT-001EU externalized the exact seven-test mixed-type/NULL/3VL/batched-point/binary/deletion-gate family
+  into the rustfmt-clean 625-line `tests/residency_sharded_point_reads.rs` owner at the same parent position.
+  Normalized comparison differs only in three rustfmt gather-call layouts; all bodies, attributes, names, and
+  order remain unchanged, and the adjacent ordinary capacity-padding test remains at the parent boundary. The
+  engine root is 6,355 lines, and the 992-test/76-family inventories remain exact. Seven GPU gates passed 21
+  sequential and 14 concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and
+  all-target check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. The
+  inherited CPU-pinned mixed-type oracle remains test-only; no production route or architectural behavior
+  changed, so the report card was not applicable. STRUCT-001EV is next.
 
 ## Known boundaries
 
