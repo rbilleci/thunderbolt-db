@@ -43,17 +43,23 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001GA is closed. The unconsumed host-sorted int4 compare/project facade is deleted; its sole engine
   consumer had already moved to the general GPU expression/sort route. The execution root is 7,903 lines, and
   full suites, static/history gates, and audit pass.
+- STRUCT-001GB is closed. Ordered int4 compaction now rejects invalid predicate/index domains, carries resident or
+  pooled input base/extent/offset as one private descriptor, validates natural alignment and exact bounds, and
+  consumes typed same-context leases for every intermediate. Permanent fail-closed/context-reuse coverage, the
+  final 15+10 HAZARD matrix, complete 55/81 and 505/487 suites, canonical report card, static gates, and independent
+  re-audit pass. The execution root is 7,951 lines; RETIRE-003 already owns the measured large host-result boundary.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001:** isolate the surviving ordered int4 compare-compaction Rust/PTX owner without letting
-   extraction decide **R3-001**.
-2. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
-3. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-4. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
+1. **STRUCT-001GC:** extract the now-total ordered int4 compare-compaction Rust/PTX ownership into bounded private
+   files without changing its stable APIs, safety contract, PTX, or device behavior.
+2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
+3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
+4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+5. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 

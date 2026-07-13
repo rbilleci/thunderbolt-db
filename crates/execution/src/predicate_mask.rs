@@ -1,9 +1,9 @@
 use std::os::raw::c_void;
 
 use super::{
-    CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, ExprStep,
-    ExprTerminal, PooledDeviceBufferOwned, Probe, ResidentElemType, check_cuda,
-    launch_cuda_resident_i32_compare_ordered_core, run_resident_arith_program,
+    CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, ExprStep, ExprTerminal,
+    PooledBufferLease, PooledDeviceBufferOwned, Probe, ResidentElemType, check_cuda,
+    launch_cuda_buffer_i32_compare_indices_ordered, run_resident_arith_program,
 };
 
 impl CudaResidentDeviceMemory {
@@ -82,11 +82,11 @@ impl CudaPredicateMaskI32 {
     }
 }
 
-/// Compact a 0/1 mask buffer (absolute device ptr) to the matching row indices, host-sorted. The
-/// terminal of the boolean predicate VM.
+/// Compact a leased 0/1 mask buffer to matching row indices ascending. The terminal of the boolean
+/// predicate VM.
 pub(super) fn compact_mask_i32_to_indices(
     resident: &CudaResidentDeviceMemory,
-    mask_device_ptr: u64,
+    mask: &PooledBufferLease<'_>,
     n: u64,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
     if n == 0 {
@@ -100,19 +100,16 @@ pub(super) fn compact_mask_i32_to_indices(
     // Re-route to the ORDERED parallel compaction (`COMPARE_ORDERED_PTX`) in INDEX-emit mode. The mask
     // is a 0/1 i32 PER ROW (the compare-to-mask / mask-binary kernels write `selp.b32 %mask,1,0` then
     // `st.global.b32 [out + idx*4]` — one i32 per row, NOT bit-packed), so "row is set" == "mask i32 !=
-    // 0". Read the leased MASK buffer as the contiguous i32 input (`input_base = mask_device_ptr`,
-    // `byte_offset = 0`) and select set rows with `needle = 0`, `comparison = 5 (ne)`: the ordered
+    // 0". Read the typed MASK lease as the contiguous i32 input and select set rows with `needle = 0`,
+    // `comparison = 5 (ne)`: the ordered
     // count/scatter kernels both test `mask[idx] != 0` and emit the surviving ROW INDICES ascending by
     // construction (contiguous block partition + ordered intra-block prefix sum) — identical indices to
     // the legacy atomic-append, but with no host `sort_unstable`.
     //
     // Lease lifetime: the ordered core does count -> host-scan -> scatter (TWO launches reading
-    // `mask_device_ptr`). The caller leases the mask buffer and holds that lease across this whole call
-    // (it is borrowed for the duration), so the input outlives both reads — unchanged from the legacy
-    // single-launch path, which also read the same mask buffer.
-    let slots =
-        launch_cuda_resident_i32_compare_ordered_core(resident, mask_device_ptr, 0, n, 0, 5, 1)?;
-    Ok(slots.into_iter().map(|slot| slot as u32).collect())
+    // mask lease). The typed wrapper validates the exact capacity and context ownership before CUDA
+    // setup; this borrow spans the call, so the input outlives both reads.
+    launch_cuda_buffer_i32_compare_indices_ordered(resident, mask, n, 0, 5)
 }
 
 /// Evaluate a boolean predicate `program` (comparisons -> masks, combined by `MaskBinary`) to one
@@ -137,7 +134,7 @@ fn launch_cuda_resident_expr_predicate_filter(
         // A well-formed predicate program leaves exactly one mask on the stack.
         return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
     }
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_i32_to_indices(resident, &mask, n)
 }
 
 fn launch_cuda_resident_expr_predicate_mask(

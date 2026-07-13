@@ -1655,12 +1655,12 @@ fn launch_cuda_resident_expr_two_col_filter(
     Ok(indices)
 }
 
-/// Compare an int4 value buffer (absolute device ptr) to `needle` and return the matching row
-/// indices, host-sorted ascending. Shared compare-and-compact tail for the arithmetic VM (the 2-col
-/// fast-path launcher keeps its own fused copy). `comparison`: 0=eq, 1=lt, 2=le, 3=gt, 4=ge.
+/// Compare an int4 value-buffer lease to `needle` and return the matching row indices ascending.
+/// Shared compare-and-compact tail for the arithmetic VM (the 2-col fast-path launcher keeps its
+/// own fused copy). `comparison`: 0=eq, 1=lt, 2=le, 3=gt, 4=ge.
 fn compact_buffer_i32_compare_to_indices(
     resident: &CudaResidentDeviceMemory,
-    value_device_ptr: u64,
+    value: &PooledBufferLease<'_>,
     n: u64,
     needle: i32,
     comparison: u32,
@@ -1668,9 +1668,7 @@ fn compact_buffer_i32_compare_to_indices(
     // The scalar compact kernel switched on codes 0=eq..4=ge only; reject 5=ne (mask-path only) so a
     // caller gets an error, not a silently-empty result. Preserved byte-identically across the
     // re-route to the ordered compaction (no production caller passes 5 here — `ne` lowers to a mask).
-    if comparison > 4 {
-        return Err(CudaRuntimeProbeError::UnsupportedComparison(comparison));
-    }
+    validate_ordered_i32_comparison(comparison, 4)?;
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -1680,29 +1678,14 @@ fn compact_buffer_i32_compare_to_indices(
     let _compact_scope = Probe::scope("compact");
 
     // Re-route to the ORDERED parallel compaction (`COMPARE_ORDERED_PTX`) in INDEX-emit mode: read the
-    // leased VALUE buffer as the contiguous i32 input (`input_base = value_device_ptr`, `byte_offset =
-    // 0`). The kernels read one i32 per row at `value_device_ptr + idx*4` (the same layout the legacy
-    // compact kernel read), so the surviving row indices are identical — but emitted ASCENDING BY
-    // CONSTRUCTION (contiguous block partition + ordered intra-block prefix sum), replacing the host
-    // `sort_unstable`. Call the shared core directly (not the column-only index wrapper, which always
-    // reads `resident.device_ptr()`) so the input base is the value buffer; reinterpret each u32 row
-    // index from its i32 slot bits (always `< n`, non-negative — bit-exact) exactly as that wrapper
-    // does.
+    // leased VALUE buffer as the contiguous i32 input. The typed wrapper verifies that this lease
+    // belongs to the resident context and covers every `value[idx]` read before either kernel launch.
+    // Surviving row indices are emitted ASCENDING BY CONSTRUCTION (contiguous block partition +
+    // ordered intra-block prefix sum), replacing the host `sort_unstable`.
     //
     // Lease lifetime: the ordered core does count -> host-scan -> scatter (TWO launches reading
-    // `value_device_ptr`). The caller leases the value buffer and holds that lease across this whole
-    // call (it is borrowed for the duration), so the input outlives both reads — unchanged from the
-    // legacy single-launch path, which also read the same buffer.
-    let slots = launch_cuda_resident_i32_compare_ordered_core(
-        resident,
-        value_device_ptr,
-        0,
-        n,
-        needle,
-        comparison,
-        1,
-    )?;
-    Ok(slots.into_iter().map(|slot| slot as u32).collect())
+    // value lease). The borrow spans this whole call, so the input outlives both reads.
+    launch_cuda_buffer_i32_compare_indices_ordered(resident, value, n, needle, comparison)
 }
 
 /// PROTOTYPE — the resident arithmetic bytecode VM (docs/architecture/17 section 2.3). Runs a postfix
@@ -1712,32 +1695,29 @@ fn compact_buffer_i32_compare_to_indices(
 /// generalizes the fixed 2-col fast-path: arbitrary depth lowers to a longer program of the same
 /// primitives. Correctness-first: each step runs on a pooled stream that syncs, so an intermediate
 /// is valid before the next step reads it (pipelining/fusion is a later perf lever).
-/// Compare two int4 value buffers (absolute device ptrs) elementwise and return the matching row
-/// indices in ASCENDING order. The col-vs-col / expr-vs-expr analogue of
+/// Compare two int4 value-buffer leases elementwise and return the matching row indices in ASCENDING
+/// order. The col-vs-col / expr-vs-expr analogue of
 /// `compact_buffer_i32_compare_to_indices`. `comparison`: 0=eq, 1=lt, 2=le, 3=gt, 4=ge.
 fn compact_buffers_i32_compare_to_indices(
     resident: &CudaResidentDeviceMemory,
-    lhs_device_ptr: u64,
-    rhs_device_ptr: u64,
+    lhs: &PooledBufferLease<'_>,
+    rhs: &PooledBufferLease<'_>,
     n: u64,
     comparison: u32,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
     // The buffer compact kernel switches on codes 0=eq..4=ge only; reject 5=ne (mask-path only) so a
     // caller gets an error, not a silently-empty result. Preserved byte-identically across the re-route
     // to the ordered two-input compaction (no production caller passes 5 here - `ne` lowers to a mask).
-    if comparison > 4 {
-        return Err(CudaRuntimeProbeError::UnsupportedComparison(comparison));
-    }
+    validate_ordered_i32_comparison(comparison, 4)?;
     if n == 0 {
         return Ok(Vec::new());
     }
     // Re-route to the TWO-INPUT ORDERED parallel compaction (`COMPARE_ORDERED_PTX`,
     // `gpu_db_buffers_i32_compare_*_blocks`): compare `lhs[i] <cmp> rhs[i]` over the two leased value
-    // buffers (`lhs_device_ptr`, `rhs_device_ptr`, each contiguous i32 at `base + idx*4` - the same
-    // layout the legacy `gpu_db_buffer_i32_compare_buffers_to_indices` atomic kernel read), so the
-    // surviving row indices are IDENTICAL (operand order lhs,rhs; codes 0..4) - but emitted ASCENDING
-    // BY CONSTRUCTION (contiguous block partition + ordered intra-block prefix sum), replacing the
-    // atomic-append + host `sort_unstable`.
+    // buffers (each contiguous i32 at `base + idx*4` - the same layout the legacy
+    // `gpu_db_buffer_i32_compare_buffers_to_indices` atomic kernel read). The typed wrapper verifies
+    // both exact lease capacities and context ownership before launch. Surviving row indices are
+    // IDENTICAL (operand order lhs,rhs; codes 0..4), but emitted ASCENDING BY CONSTRUCTION.
     //
     // Lease lifetime: the ordered launch does count -> host-scan -> scatter (TWO launches, each reading
     // BOTH buffers). The caller leases both value buffers and holds those leases across this whole call
@@ -1745,8 +1725,8 @@ fn compact_buffers_i32_compare_to_indices(
     // single-launch path, which also read the same two buffers.
     launch_cuda_resident_i32_compare_buffers_indices_ordered(
         resident,
-        lhs_device_ptr,
-        rhs_device_ptr,
+        lhs,
+        rhs,
         n,
         comparison,
     )
@@ -1778,7 +1758,7 @@ fn launch_cuda_resident_expr_arith_filter(
         // A well-formed arithmetic program leaves exactly one value on the stack.
         return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
     }
-    compact_buffer_i32_compare_to_indices(resident, value.ptr, n, needle, compare_code)
+    compact_buffer_i32_compare_to_indices(resident, &value, n, needle, compare_code)
 }
 
 fn launch_cuda_arith_value_column_at_indices(
@@ -2028,7 +2008,7 @@ fn launch_cuda_resident_expr_compare_buffers_filter(
     if !stack.is_empty() {
         return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
     }
-    compact_buffers_i32_compare_to_indices(resident, lhs.ptr, rhs.ptr, n, comparison)
+    compact_buffers_i32_compare_to_indices(resident, &lhs, &rhs, n, comparison)
 }
 
 // P2 §9.5/S2 — stable bitonic argsort primitive (the small-result branch of the adaptive GPU sort
@@ -4706,8 +4686,7 @@ fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
 ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
     launch_cuda_resident_i32_compare_ordered_core(
         resident,
-        resident.device_ptr(),
-        byte_offset,
+        OrderedI32InputWindow::resident(resident, byte_offset),
         row_count,
         needle,
         comparison.code(),
@@ -4726,6 +4705,76 @@ fn i32_bits_into_u32(values: Vec<i32>) -> Vec<u32> {
     unsafe { Vec::from_raw_parts(ptr, len, capacity) }
 }
 
+#[derive(Clone, Copy)]
+struct OrderedI32InputWindow {
+    device_base: u64,
+    allocated_bytes: u64,
+    byte_offset: u64,
+}
+
+impl OrderedI32InputWindow {
+    fn resident<R: CudaResidentReadSource>(resident: &R, byte_offset: u64) -> Self {
+        Self {
+            device_base: resident.device_ptr(),
+            allocated_bytes: resident.metadata().allocated_bytes,
+            byte_offset,
+        }
+    }
+
+    fn pooled(input: &PooledBufferLease<'_>) -> Self {
+        Self {
+            device_base: input.ptr,
+            allocated_bytes: input.capacity as u64,
+            byte_offset: 0,
+        }
+    }
+}
+
+fn validate_ordered_i32_comparison(
+    comparison: u32,
+    max_code: u32,
+) -> Result<(), CudaRuntimeProbeError> {
+    if comparison > max_code {
+        return Err(CudaRuntimeProbeError::UnsupportedComparison(comparison));
+    }
+    Ok(())
+}
+
+fn validate_ordered_i32_index_domain(row_count: u64) -> Result<(), CudaRuntimeProbeError> {
+    if row_count > u64::from(u32::MAX) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(row_count).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ordered_i32_context_identity(
+    expected: usize,
+    actual: usize,
+    capacity: usize,
+) -> Result<(), CudaRuntimeProbeError> {
+    if actual != expected {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(capacity));
+    }
+    Ok(())
+}
+
+fn validate_ordered_i32_input_window(
+    allocated_bytes: u64,
+    byte_offset: u64,
+    row_count: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    let width = std::mem::size_of::<i32>() as u64;
+    resident_window::validate_aligned_window(
+        allocated_bytes,
+        byte_offset,
+        row_count,
+        width,
+        std::mem::align_of::<i32>() as u64,
+    )
+}
+
 /// INDEX-emit launch: returns the surviving ROW INDICES (`Vec<u32>`) in ASCENDING ORDER via the SAME
 /// ordered parallel compaction, with the scatter kernel storing each match's row index (u32) instead
 /// of its value (`out_is_index = 1`). The ascending-by-construction guarantee is identical to the
@@ -4739,18 +4788,11 @@ fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
     needle: i32,
     comparison: u32,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
-    // Load-bearing precondition (audit P3): the scatter kernel stores each surviving ROW INDEX as a u32
-    // (`cvt.u32.u64` then `st.global.b32`), so it would silently truncate past u32::MAX. The grid sizing
-    // grows `chunk` for arbitrarily large row_count and does NOT cap it, so assert here (~17 GB for one
-    // i32 column = unreachable on a single GPU today, but make the invariant explicit, not a comment).
-    debug_assert!(
-        row_count <= u64::from(u32::MAX),
-        "ordered-index compaction stores row indices as u32; row_count {row_count} exceeds u32::MAX"
-    );
+    validate_ordered_i32_comparison(comparison, 5)?;
+    validate_ordered_i32_index_domain(row_count)?;
     let slots = launch_cuda_resident_i32_compare_ordered_core(
         resident,
-        resident.device_ptr(),
-        byte_offset,
+        OrderedI32InputWindow::resident(resident, byte_offset),
         row_count,
         needle,
         comparison,
@@ -4760,6 +4802,31 @@ fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
     // is `Vec<i32>` 4-byte slots, so reinterpret each slot's bits back to u32 (bit-exact — a row index
     // is `< row_count`, always non-negative, and fits u32 since row_count <= u32::MAX in every sized
     // grid). The order is already ascending by construction (no host sort).
+    Ok(i32_bits_into_u32(slots))
+}
+
+fn launch_cuda_buffer_i32_compare_indices_ordered(
+    resident: &CudaResidentDeviceMemory,
+    input: &PooledBufferLease<'_>,
+    row_count: u64,
+    needle: i32,
+    comparison: u32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    validate_ordered_i32_comparison(comparison, 5)?;
+    validate_ordered_i32_index_domain(row_count)?;
+    validate_ordered_i32_context_identity(
+        std::ptr::from_ref(resident.primary()).addr(),
+        input.primary_identity(),
+        input.capacity,
+    )?;
+    let slots = launch_cuda_resident_i32_compare_ordered_core(
+        resident,
+        OrderedI32InputWindow::pooled(input),
+        row_count,
+        needle,
+        comparison,
+        1,
+    )?;
     Ok(i32_bits_into_u32(slots))
 }
 
@@ -4774,15 +4841,13 @@ fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
 /// stores the surviving row index (col-vs-col is a predicate). `comparison` is the raw code
 /// (0=eq,1=lt,2=lte,3=gt,4=gte; ne is rejected at the wrapper).
 ///
-/// SAFETY (load-bearing precondition, audit P3): the buffers at `lhs_base` and `rhs_base` MUST each
-/// cover `[0, n*4)` - BOTH the count and the scatter kernel read every `idx in [0, n)` from BOTH
-/// bases. A too-small buffer is an out-of-bounds DEVICE read (CUDA 700). The caller leases each value
-/// buffer at exactly `n*4` and holds both leases across this whole call (borrowed for the duration),
-/// so both inputs outlive both reads - documented exactly as the single-input core's `input_base`.
-fn launch_cuda_resident_i32_compare_buffers_indices_ordered<R: CudaResidentReadSource>(
-    resident: &R,
-    lhs_base: u64,
-    rhs_base: u64,
+/// Both typed leases must belong to `resident` and cover `[0, n*4)`: the wrapper validates those
+/// exact capacities before CUDA setup. Their borrows span both count and scatter launches, so both
+/// inputs outlive every device read.
+fn launch_cuda_resident_i32_compare_buffers_indices_ordered(
+    resident: &CudaResidentDeviceMemory,
+    lhs: &PooledBufferLease<'_>,
+    rhs: &PooledBufferLease<'_>,
     n: u64,
     comparison: u32,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
@@ -4805,17 +4870,26 @@ fn launch_cuda_resident_i32_compare_buffers_indices_ordered<R: CudaResidentReadS
 
     const PTX: &[u8] = COMPARE_ORDERED_PTX;
 
+    validate_ordered_i32_comparison(comparison, 4)?;
+    validate_ordered_i32_index_domain(n)?;
+    let primary_identity = std::ptr::from_ref(resident.primary()).addr();
+    validate_ordered_i32_context_identity(
+        primary_identity,
+        lhs.primary_identity(),
+        lhs.capacity,
+    )?;
+    validate_ordered_i32_context_identity(
+        primary_identity,
+        rhs.primary_identity(),
+        rhs.capacity,
+    )?;
+    validate_ordered_i32_input_window(lhs.capacity as u64, 0, n)?;
+    validate_ordered_i32_input_window(rhs.capacity as u64, 0, n)?;
     if n == 0 {
         return Ok(Vec::new());
     }
-    // Load-bearing precondition (audit P3): the scatter kernel stores each surviving ROW INDEX as a u32
-    // (`cvt.u32.u64` then `st.global.b32`), so it would silently truncate past u32::MAX. The grid sizing
-    // grows `chunk` for arbitrarily large `n` and does NOT cap it, so assert here (~17 GB for one i32
-    // input = unreachable on a single GPU today, but make the invariant explicit, not a comment).
-    debug_assert!(
-        n <= u64::from(u32::MAX),
-        "ordered-index compaction stores row indices as u32; n {n} exceeds u32::MAX"
-    );
+    let lhs_base = lhs.ptr;
+    let rhs_base = rhs.ptr;
 
     let cu_memcpy_dtoh = unsafe {
         resident
@@ -5175,26 +5249,12 @@ fn launch_cuda_resident_i32_compare_buffers_indices_ordered<R: CudaResidentReadS
 /// (0=eq, 1=lt, 2=lte, 3=gt, 4=gte, 5=ne). All count/host-scan/scatter structure, chunk/grid sizing,
 /// and lease lifetimes are shared, so the value and index paths are byte-identical except the payload.
 ///
-/// `input_base` is the device base the kernels read `row_count` contiguous i32s from, at
-/// `input_base + byte_offset + idx*4`. The column path passes `resident.device_ptr()` (input IS the
-/// resident column, so the `byte_offset + row_count*4 <= allocated_bytes` bound is checked against the
-/// column allocation). A generalized caller passes a leased device buffer's ptr instead (its OWN i32
-/// input — e.g. a 0/1 mask or an arithmetic result); the column-allocation bound does NOT apply (the
-/// buffer is caller-sized and its lease must outlive both kernel launches), so it is checked only on
-/// the column path. `resident` still supplies the CUDA context (lib / primary / streams / leases)
-/// regardless of where the input is read.
-///
-/// SAFETY (load-bearing precondition for a leased-buffer `input_base`, audit P3): the buffer at
-/// `input_base` MUST cover `[byte_offset, byte_offset + row_count*4)` — BOTH the count and the scatter
-/// kernel read every `idx in [0, row_count)`. A too-small buffer is an out-of-bounds DEVICE read (CUDA
-/// 700). The current callers all satisfy this (the mask producers and the I32 arith filter lease exactly
-/// `row_count*4`; the I64/I128 mask buffers are larger), verified by the audit. NOTE (follow-up): make
-/// this runtime-checked by threading the input buffer's byte length down so the bound applies on the
-/// buffer path too, instead of by convention.
+/// `input` keeps the device base, exact owner capacity, and byte offset together. Kernels read
+/// `row_count` contiguous i32s from `input.device_base + input.byte_offset + idx*4`; the complete
+/// aligned window is checked against the extent before CUDA setup, so both passes are total.
 fn launch_cuda_resident_i32_compare_ordered_core<R: CudaResidentReadSource>(
     resident: &R,
-    input_base: u64,
-    byte_offset: u64,
+    input: OrderedI32InputWindow,
     row_count: u64,
     needle: i32,
     comparison: u32,
@@ -5251,31 +5311,19 @@ fn launch_cuda_resident_i32_compare_ordered_core<R: CudaResidentReadSource>(
     // (the CUDA grid-x max), rounding `chunk` up when rows would exceed `65535 * CHUNK_ROWS`.
     const PTX: &[u8] = COMPARE_ORDERED_PTX;
 
-    let bytes = row_count
-        .checked_mul(std::mem::size_of::<i32>() as u64)
-        .and_then(|bytes| byte_offset.checked_add(bytes))
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    // The `[byte_offset, byte_offset + row_count*4)` read window must fit the INPUT allocation. When the
-    // input IS the resident column (`input_base == resident.device_ptr()`) that allocation is the
-    // column's `allocated_bytes`, so check it (byte-identical to the pre-generalization column path).
-    // A generalized caller reads its OWN leased buffer (a different base), which is sized to exactly
-    // `row_count*4` with `byte_offset == 0` and owned by the caller, so the column bound does not apply.
-    if input_base == resident.device_ptr() && bytes > resident.metadata().allocated_bytes {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+    validate_ordered_i32_comparison(comparison, 5)?;
+    if out_is_index > 1 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(out_is_index as usize));
     }
+    if out_is_index == 1 {
+        validate_ordered_i32_index_domain(row_count)?;
+    }
+    validate_ordered_i32_input_window(input.allocated_bytes, input.byte_offset, row_count)?;
     if row_count == 0 {
         return Ok(Vec::new());
     }
-    // Load-bearing precondition (audit P3) for INDEX-emit mode: the scatter kernel stores each surviving
-    // ROW INDEX as a u32 (`cvt.u32.u64` then `st.global.b32`), so it would silently truncate past
-    // u32::MAX. The grid sizing grows `chunk` for arbitrarily large `row_count` and does NOT cap it, so
-    // assert here (~17 GB for one i32 input = unreachable on a single GPU today, but make the invariant
-    // explicit). Lives in the core so EVERY index-emit caller is covered (the column wrapper and the
-    // generalized mask / arithmetic-result compactions alike), not just the original column wrapper.
-    debug_assert!(
-        out_is_index == 0 || row_count <= u64::from(u32::MAX),
-        "ordered-index compaction stores row indices as u32; row_count {row_count} exceeds u32::MAX"
-    );
+    let input_base = input.device_base;
+    let byte_offset = input.byte_offset;
 
     let cu_memcpy_dtoh = unsafe {
         resident

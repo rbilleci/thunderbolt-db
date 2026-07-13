@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use super::resident_window::{validate_text_windows, validate_window};
 use super::{
-    CudaResidentDeviceMemory, CudaRuntimeProbeError, compact_mask_i32_to_indices,
-    launch_on_pooled_stream,
+    CudaResidentDeviceMemory, CudaRuntimeProbeError, PooledBufferLease,
+    compact_mask_i32_to_indices, launch_on_pooled_stream,
 };
 
 fn validate_bitmap_windows(
@@ -112,7 +112,7 @@ pub(super) fn launch_cuda_resident_i64_compare_scalar_filter(
             std::ptr::null_mut(),
         )
     })?;
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_i32_to_indices(resident, &mask, n)
 }
 
 /// Evaluate `a <cmp> b` over two resident int8 columns to surviving row indices (the type matrix, doc
@@ -201,7 +201,7 @@ pub(super) fn launch_cuda_resident_i64_compare_columns_filter(
             std::ptr::null_mut(),
         )
     })?;
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_i32_to_indices(resident, &mask, n)
 }
 
 /// Evaluate `col <cmp> scalar` (or `scalar <cmp> col` when `scalar_on_left`) over a resident numeric
@@ -295,7 +295,7 @@ pub(super) fn launch_cuda_resident_i128_compare_scalar_filter(
             std::ptr::null_mut(),
         )
     })?;
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_i32_to_indices(resident, &mask, n)
 }
 
 /// Evaluate `text[i] == needle` (or `<>` when `negate`) over a resident TEXT column to surviving row
@@ -414,7 +414,7 @@ pub(super) fn launch_cuda_resident_text_eq_scalar_filter(
             )
         }
     })?;
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_i32_to_indices(resident, &mask, n)
 }
 
 /// Evaluate `text[i] <cmp> needle` over a resident TEXT column to surviving row indices (the type
@@ -540,7 +540,7 @@ pub(super) fn launch_cuda_resident_text_compare_scalar_filter(
             )
         }
     })?;
-    compact_mask_with_validity(resident, mask.ptr, validity_offsets, n)
+    compact_mask_with_validity(resident, &mask, validity_offsets, n)
 }
 
 /// AND each nullable operand's NULL validity mask (1 = valid) into the i32 comparison `mask` ON THE GPU,
@@ -553,13 +553,14 @@ pub(super) fn launch_cuda_resident_text_compare_scalar_filter(
 /// it; the bitmap→mask + mask-AND kernels are the same the predicate VM uses (NO new/changed kernel).
 fn compact_mask_with_validity(
     resident: &CudaResidentDeviceMemory,
-    mask_ptr: u64,
+    mask: &PooledBufferLease<'_>,
     validity_offsets: &[u64],
     n: u64,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
     if validity_offsets.is_empty() || n == 0 {
-        return compact_mask_i32_to_indices(resident, mask_ptr, n);
+        return compact_mask_i32_to_indices(resident, mask, n);
     }
+    let mask_ptr = mask.ptr;
     validate_bitmap_windows(resident.metadata().allocated_bytes, validity_offsets, n)?;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -670,7 +671,7 @@ fn compact_mask_with_validity(
         }
         0
     })?;
-    compact_mask_i32_to_indices(resident, mask_ptr, n)
+    compact_mask_i32_to_indices(resident, mask, n)
 }
 
 /// Evaluate `uuid[i] <cmp> needle` over a resident UUID column (16 raw bytes/row) to surviving row
@@ -776,7 +777,7 @@ pub(super) fn launch_cuda_resident_uuid_compare_scalar_filter(
             )
         }
     })?;
-    compact_mask_with_validity(resident, mask.ptr, validity_offsets, n)
+    compact_mask_with_validity(resident, &mask, validity_offsets, n)
 }
 
 /// Evaluate `a <cmp> b` over two resident UUID columns (16 raw bytes/row each) to surviving row
@@ -862,7 +863,7 @@ pub(super) fn launch_cuda_resident_uuid_compare_columns_filter(
             std::ptr::null_mut(),
         )
     })?;
-    compact_mask_with_validity(resident, mask.ptr, validity_offsets, n)
+    compact_mask_with_validity(resident, &mask, validity_offsets, n)
 }
 
 /// Expand a resident bool column's 1-bit-per-row bitmap to surviving row indices (the type matrix,
@@ -944,7 +945,7 @@ pub(super) fn launch_cuda_resident_bool_to_mask_filter(
             std::ptr::null_mut(),
         )
     })?;
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_i32_to_indices(resident, &mask, n)
 }
 
 /// Evaluate `text[i] LIKE pattern` over a resident TEXT column to surviving row indices (the type
@@ -1064,7 +1065,7 @@ pub(super) fn launch_cuda_resident_text_like_scalar_filter(
             )
         }
     })?;
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_i32_to_indices(resident, &mask, n)
 }
 
 /// Evaluate `a <cmp> b` over two resident numeric (i128) columns to surviving row indices (the type
@@ -1153,7 +1154,7 @@ pub(super) fn launch_cuda_resident_i128_compare_columns_filter(
             std::ptr::null_mut(),
         )
     })?;
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_i32_to_indices(resident, &mask, n)
 }
 
 #[cfg(test)]

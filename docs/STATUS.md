@@ -1826,6 +1826,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   505/487 with GPU sweeps serial; workspace all-target/all-feature check, strict execution/engine clippy,
   source/history/diff/docs gates, and independent audit are clean. No live caller, kernel, or surviving result
   behavior changed, so HAZARD and report-card gates were not applicable.
+  STRUCT-001GB then made the surviving ordered int4 compare-compaction family total before extraction. Public raw
+  predicate codes now accept only 0..=5; scalar/two-input routes retain their narrower 0..=4 contract; every index
+  emitter rejects row domains above `u32::MAX` at runtime. `OrderedI32InputWindow` couples each device base with its
+  exact extent and byte offset, resident inputs reuse the shared aligned-window validator, and every single/two-
+  input intermediate is a typed same-context `PooledBufferLease` whose exact capacity is checked before CUDA setup.
+  All mask and arithmetic callers retain those borrows across both count/scatter passes. Permanent host and GPU
+  coverage exercises invalid code/domain/context, short and misaligned windows, checked arithmetic overflow,
+  zero-at-end/zero-beyond behavior, two-input limits, and valid post-error context reuse. The final five-family
+  matrix passes 15 sequential plus ten concurrent invocations with no CUDA 700/716/717; execution passes 55/81 and
+  engine passes 505/487 with GPU sweeps serial. Workspace all-target/all-feature check, strict execution/engine
+  clippy, source/diff/docs gates, and independent re-audit are clean. The final canonical card is stable: IN-L2/
+  OUT-OF-L2 rooflines are 1,471.6/1,447.4 GB/s, compare count is 0.86x/1.01x roofline, grouped aggregation is
+  1,677.3M elements/s, and batch-65,536 point reads are 247.0M at p50 140us IN-L2 and 253.0M at p50 132us OUT-OF-L2.
+  The 8M-row ordered-compaction control remains at 0.0248x roofline; the reproducible 64M-row/50%-selectivity line
+  returns roughly 134MB of host indices and remains result-path dominated, an existing boundary already owned by
+  RETIRE-003. PTX, ABI, launch geometry, ordering, and valid results are unchanged. The root is 7,951 lines.
 
 ## Known boundaries
 

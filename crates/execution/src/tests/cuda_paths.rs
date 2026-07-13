@@ -2023,6 +2023,97 @@
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_ordered_i32_compaction_preflight_fails_closed_then_reuses_context() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let values = [10_i32, 20];
+        let bytes: Vec<u8> = values
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        let resident = runtime
+            .retain_device_memory_copy(0, &bytes)
+            .expect("resident device memory");
+        resident
+            .set_current_context()
+            .expect("bind primary context");
+
+        assert_eq!(
+            resident.compare_indices_ordered_from_payload(0, 2, 10, 6),
+            Err(CudaRuntimeProbeError::UnsupportedComparison(6)),
+            "unknown comparison codes must fail before launch"
+        );
+        assert!(matches!(
+            resident.compare_indices_ordered_from_payload(
+                0,
+                u64::from(u32::MAX) + 1,
+                10,
+                0,
+            ),
+            Err(CudaRuntimeProbeError::InvalidInputLength(_))
+        ));
+        assert!(matches!(
+            resident.compare_indices_ordered_from_payload(4, 2, 10, 0),
+            Err(CudaRuntimeProbeError::InvalidInputLength(_))
+        ));
+        assert_eq!(
+            resident.compare_indices_ordered_from_payload(1, 1, 10, 0),
+            Err(CudaRuntimeProbeError::InvalidInputLength(1)),
+            "misaligned resident offsets must fail before device access"
+        );
+        assert!(resident
+            .compare_indices_ordered_from_payload(bytes.len() as u64, 0, 10, 0)
+            .expect("empty window at allocation end")
+            .is_empty());
+        assert!(matches!(
+            resident.compare_indices_ordered_from_payload(bytes.len() as u64 + 4, 0, 10, 0),
+            Err(CudaRuntimeProbeError::InvalidInputLength(_))
+        ));
+
+        {
+            let short = resident
+                .primary()
+                .lease_device_buffer(1)
+                .expect("single input lease");
+            let too_many = short.capacity as u64 / std::mem::size_of::<i32>() as u64 + 1;
+            assert!(matches!(
+                launch_cuda_buffer_i32_compare_indices_ordered(
+                    &resident, &short, too_many, 0, 0,
+                ),
+                Err(CudaRuntimeProbeError::InvalidInputLength(_))
+            ));
+
+            let rhs = resident
+                .primary()
+                .lease_device_buffer(1)
+                .expect("second input lease");
+            let too_many = short.capacity.max(rhs.capacity) as u64
+                / std::mem::size_of::<i32>() as u64
+                + 1;
+            assert!(matches!(
+                launch_cuda_resident_i32_compare_buffers_indices_ordered(
+                    &resident, &short, &rhs, too_many, 0,
+                ),
+                Err(CudaRuntimeProbeError::InvalidInputLength(_))
+            ));
+            assert_eq!(
+                launch_cuda_resident_i32_compare_buffers_indices_ordered(
+                    &resident, &short, &rhs, 1, 5,
+                ),
+                Err(CudaRuntimeProbeError::UnsupportedComparison(5))
+            );
+        }
+
+        assert_eq!(
+            resident
+                .compare_indices_ordered_from_payload(0, 2, 15, 3)
+                .expect("valid launch after preflight failures"),
+            vec![1],
+            "preflight failures must leave the CUDA context reusable"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_resident_i32_equal_row_indices_matches_expected_under_concurrent_pool_reuse() {
         // P2-M2 regression for the `equal_row_indices` migration to the pooled-async substrate.
         // This gather route is MORE exposed than its `compare_project` twin: it drives TWO device

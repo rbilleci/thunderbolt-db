@@ -21,6 +21,45 @@
         assert_eq!(unsigned, [0, 1, i32::MAX as u32, 1 << 31, u32::MAX]);
     }
 
+    #[test]
+    fn ordered_i32_compaction_preflight_is_total() {
+        assert_eq!(validate_ordered_i32_comparison(5, 5), Ok(()));
+        assert_eq!(
+            validate_ordered_i32_comparison(6, 5),
+            Err(CudaRuntimeProbeError::UnsupportedComparison(6))
+        );
+
+        assert_eq!(validate_ordered_i32_index_domain(u64::from(u32::MAX)), Ok(()));
+        assert!(matches!(
+            validate_ordered_i32_index_domain(u64::from(u32::MAX) + 1),
+            Err(CudaRuntimeProbeError::InvalidInputLength(_))
+        ));
+        assert_eq!(validate_ordered_i32_context_identity(7, 7, 64), Ok(()));
+        assert_eq!(
+            validate_ordered_i32_context_identity(7, 8, 64),
+            Err(CudaRuntimeProbeError::InvalidInputLength(64))
+        );
+
+        assert_eq!(validate_ordered_i32_input_window(12, 4, 2), Ok(()));
+        assert_eq!(
+            validate_ordered_i32_input_window(11, 4, 2),
+            Err(CudaRuntimeProbeError::InvalidInputLength(12))
+        );
+        assert_eq!(
+            validate_ordered_i32_input_window(12, 1, 2),
+            Err(CudaRuntimeProbeError::InvalidInputLength(1))
+        );
+        assert_eq!(validate_ordered_i32_input_window(8, 8, 0), Ok(()));
+        assert_eq!(
+            validate_ordered_i32_input_window(8, 12, 0),
+            Err(CudaRuntimeProbeError::InvalidInputLength(12))
+        );
+        assert!(matches!(
+            validate_ordered_i32_input_window(u64::MAX, u64::MAX - 3, 1),
+            Err(CudaRuntimeProbeError::InvalidInputLength(_))
+        ));
+    }
+
     /// Build an int4 PK hash table in the kernel's format: open-addressing `(key<<32)|(row+1)`,
     /// 0 = empty, size = next_pow2(2*n), fib hash `(key*0x9E3779B1) >> shift`, linear probe.
     /// Returns `(index_words, table_mask, hash_shift)` — mirrors the engine's host builder byte-for-byte.
