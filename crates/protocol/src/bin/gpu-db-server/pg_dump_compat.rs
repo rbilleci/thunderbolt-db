@@ -1,15 +1,13 @@
 // Legacy pg_dump compatibility ownership. This is not a product catalog execution path.
 
+use super::replication_catalog::try_execute_replication_pg_dump_query;
 use super::{
     bool_column, catalog_empty_rows, catalog_extension_discovery_rows,
-    catalog_foreign_key_metadata_columns, catalog_foreign_key_metadata_rows,
-    catalog_publication_class_rows, catalog_publication_namespace_rows,
-    catalog_publication_rel_rows, catalog_role_oid_rows, int4_column, int8_column,
-    is_catalog_foreign_key_metadata_query, is_pg_dump_class_metadata_query,
-    is_pg_dump_default_acl_metadata_query, is_pg_dump_function_metadata_query,
-    is_pg_dump_index_metadata_query, is_pg_dump_public_namespace_oid_lookup_query,
-    is_pg_dumpall_tablespace_metadata_query, pg_catalog_publication_columns,
-    pg_catalog_publication_namespace_columns, pg_catalog_publication_rel_columns,
+    catalog_foreign_key_metadata_columns, catalog_foreign_key_metadata_rows, catalog_role_oid_rows,
+    int4_column, int8_column, is_catalog_foreign_key_metadata_query,
+    is_pg_dump_class_metadata_query, is_pg_dump_default_acl_metadata_query,
+    is_pg_dump_function_metadata_query, is_pg_dump_index_metadata_query,
+    is_pg_dump_public_namespace_oid_lookup_query, is_pg_dumpall_tablespace_metadata_query,
     pg_dump_attrdef_metadata_columns, pg_dump_attrdef_metadata_query_relation_oids,
     pg_dump_attrdef_metadata_rows, pg_dump_attribute_metadata_columns,
     pg_dump_attribute_metadata_query_oids, pg_dump_attribute_metadata_rows,
@@ -345,32 +343,8 @@ pub(super) fn try_execute_pg_dump_compat_statement(
             &pg_dump_attrdef_metadata_rows(session, &relation_oids),
         ));
     }
-    if canonical.starts_with("select p.tableoid, p.oid, p.pubname")
-        && canonical.contains("from pg_publication p")
-    {
-        return Some(write_single_row(
-            stream,
-            &pg_catalog_publication_columns(),
-            &catalog_publication_class_rows(session),
-        ));
-    }
-    if canonical.starts_with("select tableoid, oid, prpubid, prrelid")
-        && canonical.contains("from pg_catalog.pg_publication_rel pr")
-    {
-        return Some(write_single_row(
-            stream,
-            &pg_catalog_publication_rel_columns(),
-            &catalog_publication_rel_rows(session),
-        ));
-    }
-    if canonical
-        == "select tableoid, oid, pnpubid, pnnspid from pg_catalog.pg_publication_namespace"
-    {
-        return Some(write_single_row(
-            stream,
-            &pg_catalog_publication_namespace_columns(),
-            &catalog_publication_namespace_rows(session),
-        ));
+    if let Some(result) = try_execute_replication_pg_dump_query(stream, session, canonical) {
+        return Some(result);
     }
     if is_pg_dump_function_metadata_query(canonical) {
         return Some(write_single_row(

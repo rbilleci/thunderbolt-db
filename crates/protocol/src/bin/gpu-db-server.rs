@@ -122,7 +122,17 @@ mod domain_ddl;
 use domain_ddl::execute_domain_ddl;
 #[path = "gpu-db-server/replication_catalog.rs"]
 mod replication_catalog;
-use replication_catalog::execute_replication_catalog_command;
+use replication_catalog::{
+    execute_replication_catalog_command, try_execute_replication_catalog_query,
+};
+#[cfg(test)]
+use replication_catalog::{
+    test_catalog_describe_publication_query_oid as catalog_describe_publication_query_oid,
+    test_psql_describe_schema_publications_query as psql_describe_schema_publications_query,
+    test_psql_list_publications_catalog_query as psql_list_publications_catalog_query,
+    test_psql_list_publications_verbose_catalog_query as psql_list_publications_verbose_catalog_query,
+    test_psql_list_subscriptions_catalog_query as psql_list_subscriptions_catalog_query,
+};
 #[path = "gpu-db-server/role_ddl.rs"]
 mod role_ddl;
 use role_ddl::execute_role_ddl;
@@ -1740,90 +1750,8 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
-    if canonical == psql_list_publications_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Name"),
-                text_column("Owner"),
-                bool_column("All tables"),
-                bool_column("Inserts"),
-                bool_column("Updates"),
-                bool_column("Deletes"),
-                bool_column("Truncates"),
-                bool_column("Via root"),
-            ],
-            &catalog_psql_publication_rows(session),
-        );
-    }
-    if canonical == psql_list_publications_verbose_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                int4_column("oid"),
-                text_column("pubname"),
-                text_column("owner"),
-                bool_column("puballtables"),
-                bool_column("pubinsert"),
-                bool_column("pubupdate"),
-                bool_column("pubdelete"),
-                bool_column("pubtruncate"),
-                bool_column("pubviaroot"),
-            ],
-            &catalog_psql_publication_verbose_rows(session),
-        );
-    }
-    if canonical
-        == "select pubname, puballtables, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot from pg_catalog.pg_publication order by pubname"
-    {
-        return write_single_row(
-            stream,
-            &[
-                text_column("pubname"),
-                bool_column("puballtables"),
-                bool_column("pubinsert"),
-                bool_column("pubupdate"),
-                bool_column("pubdelete"),
-                bool_column("pubtruncate"),
-                bool_column("pubviaroot"),
-            ],
-            &catalog_publication_direct_rows(session),
-        );
-    }
-    if canonical
-        == "select p.pubname, c.relname from pg_catalog.pg_publication p join pg_catalog.pg_publication_rel pr on pr.prpubid = p.oid join pg_catalog.pg_class c on c.oid = pr.prrelid order by p.pubname, c.relname"
-    {
-        return write_single_row(
-            stream,
-            &[text_column("pubname"), text_column("relname")],
-            &catalog_publication_rel_direct_rows(session),
-        );
-    }
-    if canonical == psql_list_subscriptions_catalog_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("Name"),
-                text_column("Owner"),
-                bool_column("Enabled"),
-                text_column("Publication"),
-            ],
-            &catalog_psql_subscription_rows(session),
-        );
-    }
-    if canonical
-        == "select subname, subenabled, subconninfo, subpublications from pg_catalog.pg_subscription order by subname"
-    {
-        return write_single_row(
-            stream,
-            &[
-                text_column("subname"),
-                bool_column("subenabled"),
-                text_column("subconninfo"),
-                text_column("subpublications"),
-            ],
-            &catalog_subscription_direct_rows(session),
-        );
+    if let Some(result) = try_execute_replication_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if canonical == psql_list_default_access_privileges_catalog_query() {
         return write_single_row(
@@ -2097,13 +2025,6 @@ fn execute_statement(
             &pg_catalog_schema_description_rows(session),
         );
     }
-    if canonical == psql_describe_schema_publications_query() {
-        return write_single_row(
-            stream,
-            &[text_column("pubname")],
-            &catalog_schema_publication_rows(session),
-        );
-    }
     if canonical == pg_catalog_namespace_query() {
         return write_single_row(
             stream,
@@ -2250,33 +2171,6 @@ fn execute_statement(
             stream,
             &pg_dump_attrdef_metadata_columns(),
             &pg_dump_attrdef_metadata_rows(session, &relation_oids),
-        );
-    }
-    if canonical.starts_with("select p.tableoid, p.oid, p.pubname")
-        && canonical.contains("from pg_publication p")
-    {
-        return write_single_row(
-            stream,
-            &pg_catalog_publication_columns(),
-            &catalog_publication_class_rows(session),
-        );
-    }
-    if canonical.starts_with("select tableoid, oid, prpubid, prrelid")
-        && canonical.contains("from pg_catalog.pg_publication_rel pr")
-    {
-        return write_single_row(
-            stream,
-            &pg_catalog_publication_rel_columns(),
-            &catalog_publication_rel_rows(session),
-        );
-    }
-    if canonical
-        == "select tableoid, oid, pnpubid, pnnspid from pg_catalog.pg_publication_namespace"
-    {
-        return write_single_row(
-            stream,
-            &pg_catalog_publication_namespace_columns(),
-            &catalog_publication_namespace_rows(session),
         );
     }
     if is_pg_dump_function_metadata_query(&canonical) {
@@ -2469,17 +2363,6 @@ fn execute_statement(
                 int4_column("stxstattarget"),
             ],
             &catalog_empty_rows_for_relation_oid(oid),
-        );
-    }
-    if let Some(oid) = catalog_describe_publication_query_oid(&canonical) {
-        return write_single_row(
-            stream,
-            &[
-                text_column("pubname"),
-                text_column("?column?"),
-                text_column("?column?"),
-            ],
-            &catalog_describe_publication_rows(session, oid),
         );
     }
     if let Some(oid) = catalog_describe_inherits_parent_query_oid(&canonical) {
@@ -3339,18 +3222,6 @@ fn psql_list_casts_catalog_query() -> &'static str {
     "select pg_catalog.format_type(castsource, null) as \"source type\", pg_catalog.format_type(casttarget, null) as \"target type\", case when c.castmethod = 'b' then '(binary coercible)' when c.castmethod = 'i' then '(with inout)' else p.proname end as \"function\", case when c.castcontext = 'e' then 'no' when c.castcontext = 'a' then 'in assignment' else 'yes' end as \"implicit?\" from pg_catalog.pg_cast c left join pg_catalog.pg_proc p on c.castfunc = p.oid left join pg_catalog.pg_type ts on c.castsource = ts.oid left join pg_catalog.pg_namespace ns on ns.oid = ts.typnamespace left join pg_catalog.pg_type tt on c.casttarget = tt.oid left join pg_catalog.pg_namespace nt on nt.oid = tt.typnamespace where ( (true and pg_catalog.pg_type_is_visible(ts.oid) ) or (true and pg_catalog.pg_type_is_visible(tt.oid) ) ) order by 1, 2"
 }
 
-fn psql_list_publications_catalog_query() -> &'static str {
-    "select pubname as \"name\", pg_catalog.pg_get_userbyid(pubowner) as \"owner\", puballtables as \"all tables\", pubinsert as \"inserts\", pubupdate as \"updates\", pubdelete as \"deletes\", pubtruncate as \"truncates\", pubviaroot as \"via root\" from pg_catalog.pg_publication order by 1"
-}
-
-fn psql_list_publications_verbose_catalog_query() -> &'static str {
-    "select oid, pubname, pg_catalog.pg_get_userbyid(pubowner) as owner, puballtables, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot from pg_catalog.pg_publication order by 2"
-}
-
-fn psql_list_subscriptions_catalog_query() -> &'static str {
-    "select subname as \"name\" , pg_catalog.pg_get_userbyid(subowner) as \"owner\" , subenabled as \"enabled\" , subpublications as \"publication\" from pg_catalog.pg_subscription where subdbid = (select oid from pg_catalog.pg_database where datname = pg_catalog.current_database())order by 1"
-}
-
 fn psql_list_default_access_privileges_catalog_query() -> &'static str {
     "select pg_catalog.pg_get_userbyid(d.defaclrole) as \"owner\", n.nspname as \"schema\", case d.defaclobjtype when 'r' then 'table' when 's' then 'sequence' when 'f' then 'function' when 't' then 'type' when 'n' then 'schema' end as \"type\", pg_catalog.array_to_string(d.defaclacl, e'\\n') as \"access privileges\" from pg_catalog.pg_default_acl d left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace order by 1, 2, 3"
 }
@@ -3807,10 +3678,6 @@ fn psql_describe_schemas_catalog_query() -> &'static str {
 fn psql_describe_schemas_verbose_catalog_query_public_filter(canonical: &str) -> bool {
     canonical
         == "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\", pg_catalog.array_to_string(n.nspacl, e'\\n') as \"access privileges\", pg_catalog.obj_description(n.oid, 'pg_namespace') as \"description\" from pg_catalog.pg_namespace n where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 1"
-}
-
-fn psql_describe_schema_publications_query() -> &'static str {
-    "select pubname from pg_catalog.pg_publication p join pg_catalog.pg_publication_namespace pn on p.oid = pn.pnpubid join pg_catalog.pg_namespace n on n.oid = pn.pnnspid where n.nspname = 'public' order by 1"
 }
 
 fn psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
@@ -4289,190 +4156,6 @@ fn pg_dump_default_table_acl_array_display(session: &Session) -> Option<String> 
     let acl = acl_array_display(&session.default_table_acl)?;
     let inner = acl.strip_prefix('{')?.strip_suffix('}')?;
     Some(format!("{{postgres=arwdDxt/postgres,{inner}}}"))
-}
-
-fn catalog_psql_publication_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    session
-        .publications
-        .values()
-        .map(|publication| {
-            vec![
-                Some(publication.name.clone()),
-                Some("postgres".to_string()),
-                Some(bool_text(publication.all_tables)),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("f".to_string()),
-            ]
-        })
-        .collect()
-}
-
-fn catalog_psql_publication_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    session
-        .publications
-        .values()
-        .map(|publication| {
-            vec![
-                Some(publication.oid.to_string()),
-                Some(publication.name.clone()),
-                Some("postgres".to_string()),
-                Some(bool_text(publication.all_tables)),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("f".to_string()),
-            ]
-        })
-        .collect()
-}
-
-fn catalog_publication_class_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    session
-        .publications
-        .values()
-        .map(|publication| {
-            vec![
-                Some("6104".to_string()),
-                Some(publication.oid.to_string()),
-                Some(publication.name.clone()),
-                Some("10".to_string()),
-                Some(bool_text(publication.all_tables)),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("f".to_string()),
-            ]
-        })
-        .collect()
-}
-
-fn catalog_publication_direct_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    session
-        .publications
-        .values()
-        .map(|publication| {
-            vec![
-                Some(publication.name.clone()),
-                Some(bool_text(publication.all_tables)),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("t".to_string()),
-                Some("f".to_string()),
-            ]
-        })
-        .collect()
-}
-
-fn catalog_publication_rel_direct_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = Vec::new();
-    for publication in session.publications.values() {
-        if publication.all_tables {
-            continue;
-        }
-        for table in &publication.tables {
-            if session.tables.contains_key(table) {
-                rows.push(vec![Some(publication.name.clone()), Some(table.clone())]);
-            }
-        }
-    }
-    rows.sort();
-    rows
-}
-
-fn catalog_publication_rel_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = Vec::new();
-    for publication in session.publications.values() {
-        if publication.all_tables {
-            continue;
-        }
-        for table in &publication.tables {
-            if let Some(table_state) = session.tables.get(table) {
-                rows.push(vec![
-                    Some("6106".to_string()),
-                    Some(format!("{}{}", publication.oid, table_state.oid)),
-                    Some(publication.oid.to_string()),
-                    Some(table_state.oid.to_string()),
-                    None,
-                    None,
-                ]);
-            }
-        }
-    }
-    rows
-}
-
-fn catalog_publication_namespace_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    session
-        .publications
-        .values()
-        .filter(|publication| publication.all_tables)
-        .map(|publication| {
-            vec![
-                Some("6237".to_string()),
-                Some((publication.oid + 100_000).to_string()),
-                Some(publication.oid.to_string()),
-                Some(PUBLIC_NAMESPACE_OID.to_string()),
-            ]
-        })
-        .collect()
-}
-
-fn catalog_describe_publication_rows(session: &Session, oid: u32) -> Vec<Vec<Option<String>>> {
-    let Some(table) = session.tables.values().find(|table| table.oid == oid) else {
-        return Vec::new();
-    };
-    let mut rows = Vec::new();
-    for publication in session.publications.values() {
-        if publication.all_tables || publication.tables.iter().any(|name| name == &table.name) {
-            rows.push(vec![Some(publication.name.clone()), None, None]);
-        }
-    }
-    rows
-}
-
-fn catalog_psql_subscription_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    session
-        .subscriptions
-        .values()
-        .map(|subscription| {
-            vec![
-                Some(subscription.name.clone()),
-                Some("postgres".to_string()),
-                Some(bool_text(subscription.enabled)),
-                Some(subscription.publications.join(", ")),
-            ]
-        })
-        .collect()
-}
-
-fn catalog_subscription_direct_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    session
-        .subscriptions
-        .values()
-        .map(|subscription| {
-            vec![
-                Some(subscription.name.clone()),
-                Some(bool_text(subscription.enabled)),
-                Some(subscription.connection.clone()),
-                Some(format!("{{{}}}", subscription.publications.join(","))),
-            ]
-        })
-        .collect()
-}
-
-fn catalog_schema_publication_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    session
-        .publications
-        .values()
-        .filter(|publication| publication.all_tables)
-        .map(|publication| vec![Some(publication.name.clone())])
-        .collect()
 }
 
 fn acl_display(acl: &BTreeMap<String, BTreeSet<TablePrivilege>>) -> Option<String> {
@@ -5470,41 +5153,6 @@ fn sql_type_alignment_code(ty: SqlType) -> &'static str {
         SqlType::Timestamp => "d",
         SqlType::Uuid => "c",
     }
-}
-
-fn pg_catalog_publication_columns() -> Vec<Column> {
-    vec![
-        int4_column("tableoid"),
-        int4_column("oid"),
-        text_column("pubname"),
-        int4_column("pubowner"),
-        bool_column("puballtables"),
-        bool_column("pubinsert"),
-        bool_column("pubupdate"),
-        bool_column("pubdelete"),
-        bool_column("pubtruncate"),
-        bool_column("pubviaroot"),
-    ]
-}
-
-fn pg_catalog_publication_rel_columns() -> Vec<Column> {
-    vec![
-        int4_column("tableoid"),
-        int4_column("oid"),
-        int4_column("prpubid"),
-        int4_column("prrelid"),
-        text_column("prrelqual"),
-        text_column("prattrs"),
-    ]
-}
-
-fn pg_catalog_publication_namespace_columns() -> Vec<Column> {
-    vec![
-        int4_column("tableoid"),
-        int4_column("oid"),
-        int4_column("pnpubid"),
-        int4_column("pnnspid"),
-    ]
 }
 
 fn is_pg_dump_function_metadata_query(canonical: &str) -> bool {
@@ -6723,25 +6371,6 @@ fn catalog_describe_statistic_ext_query_oid(canonical: &str) -> Option<u32> {
         .strip_suffix(suffix)?
         .parse()
         .ok()
-}
-
-fn catalog_describe_publication_query_oid(canonical: &str) -> Option<u32> {
-    let prefix = "select pubname , null , null from pg_catalog.pg_publication p join pg_catalog.pg_publication_namespace pn on p.oid = pn.pnpubid join pg_catalog.pg_class pc on pc.relnamespace = pn.pnnspid where pc.oid ='";
-    let middle = "' and pg_catalog.pg_relation_is_publishable('";
-    let suffix = "') union select pubname , pg_get_expr(pr.prqual, c.oid) , (case when pr.prattrs is not null then (select string_agg(attname, ', ') from pg_catalog.generate_series(0, pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s, pg_catalog.pg_attribute where attrelid = pr.prrelid and attnum = prattrs[s]) else null end) from pg_catalog.pg_publication p join pg_catalog.pg_publication_rel pr on p.oid = pr.prpubid join pg_catalog.pg_class c on c.oid = pr.prrelid where pr.prrelid = '";
-    let suffix_tail =
-        "' union select pubname , null , null from pg_catalog.pg_publication p where p.puballtables and pg_catalog.pg_relation_is_publishable('";
-    let final_suffix = "') order by 1";
-    let rest = canonical.strip_prefix(prefix)?;
-    let (first_oid, rest) = rest.split_once(middle)?;
-    let (second_oid, rest) = rest.split_once(suffix)?;
-    let (third_oid, rest) = rest.split_once(suffix_tail)?;
-    let final_oid = rest.strip_suffix(final_suffix)?;
-    if first_oid == second_oid && second_oid == third_oid && third_oid == final_oid {
-        first_oid.parse().ok()
-    } else {
-        None
-    }
 }
 
 fn catalog_describe_inherits_parent_query_oid(canonical: &str) -> Option<u32> {

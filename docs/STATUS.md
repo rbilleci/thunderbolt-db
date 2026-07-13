@@ -754,6 +754,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   an exact-string compatibility stub. All protocol/driver/security/formatting gates and independent audit are
   clean; real-psql task scenarios 01/02 and 137-198 pass, while the complete suite still fails on the separately
   tracked PostgreSQL 18 client query/render drift. The root is 8,744 lines and STRUCT-001CD is closed.
+  All eleven publication/subscription catalog read shapes now execute from the existing private 672-line
+  `replication_catalog` owner: eight through the original post-parse catalog stage and three through the exact
+  pre-parse pg-dump position. Four query literals, one strict relation-publication OID parser, three column
+  builders, and eleven row builders are token-identical private moves; the only additional exposure is five
+  explicit `cfg(test)` aliases. Predicates, columns, order, fixed/synthetic OIDs, table-liveness filtering,
+  all-table rows, subscription fields, and describe output are unchanged, while `pg_dump_compat` is 542 lines.
+  Inherited PRODUCT-002 debt remains: hard-coded owner/feature/OID values, concatenated synthetic relation OIDs,
+  public-only all-table namespace representation, disabled subscriptions, stale table names hidden by liveness
+  filtering, and broad pg-dump prefix predicates. Full protocol/driver/security/formatting gates and independent
+  audit are clean. Fresh PostgreSQL 18 scenarios 65, 66, and 337 pass; scenario 335's publication rows pass and
+  only its known `\d` query drift fails. The root is 8,373 lines and STRUCT-001CE is closed.
 
 ## Known boundaries
 
