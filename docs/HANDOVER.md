@@ -80,15 +80,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   sorting/windowing, and execution remain in place. Focused parsed/user/catalog/outer/streaming GPU joins, complete
   505/487 suites, static gates, and independent re-audit pass. The expression root is 11,097 lines; HAZARD and report
   card were not applicable.
+- STRUCT-001GJ is closed. The exact five-helper select/predicate normalization owner now lives in the 238-line private
+  `engine_expr/normalization.rs` leaf behind unchanged crate-private facade paths. Pruning, compiler/lowering,
+  grouped materialization, and runtime/device work remain in place. Six focused GPU/active routes, complete 505/487
+  suites, static gates, and independent re-audit pass. The expression root is 10,872 lines; HAZARD and report card
+  were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GJ:** isolate only the five state-free select/predicate normalization helpers into a nested private
-   leaf behind their existing crate-private facade; keep pruning, compilation/lowering, and runtime/device work in
-   place.
+1. **STRUCT-001GK:** isolate only the three pure shard-pruning/point-shape helpers and their two colocated unit tests
+   into a nested private leaf behind the existing crate-private facade; keep lookup execution and runtime/device work
+   in place.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

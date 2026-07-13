@@ -1927,6 +1927,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   do both 505/487 engine modes, all-target check, strict clippy, exact-definition/consumer/scoped-format/diff/docs
   gates, and independent re-audit. Runtime behavior did not change, so HAZARD and report-card gates were not
   applicable. The expression root is now 11,097 lines.
+  STRUCT-001GJ then isolated the five state-free select/predicate normalization helpers in the 238-line private
+  `engine_expr/normalization.rs` leaf. All bodies and their semantic docs are source-equivalent; the two parent-only
+  helpers gained only `pub(super)`, while `grouped_projection_to_aggregates`,
+  `like_pattern_for_literal_prefix`, and `resident_predicate_from_bound_filters` retain their existing
+  `crate::engine_expr` crate-private facade paths. Dependencies flow one-way to scalar IR, bound-select, error, and
+  SQL value/projection contracts; pruning, predicate compilation/lowering, grouped materialization, every `Engine`
+  method, and all runtime/device state remain at their established owners. Six focused legacy-group, LIKE, HAVING,
+  DML, and streaming GPU/active routes pass, as do both 505/487 engine modes, all-target check, strict clippy,
+  exact-source/consumer/visibility/scoped-format/diff/docs gates, and independent re-audit. Runtime behavior did not
+  change, so HAZARD and report-card gates were not applicable. The expression root is now 10,872 lines.
 
 ## Known boundaries
 
