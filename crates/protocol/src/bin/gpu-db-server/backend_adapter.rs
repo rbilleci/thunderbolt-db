@@ -1,4 +1,5 @@
-use super::{Column, ErrorField, ReadWrite};
+use super::frontend_transport::ReadWrite;
+use super::{Column, ErrorField};
 use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
 use std::io;
 

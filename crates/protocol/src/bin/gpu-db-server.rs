@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind};
 use std::sync::{Mutex, OnceLock};
 
 use gpu_db_protocol::{
@@ -15,15 +15,14 @@ use gpu_db_protocol::{
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
+#[path = "gpu-db-server/frontend_transport.rs"]
+mod frontend_transport;
+use frontend_transport::{read_tagged_frame, ReadWrite};
 #[path = "gpu-db-server/backend_adapter.rs"]
 mod backend_adapter;
 use backend_adapter::*;
 #[path = "gpu-db-server/server_bootstrap.rs"]
 mod server_bootstrap;
-
-trait ReadWrite: Read + Write {}
-
-impl<T: Read + Write> ReadWrite for T {}
 
 const PUBLIC_NAMESPACE_OID: u32 = 2200;
 const POSTGRES_DATABASE_OID: u32 = 5;
@@ -4755,35 +4754,6 @@ fn unsupported_frontend_message(message: &FrontendMessage) -> &'static str {
         | FrontendMessage::Sync
         | FrontendMessage::Flush => "unsupported frontend message",
     }
-}
-
-
-fn read_tagged_frame(stream: &mut dyn ReadWrite) -> io::Result<Option<Vec<u8>>> {
-    let mut tag = [0_u8; 1];
-    match stream.read_exact(&mut tag) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    }
-
-    let mut len_bytes = [0_u8; 4];
-    stream.read_exact(&mut len_bytes)?;
-    let frame_len = u32::from_be_bytes(len_bytes) as usize;
-    if frame_len < 4 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("invalid tagged frame length: {frame_len}"),
-        ));
-    }
-
-    let mut payload = vec![0_u8; frame_len - 4];
-    stream.read_exact(&mut payload)?;
-
-    let mut frame = Vec::with_capacity(1 + 4 + payload.len());
-    frame.extend_from_slice(&tag);
-    frame.extend_from_slice(&len_bytes);
-    frame.extend_from_slice(&payload);
-    Ok(Some(frame))
 }
 
 fn run_simple_query(

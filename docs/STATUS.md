@@ -359,6 +359,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   123-test inventory remains stable. Protocol full tests, all-target check, clippy with warnings denied,
   tokio-postgres/SQLx smokes, full TLS/SCRAM preflight, formatting, diff, and independent audit are clean.
   STRUCT-001AI is closed under the same **PRODUCT-001** containment boundary.
+  The shared legacy connection trait and tagged frontend-frame reader now live in the private 33-line
+  `frontend_transport` leaf. Normalized trait/blanket-implementation/reader tokens exactly match the parent
+  apart from required parent-private visibility. Bootstrap, the root ready loop, and the backend adapter now
+  depend on this lower transport owner; no parser or session behavior moved and no cycle or public API was
+  introduced. The 71 library + 123 binary tests, tokio-postgres/SQLx smokes, all-target check, warning-denied
+  clippy, TLS/SCRAM preflight, touched-module formatting, and independent audit are clean. STRUCT-001AJ is
+  closed. Its audit exposed inherited unbounded attacker-declared frame allocation, now owned by
+  **STRUCT-001AK**.
 
 ## Known boundaries
 
