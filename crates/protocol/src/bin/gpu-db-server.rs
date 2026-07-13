@@ -207,7 +207,6 @@ use type_system_catalog::{
 };
 #[path = "gpu-db-server/table_catalog.rs"]
 mod table_catalog;
-use table_catalog::try_execute_table_catalog_query;
 #[cfg(test)]
 use table_catalog::{
     test_catalog_psql_describe_table_privilege_rows_filtered as catalog_psql_describe_table_privilege_rows_filtered,
@@ -217,6 +216,12 @@ use table_catalog::{
     test_catalog_psql_describe_table_verbose_rows_filtered as catalog_psql_describe_table_verbose_rows_filtered,
     test_catalog_table_name_rows as catalog_table_name_rows,
     test_catalog_table_oid_rows as catalog_table_oid_rows,
+    test_pg_catalog_class_plain_table_rows as pg_catalog_class_plain_table_rows,
+    test_pg_catalog_class_plain_table_rows_for_tables as pg_catalog_class_plain_table_rows_for_tables,
+    test_pg_catalog_class_plain_tables_in_query_tables as pg_catalog_class_plain_tables_in_query_tables,
+    test_pg_catalog_class_plain_tables_query as pg_catalog_class_plain_tables_query,
+    test_pg_catalog_table_rows as pg_catalog_table_rows,
+    test_pg_catalog_tables_query as pg_catalog_tables_query,
     test_psql_describe_all_schema_tables_catalog_query as psql_describe_all_schema_tables_catalog_query,
     test_psql_describe_all_schema_tables_verbose_catalog_query as psql_describe_all_schema_tables_verbose_catalog_query,
     test_psql_describe_relations_catalog_query as psql_describe_relations_catalog_query,
@@ -225,6 +230,10 @@ use table_catalog::{
     test_psql_describe_tables_verbose_catalog_query as psql_describe_tables_verbose_catalog_query,
     test_psql_describe_tables_verbose_catalog_query_filter as psql_describe_tables_verbose_catalog_query_filter,
     test_relation_acl_display as relation_acl_display, PsqlDescribeTablesFilter,
+};
+use table_catalog::{
+    try_execute_filtered_plain_table_class_catalog_query, try_execute_pg_catalog_tables_query,
+    try_execute_plain_table_class_catalog_query, try_execute_table_catalog_query,
 };
 #[path = "gpu-db-server/sequence_execution.rs"]
 mod sequence_execution;
@@ -1874,32 +1883,14 @@ fn execute_statement(
             &catalog_empty_rows_for_relation_oid(oid),
         );
     }
-    if canonical == pg_catalog_tables_query() {
-        return write_single_row(
-            stream,
-            &[
-                text_column("schemaname"),
-                text_column("tablename"),
-                text_column("tableowner"),
-            ],
-            &pg_catalog_table_rows(session),
-        );
+    if let Some(result) = try_execute_pg_catalog_tables_query(stream, session, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_index_direct_catalog_query(stream, session, &canonical) {
         return result;
     }
-    if canonical == pg_catalog_class_plain_tables_query() {
-        return write_single_row(
-            stream,
-            &[
-                int4_column("oid"),
-                text_column("nspname"),
-                text_column("relname"),
-                text_column("relkind"),
-                text_column("relpersistence"),
-            ],
-            &pg_catalog_class_plain_table_rows(session),
-        );
+    if let Some(result) = try_execute_plain_table_class_catalog_query(stream, session, &canonical) {
+        return result;
     }
     if let Some(result) = try_execute_sequence_class_catalog_query(stream, session, &canonical) {
         return result;
@@ -1909,18 +1900,10 @@ fn execute_statement(
     {
         return result;
     }
-    if let Some(tables) = pg_catalog_class_plain_tables_in_query_tables(&canonical) {
-        return write_single_row(
-            stream,
-            &[
-                int4_column("oid"),
-                text_column("nspname"),
-                text_column("relname"),
-                text_column("relkind"),
-                text_column("relpersistence"),
-            ],
-            &pg_catalog_class_plain_table_rows_for_tables(session, &tables),
-        );
+    if let Some(result) =
+        try_execute_filtered_plain_table_class_catalog_query(stream, session, &canonical)
+    {
+        return result;
     }
     if canonical == information_schema_tables_query() {
         return write_single_row(
@@ -4392,82 +4375,6 @@ fn catalog_empty_rows_for_relation_oid(_oid: u32) -> Vec<Vec<Option<String>>> {
 
 fn catalog_empty_rows() -> Vec<Vec<Option<String>>> {
     Vec::new()
-}
-
-fn pg_catalog_tables_query() -> &'static str {
-    "select schemaname, tablename, tableowner from pg_catalog.pg_tables where schemaname = 'public' order by tablename"
-}
-
-fn pg_catalog_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut tables = session.tables.values().collect::<Vec<_>>();
-    tables.sort_by(|left, right| left.name.cmp(&right.name));
-    tables
-        .into_iter()
-        .map(|table| {
-            vec![
-                Some("public".to_string()),
-                Some(table.name.clone()),
-                Some("postgres".to_string()),
-            ]
-        })
-        .collect()
-}
-
-fn pg_catalog_class_plain_tables_query() -> &'static str {
-    "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r' order by c.relname"
-}
-
-fn pg_catalog_class_plain_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut tables = session.tables.values().collect::<Vec<_>>();
-    tables.sort_by(|left, right| left.name.cmp(&right.name));
-    pg_catalog_class_plain_table_rows_from_tables(tables)
-}
-
-fn pg_catalog_class_plain_tables_in_query_tables(canonical: &str) -> Option<Vec<String>> {
-    let prefix = "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relname in (";
-    let suffix = ") and c.relkind = 'r' order by c.relname";
-    let list = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
-    let mut tables = Vec::new();
-    for raw_name in list.split(',') {
-        let name = raw_name.trim().strip_prefix('\'')?.strip_suffix('\'')?;
-        if name.is_empty() {
-            return None;
-        }
-        tables.push(name.to_string());
-    }
-    if tables.is_empty() {
-        None
-    } else {
-        Some(tables)
-    }
-}
-
-fn pg_catalog_class_plain_table_rows_for_tables(
-    session: &Session,
-    table_names: &[String],
-) -> Vec<Vec<Option<String>>> {
-    let requested_tables = table_names.iter().collect::<BTreeSet<_>>();
-    let mut tables = requested_tables
-        .iter()
-        .filter_map(|table_name| session.tables.get(table_name.as_str()))
-        .collect::<Vec<_>>();
-    tables.sort_by(|left, right| left.name.cmp(&right.name));
-    pg_catalog_class_plain_table_rows_from_tables(tables)
-}
-
-fn pg_catalog_class_plain_table_rows_from_tables(tables: Vec<&Table>) -> Vec<Vec<Option<String>>> {
-    tables
-        .into_iter()
-        .map(|table| {
-            vec![
-                Some(table.oid.to_string()),
-                Some("public".to_string()),
-                Some(table.name.clone()),
-                Some("r".to_string()),
-                Some("p".to_string()),
-            ]
-        })
-        .collect()
 }
 
 fn information_schema_tables_query() -> &'static str {

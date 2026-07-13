@@ -1034,6 +1034,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Full protocol/driver/security/formatting gates, focused catalog/ACL tests, all 17 PostgreSQL 16 scenarios 04/06/
   13/14/17/18/19/34/35/37/75/79/80/326/333/334/341, and independent audit are clean. The root is 5,167 lines and
   STRUCT-001DE is closed.
+  Three later direct table/class catalog reads now execute from the existing private 715-line `table_catalog`
+  owner behind three additional stage-preserving delegates. Seven exact query/parser/row helpers are byte-
+  identical private moves and six `cfg(test)` wrappers retain proven consumers. Exact post-description/pre-index,
+  post-index/pre-sequence, and post-sequence/materialized-view stages preserve the interleaved route order;
+  equality and `IN` parsing, requested-name deduplication, public-only filtering, name sorting with OID-bearing rows, fixed owner/
+  schema/kind/persistence fields, 3-/5-/5-column shapes, and writers are unchanged. Inherited PRODUCT-002 debt
+  remains exact routing, host table maps and CPU filtering/sorting, hard-coded public/postgres/kind/persistence
+  metadata, and absent GPU-resident system relations. Full protocol/driver/security/formatting gates, focused
+  catalog tests, PostgreSQL 16 scenarios 22/23/29, and independent audit are clean. The root is 5,074 lines and
+  STRUCT-001DF is closed.
 
 ## Known boundaries
 

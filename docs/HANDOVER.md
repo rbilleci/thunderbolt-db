@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DF:** move the three later direct `pg_catalog` table/class reads and seven helpers into the new
-   private table-catalog owner behind three separately positioned delegates, retaining exact interleaved order.
+1. **STRUCT-001DG:** move the six contiguous `information_schema.tables` routes and twelve helpers into the
+   private table-catalog owner behind one delegate, retaining exact filters, fixed fields, sorting, and output.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
