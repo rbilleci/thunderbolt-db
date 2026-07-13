@@ -1,9 +1,9 @@
 // Legacy view DDL ownership. This is not a product execution path.
 
 use super::{
-    execute_select_result, materialize_select_rows, schema_permission_error, text_column,
-    write_command_complete, write_error, write_single_row, CatalogCommentTarget, Command,
-    ErrorField, MaterializedView, ReadWrite, SchemaPrivilege, Session, View,
+    execute_select_result, int4_column, materialize_select_rows, schema_permission_error,
+    text_column, write_command_complete, write_error, write_single_row, CatalogCommentTarget,
+    Command, ErrorField, MaterializedView, ReadWrite, SchemaPrivilege, Session, View,
 };
 use std::collections::BTreeSet;
 use std::io;
@@ -185,6 +185,48 @@ pub(super) fn test_psql_describe_materialized_views_catalog_query() -> &'static 
 #[cfg(test)]
 pub(super) fn test_psql_describe_materialized_views_verbose_catalog_query() -> &'static str {
     psql_describe_materialized_views_verbose_catalog_query()
+}
+
+fn pg_catalog_class_materialized_views_query() -> &'static str {
+    "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'm' order by c.relname"
+}
+
+fn pg_catalog_class_materialized_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut views = session.materialized_views.values().collect::<Vec<_>>();
+    views.sort_by(|left, right| left.name.cmp(&right.name));
+    views
+        .into_iter()
+        .map(|view| {
+            vec![
+                Some(view.oid.to_string()),
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("m".to_string()),
+                Some("p".to_string()),
+            ]
+        })
+        .collect()
+}
+
+pub(super) fn try_execute_materialized_view_class_catalog_query(
+    stream: &mut dyn ReadWrite,
+    session: &Session,
+    canonical: &str,
+) -> Option<io::Result<()>> {
+    if canonical != pg_catalog_class_materialized_views_query() {
+        return None;
+    }
+    Some(write_single_row(
+        stream,
+        &[
+            int4_column("oid"),
+            text_column("nspname"),
+            text_column("relname"),
+            text_column("relkind"),
+            text_column("relpersistence"),
+        ],
+        &pg_catalog_class_materialized_view_rows(session),
+    ))
 }
 
 fn session_view_depends_on(session: &Session, view: &str, target: &str) -> bool {

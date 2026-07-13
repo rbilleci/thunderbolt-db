@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001CM:** move the later direct materialized-view `pg_class` shape plus private query/row helpers into
-   the existing view owner behind a separately positioned tri-state delegate, preserving exact stage precedence.
+1. **STRUCT-001CN:** move the later adjacent `information_schema.views` and `pg_catalog.pg_views` shapes plus
+   private query/row helpers into the existing view owner, preserving exact metadata and stage precedence.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

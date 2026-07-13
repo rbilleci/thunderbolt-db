@@ -830,6 +830,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   hard-coded relation-kind/persistence values, and absent GPU-native catalog execution. Full protocol/driver/
   security/formatting gates, focused sequence/shared-catalog tests, fresh real-psql scenario 330, and independent
   audit are clean. The root is 7,737 lines and STRUCT-001CL is closed.
+  The later direct materialized-view `pg_class` read now executes from the existing private 764-line `view_ddl`
+  owner behind a second, separately positioned tri-state delegate. Its exact query literal, name-sorted row
+  builder, and route are byte-identical moves; both helpers remain private, the sole new export is the production
+  delegate, and no unconsumed test alias was added. The post-sequence/pre-filtered-plain-table class stage,
+  equality, five columns, materialized-view OIDs, public schema, `m` relation kind, `p` persistence, and name order
+  are unchanged. Inherited PRODUCT-002 debt remains: exact-query routing, host/session-backed catalog data and
+  OIDs, public-only metadata, hard-coded relation-kind/persistence fields, and absent GPU-native catalog execution.
+  Full protocol/driver/security/formatting gates, focused view/materialized-view/shared-catalog tests, fresh real-
+  psql scenario 331, and independent audit are clean. The root is 7,711 lines and STRUCT-001CM is closed.
 
 ## Known boundaries
 
