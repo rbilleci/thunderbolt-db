@@ -29,9 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001CB:** move publication target validation and publication/subscription create/drop helpers into the
-   existing private replication-catalog owner, preserving duplicate/dependency/error/comment/dirty behavior with
-   no helper exports.
+1. **STRUCT-001CC:** move the five shared-catalog table/view/sequence/index/constraint target lookups into the
+   existing private catalog-comment owner, preserving exact mutex and liveness predicates with no helper exports.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the

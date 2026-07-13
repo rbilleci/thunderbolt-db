@@ -729,6 +729,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   defaults are not modeled. Full protocol and driver gates, all-target checks, warning-denied clippy, security
   preflight, focused ACL/role/shared-catalog tests, formatting/diff checks, and independent audit are clean. The
   root is 9,078 lines and STRUCT-001CA is closed.
+  Publication target validation and publication/subscription create/drop mutations now live inside the existing
+  private 245-line `replication_catalog` owner; all five helpers are internal. Kind/existence and duplicate
+  precedence, dependency checks, all-name validation, `IF EXISTS`, checked OIDs, constructed fields, comment
+  cleanup, dirty keys, errors, command permission checks, persistence, and tags are exact moves. Inherited
+  PRODUCT-002 debt remains: dropping a publication does not reject or rewrite subscriptions that name it, and
+  missing `IF EXISTS` names still mark object/comment keys dirty before the success snapshot. Full protocol and
+  driver gates, all-target checks, warning-denied clippy, security preflight, comment/shared-catalog tests,
+  formatting/diff checks, and independent audit are clean. The root is 8,889 lines and STRUCT-001CB is closed.
 
 ## Known boundaries
 
