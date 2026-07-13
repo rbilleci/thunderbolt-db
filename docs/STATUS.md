@@ -1089,6 +1089,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   absent GPU-resident system relations. Full protocol/driver/security/formatting gates, focused attribute/catalog
   tests, PostgreSQL 16 scenarios 04/24/42/43/304/305/311/319/320/321/323/324/325/328/330/331/332/336, and
   independent audit are clean. The root is 4,095 lines and STRUCT-001DJ is closed.
+  Eight obsolete post-parse pg-dump catalog branches are deleted after a line-by-line dominance proof: table OID,
+  class metadata, index metadata, foreign-key metadata, view definition, attribute-default metadata, function
+  metadata, and empty catalog queries. The earlier unconditional `try_execute_pg_dump_compat_statement` stage
+  invokes the identical predicate/parser, column helper, row helper, writer, stream/session inputs and returns
+  `Some` for every match before parsing, so none of the later copies was reachable. The change is exactly 52 root
+  deletions; every canonical helper and existing consumer remains, and adjacent relation lookup/description code
+  is untouched. Full protocol/driver/security/formatting and focused pg-dump/catalog gates, all eighteen
+  PostgreSQL 16 pg-dump restore variants, the pg-dumpall globals restore, scenario 295, source/diff checks, and
+  independent dominance audit are clean. The root is 4,043 lines and STRUCT-001DK is closed.
 
 ## Known boundaries
 

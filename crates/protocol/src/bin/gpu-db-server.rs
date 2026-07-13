@@ -1698,58 +1698,6 @@ fn execute_statement(
     if let Some(result) = try_execute_builtin_type_catalog_query(stream, &canonical) {
         return result;
     }
-    if let Some(table) = pg_dump_table_oid_lookup_query_table(&canonical) {
-        return write_single_row(
-            stream,
-            &[int4_column("oid")],
-            &pg_dump_table_oid_lookup_rows(session, &table),
-        );
-    }
-    if is_pg_dump_class_metadata_query(&canonical) {
-        return write_single_row(
-            stream,
-            &pg_dump_class_metadata_columns(),
-            &pg_dump_class_metadata_rows(session),
-        );
-    }
-    if is_pg_dump_index_metadata_query(&canonical) {
-        return write_single_row(
-            stream,
-            &pg_dump_index_metadata_columns(),
-            &pg_dump_index_metadata_rows(session),
-        );
-    }
-    if is_catalog_foreign_key_metadata_query(&canonical) {
-        return write_single_row(
-            stream,
-            &catalog_foreign_key_metadata_columns(),
-            &catalog_foreign_key_metadata_rows(session),
-        );
-    }
-    if let Some(view_oid) = pg_dump_view_definition_query_oid(&canonical) {
-        return write_single_row(
-            stream,
-            &[text_column("viewdef")],
-            &pg_dump_view_definition_rows(session, view_oid),
-        );
-    }
-    if let Some(relation_oids) = pg_dump_attrdef_metadata_query_relation_oids(&canonical) {
-        return write_single_row(
-            stream,
-            &pg_dump_attrdef_metadata_columns(),
-            &pg_dump_attrdef_metadata_rows(session, &relation_oids),
-        );
-    }
-    if is_pg_dump_function_metadata_query(&canonical) {
-        return write_single_row(
-            stream,
-            &pg_dump_function_metadata_columns(),
-            &pg_dump_function_metadata_rows(session),
-        );
-    }
-    if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
-        return write_single_row(stream, &columns, &catalog_empty_rows());
-    }
     if catalog_describe_relation_lookup_query_all_schemas(&canonical)
         || catalog_describe_relation_lookup_query_public_namespace(&canonical)
     {

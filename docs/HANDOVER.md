@@ -29,8 +29,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 The sole work ledger is `PLAN.md`.
 
-1. **STRUCT-001DK:** prove the earlier pg-dump compatibility prelude dominates the eight later duplicate catalog
-   branches, delete only those obsolete copies, and retain every canonical helper and compatibility gate.
+1. **STRUCT-001DL:** move the fourteen contiguous psql `\d` relation-introspection routes and twenty-six helpers
+   into a bounded private owner behind one delegate, retaining exact parsing, metadata, sorting, and output.
 2. **STRUCT-001AV:** continue mapping the remaining `execute_statement` families and promote a bounded existing-
    owner or coherent-family child before each edit; never create arbitrary branch shards or a host execution API.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
