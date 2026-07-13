@@ -1188,6 +1188,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   tests, both 187-test serial/16-thread runs, replication all-target check and strict clippy, cluster/multiprocess/
   service/channel-security smokes, targeted formatting/diff/reference checks, and independent audit are clean.
   The root is 19,180 lines with 1,376 production lines before the test facade; STRUCT-001DT is next.
+  STRUCT-001DT isolated four progress/status/recovery records, three invariant error enums, and their exact
+  implementations in a private 410-line `progress` owner with only `Index`, `LogEntry`, `Role`,
+  `SnapshotMeta`, and `Term` dependencies. One helper is narrowly `pub(super)` for its sole pre-existing root
+  Raft-status consumer; the module remains private and all seven public root APIs are unchanged. Validation order/
+  errors, saturating gap arithmetic, snapshot-identity checks, recovery projection, and methods are otherwise
+  byte-identical. The exact contiguous 16-test invariant/projection block now lives in a bounded 666-line included
+  file with all original harness names. Focused progress/status/recovery tests, both 187-test serial/16-thread
+  runs, replication all-target check and strict clippy, cluster smoke, targeted formatting/diff/reference checks,
+  and independent audit are clean. The root is 18,111 lines with 972 production lines; STRUCT-001DU is next.
 
 ## Known boundaries
 
