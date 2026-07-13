@@ -567,6 +567,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   required tail expressions differ. Sequential/concurrent 127-test runs, the full protocol package and driver
   smokes, all-target checks, warning-denied clippy, security preflight, touched formatting, diff checks, and
   independent audit are clean. The root is 13,965 lines and STRUCT-001BH is closed.
+  Parsed bounded-function lifecycle and invocation commands now enter the private 113-line `function_execution`
+  owner through one exact successful-parse variant gate. CREATE/RENAME/DROP preserve permission, signature/name/
+  existence and supported-body validation, checked OIDs, ACL/comment state, dirty publication, persistence,
+  errors, and tags; invocation preserves result propagation and the row-description flag. The four-arm body is
+  normalized-exact; only clippy-required tail expressions differ. Sequential/concurrent 127-test runs, the full
+  protocol package and driver smokes, all-target checks, warning-denied clippy, security preflight, touched
+  formatting, diff checks, and independent audit are clean. The root is 13,888 lines and STRUCT-001BI is closed.
 
 ## Known boundaries
 

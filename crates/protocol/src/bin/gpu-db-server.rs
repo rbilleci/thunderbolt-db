@@ -98,6 +98,9 @@ use index_ddl::execute_index_ddl;
 #[path = "gpu-db-server/view_ddl.rs"]
 mod view_ddl;
 use view_ddl::execute_view_ddl;
+#[path = "gpu-db-server/function_execution.rs"]
+mod function_execution;
+use function_execution::execute_function_command;
 #[path = "gpu-db-server/backend_adapter.rs"]
 mod backend_adapter;
 use backend_adapter::*;
@@ -4821,67 +4824,15 @@ fn execute_statement(
             | Command::DropView(_)
             | Command::DropMaterializedView(_)),
         ) => return execute_view_ddl(stream, session, command),
+        Ok(
+            command @ (Command::CreateFunction(_)
+            | Command::RenameFunction(_)
+            | Command::DropFunction(_)
+            | Command::SelectFunction(_)),
+        ) => {
+            return execute_function_command(stream, session, command, include_row_description);
+        }
         Ok(command) => match command {
-            Command::CreateFunction(create) => {
-                if !session.public_schema_exists {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "3F000",
-                            message: "schema does not exist",
-                            position: None,
-                        },
-                    );
-                }
-                if let Some(error) =
-                    schema_permission_error(session, "public", SchemaPrivilege::Create)
-                {
-                    return write_error(stream, &error);
-                }
-                if session.functions.contains_key(&create.name) {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42723",
-                            message: "function already exists with same argument types",
-                            position: None,
-                        },
-                    );
-                }
-                let oid = session.next_relation_oid;
-                let Some(next_oid) = session.next_relation_oid.checked_add(1) else {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "54000",
-                            message: "function OID allocation exhausted",
-                            position: None,
-                        },
-                    );
-                };
-                session.next_relation_oid = next_oid;
-                session.functions.insert(
-                    create.name.clone(),
-                    FunctionInfo {
-                        oid,
-                        name: create.name.clone(),
-                        return_type: create.return_type,
-                        body: create.body,
-                        acl: BTreeMap::new(),
-                    },
-                );
-                session.mark_function_dirty(create.name);
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "CREATE FUNCTION");
-            }
-            Command::RenameFunction(rename) => {
-                if let Err(error) =
-                    rename_function_in_session(session, &rename.old_name, &rename.new_name)
-                {
-                    return write_error(stream, &error);
-                }
-                return write_command_complete(stream, "ALTER FUNCTION");
-            }
             Command::CreateSequence(create) => {
                 if !session.public_schema_exists {
                     return write_error(
@@ -5086,40 +5037,6 @@ fn execute_statement(
                     return write_error(stream, &error);
                 }
                 return write_command_complete(stream, "ALTER SEQUENCE");
-            }
-            Command::DropFunction(drop) => {
-                if !drop.if_exists && !session.functions.contains_key(&drop.name) {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42883",
-                            message: "function does not exist",
-                            position: None,
-                        },
-                    );
-                }
-                if session.functions.remove(&drop.name).is_some() {
-                    let target = CatalogCommentTarget::Function {
-                        function: drop.name.clone(),
-                    };
-                    session.comments.remove(&target);
-                    session.mark_comment_dirty(target);
-                }
-                session.mark_function_dirty(drop.name);
-                session.persist_catalog_snapshot();
-                return write_command_complete(stream, "DROP FUNCTION");
-            }
-            Command::SelectFunction(call) => {
-                let result = match execute_function_result(session, &call) {
-                    Ok(result) => result,
-                    Err(error) => return write_error(stream, &error),
-                };
-                return write_select_rows(
-                    stream,
-                    &result.columns,
-                    &result.rows,
-                    include_row_description,
-                );
             }
             Command::DropSequence(drop) => {
                 let mut seen = BTreeSet::new();
@@ -6525,6 +6442,12 @@ fn execute_statement(
             | Command::DropView(_)
             | Command::DropMaterializedView(_) => {
                 unreachable!("view DDL commands are routed by the preceding parse arm")
+            }
+            Command::CreateFunction(_)
+            | Command::RenameFunction(_)
+            | Command::DropFunction(_)
+            | Command::SelectFunction(_) => {
+                unreachable!("function commands are routed by the preceding parse arm")
             }
         },
     }
