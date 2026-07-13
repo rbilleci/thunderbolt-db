@@ -26,7 +26,7 @@ fn validate_bitmap_windows(
 /// Evaluate `col <cmp> scalar` (or `scalar <cmp> col` when `scalar_on_left`) over a resident int8
 /// column to surviving row indices (the type matrix, doc 19): run
 /// `gpu_db_resident_i64_compare_scalar_to_mask` to a 0/1 mask, then compact it with the type-agnostic
-/// `gpu_db_mask_compact_to_indices`. `comparison` 0=eq/1=lt/2=le/3=gt/4=ge/5=ne; indices host-sorted.
+/// the shared ordered mask compactor. `comparison` 0=eq/1=lt/2=le/3=gt/4=ge/5=ne; indices are ordered.
 pub(super) fn launch_cuda_resident_i64_compare_scalar_filter(
     resident: &CudaResidentDeviceMemory,
     byte_offset: u64,
@@ -48,7 +48,7 @@ pub(super) fn launch_cuda_resident_i64_compare_scalar_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_i64.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -137,7 +137,7 @@ pub(super) fn launch_cuda_resident_i64_compare_columns_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_i64.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -229,7 +229,7 @@ pub(super) fn launch_cuda_resident_i128_compare_scalar_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_i128.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -324,7 +324,7 @@ pub(super) fn launch_cuda_resident_text_eq_scalar_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_varlen.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -448,7 +448,7 @@ pub(super) fn launch_cuda_resident_text_compare_scalar_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_varlen.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -574,7 +574,8 @@ fn compact_mask_with_validity(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const BOOL_PTX: &[u8] = include_bytes!("expression_varlen.ptx");
+    const MASK_PTX: &[u8] = include_bytes!("expression_i32.ptx");
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let mask_bytes = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -587,14 +588,17 @@ fn compact_mask_with_validity(
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
-    ptx.push(0);
+    let mut bool_ptx = Vec::with_capacity(BOOL_PTX.len() + 1);
+    bool_ptx.extend_from_slice(BOOL_PTX);
+    bool_ptx.push(0);
+    let mut mask_ptx = Vec::with_capacity(MASK_PTX.len() + 1);
+    mask_ptx.extend_from_slice(MASK_PTX);
+    mask_ptx.push(0);
     // `gpu_db_resident_bool_to_mask` reads the validity bitmap (1=valid) -> an i32 0/1 mask;
     // `gpu_db_mask_binary` op 0 = AND, elementwise (in-place out==lhs is safe: each thread reads lhs[i]
     // before writing out[i], no cross-index dependency).
-    let bool_mask_fn = primary.cached_function(c"gpu_db_resident_bool_to_mask", &ptx)?;
-    let mask_binary_fn = primary.cached_function(c"gpu_db_mask_binary", &ptx)?;
+    let bool_mask_fn = primary.cached_function(c"gpu_db_resident_bool_to_mask", &bool_ptx)?;
+    let mask_binary_fn = primary.cached_function(c"gpu_db_mask_binary", &mask_ptx)?;
     let validity_mask = primary.lease_device_buffer(mask_bytes)?;
     const BLOCK: u32 = 256;
     let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
@@ -694,7 +698,7 @@ pub(super) fn launch_cuda_resident_uuid_compare_scalar_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_varlen.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -798,7 +802,7 @@ pub(super) fn launch_cuda_resident_uuid_compare_columns_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_varlen.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -882,7 +886,7 @@ pub(super) fn launch_cuda_resident_bool_to_mask_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_varlen.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -968,7 +972,7 @@ pub(super) fn launch_cuda_resident_text_like_scalar_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_varlen.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -1085,7 +1089,7 @@ pub(super) fn launch_cuda_resident_i128_compare_columns_filter(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_i128.ptx");
 
     if n == 0 {
         return Ok(Vec::new());

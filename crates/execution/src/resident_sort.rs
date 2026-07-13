@@ -28,7 +28,7 @@ pub(super) fn launch_cuda_bitonic_sort_i64(
         *mut *mut c_void,
     ) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_sort.ptx");
 
     let n = keys.len();
     if n <= 1 {
@@ -225,7 +225,7 @@ pub(super) fn launch_cuda_bitonic_sort_text(
         *mut *mut c_void,
     ) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_sort.ptx");
 
     let n = indices.len();
     if n <= 1 {
@@ -390,7 +390,7 @@ pub(super) fn launch_cuda_bitonic_sort_multikey(
         *mut *mut c_void,
     ) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_sort.ptx");
 
     let expected = n
         .checked_mul(k)
@@ -574,7 +574,7 @@ pub(super) fn launch_cuda_bitonic_sort_hetero(
         *mut *mut c_void,
     ) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_sort.ptx");
 
     let n = indices.len();
     let expected_int = n

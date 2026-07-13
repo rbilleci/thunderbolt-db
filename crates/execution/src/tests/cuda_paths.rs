@@ -1094,13 +1094,13 @@
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_resident_text_eq_scalar_filters_rows() {
         // Text equality over a resident TEXT column (the type matrix, doc 19): offsets[n+1] (u64 LE) +
-        // byte blob, where row i = blob[offsets[i]..offsets[i+1]]. The offsets are placed at a 4-mod-8
-        // byte offset to exercise the 2x 4-byte-load path (an 8-byte load there faults 716, sticky).
+        // byte blob, where row i = blob[offsets[i]..offsets[i+1]]. The public resident contract keeps
+        // the u64 offsets section 8-byte aligned; misaligned descriptors must fail before launch.
         let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
 
         let rows: [&str; 6] = ["apple", "banana", "apple", "cherry", "banana", "apple"];
         const N: u64 = 6;
-        let offsets_off: u64 = 12; // 4-mod-8 alignment: stress the 4-byte offset loads
+        let offsets_off: u64 = 16;
         let bytes_off: u64 = offsets_off + (N + 1) * 8;
 
         let mut header = Vec::new();
@@ -1427,7 +1427,7 @@
 
         let rows = ["apple", "apply", "banana", "grape", "applet", "ape", ""];
         let n = rows.len() as u64;
-        let offsets_off: u64 = 12; // 4-mod-8
+        let offsets_off: u64 = 16; // safe resident text descriptors require u64 alignment
         let bytes_off: u64 = offsets_off + (n + 1) * 8;
         let mut header = Vec::new();
         header.extend_from_slice(&n.to_le_bytes());
@@ -1526,12 +1526,12 @@
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_resident_text_predicate_vm_scalar_abi_matches_rows() {
         // The compound-predicate VM must pass the exact bounded-text ABI used by the standalone
-        // equality and ordering launchers. Keep the offsets deliberately 4-mod-8 aligned and the
-        // payload tiny: transient catalog joins exercise precisely this shape.
+        // equality and ordering launchers. Keep the offsets contract-valid and the payload tiny:
+        // transient catalog joins exercise precisely this shape.
         let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
         let rows = ["r", "v", "r", ""];
         let n = rows.len() as u64;
-        let offsets_off = 12_u64;
+        let offsets_off = 16_u64;
         let bytes_off = offsets_off + (n + 1) * std::mem::size_of::<u64>() as u64;
         let mut header = Vec::new();
         header.extend_from_slice(&n.to_le_bytes());

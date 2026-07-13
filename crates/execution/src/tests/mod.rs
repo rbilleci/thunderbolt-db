@@ -798,14 +798,37 @@
     }
 
     #[test]
-    fn expr_proto_ptx_is_pure_ascii() {
+    fn expression_family_ptx_is_pure_ascii() {
         // The runtime JIT's ptxas rejects a non-ASCII byte ("Unexpected non-ASCII character") even
         // though the LOCAL ptxas tolerates it — so a stray em-dash / smart-quote in a comment fails
-        // every GPU launch with INVALID_PTX (218). This non-GPU test keeps the PTX pure ASCII.
-        const PTX: &[u8] = include_bytes!("../expr_proto.ptx");
-        if let Some(pos) = PTX.iter().position(|&byte| !byte.is_ascii()) {
-            let line = PTX[..pos].iter().filter(|&&byte| byte == b'\n').count() + 1;
-            panic!("expr_proto.ptx has a non-ASCII byte at offset {pos} (line {line})");
+        // every GPU launch with INVALID_PTX (218). This non-GPU test keeps every decomposed leaf
+        // pure ASCII; adding a leaf requires adding it here.
+        const PTX_FILES: &[(&str, &[u8])] = &[
+            ("expression_i32.ptx", include_bytes!("../expression_i32.ptx")),
+            ("expression_i64.ptx", include_bytes!("../expression_i64.ptx")),
+            ("expression_i128.ptx", include_bytes!("../expression_i128.ptx")),
+            ("expression_varlen.ptx", include_bytes!("../expression_varlen.ptx")),
+            ("resident_gather.ptx", include_bytes!("../resident_gather.ptx")),
+            ("derived_column.ptx", include_bytes!("../derived_column.ptx")),
+            ("staged_hash_join.ptx", include_bytes!("../staged_hash_join.ptx")),
+            ("resident_aggregate.ptx", include_bytes!("../resident_aggregate.ptx")),
+            ("device_fill.ptx", include_bytes!("../device_fill.ptx")),
+            (
+                "resident_group_compact.ptx",
+                include_bytes!("../resident_group_compact.ptx"),
+            ),
+            ("resident_sort.ptx", include_bytes!("../resident_sort.ptx")),
+            ("resident_group.ptx", include_bytes!("../resident_group.ptx")),
+            (
+                "resident_group_extra.ptx",
+                include_bytes!("../resident_group_extra.ptx"),
+            ),
+        ];
+        for &(name, ptx) in PTX_FILES {
+            if let Some(pos) = ptx.iter().position(|&byte| !byte.is_ascii()) {
+                let line = ptx[..pos].iter().filter(|&&byte| byte == b'\n').count() + 1;
+                panic!("{name} has a non-ASCII byte at offset {pos} (line {line})");
+            }
         }
     }
 

@@ -50,7 +50,7 @@ pub(super) fn launch_cuda_resident_i32_sum_at_indices(
     ) -> i32;
     type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_aggregate.ptx");
 
     validate_index_window(
         resident.metadata().allocated_bytes,
@@ -176,7 +176,7 @@ pub(super) fn launch_cuda_resident_i64_sum_at_indices_i128(
     ) -> i32;
     type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_aggregate.ptx");
 
     validate_index_window(
         resident.metadata().allocated_bytes,
@@ -303,7 +303,7 @@ pub(super) fn launch_cuda_resident_i32_minmax_at_indices(
         *mut *mut c_void,
     ) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_aggregate.ptx");
 
     validate_index_window(
         resident.metadata().allocated_bytes,
@@ -436,7 +436,7 @@ pub(super) fn launch_cuda_resident_i64_minmax_at_indices(
         *mut *mut c_void,
     ) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_aggregate.ptx");
 
     validate_index_window(
         resident.metadata().allocated_bytes,
@@ -569,7 +569,7 @@ pub(super) fn launch_cuda_resident_i128_minmax_partials_at_indices(
         *mut *mut c_void,
     ) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_aggregate.ptx");
 
     validate_index_window(
         resident.metadata().allocated_bytes,
@@ -710,7 +710,7 @@ pub(super) fn launch_cuda_resident_i128_sum_partials_at_indices(
     ) -> i32;
     type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_aggregate.ptx");
 
     validate_index_window(
         resident.metadata().allocated_bytes,

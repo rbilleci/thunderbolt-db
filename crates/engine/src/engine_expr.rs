@@ -862,7 +862,7 @@ fn composite_group_count_reps(
     Ok(groups.iter().map(|g| g.key_i128 as u64 as u32).collect())
 }
 
-/// Device op-code for an arithmetic binary op (matches `expr_proto.ptx`: 0=add, 1=sub, 2=mul), or
+/// Device op-code for an arithmetic binary op (matches `expression_i*.ptx`: 0=add, 1=sub, 2=mul), or
 /// `None` if `op` is not arithmetic.
 fn arith_op_code(op: ResidentBinaryOp) -> Option<u32> {
     match op {
@@ -873,7 +873,7 @@ fn arith_op_code(op: ResidentBinaryOp) -> Option<u32> {
     }
 }
 
-/// Device comparison code for a comparison binary op (matches `expr_proto.ptx`: 0=eq, 1=lt, 2=le,
+/// Device comparison code for a comparison binary op (matches `expression_i*.ptx`: 0=eq, 1=lt, 2=le,
 /// 3=gt, 4=ge), or `None` if `op` is not a kernel-supported comparison (`Ne` has no primitive yet).
 fn compare_op_code(op: ResidentBinaryOp) -> Option<u32> {
     match op {

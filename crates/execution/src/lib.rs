@@ -3322,7 +3322,7 @@ fn launch_cuda_resident_expr_two_col_filter(
     ) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_i32.ptx");
 
     if n == 0 {
         return Ok(Vec::new());
@@ -3738,7 +3738,7 @@ fn launch_cuda_arith_value_column_at_indices_nullable(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("device_fill.ptx");
     if indices.is_empty() {
         return Ok(Vec::new());
     }

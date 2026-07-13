@@ -1,0 +1,1398 @@
+.version 8.4
+.target sm_90
+.address_size 64
+
+// Hand-maintained PTX; ownership follows the matching Rust operator module.
+
+
+// GPU inner equi-join (M5) -- BUILD side, int4 key, UNIQUE build key. Open-addressing hash table in
+// slot_keys_i128 (b128 = (lo=build_row_idx, hi=key); EMPTY128 = (0, i64::MIN) -- an int4 key is never
+// i64::MIN so a real slot never aliases EMPTY). For each build row b: hash the i64 key (murmur
+// finalizer), atom.cas.b128 claim-on-empty (lock-free, advance-on-failure linear probe -- NEVER a spin
+// lock). A LOST cas whose hi limb == this key means a DUPLICATE build key (N:N is a follow-up) -> set
+// dup_flag (the host rejects the query). build_keys are i64 (the executor sign-extends int4 -> i64).
+.visible .entry gpu_db_hash_join_build_i32(
+    .param .u64 build_keys_ptr,
+    .param .u64 build_n,
+    .param .u64 slot_keys_ptr,
+    .param .u64 mask,
+    .param .u64 dup_flag_ptr,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 bit per build key, 1 = valid). The sentinel
+    // u64::MAX = no bitmap => every key valid (byte-identical fast path -- the host still pre-filters until
+    // V1b-wire passes a real bitmap). A NULL build key matches nothing in an equi-join, so it is NOT inserted.
+    .param .u64 build_validity_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %keysp;
+    .reg .u64 %n;
+    .reg .u64 %slots;
+    .reg .u64 %mask;
+    .reg .u64 %dupp;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %zero;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .b128 %empty128;
+    .reg .b128 %key128;
+    .reg .b128 %old128;
+
+    ld.param.u64 %keysp, [build_keys_ptr];
+    ld.param.u64 %n, [build_n];
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %dupp, [dup_flag_ptr];
+    ld.param.u64 %vptr, [build_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u64 %zero, 0;
+    mov.b128 %empty128, {%zero, %empty};
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjb_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjb_done;
+    // key = build_keys[i]
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %keysp, %o;
+    ld.global.u64 %key, [%addr];
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => no bitmap => every key valid (byte-identical).
+    // Else read bit i of the dense validity bitmap; bit 0 => NULL key => skip inserting it (NULL matches
+    // nothing in an equi-join, so the build side omits it; a probe NULL likewise emits no pair).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjb_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjb_next;
+hjb_keyok:
+    // h = murmur(key) & mask
+    mov.b64 %mix, %key;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+    // key128 = (lo=i, hi=key)
+    mov.b128 %key128, {%i, %key};
+hjb_probe:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    // The cas WROTE key128 iff the slot was EMPTY128 (old.hi == i64::MIN). A real slot has hi = key
+    // (an int4 key, never i64::MIN), so hi == EMPTY uniquely means "was empty -> claimed".
+    setp.eq.u64 %p, %ohi, %empty;
+    @%p bra hjb_next;
+    // occupied: hi == this key -> DUPLICATE build key (N:N is a follow-up); else collision -> probe.
+    setp.eq.u64 %p, %ohi, %key;
+    @%p bra hjb_dup;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjb_probe;
+hjb_dup:
+    mov.u64 %tmp, 1;
+    atom.global.exch.b64 %o, [%dupp], %tmp;
+    bra hjb_next;
+hjb_next:
+    add.u64 %i, %i, %stride;
+    bra hjb_loop;
+hjb_done:
+    ret;
+}
+
+// GPU inner equi-join (M5) -- PROBE side, int4 key, UNIQUE build key. For each probe row p: hash the
+// i64 key, linear-probe slot_keys_i128. EMPTY128 slot -> no match (stop; open addressing). A slot whose
+// hi limb == key -> the single matching build row (lo): emit the pair (build_idx, probe_idx) at
+// atom.add(out_cursor) -- lock-free append. Output is bounded by probe_n (each probe matches <=1 unique
+// build key). out_pairs is [build_idx, probe_idx] u32 pairs.
+.visible .entry gpu_db_hash_join_probe_i32(
+    .param .u64 probe_keys_ptr,
+    .param .u64 probe_n,
+    .param .u64 slot_keys_ptr,
+    .param .u64 mask,
+    .param .u64 out_pairs_ptr,
+    .param .u64 out_cursor_ptr,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every probe key valid (byte-identical). A NULL probe key matches nothing -> emit no pair.
+    .param .u64 probe_validity_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %slot;
+    .reg .u32 %pidx;
+    .reg .u32 %bidx;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %keysp;
+    .reg .u64 %n;
+    .reg .u64 %slots;
+    .reg .u64 %mask;
+    .reg .u64 %outp;
+    .reg .u64 %curp;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .u64 %slotu;
+
+    ld.param.u64 %keysp, [probe_keys_ptr];
+    ld.param.u64 %n, [probe_n];
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %outp, [out_pairs_ptr];
+    ld.param.u64 %curp, [out_cursor_ptr];
+    ld.param.u64 %vptr, [probe_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjp_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjp_done;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %keysp, %o;
+    ld.global.u64 %key, [%addr];
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => no bitmap => valid (byte-identical). Else read
+    // bit i; a NULL probe key (bit 0) matches nothing -> emit no pair (skip to the loop increment).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjp_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjp_next;
+hjp_keyok:
+    mov.b64 %mix, %key;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjp_probe:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    ld.global.u64 %olo, [%addr];
+    ld.global.u64 %ohi, [%addr+8];
+    // EMPTY128 (hi==i64::MIN) -> no match (open addressing: the bucket run ended).
+    setp.eq.u64 %p, %ohi, %empty;
+    @%p bra hjp_next;
+    // hi == key -> the unique matching build row (lo).
+    setp.eq.u64 %p, %ohi, %key;
+    @%p bra hjp_emit;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjp_probe;
+hjp_emit:
+    // slot = atom.add(cursor, 1); out_pairs[slot*2] = build_idx (lo); out_pairs[slot*2+1] = probe_idx
+    mov.u64 %tmp, 1;
+    atom.global.add.u64 %slotu, [%curp], %tmp;
+    mul.lo.u64 %o, %slotu, 8;
+    add.u64 %addr, %outp, %o;
+    cvt.u32.u64 %bidx, %olo;
+    st.global.u32 [%addr], %bidx;
+    cvt.u32.u64 %pidx, %i;
+    st.global.u32 [%addr+4], %pidx;
+hjp_next:
+    add.u64 %i, %i, %stride;
+    bra hjp_loop;
+hjp_done:
+    ret;
+}
+
+// GPU inner equi-join (M5 J4b) -- BUILD side, TEXT key, UNIQUE build key. Reads build row i's text from a
+// dense [offsets][bytes] buffer (offsets = 8-byte entries read as 2x ld.u32 -- 716-safe when the section
+// is 4-mod-8), FNV-1a-64 hashes the bytes -> %thash (remap i64::MIN->0 so (idx,thash) never aliases
+// EMPTY128), slot key128 = (lo=i, hi=thash). Claims via atom.cas.b128 (lock-free, advance-on-failure
+// linear probe -- NEVER a spin lock). On a hash MATCH (hi==thash) it VERIFIES the full text byte-for-byte
+// (this row vs the slot's stored build row olo): equal = a DUPLICATE build key (N:N follow-up -> set
+// dup_flag); a hash collision (different text) keeps probing. murmur3 finalizer on thash -> bucket.
+.visible .entry gpu_db_hash_join_build_text(
+    .param .u64 payload_ptr,
+    .param .u64 offsets_off,
+    .param .u64 bytes_off,
+    .param .u64 build_n,
+    .param .u64 slot_keys_ptr,
+    .param .u64 mask,
+    .param .u64 dup_flag_ptr,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every key valid (byte-identical). A NULL build key matches nothing -> NOT inserted.
+    .param .u64 build_validity_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %ba;
+    .reg .u32 %bb;
+    .reg .u64 %payload;
+    .reg .u64 %offb;
+    .reg .u64 %bytesb;
+    .reg .u64 %n;
+    .reg .u64 %slots;
+    .reg .u64 %mask;
+    .reg .u64 %dupp;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %starta;
+    .reg .u64 %enda;
+    .reg .u64 %lena;
+    .reg .u64 %taddra;
+    .reg .u64 %startb;
+    .reg .u64 %endb;
+    .reg .u64 %lenb;
+    .reg .u64 %taddrb;
+    .reg .u64 %thash;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %j;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .b128 %empty128;
+    .reg .b128 %key128;
+    .reg .b128 %old128;
+
+    ld.param.u64 %payload, [payload_ptr];
+    ld.param.u64 %offb, [offsets_off];
+    add.u64 %offb, %payload, %offb;
+    ld.param.u64 %bytesb, [bytes_off];
+    add.u64 %bytesb, %payload, %bytesb;
+    ld.param.u64 %n, [build_n];
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %dupp, [dup_flag_ptr];
+    ld.param.u64 %vptr, [build_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u64 %tmp, 0;
+    mov.b128 %empty128, {%tmp, %empty};
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjbt_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjbt_done;
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => valid (byte-identical). Else read bit i; a NULL
+    // build key (bit 0) matches nothing -> skip this row (to the loop increment, NOT inserted).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjbt_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjbt_next;
+hjbt_keyok:
+    // text[i]: starta = offsets[i], enda = offsets[i+1]
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %starta, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %enda, {%w0, %w1};
+    sub.u64 %lena, %enda, %starta;
+    add.u64 %taddra, %bytesb, %starta;
+    // FNV-1a-64 over the bytes
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %j, 0;
+hjbt_hash:
+    setp.ge.u64 %p, %j, %lena;
+    @%p bra hjbt_hash_done;
+    add.u64 %addr, %taddra, %j;
+    ld.global.u8 %w0, [%addr];
+    cvt.u64.u32 %tmp, %w0;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %j, %j, 1;
+    bra hjbt_hash;
+hjbt_hash_done:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    mov.b128 %key128, {%i, %thash};
+    // bucket = murmur3-64 finalizer(thash) & mask
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjbt_probe:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %p, %ohi, %empty;
+    @%p bra hjbt_next;
+    // occupied: same hash? (different hash = collision -> probe)
+    setp.eq.u64 %p, %ohi, %thash;
+    @!%p bra hjbt_advance;
+    // same hash -> VERIFY text[i] vs text[olo]
+    mul.lo.u64 %o, %olo, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %startb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %endb, {%w0, %w1};
+    sub.u64 %lenb, %endb, %startb;
+    setp.ne.u64 %p, %lena, %lenb;
+    @%p bra hjbt_advance;
+    add.u64 %taddrb, %bytesb, %startb;
+    mov.u64 %j, 0;
+hjbt_verify:
+    setp.ge.u64 %p, %j, %lena;
+    @%p bra hjbt_dup;
+    add.u64 %addr, %taddra, %j;
+    ld.global.u8 %ba, [%addr];
+    add.u64 %addr, %taddrb, %j;
+    ld.global.u8 %bb, [%addr];
+    setp.ne.u32 %p, %ba, %bb;
+    @%p bra hjbt_advance;
+    add.u64 %j, %j, 1;
+    bra hjbt_verify;
+hjbt_dup:
+    mov.u64 %tmp, 1;
+    atom.global.exch.b64 %o, [%dupp], %tmp;
+    bra hjbt_next;
+hjbt_advance:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjbt_probe;
+hjbt_next:
+    add.u64 %i, %i, %stride;
+    bra hjbt_loop;
+hjbt_done:
+    ret;
+}
+
+// GPU inner equi-join (M5 J4b) -- PROBE side, TEXT key. Reads probe row j's text from the probe section
+// of the dense buffer, FNV-1a-64 hashes it (same remap), linear-probes slot_keys. EMPTY128 -> no match.
+// A slot whose hi == thash -> VERIFY probe text[j] vs the matched build row's text (read from the BUILD
+// section via the slot's lo) byte-for-byte; equal -> emit (build_idx=lo, probe_idx=j) at atom.add(cursor);
+// a hash collision keeps probing. Output <= probe_n (each probe matches <=1 unique build key).
+.visible .entry gpu_db_hash_join_probe_text(
+    .param .u64 payload_ptr,
+    .param .u64 probe_offsets_off,
+    .param .u64 probe_bytes_off,
+    .param .u64 probe_n,
+    .param .u64 build_offsets_off,
+    .param .u64 build_bytes_off,
+    .param .u64 slot_keys_ptr,
+    .param .u64 mask,
+    .param .u64 out_pairs_ptr,
+    .param .u64 out_cursor_ptr,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every probe key valid (byte-identical). A NULL probe key matches nothing -> emit no pair.
+    .param .u64 probe_validity_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %ba;
+    .reg .u32 %bb;
+    .reg .u32 %bidx;
+    .reg .u32 %pidx;
+    .reg .u64 %payload;
+    .reg .u64 %poffb;
+    .reg .u64 %pbytesb;
+    .reg .u64 %n;
+    .reg .u64 %boffb;
+    .reg .u64 %bbytesb;
+    .reg .u64 %slots;
+    .reg .u64 %mask;
+    .reg .u64 %outp;
+    .reg .u64 %curp;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %startp;
+    .reg .u64 %endp;
+    .reg .u64 %lenp;
+    .reg .u64 %taddrp;
+    .reg .u64 %startb;
+    .reg .u64 %endb;
+    .reg .u64 %lenb;
+    .reg .u64 %taddrb;
+    .reg .u64 %thash;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %j;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .u64 %slotu;
+
+    ld.param.u64 %payload, [payload_ptr];
+    ld.param.u64 %poffb, [probe_offsets_off];
+    add.u64 %poffb, %payload, %poffb;
+    ld.param.u64 %pbytesb, [probe_bytes_off];
+    add.u64 %pbytesb, %payload, %pbytesb;
+    ld.param.u64 %n, [probe_n];
+    ld.param.u64 %boffb, [build_offsets_off];
+    add.u64 %boffb, %payload, %boffb;
+    ld.param.u64 %bbytesb, [build_bytes_off];
+    add.u64 %bbytesb, %payload, %bbytesb;
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %outp, [out_pairs_ptr];
+    ld.param.u64 %curp, [out_cursor_ptr];
+    ld.param.u64 %vptr, [probe_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjpt_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjpt_done;
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => valid (byte-identical). Else read bit i; a NULL
+    // probe key (bit 0) matches nothing -> emit no pair (skip to the loop increment).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjpt_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjpt_next;
+hjpt_keyok:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %poffb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %startp, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %endp, {%w0, %w1};
+    sub.u64 %lenp, %endp, %startp;
+    add.u64 %taddrp, %pbytesb, %startp;
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %j, 0;
+hjpt_hash:
+    setp.ge.u64 %p, %j, %lenp;
+    @%p bra hjpt_hash_done;
+    add.u64 %addr, %taddrp, %j;
+    ld.global.u8 %w0, [%addr];
+    cvt.u64.u32 %tmp, %w0;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %j, %j, 1;
+    bra hjpt_hash;
+hjpt_hash_done:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjpt_probe:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    ld.global.u64 %olo, [%addr];
+    ld.global.u64 %ohi, [%addr+8];
+    setp.eq.u64 %p, %ohi, %empty;
+    @%p bra hjpt_next;
+    setp.eq.u64 %p, %ohi, %thash;
+    @!%p bra hjpt_advance;
+    // VERIFY probe text[i] vs build text[olo] (build section)
+    mul.lo.u64 %o, %olo, 8;
+    add.u64 %addr, %boffb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %startb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %endb, {%w0, %w1};
+    sub.u64 %lenb, %endb, %startb;
+    setp.ne.u64 %p, %lenp, %lenb;
+    @%p bra hjpt_advance;
+    add.u64 %taddrb, %bbytesb, %startb;
+    mov.u64 %j, 0;
+hjpt_verify:
+    setp.ge.u64 %p, %j, %lenp;
+    @%p bra hjpt_emit;
+    add.u64 %addr, %taddrp, %j;
+    ld.global.u8 %ba, [%addr];
+    add.u64 %addr, %taddrb, %j;
+    ld.global.u8 %bb, [%addr];
+    setp.ne.u32 %p, %ba, %bb;
+    @%p bra hjpt_advance;
+    add.u64 %j, %j, 1;
+    bra hjpt_verify;
+hjpt_emit:
+    mov.u64 %tmp, 1;
+    atom.global.add.u64 %slotu, [%curp], %tmp;
+    mul.lo.u64 %o, %slotu, 8;
+    add.u64 %addr, %outp, %o;
+    cvt.u32.u64 %bidx, %olo;
+    st.global.u32 [%addr], %bidx;
+    cvt.u32.u64 %pidx, %i;
+    st.global.u32 [%addr+4], %pidx;
+    bra hjpt_next;
+hjpt_advance:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjpt_probe;
+hjpt_next:
+    add.u64 %i, %i, %stride;
+    bra hjpt_loop;
+hjpt_done:
+    ret;
+}
+
+// GPU inner equi-join (M5 N:N) -- BUILD side, int (i64) key, DUPLICATE build keys CHAINED. Open-addressing
+// on slot_keys (i64, EMPTY = i64::MIN) via atom.cas.b64 establishes each key's bucket (advance-on-failure,
+// NO spin lock); a per-bucket singly-linked chain of ALL build rows with that key is built in slot_head
+// (init END = u64::MAX) + next[]: each build row PREPENDS itself via atom.exch.b64 (lock-free LIFO --
+// old_head = exch(slot_head[bucket], i); next[i] = old_head). The chain is only WALKED by the emit kernel,
+// which runs in a SEPARATE launch after cuCtxSynchronize, so next[] is fully written before any read.
+// build keys are i64 (the launcher sign-extends int + rejects i64::MIN, which aliases EMPTY).
+.visible .entry gpu_db_hash_join_build_i64_nn(
+    .param .u64 build_keys_ptr,
+    .param .u64 build_n,
+    .param .u64 slot_keys_ptr,
+    .param .u64 slot_head_ptr,
+    .param .u64 next_ptr,
+    .param .u64 mask,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every key valid (byte-identical). A NULL build key matches nothing -> NOT chained into a bucket.
+    .param .u64 build_validity_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %keysp;
+    .reg .u64 %n;
+    .reg .u64 %slotk;
+    .reg .u64 %sloth;
+    .reg .u64 %nextp;
+    .reg .u64 %mask;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %old;
+    .reg .u64 %oldhead;
+
+    ld.param.u64 %keysp, [build_keys_ptr];
+    ld.param.u64 %n, [build_n];
+    ld.param.u64 %slotk, [slot_keys_ptr];
+    ld.param.u64 %sloth, [slot_head_ptr];
+    ld.param.u64 %nextp, [next_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %vptr, [build_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjbnn_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjbnn_done;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %keysp, %o;
+    ld.global.u64 %key, [%addr];
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => no bitmap => valid (byte-identical). Else read
+    // bit i; a NULL build key (bit 0) matches nothing -> do not chain it (skip to the loop increment).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjbnn_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjbnn_next;
+hjbnn_keyok:
+    mov.b64 %mix, %key;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjbnn_probe:
+    mul.lo.u64 %o, %h, 8;
+    add.u64 %addr, %slotk, %o;
+    atom.global.cas.b64 %old, [%addr], %empty, %key;
+    setp.eq.u64 %p, %old, %empty;
+    @%p bra hjbnn_found;
+    setp.eq.u64 %p, %old, %key;
+    @%p bra hjbnn_found;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjbnn_probe;
+hjbnn_found:
+    // prepend i to the bucket's chain head (lock-free LIFO).
+    mul.lo.u64 %o, %h, 8;
+    add.u64 %addr, %sloth, %o;
+    atom.global.exch.b64 %oldhead, [%addr], %i;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %nextp, %o;
+    st.global.u64 [%addr], %oldhead;
+hjbnn_next:
+    add.u64 %i, %i, %stride;
+    bra hjbnn_loop;
+hjbnn_done:
+    ret;
+}
+
+// GPU inner equi-join (M5 N:N) -- EMIT side. For each probe row p: linear-probe slot_keys for its key's
+// bucket (EMPTY -> no match); then WALK that bucket's build-row chain (slot_head -> next[] -> .. -> END),
+// emitting (build_idx, probe_idx) for EACH chained build row at atom.add(cursor). `cap` bounds the output
+// buffer: the cursor ALWAYS increments (so it counts the exact total), but a write only happens when
+// slot < cap -- so the launcher sizes a guess, reads the cursor, and re-runs with cap = cursor if it
+// overflowed. out_pairs is [build_idx, probe_idx] u32 pairs.
+.visible .entry gpu_db_hash_join_emit_i64_nn(
+    .param .u64 probe_keys_ptr,
+    .param .u64 probe_n,
+    .param .u64 slot_keys_ptr,
+    .param .u64 slot_head_ptr,
+    .param .u64 next_ptr,
+    .param .u64 mask,
+    .param .u64 cap,
+    .param .u64 out_pairs_ptr,
+    .param .u64 out_cursor_ptr,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every key valid (byte-identical). A NULL probe key matches nothing -> emit no pairs.
+    .param .u64 probe_validity_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %bidx;
+    .reg .u32 %pidx;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %keysp;
+    .reg .u64 %n;
+    .reg .u64 %slotk;
+    .reg .u64 %sloth;
+    .reg .u64 %nextp;
+    .reg .u64 %mask;
+    .reg .u64 %cap;
+    .reg .u64 %outp;
+    .reg .u64 %curp;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %end;
+    .reg .u64 %sk;
+    .reg .u64 %cur;
+    .reg .u64 %slotu;
+
+    ld.param.u64 %keysp, [probe_keys_ptr];
+    ld.param.u64 %n, [probe_n];
+    ld.param.u64 %slotk, [slot_keys_ptr];
+    ld.param.u64 %sloth, [slot_head_ptr];
+    ld.param.u64 %nextp, [next_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %cap, [cap];
+    ld.param.u64 %outp, [out_pairs_ptr];
+    ld.param.u64 %curp, [out_cursor_ptr];
+    ld.param.u64 %vptr, [probe_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u64 %end, 0xffffffffffffffff;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjenn_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjenn_done;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %keysp, %o;
+    ld.global.u64 %key, [%addr];
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => no bitmap => valid (byte-identical). Else read
+    // bit i; a NULL probe key (bit 0) matches nothing -> emit no pairs (skip to the loop increment).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjenn_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjenn_next;
+hjenn_keyok:
+    mov.b64 %mix, %key;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjenn_find:
+    mul.lo.u64 %o, %h, 8;
+    add.u64 %addr, %slotk, %o;
+    ld.global.u64 %sk, [%addr];
+    setp.eq.u64 %p, %sk, %empty;
+    @%p bra hjenn_next;
+    setp.eq.u64 %p, %sk, %key;
+    @%p bra hjenn_walk;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjenn_find;
+hjenn_walk:
+    mul.lo.u64 %o, %h, 8;
+    add.u64 %addr, %sloth, %o;
+    ld.global.u64 %cur, [%addr];
+hjenn_chain:
+    setp.eq.u64 %p, %cur, %end;
+    @%p bra hjenn_next;
+    mov.u64 %tmp, 1;
+    atom.global.add.u64 %slotu, [%curp], %tmp;
+    setp.lt.u64 %p, %slotu, %cap;
+    @!%p bra hjenn_advance;
+    mul.lo.u64 %o, %slotu, 8;
+    add.u64 %addr, %outp, %o;
+    cvt.u32.u64 %bidx, %cur;
+    st.global.u32 [%addr], %bidx;
+    cvt.u32.u64 %pidx, %i;
+    st.global.u32 [%addr+4], %pidx;
+hjenn_advance:
+    mul.lo.u64 %o, %cur, 8;
+    add.u64 %addr, %nextp, %o;
+    ld.global.u64 %cur, [%addr];
+    bra hjenn_chain;
+hjenn_next:
+    add.u64 %i, %i, %stride;
+    bra hjenn_loop;
+hjenn_done:
+    ret;
+}
+
+// GPU inner equi-join (M5 N:N TEXT) -- BUILD, DUPLICATE text keys CHAINED. Like gpu_db_hash_join_build_text
+// (FNV-1a-64 -> b128 slot (rep_idx, thash) via atom.cas.b128 + byte-verify on a hash match) but a matched
+// text is NOT a duplicate error -- it is the same bucket; the build row PREPENDS to that bucket's chain
+// (slot_head init END=u64::MAX, atom.exch.b64 LIFO, next[]). The chain is walked only by the emit kernel
+// (a separate launch after cuCtxSynchronize). slot_keys.lo = the first claimer = the verify representative.
+.visible .entry gpu_db_hash_join_build_text_nn(
+    .param .u64 payload_ptr,
+    .param .u64 offsets_off,
+    .param .u64 bytes_off,
+    .param .u64 build_n,
+    .param .u64 slot_keys_ptr,
+    .param .u64 slot_head_ptr,
+    .param .u64 next_ptr,
+    .param .u64 mask,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every key valid (byte-identical). A NULL build key matches nothing -> NOT chained.
+    .param .u64 build_validity_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %ba;
+    .reg .u32 %bb;
+    .reg .u64 %payload;
+    .reg .u64 %offb;
+    .reg .u64 %bytesb;
+    .reg .u64 %n;
+    .reg .u64 %slots;
+    .reg .u64 %sloth;
+    .reg .u64 %nextp;
+    .reg .u64 %mask;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %starta;
+    .reg .u64 %enda;
+    .reg .u64 %lena;
+    .reg .u64 %taddra;
+    .reg .u64 %startb;
+    .reg .u64 %endb;
+    .reg .u64 %lenb;
+    .reg .u64 %taddrb;
+    .reg .u64 %thash;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %j;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .u64 %oldhead;
+    .reg .b128 %empty128;
+    .reg .b128 %key128;
+    .reg .b128 %old128;
+
+    ld.param.u64 %payload, [payload_ptr];
+    ld.param.u64 %offb, [offsets_off];
+    add.u64 %offb, %payload, %offb;
+    ld.param.u64 %bytesb, [bytes_off];
+    add.u64 %bytesb, %payload, %bytesb;
+    ld.param.u64 %n, [build_n];
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %sloth, [slot_head_ptr];
+    ld.param.u64 %nextp, [next_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %vptr, [build_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u64 %tmp, 0;
+    mov.b128 %empty128, {%tmp, %empty};
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjbtn_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjbtn_done;
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => valid (byte-identical). Else read bit i; a NULL
+    // build key (bit 0) matches nothing -> skip this row (to the loop increment, NOT chained).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjbtn_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjbtn_next;
+hjbtn_keyok:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %starta, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %enda, {%w0, %w1};
+    sub.u64 %lena, %enda, %starta;
+    add.u64 %taddra, %bytesb, %starta;
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %j, 0;
+hjbtn_hash:
+    setp.ge.u64 %p, %j, %lena;
+    @%p bra hjbtn_hash_done;
+    add.u64 %addr, %taddra, %j;
+    ld.global.u8 %w0, [%addr];
+    cvt.u64.u32 %tmp, %w0;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %j, %j, 1;
+    bra hjbtn_hash;
+hjbtn_hash_done:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    mov.b128 %key128, {%i, %thash};
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjbtn_probe:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %p, %ohi, %empty;
+    @%p bra hjbtn_found;
+    setp.eq.u64 %p, %ohi, %thash;
+    @!%p bra hjbtn_advance;
+    // same hash -> VERIFY text[i] vs the rep text[olo]
+    mul.lo.u64 %o, %olo, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %startb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %endb, {%w0, %w1};
+    sub.u64 %lenb, %endb, %startb;
+    setp.ne.u64 %p, %lena, %lenb;
+    @%p bra hjbtn_advance;
+    add.u64 %taddrb, %bytesb, %startb;
+    mov.u64 %j, 0;
+hjbtn_verify:
+    setp.ge.u64 %p, %j, %lena;
+    @%p bra hjbtn_found;
+    add.u64 %addr, %taddra, %j;
+    ld.global.u8 %ba, [%addr];
+    add.u64 %addr, %taddrb, %j;
+    ld.global.u8 %bb, [%addr];
+    setp.ne.u32 %p, %ba, %bb;
+    @%p bra hjbtn_advance;
+    add.u64 %j, %j, 1;
+    bra hjbtn_verify;
+hjbtn_advance:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjbtn_probe;
+hjbtn_found:
+    // prepend i to the bucket's chain head (lock-free LIFO).
+    mul.lo.u64 %o, %h, 8;
+    add.u64 %addr, %sloth, %o;
+    atom.global.exch.b64 %oldhead, [%addr], %i;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %nextp, %o;
+    st.global.u64 [%addr], %oldhead;
+hjbtn_next:
+    add.u64 %i, %i, %stride;
+    bra hjbtn_loop;
+hjbtn_done:
+    ret;
+}
+
+// GPU inner equi-join (M5 N:N TEXT) -- EMIT. For each probe row: FNV-hash its text, linear-probe slot_keys
+// for the text's bucket (EMPTY -> no match; same-hash -> byte-verify the probe text vs the bucket's REP
+// build text in the BUILD section), then WALK that bucket's build-row chain (slot_head -> next -> .. ->
+// END), emitting (build_idx, probe_idx) for each at atom.add(cursor). `cap` bounds writes -- the cursor
+// always increments (counts the exact total); the launcher sizes a guess via cap=0 then re-runs at cap=total.
+.visible .entry gpu_db_hash_join_emit_text_nn(
+    .param .u64 payload_ptr,
+    .param .u64 probe_offsets_off,
+    .param .u64 probe_bytes_off,
+    .param .u64 probe_n,
+    .param .u64 build_offsets_off,
+    .param .u64 build_bytes_off,
+    .param .u64 slot_keys_ptr,
+    .param .u64 slot_head_ptr,
+    .param .u64 next_ptr,
+    .param .u64 mask,
+    .param .u64 cap,
+    .param .u64 out_pairs_ptr,
+    .param .u64 out_cursor_ptr,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every probe key valid (byte-identical). A NULL probe key matches nothing -> emit no pairs.
+    .param .u64 probe_validity_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %ba;
+    .reg .u32 %bb;
+    .reg .u32 %bidx;
+    .reg .u32 %pidx;
+    .reg .u64 %payload;
+    .reg .u64 %poffb;
+    .reg .u64 %pbytesb;
+    .reg .u64 %n;
+    .reg .u64 %boffb;
+    .reg .u64 %bbytesb;
+    .reg .u64 %slots;
+    .reg .u64 %sloth;
+    .reg .u64 %nextp;
+    .reg .u64 %mask;
+    .reg .u64 %cap;
+    .reg .u64 %outp;
+    .reg .u64 %curp;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %startp;
+    .reg .u64 %endp;
+    .reg .u64 %lenp;
+    .reg .u64 %taddrp;
+    .reg .u64 %startb;
+    .reg .u64 %endb;
+    .reg .u64 %lenb;
+    .reg .u64 %taddrb;
+    .reg .u64 %thash;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %end;
+    .reg .u64 %slo;
+    .reg .u64 %shi;
+    .reg .u64 %j;
+    .reg .u64 %cur;
+    .reg .u64 %slotu;
+
+    ld.param.u64 %payload, [payload_ptr];
+    ld.param.u64 %poffb, [probe_offsets_off];
+    add.u64 %poffb, %payload, %poffb;
+    ld.param.u64 %pbytesb, [probe_bytes_off];
+    add.u64 %pbytesb, %payload, %pbytesb;
+    ld.param.u64 %n, [probe_n];
+    ld.param.u64 %boffb, [build_offsets_off];
+    add.u64 %boffb, %payload, %boffb;
+    ld.param.u64 %bbytesb, [build_bytes_off];
+    add.u64 %bbytesb, %payload, %bbytesb;
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %sloth, [slot_head_ptr];
+    ld.param.u64 %nextp, [next_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %cap, [cap];
+    ld.param.u64 %outp, [out_pairs_ptr];
+    ld.param.u64 %curp, [out_cursor_ptr];
+    ld.param.u64 %vptr, [probe_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u64 %end, 0xffffffffffffffff;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjetn_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjetn_done;
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => valid (byte-identical). Else read bit i; a NULL
+    // probe key (bit 0) matches nothing -> emit no pairs (skip to the loop increment).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjetn_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjetn_next;
+hjetn_keyok:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %poffb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %startp, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %endp, {%w0, %w1};
+    sub.u64 %lenp, %endp, %startp;
+    add.u64 %taddrp, %pbytesb, %startp;
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %j, 0;
+hjetn_hash:
+    setp.ge.u64 %p, %j, %lenp;
+    @%p bra hjetn_hash_done;
+    add.u64 %addr, %taddrp, %j;
+    ld.global.u8 %w0, [%addr];
+    cvt.u64.u32 %tmp, %w0;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %j, %j, 1;
+    bra hjetn_hash;
+hjetn_hash_done:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjetn_find:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    ld.global.u64 %slo, [%addr];
+    ld.global.u64 %shi, [%addr+8];
+    setp.eq.u64 %p, %shi, %empty;
+    @%p bra hjetn_next;
+    setp.eq.u64 %p, %shi, %thash;
+    @!%p bra hjetn_advance_find;
+    // same hash -> VERIFY probe text[i] vs build rep text[slo]
+    mul.lo.u64 %o, %slo, 8;
+    add.u64 %addr, %boffb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %startb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %endb, {%w0, %w1};
+    sub.u64 %lenb, %endb, %startb;
+    setp.ne.u64 %p, %lenp, %lenb;
+    @%p bra hjetn_advance_find;
+    add.u64 %taddrb, %bbytesb, %startb;
+    mov.u64 %j, 0;
+hjetn_verify:
+    setp.ge.u64 %p, %j, %lenp;
+    @%p bra hjetn_walk;
+    add.u64 %addr, %taddrp, %j;
+    ld.global.u8 %ba, [%addr];
+    add.u64 %addr, %taddrb, %j;
+    ld.global.u8 %bb, [%addr];
+    setp.ne.u32 %p, %ba, %bb;
+    @%p bra hjetn_advance_find;
+    add.u64 %j, %j, 1;
+    bra hjetn_verify;
+hjetn_advance_find:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjetn_find;
+hjetn_walk:
+    mul.lo.u64 %o, %h, 8;
+    add.u64 %addr, %sloth, %o;
+    ld.global.u64 %cur, [%addr];
+hjetn_chain:
+    setp.eq.u64 %p, %cur, %end;
+    @%p bra hjetn_next;
+    mov.u64 %tmp, 1;
+    atom.global.add.u64 %slotu, [%curp], %tmp;
+    setp.lt.u64 %p, %slotu, %cap;
+    @!%p bra hjetn_chain_adv;
+    mul.lo.u64 %o, %slotu, 8;
+    add.u64 %addr, %outp, %o;
+    cvt.u32.u64 %bidx, %cur;
+    st.global.u32 [%addr], %bidx;
+    cvt.u32.u64 %pidx, %i;
+    st.global.u32 [%addr+4], %pidx;
+hjetn_chain_adv:
+    mul.lo.u64 %o, %cur, 8;
+    add.u64 %addr, %nextp, %o;
+    ld.global.u64 %cur, [%addr];
+    bra hjetn_chain;
+hjetn_next:
+    add.u64 %i, %i, %stride;
+    bra hjetn_loop;
+hjetn_done:
+    ret;
+}

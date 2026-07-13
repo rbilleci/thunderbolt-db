@@ -153,7 +153,7 @@ pub(super) fn launch_cuda_bool_to_int4_column_device<'r>(
         *mut *mut c_void,
     ) -> i32;
     type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("expression_varlen.ptx");
     if n == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
@@ -247,7 +247,7 @@ pub(super) fn launch_cuda_pack_two_int4_cols_device<'r>(
         *mut *mut c_void,
     ) -> i32;
     type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("derived_column.ptx");
     if n == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
@@ -335,7 +335,7 @@ pub(super) fn launch_cuda_pack_two_cols_i128_device<'r>(
         *mut *mut c_void,
     ) -> i32;
     type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("derived_column.ptx");
     if n == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
@@ -427,7 +427,7 @@ pub(super) fn launch_cuda_widen_col_to_i64_device<'r>(
         *mut *mut c_void,
     ) -> i32;
     type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("derived_column.ptx");
     if n == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
@@ -680,7 +680,7 @@ pub(super) fn launch_cuda_build_wide_key_device<'r>(
         *mut *mut c_void,
     ) -> i32;
     type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("derived_column.ptx");
     let (desc_flat, validity_flat, derived_ptr) =
         validate_wide_key_descriptors(resident, descriptors, wbytes, n, validity)?;
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -831,7 +831,7 @@ pub(super) fn launch_cuda_mark_new_distinct_device<'r>(
         *mut *mut c_void,
     ) -> i32;
     type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("derived_column.ptx");
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     if n_usize == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
@@ -972,7 +972,7 @@ pub(super) fn launch_cuda_mark_new_distinct_text_device<'r>(
         *mut *mut c_void,
     ) -> i32;
     type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("derived_column.ptx");
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     if n_usize == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));

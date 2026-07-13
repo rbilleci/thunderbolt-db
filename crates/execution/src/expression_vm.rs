@@ -460,7 +460,10 @@ pub(super) fn run_resident_arith_program<'r>(
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     type CuMemsetD32Async = unsafe extern "C" fn(u64, u32, usize, *mut c_void) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const I32_PTX: &[u8] = include_bytes!("expression_i32.ptx");
+    const I64_PTX: &[u8] = include_bytes!("expression_i64.ptx");
+    const I128_PTX: &[u8] = include_bytes!("expression_i128.ptx");
+    const VARLEN_PTX: &[u8] = include_bytes!("expression_varlen.ptx");
 
     validate_resident_arith_program(
         resident.metadata().allocated_bytes,
@@ -513,9 +516,23 @@ pub(super) fn run_resident_arith_program<'r>(
     } else {
         None
     };
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
-    ptx.push(0);
+    let mut i32_ptx = Vec::with_capacity(I32_PTX.len() + 1);
+    i32_ptx.extend_from_slice(I32_PTX);
+    i32_ptx.push(0);
+    let mut i64_ptx = Vec::with_capacity(I64_PTX.len() + 1);
+    i64_ptx.extend_from_slice(I64_PTX);
+    i64_ptx.push(0);
+    let mut i128_ptx = Vec::with_capacity(I128_PTX.len() + 1);
+    i128_ptx.extend_from_slice(I128_PTX);
+    i128_ptx.push(0);
+    let mut varlen_ptx = Vec::with_capacity(VARLEN_PTX.len() + 1);
+    varlen_ptx.extend_from_slice(VARLEN_PTX);
+    varlen_ptx.push(0);
+    let type_ptx = match elem {
+        ResidentElemType::I32 => i32_ptx.as_slice(),
+        ResidentElemType::I64 => i64_ptx.as_slice(),
+        ResidentElemType::I128 => i128_ptx.as_slice(),
+    };
     // Per-element-type kernels (the type matrix, doc 19); the mask-binary stage is type-agnostic.
     let (load_name, binary_name, scalar_name, compare_scalar_name, compare_buffers_name) =
         match elem {
@@ -541,19 +558,19 @@ pub(super) fn run_resident_arith_program<'r>(
                 c"gpu_db_buffer_i128_compare_buffers_to_mask",
             ),
         };
-    let load_fn = primary.cached_function(load_name, &ptx)?;
-    let buffer_binary_fn = primary.cached_function(binary_name, &ptx)?;
-    let scalar_binary_fn = primary.cached_function(scalar_name, &ptx)?;
-    let compare_scalar_mask_fn = primary.cached_function(compare_scalar_name, &ptx)?;
-    let compare_buffers_mask_fn = primary.cached_function(compare_buffers_name, &ptx)?;
-    let mask_binary_fn = primary.cached_function(c"gpu_db_mask_binary", &ptx)?;
+    let load_fn = primary.cached_function(load_name, type_ptx)?;
+    let buffer_binary_fn = primary.cached_function(binary_name, type_ptx)?;
+    let scalar_binary_fn = primary.cached_function(scalar_name, type_ptx)?;
+    let compare_scalar_mask_fn = primary.cached_function(compare_scalar_name, type_ptx)?;
+    let compare_buffers_mask_fn = primary.cached_function(compare_buffers_name, type_ptx)?;
+    let mask_binary_fn = primary.cached_function(c"gpu_db_mask_binary", &i32_ptx)?;
     // Text equality -> i32 mask, so the VM can combine text `=`/`<>` with AND/OR (text IN, multi-text
     // WHERE). The needle is the varlen bytes `text_needles[needle_idx]`. Loaded lazily (only if used).
     let text_eq_mask_fn = if program
         .iter()
         .any(|s| matches!(s, ExprStep::TextEqMask { .. }))
     {
-        Some(primary.cached_function(c"gpu_db_resident_text_eq_scalar_to_mask", &ptx)?)
+        Some(primary.cached_function(c"gpu_db_resident_text_eq_scalar_to_mask", &varlen_ptx)?)
     } else {
         None
     };
@@ -564,7 +581,7 @@ pub(super) fn run_resident_arith_program<'r>(
         .iter()
         .any(|s| matches!(s, ExprStep::TextCmpMask { .. }))
     {
-        Some(primary.cached_function(c"gpu_db_resident_text_compare_scalar_to_mask", &ptx)?)
+        Some(primary.cached_function(c"gpu_db_resident_text_compare_scalar_to_mask", &varlen_ptx)?)
     } else {
         None
     };
@@ -574,7 +591,7 @@ pub(super) fn run_resident_arith_program<'r>(
         .iter()
         .any(|s| matches!(s, ExprStep::UuidCmpMask { .. }))
     {
-        Some(primary.cached_function(c"gpu_db_resident_uuid_compare_scalar_to_mask", &ptx)?)
+        Some(primary.cached_function(c"gpu_db_resident_uuid_compare_scalar_to_mask", &varlen_ptx)?)
     } else {
         None
     };
@@ -584,7 +601,10 @@ pub(super) fn run_resident_arith_program<'r>(
         .iter()
         .any(|s| matches!(s, ExprStep::TextCmpColumnsMask { .. }))
     {
-        Some(primary.cached_function(c"gpu_db_resident_text_compare_columns_to_mask", &ptx)?)
+        Some(
+            primary
+                .cached_function(c"gpu_db_resident_text_compare_columns_to_mask", &varlen_ptx)?,
+        )
     } else {
         None
     };
@@ -594,7 +614,10 @@ pub(super) fn run_resident_arith_program<'r>(
         .iter()
         .any(|s| matches!(s, ExprStep::UuidCmpColumnsMask { .. }))
     {
-        Some(primary.cached_function(c"gpu_db_resident_uuid_compare_columns_to_mask", &ptx)?)
+        Some(
+            primary
+                .cached_function(c"gpu_db_resident_uuid_compare_columns_to_mask", &varlen_ptx)?,
+        )
     } else {
         None
     };
@@ -605,7 +628,7 @@ pub(super) fn run_resident_arith_program<'r>(
         .iter()
         .any(|s| matches!(s, ExprStep::TextLikeMask { .. }))
     {
-        Some(primary.cached_function(c"gpu_db_resident_text_like_scalar_to_mask", &ptx)?)
+        Some(primary.cached_function(c"gpu_db_resident_text_like_scalar_to_mask", &varlen_ptx)?)
     } else {
         None
     };
@@ -614,7 +637,7 @@ pub(super) fn run_resident_arith_program<'r>(
         .iter()
         .any(|s| matches!(s, ExprStep::BoolMask { .. }))
     {
-        Some(primary.cached_function(c"gpu_db_resident_bool_to_mask", &ptx)?)
+        Some(primary.cached_function(c"gpu_db_resident_bool_to_mask", &varlen_ptx)?)
     } else {
         None
     };
@@ -631,8 +654,8 @@ pub(super) fn run_resident_arith_program<'r>(
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
     let (i64_load_fn, i64_compare_scalar_mask_fn) = if has_i64_step {
         (
-            Some(primary.cached_function(c"gpu_db_resident_i64_load_column", &ptx)?),
-            Some(primary.cached_function(c"gpu_db_buffer_i64_compare_scalar_to_mask", &ptx)?),
+            Some(primary.cached_function(c"gpu_db_resident_i64_load_column", &i64_ptx)?),
+            Some(primary.cached_function(c"gpu_db_buffer_i64_compare_scalar_to_mask", &i64_ptx)?),
         )
     } else {
         (None, None)
@@ -642,14 +665,16 @@ pub(super) fn run_resident_arith_program<'r>(
     // binary kernel (mul.hi), so this stays None there.
     let i128_mul_scalar_fn = match elem {
         ResidentElemType::I128 => {
-            Some(primary.cached_function(c"gpu_db_buffer_i128_mul_scalar", &ptx)?)
+            Some(primary.cached_function(c"gpu_db_buffer_i128_mul_scalar", &i128_ptx)?)
         }
         ResidentElemType::I32 | ResidentElemType::I64 => None,
     };
     // column*column multiply for I128 is its own kernel too; None for int4/int8 (their binary kernel
     // handles multiply), so the BufferBinary arm keeps using buffer_binary_fn there.
     let i128_mul_buffer_fn = match elem {
-        ResidentElemType::I128 => Some(primary.cached_function(c"gpu_db_buffer_i128_mul", &ptx)?),
+        ResidentElemType::I128 => {
+            Some(primary.cached_function(c"gpu_db_buffer_i128_mul", &i128_ptx)?)
+        }
         ResidentElemType::I32 | ResidentElemType::I64 => None,
     };
 

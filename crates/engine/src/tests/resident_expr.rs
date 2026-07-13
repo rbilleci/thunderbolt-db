@@ -2450,9 +2450,9 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_and_or() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_runs_text_equality() {
-    // Text equality on the general GPU executor (the type matrix, doc 19): byte-wise = / <>. The 7-row
-    // (ODD) count places the text offsets section at a 4-mod-8 byte offset (8 header + 7*4 int4 = 36),
-    // exercising the 2x 4-byte offset loads end to end through the real residency builder.
+    // Text equality on the general GPU executor (the type matrix, doc 19): byte-wise = / <>. The
+    // residency builder pads the text offsets section to its required 8-byte alignment even after an
+    // odd-sized int4 section.
     let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)")
         .unwrap();
@@ -2544,7 +2544,8 @@ fn gpu_execute_resident_expr_select_sql_runs_text_equality() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_runs_text_like() {
     // Text LIKE on the general GPU executor (the type matrix, doc 19): general %/_ backtracking match.
-    // 7 rows (ODD) -> text offsets at a 4-mod-8 byte offset. Includes the `\_` escape vs a bare `_`.
+    // The offsets section remains 8-byte aligned after the odd-sized int4 section. Includes the `\_`
+    // escape vs a bare `_`.
     let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)")
         .unwrap();

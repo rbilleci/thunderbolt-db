@@ -1,0 +1,1150 @@
+.version 8.4
+.target sm_90
+.address_size 64
+
+// Hand-maintained PTX; ownership follows the matching Rust operator module.
+
+
+// GROUP BY an int4 key, aggregating COUNT(*) and SUM(int4 value) into an open-addressing hash table
+// (the operator axis, doc 19; the general path -- the enumerated GROUP BY is a host BTreeMap).
+//   slot_keys : [s64; NSLOTS] host-init to EMPTY (i64::MIN) via gpu_db_fill_i64.
+//   slot_count: [u64; NSLOTS] host-init 0.   slot_sum: [s64; NSLOTS] host-init 0.
+// NSLOTS is a power of two (mask = NSLOTS-1) sized > distinct keys, so linear probing terminates.
+// Each thread r<count reads key/val = the int4 columns at row indices[r], murmur3-64-finalizes the
+// key to a slot, linear-probes with atom.cas.b64 to claim/find the group, then atom.add count + sum.
+// For COUNT(*) the caller passes sum_byte_offset = key_byte_offset (the summed value is ignored).
+.visible .entry gpu_db_group_by_i32_count_sum(
+    .param .u64 resident_ptr,
+    .param .u64 key_byte_offset,
+    .param .u64 sum_byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u64 mask,
+    .param .u64 slot_keys_ptr,
+    .param .u64 slot_count_ptr,
+    .param .u64 slot_sum_ptr,
+    .param .u64 slot_min_ptr,
+    .param .u64 slot_max_ptr,
+    .param .u64 value_is_int8,
+    .param .u64 slot_sum_hi_ptr,
+    .param .u64 key_is_int8,
+    .param .u64 value_is_numeric,
+    .param .u64 overflow_flag_ptr,
+    .param .u64 slot_min_hi_ptr,
+    .param .u64 slot_max_hi_ptr,
+    .param .u64 row_slots_ptr,
+    .param .u64 value_is_uuid,
+    .param .u64 slot_min_uuid_ptr,
+    .param .u64 slot_max_uuid_ptr,
+    .param .u64 key_is_i128,
+    .param .u64 slot_keys_i128_ptr,
+    .param .u64 key_is_text,
+    .param .u64 key_offsets_off,
+    .param .u64 key_bytes_off,
+    .param .u64 value_is_text,
+    .param .u64 value_offsets_off,
+    .param .u64 value_bytes_off,
+    .param .u64 key_base_override,
+    .param .u64 value_base_override,
+    // General all-fixed COMPOSITE key: when comp_w > 0 the key is a `comp_w`-byte WIDE KEY per row in
+    // key_base_override (built by gpu_db_build_wide_key) -- grouped via a (rep_idx, hash) b128 claim
+    // that hashes + memcmps the comp_w bytes. 0 = not a wide-key composite (every existing path).
+    .param .u64 comp_w,
+    // General COMPOSITE with TEXT members: n_text members, each (offsets_off, bytes_off, bytes_len)
+    // in text_desc_ptr. The wide-key claim ALSO folds every text member's bytes into the hash AND
+    // byte-verifies it (row idx vs the representative olo). 0 = no text members (the all-fixed wide key,
+    // byte-identical). comp_w may be 0 here (a pure all-text composite, e.g. two-text), so the wide-key
+    // path is entered on comp_w>0 OR n_text>0.
+    .param .u64 n_text,
+    .param .u64 text_desc_ptr,
+    // M3 (doc 21) 3VL: the VALUE column's NULL validity bitmap byte offset (1 = valid, 0 = NULL), or the
+    // sentinel u64::MAX = no bitmap => every value valid. A NULL value is SKIPPED from count/sum/min/max
+    // (the slot is still claimed by the KEY above, so the group still appears) -> non-NULL aggregate
+    // semantics; COUNT(*) passes the sentinel so it counts every row.
+    .param .u64 value_null_off,
+    // M3 (doc 21) 3VL: the KEY column's NULL validity bitmap byte offset (1 = valid), or sentinel
+    // u64::MAX = no bitmap => every key valid. A NULL key routes to the dedicated NULL-KEY slot
+    // (index nslots+1 = mask+2), forming ONE group (NULLs group together, distinct from real keys).
+    .param .u64 key_null_off,
+    // Query-aware aggregate-selection MASK (grouped_agg_mask: 1=COUNT, 2=SUM, 4=MIN, 8=MAX; ALL=15).
+    // Only the SELECTED fields' per-row update atomics run; the slot CLAIM + GROUP-KEY emit ALWAYS run
+    // (group identity is mask-independent). Masked-out fields stay at their init sentinels (count/sum=0,
+    // min=INT_MAX, max=INT_MIN); the host reads only the masked-in field(s) -> byte-identical for them.
+    .param .u64 agg_mask,
+    // Exact resident text byte extents plus a device error flag. Fixed-width windows and offsets arrays
+    // are checked on the host; every varlen span is checked here before any byte read.
+    .param .u64 key_bytes_limit,
+    .param .u64 value_bytes_limit,
+    .param .u64 input_error_flag
+)
+{
+    .reg .u32 %aggm;
+    .reg .u32 %aggt;
+    .reg .pred %pagg;
+    .reg .u64 %m3vnoff;
+    .reg .u64 %m3vsent;
+    .reg .u64 %m3vwd;
+    .reg .u64 %m3vaddr;
+    .reg .u32 %m3vbw;
+    .reg .u32 %m3vbt;
+    .reg .u32 %m3vbp;
+    .reg .pred %m3pnob;
+    .reg .pred %m3pnul;
+    .reg .u64 %m3knoff;
+    .reg .u64 %m3kwd;
+    .reg .u64 %m3kaddr;
+    .reg .u32 %m3kbw;
+    .reg .u32 %m3kbt;
+    .reg .u32 %m3kbp;
+    .reg .pred %m3pknob;
+    .reg .pred %m3pknul;
+    .reg .pred %pvt;
+    .reg .pred %plt;
+    .reg .pred %pgt;
+    .reg .u64 %vtext;
+    .reg .u64 %voffoff;
+    .reg .u64 %vbytesoff;
+    .reg .u64 %klimit;
+    .reg .u64 %vlimit;
+    .reg .u64 %inerr;
+    .reg .u64 %errone;
+    .reg .u64 %vstart;
+    .reg .u64 %vend;
+    .reg .u64 %vlen;
+    .reg .u64 %vbaddr;
+    .reg .u64 %curidx;
+    .reg .u64 %thisidx;
+    .reg .u64 %cstart;
+    .reg .u64 %cend;
+    .reg .u64 %clen;
+    .reg .u64 %caddr;
+    .reg .u64 %minlen;
+    .reg .u64 %oldidx;
+    .reg .s64 %cmp;
+    .reg .pred %pkt;
+    .reg .u64 %ktext;
+    .reg .u64 %koffoff;
+    .reg .u64 %kbytesoff;
+    .reg .u64 %thash;
+    .reg .u64 %tstart;
+    .reg .u64 %tend;
+    .reg .u64 %tlen;
+    .reg .u64 %taddr;
+    .reg .u64 %sstart;
+    .reg .u64 %send;
+    .reg .u64 %slen;
+    .reg .u64 %vaddr;
+    .reg .u64 %babase;
+    .reg .u64 %aaddr;
+    .reg .u64 %baddr;
+    .reg .u64 %jt;
+    .reg .u64 %o8;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
+    .reg .pred %pki;
+    .reg .u64 %ki128;
+    .reg .u64 %ski128;
+    .reg .u64 %keylo;
+    .reg .u64 %keyhi;
+    .reg .b128 %key128;
+    .reg .b128 %empty128;
+    .reg .pred %p;
+    .reg .pred %pe;
+    .reg .pred %pf;
+    .reg .pred %puu;
+    .reg .u64 %vuu;
+    .reg .u64 %mnuptr;
+    .reg .u64 %mxuptr;
+    .reg .u64 %off16;
+    .reg .b128 %val128;
+    .reg .b128 %cur128;
+    .reg .b128 %old128;
+    .reg .u64 %ulo;
+    .reg .u64 %uhi;
+    .reg .u64 %clo;
+    .reg .u64 %chi;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .u32 %bw0;
+    .reg .u32 %bw1;
+    .reg .u32 %bw2;
+    .reg .u32 %bw3;
+    .reg .pred %claimed;
+    .reg .pred %pc;
+    .reg .pred %pk;
+    .reg .pred %pmin;
+    .reg .pred %pvn;
+    .reg .pred %pov;
+    .reg .pred %plk;
+    .reg .pred %pa;
+    .reg .pred %pb;
+    .reg .pred %pupd;
+    .reg .u64 %mnhiptr;
+    .reg .u64 %mxhiptr;
+    .reg .u64 %rsptr;
+    .reg .u64 %loff;
+    .reg .u64 %laddr;
+    .reg .u64 %a1;
+    .reg .u64 %a2;
+    .reg .u64 %cmlo;
+    .reg .s64 %cmhi;
+    .reg .u32 %lockold;
+    .reg .u64 %v8;
+    .reg .u64 %k8;
+    .reg .u64 %vn;
+    .reg .u64 %voff;
+    .reg .u64 %koff2;
+    .reg .u32 %vlo;
+    .reg .u32 %vhi;
+    .reg .u32 %vlo2;
+    .reg .u32 %vhi2;
+    .reg .u32 %klo;
+    .reg .u32 %khi;
+    .reg .u64 %shptr;
+    .reg .u64 %ovptr;
+    .reg .u64 %oldlo;
+    .reg .u64 %newlo;
+    .reg .s64 %carry;
+    .reg .s64 %hi;
+    .reg .s64 %valhi;
+    .reg .s64 %oldhi;
+    .reg .s64 %newhi;
+    .reg .s64 %addend;
+    .reg .b64 %t1;
+    .reg .b64 %t2;
+    .reg .pred %mine;
+    .reg .pred %hit;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %idx;
+    .reg .s32 %k32;
+    .reg .s32 %v32;
+    .reg .s64 %key;
+    .reg .s64 %val;
+    .reg .s64 %empty;
+    .reg .s64 %cur;
+    .reg .b64 %mix;
+    .reg .b64 %tmp;
+    .reg .u64 %base;
+    .reg .u64 %iptr;
+    .reg .u64 %kptr;
+    .reg .u64 %cptr;
+    .reg .u64 %sptr;
+    .reg .u64 %mnptr;
+    .reg .u64 %mxptr;
+    .reg .u64 %count;
+    .reg .u64 %mask;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %h;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .u64 %koff;
+    .reg .u64 %soff;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %koff, [key_byte_offset];
+    ld.param.u64 %soff, [sum_byte_offset];
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %kptr, [slot_keys_ptr];
+    ld.param.u64 %cptr, [slot_count_ptr];
+    ld.param.u64 %sptr, [slot_sum_ptr];
+    ld.param.u64 %mnptr, [slot_min_ptr];
+    ld.param.u64 %mxptr, [slot_max_ptr];
+    ld.param.u64 %v8, [value_is_int8];
+    ld.param.u64 %shptr, [slot_sum_hi_ptr];
+    ld.param.u64 %k8, [key_is_int8];
+    ld.param.u64 %vn, [value_is_numeric];
+    ld.param.u64 %ovptr, [overflow_flag_ptr];
+    ld.param.u64 %mnhiptr, [slot_min_hi_ptr];
+    ld.param.u64 %mxhiptr, [slot_max_hi_ptr];
+    ld.param.u64 %rsptr, [row_slots_ptr];
+    ld.param.u64 %vuu, [value_is_uuid];
+    ld.param.u64 %mnuptr, [slot_min_uuid_ptr];
+    ld.param.u64 %mxuptr, [slot_max_uuid_ptr];
+    ld.param.u64 %m3vnoff, [value_null_off];
+    ld.param.u64 %m3knoff, [key_null_off];
+    ld.param.u32 %aggm, [agg_mask];
+    mov.u64 %m3vsent, 0xFFFFFFFFFFFFFFFF;
+    ld.param.u64 %ki128, [key_is_i128];
+    ld.param.u64 %ski128, [slot_keys_i128_ptr];
+    ld.param.u64 %ktext, [key_is_text];
+    ld.param.u64 %koffoff, [key_offsets_off];
+    ld.param.u64 %kbytesoff, [key_bytes_off];
+    ld.param.u64 %vtext, [value_is_text];
+    ld.param.u64 %voffoff, [value_offsets_off];
+    ld.param.u64 %vbytesoff, [value_bytes_off];
+    ld.param.u64 %klimit, [key_bytes_limit];
+    ld.param.u64 %vlimit, [value_bytes_limit];
+    ld.param.u64 %inerr, [input_error_flag];
+    mov.u64 %errone, 1;
+    .reg .u64 %kbov;
+    .reg .pred %pkbov;
+    ld.param.u64 %kbov, [key_base_override];
+    .reg .u64 %vbov;
+    .reg .pred %pvbov;
+    ld.param.u64 %vbov, [value_base_override];
+    .reg .u64 %compw;
+    .reg .pred %pcw;
+    .reg .pred %pnt;
+    .reg .pred %pgen;
+    .reg .u64 %wkbase;
+    .reg .u64 %wkb;
+    .reg .u64 %jw;
+    // General-composite text members: n_text + the (offsets_off, bytes_off) descriptor array, plus the
+    // per-member scratch used by the wide-key hash/verify text loops.
+    .reg .u64 %ntext;
+    .reg .u64 %tdesc;
+    .reg .u64 %tmem;
+    .reg .u64 %tdbase;
+    .reg .u64 %tdooff;
+    .reg .u64 %tdboff;
+    .reg .u64 %tdlim;
+    .reg .u64 %mstart;
+    .reg .u64 %mend;
+    .reg .u64 %mlen;
+    .reg .u64 %mbaddr;
+    .reg .u64 %rstart;
+    .reg .u64 %rend;
+    .reg .u64 %rlen;
+    .reg .u64 %rbaddr;
+    .reg .u64 %jm;
+    ld.param.u64 %compw, [comp_w];
+    ld.param.u64 %ntext, [n_text];
+    ld.param.u64 %tdesc, [text_desc_ptr];
+    mov.s64 %empty, -9223372036854775808;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+row_loop:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra row_done;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %iptr, %off;
+    ld.global.u32 %idx, [%addr];
+    cvt.u64.u32 %off, %idx;
+    mul.lo.u64 %off, %off, 4;
+    add.u64 %addr, %base, %koff;
+    // Derived group key (GROUP BY <expr>): a non-zero key_base_override replaces base+koff with the
+    // materialized expr key buffer; the int4/int8 stride (idx*4 / idx*8) below then applies. Override
+    // 0 -> byte-identical to the column-key path. A derived key is always int (ktext/ki128/k128 = 0).
+    setp.ne.u64 %pkbov, %kbov, 0;
+    @%pkbov mov.u64 %addr, %kbov;
+    // General COMPOSITE: comp_w > 0 (fixed bytes at kbov + idx*comp_w) OR n_text > 0 (text members) ->
+    // the wide-key (rep_idx, hash) claim. A pure all-text composite has comp_w == 0, so route on either.
+    setp.ne.u64 %pcw, %compw, 0;
+    setp.ne.u64 %pnt, %ntext, 0;
+    or.pred %pgen, %pcw, %pnt;
+    @%pgen bra gb_kwidekey;
+    setp.ne.u64 %pkt, %ktext, 0;
+    @%pkt bra gb_ktext;
+    setp.ne.u64 %pki, %ki128, 0;
+    @%pki bra gb_ki128;
+    setp.ne.u64 %pk, %k8, 0;
+    @%pk bra gb_ki64;
+    // int4 key: 4-byte stride, sign-extend to s64.
+    add.u64 %addr, %addr, %off;
+    ld.global.s32 %k32, [%addr];
+    cvt.s64.s32 %key, %k32;
+    bra gb_kdone;
+gb_ki64:
+    // int8 key: 8-byte stride, read as 2x4-byte, pack to s64.
+    cvt.u64.u32 %koff2, %idx;
+    mul.lo.u64 %koff2, %koff2, 8;
+    add.u64 %addr, %addr, %koff2;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %key, {%klo, %khi};
+    bra gb_kdone;
+gb_ki128:
+    // i128 key (numeric mantissa OR uuid bytes): 16-byte stride, read 4x4-byte -> keylo (bytes 0-7),
+    // keyhi (bytes 8-15). Equality key (no ordering) -> raw LE limbs, identical read for numeric+uuid.
+    cvt.u64.u32 %koff2, %idx;
+    mul.lo.u64 %koff2, %koff2, 16;
+    add.u64 %addr, %addr, %koff2;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %keylo, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %keyhi, {%klo, %khi};
+    bra gb_kdone;
+gb_ktext:
+    // text key: read offsets[idx] (8-byte entries, 2x4-byte load -- section may be 4-mod-8 aligned),
+    // FNV-1a-64 hash the bytes -> %thash; key128 = (lo=idx, hi=thash). %tstart/%tlen/%taddr are kept
+    // for the verify in the claim step. Remap thash==i64::MIN->0 so (idx,thash) never aliases EMPTY128.
+    cvt.u64.u32 %koff2, %idx;
+    mul.lo.u64 %o8, %koff2, 8;
+    add.u64 %addr, %base, %koffoff;
+    add.u64 %addr, %addr, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %tstart, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %tend, {%klo, %khi};
+    setp.gt.u64 %p, %tstart, %tend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %tend, %klimit;
+    @%p bra group_input_invalid;
+    sub.u64 %tlen, %tend, %tstart;
+    add.u64 %taddr, %base, %kbytesoff;
+    add.u64 %taddr, %taddr, %tstart;
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %jt, 0;
+ktext_hash:
+    setp.ge.u64 %p, %jt, %tlen;
+    @%p bra ktext_hash_done;
+    add.u64 %aaddr, %taddr, %jt;
+    ld.global.u8 %abyte, [%aaddr];
+    cvt.u64.u32 %tmp, %abyte;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %jt, %jt, 1;
+    bra ktext_hash;
+ktext_hash_done:
+    // Composite (fixed-width member, text member): a NON-ZERO key_base_override holds the fixed member's
+    // i64 value per row (materialized into a derived buffer). Fold kbov[idx] into the hash so tuples that
+    // differ only in the fixed member hash differently; the verify in the claim ALSO compares it. A
+    // plain text key has kbov == 0 (this fold is skipped -> byte-identical to the single-text-key path).
+    setp.eq.u64 %p, %kbov, 0;
+    @%p bra ktext_no_fixed;
+    cvt.u64.u32 %o8, %idx;
+    mul.lo.u64 %o8, %o8, 8;
+    add.u64 %addr, %kbov, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %tmp, {%klo, %khi};
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+ktext_no_fixed:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    cvt.u64.u32 %keylo, %idx;
+    mov.u64 %keyhi, %thash;
+    mov.b128 %key128, {%keylo, %keyhi};
+    bra gb_kdone;
+gb_kwidekey:
+    // General all-fixed COMPOSITE key: FNV-1a-64 hash the comp_w wide-key bytes at kbov + idx*comp_w
+    // -> thash; key128 = (lo=idx, hi=thash). Remap thash==i64::MIN->0 so (idx,thash) never aliases
+    // EMPTY128. The claim verifies the comp_w bytes (memcmp) on a hash collision (gb_kwidekeyclaim).
+    cvt.u64.u32 %koff2, %idx;
+    mul.lo.u64 %o8, %koff2, %compw;
+    add.u64 %wkbase, %kbov, %o8;
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %jw, 0;
+wkey_hash:
+    setp.ge.u64 %p, %jw, %compw;
+    @%p bra wkey_hash_text;
+    add.u64 %addr, %wkbase, %jw;
+    ld.global.u8 %abyte, [%addr];
+    cvt.u64.u32 %tmp, %abyte;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %jw, %jw, 1;
+    bra wkey_hash;
+wkey_hash_text:
+    // Fold each text member's bytes (row idx) into the same FNV hash. n_text == 0 -> 0 iterations, so
+    // the all-fixed wide key is byte-identical. The verify (gb_kwidekeyclaim) re-checks every member, so
+    // hashing without a separator is collision-safe (a collision merely probes; it never mis-groups).
+    mov.u64 %tmem, 0;
+wkey_htext_member:
+    setp.ge.u64 %p, %tmem, %ntext;
+    @%p bra wkey_hash_done;
+    mul.lo.u64 %o8, %tmem, 24;
+    add.u64 %tdbase, %tdesc, %o8;
+    ld.global.u64 %tdooff, [%tdbase];
+    ld.global.u64 %tdboff, [%tdbase+8];
+    ld.global.u64 %tdlim, [%tdbase+16];
+    cvt.u64.u32 %o8, %idx;
+    mul.lo.u64 %o8, %o8, 8;
+    add.u64 %addr, %base, %tdooff;
+    add.u64 %addr, %addr, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %mstart, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %mend, {%klo, %khi};
+    setp.gt.u64 %p, %mstart, %mend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %mend, %tdlim;
+    @%p bra group_input_invalid;
+    sub.u64 %mlen, %mend, %mstart;
+    add.u64 %mbaddr, %base, %tdboff;
+    add.u64 %mbaddr, %mbaddr, %mstart;
+    mov.u64 %jm, 0;
+wkey_htext_byte:
+    setp.ge.u64 %p, %jm, %mlen;
+    @%p bra wkey_htext_member_next;
+    add.u64 %addr, %mbaddr, %jm;
+    ld.global.u8 %abyte, [%addr];
+    cvt.u64.u32 %tmp, %abyte;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %jm, %jm, 1;
+    bra wkey_htext_byte;
+wkey_htext_member_next:
+    add.u64 %tmem, %tmem, 1;
+    bra wkey_htext_member;
+wkey_hash_done:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    cvt.u64.u32 %keylo, %idx;
+    mov.u64 %keyhi, %thash;
+    mov.b128 %key128, {%keylo, %keyhi};
+gb_kdone:
+    add.u64 %addr, %base, %soff;
+    // Derived value column (bool MIN/MAX materialized to int4): a non-zero value_base_override replaces
+    // base+soff with the derived buffer; the int4 idx*4 stride below applies. Override 0 -> byte-
+    // identical column-value path. A derived value is always int4 (vtext/vuu/vn/v8 = 0).
+    setp.ne.u64 %pvbov, %vbov, 0;
+    @%pvbov mov.u64 %addr, %vbov;
+    setp.ne.u64 %pvt, %vtext, 0;
+    @%pvt bra gb_vtext;
+    setp.ne.u64 %puu, %vuu, 0;
+    @%puu bra gb_vuuid;
+    setp.ne.u64 %pvn, %vn, 0;
+    @%pvn bra gb_vnum;
+    setp.ne.u64 %p, %v8, 0;
+    @%p bra gb_vi64;
+    // int4 value: 4-byte stride, sign-extend to s64.
+    add.u64 %addr, %addr, %off;
+    ld.global.s32 %v32, [%addr];
+    cvt.s64.s32 %val, %v32;
+    bra gb_vdone;
+gb_vtext:
+    // text value: offsets[idx]/offsets[idx+1] from base+voffoff, bytes at base+vbytesoff+start. No SUM
+    // (val=0); MIN/MAX uses %vstart/%vlen/%vaddr in gb_textminmax (lexicographic CAS on the row index).
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 8;
+    add.u64 %addr, %base, %voffoff;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %vlo, [%addr];
+    ld.global.u32 %vhi, [%addr+4];
+    mov.b64 %vstart, {%vlo, %vhi};
+    ld.global.u32 %vlo, [%addr+8];
+    ld.global.u32 %vhi, [%addr+12];
+    mov.b64 %vend, {%vlo, %vhi};
+    setp.gt.u64 %p, %vstart, %vend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %vend, %vlimit;
+    @%p bra group_input_invalid;
+    sub.u64 %vlen, %vend, %vstart;
+    add.u64 %vbaddr, %base, %vbytesoff;
+    add.u64 %vbaddr, %vbaddr, %vstart;
+    mov.u64 %val, 0;
+    bra gb_vdone;
+gb_vi64:
+    // int8 value: 8-byte stride, read as 2x4-byte (section may be 4-mod-8 aligned), pack to s64.
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 8;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %vlo, [%addr];
+    ld.global.u32 %vhi, [%addr+4];
+    mov.b64 %val, {%vlo, %vhi};
+    bra gb_vdone;
+gb_vnum:
+    // numeric value: i128 mantissa, 16-byte stride, read as 4x4-byte. low i64 -> %val, high i64 -> %valhi.
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 16;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %vlo, [%addr];
+    ld.global.u32 %vhi, [%addr+4];
+    mov.b64 %val, {%vlo, %vhi};
+    ld.global.u32 %vlo2, [%addr+8];
+    ld.global.u32 %vhi2, [%addr+12];
+    mov.b64 %valhi, {%vlo2, %vhi2};
+    bra gb_vdone;
+gb_vuuid:
+    // uuid: 16 raw bytes, UNSIGNED BIG-ENDIAN order. Read 4x4-byte, byte-reverse each word (prmt) and
+    // assemble two BE u64 limbs (%uhi = bytes 0-7 big-endian, %ulo = bytes 8-15), then pack the b128
+    // (uhi:ulo) so an unsigned 128-bit compare == the uuid memcmp order.
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 16;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %bw0, [%addr];
+    ld.global.u32 %bw1, [%addr+4];
+    ld.global.u32 %bw2, [%addr+8];
+    ld.global.u32 %bw3, [%addr+12];
+    prmt.b32 %bw0, %bw0, 0, 0x0123;
+    prmt.b32 %bw1, %bw1, 0, 0x0123;
+    prmt.b32 %bw2, %bw2, 0, 0x0123;
+    prmt.b32 %bw3, %bw3, 0, 0x0123;
+    mov.b64 %uhi, {%bw1, %bw0};
+    mov.b64 %ulo, {%bw3, %bw2};
+    mov.b128 %val128, {%ulo, %uhi};
+gb_vdone:
+    // M3 (doc 21): NULL-key check FIRST -- BEFORE the type dispatch -- so a NULL key of ANY single-column
+    // type (int2/4/8/date/timestamp/text/numeric/uuid) routes to the dedicated NULL-KEY slot (gb_nullkey,
+    // index nslots+1 = mask+2): one group for all NULL keys, no hash, no claim, distinct from real key 0 /
+    // empty text / etc. The engine passes a real key_null_off ONLY for a SINGLE-COLUMN key; a COMPOSITE /
+    // EXPRESSION key passes the sentinel (0xFFFF...) so this is skipped and the dispatch claims it
+    // unchanged (a nullable composite/expression key is rejected upstream -- its per-member NULL semantics
+    // need a different encoding than one reserved slot). The non-NULL rows fall through to the dispatch.
+    setp.eq.u64 %m3pknob, %m3knoff, %m3vsent;
+    @%m3pknob bra gb_keydispatch;
+    shr.u32 %m3kbp, %idx, 5;            // key validity word index = idx / 32
+    mul.lo.u32 %m3kbp, %m3kbp, 4;       // * 4 bytes per u32 word
+    cvt.u64.u32 %m3kwd, %m3kbp;
+    add.u64 %m3kaddr, %base, %m3knoff;
+    add.u64 %m3kaddr, %m3kaddr, %m3kwd;
+    ld.global.u32 %m3kbw, [%m3kaddr];
+    and.b32 %m3kbp, %idx, 31;           // bit = idx % 32
+    bfe.u32 %m3kbt, %m3kbw, %m3kbp, 1;
+    setp.eq.u32 %m3pknul, %m3kbt, 0;    // 0 = NULL key
+    @%m3pknul bra gb_nullkey;
+gb_keydispatch:
+    // General COMPOSITE claim: comp_w > 0 OR n_text > 0 (a pure all-text composite has comp_w == 0, so
+    // route on either -- mirrors the key-build routing; without the n_text leg a pure-text key would
+    // fall through to the i64 claim on a stale %key and collapse every row into one group).
+    setp.ne.u64 %pcw, %compw, 0;
+    setp.ne.u64 %pnt, %ntext, 0;
+    or.pred %pgen, %pcw, %pnt;
+    @%pgen bra gb_kwidekeyclaim;
+    @%pkt bra gb_ktextclaim;
+    @%pki bra gb_ki128claim;
+    // int4/i64 fall-through (NULL keys already routed to gb_nullkey above). The key i64::MIN collides with
+    // the EMPTY sentinel, so route it to a dedicated slot at index nslots (= mask+1, outside the hash range).
+    setp.eq.s64 %pmin, %key, %empty;
+    @%pmin bra gb_minkey;
+    mov.b64 %mix, %key;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+probe_loop:
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %kptr, %off;
+    atom.global.cas.b64 %cur, [%addr], %empty, %key;
+    setp.eq.s64 %claimed, %cur, %empty;
+    setp.eq.s64 %mine, %cur, %key;
+    or.pred %hit, %claimed, %mine;
+    @%hit bra do_agg;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra probe_loop;
+gb_minkey:
+    add.u64 %h, %mask, 1;
+    // M3 (doc 21): mark the reserved slot as USED (slot_keys = 0, != EMPTY = i64::MIN) so the launcher
+    // emits it on `keys[slot] != EMPTY` -- NOT on count > 0. The reserved slots are never CLAIMED via
+    // CAS, so a count-0 reserved group (all-NULL aggregate values) must still be emitted, consistently
+    // across EVERY pass, or the by-index pass merge mis-aligns. (do_agg recomputes %off/%addr/%tmp.)
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %kptr, %off;
+    mov.u64 %tmp, 0;
+    st.global.u64 [%addr], %tmp;
+    bra do_agg;
+gb_nullkey:
+    // The dedicated NULL-KEY slot (index nslots+1 = mask+2). do_agg's value-skip still applies, so a
+    // NULL-key row with a NULL value is counted in COUNT(*) but skipped from the value aggregate. Mark
+    // it USED (slot_keys = 0) like gb_minkey so a count-0 null group is still emitted (pass alignment).
+    add.u64 %h, %mask, 2;
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %kptr, %off;
+    mov.u64 %tmp, 0;
+    st.global.u64 [%addr], %tmp;
+    bra do_agg;
+gb_ki128claim:
+    // i128 key (numeric mantissa OR uuid bytes): claim via native 128-bit CAS. EMPTY128 = i128::MIN =
+    // (lo=0, hi=i64::MIN). A key == i128::MIN (only a uuid byte-pattern can be that; no numeric mantissa
+    // reaches it -- it's outside the +/-10^38 range) routes to the SAME dedicated slot as the i64 path.
+    setp.eq.u64 %pe, %keylo, 0;
+    setp.eq.u64 %pf, %keyhi, %empty;
+    and.pred %pmin, %pe, %pf;
+    @%pmin bra gb_minkey;
+    xor.b64 %mix, %keylo, %keyhi;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+    mov.u64 %clo, 0;
+    mov.b128 %empty128, {%clo, %empty};
+    mov.b128 %key128, {%keylo, %keyhi};
+probe_loop128:
+    mul.lo.u64 %off16, %h, 16;
+    add.u64 %addr, %ski128, %off16;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, 0;
+    setp.eq.u64 %pf, %ohi, %empty;
+    and.pred %claimed, %pe, %pf;
+    setp.eq.u64 %pe, %olo, %keylo;
+    setp.eq.u64 %pf, %ohi, %keyhi;
+    and.pred %mine, %pe, %pf;
+    or.pred %hit, %claimed, %mine;
+    @%hit bra do_agg;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra probe_loop128;
+gb_ktextclaim:
+    // Text key: the b128 slot holds (lo=representative row idx, hi=text hash). The CAS claims the slot
+    // for the FIRST row of a text; a LOST cas means the slot is occupied -- if its hash matches AND a
+    // full byte-compare of this row's text vs the representative's confirms equality, it's the same
+    // group (hit); otherwise (hash collision, different text) probe on. So same-text rows collapse to
+    // one group and hash collisions never merge. The representative is immutable once claimed.
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+    mov.u64 %clo, 0;
+    mov.b128 %empty128, {%clo, %empty};
+probe_loop_text:
+    mul.lo.u64 %off16, %h, 16;
+    add.u64 %addr, %ski128, %off16;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, 0;
+    setp.eq.u64 %pf, %ohi, %empty;
+    and.pred %claimed, %pe, %pf;
+    @%claimed bra do_agg;
+    setp.ne.u64 %pf, %ohi, %thash;
+    @%pf bra ktext_probe_next;
+    // Composite (fixed, text): the hash matched -- also verify the fixed member (kbov[idx] vs the rep's
+    // kbov[olo]); differ -> a hash collision across the fixed member, probe on. kbov == 0 (plain text
+    // key) skips this -> identical to the single-text-key verify.
+    setp.eq.u64 %pf, %kbov, 0;
+    @%pf bra ktext_skip_fixed;
+    cvt.u64.u32 %o8, %idx;
+    mul.lo.u64 %o8, %o8, 8;
+    add.u64 %vaddr, %kbov, %o8;
+    ld.global.u32 %klo, [%vaddr];
+    ld.global.u32 %khi, [%vaddr+4];
+    mov.b64 %sstart, {%klo, %khi};
+    mul.lo.u64 %o8, %olo, 8;
+    add.u64 %vaddr, %kbov, %o8;
+    ld.global.u32 %klo, [%vaddr];
+    ld.global.u32 %khi, [%vaddr+4];
+    mov.b64 %send, {%klo, %khi};
+    setp.ne.u64 %pf, %sstart, %send;
+    @%pf bra ktext_probe_next;
+ktext_skip_fixed:
+    mul.lo.u64 %o8, %olo, 8;
+    add.u64 %vaddr, %base, %koffoff;
+    add.u64 %vaddr, %vaddr, %o8;
+    ld.global.u32 %klo, [%vaddr];
+    ld.global.u32 %khi, [%vaddr+4];
+    mov.b64 %sstart, {%klo, %khi};
+    ld.global.u32 %klo, [%vaddr+8];
+    ld.global.u32 %khi, [%vaddr+12];
+    mov.b64 %send, {%klo, %khi};
+    setp.gt.u64 %p, %sstart, %send;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %send, %klimit;
+    @%p bra group_input_invalid;
+    sub.u64 %slen, %send, %sstart;
+    setp.ne.u64 %pf, %slen, %tlen;
+    @%pf bra ktext_probe_next;
+    add.u64 %babase, %base, %kbytesoff;
+    add.u64 %babase, %babase, %sstart;
+    mov.u64 %jt, 0;
+ktext_vbyte:
+    setp.ge.u64 %p, %jt, %tlen;
+    @%p bra do_agg;
+    add.u64 %aaddr, %taddr, %jt;
+    ld.global.u8 %abyte, [%aaddr];
+    add.u64 %baddr, %babase, %jt;
+    ld.global.u8 %bbyte, [%baddr];
+    setp.ne.u32 %p, %abyte, %bbyte;
+    @%p bra ktext_probe_next;
+    add.u64 %jt, %jt, 1;
+    bra ktext_vbyte;
+ktext_probe_next:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra probe_loop_text;
+gb_kwidekeyclaim:
+    // General all-fixed COMPOSITE: the b128 slot holds (lo=rep_idx, hi=hash). Claim for the FIRST row
+    // of a wide key; a LOST cas means occupied -- if its hash matches AND a memcmp of this row's comp_w
+    // wide-key bytes vs the representative's confirms equality, same group (hit); else (collision) probe
+    // on. So equal tuples collapse + collisions never merge. thash was remapped off i64::MIN, so the
+    // (idx, thash) slot key never aliases EMPTY128 (no dedicated-slot route needed, like the text path).
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+    mov.u64 %clo, 0;
+    mov.b128 %empty128, {%clo, %empty};
+probe_loop_widekey:
+    mul.lo.u64 %off16, %h, 16;
+    add.u64 %addr, %ski128, %off16;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, 0;
+    setp.eq.u64 %pf, %ohi, %empty;
+    and.pred %claimed, %pe, %pf;
+    @%claimed bra do_agg;
+    setp.ne.u64 %pf, %ohi, %thash;
+    @%pf bra wkey_probe_next;
+    // memcmp comp_w wide-key bytes: this row (idx) vs the representative (olo).
+    cvt.u64.u32 %koff2, %idx;
+    mul.lo.u64 %o8, %koff2, %compw;
+    add.u64 %wkbase, %kbov, %o8;
+    mul.lo.u64 %o8, %olo, %compw;
+    add.u64 %wkb, %kbov, %o8;
+    mov.u64 %jw, 0;
+wkey_vbyte:
+    setp.ge.u64 %p, %jw, %compw;
+    @%p bra wkey_vtext;
+    add.u64 %addr, %wkbase, %jw;
+    ld.global.u8 %abyte, [%addr];
+    add.u64 %addr, %wkb, %jw;
+    ld.global.u8 %bbyte, [%addr];
+    setp.ne.u32 %p, %abyte, %bbyte;
+    @%p bra wkey_probe_next;
+    add.u64 %jw, %jw, 1;
+    bra wkey_vbyte;
+wkey_vtext:
+    // Byte-verify each text member: this row (idx) vs the representative (olo). Length first, then bytes.
+    // n_text == 0 -> 0 iterations -> do_agg (the all-fixed wide key is byte-identical). A differing
+    // member -> probe on (a hash collision across that member).
+    mov.u64 %tmem, 0;
+wkey_vtext_member:
+    setp.ge.u64 %p, %tmem, %ntext;
+    @%p bra do_agg;
+    mul.lo.u64 %o8, %tmem, 24;
+    add.u64 %tdbase, %tdesc, %o8;
+    ld.global.u64 %tdooff, [%tdbase];
+    ld.global.u64 %tdboff, [%tdbase+8];
+    ld.global.u64 %tdlim, [%tdbase+16];
+    cvt.u64.u32 %o8, %idx;
+    mul.lo.u64 %o8, %o8, 8;
+    add.u64 %addr, %base, %tdooff;
+    add.u64 %addr, %addr, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %mstart, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %mend, {%klo, %khi};
+    setp.gt.u64 %p, %mstart, %mend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %mend, %tdlim;
+    @%p bra group_input_invalid;
+    sub.u64 %mlen, %mend, %mstart;
+    mul.lo.u64 %o8, %olo, 8;
+    add.u64 %addr, %base, %tdooff;
+    add.u64 %addr, %addr, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %rstart, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %rend, {%klo, %khi};
+    setp.gt.u64 %p, %rstart, %rend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %rend, %tdlim;
+    @%p bra group_input_invalid;
+    sub.u64 %rlen, %rend, %rstart;
+    setp.ne.u64 %p, %mlen, %rlen;
+    @%p bra wkey_probe_next;
+    add.u64 %mbaddr, %base, %tdboff;
+    add.u64 %mbaddr, %mbaddr, %mstart;
+    add.u64 %rbaddr, %base, %tdboff;
+    add.u64 %rbaddr, %rbaddr, %rstart;
+    mov.u64 %jm, 0;
+wkey_vtext_byte:
+    setp.ge.u64 %p, %jm, %mlen;
+    @%p bra wkey_vtext_member_next;
+    add.u64 %addr, %mbaddr, %jm;
+    ld.global.u8 %abyte, [%addr];
+    add.u64 %addr, %rbaddr, %jm;
+    ld.global.u8 %bbyte, [%addr];
+    setp.ne.u32 %p, %abyte, %bbyte;
+    @%p bra wkey_probe_next;
+    add.u64 %jm, %jm, 1;
+    bra wkey_vtext_byte;
+wkey_vtext_member_next:
+    add.u64 %tmem, %tmem, 1;
+    bra wkey_vtext_member;
+wkey_probe_next:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra probe_loop_widekey;
+do_agg:
+    // M3 (doc 21) 3VL: skip a NULL aggregate value. The slot was already claimed by the KEY above, so
+    // the group still appears (its COUNT(*) is from the count-pass / its slot exists); we just don't fold
+    // the 0/empty PLACEHOLDER into this pass's count/sum/min/max -> the pass count is the NON-NULL count.
+    // m3vnoff == sentinel (no validity bitmap) => every value valid (no skip, byte-identical fast path).
+    setp.eq.u64 %m3pnob, %m3vnoff, %m3vsent;
+    @%m3pnob bra m3_val_ok;
+    shr.u32 %m3vbp, %idx, 5;            // validity word index = idx / 32
+    mul.lo.u32 %m3vbp, %m3vbp, 4;       // * 4 bytes per u32 word
+    cvt.u64.u32 %m3vwd, %m3vbp;
+    add.u64 %m3vaddr, %base, %m3vnoff;
+    add.u64 %m3vaddr, %m3vaddr, %m3vwd;
+    ld.global.u32 %m3vbw, [%m3vaddr];
+    and.b32 %m3vbp, %idx, 31;           // bit = idx % 32
+    bfe.u32 %m3vbt, %m3vbw, %m3vbp, 1;
+    setp.eq.u32 %m3pnul, %m3vbt, 0;     // 0 = NULL
+    @%m3pnul bra gb_mmdone;             // NULL value -> skip count/sum/min/max (slot stays claimed)
+m3_val_ok:
+    mul.lo.u64 %off, %h, 8;
+    // COUNT update (bit 1): guarded -- the slot/group already exists (claim ran), so a masked-out
+    // COUNT leaves count at its 0 init and the host does not read it.
+    and.b32 %aggt, %aggm, 1;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_skipcount;
+    add.u64 %addr, %cptr, %off;
+    atom.global.add.u64 %tmp, [%addr], 1;
+gb_skipcount:
+    // SUM update (bit 2): guards the ENTIRE per-row sum (int4 / int8 i128-carry / numeric i128 + overflow
+    // flag). Masked out -> jump straight to the MIN/MAX dispatch; sum slots stay at their 0 init.
+    and.b32 %aggt, %aggm, 2;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_sumd;
+    setp.ne.u64 %pvn, %vn, 0;
+    @%pvn bra gb_sumnum;
+    setp.ne.u64 %p, %v8, 0;
+    @%p bra gb_sum8;
+    // int4 sum: single i64 atomic add.
+    add.u64 %addr, %sptr, %off;
+    atom.global.add.u64 %tmp, [%addr], %val;
+    bra gb_sumd;
+gb_sum8:
+    // int8 sum: i128 two-atomic carry (lo into slot_sum, hi into slot_sum_hi). Lock-free: each
+    // thread's carry comes from its own low-limb atomicAdd return, so sum(hi)=sum(signext+carry).
+    add.u64 %addr, %sptr, %off;
+    atom.global.add.u64 %oldlo, [%addr], %val;
+    add.u64 %newlo, %oldlo, %val;
+    setp.lt.u64 %pc, %newlo, %oldlo;
+    selp.s64 %carry, 1, 0, %pc;
+    shr.s64 %hi, %val, 63;
+    add.s64 %hi, %hi, %carry;
+    add.u64 %addr, %shptr, %off;
+    atom.global.add.u64 %tmp, [%addr], %hi;
+    bra gb_sumd;
+gb_sumnum:
+    // numeric sum: i128 += i128 (low %val, high %valhi -- the REAL high limb, not a sign-extension),
+    // same lock-free carry, plus per-add SIGNED-OVERFLOW detection on the high limb -> set the global
+    // overflow flag (PG errors on numeric overflow; we never silently wrap).
+    add.u64 %addr, %sptr, %off;
+    atom.global.add.u64 %oldlo, [%addr], %val;
+    add.u64 %newlo, %oldlo, %val;
+    setp.lt.u64 %pc, %newlo, %oldlo;
+    selp.s64 %carry, 1, 0, %pc;
+    add.s64 %addend, %valhi, %carry;
+    add.u64 %addr, %shptr, %off;
+    atom.global.add.u64 %oldhi, [%addr], %addend;
+    add.s64 %newhi, %oldhi, %addend;
+    // overflow iff (oldhi,addend same sign) && (newhi differs): (~(oldhi^addend) & (oldhi^newhi)) < 0
+    xor.b64 %t1, %oldhi, %addend;
+    xor.b64 %t2, %oldhi, %newhi;
+    not.b64 %t1, %t1;
+    and.b64 %t1, %t1, %t2;
+    setp.lt.s64 %pov, %t1, 0;
+    @%pov red.global.or.b32 [%ovptr], 1;
+gb_sumd:
+    // MIN/MAX region (bits 4|8): if NEITHER MIN nor MAX is requested, skip the whole region (the common
+    // COUNT/SUM/AVG prune) -- min/max slots stay at their INT_MAX/INT_MIN init. The text/uuid/numeric
+    // branches compute BOTH together (one loop); the host reads only the requested one, so computing the
+    // other is harmless. The plain-int branch guards MIN and MAX SEPARATELY for a finer prune.
+    and.b32 %aggt, %aggm, 12;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_mmdone;
+    @%pvt bra gb_textminmax;
+    @%puu bra gb_uuidminmax;
+    @%pvn bra gb_numminmax;
+    and.b32 %aggt, %aggm, 4;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_skipmin;
+    add.u64 %addr, %mnptr, %off;
+    atom.global.min.s64 %cur, [%addr], %val;
+gb_skipmin:
+    and.b32 %aggt, %aggm, 8;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_mmdone;
+    add.u64 %addr, %mxptr, %off;
+    atom.global.max.s64 %cur, [%addr], %val;
+    bra gb_mmdone;
+gb_numminmax:
+    // Pass 1 (LOCK-FREE): per-group MIN/MAX of the HIGH limb via signed atomics, and record this
+    // row's claimed slot so pass 2 (a second kernel) can resolve the LOW limb among the high-limb
+    // ties. (The previous per-slot spin lock deadlocked the GPU under warp contention; this two-pass
+    // design uses ONLY lock-free atomics -- no lock, no deadlock.)
+    add.u64 %a1, %mnhiptr, %off;
+    atom.global.min.s64 %cmhi, [%a1], %valhi;
+    add.u64 %a1, %mxhiptr, %off;
+    atom.global.max.s64 %cmhi, [%a1], %valhi;
+    mul.lo.u64 %loff, %i, 4;
+    add.u64 %laddr, %rsptr, %loff;
+    cvt.u32.u64 %lockold, %h;
+    st.global.u32 [%laddr], %lockold;
+    bra gb_mmdone;
+gb_uuidminmax:
+    // uuid MIN/MAX: lock-free b128 CAS loop (native 128-bit CAS, sm_90+). %val128 = the BE uuid;
+    // compare via the two UNSIGNED 64-bit halves (%uhi:%ulo). slot_min_uuid/slot_max_uuid are b128.
+    mul.lo.u64 %off16, %h, 16;
+    add.u64 %addr, %mnuptr, %off16;
+uuid_min_loop:
+    ld.global.b128 %cur128, [%addr];
+    mov.b128 {%clo, %chi}, %cur128;
+    setp.lt.u64 %pa, %uhi, %chi;
+    setp.eq.u64 %pb, %uhi, %chi;
+    setp.lt.u64 %pc, %ulo, %clo;
+    and.pred %pb, %pb, %pc;
+    or.pred %pupd, %pa, %pb;
+    @!%pupd bra uuid_do_max;
+    atom.global.cas.b128 %old128, [%addr], %cur128, %val128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, %clo;
+    setp.eq.u64 %pf, %ohi, %chi;
+    and.pred %pe, %pe, %pf;
+    @!%pe bra uuid_min_loop;
+uuid_do_max:
+    add.u64 %addr, %mxuptr, %off16;
+uuid_max_loop:
+    ld.global.b128 %cur128, [%addr];
+    mov.b128 {%clo, %chi}, %cur128;
+    setp.gt.u64 %pa, %uhi, %chi;
+    setp.eq.u64 %pb, %uhi, %chi;
+    setp.gt.u64 %pc, %ulo, %clo;
+    and.pred %pb, %pb, %pc;
+    or.pred %pupd, %pa, %pb;
+    @!%pupd bra gb_mmdone;
+    atom.global.cas.b128 %old128, [%addr], %cur128, %val128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, %clo;
+    setp.eq.u64 %pf, %ohi, %chi;
+    and.pred %pe, %pe, %pf;
+    @!%pe bra uuid_max_loop;
+    bra gb_mmdone;
+gb_textminmax:
+    // text MIN/MAX: slot_min/slot_max hold the ROW INDEX of the group's min/max text value (EMPTY =
+    // u64::MAX = -1). Lock-free CAS loop on that i64 row index; comparator = lexicographic byte compare
+    // of this row's value text (%vstart/%vlen/%vaddr) vs the slot winner's text (re-read each retry).
+    cvt.u64.u32 %thisidx, %idx;
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %mnptr, %off;
+tmin_loop:
+    ld.global.u64 %curidx, [%addr];
+    setp.eq.u64 %p, %curidx, -1;
+    @%p bra tmin_cas;
+    mul.lo.u64 %o8, %curidx, 8;
+    add.u64 %caddr, %base, %voffoff;
+    add.u64 %caddr, %caddr, %o8;
+    ld.global.u32 %klo, [%caddr];
+    ld.global.u32 %khi, [%caddr+4];
+    mov.b64 %cstart, {%klo, %khi};
+    ld.global.u32 %klo, [%caddr+8];
+    ld.global.u32 %khi, [%caddr+12];
+    mov.b64 %cend, {%klo, %khi};
+    setp.gt.u64 %p, %cstart, %cend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %cend, %vlimit;
+    @%p bra group_input_invalid;
+    sub.u64 %clen, %cend, %cstart;
+    add.u64 %caddr, %base, %vbytesoff;
+    add.u64 %caddr, %caddr, %cstart;
+    min.u64 %minlen, %vlen, %clen;
+    mov.u64 %jt, 0;
+tmin_byte:
+    setp.ge.u64 %p, %jt, %minlen;
+    @%p bra tmin_lendiff;
+    add.u64 %aaddr, %vbaddr, %jt;
+    ld.global.u8 %abyte, [%aaddr];
+    add.u64 %baddr, %caddr, %jt;
+    ld.global.u8 %bbyte, [%baddr];
+    setp.lt.u32 %plt, %abyte, %bbyte;
+    @%plt bra tmin_cas;
+    setp.gt.u32 %pgt, %abyte, %bbyte;
+    @%pgt bra tmin_next_max;
+    add.u64 %jt, %jt, 1;
+    bra tmin_byte;
+tmin_lendiff:
+    setp.lt.u64 %plt, %vlen, %clen;
+    @%plt bra tmin_cas;
+    bra tmin_next_max;
+tmin_cas:
+    atom.global.cas.b64 %oldidx, [%addr], %curidx, %thisidx;
+    setp.eq.u64 %p, %oldidx, %curidx;
+    @%p bra tmin_next_max;
+    bra tmin_loop;
+tmin_next_max:
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %mxptr, %off;
+tmax_loop:
+    ld.global.u64 %curidx, [%addr];
+    setp.eq.u64 %p, %curidx, -1;
+    @%p bra tmax_cas;
+    mul.lo.u64 %o8, %curidx, 8;
+    add.u64 %caddr, %base, %voffoff;
+    add.u64 %caddr, %caddr, %o8;
+    ld.global.u32 %klo, [%caddr];
+    ld.global.u32 %khi, [%caddr+4];
+    mov.b64 %cstart, {%klo, %khi};
+    ld.global.u32 %klo, [%caddr+8];
+    ld.global.u32 %khi, [%caddr+12];
+    mov.b64 %cend, {%klo, %khi};
+    setp.gt.u64 %p, %cstart, %cend;
+    @%p bra group_input_invalid;
+    setp.gt.u64 %p, %cend, %vlimit;
+    @%p bra group_input_invalid;
+    sub.u64 %clen, %cend, %cstart;
+    add.u64 %caddr, %base, %vbytesoff;
+    add.u64 %caddr, %caddr, %cstart;
+    min.u64 %minlen, %vlen, %clen;
+    mov.u64 %jt, 0;
+tmax_byte:
+    setp.ge.u64 %p, %jt, %minlen;
+    @%p bra tmax_lendiff;
+    add.u64 %aaddr, %vbaddr, %jt;
+    ld.global.u8 %abyte, [%aaddr];
+    add.u64 %baddr, %caddr, %jt;
+    ld.global.u8 %bbyte, [%baddr];
+    setp.gt.u32 %pgt, %abyte, %bbyte;
+    @%pgt bra tmax_cas;
+    setp.lt.u32 %plt, %abyte, %bbyte;
+    @%plt bra gb_mmdone;
+    add.u64 %jt, %jt, 1;
+    bra tmax_byte;
+tmax_lendiff:
+    setp.gt.u64 %pgt, %vlen, %clen;
+    @%pgt bra tmax_cas;
+    bra gb_mmdone;
+tmax_cas:
+    atom.global.cas.b64 %oldidx, [%addr], %curidx, %thisidx;
+    setp.eq.u64 %p, %oldidx, %curidx;
+    @%p bra gb_mmdone;
+    bra tmax_loop;
+group_input_invalid:
+    atom.global.exch.b64 %oldlo, [%inerr], %errone;
+    bra gb_mmdone;
+gb_mmdone:
+    add.u64 %i, %i, %stride;
+    bra row_loop;
+row_done:
+    ret;
+}

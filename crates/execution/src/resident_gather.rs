@@ -42,7 +42,7 @@ fn gather_resident_kernel(
         *mut *mut c_void,
     ) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const PTX: &[u8] = include_bytes!("resident_gather.ptx");
 
     let n = row_indices.len();
     if n == 0 {

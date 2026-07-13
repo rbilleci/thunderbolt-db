@@ -1,0 +1,448 @@
+.version 8.4
+.target sm_90
+.address_size 64
+
+// Hand-maintained PTX; ownership follows the matching Rust operator module.
+
+// Pass 2 of numeric MIN/MAX (LOCK-FREE). Pass 1 (the single-level kernel above) finalized each
+// group's MIN/MAX HIGH limb in slot_min_hi/slot_max_hi and recorded each row's slot in row_slots.
+// Here, for each row, if its high limb TIES the group's min-hi, fold its low limb into slot_min via
+// atom.min.u64 (same for max). Result (hi:lo) = the exact signed-i128 min/max. No lock, no deadlock.
+.visible .entry gpu_db_group_by_numeric_minmax_lo(
+    .param .u64 resident_ptr,
+    .param .u64 sum_byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u64 row_slots_ptr,
+    .param .u64 slot_min_ptr,
+    .param .u64 slot_max_ptr,
+    .param .u64 slot_min_hi_ptr,
+    .param .u64 slot_max_hi_ptr,
+    // M3 (doc 21) 3VL: the VALUE column's NULL validity bitmap byte offset (1 = valid, 0 = NULL), or the
+    // sentinel u64::MAX = no bitmap => every value valid. A NULL row is SKIPPED here (its low/high limb is
+    // a 0 placeholder and pass 1 skipped it from the high-limb min/max + left its pooled row_slots slot
+    // STALE) -- so folding it would corrupt an unrelated group / OOB. Must match pass 1's value_null_off.
+    .param .u64 value_null_off,
+    .param .u64 input_error_flag
+)
+{
+    .reg .pred %p;
+    .reg .pred %peq;
+    .reg .pred %pnob;
+    .reg .pred %pnul;
+    .reg .u64 %vnoff;
+    .reg .u64 %vnsent;
+    .reg .u64 %vwd;
+    .reg .u64 %vaddr;
+    .reg .u64 %inerr;
+    .reg .u64 %inerrval;
+    .reg .pred %pinerr;
+    .reg .u32 %vbw;
+    .reg .u32 %vbp;
+    .reg .u32 %vbt;
+    .reg .u32 %t32;
+    .reg .u32 %idx;
+    .reg .u32 %slot32;
+    .reg .u32 %vlo;
+    .reg .u32 %vhi;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .s64 %val;
+    .reg .s64 %valhi;
+    .reg .s64 %cmhi;
+    .reg .u64 %cmlo;
+    .reg .u64 %base;
+    .reg .u64 %soff;
+    .reg .u64 %iptr;
+    .reg .u64 %rsptr;
+    .reg .u64 %mnptr;
+    .reg .u64 %mxptr;
+    .reg .u64 %mnhiptr;
+    .reg .u64 %mxhiptr;
+    .reg .u64 %count;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %h;
+    .reg .u64 %off;
+    .reg .u64 %voff;
+    .reg .u64 %addr;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %soff, [sum_byte_offset];
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u64 %rsptr, [row_slots_ptr];
+    ld.param.u64 %mnptr, [slot_min_ptr];
+    ld.param.u64 %mxptr, [slot_max_ptr];
+    ld.param.u64 %mnhiptr, [slot_min_hi_ptr];
+    ld.param.u64 %mxhiptr, [slot_max_hi_ptr];
+    ld.param.u64 %vnoff, [value_null_off];
+    ld.param.u64 %inerr, [input_error_flag];
+    ld.global.u64 %inerrval, [%inerr];
+    setp.ne.u64 %pinerr, %inerrval, 0;
+    @%pinerr ret;
+    mov.u64 %vnsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+lo_loop:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra lo_done;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %rsptr, %off;
+    ld.global.u32 %slot32, [%addr];
+    cvt.u64.u32 %h, %slot32;
+    add.u64 %addr, %iptr, %off;
+    ld.global.u32 %idx, [%addr];
+    // M3 (doc 21) 3VL: skip a NULL value. Same gate as pass 1's do_agg (read bit %idx of the validity
+    // bitmap; 0 = NULL). The stale pooled row_slots slot (%h) is read above but NOT used for any indexed
+    // access before this skip. value_null_off == sentinel (u64::MAX) => no bitmap => byte-identical.
+    setp.eq.u64 %pnob, %vnoff, %vnsent;
+    @%pnob bra lo_val_ok;
+    shr.u32 %vbp, %idx, 5;          // validity word index = idx / 32
+    mul.lo.u32 %vbp, %vbp, 4;       // * 4 bytes per u32 word
+    cvt.u64.u32 %vwd, %vbp;
+    add.u64 %vaddr, %base, %vnoff;
+    add.u64 %vaddr, %vaddr, %vwd;
+    ld.global.u32 %vbw, [%vaddr];
+    and.b32 %vbp, %idx, 31;         // bit = idx % 32
+    bfe.u32 %vbt, %vbw, %vbp, 1;
+    setp.eq.u32 %pnul, %vbt, 0;     // 0 = NULL
+    @%pnul bra lo_skip;             // NULL value -> skip the low-limb fold
+lo_val_ok:
+    // numeric value at base + soff + idx*16 (4x4-byte) -> %val (low), %valhi (high)
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 16;
+    add.u64 %addr, %base, %soff;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %vlo, [%addr];
+    ld.global.u32 %vhi, [%addr+4];
+    mov.b64 %val, {%vlo, %vhi};
+    ld.global.u32 %vlo, [%addr+8];
+    ld.global.u32 %vhi, [%addr+12];
+    mov.b64 %valhi, {%vlo, %vhi};
+    mul.lo.u64 %off, %h, 8;
+    // if valhi == slot_min_hi[h]: slot_min[h] = min(slot_min[h], val_lo)
+    add.u64 %addr, %mnhiptr, %off;
+    ld.global.s64 %cmhi, [%addr];
+    setp.eq.s64 %peq, %valhi, %cmhi;
+    add.u64 %addr, %mnptr, %off;
+    @%peq atom.global.min.u64 %cmlo, [%addr], %val;
+    // if valhi == slot_max_hi[h]: slot_max[h] = max(slot_max[h], val_lo)
+    add.u64 %addr, %mxhiptr, %off;
+    ld.global.s64 %cmhi, [%addr];
+    setp.eq.s64 %peq, %valhi, %cmhi;
+    add.u64 %addr, %mxptr, %off;
+    @%peq atom.global.max.u64 %cmlo, [%addr], %val;
+lo_skip:
+    add.u64 %i, %i, %stride;
+    bra lo_loop;
+lo_done:
+    ret;
+}
+// Two-level GROUP BY: each block aggregates its rows into a SHARED-MEMORY local hash table (fast, no
+// global contention), then merges the local table into the global table (one set of global atomics
+// per local group, not per row). Kills the global-atomic contention the single-level kernel suffers
+// at low cardinality. Local table NLOCAL=1024 (LMASK=1023). On local-table overflow a row spills
+// directly to the global table (correctness for high cardinality; both contributions land in the
+// same global slot for a key). Same params + same global table as the single-level kernel.
+.visible .entry gpu_db_group_by_i32_count_sum_twolevel(
+    .param .u64 resident_ptr,
+    .param .u64 key_byte_offset,
+    .param .u64 sum_byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u64 mask,
+    .param .u64 slot_keys_ptr,
+    .param .u64 slot_count_ptr,
+    .param .u64 slot_sum_ptr,
+    .param .u64 slot_min_ptr,
+    .param .u64 slot_max_ptr,
+    // The two-level kernel uses only the 11 params above (COUNT/SUM over an int4 key+value); it shares
+    // the single-level kernel's launch-arg ARRAY, so it MUST declare the SAME positional param list to
+    // read `agg_mask` at the SAME index (37) the launcher places it. Params 11..36 below are accepted
+    // for positional ABI alignment but never loaded (the two-level path never takes the int8/numeric/
+    // uuid/text/composite/NULL branches that use them). agg_mask (index 37) IS loaded + guards COUNT/SUM.
+    .param .u64 value_is_int8_unused,
+    .param .u64 slot_sum_hi_ptr_unused,
+    .param .u64 key_is_int8_unused,
+    .param .u64 value_is_numeric_unused,
+    .param .u64 overflow_flag_ptr_unused,
+    .param .u64 slot_min_hi_ptr_unused,
+    .param .u64 slot_max_hi_ptr_unused,
+    .param .u64 row_slots_ptr_unused,
+    .param .u64 value_is_uuid_unused,
+    .param .u64 slot_min_uuid_ptr_unused,
+    .param .u64 slot_max_uuid_ptr_unused,
+    .param .u64 key_is_i128_unused,
+    .param .u64 slot_keys_i128_ptr_unused,
+    .param .u64 key_is_text_unused,
+    .param .u64 key_offsets_off_unused,
+    .param .u64 key_bytes_off_unused,
+    .param .u64 value_is_text_unused,
+    .param .u64 value_offsets_off_unused,
+    .param .u64 value_bytes_off_unused,
+    .param .u64 key_base_override_unused,
+    .param .u64 value_base_override_unused,
+    .param .u64 comp_w_unused,
+    .param .u64 n_text_unused,
+    .param .u64 text_desc_ptr_unused,
+    .param .u64 value_null_off_unused,
+    .param .u64 key_null_off_unused,
+    // Query-aware aggregate-selection MASK (grouped_agg_mask: 1=COUNT, 2=SUM, 4=MIN, 8=MAX). The two-
+    // level kernel serves only COUNT/SUM (MIN/MAX bits are irrelevant here -- it never computes them).
+    // Index 37, matching the single-level signature. Guards BOTH the shared-mem partial atomics
+    // AND the per-block global merge of each field, so a masked-out field is neither aggregated in
+    // shared NOR merged to global (stays 0 init).
+    .param .u64 agg_mask,
+    .param .u64 key_bytes_limit_unused,
+    .param .u64 value_bytes_limit_unused,
+    .param .u64 input_error_flag_unused
+)
+{
+    // slot_min_ptr / slot_max_ptr are accepted for a uniform launch signature but UNUSED here: the
+    // two-level kernel serves COUNT/SUM/AVG; grouped MIN/MAX routes to the single-level kernel.
+    .shared .align 8 .b64 s_keys[1024];
+    .shared .align 8 .b64 s_count[1024];
+    .shared .align 8 .b64 s_sum[1024];
+
+    .reg .pred %p;
+    .reg .pred %hit;
+    .reg .pred %full;
+    .reg .pred %empty_slot;
+    .reg .pred %pagg;
+    .reg .u32 %aggm;
+    .reg .u32 %aggt;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %j;
+    .reg .u32 %probe;
+    .reg .u32 %idx;
+    .reg .u32 %sa;
+    .reg .s32 %k32;
+    .reg .s32 %v32;
+    .reg .s64 %key;
+    .reg .s64 %val;
+    .reg .s64 %empty;
+    .reg .s64 %cur;
+    .reg .s64 %lkey;
+    .reg .u64 %lcount;
+    .reg .s64 %lsum;
+    .reg .b64 %mix;
+    .reg .b64 %tmp;
+    .reg .u64 %base;
+    .reg .u64 %iptr;
+    .reg .u64 %kptr;
+    .reg .u64 %cptr;
+    .reg .u64 %sptr;
+    .reg .u64 %count;
+    .reg .u64 %mask;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %h;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .u64 %koff;
+    .reg .u64 %soff;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %koff, [key_byte_offset];
+    ld.param.u64 %soff, [sum_byte_offset];
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %kptr, [slot_keys_ptr];
+    ld.param.u64 %cptr, [slot_count_ptr];
+    ld.param.u64 %sptr, [slot_sum_ptr];
+    ld.param.u32 %aggm, [agg_mask];
+    mov.s64 %empty, -9223372036854775808;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+
+    // Phase 0: init the shared local table (strided by blockDim).
+    mov.u32 %j, %lane;
+init_loop:
+    setp.ge.u32 %p, %j, 1024;
+    @%p bra init_done;
+    mov.u32 %sa, s_keys;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    st.shared.b64 [%sa], %empty;
+    mov.u32 %sa, s_count;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    st.shared.u64 [%sa], 0;
+    mov.u32 %sa, s_sum;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    st.shared.u64 [%sa], 0;
+    add.u32 %j, %j, %bdim;
+    bra init_loop;
+init_done:
+    bar.sync 0;
+
+    // Phase 1: aggregate this block's rows into the shared local table (grid-stride).
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+row_loop:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra phase2;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %iptr, %off;
+    ld.global.u32 %idx, [%addr];
+    cvt.u64.u32 %off, %idx;
+    mul.lo.u64 %off, %off, 4;
+    add.u64 %addr, %base, %koff;
+    add.u64 %addr, %addr, %off;
+    ld.global.s32 %k32, [%addr];
+    cvt.s64.s32 %key, %k32;
+    add.u64 %addr, %base, %soff;
+    add.u64 %addr, %addr, %off;
+    ld.global.s32 %v32, [%addr];
+    cvt.s64.s32 %val, %v32;
+    mov.b64 %mix, %key;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, 1023;
+    mov.u32 %probe, 0;
+local_probe:
+    cvt.u32.u64 %j, %h;
+    mov.u32 %sa, s_keys;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    atom.shared.cas.b64 %cur, [%sa], %empty, %key;
+    setp.eq.s64 %empty_slot, %cur, %empty;
+    setp.eq.s64 %p, %cur, %key;
+    or.pred %hit, %empty_slot, %p;
+    @%hit bra local_hit;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, 1023;
+    add.u32 %probe, %probe, 1;
+    setp.ge.u32 %full, %probe, 1024;
+    @%full bra overflow;
+    bra local_probe;
+local_hit:
+    // Shared-mem partial COUNT (bit 1): masked out -> the shared count stays 0 (and the guarded merge
+    // below adds nothing to the global count). The slot CLAIM above always ran (group identity).
+    and.b32 %aggt, %aggm, 1;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra local_skipcount;
+    mov.u32 %sa, s_count;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    atom.shared.add.u64 %lcount, [%sa], 1;
+local_skipcount:
+    // Shared-mem partial SUM (bit 2): masked out -> the shared sum stays 0 (merge adds nothing).
+    and.b32 %aggt, %aggm, 2;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra row_next;
+    mov.u32 %sa, s_sum;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    atom.shared.add.u64 %lcount, [%sa], %val;
+    bra row_next;
+overflow:
+    and.b64 %h, %mix, %mask;
+ov_probe:
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %kptr, %off;
+    atom.global.cas.b64 %cur, [%addr], %empty, %key;
+    setp.eq.s64 %empty_slot, %cur, %empty;
+    setp.eq.s64 %p, %cur, %key;
+    or.pred %hit, %empty_slot, %p;
+    @%hit bra ov_hit;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra ov_probe;
+ov_hit:
+    // Shared-table OVERFLOW path: a row whose key did not fit the 1024-slot shared table aggregates
+    // DIRECTLY into the global table. Guard COUNT (bit 1) and SUM (bit 2) the same way as local_hit.
+    and.b32 %aggt, %aggm, 1;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra ov_skipcount;
+    add.u64 %addr, %cptr, %off;
+    atom.global.add.u64 %lcount, [%addr], 1;
+ov_skipcount:
+    and.b32 %aggt, %aggm, 2;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra row_next;
+    add.u64 %addr, %sptr, %off;
+    atom.global.add.u64 %lcount, [%addr], %val;
+row_next:
+    add.u64 %i, %i, %stride;
+    bra row_loop;
+phase2:
+    bar.sync 0;
+    // Phase 2: merge the shared local table into the global table (strided by blockDim).
+    mov.u32 %j, %lane;
+merge_loop:
+    setp.ge.u32 %p, %j, 1024;
+    @%p bra merge_done;
+    mov.u32 %sa, s_keys;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    ld.shared.b64 %lkey, [%sa];
+    setp.eq.s64 %p, %lkey, %empty;
+    @%p bra merge_next;
+    mov.u32 %sa, s_count;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    ld.shared.u64 %lcount, [%sa];
+    mov.u32 %sa, s_sum;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    ld.shared.u64 %lsum, [%sa];
+    mov.b64 %mix, %lkey;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+merge_probe:
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %kptr, %off;
+    atom.global.cas.b64 %cur, [%addr], %empty, %lkey;
+    setp.eq.s64 %empty_slot, %cur, %empty;
+    setp.eq.s64 %p, %cur, %lkey;
+    or.pred %hit, %empty_slot, %p;
+    @%hit bra merge_hit;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra merge_probe;
+merge_hit:
+    // Per-block GLOBAL MERGE: flush this block's shared partials to the global table. Guard each field's
+    // merge by its bit (bit 1 = COUNT, bit 2 = SUM) -- so a masked-out field is neither aggregated in
+    // shared (above) NOR merged here (its global slot stays 0 init, consistent with the single-level
+    // kernel's masked-out count/sum behavior).
+    and.b32 %aggt, %aggm, 1;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra merge_skipcount;
+    add.u64 %addr, %cptr, %off;
+    atom.global.add.u64 %lkey, [%addr], %lcount;
+merge_skipcount:
+    and.b32 %aggt, %aggm, 2;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra merge_next;
+    add.u64 %addr, %sptr, %off;
+    atom.global.add.u64 %lkey, [%addr], %lsum;
+merge_next:
+    add.u32 %j, %j, %bdim;
+    bra merge_loop;
+merge_done:
+    ret;
+}

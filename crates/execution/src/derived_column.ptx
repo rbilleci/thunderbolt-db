@@ -1,0 +1,844 @@
+.version 8.4
+.target sm_90
+.address_size 64
+
+// Hand-maintained PTX; ownership follows the matching Rust operator module.
+
+
+// Composite GROUP BY key (2 fixed-width int4-section columns): pack two i32 columns into one i64 derived
+// key per row -- col0 in the high 32 bits, col1 in the low 32 bits. Bijective (each (col0,col1) -> a
+// distinct i64) and reversible (the executor unpacks the result key). No atomics/hash (a pure MAP) so it
+// cannot reintroduce the bool-kernel concurrency hazard. The i64 group path then groups by the override.
+.visible .entry gpu_db_pack_two_int4_cols(
+    .param .u64 resident_ptr,
+    .param .u64 off0,
+    .param .u64 off1,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %c0;
+    .reg .u32 %c1;
+    .reg .u64 %rp;
+    .reg .u64 %b0;
+    .reg .u64 %b1;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %k;
+    .reg .u64 %tmp;
+
+    ld.param.u64 %rp, [resident_ptr];
+    ld.param.u64 %o, [off0];
+    add.u64 %b0, %rp, %o;
+    ld.param.u64 %o, [off1];
+    add.u64 %b1, %rp, %o;
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_pack2:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_pack2;
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %b0, %o;
+    ld.global.u32 %c0, [%addr];
+    add.u64 %addr, %b1, %o;
+    ld.global.u32 %c1, [%addr];
+    cvt.u64.u32 %k, %c0;
+    shl.b64 %k, %k, 32;
+    cvt.u64.u32 %tmp, %c1;
+    or.b64 %k, %k, %tmp;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %out, %o;
+    st.global.u64 [%addr], %k;
+    add.u64 %i, %i, %stride;
+    bra loop_pack2;
+done_pack2:
+    ret;
+}
+
+// Composite GROUP BY key (2 fixed-width int columns whose combined width EXCEEDS 64 bits -- i.e. an
+// int8/timestamp member): pack the two members into one i128 derived key per row, col0 in the HIGH 64
+// bits, col1 in the LOW 64 bits. Each member is read at its own width: w==8 -> int8 section (2x ld.u32,
+// the section may be 4-mod-8 aligned), w==4 -> int4 section (ld.s32, sign-extend); both become a
+// sign-extended i64 occupying a full 64-bit half. Bijective + reversible (the executor unpacks
+// gk.key_i128: hi -> col0, lo -> col1). A pure MAP -- no atomics/hash -> no bool-kernel hazard. The
+// b128 GROUP BY claim (key_is_i128 + key_base_override, reading 16 bytes at idx*16) groups by it; the
+// 16-byte i128 is an EQUALITY key (raw LE limbs, no ordering needed). The out buffer is freshly leased
+// (16-aligned), so the two 8-byte stores at idx*16 / idx*16+8 are 8-aligned.
+.visible .entry gpu_db_pack_two_cols_i128(
+    .param .u64 resident_ptr,
+    .param .u64 off0,
+    .param .u64 w0,
+    .param .u64 off1,
+    .param .u64 w1,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %lo32;
+    .reg .u32 %hi32;
+    .reg .s32 %s32;
+    .reg .u64 %rp;
+    .reg .u64 %b0;
+    .reg .u64 %b1;
+    .reg .u64 %w0;
+    .reg .u64 %w1;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %c0;
+    .reg .u64 %c1;
+
+    ld.param.u64 %rp, [resident_ptr];
+    ld.param.u64 %o, [off0];
+    add.u64 %b0, %rp, %o;
+    ld.param.u64 %w0, [w0];
+    ld.param.u64 %o, [off1];
+    add.u64 %b1, %rp, %o;
+    ld.param.u64 %w1, [w1];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_pack128:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_pack128;
+    // col0 (the HIGH limb), read at width w0.
+    setp.eq.u64 %p, %w0, 8;
+    @%p bra p128_c0_8;
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %b0, %o;
+    ld.global.s32 %s32, [%addr];
+    cvt.s64.s32 %c0, %s32;
+    bra p128_c0_done;
+p128_c0_8:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %b0, %o;
+    ld.global.u32 %lo32, [%addr];
+    ld.global.u32 %hi32, [%addr+4];
+    mov.b64 %c0, {%lo32, %hi32};
+p128_c0_done:
+    // col1 (the LOW limb), read at width w1.
+    setp.eq.u64 %p, %w1, 8;
+    @%p bra p128_c1_8;
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %b1, %o;
+    ld.global.s32 %s32, [%addr];
+    cvt.s64.s32 %c1, %s32;
+    bra p128_c1_done;
+p128_c1_8:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %b1, %o;
+    ld.global.u32 %lo32, [%addr];
+    ld.global.u32 %hi32, [%addr+4];
+    mov.b64 %c1, {%lo32, %hi32};
+p128_c1_done:
+    // out[idx*16 + 0..8] = col1 (lo limb), out[idx*16 + 8..16] = col0 (hi limb).
+    mul.lo.u64 %o, %i, 16;
+    add.u64 %addr, %out, %o;
+    st.global.u64 [%addr], %c1;
+    st.global.u64 [%addr+8], %c0;
+    add.u64 %i, %i, %stride;
+    bra loop_pack128;
+done_pack128:
+    ret;
+}
+
+// Widen a fixed-width int column to a per-row i64 derived buffer (sign-extended): w==8 -> int8 section
+// (2x ld.u32, 716-safe), w==4 -> int4 section (ld.s32). Used as the key_base_override fixed member of a
+// composite (fixed-width, text) GROUP BY key -- the text-key claim folds out[idx] into its hash and
+// verifies out[idx] vs the representative's. A pure MAP (no atomics) -> no bool-kernel hazard.
+.visible .entry gpu_db_widen_col_to_i64(
+    .param .u64 resident_ptr,
+    .param .u64 off,
+    .param .u64 w,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %lo32;
+    .reg .u32 %hi32;
+    .reg .s32 %s32;
+    .reg .u64 %rp;
+    .reg .u64 %b;
+    .reg .u64 %w;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %c;
+
+    ld.param.u64 %rp, [resident_ptr];
+    ld.param.u64 %o, [off];
+    add.u64 %b, %rp, %o;
+    ld.param.u64 %w, [w];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_widen:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_widen;
+    setp.eq.u64 %p, %w, 8;
+    @%p bra widen_8;
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %b, %o;
+    ld.global.s32 %s32, [%addr];
+    cvt.s64.s32 %c, %s32;
+    bra widen_store;
+widen_8:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %b, %o;
+    ld.global.u32 %lo32, [%addr];
+    ld.global.u32 %hi32, [%addr+4];
+    mov.b64 %c, {%lo32, %hi32};
+widen_store:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %out, %o;
+    st.global.u64 [%addr], %c;
+    add.u64 %i, %i, %stride;
+    bra loop_widen;
+done_widen:
+    ret;
+}
+
+// Build a fixed-width WIDE KEY buffer for a general all-fixed composite GROUP BY key (>2 columns, or a
+// numeric/uuid member, or a tuple wider than 128 bits -- the cases the i64/i128 pack can't hold). Each
+// member's canonical bytes are concatenated into out[row*wbytes + dst_off]: an int member (int2/int4/
+// date via kind 0; int8/timestamp via kind 1) writes 8 bytes (the value as i64, 716-safe 2x ld.u32 for
+// int8); a numeric/uuid member (kind 2) writes its 16 raw bytes. `desc` is n_members entries of 3 u64
+// (kind, src_off, dst_off). The wide-key GROUP BY claim then hashes + memcmps `wbytes` bytes (the b128
+// slot holds (rep_idx, hash)). A pure MAP -- no atomics/hash -> it cannot reintroduce the bool hazard.
+// The out buffer is freshly leased (8-aligned) and every dst_off is a multiple of 8, so the 8-byte
+// stores are aligned.
+.visible .entry gpu_db_build_wide_key(
+    .param .u64 resident_ptr,
+    .param .u64 desc_ptr,
+    .param .u64 n_members,
+    .param .u64 wbytes,
+    .param .u64 n,
+    .param .u64 out_ptr,
+    // A SEPARATE per-row buffer for a DERIVED member (the expression group key, materialized into its
+    // own i32/i64 buffer): kind 4 reads it as i32 (sign-extend -> i64), kind 5 as i64. 0 = no derived
+    // member (every column-only wide key). src_off is unused for kinds 4/5 (the base is derived_ptr).
+    .param .u64 derived_ptr,
+    // M3 (doc 21): per-member NULL validity. 0 = no validity (every member valid -- byte-identical to the
+    // pre-M3 wide key, wbytes unchanged). Else n_members u64 entries: u64::MAX = a non-nullable member;
+    // otherwise the member's validity-bitmap byte offset in the resident payload. A NULL member's value
+    // bytes are zeroed and its bit left clear; a per-row validity WORD (bit m = member m valid) is written
+    // at out[row*wbytes + wbytes-8] (the caller reserves that trailing 8-byte slot). The wide-key claim
+    // hashes + memcmps all wbytes, so the validity word makes (NULL,5) != (0,5) != (NULL,6) distinct.
+    .param .u64 validity_desc_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u64 %derived;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .s32 %s32;
+    .reg .u64 %rp;
+    .reg .u64 %descp;
+    .reg .u64 %nm;
+    .reg .u64 %wb;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %rowbase;
+    .reg .u64 %m;
+    .reg .u64 %dbase;
+    .reg .u64 %kind;
+    .reg .u64 %srcoff;
+    .reg .u64 %dstoff;
+    .reg .u64 %src;
+    .reg .u64 %dst;
+    .reg .u64 %v;
+    .reg .u64 %vhi;
+    .reg .u64 %vdp;
+    .reg .u64 %voff;
+    .reg .u64 %vword;
+    .reg .u64 %vsent;
+
+    ld.param.u64 %rp, [resident_ptr];
+    ld.param.u64 %descp, [desc_ptr];
+    ld.param.u64 %nm, [n_members];
+    ld.param.u64 %wb, [wbytes];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %derived, [derived_ptr];
+    ld.param.u64 %vdp, [validity_desc_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_widekey:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_widekey;
+    mul.lo.u64 %rowbase, %i, %wb;
+    add.u64 %rowbase, %out, %rowbase;
+    mov.u64 %vword, 0;
+    mov.u64 %m, 0;
+wk_member:
+    setp.ge.u64 %p, %m, %nm;
+    @%p bra wk_member_done;
+    // desc[m] = (kind, src_off, dst_off) at descp + m*24
+    mul.lo.u64 %o, %m, 24;
+    add.u64 %dbase, %descp, %o;
+    ld.global.u64 %kind, [%dbase];
+    ld.global.u64 %srcoff, [%dbase+8];
+    ld.global.u64 %dstoff, [%dbase+16];
+    add.u64 %dst, %rowbase, %dstoff;
+    // M3 (doc 21): per-member NULL validity (only when validity_desc_ptr != 0). A NULL member zeroes its
+    // value bytes and leaves bit m clear; a valid (or non-nullable) member sets bit m in %vword.
+    setp.eq.u64 %p, %vdp, 0;
+    @%p bra wk_dispatch;
+    mul.lo.u64 %o, %m, 8;
+    add.u64 %src, %vdp, %o;
+    ld.global.u64 %voff, [%src];
+    setp.eq.u64 %p, %voff, %vsent;
+    @%p bra wk_setvalid;                // non-nullable member -> valid
+    shr.u64 %o, %i, 5;
+    mul.lo.u64 %o, %o, 4;
+    add.u64 %src, %rp, %voff;
+    add.u64 %src, %src, %o;
+    ld.global.u32 %w0, [%src];
+    and.b64 %o, %i, 31;
+    cvt.u32.u64 %w1, %o;
+    shr.u32 %w0, %w0, %w1;
+    and.b32 %w0, %w0, 1;
+    setp.eq.u32 %p, %w0, 0;
+    @%p bra wk_nullmember;              // validity bit 0 -> NULL member
+wk_setvalid:
+    cvt.u32.u64 %w1, %m;
+    mov.u64 %v, 1;
+    shl.b64 %v, %v, %w1;
+    or.b64 %vword, %vword, %v;
+    bra wk_dispatch;
+wk_nullmember:
+    // NULL member: write zeroed value bytes (16 for kind 2 numeric/uuid, else 8); bit m stays clear.
+    mov.u64 %v, 0;
+    st.global.u64 [%dst], %v;
+    setp.eq.u64 %p, %kind, 2;
+    @!%p bra wk_member_next;
+    st.global.u64 [%dst+8], %v;
+    bra wk_member_next;
+wk_dispatch:
+    setp.eq.u64 %p, %kind, 5;
+    @%p bra wk_dervi64;
+    setp.eq.u64 %p, %kind, 4;
+    @%p bra wk_dervi32;
+    setp.eq.u64 %p, %kind, 3;
+    @%p bra wk_bool;
+    setp.eq.u64 %p, %kind, 2;
+    @%p bra wk_i128;
+    setp.eq.u64 %p, %kind, 1;
+    @%p bra wk_int8;
+    // kind 0: int4 (4-byte) -> i64, write 8 bytes.
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %src, %rp, %srcoff;
+    add.u64 %src, %src, %o;
+    ld.global.s32 %s32, [%src];
+    cvt.s64.s32 %v, %s32;
+    st.global.u64 [%dst], %v;
+    bra wk_member_next;
+wk_int8:
+    // kind 1: int8 (8-byte, 716-safe 2x u32) -> write 8 bytes.
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %src, %rp, %srcoff;
+    add.u64 %src, %src, %o;
+    ld.global.u32 %w0, [%src];
+    ld.global.u32 %w1, [%src+4];
+    mov.b64 %v, {%w0, %w1};
+    st.global.u64 [%dst], %v;
+    bra wk_member_next;
+wk_i128:
+    // kind 2: numeric/uuid (16-byte, 4x u32) -> write 16 bytes (lo, hi).
+    mul.lo.u64 %o, %i, 16;
+    add.u64 %src, %rp, %srcoff;
+    add.u64 %src, %src, %o;
+    ld.global.u32 %w0, [%src];
+    ld.global.u32 %w1, [%src+4];
+    mov.b64 %v, {%w0, %w1};
+    ld.global.u32 %w0, [%src+8];
+    ld.global.u32 %w1, [%src+12];
+    mov.b64 %vhi, {%w0, %w1};
+    st.global.u64 [%dst], %v;
+    st.global.u64 [%dst+8], %vhi;
+    bra wk_member_next;
+wk_dervi32:
+    // kind 4: a derived i32 buffer (the expr group key) -> sign-extend to i64, write 8 bytes. The base
+    // is derived_ptr (a separate per-row buffer, indexed by the absolute row i); src_off is unused.
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %src, %derived, %o;
+    ld.global.s32 %s32, [%src];
+    cvt.s64.s32 %v, %s32;
+    st.global.u64 [%dst], %v;
+    bra wk_member_next;
+wk_dervi64:
+    // kind 5: a derived i64 buffer (the int8 expr group key) -> write 8 bytes (716-safe 2x u32).
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %src, %derived, %o;
+    ld.global.u32 %w0, [%src];
+    ld.global.u32 %w1, [%src+4];
+    mov.b64 %v, {%w0, %w1};
+    st.global.u64 [%dst], %v;
+    bra wk_member_next;
+wk_bool:
+    // kind 3: bool bitmap (1 bit/row, LE u32 words, LSB-first) -> i64 0/1. word = bitmap[i/32];
+    // bit = (word >> (i%32)) & 1. srcoff is the bitmap's byte offset in the resident payload.
+    shr.u64 %o, %i, 5;
+    mul.lo.u64 %o, %o, 4;
+    add.u64 %src, %rp, %srcoff;
+    add.u64 %src, %src, %o;
+    ld.global.u32 %w0, [%src];
+    and.b64 %o, %i, 31;
+    cvt.u32.u64 %w1, %o;
+    shr.u32 %w0, %w0, %w1;
+    and.b32 %w0, %w0, 1;
+    setp.ne.u32 %p, %w0, 0;
+    selp.u64 %v, 1, 0, %p;
+    st.global.u64 [%dst], %v;
+wk_member_next:
+    add.u64 %m, %m, 1;
+    bra wk_member;
+wk_member_done:
+    // M3 (doc 21): write the per-row validity WORD into the reserved trailing slot (only when validity is
+    // tracked). It is part of the wbytes the claim hashes + memcmps, so NULL/non-NULL members are distinct.
+    setp.eq.u64 %p, %vdp, 0;
+    @%p bra wk_no_vword;
+    sub.u64 %o, %wb, 8;
+    add.u64 %addr, %rowbase, %o;
+    st.global.u64 [%addr], %vword;
+wk_no_vword:
+    add.u64 %i, %i, %stride;
+    bra loop_widekey;
+done_widekey:
+    ret;
+}
+// COUNT(DISTINCT v) mark pass: mark the first row of each distinct (key0, key1, .., key{kdim-1})
+// tuple in SORTED order, and gather each sorted row's key0 (the group key). `keys_ptr` is the
+// row-major i64 tuple matrix (kdim i64 per row) ALREADY sorted via `perm` (the u32 permutation from
+// the multikey sort). For each sorted position i: g_out[i] = key0 of the row at perm[i]; nd_out[i] =
+// 1 iff position i begins a new tuple (i == 0, OR ANY of the kdim keys differs from sorted position
+// i-1), else 0. kdim = 2 for an int value (g, v); kdim = 3 for a numeric/uuid value (g, v_hi, v_lo)
+// -- distinctness only needs equal tuples to sort ADJACENT, so the i64 raw-bit order of (v_hi, v_lo)
+// is sufficient (a byte-identical i128 collapses). A pure MAP -- no atomics, no hash -- so it cannot
+// reintroduce the bool-GROUP-BY concurrency hazard. SUM(nd_out) grouped by g_out (via the GROUP BY
+// kernel's key/value_base_override) = the per-group distinct count. Buffers are leased (>=8-aligned)
+// so the i64 ld/st are safe.
+.visible .entry gpu_db_mark_new_distinct(
+    .param .u64 keys_ptr,
+    .param .u64 perm_ptr,
+    .param .u64 n,
+    .param .u64 kdim,
+    .param .u64 g_out,
+    .param .u64 nd_out
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %row;
+    .reg .u32 %prow;
+    .reg .u64 %keys;
+    .reg .u64 %perm;
+    .reg .u64 %n;
+    .reg .u64 %kdim;
+    .reg .u64 %k8;
+    .reg .u64 %gout;
+    .reg .u64 %ndout;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %base;
+    .reg .u64 %pbase;
+    .reg .u64 %g;
+    .reg .u64 %ka;
+    .reg .u64 %kb;
+    .reg .u64 %nd;
+    .reg .u64 %r64;
+    .reg .u64 %j;
+    .reg .u64 %jo;
+
+    ld.param.u64 %keys, [keys_ptr];
+    ld.param.u64 %perm, [perm_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %kdim, [kdim];
+    ld.param.u64 %gout, [g_out];
+    ld.param.u64 %ndout, [nd_out];
+    mul.lo.u64 %k8, %kdim, 8;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_mark_nd:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_mark_nd;
+    // row = perm[i]; base = &keys[row * kdim]
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %perm, %o;
+    ld.global.u32 %row, [%addr];
+    cvt.u64.u32 %r64, %row;
+    mul.lo.u64 %o, %r64, %k8;
+    add.u64 %base, %keys, %o;
+    // key0 (the group key) -> g_out[i]
+    ld.global.u64 %g, [%base];
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %gout, %o;
+    st.global.u64 [%addr], %g;
+    // i == 0 always begins a new distinct tuple.
+    setp.eq.u64 %p, %i, 0;
+    @%p bra mark_is_new;
+    // pbase = &keys[perm[i-1] * kdim]
+    sub.u64 %o, %i, 1;
+    mul.lo.u64 %o, %o, 4;
+    add.u64 %addr, %perm, %o;
+    ld.global.u32 %prow, [%addr];
+    cvt.u64.u32 %r64, %prow;
+    mul.lo.u64 %o, %r64, %k8;
+    add.u64 %pbase, %keys, %o;
+    // new iff ANY of the kdim keys differs from sorted position i-1.
+    mov.u64 %j, 0;
+key_cmp_loop:
+    setp.ge.u64 %p, %j, %kdim;
+    @%p bra mark_not_new;
+    mul.lo.u64 %jo, %j, 8;
+    add.u64 %addr, %base, %jo;
+    ld.global.u64 %ka, [%addr];
+    add.u64 %addr, %pbase, %jo;
+    ld.global.u64 %kb, [%addr];
+    setp.ne.u64 %p, %ka, %kb;
+    @%p bra mark_is_new;
+    add.u64 %j, %j, 1;
+    bra key_cmp_loop;
+mark_not_new:
+    mov.u64 %nd, 0;
+    bra mark_store;
+mark_is_new:
+    mov.u64 %nd, 1;
+mark_store:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %ndout, %o;
+    st.global.u64 [%addr], %nd;
+    add.u64 %i, %i, %stride;
+    bra loop_mark_nd;
+done_mark_nd:
+    ret;
+}
+
+// Validate every resident text slice referenced by `indices` before the DISTINCT marker may compare
+// bytes. Host preflight owns the offsets-table/blob allocation windows and absolute-row domain; this
+// device pass owns the actual offset contents. Any reversed or beyond-blob interval sets error[0].
+.visible .entry gpu_db_validate_distinct_text_offsets(
+    .param .u64 resident_base_ptr,
+    .param .u64 text_off,
+    .param .u64 text_bytes_len,
+    .param .u64 indices_ptr,
+    .param .u64 n,
+    .param .u64 error_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %bad;
+    .reg .pred %reversed;
+    .reg .pred %past_end;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %old_error;
+    .reg .u64 %resb;
+    .reg .u64 %offb;
+    .reg .u64 %limit;
+    .reg .u64 %indp;
+    .reg .u64 %n;
+    .reg .u64 %err;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %abs;
+    .reg .u64 %start;
+    .reg .u64 %end;
+
+    ld.param.u64 %resb, [resident_base_ptr];
+    ld.param.u64 %offb, [text_off];
+    add.u64 %offb, %resb, %offb;
+    ld.param.u64 %limit, [text_bytes_len];
+    ld.param.u64 %indp, [indices_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %err, [error_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+vtxt_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra vtxt_done;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %indp, %o;
+    ld.global.u64 %abs, [%addr];
+    mul.lo.u64 %o, %abs, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %start, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %end, {%w0, %w1};
+    setp.gt.u64 %reversed, %start, %end;
+    setp.gt.u64 %past_end, %end, %limit;
+    or.pred %bad, %reversed, %past_end;
+    @%bad atom.global.exch.b32 %old_error, [%err], 1;
+    add.u64 %i, %i, %stride;
+    bra vtxt_loop;
+vtxt_done:
+    ret;
+}
+
+// COUNT(DISTINCT v) mark pass for a TEXT value: the value is varlen so it cannot pack into i64 keys;
+// the (g, text_v) tuple was instead sorted on the GPU via gpu_db_bitonic_sort_hetero (g the int key,
+// text_v the text key), giving `perm` (positions 0..n). This kernel marks the first row of each
+// distinct (g, text_v) tuple in that sorted order and gathers each sorted row's g. For sorted
+// position i: pos = perm[i], abs = indices[pos] (the absolute resident row), g = gkeys[pos] (the int
+// group key, laid out BY POSITION exactly like the hetero sort's int_keys). g_out[i] = g; nd_out[i] =
+// 1 iff position i begins a new tuple (i == 0, OR g != g[i-1], OR the text bytes at abs differ from
+// the text at indices[perm[i-1]]). The sort already made equal (g, text_v) ADJACENT, so the text test
+// is plain byte EQUALITY (length then bytes), not a lexicographic compare. text_off/text_bytes are the
+// value column's offsets/bytes section byte offsets into resident_base; offsets are read 2x ld.u32
+// (716-safe). A pure MAP -- no atomics -- so it cannot reintroduce the bool-GROUP-BY hazard.
+// SUM(nd_out) grouped by g_out = the per-group distinct count.
+.visible .entry gpu_db_mark_new_distinct_text(
+    .param .u64 perm_ptr,
+    .param .u64 indices_ptr,
+    .param .u64 gkeys_ptr,
+    .param .u64 resident_base_ptr,
+    .param .u64 text_off,
+    .param .u64 text_bytes,
+    .param .u64 n,
+    .param .u64 g_out,
+    .param .u64 nd_out
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %pos;
+    .reg .u32 %ppos;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
+    .reg .u64 %permp;
+    .reg .u64 %indp;
+    .reg .u64 %gkp;
+    .reg .u64 %resb;
+    .reg .u64 %toff;
+    .reg .u64 %tbyt;
+    .reg .u64 %n;
+    .reg .u64 %gout;
+    .reg .u64 %ndout;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %abs;
+    .reg .u64 %pabs;
+    .reg .u64 %g;
+    .reg .u64 %pg;
+    .reg .u64 %nd;
+    .reg .u64 %offb;
+    .reg .u64 %bytb;
+    .reg .u64 %sta;
+    .reg .u64 %ena;
+    .reg .u64 %stb;
+    .reg .u64 %enb;
+    .reg .u64 %lena;
+    .reg .u64 %lenb;
+    .reg .u64 %ba;
+    .reg .u64 %bb;
+    .reg .u64 %j;
+    .reg .u64 %posq;
+    .reg .u64 %pposq;
+
+    ld.param.u64 %permp, [perm_ptr];
+    ld.param.u64 %indp, [indices_ptr];
+    ld.param.u64 %gkp, [gkeys_ptr];
+    ld.param.u64 %resb, [resident_base_ptr];
+    ld.param.u64 %toff, [text_off];
+    ld.param.u64 %tbyt, [text_bytes];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %gout, [g_out];
+    ld.param.u64 %ndout, [nd_out];
+    add.u64 %offb, %resb, %toff;
+    add.u64 %bytb, %resb, %tbyt;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+mtxt_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra mtxt_done;
+    // pos = perm[i]; abs = indices[pos]; g = gkeys[pos]
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %permp, %o;
+    ld.global.u32 %pos, [%addr];
+    cvt.u64.u32 %posq, %pos;
+    mul.lo.u64 %o, %posq, 8;
+    add.u64 %addr, %indp, %o;
+    ld.global.u64 %abs, [%addr];
+    add.u64 %addr, %gkp, %o;
+    ld.global.u64 %g, [%addr];
+    // g_out[i] = g
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %gout, %o;
+    st.global.u64 [%addr], %g;
+    // i == 0 always begins a new distinct tuple.
+    setp.eq.u64 %p, %i, 0;
+    @%p bra mtxt_new;
+    // ppos = perm[i-1]; pabs = indices[ppos]; pg = gkeys[ppos]
+    sub.u64 %o, %i, 1;
+    mul.lo.u64 %o, %o, 4;
+    add.u64 %addr, %permp, %o;
+    ld.global.u32 %ppos, [%addr];
+    cvt.u64.u32 %pposq, %ppos;
+    mul.lo.u64 %o, %pposq, 8;
+    add.u64 %addr, %indp, %o;
+    ld.global.u64 %pabs, [%addr];
+    add.u64 %addr, %gkp, %o;
+    ld.global.u64 %pg, [%addr];
+    // g != pg -> new
+    setp.ne.u64 %p, %g, %pg;
+    @%p bra mtxt_new;
+    // text of abs: sta = offsets[abs], ena = offsets[abs+1] (read 2x u32 = 716-safe)
+    mul.lo.u64 %o, %abs, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %sta, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %ena, {%w0, %w1};
+    sub.u64 %lena, %ena, %sta;
+    // text of pabs
+    mul.lo.u64 %o, %pabs, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %stb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %enb, {%w0, %w1};
+    sub.u64 %lenb, %enb, %stb;
+    // unequal length -> new
+    setp.ne.u64 %p, %lena, %lenb;
+    @%p bra mtxt_new;
+    // compare lena bytes; any differ -> new
+    add.u64 %ba, %bytb, %sta;
+    add.u64 %bb, %bytb, %stb;
+    mov.u64 %j, 0;
+mtxt_byte:
+    setp.ge.u64 %p, %j, %lena;
+    @%p bra mtxt_eq;
+    add.u64 %addr, %ba, %j;
+    ld.global.u8 %abyte, [%addr];
+    add.u64 %addr, %bb, %j;
+    ld.global.u8 %bbyte, [%addr];
+    setp.ne.u32 %p, %abyte, %bbyte;
+    @%p bra mtxt_new;
+    add.u64 %j, %j, 1;
+    bra mtxt_byte;
+mtxt_eq:
+    mov.u64 %nd, 0;
+    bra mtxt_store;
+mtxt_new:
+    mov.u64 %nd, 1;
+mtxt_store:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %ndout, %o;
+    st.global.u64 [%addr], %nd;
+    add.u64 %i, %i, %stride;
+    bra mtxt_loop;
+mtxt_done:
+    ret;
+}

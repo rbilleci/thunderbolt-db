@@ -109,7 +109,10 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
     ) -> i32;
     type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const FILL_PTX: &[u8] = include_bytes!("device_fill.ptx");
+    const COMPACT_PTX: &[u8] = include_bytes!("resident_group_compact.ptx");
+    const GROUP_PTX: &[u8] = include_bytes!("resident_group.ptx");
+    const EXTRA_PTX: &[u8] = include_bytes!("resident_group_extra.ptx");
     const EMPTY: i64 = i64::MIN;
 
     if indices.is_empty() {
@@ -164,13 +167,27 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
             .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
-    ptx.push(0);
-    let fill_fn = primary.cached_function(c"gpu_db_fill_i64", &ptx)?;
+    let mut fill_ptx = Vec::with_capacity(FILL_PTX.len() + 1);
+    fill_ptx.extend_from_slice(FILL_PTX);
+    fill_ptx.push(0);
+    let mut compact_ptx = Vec::with_capacity(COMPACT_PTX.len() + 1);
+    compact_ptx.extend_from_slice(COMPACT_PTX);
+    compact_ptx.push(0);
+    let group_source = if kernel == c"gpu_db_group_by_i32_count_sum_twolevel" {
+        EXTRA_PTX
+    } else {
+        GROUP_PTX
+    };
+    let mut group_ptx = Vec::with_capacity(group_source.len() + 1);
+    group_ptx.extend_from_slice(group_source);
+    group_ptx.push(0);
+    let mut extra_ptx = Vec::with_capacity(EXTRA_PTX.len() + 1);
+    extra_ptx.extend_from_slice(EXTRA_PTX);
+    extra_ptx.push(0);
+    let fill_fn = primary.cached_function(c"gpu_db_fill_i64", &fill_ptx)?;
     // Two-level (shared-mem local aggregation -> global merge): far less global-atomic contention at
     // low cardinality. The single-level `gpu_db_group_by_i32_count_sum` stays as the reference kernel.
-    let group_fn = primary.cached_function(kernel, &ptx)?;
+    let group_fn = primary.cached_function(kernel, &group_ptx)?;
     let indices_dev = primary.lease_device_buffer(idx_bytes)?;
     let slot_keys = primary.lease_device_buffer(slot_bytes)?;
     let slot_count = primary.lease_device_buffer(slot_bytes)?;
@@ -210,7 +227,7 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
     // Text GROUP-BY keys also live in slot_keys_i128 (b128 = (rep_row_idx, text_hash), claimed via
     // atom.cas.b128 with a full-text verify-on-lost-CAS), so the EMPTY128 fill is needed for them too.
     let fill_i128_fn = if key_is_i128 || key_is_text || comp_w > 0 || n_text > 0 {
-        Some(primary.cached_function(c"gpu_db_fill_i128", &ptx)?)
+        Some(primary.cached_function(c"gpu_db_fill_i128", &fill_ptx)?)
     } else {
         None
     };
@@ -221,7 +238,7 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
     // scatters every occupied group's fields into DENSE arrays + writes out_count. We then D2H ONLY the
     // out_count dense rows, not the full ~2*row_count slot table. Dense arrays are worst-case sized to
     // alloc_slots (every slot occupied) and leased like the slot buffers; the D2H slices to out_count.
-    let compact_fn = primary.cached_function(c"gpu_db_group_by_slot_compact", &ptx)?;
+    let compact_fn = primary.cached_function(c"gpu_db_group_by_slot_compact", &compact_ptx)?;
     let out_key = primary.lease_device_buffer(slot_bytes)?;
     let out_count_arr = primary.lease_device_buffer(slot_bytes)?;
     let out_sum = primary.lease_device_buffer(slot_bytes)?;
@@ -417,7 +434,7 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
     // buffers -> phantom groups, order-dependent on pool reuse). Gate pass 2 exactly as pass 1 gates
     // the block that feeds it: MIN or MAX actually requested.
     let pass2_fn = if value_is_numeric && (agg_mask & 12) != 0 {
-        Some(primary.cached_function(c"gpu_db_group_by_numeric_minmax_lo", &ptx)?)
+        Some(primary.cached_function(c"gpu_db_group_by_numeric_minmax_lo", &extra_ptx)?)
     } else {
         None
     };
@@ -964,7 +981,9 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     type CuStreamSync = unsafe extern "C" fn(*mut c_void) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const FILL_PTX: &[u8] = include_bytes!("device_fill.ptx");
+    const GROUP_PTX: &[u8] = include_bytes!("resident_group.ptx");
+    const EXTRA_PTX: &[u8] = include_bytes!("resident_group_extra.ptx");
     const EMPTY: i64 = i64::MIN;
 
     if runs == 0 {
@@ -1024,11 +1043,19 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
-    ptx.push(0);
-    let fill_fn = primary.cached_function(c"gpu_db_fill_i64", &ptx)?;
-    let group_fn = primary.cached_function(kernel, &ptx)?;
+    let mut fill_ptx = Vec::with_capacity(FILL_PTX.len() + 1);
+    fill_ptx.extend_from_slice(FILL_PTX);
+    fill_ptx.push(0);
+    let group_source = if kernel == c"gpu_db_group_by_i32_count_sum_twolevel" {
+        EXTRA_PTX
+    } else {
+        GROUP_PTX
+    };
+    let mut group_ptx = Vec::with_capacity(group_source.len() + 1);
+    group_ptx.extend_from_slice(group_source);
+    group_ptx.push(0);
+    let fill_fn = primary.cached_function(c"gpu_db_fill_i64", &fill_ptx)?;
+    let group_fn = primary.cached_function(kernel, &group_ptx)?;
     let indices_dev = primary.lease_device_buffer(idx_bytes)?;
     let slot_keys = primary.lease_device_buffer(slot_bytes)?;
     let slot_count = primary.lease_device_buffer(slot_bytes)?;

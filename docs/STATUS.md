@@ -1687,14 +1687,32 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   card remained stable: IN-L2/OUT-OF-L2 rooflines were 1,482.7/1,446.7 GB/s, count was 0.91x/1.01x roofline,
   grouped aggregation was 1,678.0 M elements/s, and batch-65,536 point reads were 236.8M at p50 140us IN-L2 and
   254.8M at p50 128us OUT-OF-L2; the OUT-OF-L2 index route was 3.22x scan. Audit also exposed the omitted,
-  hand-maintained 9,745-line expression PTX dependency hub, now first in PLAN as **STRUCT-001FR**.
+  hand-maintained 9,745-line expression PTX dependency hub, which was promoted as **STRUCT-001FR**.
+  STRUCT-001FR then dispositioned and deleted that ownership hub. Its 67 live entry points now reside in 13
+  operator/type-owned PTX leaves ranging from 171 to 1,398 lines; no leaf crosses the preferred production
+  envelope. Normalized declaration-through-body comparison against the former file proves every surviving symbol,
+  ABI, and body unchanged. The only removals are two unreferenced legacy compactors whose ordered replacements were
+  already live. Every cache/include consumer now loads the one leaf defining its requested entry, and a repository-
+  wide audit found 72 unique PTX definitions with no duplicates. The complete responsibility, history, consumer,
+  and ABI evidence is in `design/expression-ptx-disposition.md`. All 13 leaves independently assemble for `sm_90`,
+  pass the permanent ASCII guard, and contain no include dependency. Fifteen expression/gather/wide/varlen/derived/
+  join/aggregate/group/sort production routes passed 45 sequential plus 30 concurrent invocations without CUDA
+  700/716/717. Execution passes 53/80 in both ordinary modes and 133/133 with ignored tests included; engine passes
+  505/487 in both ordinary modes. Workspace all-target/all-feature check, strict execution/engine clippy, dependency
+  and read-policy boundaries, scoped format/reference/diff checks, and independent audit are clean. Three obsolete
+  direct text fixtures were corrected to the exact eight-byte alignment already required by the safe API, and stale
+  engine comments now describe that contract. The canonical card remains stable: IN-L2/OUT-OF-L2 rooflines are
+  1,486.0/1,451.0 GB/s, count is 0.86x/1.00x roofline, grouped aggregation is 1,677.3 M elements/s, and batch-65,536
+  point reads are 227.1M at p50 139us IN-L2 and 253.2M at p50 131us OUT-OF-L2; the OUT-OF-L2 index route is 3.25x
+  scan. A broader charter sweep also found seven independently reproducible ignored engine failures unrelated to
+  the unchanged PTX bodies; their disposition is promoted first as **QUALITY-002**.
 
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
-| 27 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
-| The 9,745-line hand-maintained expression PTX hub needs an audited ownership disposition | **STRUCT-001FR** |
+| 26 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| Seven ignored bridge/join/cold-checkpoint engine tests fail the complete charter gate | **QUALITY-002** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |

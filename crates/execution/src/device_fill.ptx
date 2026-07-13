@@ -1,0 +1,171 @@
+.version 8.4
+.target sm_90
+.address_size 64
+
+// Hand-maintained PTX; ownership follows the matching Rust operator module.
+
+
+// Fill an 8-byte-element array ptr[0..n] with a 64-bit value (grid-stride). Used to initialize a
+// GROUP BY hash table's slot_keys to EMPTY (i64::MIN) -- no cuMemset pattern produces a clean i64
+// sentinel outside the i32 key range. The buffer is freshly allocated (>=8-aligned), so st.u64 is OK.
+.visible .entry gpu_db_fill_i64(
+    .param .u64 ptr,
+    .param .u64 n,
+    .param .u64 value
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u64 %base;
+    .reg .u64 %n;
+    .reg .u64 %val;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    ld.param.u64 %base, [ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %val, [value];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+fill_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra fill_done;
+    mul.lo.u64 %off, %i, 8;
+    add.u64 %addr, %base, %off;
+    st.global.u64 [%addr], %val;
+    add.u64 %i, %i, %stride;
+    bra fill_loop;
+fill_done:
+    ret;
+}
+
+// M3 (doc 21): finalize a nullable ORDER BY EXPRESSION sort key. `value_i32` holds the on-device arith
+// result (int4 width); `mask_i32` is the expression's validity (1 = every operand was non-NULL, 0 = the
+// result is NULL). Emit a SIGN-EXTENDED i64 key where valid, else the i64::MAX sentinel (which no
+// widened int4 value can equal -> the comparator places NULL-expression rows at PG's default end, with
+// no collision). The NULL decision is thus made ON-DEVICE; the host only gathers the finished i64 keys.
+.visible .entry gpu_db_blend_widen_null_sentinel(
+    .param .u64 value_i32_ptr,
+    .param .u64 mask_i32_ptr,
+    .param .u64 out_i64_ptr,
+    .param .u64 n
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %m;
+    .reg .s32 %v32;
+    .reg .u64 %vbase;
+    .reg .u64 %mbase;
+    .reg .u64 %obase;
+    .reg .u64 %n;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .s64 %v64;
+    .reg .s64 %sent;
+
+    ld.param.u64 %vbase, [value_i32_ptr];
+    ld.param.u64 %mbase, [mask_i32_ptr];
+    ld.param.u64 %obase, [out_i64_ptr];
+    ld.param.u64 %n, [n];
+    mov.u64 %sent, 0x7FFFFFFFFFFFFFFF;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+bws_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra bws_done;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %mbase, %off;
+    ld.global.u32 %m, [%addr];
+    mul.lo.u64 %off, %i, 8;
+    add.u64 %addr, %obase, %off;
+    setp.eq.u32 %p, %m, 0;
+    @%p bra bws_null;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %off, %vbase, %off;
+    ld.global.s32 %v32, [%off];
+    cvt.s64.s32 %v64, %v32;
+    st.global.u64 [%addr], %v64;
+    bra bws_next;
+bws_null:
+    st.global.u64 [%addr], %sent;
+bws_next:
+    add.u64 %i, %i, %stride;
+    bra bws_loop;
+bws_done:
+    ret;
+}
+
+// Fill a [b128; n] array with the 128-bit value (vhi:vlo) -- used to init slot_keys_i128 to EMPTY128
+// (i128::MIN = vlo=0, vhi=i64::MIN), since that bit pattern is not a uniform-byte memset.
+.visible .entry gpu_db_fill_i128(
+    .param .u64 ptr,
+    .param .u64 n,
+    .param .u64 vlo,
+    .param .u64 vhi
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u64 %base;
+    .reg .u64 %n;
+    .reg .u64 %vlo;
+    .reg .u64 %vhi;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .b128 %v128;
+
+    ld.param.u64 %base, [ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %vlo, [vlo];
+    ld.param.u64 %vhi, [vhi];
+    mov.b128 %v128, {%vlo, %vhi};
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+fill128_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra fill128_done;
+    mul.lo.u64 %off, %i, 16;
+    add.u64 %addr, %base, %off;
+    st.global.b128 [%addr], %v128;
+    add.u64 %i, %i, %stride;
+    bra fill128_loop;
+fill128_done:
+    ret;
+}
