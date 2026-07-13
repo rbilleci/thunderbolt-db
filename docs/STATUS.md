@@ -325,6 +325,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   34.4 GB/s (0.0234x same-run roofline) in-L2 and 3.7 GB/s out-of-L2; count is 0.87x/1.02x roofline, grouped is
   1,678.3 M elements/s, and 65,536-batch point reads are 246.2M/253.2M lookups/s at p50 139/132us. Both AE and
   AF are closed.
+  The exact resident u64 row-count PTX and launcher now live in the private 92-line
+  `execution::resident_header` module behind the unchanged `CudaResidentDeviceMemory` facade. Normalized
+  implementation comparison is exact apart from parent-private visibility; the >=8-byte allocation guard,
+  cached symbol, 2xu64 ABI, 1x1x1 grid, pooled stream/scratch/events, launched-error drains, one bounded 8-byte
+  readback, and little-endian decode are unchanged. The direct primary-context/module-cache gate passed three
+  sequential and two concurrent invocations. Workspace all-target/all-feature check, execution clippy, and
+  independent re-audit are clean; the audit's sole stale test-owner comment was corrected. The exact 125-test
+  inventory and 48 active/77 GPU-ignored suite remain stable, and the execution root is 17,940 lines. The
+  canonical card remained green: in-L2/out-of-L2 `sum_i32` measured 1,480.1/1,448.3 GB/s,
+  `count_i32_compare` measured 0.873x/1.000x same-run roofline, ordered compaction measured 34.8 GB/s
+  (0.0235x roofline)/3.7 GB/s, grouped aggregation measured 1,678.0 M elements/s, and 65,536-batch point reads
+  measured 246.6M/252.6M lookups/s at p50 139/131us. STRUCT-001AG is closed.
 
 ## Known boundaries
 

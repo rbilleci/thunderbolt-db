@@ -344,7 +344,8 @@
         type CuStreamSynchronize = unsafe extern "C" fn(*mut c_void) -> i32;
         type CuStreamDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
 
-        // The exact production row_count kernel (lib.rs `launch_cuda_resident_row_count`):
+        // Snapshot of the exact production row-count kernel owned by
+        // resident_header.rs (`launch_cuda_resident_row_count`):
         // reads the u64 row-count header at [resident] and stores it to [out].
         const PTX: &[u8] = br#"
 .version 6.0
@@ -2600,4 +2601,3 @@
         // two-level kernel (`group_by_i32_count_sum_minmax_from_payload`), benchmarked by the
         // `grouped_cardinality_probe` / `read_kernel_roofline` examples.
     }
-

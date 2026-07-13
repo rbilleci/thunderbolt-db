@@ -33,8 +33,8 @@ The sole work ledger is `PLAN.md`.
    isolation matrix; never replace it with a host interpretation path.
 2. **MULTI-002:** on that host, partition write/visible-locate submissions by
    primary context and deterministically merge bounded metadata; never move lookup or visibility to the host.
-3. **STRUCT-001:** continue disposition of the 29 source-size outliers with the sidecar and unique-verdict
-   leaves closed.
+3. **STRUCT-001:** analyze and disposition `crates/protocol/src/bin/gpu-db-server.rs`, then select one
+   behavior-preserving ownership slice behind its stable server boundary.
 4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design and record the
    surviving architecture in an ADR. Do not let structural extraction decide it implicitly.
 5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
