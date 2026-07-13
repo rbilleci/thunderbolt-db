@@ -640,6 +640,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Sequential/concurrent 127-test runs, the full protocol package and driver smokes, all-target checks, warning-
   denied clippy, security preflight, focused DML tests, touched formatting, diff checks, and independent audit
   are clean. The root is 12,451 lines and STRUCT-001BQ is closed.
+  Legacy host-backed SELECT execution now lives in the private 1,432-line `select_execution` owner, explicitly
+  labeled parity/bootstrap debt rather than product direction. It owns comparison and SELECT/DELETE predicates,
+  view/materialized-view recursion and ACLs, projection/distinct/order/limit/offset, scalar/grouped aggregates
+  and HAVING, formatting/parsing/materialization, and simple-query SELECT response. Seven narrow parent-private
+  exports serve proven DML, COPY, extended-query, cursor/prepared, view, root-check, and test consumers. Both
+  moved ranges and the response arm are normalized-exact; only visibility, one clippy-required tail expression,
+  and rustfmt normalization differ. This also removed the root's two inherited formatting exceptions, so both
+  files are rustfmt-clean. Sequential/concurrent 127-test runs, the full protocol package and driver smokes,
+  all-target checks, warning-denied clippy, security preflight, focused query/view/DML/ACL tests, diff checks,
+  and independent audit are clean. The root is 11,053 lines and STRUCT-001BR is closed.
 
 ## Known boundaries
 
