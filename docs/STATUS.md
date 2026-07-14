@@ -3098,6 +3098,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The actionable inventory
   remains 13; STRUCT-001JT owns the exact programmatic-predicate family at current lines 16–408.
 
+  STRUCT-001JT then isolated the exact complete direct-`ResidentExpr` predicate matrix in the rustfmt-clean
+  398-line private `tests/resident_expr/programmatic_predicates.rs` child, reducing the PLAN-owned test root from
+  7,058 to 6,665 lines after deleting the single now-redundant trailing separator blank. Child lines 6–398 are
+  byte-identical to old parent lines 16–408 (SHA-256 `3d03992f…`) and full-file reconstruction is exact. Exactly
+  five ignored actual-GPU tests moved with no helper and four explicit import declarations/seven names. Test
+  paths intentionally gained the child segment, with no facade, visibility bridge, sibling/parent dependency,
+  unsafe, include/path indirection, or production change; parent IR/parser imports remain for proven later
+  consumers. Arithmetic materialization, multi-block ordered-int4 compaction and flipped operands, deep VM
+  trees, column/expression comparisons, boolean masks, bare-column hard error, exact rows, targets, and fallback
+  assertions remain exact. All five paths passed 15 focused local actual-GPU executions and ten independent-audit
+  executions. Both modes passed 505/487, the complete include-ignored suite passed 992/992, and workspace check,
+  strict engine Clippy, private rustdoc with the known 25-link warning baseline, scoped source/format/diff/cleanup,
+  fresh inventory, and independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The
+  actionable inventory remains 13; STRUCT-001JU owns the exact nullable-grouping family at current lines 92–569.
+
 ## Known boundaries
 
 | Boundary | Work ID |
