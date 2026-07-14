@@ -686,6 +686,10 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `p8_engine_pgwire_benchmark_endpoint/result_rows.rs` leaf, reducing the root to 3,636 lines. Payload and full
   reversible-parent hashes, build/strict Clippy/server tests, the live retained GPU smoke, static inventory, and
   independent audit pass. STRUCT-001LG owns retained batch classification next.
+- STRUCT-001LG is closed. The normalized-exact retained literal/exact batch contract now lives in the 126-line
+  private `p8_engine_pgwire_benchmark_endpoint/retained_batch.rs` leaf; the root-owned `EngineCommand` wrapper
+  classifier is unchanged and the root is 3,515 lines. Payload/reconstruction, build/lint/test, live retained GPU,
+  static inventory, and independent-audit gates pass. STRUCT-001LH owns the final runtime leaf.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -695,8 +699,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LG/LH:** extract retained batch classification, then retained runtime under the exact seams and
-   gates in PLAN.
+1. **STRUCT-001LH:** extract the retained runtime under the exact seam and full GPU/concurrency/HAZARD gates in
+   PLAN, taking the endpoint root below 3,000 lines.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

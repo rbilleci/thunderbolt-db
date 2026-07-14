@@ -3761,6 +3761,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inventory gates, and independent audit pass. Runtime behavior is unchanged, so HAZARD and report card were
   inapplicable. STRUCT-001LG owns the next neutral retained-batch leaf.
 
+  STRUCT-001LG then moved the exact 124-line retained literal/exact batch candidate owner into the rustfmt-clean
+  126-line private `p8_engine_pgwire_benchmark_endpoint/retained_batch.rs` leaf, reducing the root from 3,636 to
+  3,515 lines. The normalized payload hash is `d785e973…`, and normalized reinsertion plus import/module removal
+  reproduces the complete post-LF parent hash `901d9453…`. The root retains the `EngineCommand` wrapper classifier;
+  the candidate variants, exact/route keys, payload weighting, int4 needle parser, literal classifier, rejection
+  conditions, projection order, SQL/select ownership, callers, and errors are source-equivalent. Only explicit
+  root-confined visibility was added, and the root's now-unused protocol imports were removed. Default check/build,
+  strict example Clippy, the server suite, 16-row retained GPU endpoint smoke, scoped formatting/static/inventory,
+  and independent audit pass. Runtime behavior is unchanged, so HAZARD and report card were inapplicable.
+  STRUCT-001LH owns the final retained runtime leaf.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
