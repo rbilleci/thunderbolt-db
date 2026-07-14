@@ -105,14 +105,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   engine modes, all-target check, strict clippy, scoped source/visibility/format/diff checks, and independent audit
   pass. The complete GPU suite passed 992/0; 15 GiB of fresh generated test residue was removed. The expression root
   is 10,410 lines; HAZARD and report card were not applicable.
+- STRUCT-001GO is closed. The 25 exact state-free predicate operand/type-recognition, literal-normalization, and
+  LIKE-tokenization helpers now live in the rustfmt-clean 400-line private `engine_expr/predicate_operands.rs` leaf.
+  All consumers remain parent-local behind explicit `pub(super)` imports; compiler/lowerer bodies and every runtime,
+  device, orchestration, and `Engine` action remain in place. Fourteen typed GPU predicate/DML routes, both 505/487
+  engine modes, the complete 992-test GPU suite, static/scoped gates, and independent audit pass; 15 GiB of fresh
+  generated residue was removed. The expression root is 10,030 lines; HAZARD and report card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GO:** isolate only the state-free predicate operand/type-recognition, literal-normalization, and
-   LIKE-tokenization helpers into a nested private leaf; keep compilation/lowering, orchestration, runtime/device
+1. **STRUCT-001GP:** isolate the exact complete pre-`Engine` predicate compiler into one bounded private leaf with a
+   one-way dependency on predicate operands; keep `Engine` methods, lowering/execution orchestration, runtime/device
    action, and MULTI in place.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.

@@ -1985,6 +1985,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   source/consumer/visibility/scoped-format/diff/docs gates, and independent audit. The suite's 15 GiB of fresh
   generated `gpu-db-*` residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were
   not applicable. The expression root is now 10,410 lines.
+  STRUCT-001GO then isolated the 25 state-free resident-predicate operand/type-recognition, literal-normalization,
+  and LIKE-tokenization helpers in the rustfmt-clean 400-line private `engine_expr/predicate_operands.rs` leaf.
+  Definitions, exhaustive `ResidentExpr` matches, docs, errors, and behavior are exact apart from narrow
+  parent-equivalent `pub(super)` visibility and one rustfmt-wrapped timestamp signature. DATE still rejects raw
+  integers, TIMESTAMP still accepts bound int8 microseconds, numeric literals retain canonical scale behavior, and
+  LIKE retains bytewise escape/`%`/`_` tokenization. All 25 consumers remain in the parent behind explicit imports;
+  dependencies are one-way to neutral expression, relational table, SQL parser/value, and error contracts, with no
+  CUDA/runtime, `Engine`, unsafe, cfg, cycle, or API expansion. Compiler/lowerer bodies, every `Engine` method,
+  orchestration, routing, mutation, joins, R3 decisions, and MULTI remain in place. Fourteen focused typed GPU
+  predicate and DML routes pass, as do both 505/487 engine modes, the complete 992-test GPU suite, all-target check,
+  strict clippy, exact-source/consumer/visibility/scoped-format/diff/docs gates, and independent audit. The suite's
+  15 GiB of fresh generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates
+  were not applicable. The expression root is now 10,030 lines.
 
 ## Known boundaries
 
