@@ -3459,6 +3459,26 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were
   inapplicable. STRUCT-001KP owns current parent lines 597–1390 as the complete initial GPU join/NULL-key family.
 
+  STRUCT-001KP then isolated the exact initial inner-join/NULL-key V1b family in the rustfmt-clean 799-line private
+  `tests/sql_pg/join_null_keys.rs` child, reducing the parent from 4,766 to 3,972 lines. Old parent lines 597–1390
+  and child lines 6–799 share exact payload hash `f64136de…`; the exact child/parent hashes are
+  `410ea049…`/`dbc08ea0…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 1391 reconstructs old-parent hash `16645d69…` byte-for-byte. All 11 tests/ignores and exact two-relation
+  inner, NULL/3VL exclusion, grid-stride scale, int2/int8/UUID/text/N:N keys, RIGHT/FULL padding, all-NULL build,
+  side-swap, composite partial-NULL, anti-join, word-boundary fixtures/SQL/results/cardinality/type/target assertions
+  are preserved through four import declarations/four names. History assigns the payload exactly to the six join/
+  NULL/V1b commits; preceding scalar-DISTINCT and discarded-separator blame are separately bounded. There is no
+  glob/super dependency, visibility bridge, path/include indirection, unsafe, context bag, numbered shard, external-
+  name reference, or stale copy. Host-constructed expected sets remain test-only parity evidence, never product CPU
+  execution. Thirty-three local plus 33 independent-audit actual-GPU executions passed; local concurrent PIDs
+  `147875`/`147883` overlapped in two samples and audit PIDs `158671`/`158679` in six, with zero CUDA 700/716/719
+  or related faults. Both debug/release ordinary modes passed 505/487 in 18.25s/8.52s, the complete include-ignored
+  suite passed 992/992 in 184.32s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc
+  with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 11-file inventory, and
+  independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable.
+  STRUCT-001KQ owns current parent lines 598–1824 as the complete GPU OUTER/nullable/3VL family and will complete
+  this test-root disposition below 3,000 lines.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional

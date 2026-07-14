@@ -576,6 +576,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. Host expected
   sets remain test-only parity evidence. The actionable inventory remains 11; STRUCT-001KP owns current parent lines
   597–1390 as the complete initial GPU join/NULL-key family.
+- STRUCT-001KP is closed. The exact 11-test initial inner-join/NULL-key V1b family now lives in the rustfmt-clean
+  799-line private `tests/sql_pg/join_null_keys.rs` child; the parent is 3,972 lines. Exact payload/parent
+  reconstruction, 33 local plus 33 independent-audit actual-GPU executions, both 505/487 modes, the complete 992
+  suite, static/source/cleanup gates, fresh inventory, and audit pass. Host expected sets remain test-only parity
+  evidence. The actionable inventory remains 11; STRUCT-001KQ owns current parent lines 598–1824 as the complete
+  GPU OUTER/nullable/3VL family and will take this test root below 3,000 lines.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -585,8 +591,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KP:** isolate exact initial GPU join/NULL-key current `tests/sql_pg.rs` lines 597–1390 as mapped in
-   `PLAN.md`, preserving inner/NULL/3VL/type/N:N/pad/side-swap/composite/anti-join/word-boundary evidence.
+1. **STRUCT-001KQ:** isolate exact GPU OUTER/nullable/3VL current `tests/sql_pg.rs` lines 598–1824 as mapped in
+   `PLAN.md`, preserving pad/NULL/group/order/post-join-WHERE/Kleene/audit evidence and completing the root below
+   3,000 lines.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
