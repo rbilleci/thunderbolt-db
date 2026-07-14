@@ -3743,6 +3743,14 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   such example target. STRUCT-001LE owns that isolated consumer repair before LF/LG/LH execute; no source changed
   in this analysis slice.
 
+  STRUCT-001LE then repaired exactly those three live build selectors to the actual `gpu_db_server` owner while
+  leaving the separately owned `gpu_db_engine` persistent concurrency runner unchanged. `bash -n`, exact-site and
+  Cargo metadata checks, and the corrected default example build pass. A timeout-bounded 16-row live pgwire smoke
+  closed all count/int4/composite/text retained lookup shapes with accepted zero-H2D facts and nonzero CUDA event
+  timings; its server log is empty, no endpoint/PID remained, and no CUDA 700/716/717 appeared. The diff is exactly
+  three one-token package-selector replacements. This behavioral repair is isolated from STRUCT-001LF's first
+  structural move.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional

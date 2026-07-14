@@ -1611,7 +1611,7 @@ REPORT
     return 0
   fi
 
-  cargo build -q -p gpu_db_engine --example p8_engine_pgwire_benchmark_endpoint
+  cargo build -q -p gpu_db_server --example p8_engine_pgwire_benchmark_endpoint
   GPU_DB_P8_ENGINE_PGWIRE_LISTEN="$listen" \
     GPU_DB_P8_ENGINE_PGWIRE_FACTS="$facts_path" \
     GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS=12 \
@@ -1818,7 +1818,7 @@ REPORT
     return 0
   fi
 
-  cargo build -q -p gpu_db_engine --example p8_engine_pgwire_benchmark_endpoint
+  cargo build -q -p gpu_db_server --example p8_engine_pgwire_benchmark_endpoint
   if [ "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}" = "tokio-postgres/simple-query" ]; then
     cargo build -q -p gpu_db_engine --example p8_persistent_pgwire_concurrency_runner
   fi
@@ -2124,7 +2124,7 @@ REPORT
   psql "$pgurl" -X -v ON_ERROR_STOP=1 -c "ANALYZE order_line" >"$smoke_dir/default-postgresql-analyze.out" 2>"$smoke_dir/default-postgresql-analyze.err"
   psql "$pgurl" -X -v ON_ERROR_STOP=1 -Atc "SELECT name || E'\t' || setting FROM pg_settings WHERE name IN ('shared_buffers','work_mem','maintenance_work_mem','effective_cache_size','max_parallel_workers_per_gather','jit','max_parallel_workers','max_worker_processes') ORDER BY name" >"$pg_settings_path"
 
-  cargo build -q -p gpu_db_engine --example p8_engine_pgwire_benchmark_endpoint
+  cargo build -q -p gpu_db_server --example p8_engine_pgwire_benchmark_endpoint
   GPU_DB_P8_ENGINE_PGWIRE_LISTEN="$engine_listen" \
     GPU_DB_P8_ENGINE_PGWIRE_FACTS="$engine_facts" \
     GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS="$engine_max_sessions" \
