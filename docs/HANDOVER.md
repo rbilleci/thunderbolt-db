@@ -242,15 +242,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   240-line `engine_streaming_exec/streaming_select_route.rs` descendant with private classifier symbols, both
   `pub(crate)` routes, and all callers unchanged. The 35-run GPU matrix, fallback control, both engine modes, complete
   992 suite, static/source/comment/dependency gates, cleanup, and audit are clean; the root is 7,269 lines.
+- STRUCT-001IB is closed. Streaming filter/project chunk execution and final device windowing now live in the
+  rustfmt-clean 384-line `engine_streaming_exec/streaming_projection_fold.rs` descendant with one route-sibling
+  `pub(super)` bridge and unchanged `pub(crate)` window API. The 15-run GPU matrix, both engine modes, complete 992
+  suite, static/source/comment/dependency gates, cleanup, and audit are clean; the root is 6,899 lines.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IB:** move exact current streaming root lines 945–1314 into `streaming_projection_fold.rs`, preserving
-   the complete S-E.2 chunk/project/final-device-window owner with only one `pub(super)` route-sibling bridge, then
-   correct the separately proven obsolete host-windowing comment; keep multi-GPU scheduling deferred.
+1. **STRUCT-001IC:** move exact current grouped blocks 946–1570 and 2130–2202 into `streaming_grouped_fold.rs`,
+   preserving the complete two-level Numeric38 partial/chunk/merge/compaction/finalization owner with only one
+   `pub(super)` route-sibling bridge; correct three separately proven stale comments and keep multi-GPU deferred.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

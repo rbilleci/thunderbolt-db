@@ -2432,6 +2432,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   checks, strict clippy, exact source/comment/format/reference gates, cleanup, and independent audit are clean.
   Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001IB then isolated the complete streaming filter/project chunk execution and final device-window owner in
+  the rustfmt-clean 384-line private `engine_streaming_exec/streaming_projection_fold.rs` descendant, reducing the
+  root from 7,269 to 6,899 lines. The old contiguous block reconstructs exactly after rustfmt plus one required
+  `pub(super)` token on the route-sibling fold driver; the chunk helper remains private and existing `pub(crate)`
+  window API is unchanged. Budget/GPU selection, cold born/replay/eviction, pinned host scan/ranges/capture,
+  bounded-eager versus unbounded-lookahead pipeline, projection args and error classes, final synthesized device
+  window/budget fallback, counters/metadata/order/cardinality/NULLs, dependencies, and multi-GPU deferral are exact.
+  The only other change corrected the proven-stale attached host-windowing comment to describe the existing final
+  device pass and cardinality-only early exit. Three controls passed three serial plus two concurrent rounds each;
+  both engine modes passed 505/487 and the complete serial suite passed all 992. Engine/workspace all-target/
+  all-feature checks, strict clippy, exact source/comment/format/reference gates, cleanup, and independent audit are
+  clean. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
