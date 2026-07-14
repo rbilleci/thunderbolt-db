@@ -3651,6 +3651,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   unchanged, so HAZARD/report card were inapplicable. STRUCT-001KZ owns current execution `tests/cuda_paths.rs`
   lines 2878–3041 as the final resident-generation lifetime soundness test and will complete the last test outlier.
 
+  STRUCT-001KZ then normalized that exact one-test/one-ignore resident-generation lifetime soundness owner into
+  the rustfmt-clean 168-line private sibling `crates/execution/src/tests/cuda_generation_lifetime.rs`, reducing
+  `cuda_paths.rs` from 3,041 to 2,876 lines and completing the last test disposition below the envelope without an
+  exception. Prefixing four spaces to each nonblank child payload line 5–168 reproduces old lines 2878–3041 with
+  exact hash `8c5f929a…`; restoring that payload plus the removed separator reconstructs old-parent hash `5fdec9fc…`
+  byte-for-byte. Exact child/parent hashes are `0c5b9299…`/`d8bf5b01…`; `tests/mod.rs` changes only by the private
+  module declaration before the unchanged `include!("cuda_paths.rs")`. The test, ignore, local `Drop::drop`, owner/
+  field-drop order, generation/allocation layouts, barriers, payload offsets/bytes, expected rows, detached submit/
+  completion timing, lifetime assertions, and diagnostics are preserved through one new explicit crate import/
+  four names plus the exact test-local imports. All 164 payload lines derive from the single runtime/test-ownership
+  commit, with no new glob, visibility bridge, path/include indirection, unsafe, helper, external-name reference,
+  or stale copy. Three local plus three independent-audit actual-GPU executions passed; local PIDs `328274`/
+  `328277` overlapped in samples 5–7 and audit PIDs `330598`/`330601` in samples 4–6, with zero CUDA 700/716/719
+  or related faults. The execution library ordinary and complete include-ignored suites passed 56/77 and 133/133;
+  workspace all-target/all-feature check, strict execution Clippy, private rustdoc with the known 13-warning
+  baseline, scoped source/child-format/diff/cleanup gates, fresh four-file inventory, and independent audit are
+  clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001LA now owns analysis
+  and disposition of the handwritten research-paper mechanism-link generator, the first remaining tool outlier.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3662,7 +3681,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 5 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 4 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |

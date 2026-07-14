@@ -572,6 +572,7 @@
 
     include!("sort_join.rs");
 
+    mod cuda_generation_lifetime;
     include!("cuda_paths.rs");
 
     include!("resident_text.rs");

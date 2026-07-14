@@ -641,6 +641,13 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   actual-CUDA executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory,
   and audit pass. The actionable inventory is now five; STRUCT-001KZ owns current execution `tests/cuda_paths.rs`
   lines 2878–3041 as the final resident-generation lifetime soundness test and will complete the last test outlier.
+- STRUCT-001KZ is closed. The normalized one-test/one-ignore resident-generation publish/pinned-reader/GPU-read/
+  post-drain reclamation owner now lives in the rustfmt-clean 168-line private execution sibling
+  `tests/cuda_generation_lifetime.rs`; `cuda_paths.rs` is 2,876 lines and the last test disposition is complete
+  without an exception. Exact normalized payload/parent reconstruction, three local plus three audit actual-GPU
+  executions, execution library ordinary/complete suites, static/source/cleanup gates, fresh inventory, and audit
+  pass. Four actionable tool/example rows remain; STRUCT-001LA owns analysis and disposition of the 14,889-line
+  handwritten research-paper mechanism-link generator.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -650,9 +657,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KZ:** isolate exact resident-generation lifetime soundness test current execution
-   `tests/cuda_paths.rs` lines 2878–3041 as mapped in `PLAN.md`, preserving pinned-generation publication, GPU-read,
-   and post-drain reclamation contracts and proving it serially/concurrently on CUDA hardware.
+1. **STRUCT-001LA:** complete the analysis packet and audited disposition for
+   `scripts/generate_research_paper_mechanism_links.py` as mapped in `PLAN.md`; prove handwritten ownership,
+   generation phases/coupling, deterministic outputs/consumers, and the selected bounded module or exception case.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
