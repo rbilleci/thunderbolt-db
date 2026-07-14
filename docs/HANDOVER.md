@@ -522,6 +522,11 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   nine independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup
   gates, fresh inventory, and audit pass. The actionable inventory remains 12; STRUCT-001KF owns current parent
   lines 580–750 as the complete ordered-fold family.
+- STRUCT-001KF is closed. The exact two-test ordered-fold family now lives in the rustfmt-clean 176-line private
+  `tests/streaming_exec/ordered.rs` child; the parent is 5,041 lines. Exact payload/parent reconstruction, six local
+  plus six independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/
+  cleanup gates, fresh inventory, and audit pass. The actionable inventory remains 12; STRUCT-001KG owns the two
+  residual reduction ranges at current parent lines 581–607 and 853–936.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -531,8 +536,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KF:** isolate the exact ordered-fold family at current `tests/streaming_exec.rs` lines 580–750 as
-   mapped in `PLAN.md`, preserving top-N, compaction, bounded-residency, and honest-defer telemetry.
+1. **STRUCT-001KG:** consolidate the exact residual reduction ranges into the existing bounded scalar/grouped
+   children as mapped in `PLAN.md`, keeping the CPU assertion explicitly parity/bootstrap-only.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
