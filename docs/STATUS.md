@@ -2256,6 +2256,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   are clean. Production bytes/API/visibility and runtime are unchanged, so GPU, HAZARD, and report-card gates were
   not applicable.
 
+  STRUCT-001HL then moved the exact four-test transaction-command family into the rustfmt-clean 275-line
+  `crates/protocol/src/tests/transaction_commands.rs` child, reducing the protocol root from 9,191 to 8,920 lines.
+  Normalized reconstruction is exact; BEGIN/START, COMMIT/END, ROLLBACK/ABORT, WORK/TRANSACTION, AND [NO] CHAIN,
+  isolation/read-write/deferrability modes, mixed ordering/comma/whitespace, duplicate-kind rejection, names,
+  bodies, and errors are unchanged. The mixed 441-line control-command rejection matrix remains byte-identical in
+  the parent. The exact 71-test name-tail inventory is preserved. Four focused tests and the full protocol package
+  (71 library, 127 binary, and both one-test driver integrations), protocol all-target check/strict clippy, server
+  all-target check, security preflight, scoped gates, and independent audit are clean. Production bytes/API/
+  visibility and runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

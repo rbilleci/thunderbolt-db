@@ -178,14 +178,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `protocol/src/tests/session_commands.rs` leaf. The 71-test inventory, focused/full protocol suites,
   protocol/server static gates, security preflight, normalized-source proof, and independent audit are clean; the
   root is 9,191 lines. Audit promoted the bounded four-test transaction-command family as STRUCT-001HL.
+- STRUCT-001HL is closed. The exact four-test transaction-command family now lives in the rustfmt-clean 275-line
+  `protocol/src/tests/transaction_commands.rs` leaf. The 71-test inventory, focused/full protocol suites,
+  protocol/server static gates, security preflight, normalized-source proof, and independent audit are clean; the
+  root is 8,920 lines. Audit promoted the single 441-line negative matrix as STRUCT-001HM.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HL:** move exact current protocol test lines 1,314–1,586 into `tests/transaction_commands.rs` while
-   preserving all four alias/mode tests, the 71-test inventory, and the production codec/public facade.
+1. **STRUCT-001HM:** move exact current protocol test lines 1,317–1,757 into `tests/control_command_rejections.rs`
+   while preserving the negative matrix, 71-test inventory, and production codec/public facade.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
