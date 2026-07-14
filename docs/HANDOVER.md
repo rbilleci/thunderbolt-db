@@ -105,20 +105,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   engine modes, all-target check, strict clippy, scoped source/visibility/format/diff checks, and independent audit
   pass. The complete GPU suite passed 992/0; 15 GiB of fresh generated test residue was removed. The expression root
   is 10,410 lines; HAZARD and report card were not applicable.
-- STRUCT-001GX is closed. Exact NULL-pad and resident predicate-device mask construction now lives in the rustfmt-clean
-  107-line private `engine_expr/predicate_mask.rs` leaf. The resident builder remains `pub(crate)` and the pad helper has
-  only parent visibility; compiler/type/visibility order, probe output, text launch, errors, and retained lifetimes are
-  exact apart from import normalization. Twelve focused GPU mask consumers, both 505/487 engine modes, the complete
-  992-test GPU suite, static/feature/scoped gates, and independent audit pass; 15 GiB of generated residue was removed.
-  The expression root is 6,430 lines; HAZARD/report card were not applicable.
+- STRUCT-001GY is closed. The exact two streaming/incremental join-coordinate builders now live in the rustfmt-clean
+  248-line private `engine_expr/join_incremental.rs` leaf. Mask-before-range order, identity, key payload widths,
+  relation/orientation order, visibility/range intersection, bitmap arguments, errors, lifetimes, and streaming-only
+  consumers are unchanged. Seven focused GPU join controls, both 505/487 engine modes, the complete 992-test GPU suite,
+  static/scoped gates, and independent audit pass; 15 GiB of generated residue was removed. The expression root is
+  6,196 lines; HAZARD/report card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GY:** isolate exact streaming/incremental identity and typed-match coordinate construction into one
-   bounded private leaf; keep the main coordinate executor and projection owner in place.
+1. **STRUCT-001GZ:** isolate exact join projection resolution/materialization into one bounded private leaf; compare
+   raw roofline and canonical report card before/after because the moved owner is on the result path.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

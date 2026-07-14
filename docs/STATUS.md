@@ -2099,6 +2099,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   gates, and independent audit. Fifteen GiB of generated residue was removed. Runtime behavior did not change, so
   HAZARD and report-card gates were not applicable.
 
+  STRUCT-001GY then isolated the exact two streaming/incremental join-coordinate builders in the rustfmt-clean 248-line
+  private `engine_expr/join_incremental.rs` leaf, reducing the expression root to 6,196 lines. Both methods remain
+  `pub(crate)`. Resident predicate mask before row-range intersection, device-only mask AND, identity order, arity and
+  ambiguity errors, accumulated-versus-new orientation, relation/key order, text/numeric/UUID/int8/int4 payload widths,
+  bool rejection, key-count/NATURAL gates, right visibility/range intersection, bitmap argument order, final coordinate
+  arguments, and source lifetimes are exact apart from typed execution-path import normalization. Seven focused GPU
+  streaming, mixed-width, text, numeric/UUID, N:N, NULL-key, and composite controls pass, as do both 505/487 engine
+  modes, the complete 992-test GPU suite, all-target check, strict clippy, exact-source/import/consumer/visibility/
+  layout/argument-order/scoped-format/diff/docs gates, and independent audit. Fifteen GiB of generated residue was
+  removed. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
