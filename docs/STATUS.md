@@ -3309,6 +3309,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory remains 12;
   STRUCT-001KH owns current parent lines 581–1026 as the complete cold-tier lifecycle family.
 
+  STRUCT-001KH then isolated the exact five-test streaming cold-tier lifecycle in the rustfmt-clean 450-line
+  private `tests/streaming_exec/cold_tier.rs` child, reducing the parent from 4,928 to 4,482 lines. Old parent
+  lines 581–1026 and child lines 5–450 share exact payload hash `5c4a8823…`; the exact child/parent hashes are
+  `623c1b56…`/`808d461c…`, and removing the private module plus restoring the payload and separator 1027 reconstructs
+  old-parent hash `4a2f2c1c…` byte-for-byte. Exactly five tests/ignores and zero helpers moved through three import
+  declarations/five names; shared `gpu_available`, `select`, and multi-consumer `ClassEntryDisabled` remain private
+  in the parent. Names, SQL/results/telemetry, panic cleanup, history, the grouped-DISTINCT suite-order reference,
+  and cargo-list order are unchanged, with no visibility bridge, path/include indirection, unsafe, or stale copy.
+  Fifteen local plus 15 independent-audit actual-GPU executions passed; local concurrent PIDs `35881`/`35885`
+  overlapped in 22 samples and audit PIDs `51533`/`51541` in 129, with zero CUDA 700/716/719 or related faults.
+  Both debug/release ordinary modes passed 505/487 in 14.28s/13.37s, the complete include-ignored suite passed
+  992/992 in 173.30s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc with the
+  known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 12-file inventory, and independent
+  audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KI owns current
+  parent lines 582–999 as the complete durable cold-checkpoint family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional

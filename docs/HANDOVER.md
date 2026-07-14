@@ -532,6 +532,11 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   critical 5,000-line threshold. Exact ranges/parent reconstruction/child prefixes, host and actual-GPU focused
   matrices, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass.
   The actionable inventory remains 12; STRUCT-001KH owns current parent lines 581–1026 as the cold-tier lifecycle.
+- STRUCT-001KH is closed. The exact five-test cold-tier lifecycle now lives in the rustfmt-clean 450-line private
+  `tests/streaming_exec/cold_tier.rs` child; the parent is 4,482 lines. Exact payload/parent reconstruction, 15 local
+  plus 15 independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup
+  gates, fresh inventory, and audit pass. The actionable inventory remains 12; STRUCT-001KI owns current parent
+  lines 582–999 as the complete durable cold-checkpoint family.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -541,8 +546,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KH:** isolate the exact cold-tier lifecycle family at current `tests/streaming_exec.rs` lines
-   581–1026 as mapped in `PLAN.md`, preserving replay, invalidation, spill, patch, stamp, and eager-maintenance gates.
+1. **STRUCT-001KI:** isolate the exact durable cold-checkpoint family at current `tests/streaming_exec.rs` lines
+   582–999 as mapped in `PLAN.md`, preserving descriptor, restore, suffix, corruption, boundary, and frontier gates.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
