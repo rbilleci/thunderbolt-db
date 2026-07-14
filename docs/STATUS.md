@@ -2553,6 +2553,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   contiguous cut, and cfg(unix) behavior are unchanged. The root remains separable above 2,000 lines, so no exception
   is justified. Runtime behavior did not change, so HAZARD/report-card/GPU-kernel gates were not applicable.
 
+  STRUCT-001IK then isolated the complete WAL archive timeline/registry/selection/prune owner in the rustfmt-clean
+  785-line private `wal/src/archive_timeline.rs` leaf, reducing the WAL root from 3,639 to 2,868 lines. Four old ranges
+  reconstruct exactly after rustfmt: two private format constants, six public contracts, ten public operations, and
+  six private validation/removal helpers. All sixteen public paths remain stable through one explicit root re-export;
+  there is no visibility bridge or reverse dependency. Transaction/timestamp forks, source/branch separation, parent-
+  before-child/unique registry shape, validated selection, ancestry closure, prune artifact safety/idempotence,
+  path/value validation, manifest integration, error text, and the existing file-sync/rename sequence are unchanged.
+  This does not claim power-loss durability for containing-directory renames/deletions or per-sidecar checksums; that
+  inherited crash campaign remains DUR-002. Six focused tests and both full WAL modes passed 82/82; three engine
+  forked-timeline/cleanup integrations, WAL/engine/workspace all-target/all-feature checks, strict clippy, exact
+  source/API/re-export/format/reference gates, cleanup, and independent audit are clean. Audit found a separate
+  inherited defect: IDs/parents accept the registry's `|` delimiter, allowing unreadable durable metadata and an
+  error-after-mutation registration. STRUCT-001IL is promoted ahead of more extraction. IK itself changed no runtime
+  behavior, so HAZARD/report-card/GPU-kernel gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

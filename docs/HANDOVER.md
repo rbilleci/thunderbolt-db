@@ -279,15 +279,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   buffer/group flush behind four stable root re-exports; neutral recovery/stats contracts remain at root. One narrow
   helper bridge serves exactly three preallocation tests. Both 82-test modes, five engine durability seams, static/
   source/cleanup gates, and corrected independent audit are clean; the 3,639-line root remains PLAN-owned.
+- STRUCT-001IK is closed. The rustfmt-clean 785-line `wal/src/archive_timeline.rs` owns timeline/registry/prune with
+  two constants, six contracts, ten operations, six private helpers, stable root re-exports, and no bridge. Focused/
+  full WAL, engine timeline/cleanup, static/source gates, and audit are clean; the root is 2,868 lines. Audit promoted
+  inherited registry-delimiter injection as STRUCT-001IL before further WAL extraction.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IK:** move current WAL timeline constants/ranges 37–38, 107–154, 1218–1809, and 3178–3313 into private
-   `archive_timeline.rs`; re-export six types and ten functions without a bridge and preserve all timeline/registry/
-   prune tests and engine recovery consumers while multi-GPU stays deferred.
+1. **STRUCT-001IL:** reject `|` in timeline IDs/parents before mutation and prove direct sidecar/registry writes plus
+   registration leave missing/existing registry state unchanged; keep the existing error category and defer power-loss
+   directory-fsync/checksum coverage to DUR-002.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
