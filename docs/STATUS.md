@@ -3067,6 +3067,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   actionable inventory remains 13; STRUCT-001JR owns the exact checked-int4 arithmetic family at current lines
   1517–1688.
 
+  STRUCT-001JR then isolated the exact complete checked-int4 arithmetic family in the rustfmt-clean 177-line
+  private `tests/resident_expr/checked_arithmetic.rs` child, reducing the PLAN-owned test root from 8,338 to
+  8,166 lines after deleting the single now-redundant separator blank. Child lines 6–177 are byte-identical to
+  old parent lines 1517–1688 (SHA-256 `74108416…`) and full-file reconstruction is exact. Exactly two ignored
+  actual-GPU tests and all seven exclusively used private helpers moved with four explicit import declarations/
+  nine names. Test paths intentionally gained the child segment, with no facade, visibility bridge, sibling or
+  parent-local dependency, unsafe, include/path indirection, or production change. Specialized two-column,
+  scalar-fold, buffer×buffer, ADD, and SUB overflow paths still raise PostgreSQL `integer out of range`; 46340²,
+  21474×100000, and 1290³ boundary controls retain exact rows, GPU target, and no-fallback assertions. Both new
+  paths passed six focused local actual-GPU executions and four independent-audit executions. Both modes passed
+  505/487, the complete include-ignored suite passed 992/992, and workspace check, strict engine Clippy, private
+  rustdoc with the known 25-link warning baseline, scoped source/format/diff/cleanup, fresh inventory, and
+  independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The actionable inventory
+  remains 13; STRUCT-001JS owns the exact nullable-semantics matrix at current lines 189–1296.
+
 ## Known boundaries
 
 | Boundary | Work ID |
