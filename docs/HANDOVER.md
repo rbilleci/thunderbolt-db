@@ -117,14 +117,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   all-target/strict-clippy/static/scoped gates, and independent audit pass; generated residue was removed. Raw
   roofline and canonical two-layer/two-cache report-card comparisons are stable, including 48M-row batched point
   reads at 253.1M lookups/s and p50 132us after the move. The expression root is 5,727 lines; HAZARD was not applicable.
+- STRUCT-001HA is closed. The exact two streaming-only coordinate post-filters now live in the rustfmt-clean 84-line
+  private `engine_expr/join_coordinate_filter.rs` leaf behind unchanged `pub(crate)` inherent paths. Mask construction
+  and ordering, retained NULL-pad guards, side-0 context, errors, and the four streaming consumers are unchanged. Five
+  focused GPU controls, both 505/487 engine modes, the complete 992-test GPU suite, all-target/strict-clippy/static/
+  scoped gates, and independent audit pass; generated residue was removed. The expression root is 5,657 lines;
+  HAZARD/report card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HA:** isolate the exact two streaming-only coordinate post-filters into one bounded private leaf;
-   preserve predicate/visibility and NULL-pad mask ordering, lifetimes, side-0 context, and exact errors.
+1. **STRUCT-001HB:** isolate the exact main device-coordinate join executor into one bounded private leaf; preserve
+   typed coordinate/OUTER/sort/window/result semantics and compare raw roofline plus the canonical report card.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

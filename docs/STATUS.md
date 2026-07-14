@@ -2124,6 +2124,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   from 251.6M to 253.1M lookups/s at p50 132us, and indexed single-flight moved from 3.20x to 3.25x scan. Runtime
   behavior did not change, so HAZARD was not applicable.
 
+  STRUCT-001HA then isolated the exact two streaming-only join-coordinate post-filters in the rustfmt-clean 84-line
+  private `engine_expr/join_coordinate_filter.rs` leaf, reducing the expression root to 5,657 lines. Both methods
+  remain `pub(crate)`. Arity rejection before work, relation-order predicate and visibility masks, retained synthetic
+  NULL-pad sources/allocations, temporary `Option::as_ref` vector order, side-0 execution context, real-mask before
+  pad-mask arguments, the visibility path's all-`None` pad vector, errors, consumers, and dependency direction are
+  source-exact. Five focused GPU OUTER-WHERE, pad 3VL, typed/FULL-pad, real-NULL-versus-pad, and over-budget streaming
+  controls pass, as do both 505/487 engine modes, the complete 992-test serial GPU suite, all-target check, strict
+  clippy, static/scoped gates, and independent audit. Generated residue was removed. Runtime behavior did not change,
+  so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
