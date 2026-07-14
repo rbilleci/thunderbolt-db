@@ -3542,6 +3542,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   STRUCT-001KT owns current `tests/intent_fast_path.rs` lines 3491–4430 as the complete GPU constraint-elision
   lifecycle family.
 
+  STRUCT-001KT then isolated that exact seven-test GPU constraint-elision lifecycle in the rustfmt-clean 945-line
+  private `tests/intent_fast_path/constraint_elision.rs` child, reducing the parent from 5,204 to 4,264 lines. Old
+  parent lines 3491–4430 and child lines 6–945 share exact payload hash `f5970deb…`; the exact child/parent hashes
+  are `f9f2c7fb…`/`6ad6d330…`, and removing the private module plus restoring the payload and separator 4431
+  reconstructs old-parent hash `d9d29e20…` byte-for-byte. All seven tests/ignores and exact CHECK/FK schemas, SQL
+  histories, device-residency assertions, failure/retry/liveness pins, mixed-width predicates, results, and
+  diagnostics are preserved. Four explicit import declarations/seven names include the existing private parent
+  `gpu_ids_of_t` helper without visibility widening. History spans the exact eight GPU-native feature commits, with
+  no child glob, visibility bridge, path/include indirection, unsafe, context bag, numbered shard, external-name
+  reference, or stale copy. Twenty-one local plus 21 independent-audit actual-GPU executions passed; local
+  concurrent PIDs `202234`/`202238` overlapped in six samples and audit PIDs `213122`/`213126` were repeatedly
+  observed together, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes passed 505/487
+  in 14.48s/13.23s, the complete include-ignored suite passed 992/992 in 168.74s, and workspace all-target/all-
+  feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/child-
+  format/diff/cleanup gates, fresh nine-file inventory, and independent audit are clean. Runtime behavior is
+  unchanged, so HAZARD/report card were inapplicable. STRUCT-001KU owns current parent lines 49–1543 as the
+  complete GPU intent-lane lifecycle family and will complete this test root below 3,000 lines.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
