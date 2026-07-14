@@ -2330,6 +2330,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   security preflight, scoped gates, and independent audit are clean. Production bytes/API/visibility and runtime
   are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
 
+  STRUCT-001HS then moved the exact single 2,096-line minimal relational SQL facade test into the rustfmt-clean
+  2,085-line `crates/protocol/src/tests/relational_sql_facade.rs` child, reducing the protocol root from 4,596 to
+  2,502 lines. Normalized reconstruction is exact; all covered DDL/DML command/field equality, identifiers/types/
+  options, constraints, privileges, limits/offsets, exact parser error precedence, legacy KV ambiguity containment,
+  name, body, and assertions are unchanged. This is control-plane parser coverage only; no CPU execution or product
+  direction changed. The cohesive historical test is 85 lines over the preferred test ceiling but well below the
+  3,000-line required-analysis threshold and needs no exception. The exact 71-test name-tail inventory, focused
+  test, full protocol package (71 library, 127 binary, and both one-test driver integrations), protocol all-target
+  check/strict clippy, server check, security preflight, scoped gates, and independent audit are clean. Production
+  bytes/API/visibility and runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

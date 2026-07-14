@@ -206,14 +206,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `protocol/src/tests/frontend_messages_malformed.rs` leaf. The shared parent helper, 71-test inventory, focused/
   full protocol suites, static/security gates, normalized-source proof, and independent audit are clean; the root
   is 4,596 lines. Audit mapped four relational owners and promoted the minimal facade test as STRUCT-001HS.
+- STRUCT-001HS is closed. The exact relational SQL facade matrix now lives in the rustfmt-clean 2,085-line
+  `protocol/src/tests/relational_sql_facade.rs` leaf with its bounded cohesive-test disposition. The 71-test
+  inventory, focused/full suites, static/security gates, normalized-source proof, and independent audit are clean;
+  the root is 2,502 lines. Three final relational leaves remain; SELECT features are STRUCT-001HT.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HS:** move exact current protocol test lines 1,346–3,441 into `tests/relational_sql_facade.rs`,
-   preserving full parser command/field/error equality and the 71-test inventory.
+1. **STRUCT-001HT:** move exact current protocol test lines 1,349–1,693 into `tests/relational_select_features.rs`,
+   preserving filter/projection structures and the 71-test inventory.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
