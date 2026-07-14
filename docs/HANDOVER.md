@@ -488,6 +488,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   324 grouped queries, both 505/487 modes, the complete 992 suite, static/source/fixture/cleanup gates, fresh
   inventory, and independent audit pass. JZ is mapped at current lines 635–1526 and will complete the parent below
   3,000.
+- STRUCT-001JZ is closed and the resident-expression test outlier is complete. The exact 15-test non-grouped
+  ordering matrix now lives in the rustfmt-clean 896-line private `tests/resident_expr/nongrouped_ordering.rs`
+  child; the parent is 2,695 lines. Exact hashes/reconstruction, 45 local plus 45 independent-audit actual-GPU
+  executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit
+  pass. The audit-caught import undercount was corrected in PLAN: six exact type annotations require the fourth
+  imported name. The actionable inventory is 12; STRUCT-001KA owns the streaming scalar-reduction test family.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -497,8 +503,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001JZ:** implement the exact current lines 635–1526 `nongrouped_ordering.rs` map in `PLAN.md`;
-   its projected 2,695-line parent completes this outlier without an exception.
+1. **STRUCT-001KA:** isolate the exact scalar-reduction ranges and module prose from `tests/streaming_exec.rs` as
+   mapped in `PLAN.md`, without claiming the parked physical multi-GPU gate.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

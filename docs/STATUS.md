@@ -3190,6 +3190,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   two simultaneous test processes, with zero CUDA 700/716/717. STRUCT-001JZ owns current parent lines 635–1526 and
   completes this outlier at a projected 2,695 lines. Pure movement makes HAZARD/report card inapplicable.
 
+  STRUCT-001JZ then completed the resident-expression test outlier without an exception. The exact 15-test non-
+  grouped expression/fixed/b128/text/multikey ordering owner now lives in the rustfmt-clean 896-line private
+  `tests/resident_expr/nongrouped_ordering.rs` child, reducing the parent from 3,587 to 2,695 lines after deleting
+  one redundant separator. Child lines 5–896 byte-match old parent lines 635–1526 (payload SHA-256 `27e76ac0…`);
+  the exact child/parent hashes are `4ef2b59c…`/`52a11c42…`, and full reconstruction matches old-parent hash
+  `1dacd1f4…`. Exactly 15 tests/ignores moved with no helper, one private module, no bridge/unsafe/path indirection,
+  and unchanged names plus two external evidence references. Forty-five local and 45 independent-audit actual-GPU
+  executions passed, including simultaneous processes observed on the RTX PRO 6000, with zero CUDA 700/716/717.
+  Both debug/release ordinary modes passed 505/487, the complete include-ignored suite passed 992/992 in 170.14s,
+  and workspace check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped format/diff/
+  source/reference/cleanup gates, fresh inventory, and independent audit are clean. Audit correctly rejected the
+  planned three-name import inventory: removing `RelationalSelectResult` caused six compile errors at the exact
+  closure annotations, so the accepted narrow dependency is three import declarations/four names. Runtime behavior
+  is unchanged, so HAZARD/report card were inapplicable. The actionable inventory is 12; STRUCT-001KA owns the
+  streaming scalar-reduction family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3201,7 +3217,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 19 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 12 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |

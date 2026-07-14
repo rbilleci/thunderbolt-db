@@ -18,9 +18,9 @@ task ID here or be explicitly historical.
 
 ## Current focus
 
-1. **STRUCT-001JZ — isolate resident non-grouped ordering tests.** Move the exact 15-test GPU
-   expression/fixed/b128/text/multikey ordering matrix into bounded private
-   `tests/resident_expr/nongrouped_ordering.rs`, completing this parent outlier without an exception.
+1. **STRUCT-001KA — isolate streaming scalar-reduction tests.** Move the complete five-test scalar fold family
+   and its module-level ownership prose into bounded private `tests/streaming_exec/scalar_reductions.rs`, retaining
+   the two shared parser/GPU-probe helpers in the parent and leaving physical multi-GPU execution parked.
 2. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
    reduce the highest context risks before broad implementation work expands them further.
 3. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
@@ -37,7 +37,7 @@ the user explicitly promotes it; its hardware gates remain mandatory and are par
 The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). The corrected 2026-07-12 baseline has **30 files outside
 its analysis envelopes**: 18 production files over 2,000 lines, eight test files over 3,000 lines, and four examples
 or tools over 3,000 lines. Completed dispositions plus one subsequently crossed test threshold leave a current queue
-of **13 files**: zero production, nine tests, and four examples or tools. This inventory is a review queue, not a
+of **12 files**: zero production, eight tests, and four examples or tools. This inventory is a review queue, not a
 predetermined request to split every file.
 
 ### Analysis packet required for each file
@@ -102,8 +102,8 @@ alongside, the production module they cover; do not fragment tests merely to red
 
 | Lines | File | Disposition / evidence |
 |---:|---|---|
-| 3,587 | `crates/engine/src/tests/resident_expr.rs` | **ACTIVE — STRUCT-001JY closed; STRUCT-001JZ completes disposition.** JY moved the exact six-test grouped multi-aggregate matrix into the rustfmt-clean 314-line private `tests/resident_expr/grouped_multi_aggregate.rs` child. Exact hashes/full reconstruction, 18 local plus 18 independent-audit actual-GPU executions (324 grouped queries), both 505/487 modes, the complete 992 suite, static/source/fixture/cleanup gates, fresh inventory, and independent audit pass. JZ owns current lines 635–1526: the complete 15-test non-grouped ordering matrix, projected to a 896-line child and 2,695-line parent. |
-| 6,473 | `crates/engine/src/tests/streaming_exec.rs` | QUEUED |
+| 2,695 | `crates/engine/src/tests/resident_expr.rs` | **DISPOSITION COMPLETE — bounded resident-expression test facade below 3,000 lines; no exception.** STRUCT-001JP–JZ isolated exact scalar, nullable, grouping, DISTINCT, aggregate, and ordering owners into 177–1,459-line private leaves. JZ moved the exact 15-test non-grouped ordering matrix into the rustfmt-clean 896-line `nongrouped_ordering.rs` child; payload/full reconstruction hashes match, names and two external evidence references are unchanged, and the accepted dependency is three import declarations/four names. The independent audit caught the predicted three-name undercount: six exact `RelationalSelectResult` annotations require that fourth name, and removing it fails compilation. Forty-five local plus 45 independent-audit actual-GPU executions, both 505/487 debug/release modes, the complete 992 suite, workspace check, strict Clippy, rustdoc, static/source/cleanup gates, fresh inventory, and independent audit pass. |
+| 6,474 | `crates/engine/src/tests/streaming_exec.rs` | **ACTIVE — STRUCT-001KA owns the complete scalar-reduction family.** The handwritten test root contains shared `gpu_available`/`select` fixtures plus separable join, rank/view, reduction, projection, group/distinct/order, cold-tier/checkpoint, DML/sidecar, chunk-class, and key-index/uniqueness owners. KA moves exact module prose lines 1–10 and test ranges 39–193 plus 1212–1385 into a projected 346-line private scalar-reduction child, deleting only separators 194 and 1386 and reducing the parent to 6,133 lines. Dependencies remain child-to-parent through two narrow shared-helper imports; the one physical multi-GPU test moves structurally but remains parked and is not claimed executed on this one-GPU host. |
 | 5,835 | `crates/engine/src/tests/sql_pg.rs` | QUEUED |
 | 5,374 | `crates/engine/src/tests/mvcc_bundles.rs` | QUEUED |
 | 5,204 | `crates/engine/src/tests/intent_fast_path.rs` | QUEUED |
@@ -118,8 +118,8 @@ handwritten tool, reproducible generated artifact, or obsolete evidence before c
 | Lines | File | Disposition / evidence |
 |---:|---|---|
 | 14,889 | `scripts/generate_research_paper_mechanism_links.py` | QUEUED |
-| 4,738 | `crates/write_conveyor/examples/write_conveyor_bench.rs` | QUEUED |
-| 3,670 | `crates/server/examples/p8_engine_pgwire_benchmark_endpoint.rs` | QUEUED |
+| 4,726 | `crates/write_conveyor/examples/write_conveyor_bench.rs` | QUEUED |
+| 3,668 | `crates/server/examples/p8_engine_pgwire_benchmark_endpoint.rs` | QUEUED |
 | 3,137 | `scripts/run_p8_ch_benchmark_residency_probe.sh` | QUEUED |
 
 STRUCT-001 closes only when every row has an audited disposition; every accepted retention appears in the
@@ -132,7 +132,7 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
-| **STRUCT-001JZ** | NOW | P0 | Move exact current `crates/engine/src/tests/resident_expr.rs` lines 635–1526 into private nested `tests/resident_expr/nongrouped_ordering.rs`: the complete non-grouped GPU ordering/window matrix containing 15 ignored actual-GPU tests and no module helper. Add only private `mod nongrouped_ordering`; test paths intentionally gain that module segment, with no facade/visibility bridge, and delete only trailing separator line 1527. Preserve expression and flipped/int8 ordering, numeric/UUID/b128 and mixed-b128 unsigned-width dispatch, overflow errors, fixed/radix crossover, LIMIT/OFFSET edges, small/300-row text sorting, fixed multikey, heterogeneous int/text and two-text-key ordering, exact rows/targets/errors/fallback assertions. Keep the two existing unqualified evidence references in `sql_pg.rs` and `docs/design/expression-ptx-disposition.md` valid by preserving names. Use exactly three narrow imports (`Engine`, `DeviceTarget`, `SqlValue`) and add no shared fixture, runtime change, CPU product path, unsafe, or R3 decision. Target a 896-line child and 2,695-line parent, completing this outlier without an exception. Prove payload SHA-256 `27e76ac0…`, full reconstruction/separator, exact 15-test/15-ignore/zero-helper/import/path/history/reference inventory, no stale definitions/paths/residue, and final sizes; run all 15 new GPU paths serial/concurrent, both engine modes, complete 992 suite, workspace check, strict Clippy, private rustdoc, scoped source/reference/format/diff/cleanup, fresh inventory, and independent audit. Pure movement makes HAZARD/report card inapplicable. | STRUCT-001JY complete | `crates/engine/src/tests/resident_expr.rs`; `crates/engine/src/tests/resident_expr/nongrouped_ordering.rs`; engine resident-expression GPU suite |
+| **STRUCT-001KA** | NOW | P0 | Move exact current `crates/engine/src/tests/streaming_exec.rs` module prose lines 1–10 and test ranges 39–193 plus 1212–1385 into private nested `tests/streaming_exec/scalar_reductions.rs`: the complete five-test streaming scalar fold owner covering bounded multi-chunk COUNT/SUM/MIN/MAX with filtering/differential telemetry, secondary-GPU partial combine, bigint-to-numeric combine, NULL-heavy byte bounds, and empty-table SQL semantics. Delete only redundant separator lines 194 and 1386, add one private `mod scalar_reductions`, and leave shared private `gpu_available`/`select` helpers in the parent for their many remaining consumers. Use four narrow imports for those two helpers plus `Engine`, `DeviceTarget`, `Decimal128`, and `SqlValue`; add no visibility bridge, shared context bag, numbered shard, runtime change, CPU product path, unsafe, or R3 decision. Target a 346-line child and 6,133-line PLAN-owned parent. Preserve all five names/ignores, exact SQL/results/telemetry/errors, the four one-GPU non-vacuity proofs, and the structurally moved >=2-GPU test without claiming its parked hardware gate. Prove exact per-range payload/full reconstruction/separators, five-test/five-ignore/zero-helper/import/path/history/dependency/reference inventory, no stale definitions/residue, and final hashes/sizes; run the four one-GPU paths serial/concurrent with actual GPU and zero-fault evidence, both ordinary modes, the complete suite, workspace check, strict Clippy, private rustdoc, scoped source/format/diff/cleanup, fresh inventory, and independent audit. Pure test movement makes HAZARD/report card inapplicable. | STRUCT-001JZ complete; physical multi-GPU remains user-deferred | `crates/engine/src/tests/streaming_exec.rs`; `crates/engine/src/tests/streaming_exec/scalar_reductions.rs`; engine streaming GPU suite |
 | **STRUCT-001** | NOW | P0 | Analyze and disposition every source-size outlier through the method and ordered inventory above. Decompose by ownership, register a bounded exception, or prove generated/archive/delete status; update all references and pass targeted gates. Close only when a fresh inventory has no unowned outlier. | None | `docs/CODE_SIZE.md` |
 | **R3-001** | NOW | P0 | Audit the current lane, chunk-authoritative, MVCC-sidecar, and recovery implementations against the target write model; choose the surviving version-storage/index/CC design in an ADR. Explicitly disposition the retired mega-fuse idea rather than reviving it from archived handovers. No implementation begins from an unaccepted proposal. | None | `docs/design/write-path-design-inputs.md` |
 | **BENCH-001** | NOW | P0 | Open-loop offered-rate harness reports p50/p99/p99.9/p99.99 and saturation TPS against tuned PostgreSQL on the same host, split by deterministic-fast and interactive-slow transaction classes. Exclude warm-up from sustained metrics and publish the exact Postgres/host configuration. Results identify whether the residual is GPU-architectural or host-serial. | Quiet benchmark window and reproducible Postgres config | ADR-008; ARCHITECTURE §9 |
