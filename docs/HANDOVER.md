@@ -10,7 +10,7 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FR is closed. The deleted 9,745-line expression PTX hub is now 13 operator/type-owned leaves, each
   below 1,500 lines. All 67 live symbols/ABIs/bodies are normalized-exact; two unreferenced legacy compactors were
   deleted. Fifteen GPU routes, full execution gates, static gates, canonical report card, and independent audit pass.
-- The PTX-inclusive source inventory now has 25 outliers: 13 production, eight tests, and four examples/tools.
+- The PTX-inclusive source inventory now has 26 outliers: 13 production, nine tests, and four examples/tools.
   **STRUCT-001** owns every remaining disposition.
 - QUALITY-002 is closed. Integer SUM binding now agrees with its bigint materialized value and wire descriptor;
   the hidden join `ORDER BY` expectation and five recovery-era cold-tier fixtures now reflect their live routes.
@@ -99,15 +99,21 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   routing, orchestration, runtime/device work, and MULTI remain in place. Five focused GPU routes, complete 505/487
   suites, static gates, and independent re-audit pass. Another 513 MiB of fresh generated test residue was removed.
   The expression root is 10,441 lines; HAZARD and report card were not applicable.
+- STRUCT-001GN is closed. The exact join NULL sentinel, resident/transient device-memory owner and accessor,
+  NULL-pad mask owner, and execution-side alias now live in the 44-line private `engine_expr/join_source.rs` leaf
+  behind unchanged crate-private paths. Four focused resident/transient/OUTER/streaming GPU joins, both 505/487
+  engine modes, all-target check, strict clippy, scoped source/visibility/format/diff checks, and independent audit
+  pass. The complete GPU suite passed 992/0; 15 GiB of fresh generated test residue was removed. The expression root
+  is 10,410 lines; HAZARD and report card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GN:** isolate only the join NULL sentinel, device-memory owner/accessor, NULL-pad mask owner, and
-   execution-side alias into a nested private leaf behind the existing crate-private paths; keep join construction,
-   routing, execution, projection, and MULTI in place.
+1. **STRUCT-001GO:** isolate only the state-free predicate operand/type-recognition, literal-normalization, and
+   LIKE-tokenization helpers into a nested private leaf; keep compilation/lowering, orchestration, runtime/device
+   action, and MULTI in place.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

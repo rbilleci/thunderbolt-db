@@ -1973,12 +1973,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   gates, and independent re-audit. Another 513 MiB of fresh generated `gpu-db-*` test residue was removed. Runtime
   behavior did not change, so HAZARD and report-card gates were not applicable. The expression root is now 10,441
   lines.
+  STRUCT-001GN then isolated join device-source ownership contracts in the 44-line private
+  `engine_expr/join_source.rs` leaf. `JOIN_NULL_ROW`, `JoinDeviceMemory`, `JoinNullPadMask`, `JoinExecSide`, and
+  `JoinDeviceMemory::mem` retain exact values, variant/field/tuple order, types, docs, borrow behavior, ownership,
+  and drop order; only explicit imports and the narrow `pub(super)` exposure matching the former parent scope differ.
+  Existing `crate::engine_expr::{JoinDeviceMemory, JoinExecSide}` paths remain narrow crate-private re-exports.
+  Dependencies remain one-way to the resident-visibility, relational-residency, and typed CUDA ownership contracts;
+  join construction, routing, execution, filtering, projection, streaming orchestration, every `Engine` method, and
+  MULTI remain in place. Focused resident, transient-catalog, NULL-padded OUTER, and over-budget streaming GPU joins
+  pass, as do both 505/487 engine modes, the complete 992-test GPU suite, all-target check, strict clippy,
+  source/consumer/visibility/scoped-format/diff/docs gates, and independent audit. The suite's 15 GiB of fresh
+  generated `gpu-db-*` residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were
+  not applicable. The expression root is now 10,410 lines.
 
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
-| 25 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 26 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |

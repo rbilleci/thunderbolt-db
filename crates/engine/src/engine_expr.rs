@@ -45,40 +45,9 @@ pub(crate) use execution_source::{
     ResidentExecSource, ResidentVisibility, ShardedUnifiedExecSource,
 };
 
-/// Sentinel carried in a join's per-relation index vectors meaning "no row -> emit NULL for this
-/// relation's columns" -- a LEFT OUTER join's NULL pad for an unmatched left row (M3 -- doc 21). A real
-/// absolute row index can never be `u32::MAX` (residency row counts are far smaller), so it is unambiguous.
-const JOIN_NULL_ROW: u32 = u32::MAX;
-
-/// The device memory backing a join relation: a RESIDENT user table's published `Arc` (shared), or a
-/// SYNTHESIZED catalog relation's freshly-uploaded TRANSIENT payload (owned for the query). `.mem()`
-/// yields the `&CudaResidentDeviceMemory` the GPU pre-filter / key-projection / hash-join kernels run on.
-pub(crate) enum JoinDeviceMemory {
-    Resident(std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>),
-    Transient(gpu_db_execution::CudaResidentDeviceMemory),
-}
-
-struct JoinNullPadMask {
-    mask: Option<gpu_db_execution::CudaPredicateMaskI32>,
-    _source: gpu_db_execution::CudaResidentDeviceMemory,
-    _allocation: gpu_db_execution::CudaExternalAllocationReservation,
-}
-
-pub(crate) type JoinExecSide = (
-    RelationalResidencyEntry,
-    JoinDeviceMemory,
-    usize,
-    Option<ResidentVisibility>,
-);
-
-impl JoinDeviceMemory {
-    pub(crate) fn mem(&self) -> &gpu_db_execution::CudaResidentDeviceMemory {
-        match self {
-            JoinDeviceMemory::Resident(memory) => memory,
-            JoinDeviceMemory::Transient(memory) => memory,
-        }
-    }
-}
+mod join_source;
+use join_source::{JoinNullPadMask, JOIN_NULL_ROW};
+pub(crate) use join_source::{JoinDeviceMemory, JoinExecSide};
 
 pub(crate) use crate::engine_result_sort::gpu_sort_permutation;
 
