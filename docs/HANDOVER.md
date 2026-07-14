@@ -139,14 +139,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `engine_expr/predicate_dispatch.rs` leaf. Fifteen focused GPU controls, both 505/487 engine modes, the complete
   992-test GPU suite, all-target/strict-clippy/static/scoped gates, and independent audit pass; generated residue was
   removed. The expression root is 4,400 lines and below 5,000; HAZARD/report card were not applicable.
+- STRUCT-001HE is closed. The exact complete typed predicate-lowering owner now lives in the rustfmt-clean 1,147-line
+  private `engine_expr/predicate_typed_lowering.rs` leaf. Normalized bodies match after nine narrow sibling-visibility
+  tokens; 24 focused and 33 independent-audit GPU controls, both engine modes, the complete 992-test GPU suite,
+  all-target/strict-clippy/static/scoped gates, and independent audit pass. Generated residue was removed. The
+  expression root is 3,262 lines; HAZARD/report card were not applicable. Audit promoted the shared state-free GPU
+  COUNT(DISTINCT) grouping closure as STRUCT-001HF.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HE:** isolate the exact nine typed predicate lowerers plus numeric scale helper; preserve effective
-   sibling visibility and every fallthrough/type/width/scale/validity/layout/program/error invariant.
+1. **STRUCT-001HF:** isolate the shared GPU COUNT(DISTINCT) sort/mark/group closure as one state-free bounded helper;
+   preserve explicit captures, descriptor/layout ordering, buffer lifetimes, errors, and GPU-only aggregation.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

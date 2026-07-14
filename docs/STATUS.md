@@ -2174,6 +2174,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   suite, all-target check, strict clippy, static/scoped gates, and independent audit. Generated residue was removed.
   Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001HE then isolated the exact complete typed predicate-lowering owner in the rustfmt-clean 1,147-line
+  private `engine_expr/predicate_typed_lowering.rs` leaf, reducing the expression root to 3,262 lines. The nine
+  dispatcher-called lowerers gained only `pub(super)` to recreate their former ancestor-private visibility;
+  `numeric_cross_scale_scalar` remains private and leaf-local. After normalizing those nine authorized visibility
+  tokens, the old and new docs/attributes/bodies have identical SHA-256 hashes. Every `Ok(None)` versus hard-error
+  branch, int8/int2 width and orientation, temporal parse/op/validity program, numeric i128 scale/rescale/overflow,
+  UUID unsigned ordering, text equality/lex/LIKE/layout, row-count conversion, element type, and CUDA error remains
+  source-exact. Twenty-four focused GPU controls and 33 independent-audit GPU controls pass, as do both 505/487
+  engine modes, the complete 992-test serial GPU suite, all-target check, strict clippy, static/scoped gates, and
+  independent audit. Generated test residue was removed. Runtime behavior did not change, so HAZARD and report-card
+  gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
