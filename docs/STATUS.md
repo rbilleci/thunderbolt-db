@@ -2445,6 +2445,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   all-feature checks, strict clippy, exact source/comment/format/reference gates, cleanup, and independent audit are
   clean. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001IC then isolated the complete grouped/DISTINCT two-level streaming fold and level-2 merge in the
+  rustfmt-clean 713-line private `engine_streaming_exec/streaming_grouped_fold.rs` descendant, reducing the root from
+  6,899 to 6,200 lines. Both old blocks reconstruct exactly after rustfmt plus one required route-sibling
+  `pub(super)` token; chunk and merge helpers remain private. Normalized schema/rebind, Numeric38 Count/Sum partials,
+  lossless bigint wrapping and one final narrow, exact cold/scan/chunk/pipeline/capture, partial-byte compaction and
+  true-cardinality defer, empty/DISTINCT behavior, errors, telemetry, result metadata, and multi-GPU deferral are
+  unchanged. Three stale comments were corrected to the existing type-stable behavior; independent audit caught and
+  re-audited a dropped compaction predicate before closeout. Four controls passed three serial plus two concurrent
+  rounds each; both engine modes passed 505/487 and all 992 passed together. Engine/workspace all-target/all-feature
+  checks, strict clippy, exact source/comment/format/reference gates, cleanup, and independent GPU re-audit are clean.
+  Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
