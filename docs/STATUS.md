@@ -2825,6 +2825,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   1,952-line root and bounded 594/347/1,441/400-line children, no exception. The actionable inventory is now 19:
   six production, nine tests, and four examples/tools. STRUCT-001JD owns `engine_retained_read.rs`.
 
+  STRUCT-001JD then isolated the exact prepared retained-read template construction and batched point-lookup submit
+  pair in the rustfmt-clean 145-line private `engine_retained_read/template.rs` child, reducing the parent from
+  3,993 to 3,857 lines. Child lines 8–144 are byte-for-byte identical to old lines 369–505; exactly two public
+  inherent methods moved, with only `mod template` in the parent and no facade, re-export, visibility bridge, or API
+  change. The explicit ten-name import list is minimal; preparation and payload helpers remain parent-private and
+  callable by the descendant without widening. Single prepare/bind, filter validation, MVCC access path,
+  generation/valid/device-memory checks, empty Ready result, timing/errors, one payload submission, shared schema/
+  access-path Arcs, and pending metadata are unchanged. Unrelated parent rustfmt drift was fully restored. Both
+  modes passed 29 active resident-route and five active residency-payload controls; two facade classifier/controller
+  controls pass. Seven actual-device template/wave/completion/index/payload/facade routes passed 21 sequential plus
+  14 concurrent executions without device faults; both engine modes passed 505/487 and the complete include-ignored
+  suite passed 992/992 in 167.20s. Workspace all-target/all-feature check and strict clippy, private-item rustdoc,
+  exact source/import/helper/caller/scoped-format/diff checks, generated-residue cleanup, and independent audit are
+  clean; strict rustdoc retains the known 25-link warning baseline. Runtime behavior is unchanged, so HAZARD/report
+  card were inapplicable. STRUCT-001JE owns the exact cached wave-index getter/builder boundary; the actionable
+  inventory remains 19 because the 3,857-line parent is still PLAN-owned.
+
 ## Known boundaries
 
 | Boundary | Work ID |

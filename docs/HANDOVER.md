@@ -368,14 +368,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   Thirteen actual-CUDA routes passed 39 sequential plus 26 concurrent executions; both 505/487 modes, the complete
   992-test suite, static/source/cleanup/inventory gates, and independent audit pass. The inventory is 19; STRUCT-001JD
   owns the prepared-template pair in the next production outlier, `engine_retained_read.rs`.
+- STRUCT-001JD is closed. Exact prepared-template construction and batched point-lookup submission now live
+  byte-exact in the rustfmt-clean 145-line private `engine_retained_read/template.rs` child with unchanged public
+  inherent paths and no bridge. The parent is 3,857 lines. Seven actual-device routes passed 21 sequential plus 14
+  concurrent executions; both 505/487 modes, the complete 992-test suite, static/source/cleanup gates, and audit
+  pass. STRUCT-001JE owns the cached wave-index getter/builder pair.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JD:** isolate current `engine_retained_read.rs` lines 369–505 into the bounded private
-   `engine_retained_read/template.rs` owner exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JE:** isolate current `engine_retained_read.rs` lines 515–641 into the bounded private
+   `engine_retained_read/wave_index.rs` owner exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
