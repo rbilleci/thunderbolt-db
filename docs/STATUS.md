@@ -2511,6 +2511,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   2,944-line root still has one separable chunk-key owner. Runtime behavior did not change, so HAZARD/report-card
   gates were not applicable.
 
+  STRUCT-001IH then isolated the complete per-chunk exact key index, Bloom admission, candidate lifecycle, exact
+  device recheck, and structural uniqueness owner in the rustfmt-clean 1,164-line private
+  `engine_streaming_exec/streaming_chunk_keys.rs` descendant, reducing the root from 2,944 to 1,783 lines. The old
+  block reconstructs exactly after rustfmt plus exactly seven proven DML/lifecycle `pub(super)` bridges; six public
+  telemetry methods, five crate APIs, and nine private helpers are unchanged. Device-staged fingerprint parity,
+  collision-tolerant chaining, GPU Bloom membership, caps/LRU, spill-safe off-lock priming/rollback/stale purge,
+  candidate-only routing plus exact predicate/visibility, position mapping, overflow decline, structural NULL,
+  bounded in-batch validation, epoch-checked update self-exclusion, coordinate verdict, and counters remain exact.
+  Sixteen controls passed three serial plus two concurrent rounds each; both engine modes passed 505/487 and all 992
+  passed together. Engine/workspace all-target/all-feature checks, strict clippy, exact source/visibility/format/
+  reference gates, cleanup, and an independent audit with a separate 16-control GPU pass are clean. The remaining
+  root is a cohesive shared-contract/telemetry, checkpoint-codec/orchestration, sanctioned final-readback, and
+  scheduler facade below the production analysis threshold, so its disposition is complete without an exception.
+  Runtime behavior did not change, so HAZARD/report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
