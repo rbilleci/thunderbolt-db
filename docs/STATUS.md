@@ -2842,6 +2842,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   card were inapplicable. STRUCT-001JE owns the exact cached wave-index getter/builder boundary; the actionable
   inventory remains 19 because the 3,857-line parent is still PLAN-owned.
 
+  STRUCT-001JE then isolated the exact cached resident int4 wave-index getter and private builder in the
+  rustfmt-clean 133-line private `engine_retained_read/wave_index.rs` child, reducing the parent from 3,857 to 3,731
+  lines. After normalizing only the getter's `pub(super)`, child lines 6–132 are byte-for-byte identical to old
+  lines 515–641. Exactly two methods moved; the getter has exactly one parent payload caller and the builder remains
+  child-private. Five explicit imports are minimal. Cache identity and pointer-generation guards, lock/build/relock
+  order, budget serialization, decline-marker publication and GPU-scan fallback, DtoH key bytes, duplicate/empty/
+  overflow/probe-cap rules, hash encoding, HtoD ownership, allocation recheck, and Arc lifetime are unchanged, with
+  no reverse sibling edge, cycle, context bag, unsafe, or API drift. Both modes passed 29 active resident-route and
+  five active residency-payload controls. Five actual-device scan/index/budget/wave/dense/open-append routes passed
+  15 sequential plus 10 concurrent executions without device faults; both engine modes passed 505/487 and the
+  complete include-ignored suite passed 992/992 in 167.25s. Workspace all-target/all-feature check and strict
+  clippy, private-item rustdoc, exact source/import/caller/dependency/scoped-format/diff checks, generated-residue
+  cleanup, and independent audit are clean; strict rustdoc retains the known 25-link warning baseline. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001JF owns exact resident payload
+  submission; the actionable inventory remains 19 because the 3,731-line parent is still PLAN-owned.
+
 ## Known boundaries
 
 | Boundary | Work ID |
