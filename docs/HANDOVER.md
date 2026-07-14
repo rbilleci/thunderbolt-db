@@ -570,6 +570,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   inventory, and audit pass. Host/store twins and deauthorization remain parity/bootstrap debt only. The actionable
   inventory is now 11; STRUCT-001KO owns current `tests/sql_pg.rs` tail lines 4767–5835 as the complete device
   join-materialization audit family.
+- STRUCT-001KO is closed. The exact 15-test S7/V3 and S5/V1a join-materialization audit family plus its sole helper
+  now lives in the rustfmt-clean 1,074-line private `tests/sql_pg/join_materialization_audit.rs` child; the parent is
+  4,766 lines. Exact payload/parent reconstruction, 45 local plus 45 independent-audit actual-GPU executions, both
+  505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. Host expected
+  sets remain test-only parity evidence. The actionable inventory remains 11; STRUCT-001KP owns current parent lines
+  597–1390 as the complete initial GPU join/NULL-key family.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -579,8 +585,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KO:** isolate exact trailing device join-materialization audits at current `tests/sql_pg.rs` lines
-   4767–5835 as mapped in `PLAN.md`, preserving all NULL/pad/type/gather/window/nonvacuity and b128/text evidence.
+1. **STRUCT-001KP:** isolate exact initial GPU join/NULL-key current `tests/sql_pg.rs` lines 597–1390 as mapped in
+   `PLAN.md`, preserving inner/NULL/3VL/type/N:N/pad/side-swap/composite/anti-join/word-boundary evidence.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

@@ -3437,6 +3437,28 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   unchanged, so HAZARD/report card were inapplicable. STRUCT-001KO owns current `tests/sql_pg.rs` tail lines
   4767–5835 as the complete S7/V3 and S5/V1a device join-materialization audit family.
 
+  STRUCT-001KO then isolated the exact trailing S7/V3 and S5/V1a device join-materialization audits in the
+  rustfmt-clean 1,074-line private `tests/sql_pg/join_materialization_audit.rs` child, reducing the parent from
+  5,835 to 4,766 lines. Old parent lines 4767–5835 and child lines 6–1074 share exact payload hash `e4a4db9a…`; the
+  exact child/parent hashes are `4aa9eed1…`/`16645d69…`, and removing the sole private module plus restoring
+  separator 4766 and the tail reconstructs old-parent hash `9c355355…` byte-for-byte. Both audit headings, 15
+  tests/ignores, sole `audit_one_val` helper, exact fixtures/SQL/results, matched NULLs, OUTER pads, empty sides/
+  results, N:N/multiway/USING/NATURAL/star gathers, placeholder nonvacuity, windows, UUID byte order, numeric
+  mantissas, b128/text late steps, NULL key gates, and mixed UUID/numeric projection are preserved through four
+  import declarations/five names. The initial exact compile exposed `Decimal128` at two assertions hidden by the old
+  parent glob; adding only that explicit SQL type closed the dependency without changing the payload. History assigns
+  the tail exactly to the two audit, GPU-default, and STRATA commits, with no super/glob dependency, visibility
+  bridge, path/include indirection, unsafe, context bag, numbered shard, external-name reference, or stale copy.
+  Host-computed sets and resident one-value references remain explicitly test-only parity/cross-check evidence, never
+  product CPU execution. Forty-five local plus 45 independent-audit actual-GPU executions passed; local concurrent
+  PIDs `135908`/`135913` overlapped in five samples and audit PIDs `146698`/`146706` in 18, with zero CUDA
+  700/716/719 or related faults. The intentional caught placeholder assertion printed in every invocation while all
+  summaries remained successful. Both debug/release ordinary modes passed 505/487 in 19.79s/10.08s, the complete
+  include-ignored suite passed 992/992 in 165.91s, and workspace all-target/all-feature check, strict engine Clippy,
+  private rustdoc with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 11-file
+  inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were
+  inapplicable. STRUCT-001KP owns current parent lines 597–1390 as the complete initial GPU join/NULL-key family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
