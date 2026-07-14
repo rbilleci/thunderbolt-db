@@ -482,12 +482,187 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   root remains PLAN-owned. One hundred fifteen focused actual-GPU executions, both 505/487 modes, the complete
   992 suite, static/source/target-inventory/cleanup gates, and independent audit pass. The actionable inventory
   remains 13; STRUCT-001JY owns the exact grouped multi-aggregate matrix at current root lines 295–604.
-- STRUCT-001JY is implemented but intentionally not closed: the exact six-test grouped multi-aggregate owner now
+- STRUCT-001JY is closed. The exact six-test grouped multi-aggregate owner now
   lives in the rustfmt-clean 314-line private `tests/resident_expr/grouped_multi_aggregate.rs` child, reducing the
-  parent to 3,587 lines. Exact hashes/reconstruction, 18 focused GPU test executions covering 162 grouped queries,
-  both 505/487 modes, the complete 992 suite, static/source/fixture/cleanup gates, and fresh inventory pass. The
-  independent worker result was lost during turn steering; repeat that audit first. JZ is mapped at current lines
-  635–1526 and will complete the parent below 3,000.
+  parent to 3,587 lines. Exact hashes/reconstruction, 18 local plus 18 independent-audit GPU executions covering
+  324 grouped queries, both 505/487 modes, the complete 992 suite, static/source/fixture/cleanup gates, fresh
+  inventory, and independent audit pass. JZ is mapped at current lines 635–1526 and will complete the parent below
+  3,000.
+- STRUCT-001JZ is closed and the resident-expression test outlier is complete. The exact 15-test non-grouped
+  ordering matrix now lives in the rustfmt-clean 896-line private `tests/resident_expr/nongrouped_ordering.rs`
+  child; the parent is 2,695 lines. Exact hashes/reconstruction, 45 local plus 45 independent-audit actual-GPU
+  executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit
+  pass. The audit-caught import undercount was corrected in PLAN: six exact type annotations require the fourth
+  imported name. The actionable inventory is 12; STRUCT-001KA owns the streaming scalar-reduction test family.
+- STRUCT-001KA is closed. Exact module prose and the complete five-test scalar-reduction family now live in the
+  rustfmt-clean 346-line private `tests/streaming_exec/scalar_reductions.rs` child; the parent is 6,133 lines.
+  Exact hashes/reconstruction, 12 local plus 12 independent-audit actual-GPU one-device executions, both 505/487
+  modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The structurally
+  exact >=2-GPU control remains correctly unclaimed on this one-GPU host. The actionable inventory remains 12;
+  STRUCT-001KB owns the exact rank/window family at current parent lines 536–948.
+- STRUCT-001KB is closed. The exact two-test rank/window family now lives in the rustfmt-clean 440-line private
+  `tests/streaming_exec/rank_windows.rs` child; the parent is 5,720 lines. Exact original/normalized child hashes,
+  byte-exact parent reconstruction, six local plus six independent-audit focused executions, both 505/487 modes,
+  the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The actionable inventory
+  remains 12; STRUCT-001KC owns the exact layered-view family at current parent lines 537–631.
+- STRUCT-001KC is closed. The exact two-test layered-view family now lives in the rustfmt-clean 109-line private
+  `tests/streaming_exec/views.rs` child; the parent is 5,625 lines. Exact original/normalized child hashes,
+  byte-exact parent reconstruction, six local plus six independent-audit focused executions, both 505/487 modes,
+  the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The ignored route proved
+  actual GPU fold nonvacuity. The actionable inventory remains 12; STRUCT-001KD owns the exact projection/windowing
+  family at current parent lines 538–696.
+- STRUCT-001KD is closed. The exact two-test projection/windowing family now lives in the rustfmt-clean 164-line
+  private `tests/streaming_exec/projection.rs` child; the parent is 5,466 lines. Exact payload/parent reconstruction,
+  six local plus six independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/
+  source/cleanup gates, fresh inventory, and audit pass. The actionable inventory remains 12; STRUCT-001KE owns
+  current helper-doc lines 539–540 plus grouped/DISTINCT helper/test block 581–832.
+- STRUCT-001KE is closed. The exact three-test grouped/DISTINCT family and sole sort helper now live in the
+  rustfmt-clean 259-line private `tests/streaming_exec/grouped_distinct.rs` child; the parent is 5,212 lines. The
+  history-proven helper docs are restored to their owner. Exact two-range/parent reconstruction, nine local plus
+  nine independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup
+  gates, fresh inventory, and audit pass. The actionable inventory remains 12; STRUCT-001KF owns current parent
+  lines 580–750 as the complete ordered-fold family.
+- STRUCT-001KF is closed. The exact two-test ordered-fold family now lives in the rustfmt-clean 176-line private
+  `tests/streaming_exec/ordered.rs` child; the parent is 5,041 lines. Exact payload/parent reconstruction, six local
+  plus six independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/
+  cleanup gates, fresh inventory, and audit pass. The actionable inventory remains 12; STRUCT-001KG owns the two
+  residual reduction ranges at current parent lines 581–607 and 853–936.
+- STRUCT-001KG is closed. The exact no-budget scalar parity/bootstrap control and grouped bigint SUM regression now
+  live in their existing rustfmt-clean 374/344-line private children; the parent is 4,928 lines and below the
+  critical 5,000-line threshold. Exact ranges/parent reconstruction/child prefixes, host and actual-GPU focused
+  matrices, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass.
+  The actionable inventory remains 12; STRUCT-001KH owns current parent lines 581–1026 as the cold-tier lifecycle.
+- STRUCT-001KH is closed. The exact five-test cold-tier lifecycle now lives in the rustfmt-clean 450-line private
+  `tests/streaming_exec/cold_tier.rs` child; the parent is 4,482 lines. Exact payload/parent reconstruction, 15 local
+  plus 15 independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup
+  gates, fresh inventory, and audit pass. The actionable inventory remains 12; STRUCT-001KI owns current parent
+  lines 582–999 as the complete durable cold-checkpoint family.
+- STRUCT-001KI is closed. The exact descriptor/fixture plus five-test durable checkpoint family now lives in the
+  rustfmt-clean 423-line private `tests/streaming_exec/cold_checkpoint.rs` child; the parent is 4,064 lines. Exact
+  payload/parent reconstruction, 18 local plus 18 independent-audit focused executions, both 505/487 modes, the
+  complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The actionable inventory remains
+  12; STRUCT-001KJ owns current parent lines 583–902 as the complete streaming DML-locate family.
+- STRUCT-001KJ is closed. The exact five-test streaming DML-locate family now lives in the rustfmt-clean 324-line
+  private `tests/streaming_exec/dml_locate.rs` child; the parent is 3,744 lines. Exact payload/parent reconstruction,
+  15 local plus 15 independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/
+  source/cleanup gates, fresh inventory, and audit pass. CPU twins remain parity/bootstrap-only. The actionable
+  inventory remains 12; STRUCT-001KK owns current parent lines 584–904 as the complete P2 cold-sidecar family.
+- STRUCT-001KK is closed. The exact three-test P2 cold-sidecar family now lives in the rustfmt-clean 325-line private
+  `tests/streaming_exec/sidecars.rs` child; the parent is 3,423 lines. Exact payload/parent reconstruction, nine local
+  plus nine independent-audit focused executions, both 505/487 modes, the complete 992 suite, static/source/cleanup
+  gates, fresh inventory, and audit pass. The host COW repro remains storage/parity-bootstrap-only. The actionable
+  inventory remains 12; STRUCT-001KL owns current parent lines 585–707 as the P4-1 reverse-gather differential.
+- STRUCT-001KL is closed. The exact P4-1 reverse-gather differential now lives in the rustfmt-clean 127-line private
+  `tests/streaming_exec/reverse_gather.rs` child; the parent is 3,300 lines. Exact payload/parent reconstruction,
+  three local plus three independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite,
+  static/source/cleanup gates, fresh inventory, and audit pass. The decoder/oracle remains parity/bootstrap debt.
+  The actionable inventory remains 12; STRUCT-001KM owns current parent lines 586–771 as chunk-native locate/stamp.
+- STRUCT-001KM is closed. The exact two-test P4-2a chunk-native locate/stamp family now lives in the rustfmt-clean
+  190-line private `tests/streaming_exec/chunk_locate.rs` child; the parent is 3,114 lines. Exact payload/parent
+  reconstruction, six local plus six independent-audit actual-GPU executions, both 505/487 modes, the complete 992
+  suite, static/source/cleanup gates, fresh inventory, and audit pass. The store-driven P3 rows remain parity/
+  bootstrap-only. The actionable inventory remains 12; STRUCT-001KN owns current parent lines 587–1123 as the
+  complete P4 chunk-authoritative class lifecycle and will take this test root below 3,000 lines.
+- STRUCT-001KN is closed. The exact four-test P4 chunk-authoritative class lifecycle now lives in the rustfmt-clean
+  541-line private `tests/streaming_exec/chunk_class_lifecycle.rs` child; the parent is 2,577 lines and its
+  disposition is complete without an exception. Exact payload/parent reconstruction, 12 local plus 12 independent-
+  audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh
+  inventory, and audit pass. Host/store twins and deauthorization remain parity/bootstrap debt only. The actionable
+  inventory is now 11; STRUCT-001KO owns current `tests/sql_pg.rs` tail lines 4767–5835 as the complete device
+  join-materialization audit family.
+- STRUCT-001KO is closed. The exact 15-test S7/V3 and S5/V1a join-materialization audit family plus its sole helper
+  now lives in the rustfmt-clean 1,074-line private `tests/sql_pg/join_materialization_audit.rs` child; the parent is
+  4,766 lines. Exact payload/parent reconstruction, 45 local plus 45 independent-audit actual-GPU executions, both
+  505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. Host expected
+  sets remain test-only parity evidence. The actionable inventory remains 11; STRUCT-001KP owns current parent lines
+  597–1390 as the complete initial GPU join/NULL-key family.
+- STRUCT-001KP is closed. The exact 11-test initial inner-join/NULL-key V1b family now lives in the rustfmt-clean
+  799-line private `tests/sql_pg/join_null_keys.rs` child; the parent is 3,972 lines. Exact payload/parent
+  reconstruction, 33 local plus 33 independent-audit actual-GPU executions, both 505/487 modes, the complete 992
+  suite, static/source/cleanup gates, fresh inventory, and audit pass. Host expected sets remain test-only parity
+  evidence. The actionable inventory remains 11; STRUCT-001KQ owns current parent lines 598–1824 as the complete
+  GPU OUTER/nullable/3VL family and will take this test root below 3,000 lines.
+- STRUCT-001KQ is closed. The exact 15-test GPU OUTER/nullable/3VL family now lives in the rustfmt-clean 1,232-line
+  private `tests/sql_pg/outer_null_semantics.rs` child; the parent is 2,745 lines and its disposition is complete
+  without an exception. Exact payload/parent reconstruction, 45 local plus 45 independent-audit actual-GPU
+  executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit
+  pass. Expected rows/truth tables remain test-only parity evidence. The actionable inventory is now 10;
+  STRUCT-001KR owns current `tests/mvcc_bundles.rs` lines 3–1442 as the initial provenance bundle-path family.
+- STRUCT-001KR is closed. The exact 12-test initial provenance frame/bundle-path family now lives in the rustfmt-
+  clean 1,446-line private `tests/mvcc_bundles/provenance_bundle_paths.rs` child; the parent is 3,934 lines. Exact
+  payload/parent reconstruction, 36 local plus 36 independent-audit CPU-parity executions, nine local plus nine
+  audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh
+  inventory, and audit pass. The moved cfg(test) CPU backend remains parity/bootstrap debt only. The actionable
+  inventory remains 10; STRUCT-001KS owns current parent lines 4–1368 as the occurrence-distance family and will
+  take this test root below 3,000 lines.
+- STRUCT-001KS is closed. The exact seven-test occurrence-cardinality/distance family now lives in the rustfmt-
+  clean 1,371-line private `tests/mvcc_bundles/occurrence_distance_filters.rs` child; the parent is 2,569 lines and
+  its disposition is complete without an exception. Exact payload/parent reconstruction, 21 local plus 21 audit
+  CPU-parity executions, nine local plus nine audit actual-GPU executions, both 505/487 modes, the complete 992
+  suite, static/source/cleanup gates, fresh inventory, and audit pass. The moved cfg(test) CPU backend remains
+  parity/bootstrap debt only. The actionable inventory is now nine; STRUCT-001KT owns current
+  `tests/intent_fast_path.rs` lines 3491–4430 as the complete GPU constraint-elision lifecycle family.
+- STRUCT-001KT is closed. The exact seven-test GPU CHECK/FK elision, mixed-width DML, and preflight re-pin family
+  now lives in the rustfmt-clean 945-line private `tests/intent_fast_path/constraint_elision.rs` child; the parent
+  is 4,264 lines. Exact payload/parent reconstruction, 21 local plus 21 audit actual-GPU executions, both 505/487
+  modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The actionable
+  inventory remains nine; STRUCT-001KU owns current parent lines 49–1543 as the complete intent-lane lifecycle
+  family and will take this test root below 3,000 lines.
+- STRUCT-001KU is closed. The exact nine-test/seven-helper submit/poll, WAL/recovery, conflict, async-commit,
+  delete/update, and sustained-update lifecycle now lives in the rustfmt-clean 1,499-line private
+  `tests/intent_fast_path/lane_lifecycle.rs` child; the parent is 2,769 lines and its disposition is complete
+  without an exception. Exact payload/parent reconstruction, 27 local plus 27 audit actual-GPU executions, final
+  505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The actionable
+  inventory is now eight; STRUCT-001KV owns current `tests/resident_route.rs` lines 1032–1857 as the complete
+  sharded lookup and retained batched-projection family.
+- STRUCT-001KV is closed. The exact six-test sharded lookup/projection family now lives in the rustfmt-clean
+  832-line private `tests/resident_route/sharded_lookup.rs` child; the parent is 3,823 lines. Exact payload/parent
+  reconstruction, nine local plus nine audit ordinary executions, nine local plus nine audit actual-GPU executions,
+  both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The
+  actionable inventory remains eight; STRUCT-001KW owns current parent lines 1033–1939 as the sharded reduction
+  family and will take this test root below 3,000 lines.
+- STRUCT-001KW is closed. The exact five-test sharded reduction family now lives in the rustfmt-clean 913-line
+  private `tests/resident_route/sharded_reductions.rs` child; the parent is 2,916 lines and its disposition is
+  complete without an exception. Exact payload/parent reconstruction, 15 local plus 15 audit actual-GPU
+  executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit
+  pass. The actionable inventory is now seven; STRUCT-001KX owns current `tests/sql_catalog.rs` lines 1140–2316
+  as the complete core relation metadata/index/constraint/drop lifecycle and will take that test root below 3,000
+  lines.
+- STRUCT-001KX is closed. The exact 14-test core relation metadata/index/constraint/drop lifecycle now lives in
+  the rustfmt-clean 1,183-line private `tests/sql_catalog/relation_lifecycle.rs` child; the parent is 2,798 lines
+  and its disposition is complete without an exception. Exact payload/parent reconstruction, 42 local plus 42
+  audit CPU-oracle parity executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates,
+  fresh inventory, and audit pass. The actionable inventory is now six; STRUCT-001KY owns current
+  `tests/mvcc_query.rs` lines 1141–2296 as the 24-test initial actual-CUDA driver route matrix and will take that
+  test root below 3,000 lines.
+- STRUCT-001KY is closed. The exact 24-test/24-ignore initial actual-CUDA driver matrix now lives in the rustfmt-
+  clean 1,164-line private `tests/mvcc_query/cuda_driver_routes.rs` child; the parent is 2,347 lines and its
+  disposition is complete without an exception. Exact payload/parent reconstruction, 72 local plus 72 audit
+  actual-CUDA executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory,
+  and audit pass. The actionable inventory is now five; STRUCT-001KZ owns current execution `tests/cuda_paths.rs`
+  lines 2878–3041 as the final resident-generation lifetime soundness test and will complete the last test outlier.
+- STRUCT-001KZ is closed. The normalized one-test/one-ignore resident-generation publish/pinned-reader/GPU-read/
+  post-drain reclamation owner now lives in the rustfmt-clean 168-line private execution sibling
+  `tests/cuda_generation_lifetime.rs`; `cuda_paths.rs` is 2,876 lines and the last test disposition is complete
+  without an exception. Exact normalized payload/parent reconstruction, three local plus three audit actual-GPU
+  executions, execution library ordinary/complete suites, static/source/cleanup gates, fresh inventory, and audit
+  pass. Four actionable tool/example rows remain; STRUCT-001LA owns analysis and disposition of the 14,889-line
+  handwritten research-paper mechanism-link generator.
+- STRUCT-001LA is closed. The 14,889-line research-paper mechanism-link generator was a stale live tool whose
+  journal, mechanisms, and four generated artifacts had all moved under `docs/archive/research/` in the audited
+  documentation consolidation. It had no non-archive consumer, its live defaults no longer resolved, and an
+  explicit archived-input run regenerated all four archived artifacts byte-for-byte. The obsolete script was
+  deleted while archive evidence remained untouched. Three actionable example/tool rows remain; STRUCT-001LB owns
+  the first exact extraction from the 4,726-line write-conveyor benchmark example.
+- STRUCT-001LB analysis is complete. The handwritten example has one shared root harness and two complete client-
+  latency scenario owners. The selected two-slice disposition is exact baseline lines 2391–2784
+  (`run_file_wal_client_latency`) to private `write_conveyor_bench/direct_client_latency.rs`, followed under
+  STRUCT-001LC by baseline lines 2786–4349 (`run_file_wal_client_coalesced_latency`) to private
+  `write_conveyor_bench/coalesced_client_latency.rs`. The baseline source hash is `e9de8be1…`, its default example
+  build passes, and no non-archive external consumer was found. Preserve the root-owned CLI, shared
+  configuration/types/sampling/reporting, scenario labels/output schema, durability/recovery semantics, and use
+  only explicit one-way imports plus compile-proven narrow visibility. The projected root is ~4,333 lines after LB
+  and ~2,770 after LC; pure structural movement does not require HAZARD/report card.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -497,10 +672,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001JY:** independently re-audit the implemented `grouped_multi_aggregate.rs` extraction and close it
-   only if exact reconstruction, six new paths, actual-GPU serial/concurrent runs, static gates, and cleanup pass.
-2. **STRUCT-001JZ:** then implement the exact current lines 635–1526 `nongrouped_ordering.rs` map in `PLAN.md`;
-   its projected 2,695-line parent completes this outlier without an exception.
+1. **STRUCT-001LB:** extract exact baseline lines 2391–2784, the complete 394-line
+   `run_file_wal_client_latency` scenario, to private `examples/write_conveyor_bench/direct_client_latency.rs` and
+   pass the payload/reconstruction, default-build, focused safe-smoke, source/reference/cleanup, size-inventory,
+   and independent-audit gates in `PLAN.md`.
+2. **STRUCT-001LC:** then extract the exact 1,564-line coalesced-client scenario and complete the example below
+   3,000 lines under the separately sequenced PLAN row.
 3. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

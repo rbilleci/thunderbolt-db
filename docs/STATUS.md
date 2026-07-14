@@ -3173,7 +3173,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   makes HAZARD/report card inapplicable. The actionable inventory remains 13; STRUCT-001JY owns the exact grouped
   multi-aggregate matrix at current lines 295–604.
 
-  STRUCT-001JY is implemented and awaits only a fresh independent close audit. The exact six-test grouped multi-
+  STRUCT-001JY is closed. The exact six-test grouped multi-
   aggregate/result-alignment owner now lives in the rustfmt-clean 314-line private
   `tests/resident_expr/grouped_multi_aggregate.rs` child, reducing the PLAN-owned parent from 3,897 to 3,587
   lines after deleting the single redundant separator blank. Child lines 5–314 byte-match old parent lines
@@ -3185,9 +3185,521 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   focused local actual-GPU test executions covering 162 grouped queries (54 per run: one serial plus two
   concurrent), both modes passed 505/487, the complete include-ignored suite passed 992/992, and workspace check,
   strict engine Clippy, private rustdoc with the known 25-link warning baseline, scoped source/fixture/format/diff/
-  cleanup, and fresh 992-test inventory are clean. The independent worker result was lost during turn steering,
-  so JY is deliberately not recorded as closed. A fresh audit is the first handover action; after it passes,
-  STRUCT-001JZ owns current parent lines 635–1526 and completes this outlier at a projected 2,695 lines.
+  cleanup, and fresh 992-test inventory are clean. The fresh independent close audit repeated exact reconstruction,
+  inventory, static, cleanup, and GPU gates: another 18 actual-GPU executions covered 162 grouped queries, including
+  two simultaneous test processes, with zero CUDA 700/716/717. STRUCT-001JZ owns current parent lines 635–1526 and
+  completes this outlier at a projected 2,695 lines. Pure movement makes HAZARD/report card inapplicable.
+
+  STRUCT-001JZ then completed the resident-expression test outlier without an exception. The exact 15-test non-
+  grouped expression/fixed/b128/text/multikey ordering owner now lives in the rustfmt-clean 896-line private
+  `tests/resident_expr/nongrouped_ordering.rs` child, reducing the parent from 3,587 to 2,695 lines after deleting
+  one redundant separator. Child lines 5–896 byte-match old parent lines 635–1526 (payload SHA-256 `27e76ac0…`);
+  the exact child/parent hashes are `4ef2b59c…`/`52a11c42…`, and full reconstruction matches old-parent hash
+  `1dacd1f4…`. Exactly 15 tests/ignores moved with no helper, one private module, no bridge/unsafe/path indirection,
+  and unchanged names plus two external evidence references. Forty-five local and 45 independent-audit actual-GPU
+  executions passed, including simultaneous processes observed on the RTX PRO 6000, with zero CUDA 700/716/717.
+  Both debug/release ordinary modes passed 505/487, the complete include-ignored suite passed 992/992 in 170.14s,
+  and workspace check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped format/diff/
+  source/reference/cleanup gates, fresh inventory, and independent audit are clean. Audit correctly rejected the
+  planned three-name import inventory: removing `RelationalSelectResult` caused six compile errors at the exact
+  closure annotations, so the accepted narrow dependency is three import declarations/four names. Runtime behavior
+  is unchanged, so HAZARD/report card were inapplicable. The actionable inventory is 12; STRUCT-001KA owns the
+  streaming scalar-reduction family.
+
+  STRUCT-001KA then isolated the exact streaming scalar-reduction owner in the rustfmt-clean 346-line private
+  `tests/streaming_exec/scalar_reductions.rs` child, reducing the parent from 6,474 to 6,133 lines. Module prose
+  plus old parent ranges 39–193 and 1212–1385 are byte-exact; only blank separators 194/1386 were discarded. The
+  exact child/parent hashes are `b59e76a3…`/`c4bf88ae…`, and full reconstruction matches old-parent hash
+  `7709683a…`. Exactly five tests/ignores moved with no helper, four import declarations/six names, one private
+  module, and only the narrow child-to-parent `gpu_available`/`select` dependency. The four one-GPU controls passed
+  12 local plus 12 independent-audit actual-GPU executions, including simultaneous processes observed on the RTX
+  PRO 6000, with zero CUDA 700/716/717. The fifth control retains its >=2-GPU runtime gate, device-1 budget, and
+  secondary-GPU counter assertion but is correctly not claimed executed on this one-GPU host. Both debug/release
+  ordinary modes passed 505/487, the complete include-ignored suite passed 992/992 in 170.10s, and workspace check,
+  strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped child-format/diff/source/cleanup
+  gates, fresh inventory, and independent audit are clean. The inherited parent remains rustfmt-dirty and was not
+  rewritten. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory
+  remains 12; STRUCT-001KB owns current parent lines 536–948 as the complete rank/window family.
+
+  STRUCT-001KB then isolated the exact two-test streaming rank/window owner in the rustfmt-clean 440-line private
+  `tests/streaming_exec/rank_windows.rs` child, reducing the parent from 6,133 to 5,720 lines. Old parent lines
+  536–948 have exact payload hash `1806ea83…`; prepending the five import declarations/seven names and applying
+  rustfmt at only five inherited sites produces exact child hash `ff8c6d59…`. Removing the private module and
+  reinserting the original range plus separator reconstructs old-parent hash `c4bf88ae…` byte-for-byte; current
+  parent hash is `05a82bbf…`. Exactly two tests/ignores moved with no helper, visibility bridge, path/include
+  indirection, unsafe, or dependency beyond private `gpu_available`/`select`. Six local plus six independent-audit
+  focused executions passed, including simultaneous test processes observed on the RTX PRO 6000, with zero CUDA
+  700/716/717. Both debug/release ordinary modes passed 505/487, the complete include-ignored suite passed 992/992
+  in 175.78s, and workspace check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped
+  source/format/diff/cleanup gates, fresh inventory, and independent audit are clean. Runtime behavior is unchanged,
+  so HAZARD/report card were inapplicable. The actionable inventory remains 12; STRUCT-001KC owns current parent
+  lines 537–631 as the complete layered-view family.
+
+  STRUCT-001KC then isolated the exact two-test layered-view owner in the rustfmt-clean 109-line private
+  `tests/streaming_exec/views.rs` child, reducing the parent from 5,720 to 5,625 lines. Old parent lines 537–631
+  have exact payload hash `f35e81f7…`; prepending four import declarations/five names and applying rustfmt at only
+  three inherited sites produces exact child hash `c14b21c8…`. Removing the private module and reinserting the
+  original range plus blank separator reconstructs old-parent hash `05a82bbf…` byte-for-byte; current parent hash
+  is `3961a716…`. Exactly two tests and one ignore moved with no helper, visibility bridge, path/include indirection,
+  unsafe, or dependency beyond private `gpu_available`/`select`. Six local plus six independent-audit focused
+  executions passed; simultaneous test processes were observed on the RTX PRO 6000, and the ignored route proved
+  nonvacuity through GPU memory plus fold telemetry and result assertions, with zero CUDA 700/716/717. Both debug/
+  release ordinary modes passed 505/487, the complete include-ignored suite passed 992/992 in 172.16s, and workspace
+  check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/format/diff/cleanup
+  gates, fresh inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card
+  were inapplicable. The actionable inventory remains 12; STRUCT-001KD owns current parent lines 538–696 as the
+  complete projection/windowing family.
+
+  STRUCT-001KD then isolated the exact two-test streaming projection/windowing owner in the rustfmt-clean 164-line
+  private `tests/streaming_exec/projection.rs` child, reducing the parent from 5,625 to 5,466 lines. Old parent
+  lines 538–696 and child lines 6–164 share exact payload hash `5f901a2d…`; the exact child/parent hashes are
+  `5102459f…`/`caeeba6d…`, and removing the private module plus restoring the payload and blank separator
+  reconstructs old-parent hash `3961a716…` byte-for-byte. Exactly two tests/ignores moved with no helper, visibility
+  bridge, path/include indirection, unsafe, or dependency beyond private `gpu_available`/`select`. Six local plus
+  six independent-audit actual-GPU executions passed, including simultaneous test processes observed on the RTX
+  PRO 6000, with zero CUDA 700/716/717. Both debug/release ordinary modes passed 505/487, the complete include-
+  ignored suite passed 992/992 in 171.07s, and workspace check, strict engine Clippy, private rustdoc with the known
+  25-warning baseline, scoped source/format/diff/cleanup gates, fresh inventory, and independent audit are clean.
+  Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory remains 12;
+  STRUCT-001KE owns current helper-doc lines 539–540 plus helper/test block 581–832 as the complete grouped/DISTINCT
+  family.
+
+  STRUCT-001KE then isolated the exact three-test streaming grouped/DISTINCT owner and sole `sorted_rows` helper in
+  the rustfmt-clean 259-line private `tests/streaming_exec/grouped_distinct.rs` child, reducing the parent from
+  5,466 to 5,212 lines. History proves commit `4a22ef91` inserted `ClassEntryDisabled` between the helper's two-line
+  rustdoc and its owner; the extraction re-homes those exact docs while retaining the guard's own two-line docs.
+  Old ranges 539–540 and 581–832 have combined payload hash `f8b46a0d…`; the exact child/parent hashes are
+  `340b0f04…`/`ad927c61…`, and restoring both ranges plus separator 833 reconstructs old-parent hash `caeeba6d…`
+  byte-for-byte. Exactly three tests/ignores and one private helper moved with no visibility bridge, path/include
+  indirection, unsafe, or dependency beyond private `gpu_available`/`select`; every `sorted_rows` consumer moved.
+  Nine local plus nine independent-audit actual-GPU executions passed, including simultaneous test processes
+  observed on the RTX PRO 6000, with zero CUDA 700/716/717. Both debug/release ordinary modes passed 505/487, the
+  complete include-ignored suite passed 992/992 in 171.98s, and workspace check, strict engine Clippy, private
+  rustdoc with the known 25-warning baseline, scoped source/format/diff/cleanup gates, fresh inventory, and
+  independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The
+  actionable inventory remains 12; STRUCT-001KF owns current parent lines 580–750 as the complete ordered-fold
+  family.
+
+  STRUCT-001KF then isolated the exact two-test streaming ordered-fold owner in the rustfmt-clean 176-line private
+  `tests/streaming_exec/ordered.rs` child, reducing the parent from 5,212 to 5,041 lines. Old parent lines 580–750
+  and child lines 6–176 share exact payload hash `23b9567d…`; the exact child/parent hashes are
+  `800a2bf8…`/`67bf2701…`, and removing the private module plus restoring the payload and separator 751 reconstructs
+  old-parent hash `ad927c61…` byte-for-byte. Exactly two tests/ignores moved with no helper, visibility bridge,
+  path/include indirection, unsafe, or dependency beyond private `gpu_available`/`select`. Six local plus six
+  independent-audit actual-GPU executions passed, including simultaneous test processes observed on the RTX PRO
+  6000, with zero CUDA 700/716/717. Both debug/release ordinary modes passed 505/487, the complete include-ignored
+  suite passed 992/992 in 172.67s, and workspace check, strict engine Clippy, private rustdoc with the known
+  25-warning baseline, scoped source/format/diff/cleanup gates, fresh inventory, and independent audit are clean.
+  Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory remains 12;
+  STRUCT-001KG owns current parent lines 581–607 and 853–936 as the two residual reduction controls.
+
+  STRUCT-001KG then consolidated both residual reduction controls into their established bounded owners, reducing
+  the parent from 5,041 to 4,928 lines and below the critical 5,000-line threshold. Exact old parent lines 581–607
+  now append to the rustfmt-clean 374-line private `scalar_reductions.rs` child, while exact old lines 853–936 now
+  append to the rustfmt-clean 344-line private `grouped_distinct.rs` child. Range hashes are `d69199bd…` and
+  `008895d6…`; exact child/parent hashes are `65b3d33f…`, `c737e53e…`, and `4a2f2c1c…`, and restoring both ranges plus
+  separators 608/937 reconstructs old-parent hash `67bf2701…` byte-for-byte. The sole import change adds required
+  `Decimal128` to the grouped SQL import; old child prefixes remain exact. The scalar child now has six tests/five
+  ignores; the grouped child has four tests/four ignores/one helper. Three local plus three independent-audit host
+  executions and three local plus three independent-audit actual-GPU executions passed; simultaneous GPU processes
+  were observed on the RTX PRO 6000 with zero CUDA 700/716/717. Both debug/release ordinary modes passed 505/487,
+  the complete include-ignored suite passed 992/992 in 176.23s, and workspace check, strict engine Clippy, private
+  rustdoc with the known 25-warning baseline, scoped source/format/diff/cleanup gates, fresh inventory, and
+  independent audit are clean. The CPU assertion remains parity/bootstrap-only, never product direction. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory remains 12;
+  STRUCT-001KH owns current parent lines 581–1026 as the complete cold-tier lifecycle family.
+
+  STRUCT-001KH then isolated the exact five-test streaming cold-tier lifecycle in the rustfmt-clean 450-line
+  private `tests/streaming_exec/cold_tier.rs` child, reducing the parent from 4,928 to 4,482 lines. Old parent
+  lines 581–1026 and child lines 5–450 share exact payload hash `5c4a8823…`; the exact child/parent hashes are
+  `623c1b56…`/`808d461c…`, and removing the private module plus restoring the payload and separator 1027 reconstructs
+  old-parent hash `4a2f2c1c…` byte-for-byte. Exactly five tests/ignores and zero helpers moved through three import
+  declarations/five names; shared `gpu_available`, `select`, and multi-consumer `ClassEntryDisabled` remain private
+  in the parent. Names, SQL/results/telemetry, panic cleanup, history, the grouped-DISTINCT suite-order reference,
+  and cargo-list order are unchanged, with no visibility bridge, path/include indirection, unsafe, or stale copy.
+  Fifteen local plus 15 independent-audit actual-GPU executions passed; local concurrent PIDs `35881`/`35885`
+  overlapped in 22 samples and audit PIDs `51533`/`51541` in 129, with zero CUDA 700/716/719 or related faults.
+  Both debug/release ordinary modes passed 505/487 in 14.28s/13.37s, the complete include-ignored suite passed
+  992/992 in 173.30s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc with the
+  known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 12-file inventory, and independent
+  audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KI owns current
+  parent lines 582–999 as the complete durable cold-checkpoint family.
+
+  STRUCT-001KI then isolated the exact durable cold-checkpoint owner in the rustfmt-clean 423-line private
+  `tests/streaming_exec/cold_checkpoint.rs` child, reducing the parent from 4,482 to 4,064 lines. Old parent lines
+  582–999 and child lines 6–423 share exact payload hash `ec1f89d5…`; the exact child/parent hashes are
+  `2c911210…`/`775a6368…`, and removing the private module plus restoring the payload and separator 1000 reconstructs
+  old-parent hash `808d461c…` byte-for-byte. The P1 heading, six tests/five ignores, three private fixtures, exact
+  descriptor fields, WAL construction, SQL/results/telemetry/errors, seam/frontier semantics, and four-declaration/
+  six-name import boundary are preserved. Only private parent `gpu_available`/`select` are consumed; history assigns
+  the family to the durable checkpoint/SV2 commits, with no visibility bridge, path/include indirection, unsafe,
+  context bag, numbered shard, external-name reference, or stale copy. Eighteen local plus 18 independent-audit
+  module executions passed, including 15 actual-GPU paths each; local concurrent PIDs `57330`/`57334` overlapped in
+  20 samples and audit PIDs `71903`/`71908` in 93, with zero CUDA 700/716/719 or related faults. Both debug/release
+  ordinary modes passed 505/487 in 14.16s/11.34s, the complete include-ignored suite passed 992/992 in 162.35s, and
+  workspace all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline,
+  scoped source/child-format/diff/cleanup gates, fresh 12-file inventory, and independent audit are clean. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KJ owns current parent lines 583–902 as
+  the complete streaming DML-locate family.
+
+  STRUCT-001KJ then isolated the exact P3 streaming DML WHERE-locate owner in the rustfmt-clean 324-line private
+  `tests/streaming_exec/dml_locate.rs` child, reducing the parent from 4,064 to 3,744 lines. Old parent lines 583–902
+  and child lines 5–324 share exact payload hash `993252f5…`; the exact child/parent hashes are
+  `fbb7d1ff…`/`7df8bea7…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 903 reconstructs old-parent hash `775a6368…` byte-for-byte. The P3 heading, five tests/ignores, exact
+  DELETE/UPDATE/zero/no-budget SQL, counters, and NULL-bearing TEXT/DATE/NUMERIC/BOOL/BIGINT three-valued
+  differentials are preserved through three import declarations/four names. Only private parent
+  `gpu_available`/`select` are consumed; history assigns the range to the P3/SV2 commits, with no visibility bridge,
+  path/include indirection, unsafe, context bag, numbered shard, external-name reference, or stale copy. Host twins
+  are explicitly oracle/differential controls and the no-budget arm an activation fallback: parity/bootstrap-only,
+  never product direction. Fifteen local plus 15 independent-audit actual-GPU executions passed; local concurrent
+  PIDs `74520`/`74524` overlapped in seven samples and audit PIDs `84973`/`84978` in 18, with zero CUDA 700/716/719
+  or related faults. Both debug/release ordinary modes passed 505/487 in 14.47s/12.44s, the complete include-ignored
+  suite passed 992/992 in 161.86s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc
+  with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 12-file inventory, and
+  independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable.
+  STRUCT-001KK owns current parent lines 584–904 as the complete P2 cold-sidecar family.
+
+  STRUCT-001KK then isolated the exact P2 cold-sidecar owner in the rustfmt-clean 325-line private
+  `tests/streaming_exec/sidecars.rs` child, reducing the parent from 3,744 to 3,423 lines. Old parent lines 584–904
+  and child lines 5–325 share exact payload hash `940e6034…`; the exact child/parent hashes are
+  `53df625e…`/`0838c704…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 905 reconstructs old-parent hash `7df8bea7…` byte-for-byte. The P2 heading, three tests/two ignores,
+  exact SQL/results/counters, multi-chunk masks, v2 checkpoint/restore artifact, payload-boundary rank, and pinned
+  COW generation/change-log assertions are preserved through three import declarations/five names. Shared
+  `gpu_available`, `select`, and multi-consumer private `ClassEntryDisabled` remain in the parent; history assigns
+  the range to SV2/chunk-locate/v2-persistence commits, with no visibility bridge, path/include indirection, unsafe,
+  context bag, numbered shard, external-name reference, or stale copy. The no-GPU COW test remains explicitly a
+  minimal storage/parity bootstrap repro, never product direction. Nine local plus nine independent-audit module
+  executions passed, including six actual-GPU paths each; local concurrent PIDs `86277`/`86282` overlapped in three
+  samples and audit PIDs `97327`/`97331` in eight, with zero CUDA 700/716/719 or related faults. Both debug/release
+  ordinary modes passed 505/487 in 14.61s/7.95s, the complete include-ignored suite passed 992/992 in 176.60s, and
+  workspace all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline,
+  scoped source/child-format/diff/cleanup gates, fresh 12-file inventory, and independent audit are clean. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KL owns current parent lines 585–707 as
+  the complete P4-1 reverse-gather differential.
+
+  STRUCT-001KL then isolated the exact P4-1 reverse-gather differential in the rustfmt-clean 127-line private
+  `tests/streaming_exec/reverse_gather.rs` child, reducing the parent from 3,423 to 3,300 lines. Old parent lines
+  585–707 and child lines 5–127 share exact payload hash `5c25072d…`; the exact child/parent hashes are
+  `a750e361…`/`134b912c…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 708 reconstructs old-parent hash `0838c704…` byte-for-byte. The P4-1 heading, sole test/ignore, exact
+  INT/SMALLINT/BIGINT/DATE/TIMESTAMP/NUMERIC/BOOL/TEXT/UUID fixtures, per-section NULLs, scan order, cold-build/
+  sidecar counters, boundary gathers, and row differential are preserved through three import declarations/four
+  names. Only private `gpu_available`/`select` are consumed; history assigns the range to reverse-gather/
+  chunk-locate commits, with no visibility bridge, path/include indirection, unsafe, context bag, numbered shard,
+  external-name reference, or stale copy. The pre-stream store result and host decoder remain explicitly the
+  parity/bootstrap oracle and gated debt, never product direction. Three local plus three independent-audit
+  actual-GPU executions passed; local concurrent PIDs `98927`/`98932` overlapped in five samples and audit PIDs
+  `109355`/`109361` in six, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes passed
+  505/487 in 14.29s/13.03s, the complete include-ignored suite passed 992/992 in 161.81s, and workspace all-target/
+  all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/child-
+  format/diff/cleanup gates, fresh 12-file inventory, and independent audit are clean. Runtime behavior is unchanged,
+  so HAZARD/report card were inapplicable. STRUCT-001KM owns current parent lines 586–771 as the complete P4-2a
+  chunk-native locate/stamp family.
+
+  STRUCT-001KM then isolated the exact P4-2a chunk-native locate/stamp family in the rustfmt-clean 190-line private
+  `tests/streaming_exec/chunk_locate.rs` child, reducing the parent from 3,300 to 3,114 lines. Old parent lines
+  586–771 and child lines 5–190 share exact payload hash `b09383d7…`; the exact child/parent hashes are
+  `f541d6a9…`/`774a9f0f…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 772 reconstructs old-parent hash `134b912c…` byte-for-byte. The P4-2a heading, two tests/ignores, exact
+  predicates, coordinate decoding, SQL/results/counters, sidecar stamps, COUNT/SUM/reverse-gather visibility, and
+  re-locate idempotence are preserved through three import declarations/six names. Only private
+  `gpu_available`/`select` are consumed; history assigns the range to chunk-locate/store-free-stamp commits, with no
+  visibility bridge, path/include indirection, unsafe, context bag, numbered shard, external-name reference, or
+  stale copy. The store-driven P3 rows remain explicitly the same-pinned-view parity/bootstrap differential, never
+  product direction. Six local plus six independent-audit actual-GPU executions passed; local concurrent PIDs
+  `110527`/`110533` overlapped in five samples and audit PIDs `121110`/`121118` in seven, with zero CUDA
+  700/716/719 or related faults. Both debug/release ordinary modes passed 505/487 in 14.74s/7.90s, the complete
+  include-ignored suite passed 992/992 in 179.08s, and workspace all-target/all-feature check, strict engine Clippy,
+  private rustdoc with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 12-file
+  inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were
+  inapplicable. STRUCT-001KN owns current parent lines 587–1123 as the complete P4 chunk-authoritative class
+  lifecycle and will complete this test-root disposition below 3,000 lines.
+
+  STRUCT-001KN then isolated the exact complete P4 chunk-authoritative class lifecycle in the rustfmt-clean 541-line
+  private `tests/streaming_exec/chunk_class_lifecycle.rs` child, reducing the parent from 3,114 to 2,577 lines and
+  completing its disposition below the test envelope without an exception. Old parent lines 587–1123 and child
+  lines 5–541 share exact payload hash `465adb5c…`; the exact child/parent hashes are `43d5d119…`/`369853ed…`, and
+  removing the alphabetically placed private module plus restoring the payload and separator 1124 reconstructs
+  old-parent hash `774a9f0f…` byte-for-byte. The P4 heading, four tests/ignores, exact class entry/store-row reclaim,
+  post-freeze INSERT/read, loud deauthorization, chunk-native DELETE/UPDATE stamp/tail, old-boundary born gate,
+  sidecar, compaction, generation, counter, SQL, and result assertions are preserved through three import
+  declarations/five names. Only private `gpu_available`/`select` are consumed; history assigns the range exactly to
+  the P4 class/reclaim commits, with no visibility bridge, path/include indirection, unsafe, context bag, numbered
+  shard, external-name reference, or stale copy. Host/store twins and the CPU-pinned deauthorization exit remain
+  explicitly parity/bootstrap evidence and gated debt, never product direction. Twelve local plus 12 independent-
+  audit actual-GPU executions passed; local concurrent PIDs `122547`/`122551` overlapped in four samples and audit
+  PIDs `134466`/`134474` in 14, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes
+  passed 505/487 in 14.27s/7.98s, the complete include-ignored suite passed 992/992 in 188.63s, and workspace all-
+  target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/
+  child-format/diff/cleanup gates, fresh 11-file inventory, and independent audit are clean. Runtime behavior is
+  unchanged, so HAZARD/report card were inapplicable. STRUCT-001KO owns current `tests/sql_pg.rs` tail lines
+  4767–5835 as the complete S7/V3 and S5/V1a device join-materialization audit family.
+
+  STRUCT-001KO then isolated the exact trailing S7/V3 and S5/V1a device join-materialization audits in the
+  rustfmt-clean 1,074-line private `tests/sql_pg/join_materialization_audit.rs` child, reducing the parent from
+  5,835 to 4,766 lines. Old parent lines 4767–5835 and child lines 6–1074 share exact payload hash `e4a4db9a…`; the
+  exact child/parent hashes are `4aa9eed1…`/`16645d69…`, and removing the sole private module plus restoring
+  separator 4766 and the tail reconstructs old-parent hash `9c355355…` byte-for-byte. Both audit headings, 15
+  tests/ignores, sole `audit_one_val` helper, exact fixtures/SQL/results, matched NULLs, OUTER pads, empty sides/
+  results, N:N/multiway/USING/NATURAL/star gathers, placeholder nonvacuity, windows, UUID byte order, numeric
+  mantissas, b128/text late steps, NULL key gates, and mixed UUID/numeric projection are preserved through four
+  import declarations/five names. The initial exact compile exposed `Decimal128` at two assertions hidden by the old
+  parent glob; adding only that explicit SQL type closed the dependency without changing the payload. History assigns
+  the tail exactly to the two audit, GPU-default, and STRATA commits, with no super/glob dependency, visibility
+  bridge, path/include indirection, unsafe, context bag, numbered shard, external-name reference, or stale copy.
+  Host-computed sets and resident one-value references remain explicitly test-only parity/cross-check evidence, never
+  product CPU execution. Forty-five local plus 45 independent-audit actual-GPU executions passed; local concurrent
+  PIDs `135908`/`135913` overlapped in five samples and audit PIDs `146698`/`146706` in 18, with zero CUDA
+  700/716/719 or related faults. The intentional caught placeholder assertion printed in every invocation while all
+  summaries remained successful. Both debug/release ordinary modes passed 505/487 in 19.79s/10.08s, the complete
+  include-ignored suite passed 992/992 in 165.91s, and workspace all-target/all-feature check, strict engine Clippy,
+  private rustdoc with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 11-file
+  inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were
+  inapplicable. STRUCT-001KP owns current parent lines 597–1390 as the complete initial GPU join/NULL-key family.
+
+  STRUCT-001KP then isolated the exact initial inner-join/NULL-key V1b family in the rustfmt-clean 799-line private
+  `tests/sql_pg/join_null_keys.rs` child, reducing the parent from 4,766 to 3,972 lines. Old parent lines 597–1390
+  and child lines 6–799 share exact payload hash `f64136de…`; the exact child/parent hashes are
+  `410ea049…`/`dbc08ea0…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 1391 reconstructs old-parent hash `16645d69…` byte-for-byte. All 11 tests/ignores and exact two-relation
+  inner, NULL/3VL exclusion, grid-stride scale, int2/int8/UUID/text/N:N keys, RIGHT/FULL padding, all-NULL build,
+  side-swap, composite partial-NULL, anti-join, word-boundary fixtures/SQL/results/cardinality/type/target assertions
+  are preserved through four import declarations/four names. History assigns the payload exactly to the six join/
+  NULL/V1b commits; preceding scalar-DISTINCT and discarded-separator blame are separately bounded. There is no
+  glob/super dependency, visibility bridge, path/include indirection, unsafe, context bag, numbered shard, external-
+  name reference, or stale copy. Host-constructed expected sets remain test-only parity evidence, never product CPU
+  execution. Thirty-three local plus 33 independent-audit actual-GPU executions passed; local concurrent PIDs
+  `147875`/`147883` overlapped in two samples and audit PIDs `158671`/`158679` in six, with zero CUDA 700/716/719
+  or related faults. Both debug/release ordinary modes passed 505/487 in 18.25s/8.52s, the complete include-ignored
+  suite passed 992/992 in 184.32s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc
+  with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 11-file inventory, and
+  independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable.
+  STRUCT-001KQ owns current parent lines 598–1824 as the complete GPU OUTER/nullable/3VL family and will complete
+  this test-root disposition below 3,000 lines.
+
+  STRUCT-001KQ then isolated the exact complete GPU OUTER/nullable/3VL family in the rustfmt-clean 1,232-line
+  private `tests/sql_pg/outer_null_semantics.rs` child, reducing the parent from 3,972 to 2,745 lines and completing
+  its disposition below the test envelope without an exception. Old parent lines 598–1824 and child lines 6–1232
+  share exact payload hash `cd7ca607…`; the exact child/parent hashes are `97edad87…`/`ec3fb144…`, and removing the
+  alphabetically placed private module plus restoring the payload and separator 1825 reconstructs old-parent hash
+  `dbc08ea0…` byte-for-byte. All 15 tests/ignores and exact LEFT/RIGHT/FULL/N-way pads, explicit NULL ordering,
+  nullable composite/expression grouping/order, nullable COUNT(DISTINCT) error, join-result order, post-join WHERE,
+  device Kleene, real-NULL-versus-pad, and S6 fixtures/SQL/results/types/targets/truth tables are preserved through
+  four import declarations/five names. The initial exact compile exposed `RowBlock` at five typed closures hidden by
+  the old parent glob; adding only that explicit crate type closed the dependency without changing the payload.
+  History spans the complete OUTER/nullable/3VL/S6 family, with no super/glob dependency, visibility bridge, path/
+  include indirection, unsafe, context bag, numbered shard, external-name reference, or stale copy. Expected rows
+  and truth tables remain inside ignored GPU tests as parity evidence, never product CPU execution. Forty-five local
+  plus 45 independent-audit actual-GPU executions passed; local concurrent PIDs `159974`/`159978` overlapped in
+  five samples and audit PIDs `170572`/`170580` in 15, with zero CUDA 700/716/719 or related faults. Both debug/
+  release ordinary modes passed 505/487 in 20.21s/10.65s, the complete include-ignored suite passed 992/992 in
+  182.60s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-
+  warning baseline, scoped source/child-format/diff/cleanup gates, fresh 10-file inventory, and independent audit
+  are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KR owns current
+  `tests/mvcc_bundles.rs` lines 3–1442 as the complete initial provenance frame/bundle-path family.
+
+  STRUCT-001KR then isolated the exact initial provenance frame/bundle-path family in the rustfmt-clean 1,446-line
+  private `tests/mvcc_bundles/provenance_bundle_paths.rs` child, reducing the parent from 5,374 to 3,934 lines. Old
+  parent lines 3–1442 and child lines 7–1446 share exact payload hash `61821b5c…`; the exact child/parent hashes are
+  `fd854a96…`/`f7b58c6d…`, and removing the sole private module plus restoring the payload and separator 1443
+  reconstructs old-parent hash `151fd2f1…` byte-for-byte. All 12 tests and exact SET histories/query trees, frames,
+  bundles, summaries, quantified/positional/subpath/distance/suffix/prefix/slice filters, orders, projections,
+  limits, rows, and miss assertions are preserved through one explicit import declaration/14 names. History is
+  exactly the original MVCC-suite split plus STRATA commit, with no glob/super dependency, visibility bridge, path/
+  include indirection, unsafe, context bag, numbered shard, external-name reference, or stale copy. The moved
+  `execute_mvcc_query` tests use the cfg(test) `CpuMvccExecutionBackend` with `GpuMvccReadParityGap` and remain
+  explicit parity/bootstrap debt, never product direction; three matching CUDA-driver bundle controls provide the
+  GPU evidence. Thirty-six local plus 36 independent-audit CPU-parity executions and nine local plus nine audit
+  actual-GPU executions passed; local concurrent GPU PIDs `172548`/`172552` overlapped in 20 samples and audit PIDs
+  `184659`/`184664` overlapped repeatedly, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary
+  modes passed 505/487 in 23.15s/9.83s, the complete include-ignored suite passed 992/992 in 185.75s, and workspace
+  all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped
+  source/child-format/diff/cleanup gates, fresh 10-file inventory, and independent audit are clean. Runtime behavior
+  is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KS owns current parent lines 4–1368 as the
+  complete whole-bundle cardinality and occurrence-distance filter family and will complete this test root below
+  3,000 lines.
+
+  STRUCT-001KS then isolated that exact seven-test occurrence-cardinality/distance family in the rustfmt-clean
+  1,371-line private `tests/mvcc_bundles/occurrence_distance_filters.rs` child, reducing the parent from 3,934 to
+  2,569 lines and completing its disposition below the test envelope without an exception. Old parent lines
+  4–1368 and child lines 7–1371 share exact payload hash `c980a6cf…`; the exact child/parent hashes are
+  `f0b2d32d…`/`2487d3d3…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 1369 reconstructs old-parent hash `f7b58c6d…` byte-for-byte. All seven tests and exact SET histories,
+  query trees, bundles/summaries, cardinality/ordinal/range/distance filters, orders, projections, limits, rows, and
+  miss assertions are preserved through one explicit import declaration/13 names. History is exactly the original
+  MVCC-suite split plus STRATA commit, with no glob/super dependency, visibility bridge, path/include indirection,
+  unsafe, context bag, numbered shard, external-name reference, or stale copy. The moved `execute_mvcc_query` tests
+  use the cfg(test) CPU semantic backend and remain parity/bootstrap debt only; the same three CUDA-driver bundle
+  controls provide GPU nonvacuity. Twenty-one local plus 21 independent-audit CPU-parity executions and nine local
+  plus nine independent-audit actual-GPU executions passed. Local concurrent GPU PIDs `187588`/`187592` overlapped
+  in 14 samples and audit PIDs `199588`/`199593` were repeatedly observed together, with zero CUDA 700/716/719 or
+  related faults. Both debug/release ordinary modes passed 505/487 in 14.31s/8.08s, the complete include-ignored
+  suite passed 992/992 in 180.78s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc
+  with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh nine-file inventory, and
+  independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable.
+  STRUCT-001KT owns current `tests/intent_fast_path.rs` lines 3491–4430 as the complete GPU constraint-elision
+  lifecycle family.
+
+  STRUCT-001KT then isolated that exact seven-test GPU constraint-elision lifecycle in the rustfmt-clean 945-line
+  private `tests/intent_fast_path/constraint_elision.rs` child, reducing the parent from 5,204 to 4,264 lines. Old
+  parent lines 3491–4430 and child lines 6–945 share exact payload hash `f5970deb…`; the exact child/parent hashes
+  are `f9f2c7fb…`/`6ad6d330…`, and removing the private module plus restoring the payload and separator 4431
+  reconstructs old-parent hash `d9d29e20…` byte-for-byte. All seven tests/ignores and exact CHECK/FK schemas, SQL
+  histories, device-residency assertions, failure/retry/liveness pins, mixed-width predicates, results, and
+  diagnostics are preserved. Four explicit import declarations/seven names include the existing private parent
+  `gpu_ids_of_t` helper without visibility widening. History spans the exact eight GPU-native feature commits, with
+  no child glob, visibility bridge, path/include indirection, unsafe, context bag, numbered shard, external-name
+  reference, or stale copy. Twenty-one local plus 21 independent-audit actual-GPU executions passed; local
+  concurrent PIDs `202234`/`202238` overlapped in six samples and audit PIDs `213122`/`213126` were repeatedly
+  observed together, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes passed 505/487
+  in 14.48s/13.23s, the complete include-ignored suite passed 992/992 in 168.74s, and workspace all-target/all-
+  feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/child-
+  format/diff/cleanup gates, fresh nine-file inventory, and independent audit are clean. Runtime behavior is
+  unchanged, so HAZARD/report card were inapplicable. STRUCT-001KU owns current parent lines 49–1543 as the
+  complete GPU intent-lane lifecycle family and will complete this test root below 3,000 lines.
+
+  STRUCT-001KU then isolated that exact nine-test/seven-helper GPU intent-lane lifecycle in the rustfmt-clean
+  1,499-line private `tests/intent_fast_path/lane_lifecycle.rs` child, reducing the parent from 4,264 to 2,769 lines
+  and completing its disposition below the test envelope without an exception. Old parent lines 49–1543 and child
+  lines 5–1499 share exact payload hash `4d6234dc…`; the exact child/parent hashes are `48ea5d1e…`/`838cbb29…`,
+  and removing the alphabetically placed private module plus restoring the payload and separator 1544 reconstructs
+  old-parent hash `6ad6d330…` byte-for-byte. All nine tests/ignores, seven helpers, and exact WAL paths/env guards,
+  routes/transactions, submit/poll/drive timing, conflicts, diagnostics, rows, recovery assertions, and cleanup
+  behavior are preserved through three explicit import declarations/seven names. History spans the exact 16 intent-
+  lane commits, with no child glob, visibility widening/bridge, path/include indirection, unsafe, context bag,
+  numbered shard, external-name reference, or stale copy. Twenty-seven local plus 27 independent-audit actual-GPU
+  executions passed. Local concurrent PIDs `218035`/`218038` overlapped in 674 samples and audit PIDs `244952`/
+  `244957` in 1,937, with zero CUDA 700/716/719 or related faults. Debug ordinary mode passed 505/487 in 14.55s.
+  The first release ordinary run exposed one transient pre-existing `write_half` concurrent re-resolve failure; its
+  exact test then passed three consecutive reruns and the complete release ordinary rerun passed 505/487 in 14.61s.
+  The complete include-ignored suite passed 992/992 in 193.29s. Workspace all-target/all-feature check, strict engine
+  Clippy, private rustdoc with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh
+  eight-file inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were
+  inapplicable. STRUCT-001KV owns current `tests/resident_route.rs` lines 1032–1857 as the complete sharded lookup
+  and retained batched-projection family.
+
+  STRUCT-001KV then isolated that exact six-test sharded lookup/projection family in the rustfmt-clean 832-line
+  private `tests/resident_route/sharded_lookup.rs` child, reducing the parent from 4,649 to 3,823 lines. Old parent
+  lines 1032–1857 and child lines 7–832 share exact payload hash `530cf7e2…`; exact child/parent hashes are
+  `4177e2df…`/`ae58f71e…`, and removing the private module plus restoring the payload and separator 1858
+  reconstructs old-parent hash `a8465275…` byte-for-byte. All six tests/three ignores and exact shard layouts,
+  chunks, queries, stable-order loops, target assertions, decline behavior, rows, and diagnostics are preserved
+  through three explicit import declarations/eight names. History spans the exact five source commits, with no
+  child glob, visibility widening/bridge, path/include indirection, unsafe, helper, context bag, numbered shard,
+  external-name reference, or stale copy. Nine local plus nine audit ordinary executions and nine local plus nine
+  audit actual-GPU executions passed. Local concurrent GPU PIDs `259486`/`259491` overlapped in four samples and
+  audit PIDs `270075`/`270080` in five, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary
+  modes passed 505/487 in 16.48s/12.68s, the complete include-ignored suite passed 992/992 in 167.86s, and workspace
+  all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped
+  source/child-format/diff/cleanup gates, fresh eight-file inventory, and independent audit are clean. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KW owns current parent lines
+  1033–1939 as the complete sharded reduction family and will complete this test root below 3,000 lines.
+
+  STRUCT-001KW then isolated that exact five-test sharded reduction family in the rustfmt-clean 913-line private
+  `tests/resident_route/sharded_reductions.rs` child, reducing the parent from 3,823 to 2,916 lines and completing
+  its disposition below the test envelope without an exception. Old parent lines 1033–1939 and child lines 7–913
+  share exact payload hash `7278dd14…`; exact child/parent hashes are `a7412b06…`/`9f8753c2…`, and removing the
+  private module plus restoring the payload and lone separator 1940 reconstructs old-parent hash `ae58f71e…`
+  byte-for-byte. All five tests/zero ignores/helpers and exact shard layouts/chunks, queries, aggregate targets,
+  invalidation/missing-layout declines, rows, and diagnostics are preserved through three explicit import
+  declarations/nine names. History spans the exact six source commits and accounts for all 907 payload lines,
+  with no child glob, visibility widening/bridge, path/include indirection, unsafe, context bag, numbered shard,
+  external-name reference, or stale copy. Fifteen local plus 15 independent-audit actual-GPU executions passed.
+  Local concurrent PIDs `271192`/`271197` overlapped in two samples and audit PIDs `282084`/`282089` in three,
+  with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes passed 505/487 in 21.53s/9.31s,
+  the complete include-ignored suite passed 992/992 in 173.15s, and workspace all-target/all-feature check, strict
+  engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates,
+  fresh seven-file inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report
+  card were inapplicable. STRUCT-001KX owns current `tests/sql_catalog.rs` lines 1140–2316 as the complete core
+  relation metadata/index/constraint/drop lifecycle and will complete that test root below 3,000 lines.
+
+  STRUCT-001KX then isolated that exact 14-test core relation lifecycle in the rustfmt-clean 1,183-line private
+  `tests/sql_catalog/relation_lifecycle.rs` child, reducing the parent from 3,974 to 2,798 lines and completing its
+  disposition below the test envelope without an exception. Old parent lines 1140–2316 and child lines 7–1183
+  share exact payload hash `1f8521b7…`; exact child/parent hashes are `aebb2195…`/`879b803b…`, and removing the
+  private module plus restoring the payload and lone separator 2317 reconstructs old-parent hash `ab6388ae…`
+  byte-for-byte. All 14 tests/zero ignores/helpers and exact SQL/WAL/recovery paths, catalog/index/constraint
+  metadata, access-path/error assertions, rows, and diagnostics are preserved through two explicit import
+  declarations/13 names. History spans the exact eight source commits and accounts for all 1,177 payload lines,
+  with no child glob, visibility widening/bridge, path/include indirection, unsafe, context bag, numbered shard,
+  external-name reference, or stale copy. Forty-two local plus 42 independent-audit CPU-oracle parity executions
+  passed. Both debug/release ordinary modes passed 505/487 in 30.07s/9.83s, the complete include-ignored suite
+  passed 992/992 in 173.19s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc with
+  the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh six-file inventory, and
+  independent audit are clean. The 24 `new_local_cpu_oracle` constructions remain explicitly test-only parity/
+  bootstrap evidence; runtime behavior is unchanged, so GPU nonvacuity, HAZARD, and report card were inapplicable.
+  STRUCT-001KY owns current `tests/mvcc_query.rs` lines 1141–2296 as the complete initial actual-CUDA driver route
+  matrix and will complete that test root below 3,000 lines.
+
+  STRUCT-001KY then isolated that exact 24-test/24-ignore initial actual-CUDA driver route matrix in the rustfmt-
+  clean 1,164-line private `tests/mvcc_query/cuda_driver_routes.rs` child, reducing the parent from 3,502 to 2,347
+  lines and completing its disposition below the test envelope without an exception. Old parent lines 1141–2296
+  and child lines 9–1164 share exact payload hash `66e7ec99…`; exact child/parent hashes are `aaeb2e1a…`/
+  `7f31404c…`, and removing the private module plus restoring the payload and lone separator 2297 reconstructs old-
+  parent hash `be2f333c…` byte-for-byte. All 24 tests/24 ignores/zero helpers and exact queries/snapshots, source/
+  filter/order/projection/limit shapes, rows, target/fallback/metrics assertions, and diagnostics are preserved
+  through two explicit import declarations/17 names. History spans exactly the MVCC-suite split and STRATA commits
+  and accounts for all 1,156 payload lines, with no child glob, visibility widening/bridge, path/include indirection,
+  unsafe, context bag, numbered shard, external-name reference, or stale copy. Seventy-two local plus 72 independent-
+  audit actual-CUDA executions passed. Local concurrent PIDs `301538`/`301546` overlapped in 311 samples and audit
+  PIDs `318767`/`318773` in 315, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes
+  passed 505/487 in 14.50s/21.74s, the complete include-ignored suite passed 992/992 in 174.62s, and workspace all-
+  target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/
+  child-format/diff/cleanup gates, fresh five-file inventory, and independent audit are clean. Runtime behavior is
+  unchanged, so HAZARD/report card were inapplicable. STRUCT-001KZ owns current execution `tests/cuda_paths.rs`
+  lines 2878–3041 as the final resident-generation lifetime soundness test and will complete the last test outlier.
+
+  STRUCT-001KZ then normalized that exact one-test/one-ignore resident-generation lifetime soundness owner into
+  the rustfmt-clean 168-line private sibling `crates/execution/src/tests/cuda_generation_lifetime.rs`, reducing
+  `cuda_paths.rs` from 3,041 to 2,876 lines and completing the last test disposition below the envelope without an
+  exception. Prefixing four spaces to each nonblank child payload line 5–168 reproduces old lines 2878–3041 with
+  exact hash `8c5f929a…`; restoring that payload plus the removed separator reconstructs old-parent hash `5fdec9fc…`
+  byte-for-byte. Exact child/parent hashes are `0c5b9299…`/`d8bf5b01…`; `tests/mod.rs` changes only by the private
+  module declaration before the unchanged `include!("cuda_paths.rs")`. The test, ignore, local `Drop::drop`, owner/
+  field-drop order, generation/allocation layouts, barriers, payload offsets/bytes, expected rows, detached submit/
+  completion timing, lifetime assertions, and diagnostics are preserved through one new explicit crate import/
+  four names plus the exact test-local imports. All 164 payload lines derive from the single runtime/test-ownership
+  commit, with no new glob, visibility bridge, path/include indirection, unsafe, helper, external-name reference,
+  or stale copy. Three local plus three independent-audit actual-GPU executions passed; local PIDs `328274`/
+  `328277` overlapped in samples 5–7 and audit PIDs `330598`/`330601` in samples 4–6, with zero CUDA 700/716/719
+  or related faults. The execution library ordinary and complete include-ignored suites passed 56/77 and 133/133;
+  workspace all-target/all-feature check, strict execution Clippy, private rustdoc with the known 13-warning
+  baseline, scoped source/child-format/diff/cleanup gates, fresh four-file inventory, and independent audit are
+  clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001LA now owns analysis
+  and disposition of the handwritten research-paper mechanism-link generator, the first remaining tool outlier.
+
+  STRUCT-001LA then proved that the 14,889-line handwritten research-paper mechanism-link generator was an
+  obsolete live tool over explicitly historical inputs and outputs, and deleted it without touching archive
+  evidence. The file comprised a 21-line import/regex prelude, 13,495 lines of reviewed declarative corpora—795
+  identity overrides, 1,428 matching/
+  schema rules, 8,908 relation-review overrides, and 2,364 link-review overrides—plus 1,373 lines of parsing,
+  linking, normalization, backlog, report-writing, and CLI logic. Documentation consolidation commit `bedc1df7`
+  moved its journal, mechanisms, and four generated artifacts under `docs/archive/research/`; the live default
+  invocation therefore fails on the absent journal, and exhaustive non-archive search found no consumer or caller.
+  An explicit invocation against the archived journal/mechanisms regenerated paper links JSON `e1fc1d10…`, coverage
+  Markdown `329e7743…`, benchmark backlog JSON `e9d0641c…`, and backlog Markdown `ec71897e…` byte-for-byte. Python
+  compilation passed before deletion, the deleted source hash is `2c7b1120…`, archive files remain unchanged, and
+  no cache/output residue remains. Splitting the mixed file would have recreated live ownership for historical,
+  non-actionable data; deletion is the audited source-size disposition. Fresh inventory leaves three actionable
+  example/tool outliers; `PLAN.md` records their active ownership and sequence.
+
+  STRUCT-001LB analysis then classified the 4,726-line `write_conveyor_bench.rs` as a handwritten, auto-
+  discovered benchmark example with source hash `e9de8be1…`, no external non-archive path/name consumer, and
+  exactly three history commits: initial prototype, FUA/durable-WAL expansion, and a three-line lint repair. Its
+  responsibility map separates a cohesive ~1,355-line shared harness/config/type/instrumentation owner, a ~411-
+  line CLI dispatcher, ~624 lines of simple scenarios, exact 394-line direct-client and 1,564-line coalesced-client
+  latency scenario owners, a 23-line label helper, and a ~352-line WAL-worker/report tail. The selected module map
+  identifies current lines 2391–2784 for `direct_client_latency.rs` and baseline lines 2786–4349 for
+  `coalesced_client_latency.rs`, with both children depending one-way on explicit root-owned contracts while the
+  facade and shared harness remain unique. Size simulation gives a ~4,333-line intermediate root and a ~2,770-line
+  final root, below the example's 3,000-line envelope without an exception; `PLAN.md` alone owns execution order
+  and acceptance gates.
+  The cohesive coalesced owner is marginally above the normal 1,500-line module target because seven thread
+  closures share one queue/manager/durability synchronization lifetime; a further split would manufacture a broad
+  context bag or duplicate ownership. The default auto-example baseline build passes; no source behavior changed
+  in this analysis slice.
 
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
@@ -3200,7 +3712,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 19 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 3 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
