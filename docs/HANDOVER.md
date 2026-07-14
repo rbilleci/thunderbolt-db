@@ -563,6 +563,13 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   suite, static/source/cleanup gates, fresh inventory, and audit pass. The store-driven P3 rows remain parity/
   bootstrap-only. The actionable inventory remains 12; STRUCT-001KN owns current parent lines 587–1123 as the
   complete P4 chunk-authoritative class lifecycle and will take this test root below 3,000 lines.
+- STRUCT-001KN is closed. The exact four-test P4 chunk-authoritative class lifecycle now lives in the rustfmt-clean
+  541-line private `tests/streaming_exec/chunk_class_lifecycle.rs` child; the parent is 2,577 lines and its
+  disposition is complete without an exception. Exact payload/parent reconstruction, 12 local plus 12 independent-
+  audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh
+  inventory, and audit pass. Host/store twins and deauthorization remain parity/bootstrap debt only. The actionable
+  inventory is now 11; STRUCT-001KO owns current `tests/sql_pg.rs` tail lines 4767–5835 as the complete device
+  join-materialization audit family.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -572,9 +579,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KN:** isolate exact P4 chunk-authoritative class-lifecycle current `tests/streaming_exec.rs` lines
-   587–1123 as mapped in `PLAN.md`, preserving class entry, store reclamation/freeze, DML/born/sidecar semantics,
-   compaction, and the gated deauthorization differential; this completes the parent below 3,000 lines.
+1. **STRUCT-001KO:** isolate exact trailing device join-materialization audits at current `tests/sql_pg.rs` lines
+   4767–5835 as mapped in `PLAN.md`, preserving all NULL/pad/type/gather/window/nonvacuity and b128/text evidence.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

@@ -3417,6 +3417,26 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inapplicable. STRUCT-001KN owns current parent lines 587–1123 as the complete P4 chunk-authoritative class
   lifecycle and will complete this test-root disposition below 3,000 lines.
 
+  STRUCT-001KN then isolated the exact complete P4 chunk-authoritative class lifecycle in the rustfmt-clean 541-line
+  private `tests/streaming_exec/chunk_class_lifecycle.rs` child, reducing the parent from 3,114 to 2,577 lines and
+  completing its disposition below the test envelope without an exception. Old parent lines 587–1123 and child
+  lines 5–541 share exact payload hash `465adb5c…`; the exact child/parent hashes are `43d5d119…`/`369853ed…`, and
+  removing the alphabetically placed private module plus restoring the payload and separator 1124 reconstructs
+  old-parent hash `774a9f0f…` byte-for-byte. The P4 heading, four tests/ignores, exact class entry/store-row reclaim,
+  post-freeze INSERT/read, loud deauthorization, chunk-native DELETE/UPDATE stamp/tail, old-boundary born gate,
+  sidecar, compaction, generation, counter, SQL, and result assertions are preserved through three import
+  declarations/five names. Only private `gpu_available`/`select` are consumed; history assigns the range exactly to
+  the P4 class/reclaim commits, with no visibility bridge, path/include indirection, unsafe, context bag, numbered
+  shard, external-name reference, or stale copy. Host/store twins and the CPU-pinned deauthorization exit remain
+  explicitly parity/bootstrap evidence and gated debt, never product direction. Twelve local plus 12 independent-
+  audit actual-GPU executions passed; local concurrent PIDs `122547`/`122551` overlapped in four samples and audit
+  PIDs `134466`/`134474` in 14, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes
+  passed 505/487 in 14.27s/7.98s, the complete include-ignored suite passed 992/992 in 188.63s, and workspace all-
+  target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/
+  child-format/diff/cleanup gates, fresh 11-file inventory, and independent audit are clean. Runtime behavior is
+  unchanged, so HAZARD/report card were inapplicable. STRUCT-001KO owns current `tests/sql_pg.rs` tail lines
+  4767–5835 as the complete S7/V3 and S5/V1a device join-materialization audit family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3428,7 +3448,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 12 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 11 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
