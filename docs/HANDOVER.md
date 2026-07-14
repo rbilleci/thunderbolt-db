@@ -10,7 +10,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FR is closed. The deleted 9,745-line expression PTX hub is now 13 operator/type-owned leaves, each
   below 1,500 lines. All 67 live symbols/ABIs/bodies are normalized-exact; two unreferenced legacy compactors were
   deleted. Fifteen GPU routes, full execution gates, static gates, canonical report card, and independent audit pass.
-- The PTX-inclusive source inventory now has 26 outliers: 13 production, nine tests, and four examples/tools.
+- The PTX-inclusive source inventory now has 22 actionable outliers: nine production, nine tests, and four
+  examples/tools; the separately registered `engine_expr.rs` exception is not actionable.
   **STRUCT-001** owns every remaining disposition.
 - QUALITY-002 is closed. Integer SUM binding now agrees with its bigint materialized value and wire descriptor;
   the hidden join `ORDER BY` expectation and five recovery-era cold-tier fixtures now reflect their live routes.
@@ -294,14 +295,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   contracts, sidecar I/O, and validation behind three type/nine operation re-exports with no bridge. Both 85-test
   modes, 40 engine recovery tests, five GPU checkpoint controls, static/source/fresh-inventory gates, and audit are
   clean. The 1,872-line mixed WAL root has a complete below-threshold disposition; STRUCT-001IO owns SQL COPY.
+- STRUCT-001IO is closed. The exact SQL COPY owner now lives in the rustfmt-clean 683-line private `sql/src/copy.rs`
+  leaf behind six type/five operation crate-root re-exports with no bridge. Both SQL modes, both protocol COPY modes,
+  both engine COPY modes, static/source/fresh-inventory gates, and independent audit are clean. The SQL root is 6,772
+  lines; STRUCT-001IP owns its standalone fixed-point Decimal implementation and nine closest pure tests.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IO:** move current SQL COPY ranges 1036–1454 and 1481–1739 into private `copy.rs`, keep shared boolean
-   parsing at root, re-export six contracts/five operations without a bridge, and preserve protocol/engine consumers.
+1. **STRUCT-001IP:** move current SQL Decimal production lines 708–982 and nine pure tests at 6537–6697 into private
+   `decimal.rs`, keep the two parser-integration tests at root, and re-export `Decimal128`/`NumericOverflow` unchanged.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

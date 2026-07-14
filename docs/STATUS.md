@@ -2612,11 +2612,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   is within its envelope, so the WAL disposition is complete without an exception. Runtime behavior did not change;
   HAZARD/report-card/GPU-kernel gates were inapplicable.
 
+  STRUCT-001IO then isolated the complete SQL COPY statement/options/row-decoding owner in the rustfmt-clean
+  683-line private `sql/src/copy.rs` leaf, reducing the SQL root from 7,445 to 6,772 lines. The exact old ranges
+  1036–1454 and 1481–1739 reconstruct under the four-line child wrapper, separated only by one blank line; the
+  neutral `parse_bool_value` remains at root for both COPY and general typed-value parsing. Six public contracts and
+  five public operations retain their crate-root paths through one explicit re-export, with no bridge or visibility
+  expansion. Options/defaults, target and identifier rules, stdin/stdout classification, CSV delimiter/quote/escape/
+  header/NULL behavior, typed decoding, errors, associated constants/methods, and downstream callers are unchanged.
+  Both 23-test SQL modes, both 29-test protocol COPY modes, both three-test engine COPY modes, SQL/protocol/engine and
+  workspace all-target/all-feature checks, strict clippy, exact source/API/reference/format/diff gates, fresh
+  22-outlier inventory, and independent audit are clean. The SQL root remains a critical PLAN-owned outlier;
+  STRUCT-001IP owns its standalone Decimal implementation and closest pure tests. Runtime behavior did not change,
+  so HAZARD/report-card/GPU-kernel gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
-| 24 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 22 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
