@@ -2638,6 +2638,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and independent audit are clean. The SQL root remains critical and PLAN-owned; STRUCT-001IQ owns ACL contracts and
   privilege parsing. Runtime behavior did not change, so HAZARD/report-card/GPU-kernel gates were inapplicable.
 
+  STRUCT-001IQ then isolated all SQL ACL contracts and privilege parsing in the rustfmt-clean 675-line private
+  `sql/src/acl.rs` leaf, reducing the SQL root from 6,338 to 5,684 lines. Three exact old blocks reconstruct under an
+  explicit dependency wrapper; the ALTER DEFAULT and GRANT/REVOKE dispatcher fragments remain byte-for-behavior in
+  one `pub(super) parse_acl_command` bridge. The private child re-exports exactly 13 old public contracts, all 23
+  subordinate parsers remain private, and shared `split_leading_identifier` stays at root for five non-ACL families.
+  Default-privilege precedence is exact; recognizing mutually exclusive GRANT/REVOKE first tokens earlier is inert.
+  Both 23-test SQL modes, both dense relational-facade modes, both relation-ACL enforcement/row and default-ACL
+  persistence modes, both four-test engine ACL metadata and role/grantee replay modes, affected/workspace all-target/
+  all-feature checks, strict scoped clippy, rustdoc, exact source/API/bridge/dependency/reference/format/diff gates,
+  and independent audit are clean. Validation cleanup removed 3.8 GiB of stale generated WAL test residue. The SQL
+  root remains critical and PLAN-owned; STRUCT-001IR owns SELECT contracts and parsing. Runtime behavior did not
+  change, so HAZARD/report-card/GPU-kernel gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
