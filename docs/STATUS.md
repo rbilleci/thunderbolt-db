@@ -61,8 +61,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   zero fallback groups, and 160/160 host-install-elided writes.
 - Read roofline: in-L2 `count_i32_compare` approximately **0.87x** the same-run `sum_i32` roofline; grouped
   kernel approximately **1,678 M elements/s**.
-- Canonical report card: 48M-row out-of-L2 batched route **253.1M lookups/s at batch 65,536, p50 132us**;
-  indexed single-flight route **3.25x** the scan.
+- Canonical report card: 48M-row out-of-L2 batched route **250.2M lookups/s at batch 65,536, p50 132us**;
+  indexed single-flight route **3.23x** the scan.
 - Production release check, engine/facade examples, static host-row-removal guard, and diff whitespace check pass.
 
 ## Structural decomposition
@@ -2133,6 +2133,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   controls pass, as do both 505/487 engine modes, the complete 992-test serial GPU suite, all-target check, strict
   clippy, static/scoped gates, and independent audit. Generated residue was removed. Runtime behavior did not change,
   so HAZARD and report-card gates were not applicable.
+
+  STRUCT-001HB then isolated the exact main non-streaming/direct device-coordinate join executor in the rustfmt-clean
+  525-line private `engine_expr/join_coordinate_exec.rs` leaf, reducing the expression root to 5,143 lines. Its sole
+  sibling `join_plan` caller retains the former root-private visibility envelope through the authorized `pub(super)`
+  token; every body invariant and error remains source-exact, imports are explicit, the obsolete parent-only
+  `JoinNullPadMask` import is gone, and dependencies remain one-way. U32 bounds, input/post/range/pad masks and retained
+  lifetimes, typed key descriptors and widths, coordinate orientation and OUTER flags, pre-post-filter coordinate copy,
+  sort/null/UUID and window semantics, aliases/attnum, optional materialization, typed readback/NULL/endian/numeric/
+  UUID conversion, row-major results, and metadata are unchanged. Eleven focused GPU direct/n-way/composite/text/
+  numeric/UUID/typed-NULL/OUTER/order/window/streaming routes pass, as do both 505/487 engine modes, the complete
+  992-test serial GPU suite, all-target check, strict clippy, static/scoped gates, and independent audit. Generated
+  residue was removed. The raw roofline remained stable (out-of-L2 roofline 1448.1 to 1444.7 GB/s, gather kernel
+  155.3 to 155.3 GB/s, join 257.9 to 259.1 M-element/s, grouped 1677.0 to 1678.0 M-element/s). The canonical report
+  card likewise remained stable: out-of-L2 batched point reads moved from 253.2M at p50 131us to 250.2M at p50 132us,
+  and indexed single-flight moved from 3.24x to 3.23x scan. Runtime behavior did not change, so HAZARD was not
+  applicable.
 
 ## Known boundaries
 
