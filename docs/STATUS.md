@@ -2948,6 +2948,26 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001JK owns the complete remaining
   state-free SELECT lowering family; the actionable inventory remains 18 until the 2,797-line root is disposed.
 
+  STRUCT-001JK then isolated the exact complete state-free libpg_query single-SELECT parse/build, grouped/
+  projection/aggregate/predicate/HAVING/ORDER/LIMIT/error lowering owner in the rustfmt-clean 975-line private
+  `engine_sql_pg/select_lowering.rs` child, reducing the root from 2,797 to 1,838 lines and completing its
+  disposition without an exception. The normalized child reconstructs old lines 1834–2797 with only ten planned
+  `pub(super)` tokens and the existing `pub(crate)` parser unchanged (SHA-256 `c5de85df…`); the parent reconstructs
+  exactly after its module, one crate-visible parser facade, nine private imports, range deletion, and explicit
+  now-ownerless EOF-separator trim (SHA-256 `b51e48e4…`). The 658-line join child differs only by exact import
+  rewiring (SHA-256 `ce3c3411…`), establishing one-way `join_lowering -> select_lowering` dependency with no relay,
+  reverse edge, cycle, context bag, API growth, unsafe, cfg, parser fork, CPU relational path, or fallback. All 26
+  functions retain the exact one-crate-API/ten-bridge/15-private disposition. Single-SELECT errors and alias/
+  unsupported gates; grouped/composite/expression projection and aggregates; typed predicate/literal/NULL/IN/
+  boolean recursion; HAVING DNF; ORDER direction/NULL placement; LIMIT/OFFSET; and error surface are unchanged.
+  Twenty intended parser/GPU controls passed sequentially and exact concurrent matrices passed 40/40; the
+  independent audit added eight host and 32 actual-CUDA runs. Both modes passed 505/487, the complete
+  include-ignored suite passed 992/992 in 172.16s, affected SQL/protocol/facade suites, workspace check, strict
+  Clippy, private-item rustdoc, scoped format/source/diff/cleanup, fresh inventory, and audit are clean; rustdoc
+  retains the known 25-link warning baseline. Runtime behavior is unchanged, so HAZARD/report card were
+  inapplicable. The actionable inventory is now 17: four production, nine tests, and four examples/tools.
+  STRUCT-001JL owns the inline-test extraction in `write_conveyor/src/wal_segment.rs`.
+
 ## Known boundaries
 
 | Boundary | Work ID |

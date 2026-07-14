@@ -1,8 +1,10 @@
+use super::select_lowering::{
+    aexpr_op_token, map_predicate_node, node_enum, parse_limit, sql_pg_error,
+};
 use super::{
-    aexpr_op_token, map_predicate_node, node_enum, parse_limit, relational_column_index,
-    sql_pg_error, AExprKind, BoolExprType, ExecuteError, JoinColRef, JoinPlan, JoinProjItem,
-    JoinRelationRef, JoinStep, JoinType, Node, NodeEnum, RelationalTable, ResidentBinaryOp,
-    ResidentExpr, SelectStmt, SortByDir, SortByNulls,
+    relational_column_index, AExprKind, BoolExprType, ExecuteError, JoinColRef, JoinPlan,
+    JoinProjItem, JoinRelationRef, JoinStep, JoinType, Node, NodeEnum, RelationalTable,
+    ResidentBinaryOp, ResidentExpr, SelectStmt, SortByDir, SortByNulls,
 };
 
 /// True iff the FROM clause is a single explicit `JoinExpr` (an `a JOIN b ON ...`), routing to the M5

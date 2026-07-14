@@ -408,14 +408,21 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   complete 992-test suite, affected SQL/protocol/facade and static/source/cleanup gates, and audit pass.
   STRUCT-001JK owns the exact complete remaining state-free SELECT lowering family and is projected to close the
   root below 2,000 lines.
+- STRUCT-001JK is closed. Exact state-free single-SELECT parse/build and grouped/projection/aggregate/predicate/
+  HAVING/ORDER/LIMIT/error lowering now live normalized-exact in the rustfmt-clean 975-line private
+  `engine_sql_pg/select_lowering.rs` child behind one preserved crate parser facade and ten internal bridges. The
+  1,838-line root and 658-line join child complete the outlier without an exception. Twenty intended controls
+  passed sequentially and 40 exact concurrent executions passed; the independent audit added 40, both 505/487
+  modes, the complete 992-test suite, affected SQL/protocol/facade and static/source/cleanup/inventory gates, and
+  audit pass. The actionable inventory is 17; STRUCT-001JL owns `wal_segment` inline-test extraction.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JK:** isolate current `engine_sql_pg.rs` lines 1834–2797 into bounded private
-   `engine_sql_pg/select_lowering.rs` exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JL:** move current `write_conveyor/src/wal_segment.rs` lines 1866–2695, dedented one level, into
+   bounded private `write_conveyor/src/wal_segment/tests.rs` exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
