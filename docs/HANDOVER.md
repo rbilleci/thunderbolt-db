@@ -672,6 +672,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   lines. Exact payload/reconstruction proof, all six segment/manager acknowledgement modes, two-lane durable
   recovery, crate/build/Clippy/static gates, fresh two-outlier inventory, and independent audit pass. STRUCT-001LD
   owns analysis of the engine-backed pgwire benchmark endpoint.
+- STRUCT-001LD analysis is complete. The 3,668-line server-owned example has an acyclic three-leaf disposition:
+  exact result rows (LF), retained batch classification (LG), then the retained device-read runtime (LH), projecting
+  a ~2,860-line root. The complete graph is `root -> {runtime, retained_batch, result_rows}` plus
+  `runtime -> {retained_batch, result_rows}`. Cargo metadata and the correct `gpu_db_server` build pass, but audit
+  found all three live probe-script sites select nonexistent owner `gpu_db_engine`; STRUCT-001LE owns that isolated
+  repair first.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -681,12 +687,14 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LD:** complete the required analysis packet and select an acyclic disposition for the 3,668-line
-   `p8_engine_pgwire_benchmark_endpoint.rs` example before editing it.
-2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
-3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
-4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-5. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
+1. **STRUCT-001LE:** repair the three probe-script package selectors and restore the small engine-backed pgwire
+   endpoint smoke before structural extraction.
+2. **STRUCT-001LF/LG/LH:** extract result rows, retained batch classification, then retained runtime under the
+   exact seams and gates in PLAN.
+3. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
+4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
+5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+6. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 

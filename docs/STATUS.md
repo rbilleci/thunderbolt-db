@@ -3728,6 +3728,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and independent audit are clean. Runtime behavior is unchanged, so HAZARD and report card were inapplicable.
   STRUCT-001LD owns analysis of the next 3,668-line engine-backed pgwire example.
 
+  STRUCT-001LD analysis then classified `crates/server/examples/p8_engine_pgwire_benchmark_endpoint.rs` as a
+  3,668-line handwritten, auto-discovered `gpu_db_server` example with source hash `c5e68657…`, no cfg/unsafe
+  block, and 62 follow-history commits. Its responsibility map separates response cache (30–81), retained
+  device-read runtime (83–741), COPY/endpoint state (742–1736), request/completion contracts (1737–1907),
+  retained batch classification (1908–2031), scheduler helpers (2033–2245), result rows (2247–2283), fact/result
+  rendering (2285–2413), pgwire I/O (2414–2584), and main orchestration (2585–3668). Dependency and consumer audit
+  selected three exact leaves: neutral `result_rows.rs`, neutral `retained_batch.rs`, then
+  `retained_runtime.rs`, with the complete graph `root -> {runtime, retained_batch, result_rows}` and
+  `runtime -> {retained_batch, result_rows}`, and a projected ~2,860-line
+  root without a context bag, cycle, broad visibility, or exception. The correct default
+  `cargo check -p gpu_db_server --example p8_engine_pgwire_benchmark_endpoint` passes. The documented/live
+  probe gate does not: all three script build sites select package `gpu_db_engine`, for which Cargo reports no
+  such example target. STRUCT-001LE owns that isolated consumer repair before LF/LG/LH execute; no source changed
+  in this analysis slice.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
