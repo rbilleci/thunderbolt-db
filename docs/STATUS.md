@@ -2538,6 +2538,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   with separable buffer, segment/checkpoint, and archive owners, so no exception is justified. Runtime behavior did
   not change, so HAZARD/report-card/GPU-kernel gates were not applicable.
 
+  STRUCT-001IJ then isolated the unified in-memory, serial-fdatasync, and FUA WAL buffer/group-flush owner in the
+  rustfmt-clean 1,118-line private `wal/src/buffer.rs` leaf, reducing the WAL root from 4,749 to 3,639 lines. Two old
+  ranges reconstruct exactly after rustfmt; four public types, 27 public functions plus two constants, four private
+  types, and all stable crate-root paths are preserved through four re-exports. Neutral `WalSegmentRecovery` and
+  `WalGroupCommitStats` contracts remain at root, keeping buffer-to-root/FUA dependencies one-way. Compilation found
+  that exactly three preallocation-boundary tests consumed the formerly root-private chunk-size helper, so the final
+  frontier has one `pub(super)` helper plus one cfg(test) private root import and no production reverse edge. Both WAL
+  modes passed 82/82. Engine WAL-before-visibility, flush-failure fencing, one-fsync grouping, concurrent durable
+  recovery (201 commits in 53 fsync groups), and GPU FUA recovery parity passed. WAL/engine/workspace all-target/
+  all-feature checks, strict clippy, exact source/API/re-export/format/reference gates, cleanup, and independent audit
+  are clean after fixing its sole import-order formatting finding. W4a positional preallocation, split lock/CV,
+  serial in-flight/failure/abandon semantics, tail watermark/reinstall/truncation, group stats, record encoding, FUA
+  contiguous cut, and cfg(unix) behavior are unchanged. The root remains separable above 2,000 lines, so no exception
+  is justified. Runtime behavior did not change, so HAZARD/report-card/GPU-kernel gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

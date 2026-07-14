@@ -275,15 +275,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   (1,708), and FUA (422) include leaves with every `tests::` path unchanged; the 12 lane tests remain unchanged. Both
   82-test modes, 40 engine recovery/archive tests, four lane/FUA GPU integrations, static/source/cleanup gates, and
   independent audit are clean. The 4,749-line WAL root remains PLAN-owned; STRUCT-001IJ owns buffer/group flush.
+- STRUCT-001IJ is closed. The rustfmt-clean 1,118-line `wal/src/buffer.rs` owns in-memory, serial-fdatasync, and FUA
+  buffer/group flush behind four stable root re-exports; neutral recovery/stats contracts remain at root. One narrow
+  helper bridge serves exactly three preallocation tests. Both 82-test modes, five engine durability seams, static/
+  source/cleanup gates, and corrected independent audit are clean; the 3,639-line root remains PLAN-owned.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IJ:** move current WAL ranges 165–545 and 601–1332 into private `buffer.rs`, re-export four public
-   buffer/group types, and retain root recovery/stats contracts to keep dependencies acyclic; prove all buffer, FUA,
-   lane, engine durability, and static gates while multi-GPU stays deferred.
+1. **STRUCT-001IK:** move current WAL timeline constants/ranges 37–38, 107–154, 1218–1809, and 3178–3313 into private
+   `archive_timeline.rs`; re-export six types and ten functions without a bridge and preserve all timeline/registry/
+   prune tests and engine recovery consumers while multi-GPU stays deferred.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
