@@ -2277,6 +2277,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and independent audit are clean. Production bytes/API/visibility and runtime are unchanged, so GPU, HAZARD, and
   report-card gates were not applicable.
 
+  STRUCT-001HN then moved the exact three-test command-terminator family into the rustfmt-clean 140-line
+  `crates/protocol/src/tests/command_terminators.rs` child, reducing the protocol root from 8,481 to 8,347 lines.
+  Normalized reconstruction is exact; optional trailing semicolon/newline behavior across all covered command
+  families, repeated terminators with intervening whitespace/newlines, terminator-only `ParseError::Empty`, parsed
+  keys/values/chain bits/classifications, names, bodies, and errors are unchanged. The exact 71-test name-tail
+  inventory is preserved. Three focused tests and the full protocol package (71 library, 127 binary, and both
+  one-test driver integrations), protocol all-target check/strict clippy, server check, security preflight, scoped
+  gates, and independent audit are clean. Production bytes/API/visibility and runtime are unchanged, so GPU,
+  HAZARD, and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
