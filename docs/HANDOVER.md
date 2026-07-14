@@ -648,6 +648,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   executions, execution library ordinary/complete suites, static/source/cleanup gates, fresh inventory, and audit
   pass. Four actionable tool/example rows remain; STRUCT-001LA owns analysis and disposition of the 14,889-line
   handwritten research-paper mechanism-link generator.
+- STRUCT-001LA is closed. The 14,889-line research-paper mechanism-link generator was a stale live tool whose
+  journal, mechanisms, and four generated artifacts had all moved under `docs/archive/research/` in the audited
+  documentation consolidation. It had no non-archive consumer, its live defaults no longer resolved, and an
+  explicit archived-input run regenerated all four archived artifacts byte-for-byte. The obsolete script was
+  deleted while archive evidence remained untouched. Three actionable example/tool rows remain; STRUCT-001LB owns
+  analysis and disposition of the 4,726-line write-conveyor benchmark example.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -657,9 +663,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LA:** complete the analysis packet and audited disposition for
-   `scripts/generate_research_paper_mechanism_links.py` as mapped in `PLAN.md`; prove handwritten ownership,
-   generation phases/coupling, deterministic outputs/consumers, and the selected bounded module or exception case.
+1. **STRUCT-001LB:** complete the analysis packet and audited disposition for
+   `crates/write_conveyor/examples/write_conveyor_bench.rs` as mapped in `PLAN.md`; prove scenario/harness/report
+   ownership, feature/build entry points, consumers, reproducibility, and the selected bounded module or exception.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

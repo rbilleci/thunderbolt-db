@@ -18,9 +18,9 @@ task ID here or be explicitly historical.
 
 ## Current focus
 
-1. **STRUCT-001LA — disposition the research-paper mechanism-link generator.** Analyze the handwritten 14,889-
-   line Python tool's generation phases, data ownership, call graph, outputs, and reproducibility before selecting
-   bounded mechanism-family modules or a standards-compliant exception.
+1. **STRUCT-001LB — disposition the write-conveyor benchmark example.** Analyze the 4,726-line executable's
+   scenario families, harness/config/reporting ownership, shared fixtures, feature/build contracts, and benchmark
+   reproducibility before selecting bounded modules or a standards-compliant exception.
 2. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
    reduce the highest context risks before broad implementation work expands them further.
 3. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
@@ -37,7 +37,7 @@ the user explicitly promotes it; its hardware gates remain mandatory and are par
 The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). The corrected 2026-07-12 baseline has **30 files outside
 its analysis envelopes**: 18 production files over 2,000 lines, eight test files over 3,000 lines, and four examples
 or tools over 3,000 lines. Completed dispositions plus one subsequently crossed test threshold leave a current queue
-of **4 files**: zero production/tests and four examples or tools. This inventory is a review queue, not a
+of **3 files**: zero production/tests and three examples or tools. This inventory is a review queue, not a
 predetermined request to split every file.
 
 ### Analysis packet required for each file
@@ -117,8 +117,8 @@ handwritten tool, reproducible generated artifact, or obsolete evidence before c
 
 | Lines | File | Disposition / evidence |
 |---:|---|---|
-| 14,889 | `scripts/generate_research_paper_mechanism_links.py` | QUEUED |
-| 4,726 | `crates/write_conveyor/examples/write_conveyor_bench.rs` | QUEUED |
+| deleted | `scripts/generate_research_paper_mechanism_links.py` | **DISPOSITION COMPLETE — obsolete live tool deleted; archive evidence preserved.** STRUCT-001LA proved the 14,889-line handwritten file mixed a 21-line import/regex prelude, 13,495 lines of reviewed declarative corpora, and 1,373 lines of runtime logic, but every default input/output had moved to `docs/archive/research/` in the independently audited documentation consolidation. The live default invocation fails on the absent journal, no non-archive consumer references it, and an explicit invocation against the archived journal/mechanism inputs regenerated all four archived JSON/Markdown artifacts byte-for-byte. Splitting it would recreate ownership for historical, explicitly non-actionable data; deletion removes the dead tool while leaving the archived evidence untouched. |
+| 4,726 | `crates/write_conveyor/examples/write_conveyor_bench.rs` | **ACTIVE — STRUCT-001LB owns the analysis packet and audited disposition.** |
 | 3,668 | `crates/server/examples/p8_engine_pgwire_benchmark_endpoint.rs` | QUEUED |
 | 3,137 | `scripts/run_p8_ch_benchmark_residency_probe.sh` | QUEUED |
 
@@ -132,7 +132,7 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
-| **STRUCT-001LA** | NOW | P0 | Produce the complete analysis packet for `scripts/generate_research_paper_mechanism_links.py`: confirm its handwritten/tool classification and exact current size; map generation phases, declarative corpora, helper/call dependencies, external inputs, generated outputs, consumers, determinism, and validation entry points; use history to distinguish stable mechanism families from accidental accumulation. Then select and execute a disposition under `CODE_SIZE.md`: decompose into bounded, named mechanism-family/data modules with one-way dependencies, or register an exception only if separation would obscure a stronger proven invariant. Do not create numbered shards, a catch-all context bag, duplicated corpora, path-sensitive import hacks, or silent output drift. Acceptance requires byte-identical or intentionally reviewed generated outputs from the canonical invocation, direct script/tool tests or deterministic before/after artifact hashes, syntax/lint checks, reference and stale-symbol inventory, fresh source inventory, and independent audit. This tooling slice changes no runtime/kernel/residency/result path, so GPU/HAZARD/report-card gates are inapplicable. | STRUCT-001KZ complete | `scripts/generate_research_paper_mechanism_links.py`; generated output/consumer paths established by analysis |
+| **STRUCT-001LB** | NOW | P0 | Produce the complete analysis packet for `crates/write_conveyor/examples/write_conveyor_bench.rs`: confirm its handwritten benchmark/example classification and exact current size; map scenario families, workload generation, harness/configuration, engine/conveyor orchestration, metrics/reporting, shared fixtures, feature/build entry points, external consumers, and reproducibility contracts; use history to distinguish stable benchmark domains from accidental accumulation. Then select and execute a disposition under `CODE_SIZE.md`: decompose into bounded named scenario/harness modules with one-way dependencies, or register an exception only if separation would obscure a stronger proven invariant. Do not create numbered shards, a catch-all context bag, duplicated fixtures, broad visibility solely for line count, or output/CLI drift. Acceptance requires unchanged CLI/scenario/report schemas, targeted scenario smoke gates, example build in the required feature modes, source/reference/history inventory, deterministic fixture/result checks where available, fresh source inventory, and independent audit. Any benchmark execution must follow the existing quiet-window/hardware protocol; pure structural movement changes no read kernel/residency/result path and does not itself require HAZARD/report card. | STRUCT-001LA complete | `crates/write_conveyor/examples/write_conveyor_bench.rs`; destination modules established by analysis |
 | **STRUCT-001** | NOW | P0 | Analyze and disposition every source-size outlier through the method and ordered inventory above. Decompose by ownership, register a bounded exception, or prove generated/archive/delete status; update all references and pass targeted gates. Close only when a fresh inventory has no unowned outlier. | None | `docs/CODE_SIZE.md` |
 | **R3-001** | NOW | P0 | Audit the current lane, chunk-authoritative, MVCC-sidecar, and recovery implementations against the target write model; choose the surviving version-storage/index/CC design in an ADR. Explicitly disposition the retired mega-fuse idea rather than reviving it from archived handovers. No implementation begins from an unaccepted proposal. | None | `docs/design/write-path-design-inputs.md` |
 | **BENCH-001** | NOW | P0 | Open-loop offered-rate harness reports p50/p99/p99.9/p99.99 and saturation TPS against tuned PostgreSQL on the same host, split by deterministic-fast and interactive-slow transaction classes. Exclude warm-up from sustained metrics and publish the exact Postgres/host configuration. Results identify whether the residual is GPU-architectural or host-serial. | Quiet benchmark window and reproducible Postgres config | ADR-008; ARCHITECTURE §9 |

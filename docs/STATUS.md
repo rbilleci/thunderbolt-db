@@ -3670,6 +3670,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001LA now owns analysis
   and disposition of the handwritten research-paper mechanism-link generator, the first remaining tool outlier.
 
+  STRUCT-001LA then proved that the 14,889-line handwritten research-paper mechanism-link generator was an
+  obsolete live tool over explicitly historical inputs and outputs, and deleted it without touching archive
+  evidence. The file comprised a 21-line import/regex prelude, 13,495 lines of reviewed declarative corpora—795
+  identity overrides, 1,428 matching/
+  schema rules, 8,908 relation-review overrides, and 2,364 link-review overrides—plus 1,373 lines of parsing,
+  linking, normalization, backlog, report-writing, and CLI logic. Documentation consolidation commit `bedc1df7`
+  moved its journal, mechanisms, and four generated artifacts under `docs/archive/research/`; the live default
+  invocation therefore fails on the absent journal, and exhaustive non-archive search found no consumer or caller.
+  An explicit invocation against the archived journal/mechanisms regenerated paper links JSON `e1fc1d10…`, coverage
+  Markdown `329e7743…`, benchmark backlog JSON `e9d0641c…`, and backlog Markdown `ec71897e…` byte-for-byte. Python
+  compilation passed before deletion, the deleted source hash is `2c7b1120…`, archive files remain unchanged, and
+  no cache/output residue remains. Splitting the mixed file would have recreated live ownership for historical,
+  non-actionable data; deletion is the audited source-size disposition. Fresh inventory leaves three actionable
+  example/tool outliers. STRUCT-001LB now owns analysis and disposition of `write_conveyor_bench.rs`.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3681,7 +3696,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 4 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 3 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
