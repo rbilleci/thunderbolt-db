@@ -695,6 +695,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   execution; the bounded root is 2,856 lines. Exact normalized payload/reconstruction, strict build/lint, server
   plus 505/487 engine tests, benchmark/concurrency smokes, the 3-sequential/2-concurrent GPU HAZARD matrix, static
   inventory, and independent audit pass. Only the 3,137-line residency-probe script remains above the envelope.
+- STRUCT-001LI analysis is complete. The final 3,137-line outlier is a 70-commit, 53-function, 24-mode Bash
+  operator harness. Its exact 169-line protocol/retained boundary report family can move one-way to
+  `scripts/lib/p8_ch_benchmark_protocol_boundary.sh`, projecting a 2,969-line root; it uses only `OUT_DIR`, two
+  row env vars, and external commands, with no root helper/trap/process dependency. Baseline testing found its one
+  engine-boundary `cargo run` still selects `gpu_db_engine` although Cargo owns the example only in
+  `gpu_db_server`; STRUCT-001LJ repairs that one site before STRUCT-001LK performs the exact move.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -704,12 +710,13 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LI:** analyze the residency-probe script completely before editing and record its bounded
-   disposition and gates in PLAN.
-2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
-3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
-4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-5. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
+1. **STRUCT-001LJ:** repair the one protocol-boundary example package selector and restore the full self-check.
+2. **STRUCT-001LK:** extract the exact two-function boundary-report leaf under the PLAN gates, then close the fresh
+   STRUCT-001 inventory if no outlier remains.
+3. **STRUCT-001:** close only after the fresh inventory is clean; do not let extraction decide **R3-001**.
+4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
+5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+6. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 

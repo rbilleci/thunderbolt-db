@@ -3789,6 +3789,26 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   so the report card was inapplicable. The 3,137-line probe script is now the sole required-analysis outlier and is
   owned by STRUCT-001LI.
 
+  STRUCT-001LI analysis classified `scripts/run_p8_ch_benchmark_residency_probe.sh` as a 3,137-line handwritten,
+  700-mode Bash executable with source hash `4ee1e6a5…`, 70 follow-history commits, 53 functions, 24 CLI modes, 67
+  distinct `GPU_DB_*` symbols, and 24 artifact roots. Its responsibility map separates common deterministic/load
+  helpers (1–333), PostgreSQL controls (334–995), protocol smoke (996–1251), pgwire metrics (1252–1584), engine
+  benchmark/concurrency (1585–2058), identical target orchestration (2059–2334), protocol/retained boundary reports
+  (2335–2503), load/readiness helpers (2504–2623), guarded 25%/125% modes (2624–2916), and dispatcher/self-check/
+  cleanup (2917–3137). Live consumers are the release-candidate self-check, median-of-N concurrency wrapper, and
+  engine cleanup guidance; all background servers, traps, ports, and long-run guards remain outside the selected
+  seam. Exact lines 2335–2503 form a cohesive two-function boundary-report leaf with pre-repair analysis hash
+  `17f61da3…`: it consumes
+  only root-defined `OUT_DIR`, two row-count env vars, and external commands, calls no root helper, and owns no
+  process or trap. Sourcing it from `scripts/lib/p8_ch_benchmark_protocol_boundary.sh` gives one-way root-to-leaf
+  dependency and projects a 2,969-line root. Its blame/history is confined to the original bridge blocker,
+  engine boundary probe, session adapter, SQL-visible retained admission, and later crate-name update. Baseline
+  `bash -n` and the static bridge mode pass, but the live engine-boundary mode exits 101: its sole `cargo run` names
+  `gpu_db_engine`, while Cargo metadata and a correct check prove `p8_engine_protocol_boundary_probe` belongs only
+  to `gpu_db_server`. Because that repair lies inside the selected range, STRUCT-001LK's exact post-LJ payload and
+  reconstruction baseline is `5b67f7a0…`, not the pre-repair hash. STRUCT-001LJ owns the isolated repair before
+  STRUCT-001LK executes the structural move.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
