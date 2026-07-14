@@ -2384,6 +2384,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   strict clippy, scoped source/format/reference gates, generated-residue cleanup, and independent audit are clean.
   Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001HX then isolated the exact six-method materialized streaming join-run owner in the rustfmt-clean
+  438-line private `engine_streaming_exec/materialized_join_run.rs` descendant, reducing the root from 8,078 to
+  7,648 lines. The whole implementation reconstructs exactly after removing only six `pub(super)` tokens, which
+  preserve the former root-private parent/descendant visibility for the sole `streaming_join` sibling consumer.
+  No crate/public API or re-export changed. Alias/qualifier ambiguity, hidden ORDER projection, NULL direction,
+  UUID lexicographic order, fixed/text/validity layouts, ordered/unordered concat, top-N/window/synchronization,
+  allocation budget/high-water, typed decoding/order/scale/errors, and device behavior are exact. Both focused GPU
+  matrices passed three serial and two concurrent rounds without device faults; both 505/487 modes and complete
+  992-test serial suite passed. Engine/workspace all-target/all-feature checks, strict clippy, scoped source/format/
+  dependency/reference gates, zero generated residue, and independent audit are clean. Runtime behavior did not
+  change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

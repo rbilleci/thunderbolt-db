@@ -226,14 +226,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `engine_streaming_exec/streaming_join.rs` descendant. Corrected source proofs, both focused GPU matrices at
   3× serial/2× concurrent, both engine modes, the complete 992 suite, static gates, cleanup, and independent audit
   are clean; the root is 8,078 lines. STRUCT-001HX owns the six-method materialized join-run sibling seam.
+- STRUCT-001HX is closed. Materialized streaming join-run layout/order/plan/merge/decode now lives in the
+  rustfmt-clean 438-line `engine_streaming_exec/materialized_join_run.rs` sibling with exactly six `pub(super)`
+  bridges. GPU matrices, both engine modes, 992 suite, static/source/dependency gates, cleanup, and independent audit
+  are clean; the root is 7,648 lines. STRUCT-001HY owns the shared join/rank cold-admission method.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HX:** move exact current streaming root lines 773–1,203 into `materialized_join_run.rs`, using only
-   six `pub(super)` sibling bridges and preserving all GPU run layout/order/merge/decode behavior.
+1. **STRUCT-001HY:** move exact current streaming root lines 861–925 into `streaming_cold_admission.rs`, preserving
+   its unchanged `pub(crate)` inherent API and shared join/rank admission semantics.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
