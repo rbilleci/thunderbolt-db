@@ -3017,6 +3017,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   is now 14: one production, nine tests, and four examples/tools. STRUCT-001JO owns the exact relational row
   codec in `rel_exec_helpers.rs`.
 
+  STRUCT-001JO then isolated the exact complete relational row encode/decode/split owner in the rustfmt-clean
+  176-line private `rel_exec_helpers/row_codec.rs` child, reducing the pure-helper root from 2,136 to 1,972 lines
+  and completing the final production outlier without an exception. The normalized moved block and reconstructed
+  full file are byte-identical to old lines 721–891 (SHA-256 `6b59fab4…`) after only qualifying the nested
+  `relational_index_value` rustdoc link. Exactly four `pub(crate)` functions moved with four explicit import
+  declarations/seven names. Their stable parent facade is preserved; its narrow `unused_imports` allowance is
+  limited to the re-export because direct cell/split helpers are intentionally absent from some build modes.
+  All 72 invocation sites, prefix vocabulary, NULL token, text escaping/trailing slash, numeric scale, UUID
+  canonicalization, catalog-shape/type parsing, exact error surfaces, dependency direction, and visibility are
+  unchanged, with no runtime state, locks, allocation, unsafe, cycle, or child-path consumer. Ten focused host
+  codec/WAL/recovery controls and 24 focused actual-GPU executions passed locally; independent audit added eight
+  serial and eight concurrent GPU executions, for 40 focused GPU executions without CUDA faults. Both modes
+  passed 505/487 and the complete include-ignored suite passed 992/992 in 168.99s; workspace check, strict engine
+  Clippy, private rustdoc with the known 25-link warning baseline, scoped source/format/diff/cleanup, fresh
+  inventory, and audit are clean. Pure movement makes HAZARD/report card inapplicable. All non-excepted
+  production files are now below 2,000 lines; the actionable inventory is 13: nine tests and four examples/tools.
+  STRUCT-001JP owns the SQL scalar predicate family in `tests/resident_expr.rs`.
+
 ## Known boundaries
 
 | Boundary | Work ID |
