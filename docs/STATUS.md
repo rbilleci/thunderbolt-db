@@ -3173,6 +3173,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   makes HAZARD/report card inapplicable. The actionable inventory remains 13; STRUCT-001JY owns the exact grouped
   multi-aggregate matrix at current lines 295–604.
 
+  STRUCT-001JY is implemented and awaits only a fresh independent close audit. The exact six-test grouped multi-
+  aggregate/result-alignment owner now lives in the rustfmt-clean 314-line private
+  `tests/resident_expr/grouped_multi_aggregate.rs` child, reducing the PLAN-owned parent from 3,897 to 3,587
+  lines after deleting the single redundant separator blank. Child lines 5–314 byte-match old parent lines
+  295–604 (payload SHA-256 `d6f0756e…`); the exact child/full-parent hashes are `52cdb491…`/`1dacd1f4…`, and
+  full reconstruction is exact. Exactly six ignored actual-GPU tests moved with no helper and three imports/four
+  names. The existing `average_sql_value` re-export is imported narrowly; following `GROUPED_CLAUSE_ROWS` and
+  all five consumers remain unchanged. Test paths gained the child segment with no facade, visibility bridge,
+  sibling/parent dependency, unsafe, include/path indirection, or production change. All six paths passed 18
+  focused local actual-GPU test executions covering 162 grouped queries (54 per run: one serial plus two
+  concurrent), both modes passed 505/487, the complete include-ignored suite passed 992/992, and workspace check,
+  strict engine Clippy, private rustdoc with the known 25-link warning baseline, scoped source/fixture/format/diff/
+  cleanup, and fresh 992-test inventory are clean. The independent worker result was lost during turn steering,
+  so JY is deliberately not recorded as closed. A fresh audit is the first handover action; after it passes,
+  STRUCT-001JZ owns current parent lines 635–1526 and completes this outlier at a projected 2,695 lines.
+
 ## Known boundaries
 
 | Boundary | Work ID |
