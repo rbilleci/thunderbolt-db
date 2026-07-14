@@ -3479,6 +3479,27 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   STRUCT-001KQ owns current parent lines 598–1824 as the complete GPU OUTER/nullable/3VL family and will complete
   this test-root disposition below 3,000 lines.
 
+  STRUCT-001KQ then isolated the exact complete GPU OUTER/nullable/3VL family in the rustfmt-clean 1,232-line
+  private `tests/sql_pg/outer_null_semantics.rs` child, reducing the parent from 3,972 to 2,745 lines and completing
+  its disposition below the test envelope without an exception. Old parent lines 598–1824 and child lines 6–1232
+  share exact payload hash `cd7ca607…`; the exact child/parent hashes are `97edad87…`/`ec3fb144…`, and removing the
+  alphabetically placed private module plus restoring the payload and separator 1825 reconstructs old-parent hash
+  `dbc08ea0…` byte-for-byte. All 15 tests/ignores and exact LEFT/RIGHT/FULL/N-way pads, explicit NULL ordering,
+  nullable composite/expression grouping/order, nullable COUNT(DISTINCT) error, join-result order, post-join WHERE,
+  device Kleene, real-NULL-versus-pad, and S6 fixtures/SQL/results/types/targets/truth tables are preserved through
+  four import declarations/five names. The initial exact compile exposed `RowBlock` at five typed closures hidden by
+  the old parent glob; adding only that explicit crate type closed the dependency without changing the payload.
+  History spans the complete OUTER/nullable/3VL/S6 family, with no super/glob dependency, visibility bridge, path/
+  include indirection, unsafe, context bag, numbered shard, external-name reference, or stale copy. Expected rows
+  and truth tables remain inside ignored GPU tests as parity evidence, never product CPU execution. Forty-five local
+  plus 45 independent-audit actual-GPU executions passed; local concurrent PIDs `159974`/`159978` overlapped in
+  five samples and audit PIDs `170572`/`170580` in 15, with zero CUDA 700/716/719 or related faults. Both debug/
+  release ordinary modes passed 505/487 in 20.21s/10.65s, the complete include-ignored suite passed 992/992 in
+  182.60s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-
+  warning baseline, scoped source/child-format/diff/cleanup gates, fresh 10-file inventory, and independent audit
+  are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KR owns current
+  `tests/mvcc_bundles.rs` lines 3–1442 as the complete initial provenance frame/bundle-path family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3490,7 +3511,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 11 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 10 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
