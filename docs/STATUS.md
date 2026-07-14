@@ -2497,6 +2497,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   still separable above the 2,000-line analysis threshold, so no exception is justified. Runtime behavior did not
   change, so HAZARD/report-card gates were not applicable.
 
+  STRUCT-001IG then isolated device DML predicate locate, diagnostic reverse gather, slot locate/stamp, chunk-class
+  authority/entry/tail/deauthorization/resolve/compaction in the rustfmt-clean 1,400-line private
+  `engine_streaming_exec/streaming_dml_class.rs` descendant, reducing the root from 4,347 to 2,944 lines. The old
+  block reconstructs exactly after rustfmt plus two proven key-owner sibling bridges; twelve crate APIs and three
+  private helpers are unchanged. Budget/elision/lowered locate, reverse-gather floor/born/sidecar/type order, exact
+  device slot locate, COW stamping/install, authority/eligibility/reclaim, tail/class install, chunk-only deauth,
+  candidate+exact/full-fold resolve, epoch stamping, density compaction, identities/ranges/publication/counters, and
+  multi-GPU deferral are exact. The sole prose change correctly marks whole-entry reverse gather as diagnostic while
+  production deauthorization uses chunk-native readback. Eight controls passed three serial plus two concurrent
+  rounds each; both engine modes passed 505/487 and all 992 passed together. Engine/workspace all-target/all-feature
+  checks, strict clippy, exact source/comment/format/reference gates, cleanup, and independent audit are clean. The
+  2,944-line root still has one separable chunk-key owner. Runtime behavior did not change, so HAZARD/report-card
+  gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

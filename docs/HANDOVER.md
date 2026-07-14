@@ -262,15 +262,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   publication now live in the rustfmt-clean 802-line `engine_streaming_exec/streaming_cold_lifecycle.rs` descendant
   with two unchanged crate APIs and seven sibling bridges. The 35-run GPU matrix, both engine modes, complete 992
   suite, static/source/frontier gates, cleanup, and audit are clean; the root is 4,347 lines but remains separable.
+- STRUCT-001IG is closed. Device DML locate, reverse gather, slot/class mutation, tail, deauthorization, resolve, and
+  compaction now live in the rustfmt-clean 1,400-line `engine_streaming_exec/streaming_dml_class.rs` descendant with
+  twelve unchanged crate APIs and two key-owner bridges. The 40-run GPU matrix, both engine modes, complete 992 suite,
+  static/source/comment gates, cleanup, and audit are clean; the root is 2,944 lines. STRUCT-001IH owns chunk keys.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IG:** move exact current DML/class lines 695–2097 into `streaming_dml_class.rs`, preserving twelve
-   crate APIs and adding only two key-index sibling bridges; correct the stale reverse-gather milestone comment and
-   keep multi-GPU deferred.
+1. **STRUCT-001IH:** move exact current chunk-key lines 696–1856 into `streaming_chunk_keys.rs`, preserving six public
+   telemetry and five crate APIs, adding seven DML/lifecycle sibling bridges, and leaving a bounded 1,783-line facade;
+   run all 16 key/Bloom/uniqueness/locate controls and keep multi-GPU deferred.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
