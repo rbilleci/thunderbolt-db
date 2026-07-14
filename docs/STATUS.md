@@ -2407,6 +2407,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   all-feature checks, strict clippy, scoped source/format/reference gates, generated-residue cleanup, and independent
   audit are clean. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001HZ then isolated streaming LAG/LEAD typed result-column decoding in the rustfmt-clean 90-line private
+  `engine_streaming_exec/materialized_column_decode.rs` descendant, reducing the root from 7,589 to 7,503 lines.
+  The independently rustfmt-normalized old method equals the new `impl` block exactly; the sole `pub(crate)` API and
+  `engine_sql_pg` consumer are unchanged. Relation-0 coordinate projection, run-memory ownership, text offsets/blob/
+  validity, fixed offsets/width/validity, NULL-before-decode, coordinate order/cardinality, every bool/integer/date/
+  timestamp/numeric/UUID arm, schema scale, CUDA/error/panic contracts, and dependency direction are unchanged. The
+  focused LAG/LEAD GPU control passed three serial plus two concurrent rounds; both engine modes passed 505/487 and
+  the complete serial suite passed all 992. Engine/workspace all-target/all-feature checks, strict clippy, scoped
+  source/format/reference gates, generated-residue cleanup, and independent audit are clean. Runtime behavior did
+  not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
