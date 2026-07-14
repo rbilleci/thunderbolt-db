@@ -401,14 +401,21 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   Twenty-four CUDA routes passed 24 sequential plus 48 concurrent executions, the independent audit added 60,
   both 505/487 modes, the complete 992-test suite, static/source/cleanup/inventory gates, and audit pass. The
   actionable inventory is 18; STRUCT-001JJ owns exact PostgreSQL join lowering in `engine_sql_pg.rs`.
+- STRUCT-001JJ is closed. Exact state-free PostgreSQL explicit/comma join classification and AST-to-`JoinPlan`
+  lowering now live normalized-exact in the rustfmt-clean 656-line private `engine_sql_pg/join_lowering.rs` child
+  behind eight narrow parent bridges. The root is 2,797 lines and remains PLAN-owned. Fifteen parser/GPU routes
+  passed 15 sequential plus 30 concurrent executions, the independent audit added 28, both 505/487 modes, the
+  complete 992-test suite, affected SQL/protocol/facade and static/source/cleanup gates, and audit pass.
+  STRUCT-001JK owns the exact complete remaining state-free SELECT lowering family and is projected to close the
+  root below 2,000 lines.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JJ:** isolate current `engine_sql_pg.rs` lines 1956–2604 into bounded private
-   `engine_sql_pg/join_lowering.rs` exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JK:** isolate current `engine_sql_pg.rs` lines 1834–2797 into bounded private
+   `engine_sql_pg/select_lowering.rs` exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

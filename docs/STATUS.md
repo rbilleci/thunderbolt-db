@@ -2931,6 +2931,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inventory is now 18: five production, nine tests, and four examples/tools. STRUCT-001JJ owns PostgreSQL join
   lowering in the next production outlier, `engine_sql_pg.rs`.
 
+  STRUCT-001JJ then isolated exact state-free PostgreSQL explicit/comma join classification and AST-to-`JoinPlan`
+  lowering in the rustfmt-clean 656-line private `engine_sql_pg/join_lowering.rs` child, reducing the root from
+  3,438 to 2,797 lines. The normalized child reconstructs old lines 1956–2604 with only eight planned
+  `pub(super)` bridges (SHA-256 `29bb84ed…`), and the synthesized parent including its private module/use is exact
+  (SHA-256 `ea71d6cf…`). All 17 functions moved: eight parent bridges and nine private helpers with exact 23-name
+  imports, no re-export, API growth, unsafe, cfg, state, parser fork, CPU relational join, fallback, sibling cycle,
+  or context bag. Explicit/comma relation and alias order; INNER/LEFT/RIGHT/FULL/NATURAL/USING flags/coalescing;
+  composite ON orientation; AND partitioning and ambiguity/cartesian rejection; star/projection order;
+  per-relation predicates; ORDER direction/NULL placement; LIMIT/OFFSET; and fail-closed errors are unchanged.
+  Fifteen parser/GPU two-way/multi-way/composite/comma/NATURAL/USING/outer/catalog/window/streaming routes passed 15
+  sequential plus 30 concurrent executions; the independent audit added 28. Both modes passed 505/487, the
+  complete include-ignored suite passed 992/992 in 177.58s, SQL and protocol suites plus the focused facade GPU
+  control passed, and workspace check, strict Clippy, private-item rustdoc, exact source/import/caller/dependency/
+  scoped-format/diff, cleanup, and independent audit are clean; rustdoc retains the known 25-link warning baseline.
+  Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001JK owns the complete remaining
+  state-free SELECT lowering family; the actionable inventory remains 18 until the 2,797-line root is disposed.
+
 ## Known boundaries
 
 | Boundary | Work ID |
