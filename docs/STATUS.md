@@ -3173,7 +3173,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   makes HAZARD/report card inapplicable. The actionable inventory remains 13; STRUCT-001JY owns the exact grouped
   multi-aggregate matrix at current lines 295–604.
 
-  STRUCT-001JY is implemented and awaits only a fresh independent close audit. The exact six-test grouped multi-
+  STRUCT-001JY is closed. The exact six-test grouped multi-
   aggregate/result-alignment owner now lives in the rustfmt-clean 314-line private
   `tests/resident_expr/grouped_multi_aggregate.rs` child, reducing the PLAN-owned parent from 3,897 to 3,587
   lines after deleting the single redundant separator blank. Child lines 5–314 byte-match old parent lines
@@ -3185,9 +3185,10 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   focused local actual-GPU test executions covering 162 grouped queries (54 per run: one serial plus two
   concurrent), both modes passed 505/487, the complete include-ignored suite passed 992/992, and workspace check,
   strict engine Clippy, private rustdoc with the known 25-link warning baseline, scoped source/fixture/format/diff/
-  cleanup, and fresh 992-test inventory are clean. The independent worker result was lost during turn steering,
-  so JY is deliberately not recorded as closed. A fresh audit is the first handover action; after it passes,
-  STRUCT-001JZ owns current parent lines 635–1526 and completes this outlier at a projected 2,695 lines.
+  cleanup, and fresh 992-test inventory are clean. The fresh independent close audit repeated exact reconstruction,
+  inventory, static, cleanup, and GPU gates: another 18 actual-GPU executions covered 162 grouped queries, including
+  two simultaneous test processes, with zero CUDA 700/716/717. STRUCT-001JZ owns current parent lines 635–1526 and
+  completes this outlier at a projected 2,695 lines. Pure movement makes HAZARD/report card inapplicable.
 
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the

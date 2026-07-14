@@ -482,12 +482,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   root remains PLAN-owned. One hundred fifteen focused actual-GPU executions, both 505/487 modes, the complete
   992 suite, static/source/target-inventory/cleanup gates, and independent audit pass. The actionable inventory
   remains 13; STRUCT-001JY owns the exact grouped multi-aggregate matrix at current root lines 295–604.
-- STRUCT-001JY is implemented but intentionally not closed: the exact six-test grouped multi-aggregate owner now
+- STRUCT-001JY is closed. The exact six-test grouped multi-aggregate owner now
   lives in the rustfmt-clean 314-line private `tests/resident_expr/grouped_multi_aggregate.rs` child, reducing the
-  parent to 3,587 lines. Exact hashes/reconstruction, 18 focused GPU test executions covering 162 grouped queries,
-  both 505/487 modes, the complete 992 suite, static/source/fixture/cleanup gates, and fresh inventory pass. The
-  independent worker result was lost during turn steering; repeat that audit first. JZ is mapped at current lines
-  635–1526 and will complete the parent below 3,000.
+  parent to 3,587 lines. Exact hashes/reconstruction, 18 local plus 18 independent-audit GPU executions covering
+  324 grouped queries, both 505/487 modes, the complete 992 suite, static/source/fixture/cleanup gates, fresh
+  inventory, and independent audit pass. JZ is mapped at current lines 635–1526 and will complete the parent below
+  3,000.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -497,14 +497,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001JY:** independently re-audit the implemented `grouped_multi_aggregate.rs` extraction and close it
-   only if exact reconstruction, six new paths, actual-GPU serial/concurrent runs, static gates, and cleanup pass.
-2. **STRUCT-001JZ:** then implement the exact current lines 635–1526 `nongrouped_ordering.rs` map in `PLAN.md`;
+1. **STRUCT-001JZ:** implement the exact current lines 635–1526 `nongrouped_ordering.rs` map in `PLAN.md`;
    its projected 2,695-line parent completes this outlier without an exception.
-3. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
-4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
-5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-6. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
+2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
+3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
+4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+5. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 
