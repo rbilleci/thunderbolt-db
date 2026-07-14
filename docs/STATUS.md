@@ -3751,6 +3751,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   three one-token package-selector replacements. This behavioral repair is isolated from STRUCT-001LF's first
   structural move.
 
+  STRUCT-001LF then moved the exact 37-line SQL-value text/result-row codec into the rustfmt-clean 44-line private
+  `p8_engine_pgwire_benchmark_endpoint/result_rows.rs` leaf, reducing the example root from 3,668 to 3,636 lines.
+  The normalized payload hash is `118e6e8f…`, and removing the namespace/import plus reinserting the normalized
+  leaf reproduces the full baseline root hash `c5e68657…`. The sole entry gained only root-confined visibility;
+  protocol text/row bytes, OIDs, order/count, materialization timing, command tag, error surface, callers, and
+  generic writer boundary are source-equivalent. Default check/build, strict example Clippy, the 3-unit plus
+  3-passing/1-GPU-ignored integration suite, a 16-row retained GPU endpoint smoke, scoped formatting/static/
+  inventory gates, and independent audit pass. Runtime behavior is unchanged, so HAZARD and report card were
+  inapplicable. STRUCT-001LG owns the next neutral retained-batch leaf.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
