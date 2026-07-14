@@ -2874,6 +2874,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001JG owns cached device-index append
   maintenance; the actionable inventory remains 19 because the 3,589-line parent is still PLAN-owned.
 
+  STRUCT-001JG then isolated exact cached device-index append maintenance in the rustfmt-clean 167-line private
+  `engine_retained_read/device_index_append.rs` child, reducing the parent from 3,589 to 3,426 lines. The child is
+  exactly the formatted reconstruction of old lines 533–696 (SHA-256 `6cdf05c8…`), and the synthesized parent is
+  byte-identical outside that range (SHA-256 `3ac2b36d…`). Exactly two methods moved: the existing `pub(crate)`
+  append entry retains one executable external caller, its helper remains private with two internal calls, and
+  there is no facade, bridge, re-export, API growth, sibling edge, cycle, context bag, unsafe, DtoH, CPU hot path,
+  or unrelated parent drift. Empty-tail behavior, single and compound tails, wider `SqlValue` folding and NULL
+  skip, ordinal IDs, pointer/row-count identity, missing/declined monotonicity, load eviction, u32 bounds,
+  lock/launch/re-lock/revalidation order, insert arguments, overflow decline plus count advance, launch-failure
+  removal, and successful count advance are unchanged. Fourteen actual-CUDA append/rollover/rebuild/budget,
+  locate/value-index, version-twin, compound i32/i64/mixed/UUID/TEXT/ordinal, and recovery routes passed 14
+  sequential plus 28 concurrent executions; the independent audit passed 30 more engine executions and four
+  direct index-insert rebuild/fail-closed context-reuse executions. Both engine modes passed 505/487, the complete
+  include-ignored suite passed 992/992 in 187.47s, and workspace check, strict Clippy, private-item rustdoc, scoped
+  format/source/diff, cleanup, fresh inventory, and independent audit are clean; rustdoc retains the known 25-link
+  warning baseline. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001JH owns the
+  exact coalesced/direct wave validation and visible-locate boundary; the actionable inventory remains 19 because
+  the 3,426-line parent is still PLAN-owned.
+
 ## Known boundaries
 
 | Boundary | Work ID |
