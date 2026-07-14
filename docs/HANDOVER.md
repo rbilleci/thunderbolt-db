@@ -595,6 +595,13 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   inventory, and audit pass. The moved cfg(test) CPU backend remains parity/bootstrap debt only. The actionable
   inventory remains 10; STRUCT-001KS owns current parent lines 4–1368 as the occurrence-distance family and will
   take this test root below 3,000 lines.
+- STRUCT-001KS is closed. The exact seven-test occurrence-cardinality/distance family now lives in the rustfmt-
+  clean 1,371-line private `tests/mvcc_bundles/occurrence_distance_filters.rs` child; the parent is 2,569 lines and
+  its disposition is complete without an exception. Exact payload/parent reconstruction, 21 local plus 21 audit
+  CPU-parity executions, nine local plus nine audit actual-GPU executions, both 505/487 modes, the complete 992
+  suite, static/source/cleanup gates, fresh inventory, and audit pass. The moved cfg(test) CPU backend remains
+  parity/bootstrap debt only. The actionable inventory is now nine; STRUCT-001KT owns current
+  `tests/intent_fast_path.rs` lines 3491–4430 as the complete GPU constraint-elision lifecycle family.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -604,9 +611,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KS:** isolate exact occurrence-cardinality/distance current `tests/mvcc_bundles.rs` lines 4–1368 as
-   mapped in `PLAN.md`, preserving every query/result contract, pairing the CPU parity seam with the three existing
-   actual-GPU bundle controls, and completing the root below 3,000 lines.
+1. **STRUCT-001KT:** isolate exact GPU constraint-elision current `tests/intent_fast_path.rs` lines 3491–4430 as
+   mapped in `PLAN.md`, preserving every CHECK/FK/mixed-width/preflight contract and proving all seven ignored paths
+   serially and concurrently on actual CUDA hardware.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

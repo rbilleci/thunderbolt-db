@@ -3521,6 +3521,27 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   complete whole-bundle cardinality and occurrence-distance filter family and will complete this test root below
   3,000 lines.
 
+  STRUCT-001KS then isolated that exact seven-test occurrence-cardinality/distance family in the rustfmt-clean
+  1,371-line private `tests/mvcc_bundles/occurrence_distance_filters.rs` child, reducing the parent from 3,934 to
+  2,569 lines and completing its disposition below the test envelope without an exception. Old parent lines
+  4–1368 and child lines 7–1371 share exact payload hash `c980a6cf…`; the exact child/parent hashes are
+  `f0b2d32d…`/`2487d3d3…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 1369 reconstructs old-parent hash `f7b58c6d…` byte-for-byte. All seven tests and exact SET histories,
+  query trees, bundles/summaries, cardinality/ordinal/range/distance filters, orders, projections, limits, rows, and
+  miss assertions are preserved through one explicit import declaration/13 names. History is exactly the original
+  MVCC-suite split plus STRATA commit, with no glob/super dependency, visibility bridge, path/include indirection,
+  unsafe, context bag, numbered shard, external-name reference, or stale copy. The moved `execute_mvcc_query` tests
+  use the cfg(test) CPU semantic backend and remain parity/bootstrap debt only; the same three CUDA-driver bundle
+  controls provide GPU nonvacuity. Twenty-one local plus 21 independent-audit CPU-parity executions and nine local
+  plus nine independent-audit actual-GPU executions passed. Local concurrent GPU PIDs `187588`/`187592` overlapped
+  in 14 samples and audit PIDs `199588`/`199593` were repeatedly observed together, with zero CUDA 700/716/719 or
+  related faults. Both debug/release ordinary modes passed 505/487 in 14.31s/8.08s, the complete include-ignored
+  suite passed 992/992 in 180.78s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc
+  with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh nine-file inventory, and
+  independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable.
+  STRUCT-001KT owns current `tests/intent_fast_path.rs` lines 3491–4430 as the complete GPU constraint-elision
+  lifecycle family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3532,7 +3553,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 10 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 9 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
