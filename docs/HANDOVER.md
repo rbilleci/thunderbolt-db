@@ -105,20 +105,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   engine modes, all-target check, strict clippy, scoped source/visibility/format/diff checks, and independent audit
   pass. The complete GPU suite passed 992/0; 15 GiB of fresh generated test residue was removed. The expression root
   is 10,410 lines; HAZARD and report card were not applicable.
-- STRUCT-001GR is closed. Private `TextRebaseOp` and exact sharded unified-source construction now live in the
-  rustfmt-clean 727-line private `engine_expr/sharded_source.rs` leaf. Layout/error/order semantics and every device
-  proof, source-owner, sidecar, and `Arc` lifetime are preserved; only two rustfmt wraps differ. Seventeen focused GPU
-  sharded-layout routes, both 505/487 engine modes, the complete 992-test GPU suite, static/scoped gates, and independent
-  audit pass; 15 GiB of generated residue was removed. Before/after rooflines and normalized families are stable. The
-  expression root is 7,620 lines; HAZARD/full report card were not applicable to the exact move.
+- STRUCT-001GS is closed. The exact sharded general bridge and private point-index route helper now live in the
+  rustfmt-clean 421-line private `engine_expr/sharded_route.rs` leaf. The normalized moved source hash is identical;
+  visibility, fallback, dispatch, counters, ownership, and result framing are unchanged. Twenty-four focused GPU route
+  tests, both 505/487 engine modes, the complete 992-test GPU suite, static/scoped gates, and independent audit pass;
+  15 GiB of generated residue was removed. The expression root is 7,219 lines; HAZARD/report card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GS:** isolate the exact sharded general bridge and private point-index route helper into one bounded
-   route/result-framing leaf; keep source construction and downstream executors at their established owners.
+1. **STRUCT-001GT:** isolate the exact production DISTINCT/select bridges into one bounded private leaf; keep grouped
+   execution and the separately owned test-only GROUP BY benchmark helpers in place.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

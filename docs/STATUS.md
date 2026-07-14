@@ -2035,6 +2035,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and 349–350/260/1678 Melem/s sort/join/grouped rates remained stable. Fifteen GiB of generated residue was removed.
   Runtime behavior did not change, so HAZARD and the full report card were not applicable.
 
+  STRUCT-001GS then isolated the exact sharded general bridge and private point-index route helper in the rustfmt-clean
+  421-line private `engine_expr/sharded_route.rs` leaf, reducing the expression root to 7,219 lines. The normalized old
+  and new source has an identical SHA-256; docs, errors, ordering, visibility, fallbacks, dispatch, result framing,
+  counters, ownership, and stable caller/helper graph are exact. Dependencies flow one-way to source construction,
+  normalization/pruning, index locate, and downstream executors with no visibility expansion or reverse cycle.
+  Twenty-four focused GPU route tests pass, as do both 505/487 engine modes, the complete 992-test GPU suite,
+  all-target check, strict clippy, exact-source/import/consumer/visibility/scoped-format/diff/docs gates, and independent
+  audit. Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates
+  were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
