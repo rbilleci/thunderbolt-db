@@ -2664,6 +2664,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   parsing and will take SQL below 5,000; the root will remain PLAN-owned above 2,000. Runtime behavior did not change,
   so HAZARD/report-card/GPU-kernel gates were inapplicable.
 
+  STRUCT-001IS then isolated scalar SQL type/value contracts, type-name/typmod parsing, typed literal/cast parsing,
+  and their two closest tests in the rustfmt-clean 436-line private `sql/src/scalar.rs` leaf, reducing the SQL root
+  from 5,094 to 4,668 lines and ending its critical `>5,000` classification. Five exact old ranges reconstruct after
+  only four `pub(super)` tokens and separator normalization. `SqlType`, `SqlValue`, and three constants retain their
+  public root paths; root privately imports exactly the four bridges used by DDL/default callers and COPY/SELECT
+  siblings. Type OIDs/names/sizes, typmods/defaults, NULL/bool/numeric inference, quoted casts, rounding, date/
+  timestamp/UUID semantics, and errors are source-equivalent. Both 11-test scalar/Decimal and 23-test SQL modes,
+  both 29-test COPY, ten-test relational, seven-test catalog, four-active/42-ignored numeric, two-test default,
+  one-test coercion, and three-test facade numeric modes, affected/workspace static checks, strict scoped clippy,
+  rustdoc, exact source/API/bridge/dependency/reference/format/diff gates, and independent audit are clean. The
+  actionable inventory remains 22 because SQL is still above 2,000; STRUCT-001IT owns command/control dispatch.
+  Runtime behavior did not change, so HAZARD/report-card/GPU-kernel gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

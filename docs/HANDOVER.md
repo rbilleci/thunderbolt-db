@@ -311,14 +311,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   rustfmt-clean 607-line private `sql/src/select.rs` leaf behind three sibling parser entries. Focused/full SQL,
   protocol/engine SELECT, static/source/docs, and audit gates are clean. The SQL root is 5,094 lines; STRUCT-001IS
   owns scalar types/values and their type/literal/cast parsers and will end the critical threshold classification.
+- STRUCT-001IS is closed. Scalar types/values, type-name/typmod and literal/cast parsing, and two closest tests now
+  live exact in the rustfmt-clean 436-line private `sql/src/scalar.rs` leaf behind five stable public paths and four
+  sibling parser entries. Typed SQL/COPY/protocol/engine/facade, static/source/docs, and audit gates are clean. SQL is
+  4,668 lines and no longer critical but remains PLAN-owned; STRUCT-001IT owns top-level command/control dispatch.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IS:** move current SQL scalar ranges 541–634, 665–719, 3915–3988, 4113–4243, and 5017–5094 into
-   private `scalar.rs`, re-export two contracts/three constants, and retain exactly four parser bridges.
+1. **STRUCT-001IT:** move current SQL command/control ranges 600–879, 909–1118, and 4203–4668 into private
+   `command.rs`, keep shared keyword helpers at root, and re-export two public entry points without a bridge.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
