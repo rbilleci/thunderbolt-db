@@ -3221,6 +3221,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   rewritten. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory
   remains 12; STRUCT-001KB owns current parent lines 536–948 as the complete rank/window family.
 
+  STRUCT-001KB then isolated the exact two-test streaming rank/window owner in the rustfmt-clean 440-line private
+  `tests/streaming_exec/rank_windows.rs` child, reducing the parent from 6,133 to 5,720 lines. Old parent lines
+  536–948 have exact payload hash `1806ea83…`; prepending the five import declarations/seven names and applying
+  rustfmt at only five inherited sites produces exact child hash `ff8c6d59…`. Removing the private module and
+  reinserting the original range plus separator reconstructs old-parent hash `c4bf88ae…` byte-for-byte; current
+  parent hash is `05a82bbf…`. Exactly two tests/ignores moved with no helper, visibility bridge, path/include
+  indirection, unsafe, or dependency beyond private `gpu_available`/`select`. Six local plus six independent-audit
+  focused executions passed, including simultaneous test processes observed on the RTX PRO 6000, with zero CUDA
+  700/716/717. Both debug/release ordinary modes passed 505/487, the complete include-ignored suite passed 992/992
+  in 175.78s, and workspace check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped
+  source/format/diff/cleanup gates, fresh inventory, and independent audit are clean. Runtime behavior is unchanged,
+  so HAZARD/report card were inapplicable. The actionable inventory remains 12; STRUCT-001KC owns current parent
+  lines 537–631 as the complete layered-view family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
