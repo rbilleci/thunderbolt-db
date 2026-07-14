@@ -258,15 +258,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   rustfmt-clean 521-line `engine_streaming_exec/streaming_reduction_fold.rs` descendant with one route/admission
   bridge. The 25-run GPU matrix, both engine modes, complete 992 suite, static/source/comment gates, precise overlap/
   gauge prose, cleanup, and audit are clean; the root is 5,138 lines. STRUCT-001IF owns the cold lifecycle.
+- STRUCT-001IF is closed. Transient/cold staging, build, replay, patch, commit maintenance, load, spill, install, and
+  publication now live in the rustfmt-clean 802-line `engine_streaming_exec/streaming_cold_lifecycle.rs` descendant
+  with two unchanged crate APIs and seven sibling bridges. The 35-run GPU matrix, both engine modes, complete 992
+  suite, static/source/frontier gates, cleanup, and audit are clean; the root is 4,347 lines but remains separable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IF:** move exact current cold-lifecycle lines 596–1386 into `streaming_cold_lifecycle.rs`, preserving
-   stage/build/replay/patch/commit/load/install/spill/publication semantics, two crate APIs, and seven sibling bridges;
-   correct two stale commit-frontier mutex comments and keep multi-GPU deferred.
+1. **STRUCT-001IG:** move exact current DML/class lines 695–2097 into `streaming_dml_class.rs`, preserving twelve
+   crate APIs and adding only two key-index sibling bridges; correct the stale reverse-gather milestone comment and
+   keep multi-GPU deferred.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

@@ -2482,6 +2482,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Engine/workspace all-target/all-feature checks, strict clippy, exact source/comment/format/reference gates, cleanup,
   and independent audit are clean. Runtime behavior did not change, so HAZARD/report-card gates were not applicable.
 
+  STRUCT-001IF then isolated transient/cold staging, range/payload build, replay, delta patch, eager maintenance,
+  load, spill, install, and atomic publication in the rustfmt-clean 802-line private
+  `engine_streaming_exec/streaming_cold_lifecycle.rs` descendant, reducing the root from 5,138 to 4,347 lines. The
+  old block reconstructs exactly after rustfmt plus seven proven sibling `pub(super)` bridges; existing crate APIs
+  `stage_cold_chunk` and `maintain_streaming_cold_on_commit` remain unchanged and range/payload/delete helpers remain
+  private. Async staging/proof/capture, protected eviction/index purge, RAM/spill replay, aligned sidecar visibility,
+  pinned build, delta tiling/COW/ranges/reuse/merge, eager bounded maintenance, generation/frontier/load gates,
+  poison/caps/epoch/class policy/counters/atomic publish and lock-release-before-prime behavior are exact. Two stale
+  comments now correctly state lock-free intent-frontier races cause safe misses through strict equality plus
+  generation identity. Seven controls passed three serial plus two concurrent rounds each; both engine modes passed
+  505/487 and all 992 passed together. Engine/workspace all-target/all-feature checks, strict clippy, exact source/
+  comment/format/reference gates, cleanup, and independent audit are clean. The 4,347-line root is below 5,000 but
+  still separable above the 2,000-line analysis threshold, so no exception is justified. Runtime behavior did not
+  change, so HAZARD/report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
