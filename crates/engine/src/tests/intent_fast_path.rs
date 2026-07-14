@@ -866,7 +866,7 @@ fn gpu_lane_delete_intents_end_to_end() {
     // routes' re-prepare carries the elision RE-ENTRY arm — the production contract until
     // the read path is wired (Tier-3 mixed read+write gate work).
     let insert_route = engine.prepare_covered_insert_route("t").unwrap();
-    let delete_route = engine.prepare_covered_delete_route("t").unwrap();
+    let _delete_route = engine.prepare_covered_delete_route("t").unwrap();
 
     // DEAD-TWIN REINSERT (the visibility-aware rebuild's reason to exist): reinserting the
     // deleted key must succeed and be visible EXACTLY once — and later deletes still locate.
@@ -1042,7 +1042,7 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
     let before = select_rows_unordered_sorted(&engine);
     drop(engine); // crash
 
-    let mut recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    let recovered = Engine::open_durable_wal_segment(&path).unwrap();
     recovered.set_auto_admit_on_commit(true);
     recovered.set_host_install_elision_enabled(true);
     recovered.set_binary_wal_records_enabled(true);
@@ -2326,7 +2326,6 @@ fn gpu_range_dml_resolves_on_device_without_deelide() {
     engine
         .execute_dml_concurrent(txn, "UPDATE t SET v = 0 WHERE id <= 2")
         .unwrap();
-    txn += 1;
     assert!(
         engine.dml_device_resolve_hits() > before,
         "matching range UPDATE must RESOLVE on the device"
@@ -2446,7 +2445,6 @@ fn gpu_int8_range_dml_resolves_on_device() {
     engine
         .execute_dml_concurrent(txn, &format!("UPDATE t SET b = 0 WHERE b <= {}", 2 * big))
         .unwrap();
-    txn += 1;
     assert!(
         engine.dml_device_resolve_hits() > before,
         "int8 range UPDATE with a >i32 bound must RESOLVE on the device"

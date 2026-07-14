@@ -206,11 +206,7 @@ impl RowBlock {
         Self { values, ncols }
     }
     pub fn len(&self) -> usize {
-        if self.ncols == 0 {
-            0
-        } else {
-            self.values.len() / self.ncols
-        }
+        self.values.len().checked_div(self.ncols).unwrap_or(0)
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -427,6 +423,7 @@ pub struct RelationalRetainedSnapshotHandle {
     pub has_retained_device_memory: bool,
     pub resident_device_int4_columns: Vec<String>,
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
+    pub resident_device_null_columns: Vec<ResidentDeviceNullBitmapLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

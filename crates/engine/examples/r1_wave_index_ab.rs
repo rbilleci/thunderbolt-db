@@ -136,6 +136,7 @@ fn needles_for_batch(b: usize, batch: usize, step: u64, rows: u64) -> Vec<i32> {
     v
 }
 
+#[allow(clippy::too_many_arguments)] // Benchmark dimensions stay explicit at every measured call site.
 fn measure(
     e: &Engine,
     template: &gpu_db_engine::RelationalRetainedReadTemplate,

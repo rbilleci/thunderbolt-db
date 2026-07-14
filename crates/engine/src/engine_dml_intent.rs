@@ -986,6 +986,9 @@ impl Engine {
 
 /// The outcome of [`Engine::build_covered_insert_intent`]: a ready-to-enqueue wave item, or a
 /// synthesized-SQL fallback for the classic path (eligibility drift).
+// Keep the ready item inline: this is the latency-oriented write-intent path, and boxing every
+// successful intent would add an allocation solely to shrink the rare fallback representation.
+#[allow(clippy::large_enum_variant)]
 enum IntentBuild {
     Item(crate::engine_dml_concurrent::CommitWaveItem),
     Fallback(String),

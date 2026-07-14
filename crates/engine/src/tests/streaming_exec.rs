@@ -3,10 +3,11 @@
 //! A table whose bytes exceed the configured per-GPU residency budget has no all-resident representation,
 //! so today its aggregate would de-elide to the CPU host engine (the ADR-006 charter violation). The
 //! streaming fold serves `COUNT(*)`/`SUM`/`MIN`/`MAX` OUT-OF-CORE: the visible rows are chunked to the
-//! budget, each chunk uploaded + reduced ON THE DEVICE, partials combined host-side (control plane). The
+//! budget, each chunk uploaded + reduced ON THE DEVICE, and partials combined by one final device pass. The
 //! non-vacuity proof is the fired counter + `streaming_fold_chunks > 1` (a genuine multi-chunk fold) +
-//! `streaming_fold_peak_chunk_bytes <= budget` (only one chunk ever resident). The differential is the
-//! SAME engine's CPU-pinned answer with the budget cleared.
+//! `streaming_fold_peak_chunk_bytes <= budget` (the largest single descriptor stays bounded). S-E.5
+//! lookahead overlaps at most two chunks, each targeted at budget/2. The differential is the SAME engine's
+//! CPU-pinned answer with the budget cleared.
 
 use super::*;
 
@@ -477,7 +478,7 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
         .execute_resident_expr_select_sql(nway_two_right_sql)
         .expect("streaming prefix replay across two RIGHT/FULL steps");
     assert!(streamed_nway_two_right.rows.iter().any(|row| {
-        row == &[SqlValue::Null, SqlValue::Int4(777), SqlValue::Int4(9)]
+        row == [SqlValue::Null, SqlValue::Int4(777), SqlValue::Int4(9)]
     }));
     e.set_relational_residency_budget_bytes(0, 4096);
     let outer_sql =
@@ -926,7 +927,7 @@ fn gpu_streaming_rank_windows_over_ordered_input() {
         .execute_resident_expr_select_sql(text_partition_window_sql)
         .expect("streaming LAG/LEAD with TEXT partition key");
     assert_eq!(
-        &streamed_text_partition_window.rows.row(0)[..],
+        streamed_text_partition_window.rows.row(0),
         &[
             SqlValue::Text("p0".to_string()),
             SqlValue::Int4(0),
@@ -2015,7 +2016,7 @@ fn gpu_streaming_ordered_unbounded_fits_or_defers() {
 /// default byte-identical behavior is gated everywhere.
 #[test]
 fn streaming_reduction_absent_without_budget_uses_host_path() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a) VALUES (1), (2), (3), (4)")
         .unwrap();
@@ -2713,6 +2714,19 @@ fn p1_count(e: &Engine) -> i64 {
     }
 }
 
+/// Recovery now eagerly installs a GPU-resident snapshot. These tests exercise the distinct over-budget
+/// streaming/cold-checkpoint path, so explicitly evict that snapshot after setting the tiny budget. The cold
+/// tier is separate ownership and deliberately survives this resident-cache eviction across reopen.
+fn p1_force_streaming(e: &mut Engine, budget: u64) {
+    e.set_relational_residency_budget_bytes(0, budget);
+    let catalog = e.ddl_catalog();
+    catalog.relational_resident_cache.remove_table(
+        "t",
+        &e.read_state.residency,
+        &e.read_state.route_telemetry,
+    );
+}
+
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_cold_checkpoint_restores_streaming_cold_across_reopen() {
@@ -2722,7 +2736,7 @@ fn gpu_cold_checkpoint_restores_streaming_cold_across_reopen() {
     let budget = 512u64;
     let cut = {
         let mut e = Engine::open_durable_wal_segment(&base).expect("lanes reopen");
-        e.set_relational_residency_budget_bytes(0, budget);
+        p1_force_streaming(&mut e, budget);
         assert_eq!(p1_count(&e), expected);
         assert!(
             e.streaming_fold_hits() >= 1 && e.streaming_cold_builds() >= 1,
@@ -2755,7 +2769,7 @@ fn gpu_cold_checkpoint_restores_streaming_cold_across_reopen() {
         e.streaming_cold_restored() >= 1,
         "reopen must restore the cold tier from the checkpoint artifact"
     );
-    e.set_relational_residency_budget_bytes(0, budget);
+    p1_force_streaming(&mut e, budget);
     assert_eq!(p1_count(&e), expected);
     assert!(
         e.streaming_cold_hits() >= 1,
@@ -2777,7 +2791,7 @@ fn gpu_cold_checkpoint_patches_forward_post_checkpoint_wal_suffix() {
     let budget = 512u64;
     {
         let mut e = Engine::open_durable_wal_segment(&base).expect("lanes reopen");
-        e.set_relational_residency_budget_bytes(0, budget);
+        p1_force_streaming(&mut e, budget);
         assert_eq!(p1_count(&e), expected);
         let cut = e.checkpoint_intent_lanes().expect("lanes checkpoint");
         assert_eq!(cut, 24);
@@ -2819,7 +2833,7 @@ fn gpu_cold_checkpoint_patches_forward_post_checkpoint_wal_suffix() {
         e.streaming_cold_patches() >= 1,
         "suffix replay must patch the restored entry via the commit hooks"
     );
-    e.set_relational_residency_budget_bytes(0, budget);
+    p1_force_streaming(&mut e, budget);
     assert_eq!(
         p1_count(&e),
         expected + 6,
@@ -2842,7 +2856,7 @@ fn gpu_cold_checkpoint_corrupt_artifact_is_skipped_never_wrong() {
     let budget = 512u64;
     let cut = {
         let mut e = Engine::open_durable_wal_segment(&base).expect("lanes reopen");
-        e.set_relational_residency_budget_bytes(0, budget);
+        p1_force_streaming(&mut e, budget);
         assert_eq!(p1_count(&e), expected);
         let cut = e.checkpoint_intent_lanes().expect("lanes checkpoint");
         assert!(e.streaming_cold_checkpointed() >= 1);
@@ -2864,7 +2878,7 @@ fn gpu_cold_checkpoint_corrupt_artifact_is_skipped_never_wrong() {
         0,
         "a checksum-failed artifact must restore NOTHING"
     );
-    e.set_relational_residency_budget_bytes(0, budget);
+    p1_force_streaming(&mut e, budget);
     assert_eq!(
         p1_count(&e),
         expected,
@@ -2885,7 +2899,7 @@ fn gpu_cold_checkpoint_boundary_mismatch_is_skipped() {
     let budget = 512u64;
     let cut = {
         let mut e = Engine::open_durable_wal_segment(&base).expect("lanes reopen");
-        e.set_relational_residency_budget_bytes(0, budget);
+        p1_force_streaming(&mut e, budget);
         assert_eq!(p1_count(&e), expected);
         let cut = e.checkpoint_intent_lanes().expect("lanes checkpoint");
         assert!(e.streaming_cold_checkpointed() >= 1);
@@ -2917,7 +2931,7 @@ fn gpu_cold_checkpoint_boundary_mismatch_is_skipped() {
         0,
         "a boundary-mismatched artifact must restore NOTHING (checksum alone cannot catch it)"
     );
-    e.set_relational_residency_budget_bytes(0, budget);
+    p1_force_streaming(&mut e, budget);
     assert_eq!(
         p1_count(&e),
         expected,
@@ -2943,7 +2957,7 @@ fn gpu_cold_checkpoint_restores_under_lane_pump_frontier_watermark() {
     let budget = 512u64;
     {
         let mut e = Engine::open_durable_wal_segment(&base).expect("lanes reopen");
-        e.set_relational_residency_budget_bytes(0, budget);
+        p1_force_streaming(&mut e, budget);
         assert_eq!(p1_count(&e), expected);
         assert!(e.streaming_cold_builds() >= 1);
         // Emulate the pump: publish the EXCLUSIVE frontier (base_seq + cut), the value
@@ -2970,7 +2984,7 @@ fn gpu_cold_checkpoint_restores_under_lane_pump_frontier_watermark() {
         "the artifact must carry the SEAM boundary (inclusive last index), not the live \
          frontier — a frontier-stamped artifact never restores"
     );
-    e.set_relational_residency_budget_bytes(0, budget);
+    p1_force_streaming(&mut e, budget);
     assert_eq!(p1_count(&e), expected);
     assert!(e.streaming_cold_hits() >= 1);
     assert_eq!(e.streaming_cold_builds(), 0);

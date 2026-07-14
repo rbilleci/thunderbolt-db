@@ -310,7 +310,7 @@ impl Engine {
         // STRATA S-E.1/S-E.2 (streaming executor, ADR-012): before de-eliding an over-VRAM read to the CPU
         // host engine, try the OUT-OF-CORE streaming fold — chunk the table's visible rows to the residency
         // budget and run each chunk ON THE DEVICE: a scalar reduction (COUNT(*)/SUM/MIN/MAX) combines
-        // partials host-side (control plane); a filter/project CONCATs survivors with LIMIT/OFFSET as
+        // partials in one final device pass; a filter/project CONCATs survivors with LIMIT/OFFSET as
         // cross-chunk windowing (a satisfied LIMIT stops the scan early). Never all shards resident at
         // once. Gated on a configured per-GPU budget + a foldable shape; `None` = not applicable -> the
         // CPU path runs unchanged (default behavior is byte-identical). Any shape the device cannot

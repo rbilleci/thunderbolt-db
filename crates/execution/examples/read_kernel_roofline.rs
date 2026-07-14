@@ -217,6 +217,24 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
                 .len()
         }),
     );
+    // Permanent GPU-native constant-mask guard. This measures the VM's one-i32-per-row output fill
+    // without compaction or result D2H; g4 is therefore bytes WRITTEN, not resident input bytes read.
+    // Keeping it in both cache regimes catches accidental reintroduction of an O(rows) host staging vector.
+    bench(
+        "const_mask_false (4B/row output fill, no result D2H)",
+        g4,
+        Box::new(|| {
+            let mask = resident
+                .run_expr_predicate_mask_with_text(
+                    &[ExprStep::ConstMask { value: false }],
+                    &[],
+                    u32::try_from(rows).unwrap(),
+                    gpu_db_execution::ResidentElemType::I32,
+                )
+                .unwrap();
+            mask.allocated_bytes() as usize
+        }),
+    );
     bench(
         "compare_indices_ordered (2-pass, ~50% sel)",
         2.0 * g4,
@@ -515,8 +533,7 @@ fn main() {
         // Honest KERNEL: CUDA-event timed, two-level kernel, 10 runs, full-compute mask.
         let (_rows, kernel_ms) = resident
             .group_by_i32_count_sum_kernel_timed(
-                off_a,
-                off_b,
+                gpu_db_execution::CudaGroupByInput::resident_i32(off_a, off_b, rows),
                 gi,
                 true,
                 10,
@@ -536,8 +553,7 @@ fn main() {
             Box::new(|| {
                 resident
                     .group_by_i32_count_sum_from_payload(
-                        off_a,
-                        off_b,
+                        gpu_db_execution::CudaGroupByInput::resident_i32(off_a, off_b, rows),
                         gi,
                         gpu_db_execution::grouped_agg_mask::ALL,
                     )

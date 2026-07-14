@@ -714,10 +714,10 @@ impl Engine {
             } => {
                 // DIRECT filtered scalar-stats reduction (non-nullable): one grid-stride pass evaluates
                 // the filter `<value> <cmp> needle` ON-DEVICE and reduces the matches to (count, sum,
-                // min, max). REPLACES `filtered_stats_i32_compare_from_payload`, which projected EVERY
-                // matching value to a host `Vec<i32>` and reduced on the CPU (`CudaI32Stats::from_values`)
-                // — O(matches) D2H + host work. Byte-identical to that for NON-empty results (same i64
-                // sum, same min/max, same AVG rounding). The ONLY result change is the empty corner:
+                // min, max). REPLACES the old projection of EVERY matching value to a host `Vec<i32>`
+                // followed by a CPU reduction — O(matches) D2H + host work. Byte-identical to that for
+                // NON-empty results (same i64 sum, same min/max, same AVG rounding). The ONLY result
+                // change is the empty corner:
                 // count == 0 (zero matches) now ⇒ SQL NULL (the deliberate SQL-spec correction), where
                 // the old path emitted the empty-text/Int8(0) sentinels for MIN/MAX/AVG.
                 let started = Instant::now();
@@ -1268,6 +1268,8 @@ impl Engine {
             ))
         })?;
         let filter_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let filter_validity_bitmap_offset =
+            resident_device_null_column_offset(&snapshot, &table, filter_idx)?;
         let all_int4_projection = selected_indexes
             .iter()
             .all(|idx| table.columns[*idx].ty == SqlType::Int4);
@@ -1319,15 +1321,19 @@ impl Engine {
                     )))
                 })?;
             let layout = resident_device_text_column_layout(&snapshot, &table, text_idx)?;
+            let text_validity_bitmap_offset =
+                resident_device_null_column_offset(&snapshot, &table, text_idx)?;
             Some(
                 device_memory
                     .match_project_i32_equal_any_text_from_payload(
                         filter_offset,
+                        filter_validity_bitmap_offset,
                         &needles,
                         &int4_projection_offsets,
                         layout.offsets_byte_offset,
                         layout.bytes_byte_offset,
                         layout.bytes_len,
+                        text_validity_bitmap_offset,
                         row_count,
                     )
                     .map_err(|err| {
@@ -1413,6 +1419,9 @@ impl Engine {
                     .iter()
                     .map(|idx| {
                         if *idx == text_idx {
+                            if projected.text_is_null {
+                                return Ok(SqlValue::Null);
+                            }
                             return Ok(SqlValue::Text(projected.text.clone()));
                         }
                         if let Some(position) = int4_positions.get(idx) {
@@ -1477,6 +1486,7 @@ impl Engine {
                                 layout.offsets_byte_offset,
                                 layout.bytes_byte_offset,
                                 layout.bytes_len,
+                                row_count,
                                 &matched_row_indices,
                             )
                             .map_err(|err| {

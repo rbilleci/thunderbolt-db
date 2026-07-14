@@ -4,7 +4,7 @@
 //! whether flipping it ON by default (S-F) is net-positive for an OLTP workload:
 //!   - **read benefit:** point-read service latency, host (non-resident) vs GPU (resident).
 //!   - **write cost:**  single-row commit service latency, auto-admit OFF vs ON. With ON, every commit
-//!                      re-admits (re-uploads the whole table), so this is the price S-F would charge writes.
+//!     re-admits (re-uploads the whole table), so this is the price S-F would charge writes.
 //!
 //! Closed-loop, single-threaded → pure service latency, no queueing/contention (the open-loop
 //! offered-rate harness + a tuned-Postgres baseline are the larger PLAN §1 follow-on). Reports

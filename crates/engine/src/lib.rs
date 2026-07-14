@@ -9,11 +9,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32BatchProjectionColumns,
+    CudaCompoundFoldColumn, CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime,
+    CudaI32BatchProjectionColumns,
     CudaI32Comparison, CudaI32EqualAnyProjectSubmission, CudaI32IndexProbeDenseSubmission,
     CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory,
-    CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, ExprStep, MockGpuRuntime, PlannedOp,
-    ResidentElemType, RouteDecision, VisibleLocateShard, WriteLocateShard,
+    CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, MockGpuRuntime,
+    PlannedOp, ResidentElemType, RouteDecision, VisibleLocateShard, WriteLocateShard,
 };
 #[cfg(test)]
 use gpu_db_execution::{
@@ -101,6 +102,9 @@ pub use engine_dml_intent::{
 };
 mod engine_dml_prepare;
 pub(crate) use engine_dml_prepare::InsertPrepareValidation;
+mod engine_result_sort;
+mod engine_expr_ir;
+mod engine_join_ir;
 mod engine_expr;
 mod engine_introspection;
 mod engine_lifecycle;
@@ -416,8 +420,8 @@ pub struct Engine {
     /// DECISIONS "lpb read levers" #1: when true, the lpb unique index probe uses the DENSE-emit kernel
     /// (thread `i` -> slot `i`, no atomic, no needle_indices/row_indices/count; host compacts sequentially)
     /// instead of the atomic-compaction kernel. Byte-identical; DEFAULT ON (user 2026-06-29: strict win
-    /// >=b4096, audit SHIP) — set false to A/B against the atomic kernel. Only the unique index route honors
-    /// it — the non-unique scan always keeps the atomic kernel. Interior-mutable.
+    /// `>= b4096`, audit SHIP) — set false to A/B against the atomic kernel. Only the unique index route
+    /// honors it — the non-unique scan always keeps the atomic kernel. Interior-mutable.
     dense_index_probe_enabled: AtomicBool,
     /// Billions-of-rows scaling (segmented layout, S-d1): when true, a table is admitted as a SEGMENTED
     /// shard list (sealed shards + one bounded open shard) routed through the sharded resident read path,

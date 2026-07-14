@@ -1552,9 +1552,7 @@ impl Engine {
         // below, and the defensive no-op arm would otherwise SILENTLY SKIP an acknowledged
         // insert's apply (data loss at replay). A tagged record that fails to decode is loud.
         if is_binary_wal_record(&entry.payload) {
-            return self
-                .apply_binary_wal_entry(entry, cat)
-                .map_err(EngineError::from);
+            return self.apply_binary_wal_entry(entry, cat);
         }
         let Ok(text) = std::str::from_utf8(&entry.payload) else {
             return Ok(None);

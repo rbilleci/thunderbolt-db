@@ -1,0 +1,181 @@
+.version 6.0
+.target sm_60
+.address_size 64
+
+// Count rows whose resident TEXT payload starts with `prefix`. The offsets section contains
+// row_count+1 little-endian u64 byte offsets; loads use two u32 words so the kernel remains safe
+// even for legacy 4-mod-8 sections. The host safe API now requires the canonical 8-byte alignment.
+.visible .entry gpu_db_resident_text_prefix_count(
+    .param .u64 resident_ptr,
+    .param .u64 offsets_byte_offset,
+    .param .u64 bytes_byte_offset,
+    .param .u64 bytes_len,
+    .param .u64 prefix_ptr,
+    .param .u64 prefix_len,
+    .param .u64 row_count,
+    .param .u64 out_ptr,
+    .param .u64 error_ptr
+)
+{
+    .shared .align 4 .b32 s_part[1024];
+
+    .reg .pred %p_done;
+    .reg .pred %p_bad;
+    .reg .pred %p_short;
+    .reg .pred %p_diff;
+    .reg .pred %p_not_first;
+    .reg .pred %p_active;
+    .reg .pred %p_isthr0;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %tmp32;
+    .reg .u32 %part32;
+    .reg .u32 %rstride;
+    .reg .u32 %peer;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %text_byte;
+    .reg .u32 %prefix_byte;
+    .reg .u32 %one;
+    .reg .u64 %resident;
+    .reg .u64 %off_base;
+    .reg .u64 %bytes_base;
+    .reg .u64 %bytes_limit;
+    .reg .u64 %prefix;
+    .reg .u64 %prefix_size;
+    .reg .u64 %rows;
+    .reg .u64 %out;
+    .reg .u64 %error;
+    .reg .u64 %idx;
+    .reg .u64 %stride;
+    .reg .u64 %addr;
+    .reg .u64 %off8;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %text_len;
+    .reg .u64 %j;
+    .reg .u64 %matches;
+    .reg .u64 %sh_base;
+    .reg .u64 %sh_self;
+    .reg .u64 %sh_peer;
+    .reg .u64 %block_tot;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %addr, [offsets_byte_offset];
+    add.u64 %off_base, %resident, %addr;
+    ld.param.u64 %addr, [bytes_byte_offset];
+    add.u64 %bytes_base, %resident, %addr;
+    ld.param.u64 %bytes_limit, [bytes_len];
+    ld.param.u64 %prefix, [prefix_ptr];
+    ld.param.u64 %prefix_size, [prefix_len];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %error, [error_ptr];
+    mov.u32 %one, 1;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %tmp32, %bid, %bdim, %lane;
+    cvt.u64.u32 %idx, %tmp32;
+    mul.lo.u32 %tmp32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %tmp32;
+    mov.u64 %matches, 0;
+
+    // The canonical offsets vector starts at zero, including for an empty relation. Preserve the
+    // previous API's validation without copying the offsets section to the host.
+    setp.ne.u64 %p_not_first, %idx, 0;
+    @%p_not_first bra loop;
+    ld.global.u32 %w0, [%off_base];
+    ld.global.u32 %w1, [%off_base+4];
+    or.b32 %tmp32, %w0, %w1;
+    setp.eq.u32 %p_bad, %tmp32, 0;
+    @%p_bad bra loop;
+    atom.global.exch.b32 %tmp32, [%error], %one;
+
+loop:
+    setp.ge.u64 %p_done, %idx, %rows;
+    @%p_done bra done;
+    mul.lo.u64 %off8, %idx, 8;
+    add.u64 %addr, %off_base, %off8;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %start, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %end, {%w0, %w1};
+    setp.gt.u64 %p_bad, %start, %end;
+    @%p_bad bra malformed;
+    setp.gt.u64 %p_bad, %end, %bytes_limit;
+    @%p_bad bra malformed;
+    sub.u64 %text_len, %end, %start;
+    setp.lt.u64 %p_short, %text_len, %prefix_size;
+    @%p_short bra next;
+    mov.u64 %j, 0;
+
+prefix_loop:
+    setp.ge.u64 %p_done, %j, %prefix_size;
+    @%p_done bra matched;
+    add.u64 %addr, %bytes_base, %start;
+    add.u64 %addr, %addr, %j;
+    ld.global.u8 %text_byte, [%addr];
+    add.u64 %addr, %prefix, %j;
+    ld.global.u8 %prefix_byte, [%addr];
+    setp.ne.u32 %p_diff, %text_byte, %prefix_byte;
+    @%p_diff bra next;
+    add.u64 %j, %j, 1;
+    bra prefix_loop;
+
+matched:
+    add.u64 %matches, %matches, 1;
+    bra next;
+
+malformed:
+    atom.global.exch.b32 %tmp32, [%error], %one;
+
+next:
+    add.u64 %idx, %idx, %stride;
+    bra loop;
+
+done:
+    // Reduce each thread's grid-stride partial in shared memory, then issue one global atomic per
+    // block. Every thread reaches every barrier even when its grid-stride loop had zero iterations.
+    cvt.u32.u64 %part32, %matches;
+    mov.u64 %sh_base, s_part;
+    mul.wide.u32 %sh_self, %lane, 4;
+    add.u64 %sh_self, %sh_base, %sh_self;
+    st.shared.u32 [%sh_self], %part32;
+    bar.sync 0;
+    shr.u32 %rstride, %bdim, 1;
+
+reduce_loop:
+    setp.eq.u32 %p_done, %rstride, 0;
+    @%p_done bra reduce_done;
+    setp.lt.u32 %p_active, %lane, %rstride;
+    @!%p_active bra reduce_skip;
+    add.u32 %peer, %lane, %rstride;
+    mul.wide.u32 %sh_peer, %peer, 4;
+    add.u64 %sh_peer, %sh_base, %sh_peer;
+    ld.shared.u32 %tmp32, [%sh_peer];
+    ld.shared.u32 %part32, [%sh_self];
+    add.u32 %part32, %part32, %tmp32;
+    st.shared.u32 [%sh_self], %part32;
+
+reduce_skip:
+    bar.sync 0;
+    shr.u32 %rstride, %rstride, 1;
+    bra reduce_loop;
+
+reduce_done:
+    setp.eq.u32 %p_isthr0, %lane, 0;
+    @!%p_isthr0 bra complete;
+    ld.shared.u32 %part32, [%sh_base];
+    cvt.u64.u32 %block_tot, %part32;
+    red.global.add.u64 [%out], %block_tot;
+
+complete:
+    ret;
+}

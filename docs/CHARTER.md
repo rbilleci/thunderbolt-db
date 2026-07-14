@@ -88,9 +88,10 @@ ADR-012), never by CPU execution or hardware demand-paging.
 - **Empty/edge PG-correctness:** the general executor **hard-errors** on an empty filtered SUM/MAX/AVG rather than
   returning the legacy probe's `Int8(0)` / empty-text sentinel; PG-correct **NULL** for empty aggregates is
   M3-gated (not yet wired on that path). Routing a shape to the bridge is a correctness fix, not byte-identical on empty.
-- **Type derivation:** catalog-declared type ≠ materialized value type (e.g. `SUM(int4)` declared Int4, valued
-  Int8; `SUM(int8)`→numeric) — derive transient-relation types from VALUES. **`COUNT(*)` returns `Int4`** in this
-  engine, not PG's `Int8` — a real divergence drivers/tests must expect.
+- **Type derivation:** the bound catalog descriptor, materialized `SqlValue`, GPU relation layout, and wire
+  metadata must agree. PostgreSQL integer aggregate rules are the contract: `SUM(int2/int4)` and `COUNT(*)`
+  produce `Int8`/bigint (OID 20), while `SUM(int8)` produces numeric. Never preserve a mismatched descriptor and
+  attempt to repair it by inferring a transient-relation type from values.
 - **Lease lifetime:** a derived device buffer's lease must outlive ALL passes / the kernel call (early free + pool
   reuse = UAF).
 - **Merge workflow:** commit on the feature branch → push → checkout main → `merge --ff-only` → push → back to

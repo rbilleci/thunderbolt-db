@@ -1,15 +1,29 @@
 === psql list supported pg_catalog types ===
-         List of data types
-   Schema   |  Name   | Description
-------------+---------+-------------
- pg_catalog | integer |
- pg_catalog | text    |
-(2 rows)
+                   List of data types
+   Schema   |            Name             | Description
+------------+-----------------------------+-------------
+ pg_catalog | bigint                      |
+ pg_catalog | boolean                     |
+ pg_catalog | date                        |
+ pg_catalog | integer                     |
+ pg_catalog | numeric                     |
+ pg_catalog | smallint                    |
+ pg_catalog | text                        |
+ pg_catalog | timestamp without time zone |
+ pg_catalog | uuid                        |
+(9 rows)
 
 === psql list supported pg_catalog types verbose ===
-                                         List of data types
-   Schema   |  Name   | Internal name | Size | Elements |  Owner   | Access privileges | Description
-------------+---------+---------------+------+----------+----------+-------------------+-------------
- pg_catalog | integer | int4          | 4    |          | postgres |                   |
- pg_catalog | text    | text          | var  |          | postgres |                   |
-(2 rows)
+                                                   List of data types
+   Schema   |            Name             | Internal name | Size | Elements |  Owner   | Access privileges | Description
+------------+-----------------------------+---------------+------+----------+----------+-------------------+-------------
+ pg_catalog | bigint                      | int8          |      |          | postgres |                   |
+ pg_catalog | boolean                     | bool          |      |          | postgres |                   |
+ pg_catalog | date                        | date          | 4    |          | postgres |                   |
+ pg_catalog | integer                     | int4          | 4    |          | postgres |                   |
+ pg_catalog | numeric                     | numeric       | var  |          | postgres |                   |
+ pg_catalog | smallint                    | int2          |      |          | postgres |                   |
+ pg_catalog | text                        | text          | var  |          | postgres |                   |
+ pg_catalog | timestamp without time zone | timestamp     |      |          | postgres |                   |
+ pg_catalog | uuid                        | uuid          |      |          | postgres |                   |
+(9 rows)

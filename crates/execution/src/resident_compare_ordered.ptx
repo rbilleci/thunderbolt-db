@@ -1,0 +1,803 @@
+
+.version 6.0
+.target sm_60
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_compare_count_blocks(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 row_count,
+    .param .u64 chunk_rows,
+    .param .s32 needle,
+    .param .u32 comparison,
+    .param .u64 out_block_counts_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_lt;
+    .reg .pred %p_lte;
+    .reg .pred %p_gt;
+    .reg .pred %p_gte;
+    .reg .pred %p_eq;
+    .reg .pred %p_ne;
+    .reg .pred %p_code_lt;
+    .reg .pred %p_code_lte;
+    .reg .pred %p_code_gt;
+    .reg .pred %p_code_gte;
+    .reg .pred %p_code_eq;
+    .reg .pred %p_code_ne;
+    .reg .pred %p_match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %comparison;
+    .reg .u64 %resident;
+    .reg .u64 %offset;
+    .reg .u64 %rows;
+    .reg .u64 %chunk;
+    .reg .u64 %base;
+    .reg .u64 %block_counts;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %idx;
+    .reg .u64 %tmp64;
+    .reg .u64 %input_addr;
+    .reg .u64 %matches;
+    .reg .u64 %count_addr;
+    .reg .s32 %needle;
+    .reg .s32 %r_value;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %offset, [byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %chunk, [chunk_rows];
+    ld.param.s32 %needle, [needle];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %block_counts, [out_block_counts_ptr];
+
+    add.u64 %base, %resident, %offset;
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+
+    // start = bid * chunk; end = min(start + chunk, rows)
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %start, %tmp64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p_done, %end, %rows;
+    @%p_done mov.u64 %end, %rows;
+
+    // idx = start + lane; stride = blockDim (grid-stride WITHIN this block's range)
+    cvt.u64.u32 %tmp64, %lane;
+    add.u64 %idx, %start, %tmp64;
+    cvt.u64.u32 %tmp64, %bdim;
+
+    mov.u64 %matches, 0;
+
+loop:
+    setp.ge.u64 %p_done, %idx, %end;
+    @%p_done bra done;
+    mul.lo.u64 %input_addr, %idx, 4;
+    add.u64 %input_addr, %base, %input_addr;
+    ld.global.s32 %r_value, [%input_addr];
+    setp.lt.s32 %p_lt, %r_value, %needle;
+    setp.le.s32 %p_lte, %r_value, %needle;
+    setp.gt.s32 %p_gt, %r_value, %needle;
+    setp.ge.s32 %p_gte, %r_value, %needle;
+    setp.eq.s32 %p_eq, %r_value, %needle;
+    setp.ne.s32 %p_ne, %r_value, %needle;
+    setp.eq.u32 %p_code_eq, %comparison, 0;
+    setp.eq.u32 %p_code_lt, %comparison, 1;
+    setp.eq.u32 %p_code_lte, %comparison, 2;
+    setp.eq.u32 %p_code_gt, %comparison, 3;
+    setp.eq.u32 %p_code_gte, %comparison, 4;
+    setp.eq.u32 %p_code_ne, %comparison, 5;
+    mov.pred %p_match, 0;
+    and.pred %p_eq, %p_eq, %p_code_eq;
+    or.pred %p_match, %p_match, %p_eq;
+    and.pred %p_lt, %p_lt, %p_code_lt;
+    or.pred %p_match, %p_match, %p_lt;
+    and.pred %p_lte, %p_lte, %p_code_lte;
+    or.pred %p_match, %p_match, %p_lte;
+    and.pred %p_gt, %p_gt, %p_code_gt;
+    or.pred %p_match, %p_match, %p_gt;
+    and.pred %p_gte, %p_gte, %p_code_gte;
+    or.pred %p_match, %p_match, %p_gte;
+    and.pred %p_ne, %p_ne, %p_code_ne;
+    or.pred %p_match, %p_match, %p_ne;
+    @!%p_match bra next;
+    add.u64 %matches, %matches, 1;
+
+next:
+    add.u64 %idx, %idx, %tmp64;
+    bra loop;
+
+done:
+    // Accumulate this thread's local matches into the block's slot. Threads of a block race here,
+    // but ADDITION is commutative so the per-block TOTAL is order-independent (the ordering is
+    // established by the contiguous partition + pass B, never by this reduction).
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %count_addr, %tmp64, 8;
+    add.u64 %count_addr, %block_counts, %count_addr;
+    red.global.add.u64 [%count_addr], %matches;
+    ret;
+}
+
+// Pass B (PARALLEL intra-block ordered compaction). Block `b` owns the contiguous row range
+// `[b*chunk, min(b*chunk+chunk, rows))` and ALL `blockDim` threads cooperate (the prior version used
+// ONE thread per block, a serial re-scan ~= the kernel floor). Per iteration of the within-block
+// grid-stride (one row per thread per iteration), every thread computes a 0/1 match `%flag`, then an
+// ORDERED intra-block EXCLUSIVE prefix-sum of the flags assigns each matching row its within-block
+// rank; the value is scattered to `block_base[b] + running + rank`. The scan is monotonic in row
+// index, so the output is ASCENDING by row - byte-identical to the serial append for ANY shape.
+//
+// The intra-block scan is two-level (warp-shuffle + a tiny shared cross-warp combine): (1) a warp
+// inclusive scan of `%flag` via `shfl.sync.up.b32` over the 32 lanes; warp-local exclusive =
+// inclusive - own flag. (2) lane 31 of each warp writes its warp total to `s_scan[warp]`; after a
+// barrier WARP 0 exclusive-scans the warp totals `s_scan[0..nwarps)` (nwarps = blockDim/32 <= 32,
+// since blockDim <= 1024, one warp suffices) and publishes per-warp exclusive prefixes to
+// `s_scan[32+w]` plus the block total to `s_scan[64]`. (3) each thread's within-iteration offset =
+// (warp-local exclusive) + (per-warp prefix). `%running` accumulates the per-iteration block total
+// (matches from earlier stride iterations = strictly lower rows) and stays uniform across the block,
+// so the multi-iteration `chunk > blockDim` path also stays ascending. Loop trip count is
+// block-uniform (iter_base/end are uniform), so every `bar.sync` is reached by the whole block; each
+// `shfl.sync` runs with the full warp converged (the only per-lane branch reconverges before it).
+// Pass A and Pass B test the SAME predicate over the SAME range, so the per-block scatter count
+// equals Pass A's per-block count (count <-> scatter consistency preserved).
+.visible .entry gpu_db_resident_i32_compare_scatter_blocks(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 row_count,
+    .param .u64 chunk_rows,
+    .param .s32 needle,
+    .param .u32 comparison,
+    .param .u64 block_base_ptr,
+    .param .u64 out_values_ptr,
+    .param .u32 out_is_index
+)
+{
+    // shared scratch: [0..32) warp totals, [32..64) per-warp exclusive prefixes, [64] block total.
+    .shared .align 4 .b32 s_scan[65];
+
+    .reg .pred %p_done;
+    .reg .pred %p_lt;
+    .reg .pred %p_lte;
+    .reg .pred %p_gt;
+    .reg .pred %p_gte;
+    .reg .pred %p_eq;
+    .reg .pred %p_ne;
+    .reg .pred %p_code_lt;
+    .reg .pred %p_code_lte;
+    .reg .pred %p_code_gt;
+    .reg .pred %p_code_gte;
+    .reg .pred %p_code_eq;
+    .reg .pred %p_code_ne;
+    .reg .pred %p_match;
+    .reg .pred %p_recv;
+    .reg .pred %p_inrange;
+    .reg .pred %p_islast;
+    .reg .pred %p_warp0;
+    .reg .pred %p_lane_in;
+    .reg .pred %p_is_index;
+    .reg .u32 %thr;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %lane;
+    .reg .u32 %warp;
+    .reg .u32 %nwarps;
+    .reg .u32 %comparison;
+    .reg .u32 %flag;
+    .reg .u32 %incl;
+    .reg .u32 %recv;
+    .reg .u32 %wexcl;
+    .reg .u32 %wtot;
+    .reg .u32 %prefix;
+    .reg .u32 %btot;
+    .reg .u32 %off32;
+    .reg .u32 %tmp32;
+    .reg .u32 %row_u32;
+    .reg .u32 %store_val;
+    .reg .u64 %resident;
+    .reg .u64 %offset;
+    .reg .u64 %rows;
+    .reg .u64 %chunk;
+    .reg .u64 %base;
+    .reg .u64 %block_base;
+    .reg .u64 %out_values;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %row;
+    .reg .u64 %iter_base;
+    .reg .u64 %stride;
+    .reg .u64 %tmp64;
+    .reg .u64 %input_addr;
+    .reg .u64 %slot;
+    .reg .u64 %output_addr;
+    .reg .u64 %base_addr;
+    .reg .u64 %running;
+    .reg .u64 %sh_addr;
+    .reg .s32 %needle;
+    .reg .s32 %r_value;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %offset, [byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %chunk, [chunk_rows];
+    ld.param.s32 %needle, [needle];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %block_base, [block_base_ptr];
+    ld.param.u64 %out_values, [out_values_ptr];
+    ld.param.u32 %tmp32, [out_is_index];
+    setp.ne.u32 %p_is_index, %tmp32, 0;
+
+    add.u64 %base, %resident, %offset;
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %thr, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+
+    // lane = thr & 31; warp = thr >> 5; nwarps = (bdim + 31) >> 5
+    and.b32 %lane, %thr, 31;
+    shr.u32 %warp, %thr, 5;
+    add.u32 %tmp32, %bdim, 31;
+    shr.u32 %nwarps, %tmp32, 5;
+
+    // start = bid * chunk; end = min(start + chunk, rows)
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %start, %tmp64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p_done, %end, %rows;
+    @%p_done mov.u64 %end, %rows;
+
+    // slot = block_base[bid]  (this block's exclusive-prefix base output index)
+    mul.lo.u64 %base_addr, %tmp64, 8;
+    add.u64 %base_addr, %block_base, %base_addr;
+    ld.global.u64 %slot, [%base_addr];
+
+    cvt.u64.u32 %stride, %bdim;
+    // iter_base walks start, start+bdim, start+2*bdim, ...; row = iter_base + thr.
+    mov.u64 %iter_base, %start;
+    mov.u64 %running, 0;
+    setp.eq.u32 %p_warp0, %warp, 0;
+
+iter_loop:
+    // Continue while the block still has rows to cover: iter_base < end (block-uniform trip count).
+    setp.ge.u64 %p_done, %iter_base, %end;
+    @%p_done bra iter_done;
+
+    // row = iter_base + thr ; in-range = row < end
+    cvt.u64.u32 %tmp64, %thr;
+    add.u64 %row, %iter_base, %tmp64;
+    setp.lt.u64 %p_inrange, %row, %end;
+
+    mov.u32 %flag, 0;
+    mov.s32 %r_value, 0;
+    @!%p_inrange bra after_pred;
+
+    // value = input[row]; flag = 1 iff the value matches the comparison predicate.
+    mul.lo.u64 %input_addr, %row, 4;
+    add.u64 %input_addr, %base, %input_addr;
+    ld.global.s32 %r_value, [%input_addr];
+    setp.lt.s32 %p_lt, %r_value, %needle;
+    setp.le.s32 %p_lte, %r_value, %needle;
+    setp.gt.s32 %p_gt, %r_value, %needle;
+    setp.ge.s32 %p_gte, %r_value, %needle;
+    setp.eq.s32 %p_eq, %r_value, %needle;
+    setp.ne.s32 %p_ne, %r_value, %needle;
+    setp.eq.u32 %p_code_eq, %comparison, 0;
+    setp.eq.u32 %p_code_lt, %comparison, 1;
+    setp.eq.u32 %p_code_lte, %comparison, 2;
+    setp.eq.u32 %p_code_gt, %comparison, 3;
+    setp.eq.u32 %p_code_gte, %comparison, 4;
+    setp.eq.u32 %p_code_ne, %comparison, 5;
+    mov.pred %p_match, 0;
+    and.pred %p_eq, %p_eq, %p_code_eq;
+    or.pred %p_match, %p_match, %p_eq;
+    and.pred %p_lt, %p_lt, %p_code_lt;
+    or.pred %p_match, %p_match, %p_lt;
+    and.pred %p_lte, %p_lte, %p_code_lte;
+    or.pred %p_match, %p_match, %p_lte;
+    and.pred %p_gt, %p_gt, %p_code_gt;
+    or.pred %p_match, %p_match, %p_gt;
+    and.pred %p_gte, %p_gte, %p_code_gte;
+    or.pred %p_match, %p_match, %p_gte;
+    and.pred %p_ne, %p_ne, %p_code_ne;
+    or.pred %p_match, %p_match, %p_ne;
+    selp.u32 %flag, 1, 0, %p_match;
+
+after_pred:
+    // ---- warp inclusive scan of %flag over 32 lanes (Hillis-Steele via shfl.sync.up.b32) ----
+    // All 32 lanes participate (the in-range branch reconverged at after_pred); membermask = full.
+    mov.u32 %incl, %flag;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    // warp-local exclusive = inclusive - own flag
+    sub.u32 %wexcl, %incl, %flag;
+
+    // lane 31 writes the warp total (= inclusive at the top lane) to s_scan[warp].
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra skip_wtot_write;
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    st.shared.u32 [%sh_addr], %incl;
+skip_wtot_write:
+    bar.sync 0;
+
+    // ---- warp 0 exclusive-scans the warp totals s_scan[0..nwarps) ----
+    @!%p_warp0 bra skip_combine;
+    // each lane of warp 0 loads s_scan[lane] if lane < nwarps else 0
+    setp.lt.u32 %p_lane_in, %lane, %nwarps;
+    mov.u32 %wtot, 0;
+    @!%p_lane_in bra have_wtot;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    ld.shared.u32 %wtot, [%sh_addr];
+have_wtot:
+    // inclusive scan of %wtot over the warp (nwarps <= 32, so one warp covers every warp slot)
+    mov.u32 %prefix, %wtot;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    // exclusive per-warp prefix = inclusive - own total; write to s_scan[32 + lane] (byte 128 + 4*lane).
+    sub.u32 %tmp32, %prefix, %wtot;
+    @!%p_lane_in bra skip_excl_write;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    st.shared.u32 [%sh_addr], %tmp32;
+skip_excl_write:
+    // lane 31 holds the inclusive scan of ALL warp totals (lanes >= nwarps loaded 0) = block total;
+    // store it to s_scan[64] (byte 256).
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra skip_combine;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    st.shared.u32 [%sh_addr], %prefix;
+skip_combine:
+    bar.sync 0;
+
+    // ---- scatter: out[slot + running + per-warp-prefix + warp-local-exclusive] = value ----
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    ld.shared.u32 %prefix, [%sh_addr];
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    ld.shared.u32 %btot, [%sh_addr];
+
+    @!%p_inrange bra after_scatter;
+    setp.eq.u32 %p_match, %flag, 1;
+    @!%p_match bra after_scatter;
+    add.u32 %off32, %wexcl, %prefix;
+    cvt.u64.u32 %tmp64, %off32;
+    add.u64 %tmp64, %tmp64, %running;
+    add.u64 %tmp64, %tmp64, %slot;
+    mul.lo.u64 %output_addr, %tmp64, 4;
+    add.u64 %output_addr, %out_values, %output_addr;
+    // In INDEX mode (out_is_index != 0) store the surviving ROW INDEX (the row u64 truncated to u32 -
+    // the 4-byte out slot holds an index; row < row_count which fits u32); in VALUE mode store the
+    // matching i32 value (unchanged). The ascending order is identical for both - the scatter slot is
+    // the same row's rank, only the payload written differs.
+    cvt.u32.u64 %row_u32, %row;
+    selp.b32 %store_val, %row_u32, %r_value, %p_is_index;
+    st.global.b32 [%output_addr], %store_val;
+
+after_scatter:
+    // running += block total (uniform across the block); advance one stride window; fence the
+    // shared scratch before the next iteration's lane-31 writes overwrite it.
+    cvt.u64.u32 %tmp64, %btot;
+    add.u64 %running, %running, %tmp64;
+    add.u64 %iter_base, %iter_base, %stride;
+    bar.sync 0;
+    bra iter_loop;
+
+iter_done:
+    ret;
+}
+
+// ---- TWO-INPUT (col-vs-col) ordered compaction: compare lhs[i] <cmp> rhs[i], emit ASCENDING row
+// indices, no host sort. COPIED VERBATIM from the single-input `..._compare_count_blocks` /
+// `..._compare_scatter_blocks` above (the block partition, grid-stride, the entire two-level
+// warp-shuffle prefix-sum scan, the ordered scatter, all scaffolding); the ONLY change is the
+// match-test fold: replace the one `input[idx] <cmp> needle` load+setp with TWO loads
+// (`%a = lhs_base[idx]`, `%b = rhs_base[idx]`) and `%a <cmp> %b` (operand order lhs,rhs - identical
+// to the legacy atomic kernel `gpu_db_buffer_i32_compare_buffers_to_indices`). Codes 0..4 only
+// (eq/lt/lte/gt/gte); ne (5) is rejected at the wrapper, so the ne term is omitted. The scatter
+// ALWAYS stores the surviving ROW INDEX (col-vs-col is a predicate), so there is no `out_is_index`
+// param - the store is hardcoded to the row index (`cvt.u32.u64` of `%row`), exactly the single-input
+// index path. The match-test fold (the two loads + the setp/and/or composition) is byte-identical
+// between the two kernels below, so Pass A's per-block count equals Pass B's per-block scatter count
+// for every predicate (count <-> scatter symmetry).
+.visible .entry gpu_db_buffers_i32_compare_count_blocks(
+    .param .u64 lhs_base,
+    .param .u64 rhs_base,
+    .param .u64 row_count,
+    .param .u64 chunk_rows,
+    .param .u32 comparison,
+    .param .u64 out_block_counts_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_lt;
+    .reg .pred %p_lte;
+    .reg .pred %p_gt;
+    .reg .pred %p_gte;
+    .reg .pred %p_eq;
+    .reg .pred %p_code_lt;
+    .reg .pred %p_code_lte;
+    .reg .pred %p_code_gt;
+    .reg .pred %p_code_gte;
+    .reg .pred %p_code_eq;
+    .reg .pred %p_match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %comparison;
+    .reg .u64 %lhs;
+    .reg .u64 %rhs;
+    .reg .u64 %rows;
+    .reg .u64 %chunk;
+    .reg .u64 %block_counts;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %idx;
+    .reg .u64 %tmp64;
+    .reg .u64 %lhs_addr;
+    .reg .u64 %rhs_addr;
+    .reg .u64 %off4;
+    .reg .u64 %matches;
+    .reg .u64 %count_addr;
+    .reg .s32 %a;
+    .reg .s32 %b;
+
+    ld.param.u64 %lhs, [lhs_base];
+    ld.param.u64 %rhs, [rhs_base];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %chunk, [chunk_rows];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %block_counts, [out_block_counts_ptr];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+
+    // start = bid * chunk; end = min(start + chunk, rows)
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %start, %tmp64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p_done, %end, %rows;
+    @%p_done mov.u64 %end, %rows;
+
+    // idx = start + lane; stride = blockDim (grid-stride WITHIN this block's range)
+    cvt.u64.u32 %tmp64, %lane;
+    add.u64 %idx, %start, %tmp64;
+    cvt.u64.u32 %tmp64, %bdim;
+
+    mov.u64 %matches, 0;
+
+loop_buf:
+    setp.ge.u64 %p_done, %idx, %end;
+    @%p_done bra done_buf;
+    // value a = lhs[idx]; value b = rhs[idx]; flag iff a <cmp> b (operand order lhs,rhs).
+    mul.lo.u64 %off4, %idx, 4;
+    add.u64 %lhs_addr, %lhs, %off4;
+    ld.global.s32 %a, [%lhs_addr];
+    add.u64 %rhs_addr, %rhs, %off4;
+    ld.global.s32 %b, [%rhs_addr];
+    setp.lt.s32 %p_lt, %a, %b;
+    setp.le.s32 %p_lte, %a, %b;
+    setp.gt.s32 %p_gt, %a, %b;
+    setp.ge.s32 %p_gte, %a, %b;
+    setp.eq.s32 %p_eq, %a, %b;
+    setp.eq.u32 %p_code_eq, %comparison, 0;
+    setp.eq.u32 %p_code_lt, %comparison, 1;
+    setp.eq.u32 %p_code_lte, %comparison, 2;
+    setp.eq.u32 %p_code_gt, %comparison, 3;
+    setp.eq.u32 %p_code_gte, %comparison, 4;
+    mov.pred %p_match, 0;
+    and.pred %p_eq, %p_eq, %p_code_eq;
+    or.pred %p_match, %p_match, %p_eq;
+    and.pred %p_lt, %p_lt, %p_code_lt;
+    or.pred %p_match, %p_match, %p_lt;
+    and.pred %p_lte, %p_lte, %p_code_lte;
+    or.pred %p_match, %p_match, %p_lte;
+    and.pred %p_gt, %p_gt, %p_code_gt;
+    or.pred %p_match, %p_match, %p_gt;
+    and.pred %p_gte, %p_gte, %p_code_gte;
+    or.pred %p_match, %p_match, %p_gte;
+    @!%p_match bra next_buf;
+    add.u64 %matches, %matches, 1;
+
+next_buf:
+    add.u64 %idx, %idx, %tmp64;
+    bra loop_buf;
+
+done_buf:
+    // Accumulate this thread's local matches into the block's slot (commutative add; the ordering is
+    // established by the contiguous partition + pass B, never by this reduction).
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %count_addr, %tmp64, 8;
+    add.u64 %count_addr, %block_counts, %count_addr;
+    red.global.add.u64 [%count_addr], %matches;
+    ret;
+}
+
+// Pass B for the two-input (col-vs-col) ordered compaction. Identical structure to the single-input
+// `gpu_db_resident_i32_compare_scatter_blocks` above (contiguous block partition + two-level
+// warp-shuffle ordered intra-block prefix sum -> ascending-by-construction scatter); the ONLY changes
+// vs that kernel are: (1) TWO input bases (lhs/rhs) read at `base + idx*4` and the `%a <cmp> %b`
+// match-test fold (codes 0..4, no ne) - byte-identical to the count kernel above; (2) the store is
+// hardcoded to the surviving ROW INDEX (`cvt.u32.u64` of %row) with no `out_is_index` param, since
+// col-vs-col is a predicate. Pass A and Pass B test the SAME predicate over the SAME range, so the
+// per-block scatter count equals Pass A's per-block count.
+.visible .entry gpu_db_buffers_i32_compare_scatter_blocks(
+    .param .u64 lhs_base,
+    .param .u64 rhs_base,
+    .param .u64 row_count,
+    .param .u64 chunk_rows,
+    .param .u32 comparison,
+    .param .u64 block_base_ptr,
+    .param .u64 out_indices_ptr
+)
+{
+    // shared scratch: [0..32) warp totals, [32..64) per-warp exclusive prefixes, [64] block total.
+    .shared .align 4 .b32 s_scan[65];
+
+    .reg .pred %p_done;
+    .reg .pred %p_lt;
+    .reg .pred %p_lte;
+    .reg .pred %p_gt;
+    .reg .pred %p_gte;
+    .reg .pred %p_eq;
+    .reg .pred %p_code_lt;
+    .reg .pred %p_code_lte;
+    .reg .pred %p_code_gt;
+    .reg .pred %p_code_gte;
+    .reg .pred %p_code_eq;
+    .reg .pred %p_match;
+    .reg .pred %p_recv;
+    .reg .pred %p_inrange;
+    .reg .pred %p_islast;
+    .reg .pred %p_warp0;
+    .reg .pred %p_lane_in;
+    .reg .u32 %thr;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %lane;
+    .reg .u32 %warp;
+    .reg .u32 %nwarps;
+    .reg .u32 %comparison;
+    .reg .u32 %flag;
+    .reg .u32 %incl;
+    .reg .u32 %recv;
+    .reg .u32 %wexcl;
+    .reg .u32 %wtot;
+    .reg .u32 %prefix;
+    .reg .u32 %btot;
+    .reg .u32 %off32;
+    .reg .u32 %tmp32;
+    .reg .u32 %row_u32;
+    .reg .u64 %lhs;
+    .reg .u64 %rhs;
+    .reg .u64 %rows;
+    .reg .u64 %chunk;
+    .reg .u64 %block_base;
+    .reg .u64 %out_indices;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %row;
+    .reg .u64 %iter_base;
+    .reg .u64 %stride;
+    .reg .u64 %tmp64;
+    .reg .u64 %lhs_addr;
+    .reg .u64 %rhs_addr;
+    .reg .u64 %off4;
+    .reg .u64 %slot;
+    .reg .u64 %output_addr;
+    .reg .u64 %base_addr;
+    .reg .u64 %running;
+    .reg .u64 %sh_addr;
+    .reg .s32 %a;
+    .reg .s32 %b;
+
+    ld.param.u64 %lhs, [lhs_base];
+    ld.param.u64 %rhs, [rhs_base];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %chunk, [chunk_rows];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %block_base, [block_base_ptr];
+    ld.param.u64 %out_indices, [out_indices_ptr];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %thr, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+
+    // lane = thr & 31; warp = thr >> 5; nwarps = (bdim + 31) >> 5
+    and.b32 %lane, %thr, 31;
+    shr.u32 %warp, %thr, 5;
+    add.u32 %tmp32, %bdim, 31;
+    shr.u32 %nwarps, %tmp32, 5;
+
+    // start = bid * chunk; end = min(start + chunk, rows)
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %start, %tmp64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p_done, %end, %rows;
+    @%p_done mov.u64 %end, %rows;
+
+    // slot = block_base[bid]  (this block's exclusive-prefix base output index)
+    mul.lo.u64 %base_addr, %tmp64, 8;
+    add.u64 %base_addr, %block_base, %base_addr;
+    ld.global.u64 %slot, [%base_addr];
+
+    cvt.u64.u32 %stride, %bdim;
+    // iter_base walks start, start+bdim, start+2*bdim, ...; row = iter_base + thr.
+    mov.u64 %iter_base, %start;
+    mov.u64 %running, 0;
+    setp.eq.u32 %p_warp0, %warp, 0;
+
+iter_loop_buf:
+    // Continue while the block still has rows to cover: iter_base < end (block-uniform trip count).
+    setp.ge.u64 %p_done, %iter_base, %end;
+    @%p_done bra iter_done_buf;
+
+    // row = iter_base + thr ; in-range = row < end
+    cvt.u64.u32 %tmp64, %thr;
+    add.u64 %row, %iter_base, %tmp64;
+    setp.lt.u64 %p_inrange, %row, %end;
+
+    mov.u32 %flag, 0;
+    @!%p_inrange bra after_pred_buf;
+
+    // a = lhs[row]; b = rhs[row]; flag = 1 iff a <cmp> b (operand order lhs,rhs).
+    mul.lo.u64 %off4, %row, 4;
+    add.u64 %lhs_addr, %lhs, %off4;
+    ld.global.s32 %a, [%lhs_addr];
+    add.u64 %rhs_addr, %rhs, %off4;
+    ld.global.s32 %b, [%rhs_addr];
+    setp.lt.s32 %p_lt, %a, %b;
+    setp.le.s32 %p_lte, %a, %b;
+    setp.gt.s32 %p_gt, %a, %b;
+    setp.ge.s32 %p_gte, %a, %b;
+    setp.eq.s32 %p_eq, %a, %b;
+    setp.eq.u32 %p_code_eq, %comparison, 0;
+    setp.eq.u32 %p_code_lt, %comparison, 1;
+    setp.eq.u32 %p_code_lte, %comparison, 2;
+    setp.eq.u32 %p_code_gt, %comparison, 3;
+    setp.eq.u32 %p_code_gte, %comparison, 4;
+    mov.pred %p_match, 0;
+    and.pred %p_eq, %p_eq, %p_code_eq;
+    or.pred %p_match, %p_match, %p_eq;
+    and.pred %p_lt, %p_lt, %p_code_lt;
+    or.pred %p_match, %p_match, %p_lt;
+    and.pred %p_lte, %p_lte, %p_code_lte;
+    or.pred %p_match, %p_match, %p_lte;
+    and.pred %p_gt, %p_gt, %p_code_gt;
+    or.pred %p_match, %p_match, %p_gt;
+    and.pred %p_gte, %p_gte, %p_code_gte;
+    or.pred %p_match, %p_match, %p_gte;
+    selp.u32 %flag, 1, 0, %p_match;
+
+after_pred_buf:
+    // ---- warp inclusive scan of %flag over 32 lanes (Hillis-Steele via shfl.sync.up.b32) ----
+    mov.u32 %incl, %flag;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    // warp-local exclusive = inclusive - own flag
+    sub.u32 %wexcl, %incl, %flag;
+
+    // lane 31 writes the warp total (= inclusive at the top lane) to s_scan[warp].
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra skip_wtot_write_buf;
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    st.shared.u32 [%sh_addr], %incl;
+skip_wtot_write_buf:
+    bar.sync 0;
+
+    // ---- warp 0 exclusive-scans the warp totals s_scan[0..nwarps) ----
+    @!%p_warp0 bra skip_combine_buf;
+    setp.lt.u32 %p_lane_in, %lane, %nwarps;
+    mov.u32 %wtot, 0;
+    @!%p_lane_in bra have_wtot_buf;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    ld.shared.u32 %wtot, [%sh_addr];
+have_wtot_buf:
+    mov.u32 %prefix, %wtot;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    // exclusive per-warp prefix = inclusive - own total; write to s_scan[32 + lane] (byte 128 + 4*lane).
+    sub.u32 %tmp32, %prefix, %wtot;
+    @!%p_lane_in bra skip_excl_write_buf;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    st.shared.u32 [%sh_addr], %tmp32;
+skip_excl_write_buf:
+    // lane 31 holds the inclusive scan of ALL warp totals (lanes >= nwarps loaded 0) = block total;
+    // store it to s_scan[64] (byte 256).
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra skip_combine_buf;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    st.shared.u32 [%sh_addr], %prefix;
+skip_combine_buf:
+    bar.sync 0;
+
+    // ---- scatter: out[slot + running + per-warp-prefix + warp-local-exclusive] = row index ----
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    ld.shared.u32 %prefix, [%sh_addr];
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    ld.shared.u32 %btot, [%sh_addr];
+
+    @!%p_inrange bra after_scatter_buf;
+    setp.eq.u32 %p_match, %flag, 1;
+    @!%p_match bra after_scatter_buf;
+    add.u32 %off32, %wexcl, %prefix;
+    cvt.u64.u32 %tmp64, %off32;
+    add.u64 %tmp64, %tmp64, %running;
+    add.u64 %tmp64, %tmp64, %slot;
+    mul.lo.u64 %output_addr, %tmp64, 4;
+    add.u64 %output_addr, %out_indices, %output_addr;
+    // Col-vs-col is a predicate -> store the surviving ROW INDEX (the row u64 truncated to u32; row <
+    // row_count which fits u32 - the wrapper asserts row_count <= u32::MAX). Hardcoded index store (no
+    // value mode), exactly the single-input index path.
+    cvt.u32.u64 %row_u32, %row;
+    st.global.b32 [%output_addr], %row_u32;
+
+after_scatter_buf:
+    // running += block total (uniform across the block); advance one stride window; fence the shared
+    // scratch before the next iteration's lane-31 writes overwrite it.
+    cvt.u64.u32 %tmp64, %btot;
+    add.u64 %running, %running, %tmp64;
+    add.u64 %iter_base, %iter_base, %stride;
+    bar.sync 0;
+    bra iter_loop_buf;
+
+iter_done_buf:
+    ret;
+}

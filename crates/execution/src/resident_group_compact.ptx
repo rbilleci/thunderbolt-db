@@ -1,0 +1,420 @@
+.version 8.4
+.target sm_90
+.address_size 64
+
+// Hand-maintained PTX; ownership follows the matching Rust operator module.
+
+
+// GPU STREAM-COMPACTION of the GROUP BY slot table -> dense per-group output arrays (the result-path
+// O(groups) replacement for the host `for i in 0..nslots` compact loop + the full-table D2H). A SINGLE
+// block scans all `alloc_slots` (= nslots + 2) slots grid-stride; each thread computes the SAME
+// occupancy predicate the host loop used, a two-level warp-shuffle prefix sum assigns each occupied
+// slot its DENSE position in ASCENDING SLOT ORDER (a running offset carried across waves), and the
+// thread scatters every GroupByI32Row field densely. Byte-identical to the host compaction order.
+//
+// Occupancy (matches the host EXACTLY):
+//   - hash range idx < nslots: use_i128 != 0 -> slot_keys_i128[idx] != EMPTY128 (i128::MIN);
+//                              else            -> slot_keys[idx]     != EMPTY    (i64::MIN).
+//   - dedicated i64::MIN-key slot idx == nslots   and the NULL-KEY slot idx == nslots+1:
+//                              ALWAYS slot_keys[idx] != EMPTY (the kernel marks USED by writing 0).
+// Emitted key fields (host parity):
+//   - out_key:    idx<nslots -> slot_keys[idx]; idx==nslots -> i64::MIN; idx==nslots+1 -> 0.
+//   - out_keyi128 idx<nslots -> use_i128 ? slot_keys_i128[idx] : 0;
+//                 idx==nslots -> key_is_i128_strict ? i128::MIN : 0; idx==nslots+1 -> 0.
+//   - out_isnull: 1 iff idx == nslots+1, else 0.
+// The other fields (count/sum/sum_hi/min/max/min_hi/max_hi i64; min_uuid/max_uuid b128) are copied
+// straight from slot[idx]; the host applies the same uuid byte-reversal it always did, now over only
+// out_count dense rows. out_count_ptr (u64) <- the number of groups (thread 0).
+.visible .entry gpu_db_group_by_slot_compact(
+    .param .u64 slot_keys_ptr,
+    .param .u64 slot_count_ptr,
+    .param .u64 slot_sum_ptr,
+    .param .u64 slot_sum_hi_ptr,
+    .param .u64 slot_min_ptr,
+    .param .u64 slot_max_ptr,
+    .param .u64 slot_min_hi_ptr,
+    .param .u64 slot_max_hi_ptr,
+    .param .u64 slot_min_uuid_ptr,
+    .param .u64 slot_max_uuid_ptr,
+    .param .u64 slot_keys_i128_ptr,
+    .param .u64 nslots,
+    .param .u64 alloc_slots,
+    .param .u64 use_i128,
+    .param .u64 key_is_i128_strict,
+    .param .u64 out_key_ptr,
+    .param .u64 out_count_arr_ptr,
+    .param .u64 out_sum_ptr,
+    .param .u64 out_sum_hi_ptr,
+    .param .u64 out_min_ptr,
+    .param .u64 out_max_ptr,
+    .param .u64 out_min_hi_ptr,
+    .param .u64 out_max_hi_ptr,
+    .param .u64 out_min_uuid_ptr,
+    .param .u64 out_max_uuid_ptr,
+    .param .u64 out_keyi128_ptr,
+    .param .u64 out_isnull_ptr,
+    .param .u64 out_count_ptr
+)
+{
+    .shared .align 4 .b32 s_scan[96];
+
+    .reg .pred %p;
+    .reg .pred %p_in;
+    .reg .pred %p_recv;
+    .reg .pred %p_islast;
+    .reg .pred %p_warp0;
+    .reg .pred %p_lane_in;
+    .reg .pred %p_keep;
+    .reg .pred %p_occ;
+    .reg .pred %p_hash;
+    .reg .pred %p_ded;
+    .reg .u32 %thr;
+    .reg .u32 %bdim;
+    .reg .u32 %lane;
+    .reg .u32 %warp;
+    .reg .u32 %nwarps;
+    .reg .u32 %flag;
+    .reg .u32 %incl;
+    .reg .u32 %recv;
+    .reg .u32 %wexcl;
+    .reg .u32 %prefix;
+    .reg .u32 %btot;
+    .reg .u32 %off32;
+    .reg .u32 %tmp32;
+    .reg .u64 %k_keys;
+    .reg .u64 %k_count;
+    .reg .u64 %k_sum;
+    .reg .u64 %k_sumhi;
+    .reg .u64 %k_min;
+    .reg .u64 %k_max;
+    .reg .u64 %k_minhi;
+    .reg .u64 %k_maxhi;
+    .reg .u64 %k_minu;
+    .reg .u64 %k_maxu;
+    .reg .u64 %k_ki128;
+    .reg .u64 %nslots;
+    .reg .u64 %nalloc;
+    .reg .u64 %usei128;
+    .reg .u64 %kstrict;
+    .reg .u64 %o_key;
+    .reg .u64 %o_count;
+    .reg .u64 %o_sum;
+    .reg .u64 %o_sumhi;
+    .reg .u64 %o_min;
+    .reg .u64 %o_max;
+    .reg .u64 %o_minhi;
+    .reg .u64 %o_maxhi;
+    .reg .u64 %o_minu;
+    .reg .u64 %o_maxu;
+    .reg .u64 %o_ki128;
+    .reg .u64 %o_isnull;
+    .reg .u64 %ocnt;
+    .reg .u64 %iter;
+    .reg .u64 %stride;
+    .reg .u64 %slot;
+    .reg .u64 %running;
+    .reg .u64 %tmp64;
+    .reg .u64 %off8;
+    .reg .u64 %off16;
+    .reg .u64 %pos;
+    .reg .u64 %pos8;
+    .reg .u64 %pos16;
+    .reg .u64 %pos4;
+    .reg .u64 %addr;
+    .reg .u64 %daddr;
+    .reg .u64 %sh_addr;
+    .reg .u64 %empty;
+    .reg .u64 %i128lo;
+    .reg .u64 %i128hi;
+    .reg .u64 %o_isnull_v;
+    .reg .u64 %keyv;
+    .reg .b128 %v128;
+
+    ld.param.u64 %k_keys, [slot_keys_ptr];
+    ld.param.u64 %k_count, [slot_count_ptr];
+    ld.param.u64 %k_sum, [slot_sum_ptr];
+    ld.param.u64 %k_sumhi, [slot_sum_hi_ptr];
+    ld.param.u64 %k_min, [slot_min_ptr];
+    ld.param.u64 %k_max, [slot_max_ptr];
+    ld.param.u64 %k_minhi, [slot_min_hi_ptr];
+    ld.param.u64 %k_maxhi, [slot_max_hi_ptr];
+    ld.param.u64 %k_minu, [slot_min_uuid_ptr];
+    ld.param.u64 %k_maxu, [slot_max_uuid_ptr];
+    ld.param.u64 %k_ki128, [slot_keys_i128_ptr];
+    ld.param.u64 %nslots, [nslots];
+    ld.param.u64 %nalloc, [alloc_slots];
+    ld.param.u64 %usei128, [use_i128];
+    ld.param.u64 %kstrict, [key_is_i128_strict];
+    ld.param.u64 %o_key, [out_key_ptr];
+    ld.param.u64 %o_count, [out_count_arr_ptr];
+    ld.param.u64 %o_sum, [out_sum_ptr];
+    ld.param.u64 %o_sumhi, [out_sum_hi_ptr];
+    ld.param.u64 %o_min, [out_min_ptr];
+    ld.param.u64 %o_max, [out_max_ptr];
+    ld.param.u64 %o_minhi, [out_min_hi_ptr];
+    ld.param.u64 %o_maxhi, [out_max_hi_ptr];
+    ld.param.u64 %o_minu, [out_min_uuid_ptr];
+    ld.param.u64 %o_maxu, [out_max_uuid_ptr];
+    ld.param.u64 %o_ki128, [out_keyi128_ptr];
+    ld.param.u64 %o_isnull, [out_isnull_ptr];
+    ld.param.u64 %ocnt, [out_count_ptr];
+
+    mov.u64 %empty, 0x8000000000000000;  // i64::MIN == EMPTY == EMPTY128 hi limb
+
+    mov.u32 %thr, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    and.b32 %lane, %thr, 31;
+    shr.u32 %warp, %thr, 5;
+    add.u32 %tmp32, %bdim, 31;
+    shr.u32 %nwarps, %tmp32, 5;
+    setp.eq.u32 %p_warp0, %warp, 0;
+
+    cvt.u64.u32 %stride, %bdim;
+    cvt.u64.u32 %iter, %thr;   // each thread's first slot = its tid
+    mov.u64 %running, 0;
+
+scompact_loop:
+    // Loop while ANY thread in the block still has a slot (wave base = iter - thr < alloc_slots). All
+    // threads iterate together so the bar.sync-bounded two-level scan stays in lockstep; out-of-range
+    // lanes contribute flag 0 but still participate in the scan + barriers.
+    cvt.u64.u32 %tmp64, %thr;
+    sub.u64 %tmp64, %iter, %tmp64;     // wave base = iter - thr
+    setp.ge.u64 %p, %tmp64, %nalloc;
+    @%p bra scompact_done;
+
+    setp.lt.u64 %p_in, %iter, %nalloc;
+    mov.u64 %slot, %iter;
+
+    mov.u32 %flag, 0;
+    mov.u64 %keyv, 0;
+    mov.u64 %i128lo, 0;
+    mov.u64 %i128hi, 0;
+    mov.u64 %o_isnull_v, 0;
+    @!%p_in bra after_occ;
+
+    // hash-range vs dedicated-slot split
+    setp.lt.u64 %p_hash, %slot, %nslots;       // idx < nslots -> hash range
+
+    mul.lo.u64 %off8, %slot, 8;
+    mul.lo.u64 %off16, %slot, 16;
+
+    // Load the i64 key slot (used by occupancy on the i64 path AND every dedicated slot).
+    add.u64 %addr, %k_keys, %off8;
+    ld.global.u64 %tmp64, [%addr];             // tmp64 = slot_keys[idx]
+    mov.u64 %keyv, %tmp64;
+
+    // Load the i128 key slot hi limb (occupancy on the i128 path uses keys_i128 != i128::MIN; since
+    // EMPTY128 = (lo=0, hi=i64::MIN), testing hi != i64::MIN is sufficient -- the kernel never writes a
+    // real key whose hi == i64::MIN with lo==0; an all-MIN real key cannot occur for the supported key
+    // types). Match the host i128::MIN whole-word test by also OR-ing the lo limb.
+    add.u64 %addr, %k_ki128, %off16;
+    ld.global.u64 %i128lo, [%addr];
+    ld.global.u64 %i128hi, [%addr+8];
+
+    // ---- occupancy ----
+    @!%p_hash bra occ_dedicated;
+    // hash range: choose predicate by use_i128
+    setp.ne.u64 %p, %usei128, 0;
+    @%p bra occ_hash_i128;
+    // i64 path: slot_keys[idx] != EMPTY
+    setp.ne.u64 %p_occ, %keyv, %empty;
+    bra occ_have;
+occ_hash_i128:
+    // i128 path: (lo, hi) != (0, i64::MIN)
+    setp.ne.u64 %p, %i128lo, 0;
+    setp.ne.u64 %p_islast, %i128hi, %empty;
+    or.pred %p_occ, %p, %p_islast;
+    bra occ_have;
+occ_dedicated:
+    // dedicated (nslots) + null (nslots+1) slots: ALWAYS slot_keys[idx] != EMPTY
+    setp.ne.u64 %p_occ, %keyv, %empty;
+occ_have:
+    selp.u32 %flag, 1, 0, %p_occ;
+
+after_occ:
+    // ---- two-level warp-shuffle inclusive scan of %flag (ascending slot order) ----
+    mov.u32 %incl, %flag;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    sub.u32 %wexcl, %incl, %flag;
+
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra sc_skip_wtot;
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    st.shared.u32 [%sh_addr], %incl;
+sc_skip_wtot:
+    bar.sync 0;
+
+    @!%p_warp0 bra sc_skip_combine;
+    setp.lt.u32 %p_lane_in, %lane, %nwarps;
+    mov.u32 %tmp32, 0;
+    @!%p_lane_in bra sc_have_wtot;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    ld.shared.u32 %tmp32, [%sh_addr];
+sc_have_wtot:
+    mov.u32 %prefix, %tmp32;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    sub.u32 %tmp32, %prefix, %tmp32;
+    @!%p_lane_in bra sc_skip_excl;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    st.shared.u32 [%sh_addr], %tmp32;
+sc_skip_excl:
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra sc_skip_btot;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    st.shared.u32 [%sh_addr], %prefix;
+sc_skip_btot:
+sc_skip_combine:
+    bar.sync 0;
+
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    ld.shared.u32 %prefix, [%sh_addr];
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    ld.shared.u32 %btot, [%sh_addr];
+
+    setp.eq.u32 %p_keep, %flag, 1;
+    and.pred %p_keep, %p_keep, %p_in;
+    @!%p_keep bra sc_after_scatter;
+
+    // dense position pos = running + (wexcl + warp_prefix)
+    add.u32 %off32, %wexcl, %prefix;
+    cvt.u64.u32 %pos, %off32;
+    add.u64 %pos, %pos, %running;
+    mul.lo.u64 %pos8, %pos, 8;
+    mul.lo.u64 %pos16, %pos, 16;
+    mul.lo.u64 %pos4, %pos, 4;
+
+    // ---- compute the emitted KEY fields by slot range ----
+    // default (hash range): out_key = slot_keys[idx] (already in %keyv);
+    //                       out_keyi128 = use_i128 ? keys_i128[idx] : 0; out_isnull = 0.
+    mov.u64 %o_isnull_v, 0;
+    setp.lt.u64 %p_hash, %slot, %nslots;
+    @!%p_hash bra sc_key_dedicated;
+    // hash range key_i128
+    setp.ne.u64 %p, %usei128, 0;
+    selp.b64 %tmp64, %i128lo, 0, %p;
+    mov.u64 %i128lo, %tmp64;
+    selp.b64 %tmp64, %i128hi, 0, %p;
+    mov.u64 %i128hi, %tmp64;
+    bra sc_key_done;
+sc_key_dedicated:
+    // dedicated slots: distinguish nslots (i64::MIN key) vs nslots+1 (null group)
+    setp.eq.u64 %p, %slot, %nslots;
+    @!%p bra sc_key_null;
+    // idx == nslots: key = i64::MIN; key_i128 = key_is_i128_strict ? i128::MIN : 0; isnull = 0.
+    // (i128::MIN low limb is 0, same as the non-strict 0 case, so only the hi limb is selected.)
+    mov.u64 %keyv, %empty;
+    setp.ne.u64 %p, %kstrict, 0;
+    mov.u64 %i128lo, 0;
+    selp.b64 %i128hi, %empty, 0, %p;   // hi = i64::MIN when strict, else 0
+    mov.u64 %o_isnull_v, 0;
+    bra sc_key_done;
+sc_key_null:
+    // idx == nslots+1: key = 0; key_i128 = 0; isnull = 1
+    mov.u64 %keyv, 0;
+    mov.u64 %i128lo, 0;
+    mov.u64 %i128hi, 0;
+    mov.u64 %o_isnull_v, 1;
+sc_key_done:
+
+    // ---- scatter every field densely at pos ----
+    // out_key (i64)
+    add.u64 %daddr, %o_key, %pos8;
+    st.global.u64 [%daddr], %keyv;
+    // out_count (u64)
+    add.u64 %addr, %k_count, %off8;
+    ld.global.u64 %tmp64, [%addr];
+    add.u64 %daddr, %o_count, %pos8;
+    st.global.u64 [%daddr], %tmp64;
+    // out_sum (i64)
+    add.u64 %addr, %k_sum, %off8;
+    ld.global.u64 %tmp64, [%addr];
+    add.u64 %daddr, %o_sum, %pos8;
+    st.global.u64 [%daddr], %tmp64;
+    // out_sum_hi (i64)
+    add.u64 %addr, %k_sumhi, %off8;
+    ld.global.u64 %tmp64, [%addr];
+    add.u64 %daddr, %o_sumhi, %pos8;
+    st.global.u64 [%daddr], %tmp64;
+    // out_min (i64)
+    add.u64 %addr, %k_min, %off8;
+    ld.global.u64 %tmp64, [%addr];
+    add.u64 %daddr, %o_min, %pos8;
+    st.global.u64 [%daddr], %tmp64;
+    // out_max (i64)
+    add.u64 %addr, %k_max, %off8;
+    ld.global.u64 %tmp64, [%addr];
+    add.u64 %daddr, %o_max, %pos8;
+    st.global.u64 [%daddr], %tmp64;
+    // out_min_hi (i64)
+    add.u64 %addr, %k_minhi, %off8;
+    ld.global.u64 %tmp64, [%addr];
+    add.u64 %daddr, %o_minhi, %pos8;
+    st.global.u64 [%daddr], %tmp64;
+    // out_max_hi (i64)
+    add.u64 %addr, %k_maxhi, %off8;
+    ld.global.u64 %tmp64, [%addr];
+    add.u64 %daddr, %o_maxhi, %pos8;
+    st.global.u64 [%daddr], %tmp64;
+    // out_min_uuid (b128, raw device bytes -- host applies the same byte-reversal as before)
+    add.u64 %addr, %k_minu, %off16;
+    ld.global.b128 %v128, [%addr];
+    add.u64 %daddr, %o_minu, %pos16;
+    st.global.b128 [%daddr], %v128;
+    // out_max_uuid (b128)
+    add.u64 %addr, %k_maxu, %off16;
+    ld.global.b128 %v128, [%addr];
+    add.u64 %daddr, %o_maxu, %pos16;
+    st.global.b128 [%daddr], %v128;
+    // out_keyi128 (b128 from the resolved lo/hi)
+    mov.b128 %v128, {%i128lo, %i128hi};
+    add.u64 %daddr, %o_ki128, %pos16;
+    st.global.b128 [%daddr], %v128;
+    // out_isnull (u32: 0/1)
+    cvt.u32.u64 %tmp32, %o_isnull_v;
+    add.u64 %daddr, %o_isnull, %pos4;
+    st.global.u32 [%daddr], %tmp32;
+
+sc_after_scatter:
+    cvt.u64.u32 %tmp64, %btot;
+    add.u64 %running, %running, %tmp64;
+    add.u64 %iter, %iter, %stride;
+    bar.sync 0;
+    bra scompact_loop;
+
+scompact_done:
+    setp.ne.u32 %p, %thr, 0;
+    @%p bra sc_done;
+    st.global.u64 [%ocnt], %running;
+sc_done:
+    ret;
+}

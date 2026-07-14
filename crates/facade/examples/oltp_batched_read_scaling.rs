@@ -13,6 +13,7 @@
 //!   - **gpu per-query:** the unbatched resident route — pays the full ~72µs every call.
 //!   - **gpu batched:** the coalescing batcher — the contender; effective per-lookup cost should
 //!     fall toward 72µs / batch_size if amortization works.
+//!
 //! Reports p50/p99/p99.9 + aggregate throughput. The question: does `gpu batched` throughput (and
 //! p99) beat `host`?
 //!

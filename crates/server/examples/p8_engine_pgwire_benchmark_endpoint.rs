@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use gpu_db_engine::{
     Engine, RelationalResidencyWarmupPolicy, RelationalRetainedReadJob,
-    RelationalRetainedReadSubmission, RelationalSelectResult, ResidentDeviceTextColumnLayout,
+    RelationalRetainedReadSubmission, RelationalSelectResult, ResidentDeviceNullBitmapLayout,
+    ResidentDeviceTextColumnLayout,
 };
 use gpu_db_execution::CudaResidentDeviceMemoryReadView;
 use gpu_db_metrics::RuntimeMetricsSnapshot;
@@ -85,6 +86,7 @@ struct RetainedReadRuntimeRoute {
     row_count: u64,
     int4_columns: Vec<String>,
     text_columns: Vec<ResidentDeviceTextColumnLayout>,
+    null_columns: Vec<ResidentDeviceNullBitmapLayout>,
     read_view: CudaResidentDeviceMemoryReadView,
 }
 
@@ -547,10 +549,17 @@ fn execute_retained_read_runtime_batch(
             works,
             route,
             batch_key,
-            filter_offset,
-            &int4_projection_columns,
-            &int4_projection_offsets,
-            text_layout,
+            RetainedReadRuntimeTextBatchPlan {
+                filter_offset,
+                filter_validity_bitmap_offset: route
+                    .null_columns
+                    .iter()
+                    .find(|layout| layout.name == batch_key.filter_column)
+                    .map(|layout| layout.bitmap_byte_offset),
+                int4_projection_columns: &int4_projection_columns,
+                int4_projection_offsets: &int4_projection_offsets,
+                text_layout,
+            },
         );
     }
     let projection_offsets = batch_key
@@ -607,7 +616,12 @@ fn execute_retained_read_runtime_batch(
             .ok_or_else(|| format!("retained read runtime missing unique result {unique_idx}"))?;
         let mut bytes = Vec::new();
         let mut writer = BackendWriter::new(&mut bytes);
-        write_select_result_rows(&mut writer, &columns, &gpu_db_engine::RowBlock::from(rows.clone())).map_err(|err| err.to_string())?;
+        write_select_result_rows(
+            &mut writer,
+            &columns,
+            &gpu_db_engine::RowBlock::from(rows.clone()),
+        )
+        .map_err(|err| err.to_string())?;
         writer
             .ready_for_query(false)
             .map_err(|err| err.to_string())?;
@@ -616,14 +630,19 @@ fn execute_retained_read_runtime_batch(
     Ok(outputs)
 }
 
+struct RetainedReadRuntimeTextBatchPlan<'a> {
+    filter_offset: u64,
+    filter_validity_bitmap_offset: Option<u64>,
+    int4_projection_columns: &'a [String],
+    int4_projection_offsets: &'a [u64],
+    text_layout: &'a ResidentDeviceTextColumnLayout,
+}
+
 fn execute_retained_read_runtime_text_batch(
     works: &[RetainedReadRuntimeWork],
     route: &RetainedReadRuntimeRoute,
     batch_key: &RetainedSelectLiteralBatchKey,
-    filter_offset: u64,
-    int4_projection_columns: &[String],
-    int4_projection_offsets: &[u64],
-    text_layout: &ResidentDeviceTextColumnLayout,
+    plan: RetainedReadRuntimeTextBatchPlan<'_>,
 ) -> Result<Vec<Vec<u8>>, String> {
     let mut unique_needles = Vec::new();
     let mut unique_by_needle = HashMap::new();
@@ -642,16 +661,23 @@ fn execute_retained_read_runtime_text_batch(
     let projected_rows = route
         .read_view
         .match_project_i32_equal_any_text_from_payload(
-            filter_offset,
+            plan.filter_offset,
+            plan.filter_validity_bitmap_offset,
             &unique_needles,
-            int4_projection_offsets,
-            text_layout.offsets_byte_offset,
-            text_layout.bytes_byte_offset,
-            text_layout.bytes_len,
+            plan.int4_projection_offsets,
+            plan.text_layout.offsets_byte_offset,
+            plan.text_layout.bytes_byte_offset,
+            plan.text_layout.bytes_len,
+            route
+                .null_columns
+                .iter()
+                .find(|layout| layout.name == plan.text_layout.name)
+                .map(|layout| layout.bitmap_byte_offset),
             route.row_count,
         )
         .map_err(|err| err.to_string())?;
-    let int4_projection_index = int4_projection_columns
+    let int4_projection_index = plan
+        .int4_projection_columns
         .iter()
         .enumerate()
         .map(|(idx, column)| (column.as_str(), idx))
@@ -661,7 +687,11 @@ fn execute_retained_read_runtime_text_batch(
         if let Some(rows) = rows_by_unique.get_mut(row.needle_index) {
             let mut values = Vec::with_capacity(batch_key.projection_columns.len());
             for column in &batch_key.projection_columns {
-                if column == &text_layout.name {
+                if column == &plan.text_layout.name {
+                    if row.text_is_null {
+                        values.push(SqlValue::Null);
+                        continue;
+                    }
                     values.push(SqlValue::Text(row.text.clone()));
                 } else {
                     let value_idx =
@@ -681,7 +711,7 @@ fn execute_retained_read_runtime_text_batch(
         .projection_columns
         .iter()
         .map(|column| {
-            if column == &text_layout.name {
+            if column == &plan.text_layout.name {
                 BackendColumn::new(column, 25, -1)
             } else {
                 BackendColumn::new(column, 23, 4)
@@ -695,7 +725,12 @@ fn execute_retained_read_runtime_text_batch(
             .ok_or_else(|| format!("retained read runtime missing unique result {unique_idx}"))?;
         let mut bytes = Vec::new();
         let mut writer = BackendWriter::new(&mut bytes);
-        write_select_result_rows(&mut writer, &columns, &gpu_db_engine::RowBlock::from(rows.clone())).map_err(|err| err.to_string())?;
+        write_select_result_rows(
+            &mut writer,
+            &columns,
+            &gpu_db_engine::RowBlock::from(rows.clone()),
+        )
+        .map_err(|err| err.to_string())?;
         writer
             .ready_for_query(false)
             .map_err(|err| err.to_string())?;
@@ -1685,6 +1720,7 @@ impl EndpointState {
                 row_count: u64::try_from(handle.row_count).unwrap_or(u64::MAX),
                 int4_columns: handle.resident_device_int4_columns,
                 text_columns: handle.resident_device_text_columns,
+                null_columns: handle.resident_device_null_columns,
                 read_view,
             };
             self.retained_read_runtime
@@ -1936,10 +1972,9 @@ fn retained_select_literal_needle(select: &Select) -> Option<i32> {
         select.filter_groups[0].clone()
     } else if !select.filters.is_empty() {
         select.filters.clone()
-    } else if let Some(filter) = select.filter.clone() {
-        vec![filter]
     } else {
-        return None;
+        let filter = select.filter.clone()?;
+        vec![filter]
     };
     if filters.len() != 1 || filters[0].op != SelectFilterOp::Eq {
         return None;
@@ -1975,10 +2010,9 @@ fn retained_select_literal_batch_candidate(
         select.filter_groups[0].clone()
     } else if !select.filters.is_empty() {
         select.filters.clone()
-    } else if let Some(filter) = select.filter.clone() {
-        vec![filter]
     } else {
-        return None;
+        let filter = select.filter.clone()?;
+        vec![filter]
     };
     if filters.len() != 1 || filters[0].op != SelectFilterOp::Eq {
         return None;

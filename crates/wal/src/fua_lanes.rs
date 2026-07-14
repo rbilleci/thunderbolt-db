@@ -331,7 +331,7 @@ impl FuaWalLaneSet {
             .push_back((first_seq, end));
         lane_ref
             .backend
-            .append_frame(&payload, first_seq, seq_count)?;
+            .append_frame(payload, first_seq, seq_count)?;
         Ok(())
     }
 
@@ -539,13 +539,11 @@ fn recover_lanes_detailed(
     // Contiguous global prefix from the baseline; the first missing seq (a torn tail in some
     // lane, or an unclaimed seq) truncates the global history there — fail-closed.
     let mut records = Vec::new();
-    let mut expected_seq = baseline;
-    for (seq, record) in by_seq {
+    for (expected_seq, (seq, record)) in (baseline..).zip(by_seq) {
         if seq != expected_seq {
             break;
         }
         records.push(record);
-        expected_seq += 1;
     }
     let next_seq = baseline + records.len() as u64;
     Ok(LaneRecovery {

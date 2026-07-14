@@ -115,6 +115,7 @@ Baseline (8M i32 rows, captured 2026-06-30; roofline `sum_i32` was ~1486 GB/s on
 | scan-project ordered (1% sel) | `project_compare` | ~0.12 (2-pass) | near roof/pass — SATURATED |
 | ordered compaction (50% sel) | `compare_indices_ordered` | ~0.024 (2-pass) | output-bound — expected |
 | arith VM | `arith_filter` | ~0.023 (2-pass) | ok |
+| constant mask output | `const_mask_false` | ~0.62 IN-L2 / ~0.98 OUT-OF-L2 | 1-pass i32 device fill; no host vector/H2D or result D2H (~37us / ~188us) |
 | **scalar COUNT (reduce)** | `count_i32_compare` | **~0.85** | block-reduced (was KNOWN HEADROOM) |
 | | `count_i32_between` | **~0.44** | calls count x2 |
 | filter -> indices | `expr_i64_compare_scalar` (1% sel) | ~0.11 | ok (8B col) |
@@ -128,6 +129,11 @@ are now block-reduced and near roof in this baseline (`count_i32_compare` ~0.85;
 ~0.44 since it calls count twice). (The i64/i128 FILTERS earlier looked "slow" only as a
 100%-selectivity output artifact; at ~1% sel they are fine.) Treat a ratio FALLING below the
 baseline as the regression signal.
+
+The constant-mask line was added on 2026-07-13 after removing an inherited O(rows) host `Vec<i32>` plus H2D
+upload. Its throughput denominator is the four output bytes written per row, not input bytes read; it retains
+the synchronized VM mask on device without compaction or result D2H. Compare both cache regimes and treat a
+return toward the former ~3.3 GB/s / 10,106us IN-L2 / 80,271us OUT-OF-L2 behavior as host-staging regression.
 
 ### Standard benchmark report card (BOTH layers x BOTH cache regimes)
 

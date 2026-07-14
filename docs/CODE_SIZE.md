@@ -8,8 +8,8 @@ Line count is therefore an analysis trigger, not a license to split cohesive cod
 
 ## Size envelopes
 
-Count physical lines in tracked, human-maintained source files. Rust, CUDA/C/C++, Python, shell, JavaScript, and
-TypeScript are in scope. Markdown, lockfiles, vendored dependencies, build output, and machine-generated source
+Count physical lines in tracked, human-maintained source files. Rust, PTX, CUDA/C/C++, Python, shell, JavaScript,
+and TypeScript are in scope. Markdown, lockfiles, vendored dependencies, build output, and machine-generated source
 are not. A generated file must be reproducible and clearly identified before it is excluded.
 
 | File class | Preferred envelope | Required analysis | Critical outlier |
@@ -84,14 +84,14 @@ responsibility, changes its public boundary, or reaches the stated trigger.
 
 | File | Class and current size | Cohesion rationale | Boundary that must remain intact | Re-review trigger |
 |---|---:|---|---|---|
-| _None_ | — | Current oversized files await **STRUCT-001** disposition | — | — |
+| `crates/engine/src/engine_expr.rs` | Production, 2,433 lines | After all independently stable contracts and execution phases moved to bounded leaves, the root contains exactly one cohesive resident SELECT/grouped GPU orchestration function | Keep group-key planning, derived device-buffer ownership, pass construction/execution, cross-pass alignment, grouped result/HAVING/final framing together; do not introduce a context bag or detach lifetime guards solely for line count | Growth by 20% (~2,920 lines), a second production responsibility or method family, a stable grouped-pass contract, public-boundary change, or 5,000 lines |
 
 ## Inventory command
 
 Run from the repository root:
 
 ```bash
-git ls-files -z -- '*.rs' '*.cu' '*.cuh' '*.c' '*.h' '*.hpp' '*.cc' '*.cpp' \
+git ls-files -z -- '*.rs' '*.ptx' '*.cu' '*.cuh' '*.c' '*.h' '*.hpp' '*.cc' '*.cpp' \
   '*.py' '*.sh' '*.js' '*.ts' \
   | xargs -0 wc -l \
   | sort -nr

@@ -4,6 +4,7 @@
 //! real retained-read template path the production batcher drives — across two byte-identical routes:
 //!   - `scan`      : index off (`index_probe_enabled` off)  -> full-scan equal_any  (O(rows)/batch)
 //!   - `lpb-index` : `index_probe_enabled` on               -> launch-per-batch GPU hash-index (O(1)/needle)
+//!
 //! It also sweeps the index route's atomic vs DENSE completion kernel on the batched path.
 //!
 //! WHAT THIS MEASURES (and what it does NOT). In production, point reads flow through the facade's SINGLE
@@ -282,6 +283,7 @@ fn rows_once(
 
 /// Concurrent section: `threads` workers each run `per_thread` batches through ONE shared engine in `mode`.
 /// The GPU pipelines the per-batch launches. Returns aggregate lookups/s. NOT the production coalescer path.
+#[allow(clippy::too_many_arguments)] // Benchmark dimensions stay explicit at every measured call site.
 fn measure_concurrent(
     engine: &Arc<Engine>,
     select: &Select,

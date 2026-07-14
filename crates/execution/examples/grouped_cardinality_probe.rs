@@ -102,7 +102,11 @@ fn main() {
     let bench = |goff: u64, mask: u32| -> (f64, f64, usize) {
         let run = || {
             resident
-                .group_by_i32_count_sum_from_payload(goff, off_value, &indices, mask)
+                .group_by_i32_count_sum_from_payload(
+                    gpu_db_execution::CudaGroupByInput::resident_i32(goff, off_value, rows),
+                    &indices,
+                    mask,
+                )
                 .unwrap()
                 .len()
         };

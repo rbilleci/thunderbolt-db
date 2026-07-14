@@ -2053,9 +2053,8 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
-    // M3 (doc 21): explicit NULLS FIRST/LAST on a GROUP BY result ORDER BY, honored ON-DEVICE in
-    // gpu_sort_result_rows (an int result key's NULL sentinel value is chosen per the request). The NULL
-    // group's key renders SqlValue::Null and places per the override.
+    // M3 (doc 21): explicit NULLS FIRST/LAST on a GROUP BY result ORDER BY is honored ON-DEVICE by
+    // `gpu_sort_permutation`; the validity bitmap and per-key nulls-first mask place the NULL group.
     let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
@@ -2146,9 +2145,9 @@ fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_join_order_by_explicit_nulls_first_last_on_device() {
-    // M3 (doc 21): explicit NULLS FIRST/LAST on a JOIN-result ORDER BY, honored ON-DEVICE via
-    // gpu_sort_result_rows (the override is threaded through JoinPlan.order_by_nulls_first). A LEFT join
-    // pads the unmatched row's x to NULL; the override places it.
+    // M3 (doc 21): explicit NULLS FIRST/LAST on a JOIN-result ORDER BY is honored ON-DEVICE by
+    // `sort_join_coordinates` (the override is threaded through `JoinPlan::order_by_nulls_first`). A LEFT
+    // join pads the unmatched row's x to NULL; the override places it.
     let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, n TEXT)")
         .unwrap();
@@ -4291,15 +4290,23 @@ fn gpu_inner_join_order_by_limit_offset() {
         vec![("bob".to_string(), 70), ("charlie".to_string(), 50)],
         "OFFSET 1 LIMIT 2 slices the sorted result"
     );
-    // A non-projected ORDER BY key is a follow-up -> a clear error, not a wrong/partial answer.
-    let err = e
+    // PostgreSQL permits a non-projected ORDER BY key for a non-DISTINCT SELECT. The join sorter keeps
+    // that device column through ordering and drops it only at final projection.
+    let hidden_key = e
         .execute_resident_expr_select_sql(
             "SELECT l.name FROM l JOIN r ON l.id = r.lid ORDER BY r.score DESC",
         )
-        .expect_err("non-projected ORDER BY key must be rejected, not silently dropped");
-    assert!(
-        format!("{err:?}").contains("must appear in the SELECT list"),
-        "got: {err:?}"
+        .expect("non-projected ORDER BY key");
+    assert_eq!(hidden_key.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        hidden_key.rows,
+        vec![
+            vec![SqlValue::Text("alice".to_string())],
+            vec![SqlValue::Text("bob".to_string())],
+            vec![SqlValue::Text("charlie".to_string())],
+            vec![SqlValue::Text("charlie".to_string())],
+        ],
+        "the hidden score column orders on-device before final projection"
     );
 }
 
@@ -4397,9 +4404,10 @@ fn gpu_join_result_nullable_value_columns_from_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_join_limit_offset_window_edges() {
-    // S7/V3: OFFSET/LIMIT on the join result now WINDOWS the device sort permutation (gpu_sort_permutation),
-    // gathering only the kept window -- no host drain/truncate on result data. Edge cases vs the old
-    // drain/truncate: OFFSET past the end -> empty, LIMIT 0 -> empty, OFFSET+LIMIT past the end -> clamped.
+    // S7/V3: the join result sorts device coordinates with `sort_join_coordinates`, then windows those
+    // coordinates with `window_join_coordinates` before materialization -- no host drain/truncate on result
+    // data. Edge cases vs the old drain/truncate: OFFSET past the end -> empty, LIMIT 0 -> empty,
+    // OFFSET+LIMIT past the end -> clamped.
     let mut e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
