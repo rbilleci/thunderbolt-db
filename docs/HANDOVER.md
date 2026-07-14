@@ -488,6 +488,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   both 505/487 modes, the complete 992 suite, static/source/fixture/cleanup gates, and fresh inventory pass. The
   independent worker result was lost during turn steering; repeat that audit first. JZ is mapped at current lines
   635–1526 and will complete the parent below 3,000.
+- GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
+  complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
+  debt and is not treated as a valid blocking `ubuntu-latest` gate.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.

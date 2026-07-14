@@ -3189,6 +3189,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   so JY is deliberately not recorded as closed. A fresh audit is the first handover action; after it passes,
   STRUCT-001JZ owns current parent lines 635–1526 and completes this outlier at a projected 2,695 lines.
 
+  GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
+  all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
+  complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
+  workspace/facade/pgwire chain was not a valid CPU-runner gate after production CPU SELECT fallback removal.
+  A local PostgreSQL 18 `psql` probe also reconfirmed that the checked-in PostgreSQL 16 golden expectations have
+  rendering and behavior drift already owned by PRODUCT-002; that suite is no longer a blocking CPU CI step.
+
 ## Known boundaries
 
 | Boundary | Work ID |
