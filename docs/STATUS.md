@@ -2858,6 +2858,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001JF owns exact resident payload
   submission; the actionable inventory remains 19 because the 3,731-line parent is still PLAN-owned.
 
+  STRUCT-001JF then isolated the exact resident int4 equality-payload submission owner in the rustfmt-clean
+  150-line private `engine_retained_read/submission.rs` child, reducing the parent from 3,731 to 3,589 lines. After
+  normalizing only `pub(super)`, child lines 7–149 are byte-for-byte identical to old lines 372–514. Exactly one
+  method moved behind one narrow bridge serving exactly the parent jobs path and template sibling. Eight explicit
+  imports are minimal; the only sibling edge is one-way to wave-index. Snapshot/schema/validity and row/offset/
+  device proofs/errors, event/metrics/timing, index-only distinct assertion, index/dense/atomic/scan selection,
+  relaxed hit counter, launch error mapping, and returned deferred tuple are unchanged, with no cycle, context bag,
+  unsafe, API, or unrelated parent drift. Both modes passed 29 active resident-route and five active residency-
+  payload controls. Eight actual-device jobs/template/scan/index/budget/wave/completion/dense/append/facade routes
+  passed 24 sequential plus 16 concurrent executions without device faults; both engine modes passed 505/487 and
+  the complete include-ignored suite passed 992/992 in 176.32s. Workspace all-target/all-feature check and strict
+  clippy, private-item rustdoc, exact source/import/caller/dependency/scoped-format/diff checks, generated-residue
+  cleanup, and independent audit are clean; strict rustdoc retains the known 25-link warning baseline. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001JG owns cached device-index append
+  maintenance; the actionable inventory remains 19 because the 3,589-line parent is still PLAN-owned.
+
 ## Known boundaries
 
 | Boundary | Work ID |

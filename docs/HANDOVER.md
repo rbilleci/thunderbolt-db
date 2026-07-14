@@ -378,14 +378,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   parent caller; the builder remains private. The parent is 3,731 lines. Five actual-device routes passed 15
   sequential plus 10 concurrent executions; both 505/487 modes, the complete 992-test suite, static/source/cleanup
   gates, and audit pass. STRUCT-001JF owns retained int4 payload submission.
+- STRUCT-001JF is closed. Exact retained int4 payload submission now lives normalized-exact in the rustfmt-clean
+  150-line private `engine_retained_read/submission.rs` child. Its sole bridge serves exactly the parent jobs path
+  and template sibling; the parent is 3,589 lines. Eight actual-device routes passed 24 sequential plus 16
+  concurrent executions; both 505/487 modes, the complete 992-test suite, static/source/cleanup gates, and audit
+  pass. STRUCT-001JG owns cached device-index append maintenance.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JF:** isolate current `engine_retained_read.rs` lines 372–514 into the bounded private
-   `engine_retained_read/submission.rs` owner exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JG:** isolate current `engine_retained_read.rs` lines 533–696 into the bounded private
+   `engine_retained_read/device_index_append.rs` owner exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
