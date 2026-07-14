@@ -3633,6 +3633,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   STRUCT-001KY owns current `tests/mvcc_query.rs` lines 1141–2296 as the complete initial actual-CUDA driver route
   matrix and will complete that test root below 3,000 lines.
 
+  STRUCT-001KY then isolated that exact 24-test/24-ignore initial actual-CUDA driver route matrix in the rustfmt-
+  clean 1,164-line private `tests/mvcc_query/cuda_driver_routes.rs` child, reducing the parent from 3,502 to 2,347
+  lines and completing its disposition below the test envelope without an exception. Old parent lines 1141–2296
+  and child lines 9–1164 share exact payload hash `66e7ec99…`; exact child/parent hashes are `aaeb2e1a…`/
+  `7f31404c…`, and removing the private module plus restoring the payload and lone separator 2297 reconstructs old-
+  parent hash `be2f333c…` byte-for-byte. All 24 tests/24 ignores/zero helpers and exact queries/snapshots, source/
+  filter/order/projection/limit shapes, rows, target/fallback/metrics assertions, and diagnostics are preserved
+  through two explicit import declarations/17 names. History spans exactly the MVCC-suite split and STRATA commits
+  and accounts for all 1,156 payload lines, with no child glob, visibility widening/bridge, path/include indirection,
+  unsafe, context bag, numbered shard, external-name reference, or stale copy. Seventy-two local plus 72 independent-
+  audit actual-CUDA executions passed. Local concurrent PIDs `301538`/`301546` overlapped in 311 samples and audit
+  PIDs `318767`/`318773` in 315, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes
+  passed 505/487 in 14.50s/21.74s, the complete include-ignored suite passed 992/992 in 174.62s, and workspace all-
+  target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/
+  child-format/diff/cleanup gates, fresh five-file inventory, and independent audit are clean. Runtime behavior is
+  unchanged, so HAZARD/report card were inapplicable. STRUCT-001KZ owns current execution `tests/cuda_paths.rs`
+  lines 2878–3041 as the final resident-generation lifetime soundness test and will complete the last test outlier.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3644,7 +3662,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 6 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 5 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |

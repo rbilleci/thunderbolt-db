@@ -635,6 +635,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   fresh inventory, and audit pass. The actionable inventory is now six; STRUCT-001KY owns current
   `tests/mvcc_query.rs` lines 1141–2296 as the 24-test initial actual-CUDA driver route matrix and will take that
   test root below 3,000 lines.
+- STRUCT-001KY is closed. The exact 24-test/24-ignore initial actual-CUDA driver matrix now lives in the rustfmt-
+  clean 1,164-line private `tests/mvcc_query/cuda_driver_routes.rs` child; the parent is 2,347 lines and its
+  disposition is complete without an exception. Exact payload/parent reconstruction, 72 local plus 72 audit
+  actual-CUDA executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory,
+  and audit pass. The actionable inventory is now five; STRUCT-001KZ owns current execution `tests/cuda_paths.rs`
+  lines 2878–3041 as the final resident-generation lifetime soundness test and will complete the last test outlier.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -644,9 +650,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KY:** isolate exact initial actual-CUDA MVCC driver route matrix current `tests/mvcc_query.rs`
-   lines 1141–2296 as mapped in `PLAN.md`, preserving all 24 source/filter/order/projection/limit, target,
-   fallback, row, and metrics contracts and proving them serially/concurrently on CUDA hardware.
+1. **STRUCT-001KZ:** isolate exact resident-generation lifetime soundness test current execution
+   `tests/cuda_paths.rs` lines 2878–3041 as mapped in `PLAN.md`, preserving pinned-generation publication, GPU-read,
+   and post-drain reclamation contracts and proving it serially/concurrently on CUDA hardware.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
