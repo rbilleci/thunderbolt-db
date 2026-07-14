@@ -3836,6 +3836,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   workspace-`TMPDIR` self-check, cleanup, and independent audit pass. STRUCT-001LM owns the final source-equivalent
   169-line extraction.
 
+  STRUCT-001LM then moved the two protocol/retained boundary report functions into the 169-line sourced
+  `scripts/lib/p8_ch_benchmark_protocol_boundary.sh` leaf, reducing the executable root from 3,137 to 2,969 lines
+  and completing the final outlier without an exception. After removing the standard shell-source header and
+  restoring the boundary separator, the payload hash is `5b67f7a0…`; expanding the sole source line reproduces the
+  complete post-LL parent hash `8935732c…`. The root-to-leaf dependency is one-way: the leaf consumes only `OUT_DIR`,
+  the two planned row-count env vars, and external commands, with no root helper, trap, process, port, or back-edge.
+  All 53 functions, 24 CLI modes, reports, metrics, blockers, exit behavior, and file modes remain intact. Shell
+  syntax, both direct boundary modes, the 16-row SQL-visible retained-admission/zero-H2D probe, the complete
+  workspace-`TMPDIR` self-check, source/reference/cleanup gates, and independent audit pass. The fresh standard
+  inventory has no unowned outlier: the largest tool/example root is 2,969 lines, every test is below 3,000, every
+  production file is below 2,000 except the registered 2,433-line `engine_expr.rs` exception. Runtime behavior is
+  unchanged, so HAZARD and the report card were inapplicable. STRUCT-001 is closed.
+
+  The STRUCT-001LM closeout audit also exposed one inherited benchmark-evidence mismatch, unchanged by the move:
+  the live protocol-boundary probe reports `post_mutation_residency_invalidated=false` and an accepted resident
+  route after incremental INSERT maintenance, while the wrapper metrics hardcode that field to `true` and retain
+  stale invalidation prose. This does not affect the exact structural proof or retained admission/zero-H2D result;
+  BENCH-001 owns reconciling the claim with live mutation semantics before accepting comparison evidence.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3847,7 +3866,6 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 1 actionable source file exceeds the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
