@@ -549,15 +549,17 @@ fn execute_retained_read_runtime_batch(
             works,
             route,
             batch_key,
-            filter_offset,
-            route
-                .null_columns
-                .iter()
-                .find(|layout| layout.name == batch_key.filter_column)
-                .map(|layout| layout.bitmap_byte_offset),
-            &int4_projection_columns,
-            &int4_projection_offsets,
-            text_layout,
+            RetainedReadRuntimeTextBatchPlan {
+                filter_offset,
+                filter_validity_bitmap_offset: route
+                    .null_columns
+                    .iter()
+                    .find(|layout| layout.name == batch_key.filter_column)
+                    .map(|layout| layout.bitmap_byte_offset),
+                int4_projection_columns: &int4_projection_columns,
+                int4_projection_offsets: &int4_projection_offsets,
+                text_layout,
+            },
         );
     }
     let projection_offsets = batch_key
@@ -614,7 +616,12 @@ fn execute_retained_read_runtime_batch(
             .ok_or_else(|| format!("retained read runtime missing unique result {unique_idx}"))?;
         let mut bytes = Vec::new();
         let mut writer = BackendWriter::new(&mut bytes);
-        write_select_result_rows(&mut writer, &columns, &gpu_db_engine::RowBlock::from(rows.clone())).map_err(|err| err.to_string())?;
+        write_select_result_rows(
+            &mut writer,
+            &columns,
+            &gpu_db_engine::RowBlock::from(rows.clone()),
+        )
+        .map_err(|err| err.to_string())?;
         writer
             .ready_for_query(false)
             .map_err(|err| err.to_string())?;
@@ -623,15 +630,19 @@ fn execute_retained_read_runtime_batch(
     Ok(outputs)
 }
 
+struct RetainedReadRuntimeTextBatchPlan<'a> {
+    filter_offset: u64,
+    filter_validity_bitmap_offset: Option<u64>,
+    int4_projection_columns: &'a [String],
+    int4_projection_offsets: &'a [u64],
+    text_layout: &'a ResidentDeviceTextColumnLayout,
+}
+
 fn execute_retained_read_runtime_text_batch(
     works: &[RetainedReadRuntimeWork],
     route: &RetainedReadRuntimeRoute,
     batch_key: &RetainedSelectLiteralBatchKey,
-    filter_offset: u64,
-    filter_validity_bitmap_offset: Option<u64>,
-    int4_projection_columns: &[String],
-    int4_projection_offsets: &[u64],
-    text_layout: &ResidentDeviceTextColumnLayout,
+    plan: RetainedReadRuntimeTextBatchPlan<'_>,
 ) -> Result<Vec<Vec<u8>>, String> {
     let mut unique_needles = Vec::new();
     let mut unique_by_needle = HashMap::new();
@@ -650,22 +661,23 @@ fn execute_retained_read_runtime_text_batch(
     let projected_rows = route
         .read_view
         .match_project_i32_equal_any_text_from_payload(
-            filter_offset,
-            filter_validity_bitmap_offset,
+            plan.filter_offset,
+            plan.filter_validity_bitmap_offset,
             &unique_needles,
-            int4_projection_offsets,
-            text_layout.offsets_byte_offset,
-            text_layout.bytes_byte_offset,
-            text_layout.bytes_len,
+            plan.int4_projection_offsets,
+            plan.text_layout.offsets_byte_offset,
+            plan.text_layout.bytes_byte_offset,
+            plan.text_layout.bytes_len,
             route
                 .null_columns
                 .iter()
-                .find(|layout| layout.name == text_layout.name)
+                .find(|layout| layout.name == plan.text_layout.name)
                 .map(|layout| layout.bitmap_byte_offset),
             route.row_count,
         )
         .map_err(|err| err.to_string())?;
-    let int4_projection_index = int4_projection_columns
+    let int4_projection_index = plan
+        .int4_projection_columns
         .iter()
         .enumerate()
         .map(|(idx, column)| (column.as_str(), idx))
@@ -675,7 +687,7 @@ fn execute_retained_read_runtime_text_batch(
         if let Some(rows) = rows_by_unique.get_mut(row.needle_index) {
             let mut values = Vec::with_capacity(batch_key.projection_columns.len());
             for column in &batch_key.projection_columns {
-                if column == &text_layout.name {
+                if column == &plan.text_layout.name {
                     if row.text_is_null {
                         values.push(SqlValue::Null);
                         continue;
@@ -699,7 +711,7 @@ fn execute_retained_read_runtime_text_batch(
         .projection_columns
         .iter()
         .map(|column| {
-            if column == &text_layout.name {
+            if column == &plan.text_layout.name {
                 BackendColumn::new(column, 25, -1)
             } else {
                 BackendColumn::new(column, 23, 4)
@@ -713,7 +725,12 @@ fn execute_retained_read_runtime_text_batch(
             .ok_or_else(|| format!("retained read runtime missing unique result {unique_idx}"))?;
         let mut bytes = Vec::new();
         let mut writer = BackendWriter::new(&mut bytes);
-        write_select_result_rows(&mut writer, &columns, &gpu_db_engine::RowBlock::from(rows.clone())).map_err(|err| err.to_string())?;
+        write_select_result_rows(
+            &mut writer,
+            &columns,
+            &gpu_db_engine::RowBlock::from(rows.clone()),
+        )
+        .map_err(|err| err.to_string())?;
         writer
             .ready_for_query(false)
             .map_err(|err| err.to_string())?;
