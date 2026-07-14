@@ -129,14 +129,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   GPU suite, all-target/strict-clippy/static/scoped gates, and independent audit pass; generated residue was removed.
   Raw roofline and canonical two-layer/two-cache report-card comparisons are stable, including 48M-row batched point
   reads at 250.2M lookups/s and p50 132us after the move. The expression root is 5,143 lines; HAZARD was not applicable.
+- STRUCT-001HC is closed. The exact three general-select/grouped entry bridges now share the rustfmt-clean 226-line
+  private `engine_expr/select_bridge.rs` owner behind unchanged `pub(crate)` inherent paths. Ten focused GPU controls,
+  both 505/487 engine modes, the complete 992-test GPU suite, all-target/strict-clippy/static/scoped gates, and
+  independent audit pass; generated residue was removed. The expression root is 5,014 lines; HAZARD/report card were
+  not applicable. Audit found history-proven orphaned dispatcher docs and promoted their repair as STRUCT-001HD.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HC:** move the exact three general-select/grouped entry bridges into existing `select_bridge.rs`;
-   preserve binding, normalization, source/visibility forwarding, order metadata, and stable inherent paths.
+1. **STRUCT-001HD:** re-home the history-proven orphaned dispatcher docs and isolate exact predicate dispatch plus
+   bool/NULL fast paths; preserve GPU-only dispatch order, bounds/validity/errors, consumers, and visibility.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

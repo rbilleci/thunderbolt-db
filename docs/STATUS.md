@@ -2150,6 +2150,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and indexed single-flight moved from 3.24x to 3.23x scan. Runtime behavior did not change, so HAZARD was not
   applicable.
 
+  STRUCT-001HC then consolidated the exact three general-select/grouped entry bridges in the rustfmt-clean 226-line
+  existing private `engine_expr/select_bridge.rs` leaf, reducing the expression root to 5,014 lines. All three
+  methods remain `pub(crate)` and the programmatic wrapper retains `#[allow(dead_code)]`. Every rustdoc/comment/body,
+  the single binding and argument order, legacy grouped normalization before binding, injected source/visibility,
+  predicate reconstruction before clearing all bound filters, group-key derivation, order metadata vector lengths/
+  values, consumers, imports, and dependency direction are source-equivalent; the module ownership prose now names
+  the complete bridge owner. Ten focused GPU programmatic-predicate, grouped/plain/ordered/DISTINCT dispatch,
+  sharded-source, and versioned-visibility controls pass, as do both 505/487 engine modes, the complete 992-test
+  serial GPU suite, all-target check, strict clippy, static/scoped gates, and independent audit. Generated residue
+  was removed. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
