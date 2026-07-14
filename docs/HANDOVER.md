@@ -190,14 +190,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `protocol/src/tests/command_terminators.rs` leaf. The 71-test inventory, focused/full protocol suites,
   protocol/server static gates, security preflight, normalized-source proof, and independent audit are clean; the
   root is 8,347 lines. Audit promoted the six-test legacy KV-command family as STRUCT-001HO.
+- STRUCT-001HO is closed. The exact six-test legacy KV parser family now lives in the rustfmt-clean 77-line
+  `protocol/src/tests/kv_commands.rs` leaf. The 71-test inventory, bootstrap containment, focused/full protocol
+  suites, static/security gates, normalized-source proof, and independent audit are clean; the root is 8,276
+  lines. Audit promoted the three-test session-lifecycle family as STRUCT-001HP.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HO:** move exact current protocol test lines 1,323–1,395 into `tests/kv_commands.rs` while preserving
-   alias/arity errors, bootstrap containment, the 71-test inventory, and production codec/public facade.
+1. **STRUCT-001HP:** move exact current protocol test lines 1,329–1,410 into `tests/session_lifecycle.rs` while
+   preserving transitions, Sync/error semantics, the 71-test inventory, and production codec/public facade.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

@@ -2287,6 +2287,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   gates, and independent audit are clean. Production bytes/API/visibility and runtime are unchanged, so GPU,
   HAZARD, and report-card gates were not applicable.
 
+  STRUCT-001HO then moved the exact six-test legacy GET/DEL parser-facade family into the rustfmt-clean 77-line
+  `crates/protocol/src/tests/kv_commands.rs` child, reducing the protocol root from 8,347 to 8,276 lines. Normalized
+  reconstruction is exact; DEL/DELETE/DELETE FROM aliases, exact keys, `DeleteKv`/`GetKv`, missing/extra arity,
+  `InvalidDel`/`InvalidGet`, unsupported `DELETE TABLE`, names, bodies, and errors are unchanged. This remains
+  test-only coverage of the existing bootstrap facade and does not broaden into relational DELETE or product
+  direction. The exact 71-test name-tail inventory is preserved. Six focused tests and the full protocol package
+  (71 library, 127 binary, and both one-test driver integrations), protocol all-target check/strict clippy, server
+  check, security preflight, scoped gates, and independent audit are clean. Production bytes/API/visibility and
+  runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
