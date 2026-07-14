@@ -2968,6 +2968,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inapplicable. The actionable inventory is now 17: four production, nine tests, and four examples/tools.
   STRUCT-001JL owns the inline-test extraction in `write_conveyor/src/wal_segment.rs`.
 
+  STRUCT-001JL then moved the exact complete inline `wal_segment` test body into the rustfmt-clean 830-line private
+  `write_conveyor/src/wal_segment/tests.rs` child, reducing the production root from 2,696 to 1,865 lines and
+  completing its disposition without an exception. The old wrapper reconstructs byte-identically from the child
+  (SHA-256 `85acb6e5…`), the production prefix is byte-identical (SHA-256 `69a50fea…`), and the dedented child matches
+  old lines 1866–2695 exactly (SHA-256 `9e9fbd53…`). Exactly four private helpers and 31 tests moved with four
+  imports, original order, unchanged `wal_segment::tests::*` paths, and zero production/API/visibility/unsafe/
+  format/layout drift, bridge, re-export, or context module. Focused default-concurrent, serial, and release runs
+  passed 31/31; complete debug and release crate inventories passed 59/59 each; six actual-GPU lane durability/
+  recovery executions and both 505/487 engine modes passed. Workspace check, strict write-conveyor Clippy,
+  private-item rustdoc, exact source/path/import/function/scoped-format/diff, cleanup, fresh inventory, and
+  independent audit are clean. Pure test relocation makes HAZARD/GPU roofline/report card inapplicable. The
+  actionable inventory is now 16: three production, nine tests, and four examples/tools. STRUCT-001JM owns
+  pre-durable command/constraint validation in `engine_write_apply.rs`.
+
 ## Known boundaries
 
 | Boundary | Work ID |

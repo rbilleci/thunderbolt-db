@@ -415,14 +415,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   passed sequentially and 40 exact concurrent executions passed; the independent audit added 40, both 505/487
   modes, the complete 992-test suite, affected SQL/protocol/facade and static/source/cleanup/inventory gates, and
   audit pass. The actionable inventory is 17; STRUCT-001JL owns `wal_segment` inline-test extraction.
+- STRUCT-001JL is closed. The exact inline WAL-segment test body now lives in the rustfmt-clean 830-line private
+  `write_conveyor/src/wal_segment/tests.rs` child with four helpers and 31 stable-path tests. The 1,865-line
+  production root is byte-identical outside its two-line module declaration and completes the outlier without an
+  exception. Focused 31-test concurrent/serial/release runs, complete 59-test debug/release suites, six GPU lane
+  recovery executions, both 505/487 modes, static/source/cleanup/inventory gates, and audit pass. The actionable
+  inventory is 16; STRUCT-001JM owns exact command/constraint preflight validation in `engine_write_apply.rs`.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JL:** move current `write_conveyor/src/wal_segment.rs` lines 1866–2695, dedented one level, into
-   bounded private `write_conveyor/src/wal_segment/tests.rs` exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JM:** isolate current `engine_write_apply.rs` lines 470–1942 into bounded private
+   `engine_write_apply/preflight.rs` exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
