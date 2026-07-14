@@ -2371,6 +2371,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   preflight, scoped gates, and independent audit are clean. Production bytes/API/visibility and runtime are
   unchanged, so GPU, HAZARD, and report-card gates were not applicable. The protocol disposition is complete.
 
+  STRUCT-001HW then isolated the exact streaming two-/N-way join emitter alias, mixed-radix cursor, and three-method
+  orchestration owner in the rustfmt-clean 1,396-line private `engine_streaming_exec/streaming_join.rs` descendant,
+  reducing the root from 9,447 to 8,078 lines. Direct source proof corrected the proposed boundary before editing:
+  adjacent chunk-byte and SELECT docs remain with their actual owners. Three fragment reconstructions and the root
+  reconstruction are exact; the stable `pub(crate) try_streaming_inner_join`, two `engine_sql_pg` consumers, private
+  helpers, broad descendant import, and visibility are unchanged. Recursion/product order, snapshot pinning,
+  staging/block sizing, INNER/OUTER complements, predicate/visibility/NULL masks, coordinate/buffer lifetimes,
+  projection/order/window, allocation accounting, decline/errors, and device-only relational execution are exact.
+  Both focused GPU matrices passed three serial and two concurrent rounds without device faults; engine passed
+  505 ordinary/487 ignored and the complete 992-test serial suite. Engine/workspace all-target/all-feature checks,
+  strict clippy, scoped source/format/reference gates, generated-residue cleanup, and independent audit are clean.
+  Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

@@ -221,15 +221,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001HV is closed and the protocol disposition is complete. The final catalog family lives in the
   rustfmt-clean 483-line `protocol/src/tests/catalog_sql_compat.rs`; the root is exactly 1,357 lines, all 71 tests
   remain, no protocol source crosses its required-analysis threshold, and every focused/full/static/security/
-  inventory/audit gate is clean. STRUCT-001HW now owns the exact streaming N-way join orchestration seam.
+  inventory/audit gate is clean. STRUCT-001HW then owned the exact streaming two-/N-way join orchestration seam.
+- STRUCT-001HW is closed. Exact two-/N-way streaming join orchestration now lives in the rustfmt-clean 1,396-line
+  `engine_streaming_exec/streaming_join.rs` descendant. Corrected source proofs, both focused GPU matrices at
+  3× serial/2× concurrent, both engine modes, the complete 992 suite, static gates, cleanup, and independent audit
+  are clean; the root is 8,078 lines. STRUCT-001HX owns the six-method materialized join-run sibling seam.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HW:** move the exact N-way streaming join alias/cursor/three-method owner into
-   `engine_streaming_exec/streaming_join.rs` with no visibility or runtime change and run its full GPU/suite gates.
+1. **STRUCT-001HX:** move exact current streaming root lines 773–1,203 into `materialized_join_run.rs`, using only
+   six `pub(super)` sibling bridges and preserving all GPU run layout/order/merge/decode behavior.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
