@@ -345,14 +345,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   three sibling bridges serve `lane.rs`; the parent is 1,761 lines, with 851/660/1,465-line children, so the whole
   concurrent-DML owner is complete with no exception. Eight GPU routes passed 24 sequential plus 16 concurrent
   executions; both 505/487 modes, the complete 992-test suite, static/source/cleanup gates, and audit pass.
+- STRUCT-001IZ is closed. Exact MVCC projection, row-size/transfer accounting, filter, ordering, and structural
+  identity now live byte-exact in the rustfmt-clean 1,441-line private `mvcc_read_exec/row_ops.rs` child behind a
+  six-name facade. The parent is 3,251 lines and remains PLAN-owned. Nine actual-CUDA routes passed 27 sequential
+  plus 18 concurrent executions; both 505/487 modes, the complete 992-test suite, workspace static/source/cleanup
+  gates, and independent audit pass. STRUCT-001JA owns the final follow-chain/source/all-version resolution family.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IZ:** analyze and disposition the 4,636-line `mvcc_read_exec.rs` GPU-native MVCC read owner; promote
-   any discovered STRUCT-001 child before implementation.
+1. **STRUCT-001JA:** isolate current `mvcc_read_exec.rs` lines 2858–3251 into the bounded private
+   `mvcc_read_exec/source_resolution.rs` owner exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

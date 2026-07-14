@@ -2762,6 +2762,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   851/660/1,465-line children, no exception, cycle, context bag, API drift, or R3-001 decision. The actionable
   inventory is now 20: seven production, nine tests, and four examples/tools. STRUCT-001IZ owns `mvcc_read_exec.rs`.
 
+  STRUCT-001IZ then isolated the exact MVCC row projection, size/transfer accounting, filter, ordering, and
+  structural-identity owner in the rustfmt-clean 1,441-line private `mvcc_read_exec/row_ops.rs` child, reducing the
+  parent from 4,636 to 3,251 lines. The child function region is byte-for-byte identical to old lines 2838–4227;
+  exactly six `pub(crate)` functions moved behind an exact six-name facade, and explicit imports point one-way to
+  parent-owned provenance/row contracts without a wildcard, bridge, cycle, context bag, unsafe block, or API drift.
+  Nine actual-CUDA MVCC filter/order/projection routes passed 27 sequential plus 18 concurrent executions without
+  device faults; both engine modes passed 505/487 and the complete include-ignored suite passed 992/992 in 176.84s.
+  Workspace all-target/all-feature check and strict clippy, private-item rustdoc, exact source/caller/dependency/
+  visibility/scoped-format/diff checks, 13 GiB generated-residue cleanup, and independent audit are clean. Rust
+  1.94 exposed two pre-existing example lints during the gate; a documentation paragraph break and typed retained-
+  text batch plan repaired them without behavior changes, and the server package plus workspace static gates pass.
+  Strict rustdoc retains the known 25-link warning baseline. Runtime behavior is unchanged, so HAZARD/report card
+  were inapplicable. STRUCT-001JA owns the exact follow-chain/source/all-version resolution boundary; the actionable
+  inventory remains 20 because the 3,251-line parent is still PLAN-owned.
+
 ## Known boundaries
 
 | Boundary | Work ID |
