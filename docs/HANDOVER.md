@@ -588,6 +588,13 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit
   pass. Expected rows/truth tables remain test-only parity evidence. The actionable inventory is now 10;
   STRUCT-001KR owns current `tests/mvcc_bundles.rs` lines 3–1442 as the initial provenance bundle-path family.
+- STRUCT-001KR is closed. The exact 12-test initial provenance frame/bundle-path family now lives in the rustfmt-
+  clean 1,446-line private `tests/mvcc_bundles/provenance_bundle_paths.rs` child; the parent is 3,934 lines. Exact
+  payload/parent reconstruction, 36 local plus 36 independent-audit CPU-parity executions, nine local plus nine
+  audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh
+  inventory, and audit pass. The moved cfg(test) CPU backend remains parity/bootstrap debt only. The actionable
+  inventory remains 10; STRUCT-001KS owns current parent lines 4–1368 as the occurrence-distance family and will
+  take this test root below 3,000 lines.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -597,9 +604,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KR:** isolate exact initial provenance frame/bundle-path current `tests/mvcc_bundles.rs` lines
-   3–1442 as mapped in `PLAN.md`, preserving every query/result contract and pairing the CPU parity seam with the
-   three existing actual-GPU bundle controls.
+1. **STRUCT-001KS:** isolate exact occurrence-cardinality/distance current `tests/mvcc_bundles.rs` lines 4–1368 as
+   mapped in `PLAN.md`, preserving every query/result contract, pairing the CPU parity seam with the three existing
+   actual-GPU bundle controls, and completing the root below 3,000 lines.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

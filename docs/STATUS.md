@@ -3500,6 +3500,27 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KR owns current
   `tests/mvcc_bundles.rs` lines 3–1442 as the complete initial provenance frame/bundle-path family.
 
+  STRUCT-001KR then isolated the exact initial provenance frame/bundle-path family in the rustfmt-clean 1,446-line
+  private `tests/mvcc_bundles/provenance_bundle_paths.rs` child, reducing the parent from 5,374 to 3,934 lines. Old
+  parent lines 3–1442 and child lines 7–1446 share exact payload hash `61821b5c…`; the exact child/parent hashes are
+  `fd854a96…`/`f7b58c6d…`, and removing the sole private module plus restoring the payload and separator 1443
+  reconstructs old-parent hash `151fd2f1…` byte-for-byte. All 12 tests and exact SET histories/query trees, frames,
+  bundles, summaries, quantified/positional/subpath/distance/suffix/prefix/slice filters, orders, projections,
+  limits, rows, and miss assertions are preserved through one explicit import declaration/14 names. History is
+  exactly the original MVCC-suite split plus STRATA commit, with no glob/super dependency, visibility bridge, path/
+  include indirection, unsafe, context bag, numbered shard, external-name reference, or stale copy. The moved
+  `execute_mvcc_query` tests use the cfg(test) `CpuMvccExecutionBackend` with `GpuMvccReadParityGap` and remain
+  explicit parity/bootstrap debt, never product direction; three matching CUDA-driver bundle controls provide the
+  GPU evidence. Thirty-six local plus 36 independent-audit CPU-parity executions and nine local plus nine audit
+  actual-GPU executions passed; local concurrent GPU PIDs `172548`/`172552` overlapped in 20 samples and audit PIDs
+  `184659`/`184664` overlapped repeatedly, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary
+  modes passed 505/487 in 23.15s/9.83s, the complete include-ignored suite passed 992/992 in 185.75s, and workspace
+  all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped
+  source/child-format/diff/cleanup gates, fresh 10-file inventory, and independent audit are clean. Runtime behavior
+  is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KS owns current parent lines 4–1368 as the
+  complete whole-bundle cardinality and occurrence-distance filter family and will complete this test root below
+  3,000 lines.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
