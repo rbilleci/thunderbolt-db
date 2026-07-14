@@ -3342,6 +3342,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KJ owns current parent lines 583–902 as
   the complete streaming DML-locate family.
 
+  STRUCT-001KJ then isolated the exact P3 streaming DML WHERE-locate owner in the rustfmt-clean 324-line private
+  `tests/streaming_exec/dml_locate.rs` child, reducing the parent from 4,064 to 3,744 lines. Old parent lines 583–902
+  and child lines 5–324 share exact payload hash `993252f5…`; the exact child/parent hashes are
+  `fbb7d1ff…`/`7df8bea7…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 903 reconstructs old-parent hash `775a6368…` byte-for-byte. The P3 heading, five tests/ignores, exact
+  DELETE/UPDATE/zero/no-budget SQL, counters, and NULL-bearing TEXT/DATE/NUMERIC/BOOL/BIGINT three-valued
+  differentials are preserved through three import declarations/four names. Only private parent
+  `gpu_available`/`select` are consumed; history assigns the range to the P3/SV2 commits, with no visibility bridge,
+  path/include indirection, unsafe, context bag, numbered shard, external-name reference, or stale copy. Host twins
+  are explicitly oracle/differential controls and the no-budget arm an activation fallback: parity/bootstrap-only,
+  never product direction. Fifteen local plus 15 independent-audit actual-GPU executions passed; local concurrent
+  PIDs `74520`/`74524` overlapped in seven samples and audit PIDs `84973`/`84978` in 18, with zero CUDA 700/716/719
+  or related faults. Both debug/release ordinary modes passed 505/487 in 14.47s/12.44s, the complete include-ignored
+  suite passed 992/992 in 161.86s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc
+  with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 12-file inventory, and
+  independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable.
+  STRUCT-001KK owns current parent lines 584–904 as the complete P2 cold-sidecar family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional

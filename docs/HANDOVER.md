@@ -542,6 +542,11 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   payload/parent reconstruction, 18 local plus 18 independent-audit focused executions, both 505/487 modes, the
   complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The actionable inventory remains
   12; STRUCT-001KJ owns current parent lines 583–902 as the complete streaming DML-locate family.
+- STRUCT-001KJ is closed. The exact five-test streaming DML-locate family now lives in the rustfmt-clean 324-line
+  private `tests/streaming_exec/dml_locate.rs` child; the parent is 3,744 lines. Exact payload/parent reconstruction,
+  15 local plus 15 independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/
+  source/cleanup gates, fresh inventory, and audit pass. CPU twins remain parity/bootstrap-only. The actionable
+  inventory remains 12; STRUCT-001KK owns current parent lines 584–904 as the complete P2 cold-sidecar family.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -551,8 +556,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KJ:** isolate the exact streaming DML-locate family at current `tests/streaming_exec.rs` lines
-   583–902 as mapped in `PLAN.md`, preserving range, zero-match, activation, and typed differential gates.
+1. **STRUCT-001KK:** isolate the exact P2 cold-sidecar family at current `tests/streaming_exec.rs` lines 584–904
+   as mapped in `PLAN.md`, preserving stamped reads, v2 restore, payload-rank, and COW change-log gates.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
