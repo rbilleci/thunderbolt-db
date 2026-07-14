@@ -2266,6 +2266,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   all-target check, security preflight, scoped gates, and independent audit are clean. Production bytes/API/
   visibility and runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
 
+  STRUCT-001HM then moved the exact single 441-line negative control-command parser matrix into the rustfmt-clean
+  443-line `crates/protocol/src/tests/control_command_rejections.rs` child, reducing the protocol root from 8,920
+  to 8,481 lines. Its broad historical function name is unchanged while the module explicitly owns malformed
+  transaction modes/chains, FLUSH/CHECKPOINT extras, RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/UNLISTEN/NOTIFY,
+  SET ROLE/AUTH/TRANSACTION/session-characteristic errors, exact error classifications, quoted identifiers,
+  commas, typed/dollar strings, and unterminated inputs. Normalized reconstruction and the exact 71-test name-tail
+  inventory are unchanged. The focused test and full protocol package (71 library, 127 binary, and both one-test
+  driver integrations), protocol all-target check/strict clippy, server check, security preflight, scoped gates,
+  and independent audit are clean. Production bytes/API/visibility and runtime are unchanged, so GPU, HAZARD, and
+  report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
