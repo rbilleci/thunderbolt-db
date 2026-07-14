@@ -2065,6 +2065,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   consumer/cfg/visibility/scoped-format/diff/docs gates, and independent audit pass. Fifteen GiB of generated residue
   was removed. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001GV then isolated exact join-side resident/sharded/transient source resolution in the rustfmt-clean 81-line
+  private `engine_expr/join_side.rs` leaf, reducing the expression root to 6,962 lines. Single-store precedence,
+  nonempty-shard detection, statement `copin_s`, unified descriptor/device/visibility ownership, row counts,
+  validity/memory failures, transient probe/upload/`Arc` lifetime, GPU-only errors, stable visibility, and consumers
+  remain equivalent; only rustfmt wrapping differs. The five rustdoc lines accidentally orphaned by the historical JOIN
+  insertion were moved byte-for-byte back immediately above `execute_resident_expr_select_with_binding`, their original
+  owner. Seven focused GPU resident, mixed-key, transient-catalog, sharded-flip, and streaming joins pass, as do both
+  505/487 engine modes, the complete 992-test GPU suite, all-target check, strict clippy, exact-source/import/consumer/
+  visibility/history/scoped-format/diff/docs gates, and independent audit. Fifteen GiB of generated residue was
+  removed. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
