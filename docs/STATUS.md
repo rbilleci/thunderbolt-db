@@ -2747,11 +2747,26 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   unchanged, so HAZARD/report card were inapplicable. STRUCT-001IY owns the final exact lane validation/device-
   apply/settlement extraction that will complete this file below 2,000 lines without an exception.
 
+  STRUCT-001IY then isolated exact lane unique validation, authoritative duplicate recheck, merged apply, device
+  tombstone/update launch, and settlement ownership in the rustfmt-clean 660-line private
+  `engine_dml_concurrent/lane_apply.rs` child, reducing the parent from 2,414 to 1,761 lines. Normalized
+  reconstruction matches old lines 1159–1811 after exactly three authorized `pub(super)` bridges for the existing
+  `lane.rs` callers; the other three helpers remain private. Catalog drift and 23505 behavior, device locate/recheck,
+  insert/delete/update merge order, launch/error handling, durability/applied/visible cuts, async/strict acks, stats,
+  and outcomes are source-equivalent. Eight affected GPU routes passed 24 sequential plus 16 concurrent executions
+  without CUDA 700/716/717; both engine modes passed 505/487 and the complete include-ignored suite passed 992/992.
+  Workspace all-target/all-feature check, strict engine clippy, private-item rustdoc, scoped source/visibility/
+  caller/dependency/format/diff checks, 68 GiB generated-residue cleanup, fresh inventory, and independent audit are
+  clean. Strict rustdoc remains the pre-existing link-warning baseline recorded at IW. Runtime behavior is unchanged,
+  so HAZARD/report card were inapplicable. Final file disposition is complete with a 1,761-line parent and bounded
+  851/660/1,465-line children, no exception, cycle, context bag, API drift, or R3-001 decision. The actionable
+  inventory is now 20: seven production, nine tests, and four examples/tools. STRUCT-001IZ owns `mvcc_read_exec.rs`.
+
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
-| 21 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 20 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |

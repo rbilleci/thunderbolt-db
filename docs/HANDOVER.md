@@ -10,7 +10,7 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FR is closed. The deleted 9,745-line expression PTX hub is now 13 operator/type-owned leaves, each
   below 1,500 lines. All 67 live symbols/ABIs/bodies are normalized-exact; two unreferenced legacy compactors were
   deleted. Fifteen GPU routes, full execution gates, static gates, canonical report card, and independent audit pass.
-- The PTX-inclusive source inventory now has 21 actionable outliers: eight production, nine tests, and four
+- The PTX-inclusive source inventory now has 20 actionable outliers: seven production, nine tests, and four
   examples/tools; the separately registered `engine_expr.rs` exception is not actionable.
   **STRUCT-001** owns every remaining disposition.
 - QUALITY-002 is closed. Integer SUM binding now agrees with its bigint materialized value and wire descriptor;
@@ -340,14 +340,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   prose proven misattached to lane drive was deleted. Seven GPU routes passed 21 sequential plus 14 concurrent
   executions; both 505/487 modes, the complete 992-test suite, static/source/cleanup gates, and audit pass.
   STRUCT-001IY owns the final lane validation/device-apply/settlement boundary.
+- STRUCT-001IY is closed. Exact lane validation, authoritative duplicate recheck, merged device apply, tombstone/
+  update launches, and settlement now live in the rustfmt-clean 660-line private `lane_apply.rs` child. Exactly
+  three sibling bridges serve `lane.rs`; the parent is 1,761 lines, with 851/660/1,465-line children, so the whole
+  concurrent-DML owner is complete with no exception. Eight GPU routes passed 24 sequential plus 16 concurrent
+  executions; both 505/487 modes, the complete 992-test suite, static/source/cleanup gates, and audit pass.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IY:** move current `engine_dml_concurrent.rs` lines 1159–1811 into private `lane_apply.rs`, exposing
-   only the three exact sibling-called methods and completing the parent below 2,000 lines.
+1. **STRUCT-001IZ:** analyze and disposition the 4,636-line `mvcc_read_exec.rs` GPU-native MVCC read owner; promote
+   any discovered STRUCT-001 child before implementation.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

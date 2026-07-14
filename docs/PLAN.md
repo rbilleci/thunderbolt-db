@@ -18,9 +18,9 @@ task ID here or be explicitly historical.
 
 ## Current focus
 
-1. **STRUCT-001IY — complete concurrent-DML file disposition.** Move the exact lane validation/device-apply/
-   settlement owner into bounded private `engine_dml_concurrent/lane_apply.rs`, reducing the parent below its
-   production envelope with three narrow sibling bridges and no exception or R3-001 decision.
+1. **STRUCT-001IZ — disposition MVCC read execution ownership.** Analyze the 4,636-line `mvcc_read_exec.rs`
+   production owner, promote any newly discovered STRUCT-001 child before implementation, and execute one bounded
+   behavior-preserving ownership disposition without weakening GPU-native read execution.
 2. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
    reduce the highest context risks before broad implementation work expands them further.
 3. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
@@ -37,7 +37,7 @@ the user explicitly promotes it; its hardware gates remain mandatory and are par
 The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). The corrected 2026-07-12 baseline has **30 files outside
 its analysis envelopes**: 18 production files over 2,000 lines, eight test files over 3,000 lines, and four examples
 or tools over 3,000 lines. Completed dispositions plus one subsequently crossed test threshold leave a current queue
-of **21 files**: eight production, nine tests, and four examples or tools. This inventory is a review queue, not a
+of **20 files**: seven production, nine tests, and four examples or tools. This inventory is a review queue, not a
 predetermined request to split every file.
 
 ### Analysis packet required for each file
@@ -88,8 +88,8 @@ facades, unless one is a safe leaf extraction that directly reduces an earlier w
 
 | Lines | File | Disposition / evidence |
 |---:|---|---|
-| 2,414 | `crates/engine/src/engine_dml_concurrent.rs` | **ACTIVE — STRUCT-001IW/IX isolated bounded commit-wave and lane-coordinator owners; STRUCT-001IY owns the final lane validation/device-apply/settlement extraction.** IX preserves exact executable behavior behind existing crate paths plus one parent resize bridge and deleted 18 lines of proven-misattributed D3b prose. IY is projected to reduce the parent below 2,000 with no exception; do not let structural extraction decide R3-001. |
-| 4,636 | `crates/engine/src/mvcc_read_exec.rs` | QUEUED |
+| 1,761 | `crates/engine/src/engine_dml_concurrent.rs` | **DISPOSITION COMPLETE — bounded concurrent-DML facade below 2,000 lines; no exception.** STRUCT-001IW/IX/IY isolated exact serial/sharded wave sequencing in `wave.rs` (1,465), lane coordination in `lane.rs` (851), and lane validation/device apply/settlement in `lane_apply.rs` (660). Stable crate/inherent paths remain; the nested graph has one parent resize bridge and three lane-to-apply bridges, no cycle or context bag. The stale 18-line D3b prose misattached to lane drive was deleted. Across the three slices, focused GPU intent/lane/compound/recovery routes passed 69 sequential plus 46 concurrent executions without device faults; both 505/487 modes, three complete 992-test GPU suites, static/source/cleanup gates, and independent audits pass. Structural extraction did not decide R3-001. |
+| 4,636 | `crates/engine/src/mvcc_read_exec.rs` | **ACTIVE — STRUCT-001IZ owns the required analysis packet and first bounded disposition.** Preserve GPU-native MVCC visibility/filter/order/projection behavior and stable engine/execution contracts; do not introduce a CPU hot-path answer. |
 | 3,993 | `crates/engine/src/engine_retained_read.rs` | QUEUED |
 | 3,437 | `crates/engine/src/engine_sql_pg.rs` | QUEUED |
 | 2,696 | `crates/write_conveyor/src/wal_segment.rs` | QUEUED |
@@ -132,7 +132,7 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
-| **STRUCT-001IY** | NOW | P0 | Move exact current `engine_dml_concurrent.rs` lines 1159–1811, the complete lane unique validation, authoritative duplicate recheck, merged apply, device tombstone/update, and settlement owner, into private nested `engine_dml_concurrent/lane_apply.rs`. Add only `mod lane_apply`; change exactly `lane_validate_unique`, `lane_apply_merged`, and `settle_intent_lane` to `pub(super)` for existing `lane.rs` sibling calls; keep `lane_authoritative_dup_check`, `apply_lane_tombstones_device`, and `apply_lane_updates_device` private. Preserve catalog-drift/23505 semantics, device locate/recheck, insert/delete/update merge order, tombstone/update launches, durability/applied/visible cut settlement, async/strict acknowledgements, errors, stats, and outcome ownership. Target a ~660-line child and 1,762-line parent, completing the file with bounded 1,465/851/~660 children and no exception, context bag, public API change, or R3-001 decision. Prove normalized exact range reconstruction, exactly three bridges, complete caller/dependency/final-disposition inventories; run focused non-vacuous GPU lane insert/delete/update/compound/async/recovery gates sequentially and concurrently, both engine modes, the complete engine suite, affected/workspace static checks, strict engine clippy, scoped docs/source/format/diff/cleanup, fresh inventory, and independent audit. Pure movement makes the report card inapplicable. | STRUCT-001IX complete; independent final-boundary audit; physical multi-GPU remains user-deferred | `crates/engine/src/engine_dml_concurrent.rs`; `crates/engine/src/engine_dml_concurrent/lane_apply.rs`; lane/compound/recovery tests |
+| **STRUCT-001IZ** | NOW | P0 | Produce the required current analysis packet for 4,636-line `crates/engine/src/mvcc_read_exec.rs`, identify a cohesive invariant-owned boundary, and promote any discovered safety/correctness child before extraction. Execute one behavior-preserving disposition with stable engine/execution APIs, one-way private dependencies, bounded descendants, no catch-all context bag, and no CPU hot-path expansion. Prove exact source/visibility/caller/dependency ownership; run focused non-vacuous GPU MVCC read/visibility/filter/order/projection gates sequentially and concurrently, both complete engine modes, the complete engine suite, affected/workspace static checks, strict engine clippy, scoped docs/source/format/diff/cleanup, fresh inventory, and independent audit. Run the canonical report card if the slice changes a read kernel, residency layout, scheduler, or result path; pure movement alone does not. | STRUCT-001IY complete; physical multi-GPU remains user-deferred | `crates/engine/src/mvcc_read_exec.rs`; affected MVCC/GPU read tests |
 | **STRUCT-001** | NOW | P0 | Analyze and disposition every source-size outlier through the method and ordered inventory above. Decompose by ownership, register a bounded exception, or prove generated/archive/delete status; update all references and pass targeted gates. Close only when a fresh inventory has no unowned outlier. | None | `docs/CODE_SIZE.md` |
 | **R3-001** | NOW | P0 | Audit the current lane, chunk-authoritative, MVCC-sidecar, and recovery implementations against the target write model; choose the surviving version-storage/index/CC design in an ADR. Explicitly disposition the retired mega-fuse idea rather than reviving it from archived handovers. No implementation begins from an unaccepted proposal. | None | `docs/design/write-path-design-inputs.md` |
 | **BENCH-001** | NOW | P0 | Open-loop offered-rate harness reports p50/p99/p99.9/p99.99 and saturation TPS against tuned PostgreSQL on the same host, split by deterministic-fast and interactive-slow transaction classes. Exclude warm-up from sustained metrics and publish the exact Postgres/host configuration. Results identify whether the residual is GPU-architectural or host-serial. | Quiet benchmark window and reproducible Postgres config | ADR-008; ARCHITECTURE §9 |
