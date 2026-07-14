@@ -2055,6 +2055,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were
   not applicable.
 
+  STRUCT-001GU then isolated the exact two test-only GROUP BY benchmark helpers in the rustfmt-clean 115-line private
+  `engine_expr/group_bench.rs` leaf, reducing the expression root to 7,031 lines. The module and both methods retain
+  explicit test gates; docs, inputs, catalog/snapshot/device failures, column resolution, capacity-strided offsets, u32
+  bounds, index domains, `rows_limit`, `two_level`, `runs`, `agg_mask`, timing projection, returned rows, and error
+  mapping are exact apart from explicit execution-type import normalization and consequent rustfmt wrapping. Its sole
+  live consumer remains the ignored two-level-vs-single-level GPU benchmark, which passed non-vacuously. Both 505/487
+  engine modes, the complete 992-test GPU suite, all-target check, strict test-target clippy, exact-source/import/
+  consumer/cfg/visibility/scoped-format/diff/docs gates, and independent audit pass. Fifteen GiB of generated residue
+  was removed. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
