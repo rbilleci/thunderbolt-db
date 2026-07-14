@@ -218,14 +218,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `protocol/src/tests/relational_aggregates.rs` leaf. The 71-test inventory, focused/full suites, static/security
   gates, normalized-source proof, and independent audit are clean; the root is 1,850 lines. Final protocol child
   STRUCT-001HV owns the seven bounded catalog compatibility tests.
+- STRUCT-001HV is closed and the protocol disposition is complete. The final catalog family lives in the
+  rustfmt-clean 483-line `protocol/src/tests/catalog_sql_compat.rs`; the root is exactly 1,357 lines, all 71 tests
+  remain, no protocol source crosses its required-analysis threshold, and every focused/full/static/security/
+  inventory/audit gate is clean. STRUCT-001HW now owns the exact streaming N-way join orchestration seam.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HV:** move exact current protocol test lines 1,355–1,849 into `tests/catalog_sql_compat.rs`, then
-   close the protocol disposition at the verified 1,357-line root.
+1. **STRUCT-001HW:** move the exact N-way streaming join alias/cursor/three-method owner into
+   `engine_streaming_exec/streaming_join.rs` with no visibility or runtime change and run its full GPU/suite gates.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

@@ -2359,11 +2359,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   strict clippy, server check, security preflight, scoped gates, and independent audit are clean. Production
   bytes/API/visibility and runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
 
+  STRUCT-001HV then moved the exact seven-test bounded catalog SQL compatibility family into the rustfmt-clean
+  483-line `crates/protocol/src/tests/catalog_sql_compat.rs` child, reducing the protocol root from 1,850 to the
+  exact 1,357-line endpoint. Normalized reconstruction is exact; sequence/domain/function DDL, extension cleanup,
+  sequence values, materialized-view lifecycle, normalized identifiers/signatures/types/options, exact errors,
+  names, bodies, and assertions are unchanged. The root retains one closest backend-writer test and its private
+  helper plus the private frame helper shared by 257 child calls; 13 children own the other 70 tests. Fresh
+  inventory finds no protocol source beyond its analysis threshold; the largest child is the audited cohesive
+  2,085-line single-test relational facade. Seven focused tests, the exact 71-test name inventory, full protocol
+  package (71 library, 127 binary, both one-test integrations, docs), protocol/server static gates, security
+  preflight, scoped gates, and independent audit are clean. Production bytes/API/visibility and runtime are
+  unchanged, so GPU, HAZARD, and report-card gates were not applicable. The protocol disposition is complete.
+
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
-| 26 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 24 source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
