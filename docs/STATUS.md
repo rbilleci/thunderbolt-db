@@ -2625,6 +2625,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   STRUCT-001IP owns its standalone Decimal implementation and closest pure tests. Runtime behavior did not change,
   so HAZARD/report-card/GPU-kernel gates were inapplicable.
 
+  STRUCT-001IP then isolated the standalone fixed-point Decimal implementation and its nine closest pure tests in
+  the rustfmt-clean 442-line private `sql/src/decimal.rs` leaf, reducing the SQL root from 6,772 to 6,338 lines. The
+  exact production range 708–982 and nine test functions at 6537–6697 reconstruct under the child wrappers; scoped
+  formatting only removes one blank after the local test import. The two parser-integration tests remain at root.
+  `Decimal128` and `NumericOverflow` retain their crate-root paths through one explicit re-export with no bridge,
+  dependency, or visibility expansion. Parse/format, inferred/target scale, half-up rescale, checked arithmetic and
+  overflow, scale-aligned total order, `i128::MIN`, display/traits, constants, methods, and downstream consumers are
+  unchanged. Both 11-test Decimal and 23-test full SQL modes, both four-active/42-ignored engine numeric modes, both
+  three-test facade numeric modes, SQL/protocol/engine/facade/workspace all-target/all-feature checks, SQL/protocol/
+  engine strict clippy, rustdoc-with-warnings-denied, exact source/API/reference/format/diff gates, fresh inventory,
+  and independent audit are clean. The SQL root remains critical and PLAN-owned; STRUCT-001IQ owns ACL contracts and
+  privilege parsing. Runtime behavior did not change, so HAZARD/report-card/GPU-kernel gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
