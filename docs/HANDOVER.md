@@ -105,20 +105,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   engine modes, all-target check, strict clippy, scoped source/visibility/format/diff checks, and independent audit
   pass. The complete GPU suite passed 992/0; 15 GiB of fresh generated test residue was removed. The expression root
   is 10,410 lines; HAZARD and report card were not applicable.
-- STRUCT-001GV is closed. Exact join-side resident/sharded/transient source resolution now lives in the rustfmt-clean
-  81-line private `engine_expr/join_side.rs` leaf; source precedence, ownership, lifetimes, errors, and consumers are
-  unchanged. Five historically proven orphaned select-orchestrator rustdoc lines were moved byte-for-byte back onto
-  their intended method. Seven focused GPU joins, both 505/487 engine modes, the complete 992-test GPU suite,
-  static/scoped gates, and independent audit pass; 15 GiB of generated residue was removed. The expression root is
-  6,962 lines; HAZARD/report card were not applicable.
+- STRUCT-001GW is closed. The exact four-method join entry/adapter/plan owner now lives in the rustfmt-clean 454-line
+  private `engine_expr/join_plan.rs` leaf. Argument ordering, validation, key classification, NATURAL/USING, projection,
+  ordering, sentinel, source, and final coordinate/materialized dispatch semantics are unchanged. Twenty distinct
+  focused GPU join-plan routes, both 505/487 engine modes, the complete 992-test GPU suite, static/scoped gates, and
+  independent audit pass; 15 GiB of generated residue was removed. The expression root is 6,515 lines; HAZARD/report
+  card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GW:** isolate the exact four-method join entry/adapter/plan owner into one bounded private leaf; keep
-   predicate masks, projection materialization, and coordinate execution at their established owners.
+1. **STRUCT-001GX:** isolate exact NULL-pad and resident predicate-device mask construction into one bounded leaf;
+   retain only a narrow parent seam and keep orchestration/lowering at their established owners.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

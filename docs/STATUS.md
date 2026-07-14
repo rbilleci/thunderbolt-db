@@ -2076,6 +2076,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   visibility/history/scoped-format/diff/docs gates, and independent audit. Fifteen GiB of generated residue was
   removed. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001GW then isolated the exact four-method join entry/adapter/plan owner in the rustfmt-clean 454-line private
+  `engine_expr/join_plan.rs` leaf, reducing the expression root to 6,515 lines. Three inherent methods remain
+  `pub(crate)` and the override remains private. Docs, attributes, bodies, errors, adapter argument/option ordering,
+  arity checks, statement `copin_s`, OUTER decisions, ambiguity handling, type/key classification, NATURAL/USING
+  coalescing, projection/star order, sentinel guard, ORDER alias/NULL order resolution, GPU selection, and final
+  coordinate/materialized dispatch are equivalent; only rustfmt compaction differs. Twenty distinct focused GPU
+  resident, unsupported, multi-way, comma/star/composite/text/numeric/UUID, USING/NATURAL, OUTER/WHERE, order/window,
+  and streaming join-plan routes pass, as do both 505/487 engine modes, the complete 992-test GPU suite, all-target
+  check, strict clippy, exact-source/import/consumer/visibility/scoped-format/diff/docs gates, and independent audit.
+  Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were
+  not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
