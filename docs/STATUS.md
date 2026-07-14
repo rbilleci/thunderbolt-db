@@ -3035,6 +3035,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   production files are now below 2,000 lines; the actionable inventory is 13: nine tests and four examples/tools.
   STRUCT-001JP owns the SQL scalar predicate family in `tests/resident_expr.rs`.
 
+  STRUCT-001JP then isolated the exact complete SQL-bound scalar predicate type matrix in the rustfmt-clean
+  1,459-line private `tests/resident_expr/sql_scalar_predicates.rs` child, reducing the PLAN-owned test root from
+  10,375 to 8,921 lines. The moved payload is byte-identical to old lines 1687–3141 and full-file reconstruction is
+  exact (SHA-256 `bf47b65c…`). Exactly 17 ignored actual-GPU tests and the sole private
+  `run_int8_square_gt_zero` helper moved with three explicit import declarations/six names; the parent adds only
+  one private module declaration. Test paths intentionally gained the child segment, with no facade, visibility
+  bridge, parent-local dependency, unsafe, include/path indirection, or production change. BIGINT predicates,
+  arithmetic, overflow, and boolean logic; NUMERIC comparison/arithmetic/multiply/cross-scale/AND-OR; TEXT
+  equality/LIKE; DATE/TIMESTAMP/UUID/INT2 comparisons; and BOOL predicate/projection remain exact. All 17 new
+  paths passed 51 focused local actual-GPU executions and 34 independent-audit executions, for 85 focused GPU
+  executions without CUDA faults. Both modes passed 505/487, the complete include-ignored suite passed 992/992,
+  and workspace check, strict engine Clippy, private rustdoc with the known 25-link warning baseline, scoped
+  source/format/diff/cleanup, fresh inventory, and independent audit are clean. Pure movement makes HAZARD/report
+  card inapplicable. The actionable inventory remains 13 because the parent remains above 3,000 lines;
+  STRUCT-001JQ owns its exact scalar aggregate family at current lines 1689–2271.
+
 ## Known boundaries
 
 | Boundary | Work ID |
