@@ -3597,6 +3597,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KW owns current parent lines
   1033–1939 as the complete sharded reduction family and will complete this test root below 3,000 lines.
 
+  STRUCT-001KW then isolated that exact five-test sharded reduction family in the rustfmt-clean 913-line private
+  `tests/resident_route/sharded_reductions.rs` child, reducing the parent from 3,823 to 2,916 lines and completing
+  its disposition below the test envelope without an exception. Old parent lines 1033–1939 and child lines 7–913
+  share exact payload hash `7278dd14…`; exact child/parent hashes are `a7412b06…`/`9f8753c2…`, and removing the
+  private module plus restoring the payload and lone separator 1940 reconstructs old-parent hash `ae58f71e…`
+  byte-for-byte. All five tests/zero ignores/helpers and exact shard layouts/chunks, queries, aggregate targets,
+  invalidation/missing-layout declines, rows, and diagnostics are preserved through three explicit import
+  declarations/nine names. History spans the exact six source commits and accounts for all 907 payload lines,
+  with no child glob, visibility widening/bridge, path/include indirection, unsafe, context bag, numbered shard,
+  external-name reference, or stale copy. Fifteen local plus 15 independent-audit actual-GPU executions passed.
+  Local concurrent PIDs `271192`/`271197` overlapped in two samples and audit PIDs `282084`/`282089` in three,
+  with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes passed 505/487 in 21.53s/9.31s,
+  the complete include-ignored suite passed 992/992 in 173.15s, and workspace all-target/all-feature check, strict
+  engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates,
+  fresh seven-file inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report
+  card were inapplicable. STRUCT-001KX owns current `tests/sql_catalog.rs` lines 1140–2316 as the complete core
+  relation metadata/index/constraint/drop lifecycle and will complete that test root below 3,000 lines.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3608,7 +3626,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 8 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 7 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
