@@ -471,14 +471,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   focused actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/reference/cleanup/
   inventory gates, and independent audit pass. The actionable inventory remains 13; STRUCT-001JW owns the exact
   composite-grouping matrix at current root lines 94–1063.
+- STRUCT-001JW is closed. The exact 23-test composite grouping matrix and paired bare-bigint sentinel now live in
+  the rustfmt-clean 974-line private `tests/resident_expr/composite_grouping.rs` child; the 4,684-line test root is
+  below the critical threshold but remains PLAN-owned. One hundred fifteen focused actual-GPU executions, both
+  505/487 modes, the complete 992 suite, static/source/cleanup/inventory gates, and independent audit pass. The
+  actionable inventory remains 13; STRUCT-001JX owns the exact COUNT(DISTINCT) matrix at current root lines
+  352–1138.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JW:** isolate current `tests/resident_expr.rs` lines 94–1063 into bounded private
-   `tests/resident_expr/composite_grouping.rs` exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JX:** isolate current `tests/resident_expr.rs` lines 352–1138 into bounded private
+   `tests/resident_expr/count_distinct.rs` exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

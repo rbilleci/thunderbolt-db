@@ -3143,6 +3143,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inventory, and independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The actionable
   inventory remains 13; STRUCT-001JW owns the exact composite-grouping matrix at current lines 94–1063.
 
+  STRUCT-001JW then isolated the exact complete composite-key grouping breadth matrix in the rustfmt-clean
+  974-line private `tests/resident_expr/composite_grouping.rs` child, reducing the PLAN-owned test root from
+  5,654 to 4,684 lines and below the critical 5,000-line threshold after deleting the single now-redundant
+  trailing separator blank. The payload matches old parent lines 94–1063 byte-for-byte (SHA-256 `1ab685e1…`),
+  the child/full-parent hashes match their precomputed values, and full reconstruction is exact. Exactly 23
+  ignored actual-GPU tests moved with no module helper, three header imports/five names, and the sole function-
+  local `BTreeMap`; the history-paired bare-bigint sentinel, `SqlType` schema checks, `Decimal128`, fully qualified
+  UUID parse, 21 positive target assertions, and two clean rejection controls remain exact. Test paths gained the
+  child segment with no facade, visibility bridge, sibling/parent dependency, unsafe, include/path indirection,
+  or production change. All 23 paths passed 69 focused local actual-GPU executions and 46 independent-audit
+  executions. Both modes passed 505/487, the complete include-ignored suite passed 992/992, and workspace check,
+  strict engine Clippy, private rustdoc with the known 25-link warning baseline, scoped source/format/diff/cleanup,
+  fresh inventory, and independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The
+  actionable inventory remains 13; STRUCT-001JX owns the exact COUNT(DISTINCT) matrix at current lines 352–1138.
+
 ## Known boundaries
 
 | Boundary | Work ID |
