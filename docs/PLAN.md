@@ -18,9 +18,9 @@ task ID here or be explicitly historical.
 
 ## Current focus
 
-1. **STRUCT-001IW — disposition concurrent DML execution ownership.** Analyze the 4,728-line
-   `engine_dml_concurrent.rs` production owner, promote any newly discovered STRUCT-001 child before implementation,
-   and execute one bounded behavior-preserving ownership disposition without deciding R3-001 implicitly.
+1. **STRUCT-001IX — isolate intent-lane coordinator ownership.** Move the exact lane drive/resize/submit/rescue/
+   apply-queue coordinator into a bounded private `engine_dml_concurrent/lane.rs` child, deleting the inherited
+   D3b group-flush prose proven misattached to the lane entry, without deciding R3-001 implicitly.
 2. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
    reduce the highest context risks before broad implementation work expands them further.
 3. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
@@ -88,7 +88,7 @@ facades, unless one is a safe leaf extraction that directly reduces an earlier w
 
 | Lines | File | Disposition / evidence |
 |---:|---|---|
-| 4,728 | `crates/engine/src/engine_dml_concurrent.rs` | **ACTIVE — STRUCT-001IW owns the analysis packet and first bounded disposition.** Preserve serialized-writer, lane/transaction, GPU-resident state, recovery, and R3-001 decision boundaries; do not let a structural extraction choose the target write architecture. |
+| 3,277 | `crates/engine/src/engine_dml_concurrent.rs` | **ACTIVE — STRUCT-001IW isolated the complete serial/sharded commit-wave owner in bounded 1,465-line `engine_dml_concurrent/wave.rs`; STRUCT-001IX owns the next lane-coordinator extraction.** IW preserves one inherent-method bridge and exact ordered validation/WAL/apply/wedge semantics. The parent remains PLAN-owned for lane and durability/text ownership; do not let structural extraction decide R3-001. |
 | 4,636 | `crates/engine/src/mvcc_read_exec.rs` | QUEUED |
 | 3,993 | `crates/engine/src/engine_retained_read.rs` | QUEUED |
 | 3,437 | `crates/engine/src/engine_sql_pg.rs` | QUEUED |
@@ -132,7 +132,7 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
-| **STRUCT-001IW** | NOW | P0 | Produce the required analysis packet for current 4,728-line `crates/engine/src/engine_dml_concurrent.rs`, identify a cohesive invariant-owned boundary, and promote any newly discovered safety/correctness child ahead of extraction. Then execute one behavior-preserving disposition with stable engine APIs, one-way private dependencies, no catch-all context bag or R3-001 architecture decision, and bounded descendants. Prove exact source/visibility/caller/dependency ownership; run focused non-vacuous GPU concurrent-DML/recovery gates, both complete engine modes, the complete engine suite, all affected/workspace static checks, strict scoped clippy, scoped source/format/diff/docs/cleanup, fresh inventory, and independent audit. Run the report card only if the slice changes a read kernel, residency layout, scheduler, or result path. | STRUCT-001IV complete; physical multi-GPU remains user-deferred | `crates/engine/src/engine_dml_concurrent.rs`; affected engine DML/recovery tests |
+| **STRUCT-001IX** | NOW | P0 | Move current `engine_dml_concurrent.rs` range 1158–2020 into private nested `engine_dml_concurrent/lane.rs`, but delete the inherited lines 1158–1175 D3b group-flush prose proven misattached to `drive_intent_lane`; preserve exact executable source from 1176–2020. Add only `mod lane`; retain existing `pub(crate)` inherent paths on `drive_intent_lane` and `submit_lane_intent`, keep `maybe_resize_lanes`, `rescue_held_intents`, and `drive_apply_queue_once` private, and add no bridge. Preserve single-writer lane guards, adaptive resize/barrier and hold rescue, sequence/timestamp claims, async/strict settlement, device validate/apply handoff, stats, poison, and outcome ownership. Target a <900-line child and ~2,415-line PLAN-owned parent with one-way nested-child dependencies and no context bag, public API change, or R3-001 decision. Prove exact 1176–2020 reconstruction plus explicit obsolete-doc deletion and complete visibility/caller/dependency inventories; run focused non-vacuous GPU lane insert/delete/update/resize/async/recovery gates sequentially and concurrently, both engine modes, the complete engine suite, affected/workspace static checks, strict engine clippy, scoped docs/source/format/diff/cleanup, fresh inventory, and independent audit. Pure movement makes the report card inapplicable. | STRUCT-001IW complete; independent next-boundary audit; physical multi-GPU remains user-deferred | `crates/engine/src/engine_dml_concurrent.rs`; `crates/engine/src/engine_dml_concurrent/lane.rs`; lane/recovery tests |
 | **STRUCT-001** | NOW | P0 | Analyze and disposition every source-size outlier through the method and ordered inventory above. Decompose by ownership, register a bounded exception, or prove generated/archive/delete status; update all references and pass targeted gates. Close only when a fresh inventory has no unowned outlier. | None | `docs/CODE_SIZE.md` |
 | **R3-001** | NOW | P0 | Audit the current lane, chunk-authoritative, MVCC-sidecar, and recovery implementations against the target write model; choose the surviving version-storage/index/CC design in an ADR. Explicitly disposition the retired mega-fuse idea rather than reviving it from archived handovers. No implementation begins from an unaccepted proposal. | None | `docs/design/write-path-design-inputs.md` |
 | **BENCH-001** | NOW | P0 | Open-loop offered-rate harness reports p50/p99/p99.9/p99.99 and saturation TPS against tuned PostgreSQL on the same host, split by deterministic-fast and interactive-slow transaction classes. Exclude warm-up from sustained metrics and publish the exact Postgres/host configuration. Results identify whether the residual is GPU-architectural or host-serial. | Quiet benchmark window and reproducible Postgres config | ADR-008; ARCHITECTURE §9 |

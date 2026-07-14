@@ -2715,6 +2715,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   did not change, so HAZARD/report-card/GPU-kernel gates were inapplicable. STRUCT-001IW owns the next production
   outlier, `engine_dml_concurrent.rs`.
 
+  STRUCT-001IW then isolated the exact serial/sharded commit-wave sequencing, fail-stop guard, batched unique
+  validation, ordered WAL/apply, and compound-key probe/recheck owner in the rustfmt-clean 1,465-line private
+  `engine_dml_concurrent/wave.rs` child, reducing the parent from 4,728 to 3,277 lines. Normalized reconstruction
+  matches old ranges 39–102, 407–437, 1138–2396, and 4633–4728 apart from separator blanks and the sole authorized
+  `pub(super)` on `sequence_commit_wave`; the unchanged parent caller retains inherent-method syntax and all other
+  15 child functions/contracts remain private. Serial/sharded admission, catalog-generation validation, compound
+  fingerprint plus authoritative tuple recheck, same-wave winner rules, commit-seq/row-id order, WAL patch/propose,
+  durability-prefix/ledger behavior, fast-run/device append, elision/rehydration/invalidation, wedge, and outcomes
+  are source-equivalent. Eight affected GPU routes passed 24 sequential plus 16 concurrent executions with no CUDA
+  700/716/717; both engine modes passed 505/487 and the complete include-ignored suite passed 992/992. Workspace
+  all-target/all-feature check, strict engine clippy, scoped format/diff/source/visibility/dependency checks,
+  generated-residue cleanup, and independent audit are clean. Engine rustdoc completes with private items; strict
+  rustdoc remains blocked by the pre-existing repository-wide broken/private-link baseline (including unchanged
+  links in this exact-moved parent), not by IW. Runtime behavior is unchanged, so HAZARD/report card were
+  inapplicable. STRUCT-001IX owns the next exact lane coordinator boundary and deletion of the inherited D3b
+  group-flush prose proven misattached to its lane-drive entry.
+
 ## Known boundaries
 
 | Boundary | Work ID |
