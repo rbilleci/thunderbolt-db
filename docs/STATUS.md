@@ -2912,6 +2912,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   owns the complete remaining sharded point-lookup backend and is projected to close the parent below 2,000 lines;
   the actionable inventory remains 19 until that disposition lands.
 
+  STRUCT-001JI then isolated the exact complete remaining sharded point-lookup backend in the rustfmt-clean
+  1,388-line private `engine_retained_read/shard_point_lookup.rs` child, reducing the parent from 3,049 to 1,669
+  lines and completing its disposition without an exception. The normalized child reconstructs old lines
+  537–1917 with only the three planned `pub(super)` tokens (SHA-256 `b480583c…`), and the synthesized parent is
+  byte-identical outside that range (SHA-256 `6ce9f084…`). All 11 methods moved: two existing `pub(crate)`
+  contracts, six private helpers, and exactly three narrow parent/sibling bridges, with no re-export, external API
+  growth, context bag, unsafe, sibling cycle, or new CPU product path. Per-item typed locate; generation/pressure/
+  liveness and hit proofs; host-reference cache pointer/row/ABA/monotone/load/hash/bloom behavior; DtoH-outside-lock
+  extension and revalidation; single/batch publication; cross-shard duplicate and NULL/visibility gates;
+  device-index typed layout/fold/GC-twin/budget/publication rules; and dense/binary GPU gather ordering/status/
+  counters are unchanged. Twenty-four actual-CUDA shard cache/index/batch/visibility/compound/append/update/budget
+  routes passed 24 sequential plus 48 concurrent executions; the independent audit added 60 non-vacuous engine
+  and direct execution runs. Both modes passed 505/487, the complete include-ignored suite passed 992/992 in
+  186.81s, and workspace check, strict Clippy, private-item rustdoc, exact source/bridge/import/caller/dependency/
+  scoped-format/diff, cleanup, fresh inventory, and independent audit are clean; rustdoc retains the known 25-link
+  warning baseline. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The actionable
+  inventory is now 18: five production, nine tests, and four examples/tools. STRUCT-001JJ owns PostgreSQL join
+  lowering in the next production outlier, `engine_sql_pg.rs`.
+
 ## Known boundaries
 
 | Boundary | Work ID |

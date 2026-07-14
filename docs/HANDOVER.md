@@ -395,14 +395,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   routes passed 18 sequential plus 36 concurrent executions, the independent audit added 38 executions, both
   505/487 modes, the complete 992-test suite, static/source/cleanup gates, and audit pass. STRUCT-001JI owns the
   exact complete remaining sharded point-lookup backend and is projected to close the root below 2,000 lines.
+- STRUCT-001JI is closed. The exact complete remaining sharded point-lookup backend now lives normalized-exact in
+  the rustfmt-clean 1,388-line private `engine_retained_read/shard_point_lookup.rs` child behind exactly three
+  narrow parent/sibling bridges. The root is 1,669 lines and its disposition is complete without an exception.
+  Twenty-four CUDA routes passed 24 sequential plus 48 concurrent executions, the independent audit added 60,
+  both 505/487 modes, the complete 992-test suite, static/source/cleanup/inventory gates, and audit pass. The
+  actionable inventory is 18; STRUCT-001JJ owns exact PostgreSQL join lowering in `engine_sql_pg.rs`.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JI:** isolate current `engine_retained_read.rs` lines 537–1917 into the bounded private
-   `engine_retained_read/shard_point_lookup.rs` owner exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JJ:** isolate current `engine_sql_pg.rs` lines 1956–2604 into bounded private
+   `engine_sql_pg/join_lowering.rs` exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
