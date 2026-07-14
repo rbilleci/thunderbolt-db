@@ -2999,6 +2999,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   nine tests, and four examples/tools. STRUCT-001JN owns the state-free contracts and device-predicate lowering
   prelude in `engine_dml_prepare.rs`.
 
+  STRUCT-001JN then isolated the exact complete state-free DML prepare contract and device-predicate prelude in
+  the rustfmt-clean 232-line private `engine_dml_prepare/contracts.rs` child, reducing the runtime-method root
+  from 2,200 to 1,978 lines and completing its disposition without an exception. The normalized moved source
+  matches old lines 9–236 byte-for-byte (SHA-256 `f3d0ad5f…`) after only the authorized parent-equivalent
+  `pub(super)` token on the private equality-literal helper. Exactly two tuple aliases, two functions, and the
+  two-variant validation enum with its ledger proof moved; the four crate-private facade paths, 15 DNF-lowering
+  callers, sole device-literal caller, tuple layouts, derives, canonical DATE/UUID/typed literal mapping,
+  mixed-width and text/LIKE/bool/numeric lowering, left-associated DNF order, every decline, catalog-generation
+  revalidation, and FK/PK rules are unchanged. Dependencies remain one-way to neutral SQL/table/write-set/
+  expression contracts with no `Engine`, runtime state, allocation, unsafe, reverse edge, cycle, or API growth.
+  Ten focused host controls and 54 focused actual-GPU executions passed locally; independent audit added 23
+  serial plus 23 concurrent GPU controls, for 100 focused GPU executions without CUDA faults. Both modes passed
+  505/487 and the complete include-ignored suite passed 992/992 in 181.99s; workspace check, strict engine
+  Clippy, private rustdoc with the known 25-link warning baseline, scoped source/format/diff/cleanup, fresh
+  inventory, and audit are clean. Pure movement makes HAZARD/report card inapplicable. The actionable inventory
+  is now 14: one production, nine tests, and four examples/tools. STRUCT-001JO owns the exact relational row
+  codec in `rel_exec_helpers.rs`.
+
 ## Known boundaries
 
 | Boundary | Work ID |

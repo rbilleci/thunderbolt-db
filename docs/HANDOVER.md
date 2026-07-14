@@ -426,14 +426,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   without an exception. Twenty host controls, 57 focused GPU executions, both 505/487 modes, the complete 992
   suite, static/source/cleanup/inventory gates, and independent audit pass. The actionable inventory is 15;
   STRUCT-001JN owns the exact state-free contracts/device-predicate prelude in `engine_dml_prepare.rs`.
+- STRUCT-001JN is closed. The exact state-free DML contracts/device-predicate prelude now lives in the
+  rustfmt-clean 232-line private `engine_dml_prepare/contracts.rs` child; the 1,978-line runtime-method root
+  completes the outlier without an exception. Ten host controls, 100 focused GPU executions, both 505/487
+  modes, the complete 992 suite, static/source/cleanup/inventory gates, and independent audit pass. The
+  actionable inventory is 14; STRUCT-001JO owns the exact row codec in `rel_exec_helpers.rs`.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JN:** isolate current `engine_dml_prepare.rs` lines 9–236 into bounded private
-   `engine_dml_prepare/contracts.rs` exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JO:** isolate current `rel_exec_helpers.rs` lines 721–891 into bounded private
+   `rel_exec_helpers/row_codec.rs` exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
