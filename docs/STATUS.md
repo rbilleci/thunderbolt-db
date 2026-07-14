@@ -2011,6 +2011,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   dependency/scoped-format/diff/docs gates, and independent audit. Fresh generated test residue was removed. Runtime
   behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001GQ then isolated the current resident DML transition orchestration in the rustfmt-clean 486-line private
+  `engine_expr/resident_dml.rs` leaf, reducing the expression root to 8,341 lines. The eight method docs and bodies are
+  byte-exact: five stable inherent methods remain `pub(crate)` and three helpers remain leaf-private. Shard snapshot
+  and generation capture, zone-map/local-slot correctness, W0 liveness, the already-dead filter, exact-one fingerprint
+  tuple verification, zero-row handling, partial-failure re-admit, tombstone-before-append ordering, multi-row identity,
+  the SV6 `created_by` stamp, and churn accounting are unchanged. Dependencies flow one-way to shard pruning,
+  predicate lowering, and existing resident mutation/read primitives; R3-001 remains the sole future-design owner.
+  Twelve focused GPU transition tests pass, as do both 505/487 engine modes, the complete 992-test GPU suite,
+  all-target check, strict clippy, exact-source/consumer/visibility/dependency/scoped-format/diff/docs gates, and
+  independent audit. Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and
+  report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
