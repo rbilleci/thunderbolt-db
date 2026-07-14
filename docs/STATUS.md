@@ -1999,6 +1999,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   15 GiB of fresh generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates
   were not applicable. The expression root is now 10,030 lines.
 
+  STRUCT-001GP then isolated the complete 25-function resident predicate compiler in the rustfmt-clean 1,252-line
+  private `engine_expr/predicate_compiler.rs` leaf, reducing the expression root to 8,812 lines. The exact executable
+  block now depends one-way on predicate operands through explicit imports; seven helpers remain leaf-private and only
+  the 18 proven parent-used functions gained `pub(super)`. Every `ExprStep` opcode/order, postfix-stack transition,
+  numeric rescale/canonicalization/overflow error, typed offset, 3VL validity-AND order, element-width diversion,
+  LIKE byte token, bool constant-fold result, text/UUID orientation, and error string remains source-equivalent.
+  Every `Engine` method, lowerer/execution orchestrator, runtime/device action, routing, mutation, join, R3 decision,
+  and MULTI concern remains in place. Twenty-three focused typed GPU predicate/DML tests pass, as do both 505/487
+  engine modes, the complete 992-test GPU suite, all-target check, strict clippy, exact-source/consumer/visibility/
+  dependency/scoped-format/diff/docs gates, and independent audit. Fresh generated test residue was removed. Runtime
+  behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
