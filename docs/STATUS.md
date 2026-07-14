@@ -2023,6 +2023,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   independent audit. Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and
   report-card gates were not applicable.
 
+  STRUCT-001GR then isolated private `TextRebaseOp` and the exact sharded unified-source layout/recompaction method in
+  the rustfmt-clean 727-line private `engine_expr/sharded_source.rs` leaf, reducing the expression root to 7,620 lines.
+  The executable body, errors, segment/fill/copy order, checked arithmetic, offsets, descriptor field order, counters,
+  and device proof/source-owner/sidecar/`Arc` lifetimes remain equivalent; only two rustfmt line wraps differ. The
+  stable inherent method and four callers are unchanged, dependencies are one-way, and obsolete parent imports were
+  removed without visibility expansion. Seventeen focused GPU sharded-layout routes pass, as do both 505/487 engine
+  modes, the complete 992-test GPU suite, all-target check, strict clippy, exact-source/import/consumer/visibility/
+  lifetime/scoped-format/diff/docs gates, and independent audit. The required roofline comparison showed no material
+  regression: IN/OUT `sum_i32` was 1488/1445 GB/s before and 1481/1448 after; representative normalized scan ratios
+  and 349–350/260/1678 Melem/s sort/join/grouped rates remained stable. Fifteen GiB of generated residue was removed.
+  Runtime behavior did not change, so HAZARD and the full report card were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
