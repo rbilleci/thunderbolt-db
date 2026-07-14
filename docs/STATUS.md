@@ -3264,6 +3264,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   STRUCT-001KE owns current helper-doc lines 539–540 plus helper/test block 581–832 as the complete grouped/DISTINCT
   family.
 
+  STRUCT-001KE then isolated the exact three-test streaming grouped/DISTINCT owner and sole `sorted_rows` helper in
+  the rustfmt-clean 259-line private `tests/streaming_exec/grouped_distinct.rs` child, reducing the parent from
+  5,466 to 5,212 lines. History proves commit `4a22ef91` inserted `ClassEntryDisabled` between the helper's two-line
+  rustdoc and its owner; the extraction re-homes those exact docs while retaining the guard's own two-line docs.
+  Old ranges 539–540 and 581–832 have combined payload hash `f8b46a0d…`; the exact child/parent hashes are
+  `340b0f04…`/`ad927c61…`, and restoring both ranges plus separator 833 reconstructs old-parent hash `caeeba6d…`
+  byte-for-byte. Exactly three tests/ignores and one private helper moved with no visibility bridge, path/include
+  indirection, unsafe, or dependency beyond private `gpu_available`/`select`; every `sorted_rows` consumer moved.
+  Nine local plus nine independent-audit actual-GPU executions passed, including simultaneous test processes
+  observed on the RTX PRO 6000, with zero CUDA 700/716/717. Both debug/release ordinary modes passed 505/487, the
+  complete include-ignored suite passed 992/992 in 171.98s, and workspace check, strict engine Clippy, private
+  rustdoc with the known 25-warning baseline, scoped source/format/diff/cleanup gates, fresh inventory, and
+  independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The
+  actionable inventory remains 12; STRUCT-001KF owns current parent lines 580–750 as the complete ordered-fold
+  family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
