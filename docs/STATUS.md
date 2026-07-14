@@ -2045,6 +2045,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   audit. Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates
   were not applicable.
 
+  STRUCT-001GT then isolated the exact production DISTINCT/select bridges in the rustfmt-clean 91-line private
+  `engine_expr/select_bridge.rs` leaf, reducing the expression root to 7,141 lines. The normalized old/new source hash
+  is identical; docs, errors, one-column validation, GROUP BY plus COUNT synthesis, source/visibility forwarding,
+  schema `Arc` truncation, flat `RowBlock` reframing, distinct-first dispatch, stable visibility, and consumers remain
+  exact. Dependencies flow one-way to grouped execution and neutral source/result contracts with no cycle or expansion.
+  Thirteen focused GPU/route tests pass, as do both 505/487 engine modes, the complete 992-test GPU suite, all-target
+  check, strict clippy, exact-source/import/consumer/visibility/scoped-format/diff/docs gates, and independent audit.
+  Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were
+  not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
