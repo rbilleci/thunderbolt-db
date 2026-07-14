@@ -527,6 +527,11 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   plus six independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/source/
   cleanup gates, fresh inventory, and audit pass. The actionable inventory remains 12; STRUCT-001KG owns the two
   residual reduction ranges at current parent lines 581–607 and 853–936.
+- STRUCT-001KG is closed. The exact no-budget scalar parity/bootstrap control and grouped bigint SUM regression now
+  live in their existing rustfmt-clean 374/344-line private children; the parent is 4,928 lines and below the
+  critical 5,000-line threshold. Exact ranges/parent reconstruction/child prefixes, host and actual-GPU focused
+  matrices, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass.
+  The actionable inventory remains 12; STRUCT-001KH owns current parent lines 581–1026 as the cold-tier lifecycle.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -536,8 +541,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KG:** consolidate the exact residual reduction ranges into the existing bounded scalar/grouped
-   children as mapped in `PLAN.md`, keeping the CPU assertion explicitly parity/bootstrap-only.
+1. **STRUCT-001KH:** isolate the exact cold-tier lifecycle family at current `tests/streaming_exec.rs` lines
+   581–1026 as mapped in `PLAN.md`, preserving replay, invalidation, spill, patch, stamp, and eager-maintenance gates.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

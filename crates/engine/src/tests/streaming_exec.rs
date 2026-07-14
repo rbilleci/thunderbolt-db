@@ -578,34 +578,6 @@ impl Drop for ChunkKeyIndexCapOverride {
     }
 }
 
-/// No-regression + non-vacuity WITHOUT a GPU: with NO budget configured, the streaming fold must NOT fire
-/// and the CPU host path serves the aggregate identically. Runs in the normal (non-ignored) suite so the
-/// default byte-identical behavior is gated everywhere.
-#[test]
-fn streaming_reduction_absent_without_budget_uses_host_path() {
-    let e = Engine::new_local_cpu_oracle();
-    e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a) VALUES (1), (2), (3), (4)")
-        .unwrap();
-
-    // No budget set -> the streaming gate returns None -> the CPU pinned path serves it.
-    let count = e
-        .execute_relational_select(&select("SELECT COUNT(*) FROM t"))
-        .unwrap();
-    assert_eq!(count.rows, vec![vec![SqlValue::Int8(4)]]);
-    assert_eq!(
-        e.streaming_fold_hits(),
-        0,
-        "with no residency budget the streaming fold must never fire"
-    );
-
-    let sum = e
-        .execute_relational_select(&select("SELECT SUM(a) FROM t"))
-        .unwrap();
-    assert_eq!(sum.rows, vec![vec![SqlValue::Int8(10)]]);
-    assert_eq!(e.streaming_fold_hits(), 0, "SUM stays on the host path too");
-}
-
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_cold_tier_replay_probe() {
@@ -846,91 +818,6 @@ fn gpu_streaming_cold_tier_spills_and_replays_from_disk() {
     crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
         .store(0, std::sync::atomic::Ordering::Relaxed);
     if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
-}
-
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_streaming_grouped_bigint_sum_repro() {
-    // COVERAGE gate: grouped SUM(bigint) over a streamed table = Numeric{38,0} partials in the
-    // merge with a SUM-only aggregate mask — the exact shape of the masked-pass2 phantom-group
-    // kernel bug (execution/lib.rs pass2_fn gate). NOTE (audit, sabotage-verified): this standalone
-    // test does NOT deterministically reproduce the phantom (its small row_slots lease lands in a
-    // pool bucket the phase-1 contamination does not dirty) — the AUTHORITATIVE regression gate is
-    // the suite ORDER `gpu_streaming_cold_tier_spills_and_replays_from_disk` then
-    // `gpu_streaming_distinct_over_budget_set_union`, which failed deterministically when the pass2
-    // gate was removed. This test pins the SHAPE (numeric partials + SUM mask reach the merge).
-    crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
-        .store(1024, std::sync::atomic::Ordering::Relaxed);
-    let outcome = std::panic::catch_unwind(|| {
-        let mut e = Engine::new_local_cpu_oracle();
-        let mut seq = 0u64;
-        if !gpu_available(&mut e, &mut seq) {
-            return;
-        }
-        // Phase 1: pool contamination — a spilled cold build + replays (mirrors the spill test).
-        seq += 1;
-        e.execute_text(seq, "CREATE TABLE contam (a INT)").unwrap();
-        let mut values = String::new();
-        for i in 0..1500 {
-            if i > 0 {
-                values.push(',');
-            }
-            values.push_str(&format!("({i})"));
-        }
-        seq += 1;
-        e.execute_text(seq, &format!("INSERT INTO contam (a) VALUES {values}"))
-            .unwrap();
-        e.set_relational_residency_budget_bytes(0, 4096);
-        let _ = e
-            .execute_relational_select(&select("SELECT COUNT(*) FROM contam"))
-            .unwrap();
-        let _ = e
-            .execute_relational_select(&select("SELECT SUM(a) FROM contam"))
-            .unwrap();
-        let _ = e
-            .execute_relational_select(&select("SELECT a FROM contam WHERE a >= 1000"))
-            .unwrap();
-
-        // Phase 2: grouped SUM(bigint) over a streamed table -> numeric partials in the merge.
-        seq += 1;
-        e.execute_text(seq, "CREATE TABLE gb (g INT, v BIGINT)")
-            .unwrap();
-        let mut values = String::new();
-        for i in 0..1500i64 {
-            if i > 0 {
-                values.push(',');
-            }
-            values.push_str(&format!("({}, {})", i % 13, 1000 + i));
-        }
-        seq += 1;
-        e.execute_text(seq, &format!("INSERT INTO gb (g, v) VALUES {values}"))
-            .unwrap();
-        let result = e
-            .execute_relational_select(&select("SELECT g, SUM(v) FROM gb GROUP BY g"))
-            .unwrap();
-        let mut rows = result.rows.clone().into_boxed();
-        rows.sort_by(|a, b| crate::rel_exec_helpers::compare_sql_values(&a[0], &b[0]));
-        let expected: Vec<Vec<SqlValue>> = (0..13i64)
-            .map(|g| {
-                let sum: i128 = (0..1500i64)
-                    .filter(|i| i % 13 == g)
-                    .map(|i| (1000 + i) as i128)
-                    .sum();
-                vec![
-                    SqlValue::Int4(g as i32),
-                    SqlValue::Numeric(Decimal128::new(sum, 0)),
-                ]
-            })
-            .collect();
-        assert_eq!(rows.len(), 13, "13 groups, no duplicates: got {rows:?}");
-        assert_eq!(rows, expected, "grouped SUM(bigint) exact");
-        assert!(e.streaming_fold_hits() >= 1, "streamed (not CPU)");
-    });
-    crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-    if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
 }

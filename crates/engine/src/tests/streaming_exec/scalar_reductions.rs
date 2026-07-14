@@ -344,3 +344,31 @@ fn gpu_streaming_reduction_empty_table_pg_semantics() {
         "streaming fold fired for the empty table"
     );
 }
+
+/// No-regression + non-vacuity WITHOUT a GPU: with NO budget configured, the streaming fold must NOT fire
+/// and the CPU host path serves the aggregate identically. Runs in the normal (non-ignored) suite so the
+/// default byte-identical behavior is gated everywhere.
+#[test]
+fn streaming_reduction_absent_without_budget_uses_host_path() {
+    let e = Engine::new_local_cpu_oracle();
+    e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a) VALUES (1), (2), (3), (4)")
+        .unwrap();
+
+    // No budget set -> the streaming gate returns None -> the CPU pinned path serves it.
+    let count = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM t"))
+        .unwrap();
+    assert_eq!(count.rows, vec![vec![SqlValue::Int8(4)]]);
+    assert_eq!(
+        e.streaming_fold_hits(),
+        0,
+        "with no residency budget the streaming fold must never fire"
+    );
+
+    let sum = e
+        .execute_relational_select(&select("SELECT SUM(a) FROM t"))
+        .unwrap();
+    assert_eq!(sum.rows, vec![vec![SqlValue::Int8(10)]]);
+    assert_eq!(e.streaming_fold_hits(), 0, "SUM stays on the host path too");
+}

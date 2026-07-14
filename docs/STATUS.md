@@ -3293,6 +3293,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory remains 12;
   STRUCT-001KG owns current parent lines 581–607 and 853–936 as the two residual reduction controls.
 
+  STRUCT-001KG then consolidated both residual reduction controls into their established bounded owners, reducing
+  the parent from 5,041 to 4,928 lines and below the critical 5,000-line threshold. Exact old parent lines 581–607
+  now append to the rustfmt-clean 374-line private `scalar_reductions.rs` child, while exact old lines 853–936 now
+  append to the rustfmt-clean 344-line private `grouped_distinct.rs` child. Range hashes are `d69199bd…` and
+  `008895d6…`; exact child/parent hashes are `65b3d33f…`, `c737e53e…`, and `4a2f2c1c…`, and restoring both ranges plus
+  separators 608/937 reconstructs old-parent hash `67bf2701…` byte-for-byte. The sole import change adds required
+  `Decimal128` to the grouped SQL import; old child prefixes remain exact. The scalar child now has six tests/five
+  ignores; the grouped child has four tests/four ignores/one helper. Three local plus three independent-audit host
+  executions and three local plus three independent-audit actual-GPU executions passed; simultaneous GPU processes
+  were observed on the RTX PRO 6000 with zero CUDA 700/716/717. Both debug/release ordinary modes passed 505/487,
+  the complete include-ignored suite passed 992/992 in 176.23s, and workspace check, strict engine Clippy, private
+  rustdoc with the known 25-warning baseline, scoped source/format/diff/cleanup gates, fresh inventory, and
+  independent audit are clean. The CPU assertion remains parity/bootstrap-only, never product direction. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory remains 12;
+  STRUCT-001KH owns current parent lines 581–1026 as the complete cold-tier lifecycle family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
