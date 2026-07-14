@@ -3683,7 +3683,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   compilation passed before deletion, the deleted source hash is `2c7b1120…`, archive files remain unchanged, and
   no cache/output residue remains. Splitting the mixed file would have recreated live ownership for historical,
   non-actionable data; deletion is the audited source-size disposition. Fresh inventory leaves three actionable
-  example/tool outliers. STRUCT-001LB now owns analysis and disposition of `write_conveyor_bench.rs`.
+  example/tool outliers; `PLAN.md` records their active ownership and sequence.
+
+  STRUCT-001LB analysis then classified the 4,726-line `write_conveyor_bench.rs` as a handwritten, auto-
+  discovered benchmark example with source hash `e9de8be1…`, no external non-archive path/name consumer, and
+  exactly three history commits: initial prototype, FUA/durable-WAL expansion, and a three-line lint repair. Its
+  responsibility map separates a cohesive ~1,355-line shared harness/config/type/instrumentation owner, a ~411-
+  line CLI dispatcher, ~624 lines of simple scenarios, exact 394-line direct-client and 1,564-line coalesced-client
+  latency scenario owners, a 23-line label helper, and a ~352-line WAL-worker/report tail. The selected module map
+  identifies current lines 2391–2784 for `direct_client_latency.rs` and baseline lines 2786–4349 for
+  `coalesced_client_latency.rs`, with both children depending one-way on explicit root-owned contracts while the
+  facade and shared harness remain unique. Size simulation gives a ~4,333-line intermediate root and a ~2,770-line
+  final root, below the example's 3,000-line envelope without an exception; `PLAN.md` alone owns execution order
+  and acceptance gates.
+  The cohesive coalesced owner is marginally above the normal 1,500-line module target because seven thread
+  closures share one queue/manager/durability synchronization lifetime; a further split would manufacture a broad
+  context bag or duplicate ownership. The default auto-example baseline build passes; no source behavior changed
+  in this analysis slice.
 
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the

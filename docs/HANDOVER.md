@@ -653,7 +653,16 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   documentation consolidation. It had no non-archive consumer, its live defaults no longer resolved, and an
   explicit archived-input run regenerated all four archived artifacts byte-for-byte. The obsolete script was
   deleted while archive evidence remained untouched. Three actionable example/tool rows remain; STRUCT-001LB owns
-  analysis and disposition of the 4,726-line write-conveyor benchmark example.
+  the first exact extraction from the 4,726-line write-conveyor benchmark example.
+- STRUCT-001LB analysis is complete. The handwritten example has one shared root harness and two complete client-
+  latency scenario owners. The selected two-slice disposition is exact baseline lines 2391–2784
+  (`run_file_wal_client_latency`) to private `write_conveyor_bench/direct_client_latency.rs`, followed under
+  STRUCT-001LC by baseline lines 2786–4349 (`run_file_wal_client_coalesced_latency`) to private
+  `write_conveyor_bench/coalesced_client_latency.rs`. The baseline source hash is `e9de8be1…`, its default example
+  build passes, and no non-archive external consumer was found. Preserve the root-owned CLI, shared
+  configuration/types/sampling/reporting, scenario labels/output schema, durability/recovery semantics, and use
+  only explicit one-way imports plus compile-proven narrow visibility. The projected root is ~4,333 lines after LB
+  and ~2,770 after LC; pure structural movement does not require HAZARD/report card.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -663,13 +672,16 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LB:** complete the analysis packet and audited disposition for
-   `crates/write_conveyor/examples/write_conveyor_bench.rs` as mapped in `PLAN.md`; prove scenario/harness/report
-   ownership, feature/build entry points, consumers, reproducibility, and the selected bounded module or exception.
-2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
-3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
-4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-5. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
+1. **STRUCT-001LB:** extract exact baseline lines 2391–2784, the complete 394-line
+   `run_file_wal_client_latency` scenario, to private `examples/write_conveyor_bench/direct_client_latency.rs` and
+   pass the payload/reconstruction, default-build, focused safe-smoke, source/reference/cleanup, size-inventory,
+   and independent-audit gates in `PLAN.md`.
+2. **STRUCT-001LC:** then extract the exact 1,564-line coalesced-client scenario and complete the example below
+   3,000 lines under the separately sequenced PLAN row.
+3. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
+4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
+5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+6. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 
