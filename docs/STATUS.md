@@ -2350,6 +2350,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   check, security preflight, scoped gates, and independent audit are clean. Production bytes/API/visibility and
   runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
 
+  STRUCT-001HU then moved the exact five-test relational aggregate family into the rustfmt-clean 315-line
+  `crates/protocol/src/tests/relational_aggregates.rs` child, reducing the protocol root from 2,159 to 1,850 lines.
+  Normalized reconstruction is exact; COUNT/HAVING/SUM/AVG/MIN-MAX projection/function/column/distinct/alias,
+  COUNT(*) versus column, GROUP BY/HAVING ordering, filters, output aliases/types, numeric behavior, exact errors,
+  names, bodies, and assertions are unchanged. The exact 71-test name-tail inventory, five focused tests, full
+  protocol package (71 library, 127 binary, and both one-test driver integrations), protocol all-target check/
+  strict clippy, server check, security preflight, scoped gates, and independent audit are clean. Production
+  bytes/API/visibility and runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
