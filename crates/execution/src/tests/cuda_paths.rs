@@ -1365,7 +1365,7 @@
         for offset in [0_u64, u64::MAX, 0] {
             offsets.extend_from_slice(&offset.to_le_bytes());
         }
-        let blob = [b'x'];
+        let blob = *b"x";
         let resident = runtime
             .retain_device_memory_chunks(
                 0,

@@ -900,19 +900,11 @@ impl DurableSyncSnapshot {
     }
 
     fn avg_sync_ns(self) -> u64 {
-        if self.sync_calls == 0 {
-            0
-        } else {
-            self.sync_ns / self.sync_calls
-        }
+        self.sync_ns.checked_div(self.sync_calls).unwrap_or(0)
     }
 
     fn avg_wait_ns(self) -> u64 {
-        if self.sync_calls == 0 {
-            0
-        } else {
-            self.wait_ns / self.sync_calls
-        }
+        self.wait_ns.checked_div(self.sync_calls).unwrap_or(0)
     }
 
     fn format(self) -> String {
@@ -1016,11 +1008,7 @@ impl WalPrewriteSnapshot {
     }
 
     fn avg_write_ns(self) -> u64 {
-        if self.write_calls == 0 {
-            0
-        } else {
-            self.write_ns / self.write_calls
-        }
+        self.write_ns.checked_div(self.write_calls).unwrap_or(0)
     }
 
     fn format(self) -> String {

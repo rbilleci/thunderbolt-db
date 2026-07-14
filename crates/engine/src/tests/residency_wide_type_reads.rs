@@ -17,8 +17,7 @@ fn text_column_elides_appends_and_reads_multishard() {
         e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the text gather
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
             .unwrap();
-        let mut seq = 2u64;
-        for chunk in 0..2_i64 {
+        for (seq, chunk) in (2_u64..).zip(0..2_i64) {
             // s = a varied-length string; k % 7 == 0 -> a GENUINELY EMPTY string (a zero-length blob
             // span, incl. the FIRST row k=0 and spans landing at shard boundaries) — exercises the
             // offset math where consecutive offsets are equal.
@@ -36,7 +35,6 @@ fn text_column_elides_appends_and_reads_multishard() {
                 &format!("INSERT INTO t (id, s) VALUES {}", vals.join(",")),
             )
             .unwrap();
-            seq += 1;
         }
         let elided = e.table_install_elided("t");
         let shard_count = e.resident_shard_count("t");
@@ -108,8 +106,7 @@ fn numeric_column_elides_appends_and_reads_multishard() {
         e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the gather
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, amt NUMERIC(20,4))")
             .unwrap();
-        let mut seq = 2u64;
-        for chunk in 0..2_i64 {
+        for (seq, chunk) in (2_u64..).zip(0..2_i64) {
             // amt = a distinct 4-scale decimal per row (id.frac) so a wrong gather is visible.
             let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
                 .map(|k| format!("({k}, {k}.{:04})", (k * 7) % 10000))
@@ -119,7 +116,6 @@ fn numeric_column_elides_appends_and_reads_multishard() {
                 &format!("INSERT INTO t (id, amt) VALUES {}", vals.join(",")),
             )
             .unwrap();
-            seq += 1;
         }
         let elided = e.table_install_elided("t");
         let shard_count = e.resident_shard_count("t");
@@ -179,8 +175,7 @@ fn bool_column_elides_appends_and_reads_multishard() {
         e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the bitmap gather
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, flag BOOLEAN)")
             .unwrap();
-        let mut seq = 2u64;
-        for chunk in 0..2_i64 {
+        for (seq, chunk) in (2_u64..).zip(0..2_i64) {
             // flag = (id % 3 == 0): a word-crossing true/false spread so a wrong bitmap offset, a
             // mis-packed word, or a mis-aligned cross-shard copy is visible in the differential.
             let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
@@ -191,7 +186,6 @@ fn bool_column_elides_appends_and_reads_multishard() {
                 &format!("INSERT INTO t (id, flag) VALUES {}", vals.join(",")),
             )
             .unwrap();
-            seq += 1;
         }
         let elided = e.table_install_elided("t");
         let shard_count = e.resident_shard_count("t");
@@ -302,8 +296,7 @@ fn b128_and_bigint_filtered_rehydration_reads_from_device() {
             e.set_shard_size_target(64); // multi-shard -> the gather spans shards
             e.execute_text(1, &format!("CREATE TABLE t (id INT PRIMARY KEY, val {ty})"))
                 .unwrap();
-            let mut seq = 2u64;
-            for chunk in 0..2_i64 {
+            for (seq, chunk) in (2_u64..).zip(0..2_i64) {
                 let vals: Vec<String> = (chunk * 100..(chunk + 1) * 100)
                     .map(|k| format!("({k}, {})", val_fn(k)))
                     .collect();
@@ -312,7 +305,6 @@ fn b128_and_bigint_filtered_rehydration_reads_from_device() {
                     &format!("INSERT INTO t (id, val) VALUES {}", vals.join(",")),
                 )
                 .unwrap();
-                seq += 1;
             }
             let elided = e.table_install_elided("t");
             // A FILTERED projection of the value column is NOT a served on-device shape -> CPU-pinned

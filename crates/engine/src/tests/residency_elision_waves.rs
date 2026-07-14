@@ -79,8 +79,7 @@ fn wave_batch_concurrent_dup_race_single_winner() {
     e.set_device_write_locate_wave_batch_enabled(true);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
-    let mut seq = 2u64;
-    for chunk in 0..2_i64 {
+    for (seq, chunk) in (2_u64..).zip(0..2_i64) {
         let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
             .map(|k| format!("({k},{})", k * 10))
             .collect();
@@ -89,7 +88,6 @@ fn wave_batch_concurrent_dup_race_single_winner() {
             &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
         )
         .unwrap();
-        seq += 1;
     }
     // Enter elision.
     for t in 0..20_u64 {
@@ -169,8 +167,7 @@ fn constrained_elision_same_snapshot_dup_insert_single_winner() {
     e.set_constrained_elision_enabled(true);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
-    let mut seq = 2u64;
-    for chunk in 0..2_i64 {
+    for (seq, chunk) in (2_u64..).zip(0..2_i64) {
         let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
             .map(|k| format!("({k},{})", k * 10))
             .collect();
@@ -179,7 +176,6 @@ fn constrained_elision_same_snapshot_dup_insert_single_winner() {
             &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
         )
         .unwrap();
-        seq += 1;
     }
     // Enter elision via a handled wave append.
     for t in 0..20_u64 {
@@ -250,8 +246,7 @@ fn constrained_elision_concurrent_dup_race_single_winner_per_key() {
     e.set_constrained_elision_enabled(true);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
-    let mut seq = 2u64;
-    for chunk in 0..2_i64 {
+    for (seq, chunk) in (2_u64..).zip(0..2_i64) {
         let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
             .map(|k| format!("({k},{})", k * 10))
             .collect();
@@ -260,7 +255,6 @@ fn constrained_elision_concurrent_dup_race_single_winner_per_key() {
             &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
         )
         .unwrap();
-        seq += 1;
     }
     let successes: Vec<std::sync::atomic::AtomicU32> = (0..200)
         .map(|_| std::sync::atomic::AtomicU32::new(0))

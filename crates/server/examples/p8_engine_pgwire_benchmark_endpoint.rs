@@ -1972,10 +1972,9 @@ fn retained_select_literal_needle(select: &Select) -> Option<i32> {
         select.filter_groups[0].clone()
     } else if !select.filters.is_empty() {
         select.filters.clone()
-    } else if let Some(filter) = select.filter.clone() {
-        vec![filter]
     } else {
-        return None;
+        let filter = select.filter.clone()?;
+        vec![filter]
     };
     if filters.len() != 1 || filters[0].op != SelectFilterOp::Eq {
         return None;
@@ -2011,10 +2010,9 @@ fn retained_select_literal_batch_candidate(
         select.filter_groups[0].clone()
     } else if !select.filters.is_empty() {
         select.filters.clone()
-    } else if let Some(filter) = select.filter.clone() {
-        vec![filter]
     } else {
-        return None;
+        let filter = select.filter.clone()?;
+        vec![filter]
     };
     if filters.len() != 1 || filters[0].op != SelectFilterOp::Eq {
         return None;

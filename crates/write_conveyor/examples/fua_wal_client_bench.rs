@@ -521,7 +521,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     continue;
                                 }
                                 while seq - shared.consumed_seq.load(Ordering::Acquire)
-                                    >= shared.ring_mask + 1
+                                    > shared.ring_mask
                                 {
                                     std::thread::yield_now();
                                 }
@@ -565,9 +565,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             return (latencies, wake_lags);
                         }
                         // slot reuse gate
-                        while seq - shared.consumed_seq.load(Ordering::Acquire)
-                            >= shared.ring_mask + 1
-                        {
+                        while seq - shared.consumed_seq.load(Ordering::Acquire) > shared.ring_mask {
                             std::thread::yield_now();
                         }
                         let ingress = Instant::now();

@@ -47,10 +47,9 @@ pub(crate) fn shard_point_lookup_int4_eq(
         bound.filter_groups.clone()
     } else if !bound.filters.is_empty() {
         vec![bound.filters.clone()]
-    } else if let Some(filter) = bound.filter.clone() {
-        vec![vec![filter]]
     } else {
-        return None;
+        let filter = bound.filter.clone()?;
+        vec![vec![filter]]
     };
     if filter_groups.len() != 1 || filter_groups[0].len() != 1 {
         return None;

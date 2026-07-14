@@ -422,8 +422,7 @@ fn constrained_elision_ddl_race_does_not_wedge_the_commit_path() {
     // Defaults: elision ON (the A5 flip). The wedge repro does NOT need constrained
     // elision — the DDL's validator read on an A5-elided table is enough.
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
-    let mut seq = 2u64;
-    for chunk in 0..2_i64 {
+    for (seq, chunk) in (2_u64..).zip(0..2_i64) {
         let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
             .map(|k| format!("({k},{})", k * 10))
             .collect();
@@ -432,7 +431,6 @@ fn constrained_elision_ddl_race_does_not_wedge_the_commit_path() {
             &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
         )
         .unwrap();
-        seq += 1;
     }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let txn = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(10_000));
@@ -527,8 +525,7 @@ fn constrained_elision_offlock_rehydrate_races_sequencer_safely() {
     e.set_constrained_elision_enabled(true);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
-    let mut seq = 2u64;
-    for chunk in 0..2_i64 {
+    for (seq, chunk) in (2_u64..).zip(0..2_i64) {
         let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
             .map(|k| format!("({k},{})", k * 10))
             .collect();
@@ -537,7 +534,6 @@ fn constrained_elision_offlock_rehydrate_races_sequencer_safely() {
             &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
         )
         .unwrap();
-        seq += 1;
     }
     // Elide via waves, then CHURN the open shard: the SV5 update-append duplicates key 130
     // in the id column -> the cached index entry DECLINES (monotone) -> subsequent unique

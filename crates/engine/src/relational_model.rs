@@ -206,11 +206,7 @@ impl RowBlock {
         Self { values, ncols }
     }
     pub fn len(&self) -> usize {
-        if self.ncols == 0 {
-            0
-        } else {
-            self.values.len() / self.ncols
-        }
+        self.values.len().checked_div(self.ncols).unwrap_or(0)
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0

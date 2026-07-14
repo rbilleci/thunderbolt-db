@@ -321,11 +321,9 @@ fn a4b_multi_row_dml_stays_incremental_and_matches_oracle() {
             })
             .collect()
     };
-    let mut seq = 300_u64;
-    for sql in &statements {
+    for (seq, sql) in (300_u64..).zip(&statements) {
         e.execute_text(seq, sql).unwrap();
         o.execute_text(seq, sql).unwrap();
-        seq += 1;
     }
     for (shard_id, ptr) in &ptrs_before {
         let survived = e
