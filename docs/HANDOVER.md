@@ -615,6 +615,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The actionable
   inventory is now eight; STRUCT-001KV owns current `tests/resident_route.rs` lines 1032–1857 as the complete
   sharded lookup and retained batched-projection family.
+- STRUCT-001KV is closed. The exact six-test sharded lookup/projection family now lives in the rustfmt-clean
+  832-line private `tests/resident_route/sharded_lookup.rs` child; the parent is 3,823 lines. Exact payload/parent
+  reconstruction, nine local plus nine audit ordinary executions, nine local plus nine audit actual-GPU executions,
+  both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The
+  actionable inventory remains eight; STRUCT-001KW owns current parent lines 1033–1939 as the sharded reduction
+  family and will take this test root below 3,000 lines.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -624,9 +630,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KV:** isolate exact sharded-lookup current `tests/resident_route.rs` lines 1032–1857 as mapped in
-   `PLAN.md`, preserving every shard/chunk/query/result/decline contract and pairing the three ordinary fixture
-   paths with the three ignored actual-GPU stable-order/batched-projection paths.
+1. **STRUCT-001KW:** isolate exact sharded reductions current `tests/resident_route.rs` lines 1033–1939 as mapped in
+   `PLAN.md`, preserving every shard/chunk/query/aggregate/decline contract and proving all five paths serially and
+   concurrently on actual CUDA hardware.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

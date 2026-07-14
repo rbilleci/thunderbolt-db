@@ -3580,6 +3580,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inapplicable. STRUCT-001KV owns current `tests/resident_route.rs` lines 1032–1857 as the complete sharded lookup
   and retained batched-projection family.
 
+  STRUCT-001KV then isolated that exact six-test sharded lookup/projection family in the rustfmt-clean 832-line
+  private `tests/resident_route/sharded_lookup.rs` child, reducing the parent from 4,649 to 3,823 lines. Old parent
+  lines 1032–1857 and child lines 7–832 share exact payload hash `530cf7e2…`; exact child/parent hashes are
+  `4177e2df…`/`ae58f71e…`, and removing the private module plus restoring the payload and separator 1858
+  reconstructs old-parent hash `a8465275…` byte-for-byte. All six tests/three ignores and exact shard layouts,
+  chunks, queries, stable-order loops, target assertions, decline behavior, rows, and diagnostics are preserved
+  through three explicit import declarations/eight names. History spans the exact five source commits, with no
+  child glob, visibility widening/bridge, path/include indirection, unsafe, helper, context bag, numbered shard,
+  external-name reference, or stale copy. Nine local plus nine audit ordinary executions and nine local plus nine
+  audit actual-GPU executions passed. Local concurrent GPU PIDs `259486`/`259491` overlapped in four samples and
+  audit PIDs `270075`/`270080` in five, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary
+  modes passed 505/487 in 16.48s/12.68s, the complete include-ignored suite passed 992/992 in 167.86s, and workspace
+  all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped
+  source/child-format/diff/cleanup gates, fresh eight-file inventory, and independent audit are clean. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KW owns current parent lines
+  1033–1939 as the complete sharded reduction family and will complete this test root below 3,000 lines.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
