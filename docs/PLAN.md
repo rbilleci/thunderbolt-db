@@ -18,9 +18,9 @@ task ID here or be explicitly historical.
 
 ## Current focus
 
-1. **STRUCT-001JC — isolate CUDA MVCC filter execution.** Move the exact visibility/source/filter mask pipeline and
-   key/value/provenance/bundle mask owner into bounded private `mvcc_read_exec/cuda_filter.rs` behind an 18-name
-   crate facade, completing the MVCC read root below 2,000 lines without weakening GPU-native execution.
+1. **STRUCT-001JD — isolate retained-read prepared templates.** Move the exact prepared-template construction and
+   batched point-lookup submission pair into bounded private `engine_retained_read/template.rs` while preserving
+   public inherent paths and GPU-resident payload execution.
 2. **STRUCT-001 — analyze and disposition every oversized source file.** Establish safe module boundaries and
    reduce the highest context risks before broad implementation work expands them further.
 3. **R3-001 — reconcile the live write path with the target GPU-native write design.** This remains the next
@@ -37,7 +37,7 @@ the user explicitly promotes it; its hardware gates remain mandatory and are par
 The source-size standard is [`CODE_SIZE.md`](CODE_SIZE.md). The corrected 2026-07-12 baseline has **30 files outside
 its analysis envelopes**: 18 production files over 2,000 lines, eight test files over 3,000 lines, and four examples
 or tools over 3,000 lines. Completed dispositions plus one subsequently crossed test threshold leave a current queue
-of **20 files**: seven production, nine tests, and four examples or tools. This inventory is a review queue, not a
+of **19 files**: six production, nine tests, and four examples or tools. This inventory is a review queue, not a
 predetermined request to split every file.
 
 ### Analysis packet required for each file
@@ -89,9 +89,9 @@ facades, unless one is a safe leaf extraction that directly reduces an earlier w
 | Lines | File | Disposition / evidence |
 |---:|---|---|
 | 1,761 | `crates/engine/src/engine_dml_concurrent.rs` | **DISPOSITION COMPLETE — bounded concurrent-DML facade below 2,000 lines; no exception.** STRUCT-001IW/IX/IY isolated exact serial/sharded wave sequencing in `wave.rs` (1,465), lane coordination in `lane.rs` (851), and lane validation/device apply/settlement in `lane_apply.rs` (660). Stable crate/inherent paths remain; the nested graph has one parent resize bridge and three lane-to-apply bridges, no cycle or context bag. The stale 18-line D3b prose misattached to lane drive was deleted. Across the three slices, focused GPU intent/lane/compound/recovery routes passed 69 sequential plus 46 concurrent executions without device faults; both 505/487 modes, three complete 992-test GPU suites, static/source/cleanup gates, and independent audits pass. Structural extraction did not decide R3-001. |
-| 2,528 | `crates/engine/src/mvcc_read_exec.rs` | **ACTIVE — STRUCT-001IZ/JA/JB isolated exact bounded row-operation (1,441), source-resolution (400), and query-capability (347) owners; STRUCT-001JC owns the final exact CUDA filter boundary projected to complete the root below 2,000 lines.** Preserve GPU-native MVCC visibility/filter/order/projection behavior and stable engine/execution contracts; do not introduce a CPU hot-path answer. |
-| 3,993 | `crates/engine/src/engine_retained_read.rs` | QUEUED |
-| 3,437 | `crates/engine/src/engine_sql_pg.rs` | QUEUED |
+| 1,952 | `crates/engine/src/mvcc_read_exec.rs` | **DISPOSITION COMPLETE — bounded GPU-native MVCC read root below 2,000 lines; no exception.** STRUCT-001IZ/JA/JB/JC isolated exact row-operation (1,441), source-resolution (400), query-capability (347), and CUDA filter (594) owners behind stable crate facades. The final JC slice passed 39 sequential plus 26 concurrent actual-CUDA filter executions, both 505/487 modes, the complete 992-test suite, static/source/cleanup gates, fresh inventory, and independent audit. Dependencies remain one-way, backend contracts remain root-owned, and no CPU hot path or API drift was introduced. |
+| 3,993 | `crates/engine/src/engine_retained_read.rs` | **ACTIVE — STRUCT-001JD owns the exact prepared-template pair as the first bounded disposition.** Preserve GPU-resident retained snapshots/payload execution, stable public inherent paths, and explicit CPU-reference debt boundaries. |
+| 3,438 | `crates/engine/src/engine_sql_pg.rs` | QUEUED |
 | 2,696 | `crates/write_conveyor/src/wal_segment.rs` | QUEUED |
 | 2,250 | `crates/engine/src/engine_write_apply.rs` | QUEUED |
 | 2,200 | `crates/engine/src/engine_dml_prepare.rs` | QUEUED |
@@ -119,7 +119,7 @@ handwritten tool, reproducible generated artifact, or obsolete evidence before c
 |---:|---|---|
 | 14,889 | `scripts/generate_research_paper_mechanism_links.py` | QUEUED |
 | 4,738 | `crates/write_conveyor/examples/write_conveyor_bench.rs` | QUEUED |
-| 3,653 | `crates/server/examples/p8_engine_pgwire_benchmark_endpoint.rs` | QUEUED |
+| 3,670 | `crates/server/examples/p8_engine_pgwire_benchmark_endpoint.rs` | QUEUED |
 | 3,137 | `scripts/run_p8_ch_benchmark_residency_probe.sh` | QUEUED |
 
 STRUCT-001 closes only when every row has an audited disposition; every accepted retention appears in the
@@ -132,7 +132,7 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
-| **STRUCT-001JC** | NOW | P0 | Move exact current `mvcc_read_exec.rs` lines 204–789, exactly 18 functions from `execute_cuda_supported_filter` through `prefix_equivalent_key_range`, into private nested `mvcc_read_exec/cuda_filter.rs`. Keep backend contracts/types and `CudaMvccExecutionBackend` in the root. Add `mod cuda_filter` and an explicit 18-name `pub(crate) use` facade with only a statement-scoped unused-import allowance to preserve formerly crate-root-visible helper paths. Preserve filter execution, visibility/source/filter mask composition, CPU-resolved filters, key exact/prefix/range and value masks, scalar/bundle provenance masks, logical any/count behavior, and prefix-range equivalence exactly. Keep dependency direction child-to-parent backend/row contracts, existing query-capability/row-ops facades, execution runtime, and model types; neither sibling may depend back on this child, and no cycle, context bag, API growth, or CPU hot path is allowed. Target a ~620-line child and ~1,960-line bounded root, completing this production outlier with no exception if fresh inventory confirms. Prove exact-range reconstruction, exact 18-name facade, imports/callers, and backend ownership; run focused non-vacuous visibility/source/key/value/provenance/bundle/logical CUDA filter controls sequentially and concurrently, both-mode MVCC query/provenance/bundle suites, both complete engine modes, the complete engine suite, affected/workspace static checks, strict engine clippy, scoped docs/source/format/diff/cleanup, fresh inventory, and independent audit. Pure movement makes HAZARD/report card inapplicable. | STRUCT-001JB complete; independent responsibility/history/dependency map; physical multi-GPU remains user-deferred | `crates/engine/src/mvcc_read_exec.rs`; `crates/engine/src/mvcc_read_exec/cuda_filter.rs`; MVCC GPU/read suites |
+| **STRUCT-001JD** | NOW | P0 | Move exact current `engine_retained_read.rs` lines 369–505, including their rustdocs, into private nested `engine_retained_read/template.rs`: exactly the two public inherent methods `prepare_relational_retained_read_template` and `submit_relational_retained_template_point_lookups`. Add only `mod template`; preserve the public inherent paths without re-export or visibility bridge. Preserve single prepare/bind, filter-shape validation, generation/validity/device-memory checks, empty-batch `Ready` result, one resident payload launch, shared schema/access-path ownership, pending metadata, errors, and timing exactly. Keep dependency direction child-to-parent prepare/bind/MVCC-query/snapshot-handle helpers and private payload submission plus explicit retained-model/SQL/time/Arc types; the parent must not call the pair, and no cycle, context bag, public API growth, or CPU hot path is allowed. Target a ~150–165-line child and ~3,857-line PLAN-owned parent. Prove exact-range reconstruction, exact two-method inventory, imports/helpers/callers/history, and unchanged visibility; run focused template prepare/generation/empty/schema/index-vs-scan/dense-vs-atomic controls, non-vacuous wave-index/wave-engine/batched-completion/residency-payload template CUDA controls sequentially and concurrently, facade point-lookup-batcher controls, both engine/facade modes, the complete engine suite, affected/workspace static checks, strict clippy, rustdoc, scoped source/format/diff/cleanup, fresh inventory, and independent audit. Pure movement makes HAZARD/report card inapplicable. | STRUCT-001JC complete; independent responsibility/history/dependency map; physical multi-GPU remains user-deferred | `crates/engine/src/engine_retained_read.rs`; `crates/engine/src/engine_retained_read/template.rs`; retained-read/template/wave/facade suites |
 | **STRUCT-001** | NOW | P0 | Analyze and disposition every source-size outlier through the method and ordered inventory above. Decompose by ownership, register a bounded exception, or prove generated/archive/delete status; update all references and pass targeted gates. Close only when a fresh inventory has no unowned outlier. | None | `docs/CODE_SIZE.md` |
 | **R3-001** | NOW | P0 | Audit the current lane, chunk-authoritative, MVCC-sidecar, and recovery implementations against the target write model; choose the surviving version-storage/index/CC design in an ADR. Explicitly disposition the retired mega-fuse idea rather than reviving it from archived handovers. No implementation begins from an unaccepted proposal. | None | `docs/design/write-path-design-inputs.md` |
 | **BENCH-001** | NOW | P0 | Open-loop offered-rate harness reports p50/p99/p99.9/p99.99 and saturation TPS against tuned PostgreSQL on the same host, split by deterministic-fast and interactive-slow transaction classes. Exclude warm-up from sustained metrics and publish the exact Postgres/host configuration. Results identify whether the residual is GPU-architectural or host-serial. | Quiet benchmark window and reproducible Postgres config | ADR-008; ARCHITECTURE §9 |

@@ -2808,11 +2808,28 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   unchanged, so HAZARD/report card were inapplicable. STRUCT-001JC owns the exact CUDA filter pipeline projected to
   complete this root below 2,000 lines; the actionable inventory remains 20 until that disposition closes.
 
+  STRUCT-001JC then isolated the exact CUDA MVCC filter execution, visibility/source/filter mask composition,
+  key/range/prefix/value masks, scalar/bundle provenance masks, logical any/count behavior, and prefix-range
+  equivalence in the rustfmt-clean 594-line private `mvcc_read_exec/cuda_filter.rs` child, reducing the parent from
+  2,528 to 1,952 lines. Child lines 9–594 are byte-for-byte identical to old lines 204–789; exactly 18 functions
+  moved behind an exact 18-name facade with a statement-only unused-import allowance preserving former crate paths.
+  Backend contracts/types remain root-owned, imports are explicit, and dependencies point one-way through existing
+  query-capability, row-ops, and provenance facades with no reverse edge, cycle, context bag, unsafe, API, or
+  behavior drift. Both modes passed all 103 affected active MVCC query/provenance/bundle tests. Thirteen actual-CUDA
+  source/visibility/key/range/prefix/string/numeric/logical/provenance/bundle/CPU-resolved filter routes passed 39
+  sequential plus 26 concurrent executions without device faults; both engine modes passed 505/487 and the complete
+  include-ignored suite passed 992/992 in 176.39s. Workspace all-target/all-feature check and strict clippy,
+  private-item rustdoc, exact source/facade/import/caller/scoped-format/diff checks, generated-residue cleanup, fresh
+  inventory, and independent audit are clean; strict rustdoc retains the known 25-link warning baseline. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. Final file disposition is complete with a
+  1,952-line root and bounded 594/347/1,441/400-line children, no exception. The actionable inventory is now 19:
+  six production, nine tests, and four examples/tools. STRUCT-001JD owns `engine_retained_read.rs`.
+
 ## Known boundaries
 
 | Boundary | Work ID |
 |---|---|
-| 20 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 19 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |

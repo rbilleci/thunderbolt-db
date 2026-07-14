@@ -10,7 +10,7 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FR is closed. The deleted 9,745-line expression PTX hub is now 13 operator/type-owned leaves, each
   below 1,500 lines. All 67 live symbols/ABIs/bodies are normalized-exact; two unreferenced legacy compactors were
   deleted. Fifteen GPU routes, full execution gates, static gates, canonical report card, and independent audit pass.
-- The PTX-inclusive source inventory now has 20 actionable outliers: seven production, nine tests, and four
+- The PTX-inclusive source inventory now has 19 actionable outliers: six production, nine tests, and four
   examples/tools; the separately registered `engine_expr.rs` exception is not actionable.
   **STRUCT-001** owns every remaining disposition.
 - QUALITY-002 is closed. Integer SUM binding now agrees with its bigint materialized value and wire descriptor;
@@ -362,14 +362,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   routes passed 24 sequential plus 16 concurrent executions; both 505/487 modes, the complete 992-test suite,
   static/cleanup gates, and independent audit pass. STRUCT-001JC owns the final CUDA filter extraction projected
   to complete the parent below 2,000 lines without an exception.
+- STRUCT-001JC is closed. Exact CUDA MVCC filter execution and source/visibility/key/value/provenance/bundle/logical
+  mask ownership now live byte-exact in the rustfmt-clean 594-line private `mvcc_read_exec/cuda_filter.rs` child.
+  The root is 1,952 lines with bounded 594/347/1,441/400-line children, completing the outlier without an exception.
+  Thirteen actual-CUDA routes passed 39 sequential plus 26 concurrent executions; both 505/487 modes, the complete
+  992-test suite, static/source/cleanup/inventory gates, and independent audit pass. The inventory is 19; STRUCT-001JD
+  owns the prepared-template pair in the next production outlier, `engine_retained_read.rs`.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JC:** isolate current `mvcc_read_exec.rs` lines 204–789 into the bounded private
-   `mvcc_read_exec/cuda_filter.rs` owner exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JD:** isolate current `engine_retained_read.rs` lines 369–505 into the bounded private
+   `engine_retained_read/template.rs` owner exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
