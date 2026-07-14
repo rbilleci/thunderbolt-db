@@ -547,6 +547,11 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   15 local plus 15 independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/
   source/cleanup gates, fresh inventory, and audit pass. CPU twins remain parity/bootstrap-only. The actionable
   inventory remains 12; STRUCT-001KK owns current parent lines 584–904 as the complete P2 cold-sidecar family.
+- STRUCT-001KK is closed. The exact three-test P2 cold-sidecar family now lives in the rustfmt-clean 325-line private
+  `tests/streaming_exec/sidecars.rs` child; the parent is 3,423 lines. Exact payload/parent reconstruction, nine local
+  plus nine independent-audit focused executions, both 505/487 modes, the complete 992 suite, static/source/cleanup
+  gates, fresh inventory, and audit pass. The host COW repro remains storage/parity-bootstrap-only. The actionable
+  inventory remains 12; STRUCT-001KL owns current parent lines 585–707 as the P4-1 reverse-gather differential.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -556,8 +561,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KK:** isolate the exact P2 cold-sidecar family at current `tests/streaming_exec.rs` lines 584–904
-   as mapped in `PLAN.md`, preserving stamped reads, v2 restore, payload-rank, and COW change-log gates.
+1. **STRUCT-001KL:** isolate the exact P4-1 reverse-gather differential at current `tests/streaming_exec.rs` lines
+   585–707 as mapped in `PLAN.md`, preserving mixed types, NULLs, order, and sidecar masking.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

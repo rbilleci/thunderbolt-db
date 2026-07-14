@@ -3360,6 +3360,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable.
   STRUCT-001KK owns current parent lines 584–904 as the complete P2 cold-sidecar family.
 
+  STRUCT-001KK then isolated the exact P2 cold-sidecar owner in the rustfmt-clean 325-line private
+  `tests/streaming_exec/sidecars.rs` child, reducing the parent from 3,744 to 3,423 lines. Old parent lines 584–904
+  and child lines 5–325 share exact payload hash `940e6034…`; the exact child/parent hashes are
+  `53df625e…`/`0838c704…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 905 reconstructs old-parent hash `7df8bea7…` byte-for-byte. The P2 heading, three tests/two ignores,
+  exact SQL/results/counters, multi-chunk masks, v2 checkpoint/restore artifact, payload-boundary rank, and pinned
+  COW generation/change-log assertions are preserved through three import declarations/five names. Shared
+  `gpu_available`, `select`, and multi-consumer private `ClassEntryDisabled` remain in the parent; history assigns
+  the range to SV2/chunk-locate/v2-persistence commits, with no visibility bridge, path/include indirection, unsafe,
+  context bag, numbered shard, external-name reference, or stale copy. The no-GPU COW test remains explicitly a
+  minimal storage/parity bootstrap repro, never product direction. Nine local plus nine independent-audit module
+  executions passed, including six actual-GPU paths each; local concurrent PIDs `86277`/`86282` overlapped in three
+  samples and audit PIDs `97327`/`97331` in eight, with zero CUDA 700/716/719 or related faults. Both debug/release
+  ordinary modes passed 505/487 in 14.61s/7.95s, the complete include-ignored suite passed 992/992 in 176.60s, and
+  workspace all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline,
+  scoped source/child-format/diff/cleanup gates, fresh 12-file inventory, and independent audit are clean. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KL owns current parent lines 585–707 as
+  the complete P4-1 reverse-gather differential.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
