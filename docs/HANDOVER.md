@@ -10,7 +10,7 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 - STRUCT-001FR is closed. The deleted 9,745-line expression PTX hub is now 13 operator/type-owned leaves, each
   below 1,500 lines. All 67 live symbols/ABIs/bodies are normalized-exact; two unreferenced legacy compactors were
   deleted. Fifteen GPU routes, full execution gates, static gates, canonical report card, and independent audit pass.
-- The PTX-inclusive source inventory now has 22 actionable outliers: nine production, nine tests, and four
+- The PTX-inclusive source inventory now has 21 actionable outliers: eight production, nine tests, and four
   examples/tools; the separately registered `engine_expr.rs` exception is not actionable.
   **STRUCT-001** owns every remaining disposition.
 - QUALITY-002 is closed. Integer SUM binding now agrees with its bigint materialized value and wire descriptor;
@@ -323,14 +323,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   rustfmt-clean 540-line private `sql/src/ast.rs` leaf behind an explicit 66-name facade and no bridge. Full SQL/
   protocol, facade/engine consumers, static/source/docs, and audit gates are clean. SQL is 3,198 lines; STRUCT-001IV
   owns the final relational dispatcher/schema/table/index/DML decomposition and projected root disposition.
+- STRUCT-001IV is closed. The exact six-range relation/schema/table/index/DML parser owner now lives in the
+  rustfmt-clean 1,414-line private `sql/src/relation.rs` leaf, reducing the SQL root to 1,810 lines. Its sole
+  `pub(super)` dispatcher bridge preserves the existing private command caller; all 36 subordinate functions remain
+  private. Both-mode SQL/protocol/server/engine/facade gates, static/source/rustdoc/cleanup gates, fresh inventory,
+  and independent audit are clean. Every SQL production file is now below its envelope with no exception.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IV:** move current SQL ranges 112–346, 639–1480, 1685–1798, 1928–1993, 2745–2751, and 2766–2889
-   into private `relation.rs`; preserve the complete classifier and expose only `parse_relational_command` to parent.
+1. **STRUCT-001IW:** analyze and disposition the 4,728-line `engine_dml_concurrent.rs` owner without deciding
+   **R3-001** implicitly; promote any discovered STRUCT-001 child before implementation.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
