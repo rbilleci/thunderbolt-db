@@ -2088,6 +2088,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were
   not applicable.
 
+  STRUCT-001GX then isolated exact NULL-pad and resident predicate-device mask construction in the rustfmt-clean
+  107-line private `engine_expr/predicate_mask.rs` leaf, reducing the expression root to 6,430 lines. The resident
+  builder remains `pub(crate)` and the pad helper gained only narrow `pub(super)` visibility for its two parent callers.
+  Compiler/type selection, zero/no-op gates, visibility conjunct order and predicate flag, `probe-timing` output,
+  text-aware launch, errors, allocation-before-build, the all-NULL source, and retained mask/source/allocation lifetimes
+  are exact apart from explicit execution-type import normalization. Twelve focused GPU pushed-filter, OUTER-pad 3VL,
+  typed NULL/N:N, rank, and streaming consumers pass, as do both 505/487 engine modes, the complete 992-test GPU suite,
+  all-target/probe-feature checks, strict clippy, exact-source/import/consumer/visibility/feature/scoped-format/diff/docs
+  gates, and independent audit. Fifteen GiB of generated residue was removed. Runtime behavior did not change, so
+  HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
