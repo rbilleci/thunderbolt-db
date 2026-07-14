@@ -2196,6 +2196,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   992-test serial GPU suite, all-target check, strict clippy, static/scoped gates, and independent audit. Generated
   test residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001HG then isolated the complete scalar aggregate phase in the rustfmt-clean 231-line private
+  `engine_expr/scalar_aggregate.rs` leaf, reducing the expression root to 2,925 lines. A normalized reconstruction
+  is token-identical after explicit capture-borrow adaptations and the required helper tail-result syntax. Selected
+  columns and access path transfer by value and are Arc-wrapped exactly once without clones. Zero-row typed NULL
+  versus COUNT zero, int4/int8/numeric SUM/MIN/MAX/AVG result types and scales, checked overflow/error strings,
+  COUNT(DISTINCT) constant-group delegation, GPU metadata, and resident/device/index lifetimes are unchanged. Ten
+  focused GPU/spec controls and 28 independent-audit GPU/spec controls pass, as do both 505/487 engine modes, the
+  complete 992-test serial GPU suite, all-target check, strict clippy, static/scoped gates, and independent audit.
+  Generated test residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were not
+  applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

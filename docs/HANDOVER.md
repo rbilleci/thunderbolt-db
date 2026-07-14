@@ -151,14 +151,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   suite, all-target/strict-clippy/static/scoped gates, and independent audit are clean; generated residue was removed.
   The expression root is 3,127 lines; HAZARD/report card were not applicable. Audit promoted the complete scalar
   aggregate phase as STRUCT-001HG.
+- STRUCT-001HG is closed. Complete scalar aggregate execution now lives in the rustfmt-clean 231-line private
+  `engine_expr/scalar_aggregate.rs` leaf with exact normalized logic and clone-free by-value result ownership.
+  Ten focused and 28 independent-audit GPU/spec controls, both engine modes, the complete 992-test suite,
+  all-target/strict-clippy/static/scoped gates, and independent audit are clean; generated residue was removed. The
+  expression root is 2,925 lines; HAZARD/report card were not applicable. Audit promoted terminal projected-row
+  materialization as STRUCT-001HH.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HG:** isolate the complete scalar aggregate phase as one bounded helper; transfer selected columns and
-   access path by value and preserve zero-row, typed reduction, AVG, COUNT(DISTINCT), error, and result invariants.
+1. **STRUCT-001HH:** isolate terminal typed/nullable projected-row materialization; transfer bound selection and
+   access path by value while preserving ordered/windowed indices, row-major output, gathers, errors, and GPU targets.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
