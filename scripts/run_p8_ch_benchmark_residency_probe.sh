@@ -3110,7 +3110,7 @@ case "$mode" in
     grep -q '"query":"order_line_lookup_composite_int4_projection"' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/metrics.jsonl"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ENGINE_PGWIRE_ROWS=16 GPU_DB_CH_BENCH_ENGINE_PGWIRE_PORT=55439 GPU_DB_CH_BENCH_ENGINE_PGWIRE_CONCURRENCY_TARGETS=1,2 \
       "$0" --engine-backed-pgwire-concurrency-smoke >"$tmp_dir/engine-pgwire-concurrency.out"
-    grep -q 'postgresql_baseline_target_required_for_identical_curves' "$tmp_dir/out/engine-backed-pgwire-concurrency-smoke/engine-backed-pgwire-concurrency-smoke.md"
+    grep -q '"kind":"engine_backed_pgwire_concurrency_decision".*"status":"closed".*"scheduler":"owner_thread_engine_command_queue".*"next_target":"runtime_queue_or_stream_pool"' "$tmp_dir/out/engine-backed-pgwire-concurrency-smoke/metrics.jsonl"
     grep -q '"kind":"engine_backed_pgwire_concurrency_metric"' "$tmp_dir/out/engine-backed-pgwire-concurrency-smoke/metrics.jsonl"
     grep -q '"concurrency":2' "$tmp_dir/out/engine-backed-pgwire-concurrency-smoke/metrics.jsonl"
     grep -q 'order_line_lookup_ol_o_id_multi_column' "$tmp_dir/out/engine-backed-pgwire-concurrency-smoke/concurrency-curve.csv"

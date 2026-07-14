@@ -710,7 +710,10 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   route class, and GPU retention; direct 16-row smoke and independent audit pass. The full self-check advances to a
   separate stale concurrency-report blocker assertion even though current decision metrics close persistent 1/2-
   client sessions under the owner-thread scheduler and name the runtime queue/stream pool as the next target.
-  STRUCT-001LL owns that exact one-site repair before STRUCT-001LM performs the structural move.
+  STRUCT-001LL owns that exact one-site repair.
+- STRUCT-001LL is closed. The stale concurrency prose assertion now binds the current closed owner-thread decision
+  and runtime-queue/stream-pool next-target metrics contract. Direct 16-row/1,2-client smoke, the complete workspace-
+  local self-check, cleanup, and independent audit pass. STRUCT-001LM performs the final structural move.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -720,14 +723,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LL:** replace the stale concurrency blocker-text assertion with the current closed decision metrics
-   contract and restore the full self-check.
-2. **STRUCT-001LM:** extract the exact two-function boundary-report leaf under the PLAN gates, then close the fresh
+1. **STRUCT-001LM:** extract the exact two-function boundary-report leaf under the PLAN gates, then close the fresh
    STRUCT-001 inventory if no outlier remains.
-3. **STRUCT-001:** close only after the fresh inventory is clean; do not let extraction decide **R3-001**.
-4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
-5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-6. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
+2. **STRUCT-001:** close only after the fresh inventory is clean; do not let extraction decide **R3-001**.
+3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
+4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+5. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 

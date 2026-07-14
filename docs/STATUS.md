@@ -3805,9 +3805,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   engine boundary probe, session adapter, SQL-visible retained admission, and later crate-name update. Baseline
   `bash -n` and the static bridge mode pass, but the live engine-boundary mode exits 101: its sole `cargo run` names
   `gpu_db_engine`, while Cargo metadata and a correct check prove `p8_engine_protocol_boundary_probe` belongs only
-  to `gpu_db_server`. Because that repair lies inside the selected range, STRUCT-001LL's exact post-LJ payload and
+  to `gpu_db_server`. Because that repair lies inside the selected range, STRUCT-001LM's exact post-LJ payload and
   reconstruction baseline is `5b67f7a0…`, not the pre-repair hash. STRUCT-001LJ owns the isolated repair before
-  STRUCT-001LK repairs the later self-check assertions and STRUCT-001LL executes the structural move.
+  STRUCT-001LK/LL repair the later self-check assertions and STRUCT-001LM executes the structural move.
 
   STRUCT-001LJ then corrected exactly that one invocation to the owning `gpu_db_server` package. Cargo ownership,
   shell syntax, the example check, and a timeout-bounded 16-row engine protocol-boundary probe pass; the report
@@ -3828,6 +3828,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   live decision metrics close real overlapping persistent sessions under the owner-thread scheduler and name
   `runtime_queue_or_stream_pool` as the next target. STRUCT-001LL owns that exact one-assertion repair before
   STRUCT-001LM performs the unchanged 169-line structural move.
+
+  STRUCT-001LL then replaced exactly that one retired report-text assertion with the live concurrency-decision
+  metrics contract: `status=closed`, `scheduler=owner_thread_engine_command_queue`, and
+  `next_target=runtime_queue_or_stream_pool`. The surrounding per-metric, concurrency-2, and curve checks are
+  unchanged. Shell syntax, the direct 16-row/1,2-client concurrency smoke, exact one-site static diff, the complete
+  workspace-`TMPDIR` self-check, cleanup, and independent audit pass. STRUCT-001LM owns the final source-equivalent
+  169-line extraction.
 
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
