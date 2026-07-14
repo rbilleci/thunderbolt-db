@@ -628,6 +628,13 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   pass. The actionable inventory is now seven; STRUCT-001KX owns current `tests/sql_catalog.rs` lines 1140–2316
   as the complete core relation metadata/index/constraint/drop lifecycle and will take that test root below 3,000
   lines.
+- STRUCT-001KX is closed. The exact 14-test core relation metadata/index/constraint/drop lifecycle now lives in
+  the rustfmt-clean 1,183-line private `tests/sql_catalog/relation_lifecycle.rs` child; the parent is 2,798 lines
+  and its disposition is complete without an exception. Exact payload/parent reconstruction, 42 local plus 42
+  audit CPU-oracle parity executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates,
+  fresh inventory, and audit pass. The actionable inventory is now six; STRUCT-001KY owns current
+  `tests/mvcc_query.rs` lines 1141–2296 as the 24-test initial actual-CUDA driver route matrix and will take that
+  test root below 3,000 lines.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -637,9 +644,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KX:** isolate exact core relation metadata/index/constraint/drop lifecycle current
-   `tests/sql_catalog.rs` lines 1140–2316 as mapped in `PLAN.md`, preserving all 14 SQL/WAL/recovery and catalog
-   metadata/access-path/error contracts.
+1. **STRUCT-001KY:** isolate exact initial actual-CUDA MVCC driver route matrix current `tests/mvcc_query.rs`
+   lines 1141–2296 as mapped in `PLAN.md`, preserving all 24 source/filter/order/projection/limit, target,
+   fallback, row, and metrics contracts and proving them serially/concurrently on CUDA hardware.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
