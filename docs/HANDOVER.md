@@ -250,15 +250,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   merge now live in the rustfmt-clean 713-line `engine_streaming_exec/streaming_grouped_fold.rs` descendant with one
   route-sibling bridge. The 20-run GPU matrix, both engine modes, complete 992 suite, static/source/comment gates,
   corrected compaction prose, cleanup, and independent re-audit are clean; the root is 6,200 lines.
+- STRUCT-001ID is closed. Streaming ordered top-N/unbounded chunking, compaction, and final device sort/window now
+  live in the rustfmt-clean 567-line `engine_streaming_exec/streaming_ordered_fold.rs` descendant with exactly route
+  and projection-sibling bridges. The 15-run GPU matrix, both engine modes, complete 992 suite, static/source/comment
+  gates, cleanup, and audit are clean; the root is 5,643 lines. STRUCT-001IE owns scalar reduction.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001ID:** move exact current ordered block 947–1503 into `streaming_ordered_fold.rs`, preserving complete
-   top-N/unbounded chunk/sort/compaction/final-device-window semantics with only route and projection-sibling bridges;
-   pluralize two separately proven sort-key comments and keep multi-GPU deferred.
+1. **STRUCT-001IE:** move exact current scalar blocks 549–598, 646–946, and 1740–1891 into
+   `streaming_reduction_fold.rs`, preserving complete partial/chunk/final-device-combine semantics with only one
+   route/admission sibling bridge; correct four stale host-combine/one-chunk comments and keep multi-GPU deferred.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

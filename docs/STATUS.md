@@ -2457,6 +2457,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   checks, strict clippy, exact source/comment/format/reference gates, cleanup, and independent GPU re-audit are clean.
   Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001ID then isolated the complete streaming ORDER BY top-N/unbounded chunk, compaction, and final device
+  sort/window owner in the rustfmt-clean 567-line private `engine_streaming_exec/streaming_ordered_fold.rs`
+  descendant, reducing the root from 6,200 to 5,643 lines. The old block reconstructs exactly after rustfmt plus
+  exactly two required `pub(super)` tokens: route driver and projection sibling's shared empty-ORDER sort/window;
+  the chunk helper stays private. Top-N/unbounded selection, selected schema, bind/fallback, cold/scan/ranges/capture,
+  lookahead/drain, per-chunk args/errors, byte accounting, device re-sort/re-window, honest budget defers, final real
+  window, counters/metadata/order/NULL/cardinality, dependencies, and multi-GPU deferral are exact. Two comments now
+  correctly describe multiple fully projected sort keys. Three controls passed three serial plus two concurrent
+  rounds each; both engine modes passed 505/487 and all 992 passed together. Engine/workspace all-target/all-feature
+  checks, strict clippy, exact source/comment/format/reference gates, cleanup, and independent audit are clean.
+  Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

@@ -15,7 +15,8 @@ enum StreamShape {
         normalized: SelectProjection,
         distinct_key_only: bool,
     },
-    /// S-E.4: a single-key `ORDER BY` projection. `top_n` = the `[OFFSET,OFFSET+LIMIT)` window bound
+    /// S-E.4: an `ORDER BY` projection whose sort keys are fully projected. `top_n` = the
+    /// `[OFFSET,OFFSET+LIMIT)` window bound
     /// (`Some` = a top-N stream: each chunk's device-sorted local top-(skip+take) is its only possible
     /// contribution to the global window; `None` = unbounded — the whole survivor set must fit the
     /// budget for the final device sort, else defer).
