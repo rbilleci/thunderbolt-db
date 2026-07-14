@@ -700,7 +700,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `scripts/lib/p8_ch_benchmark_protocol_boundary.sh`, projecting a 2,969-line root; it uses only `OUT_DIR`, two
   row env vars, and external commands, with no root helper/trap/process dependency. Baseline testing found its one
   engine-boundary `cargo run` still selects `gpu_db_engine` although Cargo owns the example only in
-  `gpu_db_server`; STRUCT-001LJ repairs that one site before STRUCT-001LK performs the exact move.
+  `gpu_db_server`.
+- STRUCT-001LJ is closed. The exact one-site selector repair restores the 16-row engine protocol-boundary mode with
+  SQL-visible retained admission and zero H2D. The full self-check now passes that former blocker and exposes two
+  early retained-runtime-view shape assertions against endpoint facts that do not own them; live metrics retain the
+  executed query, pass status, retained route class, and GPU-retention evidence for both shapes.
+  STRUCT-001LK owns that exact two-site harness repair before STRUCT-001LL performs the structural move.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -710,8 +715,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LJ:** repair the one protocol-boundary example package selector and restore the full self-check.
-2. **STRUCT-001LK:** extract the exact two-function boundary-report leaf under the PLAN gates, then close the fresh
+1. **STRUCT-001LK:** point the two stale early-shape assertions at their live metrics records and
+   restore the full self-check.
+2. **STRUCT-001LL:** extract the exact two-function boundary-report leaf under the PLAN gates, then close the fresh
    STRUCT-001 inventory if no outlier remains.
 3. **STRUCT-001:** close only after the fresh inventory is clean; do not let extraction decide **R3-001**.
 4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.

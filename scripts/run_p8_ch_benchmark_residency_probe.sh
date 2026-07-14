@@ -2424,7 +2424,7 @@ write_engine_backed_protocol_boundary_probe() {
   local secondary_blocker="true_concurrent_client_curves_required"
   local retained_blocker="closed"
 
-  cargo run -q -p gpu_db_engine --example p8_engine_protocol_boundary_probe >"$facts_path"
+  cargo run -q -p gpu_db_server --example p8_engine_protocol_boundary_probe >"$facts_path"
 
   cat >"$metrics_path" <<JSON
 {"kind":"engine_backed_protocol_boundary_probe","rows":$rows,"status":"closed","engine_owned_target":true,"protocol_parser_reused":true,"startup_packet_parser_reused":true,"frontend_message_parser_reused":true,"wire_session_api_available":true,"copy_parser_in_protocol_lib":true,"backend_writer_api_available":true,"ready_loop_state_available":true,"engine_owned_session_probe":true,"copy_stream_lifecycle_probe":true,"protocol_server_session_catalog_reusable":false,"create_table_into_engine_wal_mvcc":true,"copy_rows_visible_through_engine_select":true,"resident_admission_from_sql_visible_rows":true,"retained_route_zero_h2d":true,"post_mutation_residency_invalidated":true,"next_blocker":"$blocker","secondary_blocker":"$secondary_blocker","retained_blocker":"$retained_blocker"}

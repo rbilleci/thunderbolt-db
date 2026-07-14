@@ -3805,9 +3805,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   engine boundary probe, session adapter, SQL-visible retained admission, and later crate-name update. Baseline
   `bash -n` and the static bridge mode pass, but the live engine-boundary mode exits 101: its sole `cargo run` names
   `gpu_db_engine`, while Cargo metadata and a correct check prove `p8_engine_protocol_boundary_probe` belongs only
-  to `gpu_db_server`. Because that repair lies inside the selected range, STRUCT-001LK's exact post-LJ payload and
+  to `gpu_db_server`. Because that repair lies inside the selected range, STRUCT-001LL's exact post-LJ payload and
   reconstruction baseline is `5b67f7a0…`, not the pre-repair hash. STRUCT-001LJ owns the isolated repair before
-  STRUCT-001LK executes the structural move.
+  STRUCT-001LK repairs the later self-check assertions and STRUCT-001LL executes the structural move.
+
+  STRUCT-001LJ then corrected exactly that one invocation to the owning `gpu_db_server` package. Cargo ownership,
+  shell syntax, the example check, and a timeout-bounded 16-row engine protocol-boundary probe pass; the report
+  records SQL-visible retained admission with zero H2D. Running the full self-check from workspace-local `TMPDIR`
+  now advances beyond the former exit-101 blocker and exposes a separate inherited harness defect: two earlier
+  equality-projection routes execute through the retained runtime view before the owner-thread `EndpointState`
+  fact writer, so assertions for those shapes consult an artifact that does not own them. Fresh benchmark metrics
+  retain each executed query, pass status, retained route classification, and GPU-retention fact; endpoint facts
+  retain the endpoint-wide accepted/zero-H2D and later owner-thread shapes. STRUCT-001LK owns the exact two-
+  assertion artifact repair before STRUCT-001LL performs the unchanged 169-line structural move.
 
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
