@@ -705,7 +705,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   SQL-visible retained admission and zero H2D. The full self-check now passes that former blocker and exposes two
   early retained-runtime-view shape assertions against endpoint facts that do not own them; live metrics retain the
   executed query, pass status, retained route class, and GPU-retention evidence for both shapes.
-  STRUCT-001LK owns that exact two-site harness repair before STRUCT-001LL performs the structural move.
+  STRUCT-001LK owns that exact two-site harness repair.
+- STRUCT-001LK is closed. Both early route assertions now bind live metrics query records to pass status, retained
+  route class, and GPU retention; direct 16-row smoke and independent audit pass. The full self-check advances to a
+  separate stale concurrency-report blocker assertion even though current decision metrics close persistent 1/2-
+  client sessions under the owner-thread scheduler and name the runtime queue/stream pool as the next target.
+  STRUCT-001LL owns that exact one-site repair before STRUCT-001LM performs the structural move.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -715,9 +720,9 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LK:** point the two stale early-shape assertions at their live metrics records and
-   restore the full self-check.
-2. **STRUCT-001LL:** extract the exact two-function boundary-report leaf under the PLAN gates, then close the fresh
+1. **STRUCT-001LL:** replace the stale concurrency blocker-text assertion with the current closed decision metrics
+   contract and restore the full self-check.
+2. **STRUCT-001LM:** extract the exact two-function boundary-report leaf under the PLAN gates, then close the fresh
    STRUCT-001 inventory if no outlier remains.
 3. **STRUCT-001:** close only after the fresh inventory is clean; do not let extraction decide **R3-001**.
 4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.

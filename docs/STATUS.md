@@ -3817,7 +3817,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   fact writer, so assertions for those shapes consult an artifact that does not own them. Fresh benchmark metrics
   retain each executed query, pass status, retained route classification, and GPU-retention fact; endpoint facts
   retain the endpoint-wide accepted/zero-H2D and later owner-thread shapes. STRUCT-001LK owns the exact two-
-  assertion artifact repair before STRUCT-001LL performs the unchanged 169-line structural move.
+  assertion artifact repair before the structural move.
+
+  STRUCT-001LK then replaced exactly those two shape-only endpoint-fact checks with live metrics assertions that
+  bind each executed query to `correctness_status=pass`, its expected retained route classification, and
+  `retained_gpu_route=true`. The accepted/zero-H2D and composite endpoint-fact assertions remain unchanged. Shell
+  syntax, the direct 16-row pgwire benchmark smoke, exact two-site static diff, and independent audit pass. The
+  full workspace-`TMPDIR` self-check now passes both repaired assertions and advances to one separate stale check:
+  the concurrency smoke no longer reports `postgresql_baseline_target_required_for_identical_curves`; its current
+  live decision metrics close real overlapping persistent sessions under the owner-thread scheduler and name
+  `runtime_queue_or_stream_pool` as the next target. STRUCT-001LL owns that exact one-assertion repair before
+  STRUCT-001LM performs the unchanged 169-line structural move.
 
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
