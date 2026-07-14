@@ -2235,6 +2235,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   consumers or require a catch-all context bag, so the root is now an accepted `CODE_SIZE.md` exception with
   concrete growth, responsibility, contract, public-boundary, and 5,000-line re-review triggers.
 
+  STRUCT-001HJ then moved the exact private `with_length_prefix` helper and all 26 startup-packet tests into the
+  rustfmt-clean 641-line `crates/protocol/src/tests/startup.rs` child, reducing the protocol root from 10,271 to
+  9,635 lines. The child is path-declared inside the existing inline test module; every name, attribute, body,
+  strict length/minimum/mismatch check, SSL/GSS shape, cancel-key cap, v3 minor rule, parameter ordering/duplicate/
+  empty/UTF-8/null/pairing case, and error variant is source-equivalent. The exact 71-test name-tail inventory is
+  unchanged. The focused 26-test family and 71-test library pass, as does the full protocol package (71 library,
+  127 binary, and both one-test driver integrations), protocol all-target check/strict clippy, server all-target
+  check, connection-security preflight, scoped format/diff/source/reference gates, and independent audit. No
+  production/API/visibility or runtime behavior changed, so GPU, HAZARD, and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

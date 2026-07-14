@@ -169,14 +169,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   generated residue was removed. The 2,433-line expression root now has exactly one cohesive orchestration function
   and is a registered `CODE_SIZE.md` exception with strict re-review triggers. The next Wave-1 outlier is protocol
   library inline tests; audit promoted its 26 startup-packet tests as STRUCT-001HJ.
+- STRUCT-001HJ is closed. The exact startup helper and all 26 packet/error tests now live in the rustfmt-clean
+  641-line `protocol/src/tests/startup.rs` leaf. The 71-test inventory, focused and full protocol suites,
+  protocol/server static gates, security preflight, normalized-source proof, and independent audit are clean; the
+  root is 9,635 lines. Audit promoted the exact nine-test SET/session-control family as STRUCT-001HK.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HJ:** move the exact startup-packet helper and 26 tests into a bounded protocol test leaf while
-   preserving the 71-test inventory, frame/error semantics, and production codec/public facade unchanged.
+1. **STRUCT-001HK:** move exact current protocol test lines 1,312–1,757 into `tests/session_commands.rs` while
+   preserving all nine SET/session-control tests, the 71-test inventory, and the production codec/public facade.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
