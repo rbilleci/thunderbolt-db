@@ -2581,6 +2581,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   selection/prune behavior, and existing file-sync/rename behavior are unchanged; containing-directory crash
   persistence remains DUR-002. GPU-kernel/report-card gates were inapplicable.
 
+  STRUCT-001IM then isolated the WAL archive object-backup owner in the rustfmt-clean 648-line private
+  `wal/src/archive_object_backup.rs` leaf, reducing the WAL root from 2,868 to 2,231 lines. Five old ranges reconstruct
+  exactly after rustfmt: one format constant, two public contracts, four public export/restore/manifest operations,
+  four private verified object/path helpers, and the checksum. All six public paths remain stable through one explicit
+  root re-export; there is no bridge or reverse dependency. Archive validation-before-export, relative object mapping,
+  size/checksum and rendered-metadata verification before install, staging cleanup/rollback, final manifest validation,
+  delimiter/newline path rejection, errors, and the existing file-sync/rename sequence are source-identical. This does
+  not claim containing-directory crash persistence, which remains DUR-002. Four focused tests and both full WAL modes
+  passed 85/85; the engine object-backup recovery integration, WAL/engine/workspace all-target/all-feature checks,
+  strict clippy, exact source/API/re-export/format/reference gates, cleanup, and independent audit are clean. The root
+  remains 231 lines above the production threshold with one coherent checkpoint owner, so no exception is justified.
+  Runtime behavior did not change; HAZARD/report-card/GPU-kernel gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

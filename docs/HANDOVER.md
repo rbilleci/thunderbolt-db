@@ -287,15 +287,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   mutation. Three regressions cover direct sidecar/registry/register paths, IDs/parents, missing/existing targets,
   exact readable registry preservation, and temp absence. Nine focused and both 85-test modes, engine/static gates,
   and independent re-audit are clean; STRUCT-001IM owns object backup.
+- STRUCT-001IM is closed. The rustfmt-clean 648-line `wal/src/archive_object_backup.rs` owns verified object export,
+  restore, manifest I/O, path validation, and checksum behind two type/four operation re-exports with no bridge. Four
+  focused and both 85-test modes, engine restore, static/source gates, and audit are clean; the root is 2,231 lines.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IM:** move current WAL object-backup ranges 47, 115–128, 1009–1508, 2275–2392, and 2841–2848 into
-   private `archive_object_backup.rs`; re-export two types/four operations without a bridge and preserve verified
-   export/restore tests and engine recovery while power-loss directory persistence remains DUR-002.
+1. **STRUCT-001IN:** move current WAL checkpoint/control ranges 52, 64–74, 343–535, 732–865, and 1702–1725 into
+   private `checkpoint.rs`; re-export three types/nine operations without a bridge, preserve lane/regular checkpoint
+   crash semantics, and freshly audit the projected 1,872-line mixed root for complete size disposition.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
