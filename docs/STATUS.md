@@ -3235,6 +3235,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   so HAZARD/report card were inapplicable. The actionable inventory remains 12; STRUCT-001KC owns current parent
   lines 537–631 as the complete layered-view family.
 
+  STRUCT-001KC then isolated the exact two-test layered-view owner in the rustfmt-clean 109-line private
+  `tests/streaming_exec/views.rs` child, reducing the parent from 5,720 to 5,625 lines. Old parent lines 537–631
+  have exact payload hash `f35e81f7…`; prepending four import declarations/five names and applying rustfmt at only
+  three inherited sites produces exact child hash `c14b21c8…`. Removing the private module and reinserting the
+  original range plus blank separator reconstructs old-parent hash `05a82bbf…` byte-for-byte; current parent hash
+  is `3961a716…`. Exactly two tests and one ignore moved with no helper, visibility bridge, path/include indirection,
+  unsafe, or dependency beyond private `gpu_available`/`select`. Six local plus six independent-audit focused
+  executions passed; simultaneous test processes were observed on the RTX PRO 6000, and the ignored route proved
+  nonvacuity through GPU memory plus fold telemetry and result assertions, with zero CUDA 700/716/717. Both debug/
+  release ordinary modes passed 505/487, the complete include-ignored suite passed 992/992 in 172.16s, and workspace
+  check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/format/diff/cleanup
+  gates, fresh inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card
+  were inapplicable. The actionable inventory remains 12; STRUCT-001KD owns current parent lines 538–696 as the
+  complete projection/windowing family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
