@@ -51,7 +51,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Crash-durable replay exists; the broader fault campaign, automatic lane checkpointing, PITR timestamps, and
   multi-node quorum integration are **DUR-001**, **DUR-002**, and **HA-001**.
 
-## Verification snapshot — 2026-07-13
+## Verification snapshot — 2026-07-14
 
 - Engine library: ordinary mode **505 passed, 0 failed, 487 GPU-ignored**; complete serial mode
   **992 passed, 0 failed, 0 ignored**.
@@ -59,10 +59,10 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Pgwire: ordinary suite **3 passed** plus the ignored non-vacuous sharded/NULL GPU golden passes.
 - Production mixed gate: **116.2k reads/s**, p50 **246us**, p99 **501us**, p99.9 **671us**; zero host gathers,
   zero fallback groups, and 160/160 host-install-elided writes.
-- Read roofline: in-L2 `count_i32_compare` approximately **0.92x** the same-run `sum_i32` roofline; grouped
+- Read roofline: in-L2 `count_i32_compare` approximately **0.87x** the same-run `sum_i32` roofline; grouped
   kernel approximately **1,678 M elements/s**.
-- Canonical report card: 48M-row out-of-L2 batched route **249.7M lookups/s at batch 65,536, p50 132us**;
-  indexed single-flight route **3.20x** the scan.
+- Canonical report card: 48M-row out-of-L2 batched route **253.1M lookups/s at batch 65,536, p50 132us**;
+  indexed single-flight route **3.25x** the scan.
 - Production release check, engine/facade examples, static host-row-removal guard, and diff whitespace check pass.
 
 ## Structural decomposition
@@ -2109,6 +2109,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   modes, the complete 992-test GPU suite, all-target check, strict clippy, exact-source/import/consumer/visibility/
   layout/argument-order/scoped-format/diff/docs gates, and independent audit. Fifteen GiB of generated residue was
   removed. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
+  STRUCT-001GZ then isolated the exact complete join projection resolution/materialization owner in the
+  rustfmt-clean 478-line private `engine_expr/join_projection.rs` leaf, reducing the expression root to 5,727
+  lines. All four methods remain `pub(crate)`. Missing/ambiguous/FROM/alias-misalignment errors, relation-0
+  coalescing, bare and qualified star order, alias expansion and attnum, device materialization specs and typed
+  layouts, side-0 ownership, validity zip, endian conversion, numeric scale, UUID bytes, SQL NULL mapping,
+  consumers, and dependency direction are source-equivalent. Eleven focused GPU star/USING/NATURAL/catalog/
+  transient/three-way/typed-NULL/OUTER-pad/text/UUID/numeric/streaming routes pass, as do both 505/487 engine
+  modes, the complete 992-test serial GPU suite, all-target check, strict clippy, static/scoped gates, and
+  independent audit. Generated test residue was removed. The raw roofline remained stable (out-of-L2 roofline
+  1440.2 to 1444.1 GB/s, gather kernel 152.5 to 155.3 GB/s, join 258.8 to 259.8 M-element/s, grouped 1677.7 to
+  1678.1 M-element/s). The canonical report card likewise remained stable: out-of-L2 batched point reads moved
+  from 251.6M to 253.1M lookups/s at p50 132us, and indexed single-flight moved from 3.20x to 3.25x scan. Runtime
+  behavior did not change, so HAZARD was not applicable.
 
 ## Known boundaries
 

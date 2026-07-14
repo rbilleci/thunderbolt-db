@@ -111,14 +111,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   consumers are unchanged. Seven focused GPU join controls, both 505/487 engine modes, the complete 992-test GPU suite,
   static/scoped gates, and independent audit pass; 15 GiB of generated residue was removed. The expression root is
   6,196 lines; HAZARD/report card were not applicable.
+- STRUCT-001GZ is closed. The exact four-method join projection resolution/materialization owner now lives in the
+  rustfmt-clean 478-line private `engine_expr/join_projection.rs` leaf behind unchanged `pub(crate)` inherent paths.
+  Eleven focused typed/OUTER/streaming GPU joins, both 505/487 engine modes, the complete 992-test GPU suite,
+  all-target/strict-clippy/static/scoped gates, and independent audit pass; generated residue was removed. Raw
+  roofline and canonical two-layer/two-cache report-card comparisons are stable, including 48M-row batched point
+  reads at 253.1M lookups/s and p50 132us after the move. The expression root is 5,727 lines; HAZARD was not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001GZ:** isolate exact join projection resolution/materialization into one bounded private leaf; compare
-   raw roofline and canonical report card before/after because the moved owner is on the result path.
+1. **STRUCT-001HA:** isolate the exact two streaming-only coordinate post-filters into one bounded private leaf;
+   preserve predicate/visibility and NULL-pad mask ordering, lifetimes, side-0 context, and exact errors.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
