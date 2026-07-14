@@ -3051,6 +3051,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   card inapplicable. The actionable inventory remains 13 because the parent remains above 3,000 lines;
   STRUCT-001JQ owns its exact scalar aggregate family at current lines 1689–2271.
 
+  STRUCT-001JQ then isolated the exact complete scalar aggregate test family in the rustfmt-clean 587-line
+  private `tests/resident_expr/scalar_aggregates.rs` child, reducing the PLAN-owned test root from 8,921 to
+  8,338 lines after deleting the single now-redundant separator blank. The moved payload is byte-identical to
+  old lines 1689–2271 (SHA-256 `c021b88c…`) and full-file reconstruction is exact. Exactly six tests moved: five
+  ignored actual-GPU aggregate tests and the active host PostgreSQL AVG scale/rounding oracle, with zero local
+  helpers and three explicit import declarations/six names. Test paths intentionally gained the child segment,
+  with no facade, visibility bridge, parent-local dependency, unsafe, include/path indirection, or production
+  change. Filtered INT4 COUNT/SUM/MIN/MAX/AVG, empty-result NULL and rejection behavior, INT8 result metadata,
+  NUMERIC MIN/MAX/SUM/AVG, wide carry, and checked i128 overflow remain exact. The five GPU paths passed 15
+  focused local actual-GPU executions and ten independent-audit executions; the host oracle passed locally and
+  under audit. Both modes passed 505/487, the complete include-ignored suite passed 992/992, and workspace check,
+  strict engine Clippy, private rustdoc with the known 25-link warning baseline, scoped source/format/diff/cleanup,
+  fresh inventory, and independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The
+  actionable inventory remains 13; STRUCT-001JR owns the exact checked-int4 arithmetic family at current lines
+  1517–1688.
+
 ## Known boundaries
 
 | Boundary | Work ID |

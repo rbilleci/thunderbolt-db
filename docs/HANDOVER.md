@@ -441,14 +441,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   remains PLAN-owned. Eighty-five focused actual-GPU executions, both 505/487 modes, the complete 992 suite,
   static/source/cleanup/inventory gates, and independent audit pass. The actionable inventory remains 13;
   STRUCT-001JQ owns the exact scalar aggregate family at current root lines 1689–2271.
+- STRUCT-001JQ is closed. The exact six-test scalar aggregate family now lives in the rustfmt-clean 587-line
+  private `tests/resident_expr/scalar_aggregates.rs` child; the 8,338-line test root remains PLAN-owned.
+  Twenty-five focused actual-GPU executions plus two host-oracle executions, both 505/487 modes, the complete
+  992 suite, static/source/cleanup/inventory gates, and independent audit pass. The actionable inventory remains
+  13; STRUCT-001JR owns the exact checked-int4 arithmetic family at current root lines 1517–1688.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JQ:** isolate current `tests/resident_expr.rs` lines 1689–2271 into bounded private
-   `tests/resident_expr/scalar_aggregates.rs` exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JR:** isolate current `tests/resident_expr.rs` lines 1517–1688 into bounded private
+   `tests/resident_expr/checked_arithmetic.rs` exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
