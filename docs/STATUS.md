@@ -3701,6 +3701,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   context bag or duplicate ownership. The default auto-example baseline build passes; no source behavior changed
   in this analysis slice.
 
+  STRUCT-001LB then isolated the exact complete direct-client latency scenario in the rustfmt-clean 402-line
+  private `examples/write_conveyor_bench/direct_client_latency.rs` child, reducing the example root from 4,726
+  to 4,337 lines. Baseline lines 2391–2784 and normalized child lines 9–402 share payload hash `3b2b4974…`;
+  removing the six-line module/import seam and restoring the normalized payload reconstructs baseline hash
+  `e9de8be1…` byte-for-byte. The child has one explicit parent import list and only the compile-required private
+  module plus root-confined function visibility; no glob, path/include indirection, sibling dependency, context
+  bag, helper duplication, external target/API, or stale owner remains. Small logged, store-applied, and durable
+  routes passed locally and under independent audit with matching checksums, store validation, durability fence,
+  latency stages, and scan recovery. The 59-test crate suite, default example check/build, strict example Clippy,
+  child rustfmt, diff/reference/history/cleanup gates, fresh three-outlier inventory, and independent audit are
+  clean. Runtime behavior is unchanged, so HAZARD and report card were inapplicable. STRUCT-001LC owns the exact
+  remaining coalesced-client scenario.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional

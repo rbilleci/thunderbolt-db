@@ -663,6 +663,10 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   configuration/types/sampling/reporting, scenario labels/output schema, durability/recovery semantics, and use
   only explicit one-way imports plus compile-proven narrow visibility. The projected root is ~4,333 lines after LB
   and ~2,770 after LC; pure structural movement does not require HAZARD/report card.
+- STRUCT-001LB is closed. The exact direct-client latency owner now lives normalized-exact in the 402-line private
+  `write_conveyor_bench/direct_client_latency.rs` child; the root is 4,337 lines. Reversible-parent proof, all
+  logged/store-applied/durable smokes, the 59-test crate suite, default build, strict example Clippy, scoped static
+  gates, fresh inventory, and independent audit pass. STRUCT-001LC owns the remaining coalesced scenario.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -672,16 +676,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LB:** extract exact baseline lines 2391–2784, the complete 394-line
-   `run_file_wal_client_latency` scenario, to private `examples/write_conveyor_bench/direct_client_latency.rs` and
-   pass the payload/reconstruction, default-build, focused safe-smoke, source/reference/cleanup, size-inventory,
-   and independent-audit gates in `PLAN.md`.
-2. **STRUCT-001LC:** then extract the exact 1,564-line coalesced-client scenario and complete the example below
+1. **STRUCT-001LC:** extract the exact 1,564-line coalesced-client scenario and complete the example below
    3,000 lines under the separately sequenced PLAN row.
-3. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
-4. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
-5. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
-6. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
+2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
+3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
+4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
+5. **MULTI-001/002/003:** only after all non-MULTI work completes or the user explicitly promotes them.
 
 Do not infer work from `NEXT`, `TODO`, `OPEN`, or deferred language in archived documents or design references.
 
