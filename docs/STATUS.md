@@ -2792,6 +2792,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   HAZARD/report card were inapplicable. STRUCT-001JB owns the exact CUDA query-capability/gap boundary; the
   actionable inventory remains 20 because the 2,863-line parent is still PLAN-owned.
 
+  STRUCT-001JB then isolated the exact first-slice gap contract/labels, recursive logical-filter classification,
+  CPU-resolved and native source classification, order/projection support, and final query eligibility in the
+  rustfmt-clean 347-line private `mvcc_read_exec/query_capability.rs` child, reducing the parent from 2,863 to 2,528
+  lines. Child lines 3–347 are byte-for-byte identical to old lines 1627–1971 after the compiler corrected the
+  promoted start by one line so the enum derive moved with its owner. The exact enum plus 15-function inventory is
+  preserved behind a 16-name facade; its statement-only unused-import allowance preserves formerly crate-visible
+  helpers. Child imports are exactly five model types, with no parent implementation, sibling, runtime/device,
+  cycle, context bag, unsafe block, or behavior/API drift. Both modes passed all 73 affected active MVCC query and
+  provenance tests. Eight actual-CUDA source/filter/order/projection/composition routes passed 24 sequential plus
+  16 concurrent executions without device faults; both complete engine modes passed 505/487 and the complete
+  include-ignored suite passed 992/992 in 167.26s. Workspace all-target/all-feature check and strict clippy,
+  private-item rustdoc, exact source/facade/import/caller/scoped-format/diff checks, generated-residue cleanup, and
+  independent audit are clean; strict rustdoc retains the known 25-link warning baseline. Runtime behavior is
+  unchanged, so HAZARD/report card were inapplicable. STRUCT-001JC owns the exact CUDA filter pipeline projected to
+  complete this root below 2,000 lines; the actionable inventory remains 20 until that disposition closes.
+
 ## Known boundaries
 
 | Boundary | Work ID |

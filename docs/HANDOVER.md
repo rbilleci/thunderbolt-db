@@ -356,14 +356,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   tests; seven actual-CUDA routes passed 21 sequential plus 14 concurrent executions, both 505/487 modes, the
   complete 992-test suite, and static/cleanup gates pass, and independent audit found no issue. STRUCT-001JB owns
   CUDA query-capability/gap classification.
+- STRUCT-001JB is closed. Exact CUDA first-slice gap/label, filter/source classification, order/projection support,
+  and final query eligibility now live byte-exact in the rustfmt-clean 347-line private
+  `mvcc_read_exec/query_capability.rs` child behind a 16-name facade. The parent is 2,528 lines. Eight actual-CUDA
+  routes passed 24 sequential plus 16 concurrent executions; both 505/487 modes, the complete 992-test suite,
+  static/cleanup gates, and independent audit pass. STRUCT-001JC owns the final CUDA filter extraction projected
+  to complete the parent below 2,000 lines without an exception.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JB:** isolate current `mvcc_read_exec.rs` lines 1628–1971 into the bounded private
-   `mvcc_read_exec/query_capability.rs` owner exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JC:** isolate current `mvcc_read_exec.rs` lines 204–789 into the bounded private
+   `mvcc_read_exec/cuda_filter.rs` owner exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
