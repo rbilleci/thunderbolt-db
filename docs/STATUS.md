@@ -2218,6 +2218,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and independent audit. Generated test residue was removed. Runtime behavior did not change, so HAZARD and
   report-card gates were not applicable.
 
+  STRUCT-001HI then isolated exact non-grouped GPU ORDER and post-sort LIMIT/OFFSET in the rustfmt-clean 354-line
+  private `engine_expr/non_grouped_order.rs` leaf, reducing the expression root to 2,433 lines. The normalized phase
+  is token-identical after explicit snapshot borrowing and the helper result wrapper; survivor indices move by value
+  through ORDER, windowing, and projected-row materialization. Expression I32/I64 execution, nullable sentinel/errors,
+  typed/text/heterogeneous/numeric/UUID key layouts, NULL/DESC masks, matrix slots, 64-key guards, bitonic/radix choice,
+  permutation remapping, identity, and the sole conditional window copy are unchanged. The obsolete crate-root
+  `ExprStep` import was removed. Twenty focused and 20 independent-audit GPU controls pass, as do both 505/487 engine
+  modes, the complete 992-test serial GPU suite, all-target check, strict clippy, static/scoped gates, and independent
+  audit. Generated test residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were
+  not applicable.
+
+  The 2,433-line expression root now contains exactly one function: the cohesive resident SELECT/grouped GPU
+  orchestrator. Every stable IR, predicate, join, source, route, scalar, DISTINCT, ORDER, and projection owner is
+  already isolated. Splitting the remaining grouped pipeline would detach derived-buffer lifetime guards from their
+  consumers or require a catch-all context bag, so the root is now an accepted `CODE_SIZE.md` exception with
+  concrete growth, responsibility, contract, public-boundary, and 5,000-line re-review triggers.
+
 ## Known boundaries
 
 | Boundary | Work ID |

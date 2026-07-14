@@ -13,7 +13,7 @@ use gpu_db_execution::{
     CudaI32BatchProjectionColumns,
     CudaI32Comparison, CudaI32EqualAnyProjectSubmission, CudaI32IndexProbeDenseSubmission,
     CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory,
-    CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, ExprStep, MockGpuRuntime,
+    CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, MockGpuRuntime,
     PlannedOp, ResidentElemType, RouteDecision, VisibleLocateShard, WriteLocateShard,
 };
 #[cfg(test)]

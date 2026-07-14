@@ -163,14 +163,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   all-target/strict-clippy/static/scoped gates, and independent audit are clean; generated residue was removed. The
   expression root is 2,746 lines; HAZARD/report card were not applicable. Audit promoted non-grouped GPU ORDER and
   post-sort windowing as STRUCT-001HI.
+- STRUCT-001HI is closed. Non-grouped GPU ORDER and post-sort windowing now live in the rustfmt-clean 354-line
+  private `engine_expr/non_grouped_order.rs` leaf. Twenty focused and 20 independent-audit GPU controls, both engine
+  modes, the complete 992-test suite, all-target/strict-clippy/static/scoped gates, and independent audit are clean;
+  generated residue was removed. The 2,433-line expression root now has exactly one cohesive orchestration function
+  and is a registered `CODE_SIZE.md` exception with strict re-review triggers. The next Wave-1 outlier is protocol
+  library inline tests; audit promoted its 26 startup-packet tests as STRUCT-001HJ.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HI:** isolate non-grouped GPU ORDER and post-sort LIMIT/OFFSET; consume and return survivor indices by
-   value while preserving key typing, nullable routing, masks, algorithm choice, errors, and pre-projection windowing.
+1. **STRUCT-001HJ:** move the exact startup-packet helper and 26 tests into a bounded protocol test leaf while
+   preserving the 71-test inventory, frame/error semantics, and production codec/public facade unchanged.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
