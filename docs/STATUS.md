@@ -3379,6 +3379,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KL owns current parent lines 585–707 as
   the complete P4-1 reverse-gather differential.
 
+  STRUCT-001KL then isolated the exact P4-1 reverse-gather differential in the rustfmt-clean 127-line private
+  `tests/streaming_exec/reverse_gather.rs` child, reducing the parent from 3,423 to 3,300 lines. Old parent lines
+  585–707 and child lines 5–127 share exact payload hash `5c25072d…`; the exact child/parent hashes are
+  `a750e361…`/`134b912c…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 708 reconstructs old-parent hash `0838c704…` byte-for-byte. The P4-1 heading, sole test/ignore, exact
+  INT/SMALLINT/BIGINT/DATE/TIMESTAMP/NUMERIC/BOOL/TEXT/UUID fixtures, per-section NULLs, scan order, cold-build/
+  sidecar counters, boundary gathers, and row differential are preserved through three import declarations/four
+  names. Only private `gpu_available`/`select` are consumed; history assigns the range to reverse-gather/
+  chunk-locate commits, with no visibility bridge, path/include indirection, unsafe, context bag, numbered shard,
+  external-name reference, or stale copy. The pre-stream store result and host decoder remain explicitly the
+  parity/bootstrap oracle and gated debt, never product direction. Three local plus three independent-audit
+  actual-GPU executions passed; local concurrent PIDs `98927`/`98932` overlapped in five samples and audit PIDs
+  `109355`/`109361` in six, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes passed
+  505/487 in 14.29s/13.03s, the complete include-ignored suite passed 992/992 in 161.81s, and workspace all-target/
+  all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped source/child-
+  format/diff/cleanup gates, fresh 12-file inventory, and independent audit are clean. Runtime behavior is unchanged,
+  so HAZARD/report card were inapplicable. STRUCT-001KM owns current parent lines 586–771 as the complete P4-2a
+  chunk-native locate/stamp family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
