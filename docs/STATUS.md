@@ -2207,6 +2207,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   Generated test residue was removed. Runtime behavior did not change, so HAZARD and report-card gates were not
   applicable.
 
+  STRUCT-001HH then isolated terminal typed/nullable projected-row materialization in the rustfmt-clean 216-line
+  private `engine_expr/projected_rows.rs` leaf, reducing the expression root to 2,746 lines. The normalized helper
+  is token-identical after explicit snapshot borrowing. Bound selection, access path, and the already-windowed
+  survivor vector move by value without clones; GPU ORDER and LIMIT/OFFSET remain before every gather. Exact typed
+  dispatch/default behavior, numeric scale, UUID little-endian reconstruction, int2 narrowing, bool/date/timestamp
+  tagging, text layout/row count, validity-bitmap SQL NULL override, row-major flat output, targets, metadata, and
+  errors are unchanged. Twenty-seven focused GPU controls and 35 independent-audit GPU controls pass, as do both
+  505/487 engine modes, the complete 992-test serial GPU suite, all-target check, strict clippy, static/scoped gates,
+  and independent audit. Generated test residue was removed. Runtime behavior did not change, so HAZARD and
+  report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

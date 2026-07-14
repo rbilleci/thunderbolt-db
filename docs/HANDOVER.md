@@ -157,14 +157,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   all-target/strict-clippy/static/scoped gates, and independent audit are clean; generated residue was removed. The
   expression root is 2,925 lines; HAZARD/report card were not applicable. Audit promoted terminal projected-row
   materialization as STRUCT-001HH.
+- STRUCT-001HH is closed. Terminal typed/nullable projection and result framing now live in the rustfmt-clean
+  216-line private `engine_expr/projected_rows.rs` leaf with exact normalized logic and clone-free by-value inputs.
+  Twenty-seven focused and 35 independent-audit GPU controls, both engine modes, the complete 992-test suite,
+  all-target/strict-clippy/static/scoped gates, and independent audit are clean; generated residue was removed. The
+  expression root is 2,746 lines; HAZARD/report card were not applicable. Audit promoted non-grouped GPU ORDER and
+  post-sort windowing as STRUCT-001HI.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HH:** isolate terminal typed/nullable projected-row materialization; transfer bound selection and
-   access path by value while preserving ordered/windowed indices, row-major output, gathers, errors, and GPU targets.
+1. **STRUCT-001HI:** isolate non-grouped GPU ORDER and post-sort LIMIT/OFFSET; consume and return survivor indices by
+   value while preserving key typing, nullable routing, masks, algorithm choice, errors, and pre-projection windowing.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
