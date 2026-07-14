@@ -145,14 +145,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   all-target/strict-clippy/static/scoped gates, and independent audit pass. Generated residue was removed. The
   expression root is 3,262 lines; HAZARD/report card were not applicable. Audit promoted the shared state-free GPU
   COUNT(DISTINCT) grouping closure as STRUCT-001HF.
+- STRUCT-001HF is closed. Shared GPU COUNT(DISTINCT) sort/mark/group execution now lives in the rustfmt-clean
+  161-line private `engine_expr/grouped_count_distinct.rs` leaf. Normalized source, explicit captures, both callers,
+  GPU buffer lifetimes, 27 focused and 25 independent-audit GPU controls, both engine modes, the complete 992-test
+  suite, all-target/strict-clippy/static/scoped gates, and independent audit are clean; generated residue was removed.
+  The expression root is 3,127 lines; HAZARD/report card were not applicable. Audit promoted the complete scalar
+  aggregate phase as STRUCT-001HG.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HF:** isolate the shared GPU COUNT(DISTINCT) sort/mark/group closure as one state-free bounded helper;
-   preserve explicit captures, descriptor/layout ordering, buffer lifetimes, errors, and GPU-only aggregation.
+1. **STRUCT-001HG:** isolate the complete scalar aggregate phase as one bounded helper; transfer selected columns and
+   access path by value and preserve zero-row, typed reduction, AVG, COUNT(DISTINCT), error, and result invariants.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
