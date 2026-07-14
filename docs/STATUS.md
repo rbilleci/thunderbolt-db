@@ -2594,6 +2594,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   remains 231 lines above the production threshold with one coherent checkpoint owner, so no exception is justified.
   Runtime behavior did not change; HAZARD/report-card/GPU-kernel gates were inapplicable.
 
+  STRUCT-001IN then isolated regular and lane checkpoint/control ownership in the rustfmt-clean 371-line private
+  `wal/src/checkpoint.rs` leaf, reducing the WAL root from 2,231 to 1,872 lines. Five old ranges reconstruct exactly
+  after rustfmt: the control magic, three public contracts, nine public path/write/read operations, and one private
+  control-versus-segment validator. All twelve public paths remain stable through one explicit root re-export; there
+  is no bridge or visibility expansion. Lane generation-path/cut identity, record-count validation, segment sync and
+  parent sync before sidecar temp-sync/rename/parent-sync commit, post-commit retirement, missing/malformed behavior,
+  regular relative resolution, strict segment read, longer-segment logical truncation, shorter-segment rejection,
+  last-transaction validation, and errors are source-identical. Inherited bare-relative-path and monotonic-cut
+  boundaries remain caller/DUR-002 concerns and did not block the pure move. Both WAL modes passed 85/85; all 40
+  engine recovery/checkpoint integrations and five GPU cold-checkpoint/lane controls passed. WAL/engine/workspace
+  all-target/all-feature checks, strict clippy, exact source/API/re-export/format/reference gates, cleanup, fresh size
+  inventory, and independent audit are clean. The final 1,872-line mixed root is below the mandatory production
+  threshold and cohesively owns shared record/archive/recovery/commit contracts, segment/tail persistence, archive
+  manifest/recovery/retention, and shared validators/codecs used across bounded children. Further splitting would
+  create bridge/helper churn; re-audit at 2,000 lines or on a new family/cycle/public-boundary trigger. Every WAL child
+  is within its envelope, so the WAL disposition is complete without an exception. Runtime behavior did not change;
+  HAZARD/report-card/GPU-kernel gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
