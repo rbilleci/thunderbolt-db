@@ -319,14 +319,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   private `sql/src/command.rs` leaf behind two public re-exports and no bridge. Compile validation kept shared
   `is_identifier_char` with the root lexical owner and corrected the third moved range to 4207–4668. Full SQL/protocol,
   facade/engine consumers, static/source/docs, and audit gates are clean. SQL is 3,717 lines; STRUCT-001IU owns AST.
+- STRUCT-001IU is closed. `Command` and all 65 remaining public DDL/DML contracts now live byte-exact in the
+  rustfmt-clean 540-line private `sql/src/ast.rs` leaf behind an explicit 66-name facade and no bridge. Full SQL/
+  protocol, facade/engine consumers, static/source/docs, and audit gates are clean. SQL is 3,198 lines; STRUCT-001IV
+  owns the final relational dispatcher/schema/table/index/DML decomposition and projected root disposition.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IU:** move current SQL public AST block 46–579 into private `ast.rs`, keep `ParseError` at root, and
-   re-export the exact 66 contract names without a bridge.
+1. **STRUCT-001IV:** move current SQL ranges 112–346, 639–1480, 1685–1798, 1928–1993, 2745–2751, and 2766–2889
+   into private `relation.rs`; preserve the complete classifier and expose only `parse_relational_command` to parent.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

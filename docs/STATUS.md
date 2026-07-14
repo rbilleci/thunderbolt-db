@@ -2691,6 +2691,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   contract block; SQL remains PLAN-owned above 2,000. Runtime behavior did not change, so HAZARD/report-card/GPU-
   kernel gates were inapplicable.
 
+  STRUCT-001IU then isolated `Command` and all 65 remaining public relational DDL/DML contracts in the rustfmt-clean
+  540-line private `sql/src/ast.rs` leaf, reducing the SQL root from 3,717 to 3,198 lines. The exact old block
+  reconstructs after separator normalization; 66 definitions match 66 explicit root re-exports, with no functions,
+  wildcard, bridge, or visibility growth. The child depends only on seven ACL, two SELECT, and two scalar contracts;
+  every variant, field, derive, doc, crate-root path, and downstream construction/match is source-identical. Both
+  23-test SQL and complete 71-test protocol modes, both facade lifecycle and engine role/session modes, affected/
+  workspace static checks, strict scoped clippy, rustdoc, exact source/API/dependency/reference/format/diff gates,
+  and independent audit are clean. STRUCT-001IV owns the exact relational dispatcher plus schema/table/index/DML
+  parser boundary and is projected to complete the SQL root disposition below 2,000. Runtime behavior did not change,
+  so HAZARD/report-card/GPU-kernel gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
