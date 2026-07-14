@@ -3113,6 +3113,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   fresh inventory, and independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The
   actionable inventory remains 13; STRUCT-001JU owns the exact nullable-grouping family at current lines 92–569.
 
+  STRUCT-001JU then isolated the exact complete nullable `GROUP BY` contract in the rustfmt-clean 482-line
+  private `tests/resident_expr/nullable_grouping.rs` child, reducing the PLAN-owned test root from 6,665 to
+  6,187 lines after deleting the single now-redundant trailing separator blank. Child lines 5–482 are
+  byte-identical to old parent lines 92–569 (SHA-256 `f28edaf9…`) and full-file reconstruction is exact. Exactly
+  nine ignored actual-GPU tests moved with no helper and three explicit import declarations/four names; the
+  fully qualified UUID parser remains exact. Test paths intentionally gained the child segment, with no facade,
+  visibility bridge, sibling/parent dependency, unsafe, include/path indirection, or production change. Reserved
+  NULL-key grouping, all-NULL multi-pass visibility, NULL aggregate-value skipping, COUNT(*) interaction,
+  nullable INT8/numeric/text/UUID breadth, COUNT(DISTINCT) clean rejection, and dirty-slot two-pass safety remain
+  exact. All nine paths passed 27 focused local actual-GPU executions and 18 independent-audit executions. Both
+  modes passed 505/487, the complete include-ignored suite passed 992/992, and workspace check, strict engine
+  Clippy, private rustdoc with the known 25-link warning baseline, scoped source/format/diff/cleanup, fresh
+  inventory, and independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The actionable
+  inventory remains 13; STRUCT-001JV owns the exact single-key grouping family at current lines 93–625.
+
 ## Known boundaries
 
 | Boundary | Work ID |
