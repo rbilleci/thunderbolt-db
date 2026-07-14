@@ -451,14 +451,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   remains PLAN-owned. Ten focused actual-GPU executions, both 505/487 modes, the complete 992 suite,
   static/source/cleanup/inventory gates, and independent audit pass. The actionable inventory remains 13;
   STRUCT-001JS owns the exact nullable-semantics matrix at current root lines 189–1296.
+- STRUCT-001JS is closed. The exact 15-test nullable predicate/projection/ordering matrix now lives in the
+  rustfmt-clean 1,113-line private `tests/resident_expr/nullable_semantics.rs` child; the 7,058-line test root
+  remains PLAN-owned. Seventy-five focused actual-GPU executions, both 505/487 modes, the complete 992 suite,
+  static/source/reference/cleanup/inventory gates, and independent audit pass. The actionable inventory remains
+  13; STRUCT-001JT owns the exact programmatic-predicate family at current root lines 16–408.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JS:** isolate current `tests/resident_expr.rs` lines 189–1296 into bounded private
-   `tests/resident_expr/nullable_semantics.rs` exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JT:** isolate current `tests/resident_expr.rs` lines 16–408 into bounded private
+   `tests/resident_expr/programmatic_predicates.rs` exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

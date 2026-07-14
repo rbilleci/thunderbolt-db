@@ -3082,6 +3082,22 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The actionable inventory
   remains 13; STRUCT-001JS owns the exact nullable-semantics matrix at current lines 189–1296.
 
+  STRUCT-001JS then isolated the exact complete nullable-semantics matrix in the rustfmt-clean 1,113-line
+  private `tests/resident_expr/nullable_semantics.rs` child, reducing the PLAN-owned test root from 8,166 to
+  7,058 lines after deleting the single now-redundant trailing separator blank. Child lines 6–1113 are
+  byte-identical to old parent lines 189–1296 (SHA-256 `3225df12…`) and full-file reconstruction is exact.
+  Exactly 15 ignored actual-GPU tests moved with no helper and four explicit import declarations/eight names;
+  the fully qualified UUID parser and two unqualified design-document evidence names remain unchanged. Test
+  paths intentionally gained the child segment, with no facade, visibility bridge, sibling/parent dependency,
+  unsafe, include/path indirection, or production change. Validity-aware WHERE 3VL, projected NULLs across word
+  boundaries, nullable typed/mixed-width/text/UUID/numeric traps, cross-scale composition, clean errors, and
+  PostgreSQL-default fixed/text/numeric/UUID NULL ordering remain exact. All 15 paths passed 45 focused local
+  actual-GPU executions and 30 independent-audit executions without device faults. Both modes passed 505/487,
+  the complete include-ignored suite passed 992/992, and workspace check, strict engine Clippy, private rustdoc
+  with the known 25-link warning baseline, scoped source/reference/format/diff/cleanup, fresh inventory, and
+  independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The actionable inventory
+  remains 13; STRUCT-001JT owns the exact programmatic-predicate family at current lines 16–408.
+
 ## Known boundaries
 
 | Boundary | Work ID |
