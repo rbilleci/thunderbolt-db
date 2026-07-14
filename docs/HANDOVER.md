@@ -667,6 +667,11 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `write_conveyor_bench/direct_client_latency.rs` child; the root is 4,337 lines. Reversible-parent proof, all
   logged/store-applied/durable smokes, the 59-test crate suite, default build, strict example Clippy, scoped static
   gates, fresh inventory, and independent audit pass. STRUCT-001LC owns the remaining coalesced scenario.
+- STRUCT-001LC is closed and the write-conveyor example disposition is complete. The exact coalesced scenario lives
+  in the cohesive 1,577-line private `write_conveyor_bench/coalesced_client_latency.rs` child; the root is 2,776
+  lines. Exact payload/reconstruction proof, all six segment/manager acknowledgement modes, two-lane durable
+  recovery, crate/build/Clippy/static gates, fresh two-outlier inventory, and independent audit pass. STRUCT-001LD
+  owns analysis of the engine-backed pgwire benchmark endpoint.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -676,8 +681,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001LC:** extract the exact 1,564-line coalesced-client scenario and complete the example below
-   3,000 lines under the separately sequenced PLAN row.
+1. **STRUCT-001LD:** complete the required analysis packet and select an acyclic disposition for the 3,668-line
+   `p8_engine_pgwire_benchmark_endpoint.rs` example before editing it.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

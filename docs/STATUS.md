@@ -3714,6 +3714,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   clean. Runtime behavior is unchanged, so HAZARD and report card were inapplicable. STRUCT-001LC owns the exact
   remaining coalesced-client scenario.
 
+  STRUCT-001LC then isolated the exact complete coalesced-client latency scenario in the rustfmt-clean, cohesive
+  1,577-line private `examples/write_conveyor_bench/coalesced_client_latency.rs` child, reducing the example root
+  from 4,337 to 2,776 lines and completing its disposition below the example envelope without an exception.
+  Original baseline lines 2786–4349, pre-slice root lines 2397–3960, and normalized child lines 14–1577 share
+  payload hash `67188e3e…`; restoring the prior module/import seam and normalized payload reconstructs pre-slice
+  root hash `5524e379…` byte-for-byte. The child retains all seven synchronization thread closures through one
+  explicit parent import list and root-confined entry visibility; no glob, path/include indirection, sibling cycle,
+  context bag, duplicated owner/helper, or external target/API exists. Small logged/store-applied/durable routes
+  passed on both segment and manager backends with checksum `0xe708e2ad2c8fc45`, zero final store/durable lag,
+  successful recovery, and a non-vacuous two-lane manager durable run. The 59-test crate suite, default example
+  check/build, strict example Clippy, scoped rustfmt/reference/history/cleanup gates, fresh two-outlier inventory,
+  and independent audit are clean. Runtime behavior is unchanged, so HAZARD and report card were inapplicable.
+  STRUCT-001LD owns analysis of the next 3,668-line engine-backed pgwire example.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3725,7 +3739,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 3 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 2 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
