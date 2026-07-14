@@ -3158,6 +3158,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   fresh inventory, and independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The
   actionable inventory remains 13; STRUCT-001JX owns the exact COUNT(DISTINCT) matrix at current lines 352–1138.
 
+  STRUCT-001JX then isolated the exact complete grouped/scalar COUNT(DISTINCT) matrix in the rustfmt-clean
+  791-line private `tests/resident_expr/count_distinct.rs` child, reducing the PLAN-owned test root from 4,684 to
+  3,897 lines after deleting the single now-redundant trailing separator blank. The payload matches old parent
+  lines 352–1138 byte-for-byte (SHA-256 `c65e8798…`), the child/full-parent hashes match their precomputed values,
+  and full reconstruction is exact. Exactly 23 ignored actual-GPU tests moved with no helper and three imports/
+  four names; both scalar controls, mixed-width companion, `Decimal128`, 21 positive target assertions, the empty
+  success without a target assertion, and clean rejection inventory remain exact without adding UUID-parser or
+  `SqlType` dependencies. Test paths gained the child segment with no facade, visibility bridge, sibling/parent
+  dependency, unsafe, include/path indirection, or production change. All 23 paths passed 69 focused local actual-
+  GPU executions and 46 independent-audit executions. Both modes passed 505/487, the complete include-ignored
+  suite passed 992/992, and workspace check, strict engine Clippy, private rustdoc with the known 25-link warning
+  baseline, scoped source/format/diff/cleanup, fresh inventory, and independent audit are clean. Pure movement
+  makes HAZARD/report card inapplicable. The actionable inventory remains 13; STRUCT-001JY owns the exact grouped
+  multi-aggregate matrix at current lines 295–604.
+
 ## Known boundaries
 
 | Boundary | Work ID |
