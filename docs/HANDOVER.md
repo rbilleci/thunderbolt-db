@@ -271,15 +271,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   descendant with six public telemetry, five unchanged crate APIs, seven sibling bridges, and nine private helpers.
   The 80-run GPU matrix, both engine modes, complete 992 suite, static/source/cleanup gates, and independent audit are
   clean. The 1,783-line root is a bounded facade below the production threshold; STRUCT-001II owns WAL tests.
+- STRUCT-001II is closed. The 70 inline WAL tests now live in exact ordered buffer/segment/checkpoint (841), archive
+  (1,708), and FUA (422) include leaves with every `tests::` path unchanged; the 12 lane tests remain unchanged. Both
+  82-test modes, 40 engine recovery/archive tests, four lane/FUA GPU integrations, static/source/cleanup gates, and
+  independent audit are clean. The 4,749-line WAL root remains PLAN-owned; STRUCT-001IJ owns buffer/group flush.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001II:** retain WAL test support and move exact current ranges 4746–5586, 5588–7315, and 7317–7748 into
-   ordered buffer/segment/checkpoint, archive, and FUA `include!` leaves; preserve all 82 test paths and keep the
-   remaining ~4,751-line production root PLAN-owned for its next analysis.
+1. **STRUCT-001IJ:** move current WAL ranges 165–545 and 601–1332 into private `buffer.rs`, re-export four public
+   buffer/group types, and retain root recovery/stats contracts to keep dependencies acyclic; prove all buffer, FUA,
+   lane, engine durability, and static gates while multi-GPU stays deferred.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

@@ -2526,6 +2526,18 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   scheduler facade below the production analysis threshold, so its disposition is complete without an exception.
   Runtime behavior did not change, so HAZARD/report-card gates were not applicable.
 
+  STRUCT-001II then moved the WAL root's 70 inline tests into three ordered include leaves while retaining the shared
+  parent test module and support: `tests/buffer_segment_checkpoint.rs` (31 tests, 841 lines), `tests/archive.rs`
+  (32 tests, 1,708 lines), and `tests/fua_backend.rs` (seven tests, 422 lines). Each leaf reconstructs its exact old
+  range after one-indent removal and rustfmt; root reconstruction is exact with only three ordered includes. All 70
+  `tests::` names, attributes, bodies, and lexical order plus the unchanged 12 `fua_lanes::tests` paths compile to the
+  same 82-test inventory. Both serial and default/concurrent WAL modes passed 82/82; all 40 engine recovery/archive
+  integrations and four focused lane/FUA GPU recovery controls passed. WAL/workspace all-target/all-feature checks,
+  strict clippy, exact source/name/order/format/reference gates, cleanup, and independent audit are clean. Production
+  bytes are unchanged and the root fell from 7,749 to 4,749 lines. It remains above the production analysis threshold
+  with separable buffer, segment/checkpoint, and archive owners, so no exception is justified. Runtime behavior did
+  not change, so HAZARD/report-card/GPU-kernel gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
