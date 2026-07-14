@@ -3325,6 +3325,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   audit are clean. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KI owns current
   parent lines 582–999 as the complete durable cold-checkpoint family.
 
+  STRUCT-001KI then isolated the exact durable cold-checkpoint owner in the rustfmt-clean 423-line private
+  `tests/streaming_exec/cold_checkpoint.rs` child, reducing the parent from 4,482 to 4,064 lines. Old parent lines
+  582–999 and child lines 6–423 share exact payload hash `ec1f89d5…`; the exact child/parent hashes are
+  `2c911210…`/`775a6368…`, and removing the private module plus restoring the payload and separator 1000 reconstructs
+  old-parent hash `808d461c…` byte-for-byte. The P1 heading, six tests/five ignores, three private fixtures, exact
+  descriptor fields, WAL construction, SQL/results/telemetry/errors, seam/frontier semantics, and four-declaration/
+  six-name import boundary are preserved. Only private parent `gpu_available`/`select` are consumed; history assigns
+  the family to the durable checkpoint/SV2 commits, with no visibility bridge, path/include indirection, unsafe,
+  context bag, numbered shard, external-name reference, or stale copy. Eighteen local plus 18 independent-audit
+  module executions passed, including 15 actual-GPU paths each; local concurrent PIDs `57330`/`57334` overlapped in
+  20 samples and audit PIDs `71903`/`71908` in 93, with zero CUDA 700/716/719 or related faults. Both debug/release
+  ordinary modes passed 505/487 in 14.16s/11.34s, the complete include-ignored suite passed 992/992 in 162.35s, and
+  workspace all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline,
+  scoped source/child-format/diff/cleanup gates, fresh 12-file inventory, and independent audit are clean. Runtime
+  behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001KJ owns current parent lines 583–902 as
+  the complete streaming DML-locate family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
