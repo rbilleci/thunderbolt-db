@@ -2982,6 +2982,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   actionable inventory is now 16: three production, nine tests, and four examples/tools. STRUCT-001JM owns
   pre-durable command/constraint validation in `engine_write_apply.rs`.
 
+  STRUCT-001JM then isolated the exact complete pre-durable all-command constraint/catalog validation owner in
+  the rustfmt-clean 1,486-line private `engine_write_apply/preflight.rs` leaf, reducing the apply/batcher root
+  from 2,250 to 779 lines and completing its disposition without an exception. The executable method is
+  byte-identical to old lines 470–1941 (SHA-256 `ea2e7db8…`) and full-source reconstruction is exact (SHA-256
+  `d9d8df95…`). Exactly one unchanged `pub(crate)` inherent method moved; its three callers, 63 unique command
+  variants plus fallback, validation/error ordering, catalog/snapshot boundaries, sequence simulation,
+  GPU-first device probes, streaming/elision/deauthorization behavior, and explicit host parity/bootstrap debt
+  are unchanged. The private leaf has five explicit import declarations/21 names, including the `TupleStore`
+  trait formerly supplied by the parent glob, with no bridge, re-export, cycle, API growth, unsafe, or runtime
+  change. Twenty focused host controls and 57 focused actual-GPU executions passed, including two concurrent
+  19-route matrices without CUDA 700/716/717. Both modes passed 505/487 and the complete include-ignored suite
+  passed 992/992 in 183.31s; workspace check, strict engine Clippy, private-item rustdoc with the known 25-link
+  warning baseline, scoped source/format/diff/cleanup, fresh inventory, and independent audit are clean. Pure
+  source movement makes HAZARD/report card inapplicable. The actionable inventory is now 15: two production,
+  nine tests, and four examples/tools. STRUCT-001JN owns the state-free contracts and device-predicate lowering
+  prelude in `engine_dml_prepare.rs`.
+
 ## Known boundaries
 
 | Boundary | Work ID |

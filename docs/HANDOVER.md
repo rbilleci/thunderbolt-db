@@ -421,14 +421,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   exception. Focused 31-test concurrent/serial/release runs, complete 59-test debug/release suites, six GPU lane
   recovery executions, both 505/487 modes, static/source/cleanup/inventory gates, and audit pass. The actionable
   inventory is 16; STRUCT-001JM owns exact command/constraint preflight validation in `engine_write_apply.rs`.
+- STRUCT-001JM is closed. The exact all-command pre-durable validation method now lives in the rustfmt-clean
+  1,486-line private `engine_write_apply/preflight.rs` leaf; the 779-line apply/batcher root completes the outlier
+  without an exception. Twenty host controls, 57 focused GPU executions, both 505/487 modes, the complete 992
+  suite, static/source/cleanup/inventory gates, and independent audit pass. The actionable inventory is 15;
+  STRUCT-001JN owns the exact state-free contracts/device-predicate prelude in `engine_dml_prepare.rs`.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JM:** isolate current `engine_write_apply.rs` lines 470–1942 into bounded private
-   `engine_write_apply/preflight.rs` exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JN:** isolate current `engine_dml_prepare.rs` lines 9–236 into bounded private
+   `engine_dml_prepare/contracts.rs` exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
