@@ -2245,6 +2245,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   check, connection-security preflight, scoped format/diff/source/reference gates, and independent audit. No
   production/API/visibility or runtime behavior changed, so GPU, HAZARD, and report-card gates were not applicable.
 
+  STRUCT-001HK then moved the exact eight-test SET/session-control parser-facade family into the rustfmt-clean
+  447-line `crates/protocol/src/tests/session_commands.rs` child, reducing the protocol root from 9,635 to 9,191
+  lines. Direct source inventory corrected the initially promoted count from nine to eight before implementation.
+  Normalized reconstruction is exact; quoted identifiers, whitespace separators, role/auth and transaction-
+  characteristic aliases, CHECKPOINT/FLUSH, RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY, payload/dollar-quote
+  cases, names, bodies, and errors are unchanged. The exact 71-test name-tail inventory is preserved. The focused
+  eight tests and full protocol package (71 library, 127 binary, and both one-test driver integrations), protocol
+  all-target check/strict clippy, server all-target check, security preflight, scoped gates, and independent audit
+  are clean. Production bytes/API/visibility and runtime are unchanged, so GPU, HAZARD, and report-card gates were
+  not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
