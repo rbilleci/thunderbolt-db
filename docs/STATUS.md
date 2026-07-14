@@ -2396,6 +2396,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   dependency/reference gates, zero generated residue, and independent audit are clean. Runtime behavior did not
   change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001HY then isolated the shared streaming join/rank cold-input admission invariant in the rustfmt-clean
+  60-line private `engine_streaming_exec/streaming_cold_admission.rs` descendant, reducing the root from 7,648 to
+  7,589 lines. Live-source proof corrected the stale planned boundary from 861–925 to the exact 861–919 method
+  before editing, leaving the following SELECT contract with its actual owner. The sole `pub(crate)` inherent API,
+  all three join plus one rank consumer, `(input_cap / 2).max(1)` target, retained-load first, class-authoritative
+  no-rescan/target bound, count-only capture, exact snapshot/GPU/budget arguments, error-to-decline behavior, and
+  post-capture reload are unchanged. Four focused GPU controls passed three serial and two concurrent rounds each;
+  both engine modes passed 505/487 and the complete serial suite passed all 992. Engine/workspace all-target/
+  all-feature checks, strict clippy, scoped source/format/reference gates, generated-residue cleanup, and independent
+  audit are clean. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
