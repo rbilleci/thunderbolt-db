@@ -210,14 +210,18 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `protocol/src/tests/relational_sql_facade.rs` leaf with its bounded cohesive-test disposition. The 71-test
   inventory, focused/full suites, static/security gates, normalized-source proof, and independent audit are clean;
   the root is 2,502 lines. Three final relational leaves remain; SELECT features are STRUCT-001HT.
+- STRUCT-001HT is closed. The exact four-test SELECT feature family now lives in the rustfmt-clean 349-line
+  `protocol/src/tests/relational_select_features.rs` leaf. The 71-test inventory, focused/full suites, static/
+  security gates, normalized-source proof, and independent audit are clean; the root is 2,159 lines. Aggregate
+  coverage is promoted as STRUCT-001HU, followed by the final catalog compatibility leaf.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HT:** move exact current protocol test lines 1,349–1,693 into `tests/relational_select_features.rs`,
-   preserving filter/projection structures and the 71-test inventory.
+1. **STRUCT-001HU:** move exact current protocol test lines 1,352–1,662 into `tests/relational_aggregates.rs`,
+   preserving aggregate/group/filter structures and the 71-test inventory.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

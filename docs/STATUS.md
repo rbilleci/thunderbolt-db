@@ -2341,6 +2341,15 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   check/strict clippy, server check, security preflight, scoped gates, and independent audit are clean. Production
   bytes/API/visibility and runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
 
+  STRUCT-001HT then moved the exact four-test relational SELECT feature family into the rustfmt-clean 349-line
+  `crates/protocol/src/tests/relational_select_features.rs` child, reducing the protocol root from 2,502 to 2,159
+  lines. Normalized reconstruction is exact; IN/BETWEEN/prefix-LIKE/DISTINCT filter groups, negation ordering,
+  coercion/NULL/errors, projection order, aliases/limits/order fields, exact command structures, names, bodies, and
+  assertions are unchanged. The exact 71-test name-tail inventory, four focused tests, full protocol package
+  (71 library, 127 binary, and both one-test driver integrations), protocol all-target check/strict clippy, server
+  check, security preflight, scoped gates, and independent audit are clean. Production bytes/API/visibility and
+  runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
