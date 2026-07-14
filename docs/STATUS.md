@@ -3206,6 +3206,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   is unchanged, so HAZARD/report card were inapplicable. The actionable inventory is 12; STRUCT-001KA owns the
   streaming scalar-reduction family.
 
+  STRUCT-001KA then isolated the exact streaming scalar-reduction owner in the rustfmt-clean 346-line private
+  `tests/streaming_exec/scalar_reductions.rs` child, reducing the parent from 6,474 to 6,133 lines. Module prose
+  plus old parent ranges 39–193 and 1212–1385 are byte-exact; only blank separators 194/1386 were discarded. The
+  exact child/parent hashes are `b59e76a3…`/`c4bf88ae…`, and full reconstruction matches old-parent hash
+  `7709683a…`. Exactly five tests/ignores moved with no helper, four import declarations/six names, one private
+  module, and only the narrow child-to-parent `gpu_available`/`select` dependency. The four one-GPU controls passed
+  12 local plus 12 independent-audit actual-GPU executions, including simultaneous processes observed on the RTX
+  PRO 6000, with zero CUDA 700/716/717. The fifth control retains its >=2-GPU runtime gate, device-1 budget, and
+  secondary-GPU counter assertion but is correctly not claimed executed on this one-GPU host. Both debug/release
+  ordinary modes passed 505/487, the complete include-ignored suite passed 992/992 in 170.10s, and workspace check,
+  strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped child-format/diff/source/cleanup
+  gates, fresh inventory, and independent audit are clean. The inherited parent remains rustfmt-dirty and was not
+  rewritten. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory
+  remains 12; STRUCT-001KB owns current parent lines 536–948 as the complete rank/window family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional

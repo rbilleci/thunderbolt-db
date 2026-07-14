@@ -494,6 +494,12 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   executions, both 505/487 modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit
   pass. The audit-caught import undercount was corrected in PLAN: six exact type annotations require the fourth
   imported name. The actionable inventory is 12; STRUCT-001KA owns the streaming scalar-reduction test family.
+- STRUCT-001KA is closed. Exact module prose and the complete five-test scalar-reduction family now live in the
+  rustfmt-clean 346-line private `tests/streaming_exec/scalar_reductions.rs` child; the parent is 6,133 lines.
+  Exact hashes/reconstruction, 12 local plus 12 independent-audit actual-GPU one-device executions, both 505/487
+  modes, the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The structurally
+  exact >=2-GPU control remains correctly unclaimed on this one-GPU host. The actionable inventory remains 12;
+  STRUCT-001KB owns the exact rank/window family at current parent lines 536–948.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -503,8 +509,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KA:** isolate the exact scalar-reduction ranges and module prose from `tests/streaming_exec.rs` as
-   mapped in `PLAN.md`, without claiming the parked physical multi-GPU gate.
+1. **STRUCT-001KB:** isolate the exact rank/window family at current `tests/streaming_exec.rs` lines 536–948 as
+   mapped in `PLAN.md`, preserving its resident-GPU oracle and pinned catalog/data generation boundary.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
