@@ -2677,6 +2677,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   actionable inventory remains 22 because SQL is still above 2,000; STRUCT-001IT owns command/control dispatch.
   Runtime behavior did not change, so HAZARD/report-card/GPU-kernel gates were inapplicable.
 
+  STRUCT-001IT then isolated top-level command entry, transaction/session/reset/notify controls, and legacy KV
+  dispatch in the rustfmt-clean 959-line private `sql/src/command.rs` leaf, reducing the SQL root from 4,668 to 3,717
+  lines. Compile validation corrected the preliminary range: root lexical `is_keyword_boundary` also consumes
+  `is_identifier_char`, while the command child does not, so that exact helper remains root-owned and the final third
+  moved range is 4207–4668 rather than 4203–4668. The other exact ranges are 600–879 and 909–1118. The child exposes
+  only the two old public command entries through root re-export, with no sibling bridge or root back-call and exactly
+  five explicit dependencies. Transaction modes/chains, FLUSH, RESET/DISCARD, NOTIFY payload grammar, SET/session/
+  role handling, legacy SET/GET/DEL, relational precedence, catalog-aware dispatch, and errors are source-equivalent.
+  Both 23-test SQL modes, both complete 71-test protocol library modes, both facade lifecycle and engine role/session
+  modes, affected/workspace static checks, strict scoped clippy, rustdoc, exact source/API/dependency/reference/
+  format/diff gates, and corrected independent audit are clean. STRUCT-001IU owns the function-free 66-type AST
+  contract block; SQL remains PLAN-owned above 2,000. Runtime behavior did not change, so HAZARD/report-card/GPU-
+  kernel gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
