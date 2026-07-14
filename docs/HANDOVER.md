@@ -511,6 +511,11 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   the complete 992 suite, static/source/cleanup gates, fresh inventory, and audit pass. The ignored route proved
   actual GPU fold nonvacuity. The actionable inventory remains 12; STRUCT-001KD owns the exact projection/windowing
   family at current parent lines 538–696.
+- STRUCT-001KD is closed. The exact two-test projection/windowing family now lives in the rustfmt-clean 164-line
+  private `tests/streaming_exec/projection.rs` child; the parent is 5,466 lines. Exact payload/parent reconstruction,
+  six local plus six independent-audit actual-GPU executions, both 505/487 modes, the complete 992 suite, static/
+  source/cleanup gates, fresh inventory, and audit pass. The actionable inventory remains 12; STRUCT-001KE owns
+  current helper-doc lines 539–540 plus grouped/DISTINCT helper/test block 581–832.
 - GitHub CPU CI now runs branch-diff whitespace, strict workspace Clippy, and the 13-crate host-neutral suite;
   complete engine runtime tests require a detected NVIDIA device. PostgreSQL 18 golden drift remains PRODUCT-002
   debt and is not treated as a valid blocking `ubuntu-latest` gate.
@@ -520,8 +525,8 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
 
 ## Resume here
 
-1. **STRUCT-001KD:** isolate the exact projection/windowing family at current `tests/streaming_exec.rs` lines
-   538–696 as mapped in `PLAN.md`, preserving multi-chunk, bounded-residency, and early-exit telemetry.
+1. **STRUCT-001KE:** isolate the exact grouped/DISTINCT family at current `tests/streaming_exec.rs` ranges mapped in
+   `PLAN.md`, re-homing the history-proven `sorted_rows` docs and preserving compaction/defer telemetry.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

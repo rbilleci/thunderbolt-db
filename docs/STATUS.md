@@ -3250,6 +3250,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   were inapplicable. The actionable inventory remains 12; STRUCT-001KD owns current parent lines 538–696 as the
   complete projection/windowing family.
 
+  STRUCT-001KD then isolated the exact two-test streaming projection/windowing owner in the rustfmt-clean 164-line
+  private `tests/streaming_exec/projection.rs` child, reducing the parent from 5,625 to 5,466 lines. Old parent
+  lines 538–696 and child lines 6–164 share exact payload hash `5f901a2d…`; the exact child/parent hashes are
+  `5102459f…`/`caeeba6d…`, and removing the private module plus restoring the payload and blank separator
+  reconstructs old-parent hash `3961a716…` byte-for-byte. Exactly two tests/ignores moved with no helper, visibility
+  bridge, path/include indirection, unsafe, or dependency beyond private `gpu_available`/`select`. Six local plus
+  six independent-audit actual-GPU executions passed, including simultaneous test processes observed on the RTX
+  PRO 6000, with zero CUDA 700/716/717. Both debug/release ordinary modes passed 505/487, the complete include-
+  ignored suite passed 992/992 in 171.07s, and workspace check, strict engine Clippy, private rustdoc with the known
+  25-warning baseline, scoped source/format/diff/cleanup gates, fresh inventory, and independent audit are clean.
+  Runtime behavior is unchanged, so HAZARD/report card were inapplicable. The actionable inventory remains 12;
+  STRUCT-001KE owns current helper-doc lines 539–540 plus helper/test block 581–832 as the complete grouped/DISTINCT
+  family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
