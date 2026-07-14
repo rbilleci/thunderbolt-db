@@ -2319,6 +2319,17 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   independent audit are clean. Production bytes/API/visibility and runtime are unchanged, so GPU, HAZARD, and
   report-card gates were not applicable.
 
+  STRUCT-001HR then moved the exact single 1,585-line malformed frontend-message matrix into the rustfmt-clean
+  1,556-line `crates/protocol/src/tests/frontend_messages_malformed.rs` child, reducing the protocol root from
+  6,179 to 4,596 lines. The shared parent-private `frontend_frame` remains the one definition consumed 134 times by
+  this leaf and 123 by valid coverage. Normalized reconstruction is exact; header/tag/length, Q/password/SASL,
+  C-string/UTF-8/binary, Parse/Describe/Close/Execute/Bind/FunctionCall count/code/value/trailing, zero-payload,
+  CopyFail, exact error variant/field/precedence, signed-count, empty/NULL, bounded-read, name, body, and assertion
+  behavior is unchanged. The exact 71-test name-tail inventory, focused test, full protocol package (71 library,
+  127 binary, and both one-test driver integrations), protocol all-target check/strict clippy, server check,
+  security preflight, scoped gates, and independent audit are clean. Production bytes/API/visibility and runtime
+  are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
