@@ -389,14 +389,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   passed 14 sequential plus 28 concurrent executions, the independent audit added 34 executions, both 505/487
   modes, the complete 992-test suite, static/source/cleanup gates, and audit pass. STRUCT-001JH owns the exact
   coalesced/direct wave-validation and visible-locate boundary.
+- STRUCT-001JH is closed. Exact coalesced/direct wave validation and visible-locate execution now live
+  normalized-exact in the rustfmt-clean 383-line private `engine_retained_read/wave_locate.rs` child with three
+  unchanged crate-visible paths, a private coalescer, and zero bridges. The parent is 3,049 lines. Eighteen CUDA
+  routes passed 18 sequential plus 36 concurrent executions, the independent audit added 38 executions, both
+  505/487 modes, the complete 992-test suite, static/source/cleanup gates, and audit pass. STRUCT-001JI owns the
+  exact complete remaining sharded point-lookup backend and is projected to close the root below 2,000 lines.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001JH:** isolate current `engine_retained_read.rs` lines 535–912 into the bounded private
-   `engine_retained_read/wave_locate.rs` owner exactly as promoted in `PLAN.md`.
+1. **STRUCT-001JI:** isolate current `engine_retained_read.rs` lines 537–1917 into the bounded private
+   `engine_retained_read/shard_point_lookup.rs` owner exactly as promoted in `PLAN.md`.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

@@ -2893,6 +2893,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   exact coalesced/direct wave validation and visible-locate boundary; the actionable inventory remains 19 because
   the 3,426-line parent is still PLAN-owned.
 
+  STRUCT-001JH then isolated exact coalesced/direct wave validation and visible-locate execution in the
+  rustfmt-clean 383-line private `engine_retained_read/wave_locate.rs` child, reducing the parent from 3,426 to
+  3,049 lines. The formatted child reconstructs old lines 535–912 exactly (SHA-256 `d09820f7…`), and the synthesized
+  parent is byte-identical outside that range (SHA-256 `09fed171…`). Exactly four methods moved with unchanged
+  visibility: three `pub(crate)` inherent paths, one private coalescer, zero bridges/re-exports/API growth, exact
+  two external validation callers, two external visible-locate callers, and one-way dependencies into parent
+  layout/liveness/index contracts. Lane/direct dispatch; table/key queue partition; leader and Acquire/Release
+  publication; concatenate/one-launch/scatter/None/statistics; count-only arguments; shard schema/pressure/validity/
+  liveness gates; fixed/blob layouts; index basis; cardinality and counters; per-needle snapshots; visibility-region
+  owners; newer-row-count rebind; descriptor-to-shard mapping; and probed identity handles are unchanged. Eighteen
+  actual-CUDA wave/race/A3/invalidation/budget, multiwriter/same-key, lane DELETE/UPDATE/recovery/zero-match,
+  compound i32/i64/mixed/UUID/TEXT, and rollover routes passed 18 sequential plus 36 concurrent executions; the
+  independent audit added 38 locate/index executions. Both modes passed 505/487, the complete include-ignored
+  suite passed 992/992 in 171.79s, and workspace check, strict Clippy, private-item rustdoc, exact source/import/
+  caller/dependency/scoped-format/diff, cleanup, and independent audit are clean; rustdoc retains the known
+  25-link warning baseline. Runtime behavior is unchanged, so HAZARD/report card were inapplicable. STRUCT-001JI
+  owns the complete remaining sharded point-lookup backend and is projected to close the parent below 2,000 lines;
+  the actionable inventory remains 19 until that disposition lands.
+
 ## Known boundaries
 
 | Boundary | Work ID |
