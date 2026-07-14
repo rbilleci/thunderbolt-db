@@ -3560,6 +3560,26 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   unchanged, so HAZARD/report card were inapplicable. STRUCT-001KU owns current parent lines 49–1543 as the
   complete GPU intent-lane lifecycle family and will complete this test root below 3,000 lines.
 
+  STRUCT-001KU then isolated that exact nine-test/seven-helper GPU intent-lane lifecycle in the rustfmt-clean
+  1,499-line private `tests/intent_fast_path/lane_lifecycle.rs` child, reducing the parent from 4,264 to 2,769 lines
+  and completing its disposition below the test envelope without an exception. Old parent lines 49–1543 and child
+  lines 5–1499 share exact payload hash `4d6234dc…`; the exact child/parent hashes are `48ea5d1e…`/`838cbb29…`,
+  and removing the alphabetically placed private module plus restoring the payload and separator 1544 reconstructs
+  old-parent hash `6ad6d330…` byte-for-byte. All nine tests/ignores, seven helpers, and exact WAL paths/env guards,
+  routes/transactions, submit/poll/drive timing, conflicts, diagnostics, rows, recovery assertions, and cleanup
+  behavior are preserved through three explicit import declarations/seven names. History spans the exact 16 intent-
+  lane commits, with no child glob, visibility widening/bridge, path/include indirection, unsafe, context bag,
+  numbered shard, external-name reference, or stale copy. Twenty-seven local plus 27 independent-audit actual-GPU
+  executions passed. Local concurrent PIDs `218035`/`218038` overlapped in 674 samples and audit PIDs `244952`/
+  `244957` in 1,937, with zero CUDA 700/716/719 or related faults. Debug ordinary mode passed 505/487 in 14.55s.
+  The first release ordinary run exposed one transient pre-existing `write_half` concurrent re-resolve failure; its
+  exact test then passed three consecutive reruns and the complete release ordinary rerun passed 505/487 in 14.61s.
+  The complete include-ignored suite passed 992/992 in 193.29s. Workspace all-target/all-feature check, strict engine
+  Clippy, private rustdoc with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh
+  eight-file inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were
+  inapplicable. STRUCT-001KV owns current `tests/resident_route.rs` lines 1032–1857 as the complete sharded lookup
+  and retained batched-projection family.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3571,7 +3591,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 9 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 8 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
