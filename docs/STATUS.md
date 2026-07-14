@@ -2777,6 +2777,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   were inapplicable. STRUCT-001JA owns the exact follow-chain/source/all-version resolution boundary; the actionable
   inventory remains 20 because the 3,251-line parent is still PLAN-owned.
 
+  STRUCT-001JA then isolated the exact follow-chain seed/branch recursion and general/all-version MVCC source
+  resolution owner in the rustfmt-clean 400-line private `mvcc_read_exec/source_resolution.rs` child, reducing the
+  parent from 3,251 to 2,863 lines. Child lines 7–400 are byte-for-byte identical to old lines 2858–3251; exactly
+  six functions moved behind an exact six-name facade, test-only `collect_operator_rows` stayed with the backend,
+  recursion remains child-local, and the sole execution edge points one-way to parent composition. The statement-
+  scoped unused-import allowance preserves four formerly crate-reachable helper paths and does not cover code or
+  module scope. Both modes passed all 128 affected active MVCC query/join/provenance/bundle tests. Seven actual-CUDA
+  follow-chain/concat/set-composition/labeled-branch routes passed 21 sequential plus 14 concurrent executions
+  without device faults; both complete engine modes passed 505/487 and the complete include-ignored suite passed
+  992/992 in 166.90s. Workspace all-target/all-feature check and strict clippy, private-item rustdoc, exact source/
+  facade/import/caller/scoped-format/diff checks, generated-residue cleanup, and independent audit are clean;
+  strict rustdoc retains the known 25-link warning baseline. Runtime behavior is unchanged, so
+  HAZARD/report card were inapplicable. STRUCT-001JB owns the exact CUDA query-capability/gap boundary; the
+  actionable inventory remains 20 because the 2,863-line parent is still PLAN-owned.
+
 ## Known boundaries
 
 | Boundary | Work ID |
