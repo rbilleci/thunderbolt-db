@@ -238,15 +238,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   `engine_streaming_exec/materialized_column_decode.rs` descendant with its sole `pub(crate)` API/caller unchanged.
   Focused GPU controls, both engine modes, complete 992 suite, static/source/dependency gates, cleanup, and audit are
   clean; the root is 7,503 lines. STRUCT-001IA owns streaming SELECT classification/admission/dispatch.
+- STRUCT-001IA is closed. Streaming SELECT classification/admission/binding/dispatch now lives in the rustfmt-clean
+  240-line `engine_streaming_exec/streaming_select_route.rs` descendant with private classifier symbols, both
+  `pub(crate)` routes, and all callers unchanged. The 35-run GPU matrix, fallback control, both engine modes, complete
+  992 suite, static/source/comment/dependency gates, cleanup, and audit are clean; the root is 7,269 lines.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IA:** move exact current streaming classifier lines 603–735 and route lines 776–875 into
-   `streaming_select_route.rs`, preserving classification/admission/binding/fallback/dispatch while leaving current
-   root lines 738–774 multi-GPU scheduling deferred; then correct the two separately proven obsolete comments.
+1. **STRUCT-001IB:** move exact current streaming root lines 945–1314 into `streaming_projection_fold.rs`, preserving
+   the complete S-E.2 chunk/project/final-device-window owner with only one `pub(super)` route-sibling bridge, then
+   correct the separately proven obsolete host-windowing comment; keep multi-GPU scheduling deferred.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

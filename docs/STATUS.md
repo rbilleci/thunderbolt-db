@@ -2418,6 +2418,20 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   source/format/reference gates, generated-residue cleanup, and independent audit are clean. Runtime behavior did
   not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001IA then isolated streamable SELECT shape classification, admission, binding, and four-fold dispatch in
+  the rustfmt-clean 240-line private `engine_streaming_exec/streaming_select_route.rs` descendant, reducing the root
+  from 7,503 to 7,269 lines. The two noncontiguous source blocks reconstruct exactly apart from one separately proven
+  classifier-doc correction; the intervening multi-GPU scheduler remains byte-for-byte in the root. `StreamShape`
+  and `streaming_shape` remain private, both inherent routes remain `pub(crate)`, and all three current-boundary plus
+  one explicit-boundary callers are unchanged. Every HAVING/ORDER/DISTINCT/group/plain/scalar classification,
+  top-N/normalization/decline, budget/elision/class guard, catalog-data boundary bind, cold probe/CPU fallback,
+  predicate lowering/filter clearing, fold argument, and `Some`/`None` invariant is exact. The only other change
+  corrected the audit-proven stale claim that scalar partials combine on the host; the final combine is on device.
+  Seven route controls passed three serial plus two concurrent rounds each, the no-budget fallback passed, both
+  engine modes passed 505/487, and the complete serial suite passed all 992. Engine/workspace all-target/all-feature
+  checks, strict clippy, exact source/comment/format/reference gates, cleanup, and independent audit are clean.
+  Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
