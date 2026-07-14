@@ -283,15 +283,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   two constants, six contracts, ten operations, six private helpers, stable root re-exports, and no bridge. Focused/
   full WAL, engine timeline/cleanup, static/source gates, and audit are clean; the root is 2,868 lines. Audit promoted
   inherited registry-delimiter injection as STRUCT-001IL before further WAL extraction.
+- STRUCT-001IL is closed. Timeline IDs and parents now reject the registry `|` delimiter before any filesystem
+  mutation. Three regressions cover direct sidecar/registry/register paths, IDs/parents, missing/existing targets,
+  exact readable registry preservation, and temp absence. Nine focused and both 85-test modes, engine/static gates,
+  and independent re-audit are clean; STRUCT-001IM owns object backup.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IL:** reject `|` in timeline IDs/parents before mutation and prove direct sidecar/registry writes plus
-   registration leave missing/existing registry state unchanged; keep the existing error category and defer power-loss
-   directory-fsync/checksum coverage to DUR-002.
+1. **STRUCT-001IM:** move current WAL object-backup ranges 47, 115–128, 1009–1508, 2275–2392, and 2841–2848 into
+   private `archive_object_backup.rs`; re-export two types/four operations without a bridge and preserve verified
+   export/restore tests and engine recovery while power-loss directory persistence remains DUR-002.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

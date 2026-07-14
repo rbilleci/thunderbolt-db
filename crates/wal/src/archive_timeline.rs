@@ -690,7 +690,7 @@ fn validate_timeline_value(path: &Path, field: &str, value: &str) -> Result<(), 
             path.display()
         )));
     }
-    if value == "none" || value.contains('\n') || value.contains('\r') {
+    if value == "none" || value.contains('\n') || value.contains('\r') || value.contains('|') {
         return Err(EngineError::Durability(format!(
             "WAL archive timeline {field} contains unsupported value in {}",
             path.display()

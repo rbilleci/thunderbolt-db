@@ -841,6 +841,141 @@ fn wal_archive_forks_timestamp_timeline_and_rejects_self_parent_without_mutation
 }
 
 #[test]
+fn wal_archive_timeline_rejects_delimiter_before_sidecar_mutation() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-wal-timeline-delimiter-sidecar-{}-{}",
+        std::process::id(),
+        NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let existing_path = dir.join("EXISTING_TIMELINE");
+    let missing_path = dir.join("MISSING_TIMELINE");
+    let sentinel = b"existing timeline bytes";
+    fs::write(&existing_path, sentinel).unwrap();
+    let base = WalArchiveTimeline {
+        timeline_id: "timeline-valid".to_string(),
+        parent_timeline_id: None,
+        fork_txn_id: 7,
+        fork_timestamp_micros: Some(9),
+        source_manifest_path: dir.join("source-manifest"),
+        branch_manifest_path: dir.join("branch-manifest"),
+    };
+
+    let mut invalid_id = base.clone();
+    invalid_id.timeline_id = "timeline|injected".to_string();
+    let err = write_wal_archive_timeline(&missing_path, &invalid_id).unwrap_err();
+    assert!(err.to_string().contains("contains unsupported value"));
+    assert!(!missing_path.exists());
+    assert!(!temporary_control_path(&missing_path).exists());
+
+    let mut invalid_parent = base;
+    invalid_parent.parent_timeline_id = Some("parent|injected".to_string());
+    let err = write_wal_archive_timeline(&existing_path, &invalid_parent).unwrap_err();
+    assert!(err.to_string().contains("contains unsupported value"));
+    assert_eq!(fs::read(&existing_path).unwrap(), sentinel);
+    assert!(!temporary_control_path(&existing_path).exists());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn wal_archive_timeline_registry_rejects_delimiter_without_mutation() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-wal-timeline-delimiter-registry-{}-{}",
+        std::process::id(),
+        NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let registry_path = dir.join("TIMELINE_REGISTRY");
+    let entry =
+        |timeline_id: &str, parent_timeline_id: Option<&str>| WalArchiveTimelineRegistryEntry {
+            timeline_id: timeline_id.to_string(),
+            parent_timeline_id: parent_timeline_id.map(str::to_string),
+            fork_txn_id: 1,
+            fork_timestamp_micros: None,
+            timeline_path: dir.join(format!("{timeline_id}.timeline")),
+            branch_manifest_path: dir.join(format!("{timeline_id}.manifest")),
+        };
+
+    let invalid_id = WalArchiveTimelineRegistry {
+        timelines: vec![entry("timeline|injected", None)],
+    };
+    let err = write_wal_archive_timeline_registry(&registry_path, &invalid_id).unwrap_err();
+    assert!(err.to_string().contains("contains unsupported value"));
+    assert!(!registry_path.exists());
+    assert!(!temporary_control_path(&registry_path).exists());
+
+    let valid = WalArchiveTimelineRegistry {
+        timelines: vec![entry("timeline-root", None)],
+    };
+    write_wal_archive_timeline_registry(&registry_path, &valid).unwrap();
+    let before = fs::read(&registry_path).unwrap();
+    let invalid_parent = WalArchiveTimelineRegistry {
+        timelines: vec![
+            entry("timeline-root", None),
+            entry("timeline-child", Some("timeline|injected")),
+        ],
+    };
+    let err = write_wal_archive_timeline_registry(&registry_path, &invalid_parent).unwrap_err();
+    assert!(err.to_string().contains("contains unsupported value"));
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
+    assert_eq!(
+        read_wal_archive_timeline_registry(&registry_path).unwrap(),
+        valid
+    );
+    assert!(!temporary_control_path(&registry_path).exists());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn register_timeline_rejects_delimiter_sidecar_without_registry_mutation() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-wal-timeline-delimiter-register-{}-{}",
+        std::process::id(),
+        NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let timeline_path = dir.join("INJECTED_TIMELINE");
+    let registry_path = dir.join("TIMELINE_REGISTRY");
+    let missing_registry_path = dir.join("MISSING_REGISTRY");
+    fs::write(
+        &timeline_path,
+        format!(
+            "GPUDBWALTIMELINE1\ntimeline_id=timeline|injected\nparent_timeline_id=none\nfork_txn_id=1\nfork_timestamp_micros=none\nsource_manifest_path={}\nbranch_manifest_path={}\n",
+            dir.join("source-manifest").display(),
+            dir.join("branch-manifest").display()
+        ),
+    )
+    .unwrap();
+
+    let valid = WalArchiveTimelineRegistry {
+        timelines: vec![WalArchiveTimelineRegistryEntry {
+            timeline_id: "timeline-root".to_string(),
+            parent_timeline_id: None,
+            fork_txn_id: 0,
+            fork_timestamp_micros: None,
+            timeline_path: dir.join("root.timeline"),
+            branch_manifest_path: dir.join("root.manifest"),
+        }],
+    };
+    write_wal_archive_timeline_registry(&registry_path, &valid).unwrap();
+    let before = fs::read(&registry_path).unwrap();
+
+    let err = register_wal_archive_timeline(&missing_registry_path, &timeline_path).unwrap_err();
+    assert!(err.to_string().contains("contains unsupported value"));
+    assert!(!missing_registry_path.exists());
+    assert!(!temporary_control_path(&missing_registry_path).exists());
+
+    let err = register_wal_archive_timeline(&registry_path, &timeline_path).unwrap_err();
+    assert!(err.to_string().contains("contains unsupported value"));
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
+    assert_eq!(
+        read_wal_archive_timeline_registry(&registry_path).unwrap(),
+        valid
+    );
+    assert!(!temporary_control_path(&registry_path).exists());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn wal_archive_timeline_registry_requires_parent_before_child_and_unique_ids() {
     let dir = std::env::temp_dir().join(format!(
         "gpu-db-wal-archive-timeline-registry-{}-{}",

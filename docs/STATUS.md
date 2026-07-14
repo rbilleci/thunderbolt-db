@@ -2568,6 +2568,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   error-after-mutation registration. STRUCT-001IL is promoted ahead of more extraction. IK itself changed no runtime
   behavior, so HAZARD/report-card/GPU-kernel gates were not applicable.
 
+  STRUCT-001IL then closed the audit-promoted timeline registry delimiter defect. `validate_timeline_value` now
+  rejects `|` through the existing durability/`contains unsupported value` category, so both timeline IDs and parent
+  IDs fail before sidecar directory creation, temp-file creation, registry reads, or registry writes. Three new
+  non-vacuous regressions cover direct sidecar writes, direct registry writes, and registration from a crafted
+  delimiter-bearing sidecar across ID/parent and missing/existing target cases; they assert unchanged exact bytes,
+  post-error registry readability/equality, target absence, and temp-artifact absence. Reverting the condition causes
+  the direct writer assertions to fail, while the precise error-category checks prevent false passes through later
+  missing-manifest validation. All nine timeline tests passed, both full WAL modes passed 85/85, and three engine
+  timeline/cleanup integrations passed. WAL/engine/workspace all-target/all-feature checks, strict clippy, format/
+  diff/reference/cleanup gates, and independent re-audit are clean. Public APIs, valid serialization, parent order,
+  selection/prune behavior, and existing file-sync/rename behavior are unchanged; containing-directory crash
+  persistence remains DUR-002. GPU-kernel/report-card gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
