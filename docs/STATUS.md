@@ -3398,6 +3398,25 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   so HAZARD/report card were inapplicable. STRUCT-001KM owns current parent lines 586–771 as the complete P4-2a
   chunk-native locate/stamp family.
 
+  STRUCT-001KM then isolated the exact P4-2a chunk-native locate/stamp family in the rustfmt-clean 190-line private
+  `tests/streaming_exec/chunk_locate.rs` child, reducing the parent from 3,300 to 3,114 lines. Old parent lines
+  586–771 and child lines 5–190 share exact payload hash `b09383d7…`; the exact child/parent hashes are
+  `f541d6a9…`/`774a9f0f…`, and removing the alphabetically placed private module plus restoring the payload and
+  separator 772 reconstructs old-parent hash `134b912c…` byte-for-byte. The P4-2a heading, two tests/ignores, exact
+  predicates, coordinate decoding, SQL/results/counters, sidecar stamps, COUNT/SUM/reverse-gather visibility, and
+  re-locate idempotence are preserved through three import declarations/six names. Only private
+  `gpu_available`/`select` are consumed; history assigns the range to chunk-locate/store-free-stamp commits, with no
+  visibility bridge, path/include indirection, unsafe, context bag, numbered shard, external-name reference, or
+  stale copy. The store-driven P3 rows remain explicitly the same-pinned-view parity/bootstrap differential, never
+  product direction. Six local plus six independent-audit actual-GPU executions passed; local concurrent PIDs
+  `110527`/`110533` overlapped in five samples and audit PIDs `121110`/`121118` in seven, with zero CUDA
+  700/716/719 or related faults. Both debug/release ordinary modes passed 505/487 in 14.74s/7.90s, the complete
+  include-ignored suite passed 992/992 in 179.08s, and workspace all-target/all-feature check, strict engine Clippy,
+  private rustdoc with the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh 12-file
+  inventory, and independent audit are clean. Runtime behavior is unchanged, so HAZARD/report card were
+  inapplicable. STRUCT-001KN owns current parent lines 587–1123 as the complete P4 chunk-authoritative class
+  lifecycle and will complete this test-root disposition below 3,000 lines.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
