@@ -2732,6 +2732,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inapplicable. STRUCT-001IX owns the next exact lane coordinator boundary and deletion of the inherited D3b
   group-flush prose proven misattached to its lane-drive entry.
 
+  STRUCT-001IX then isolated exact intent-lane drive/resize/submit/rescue/apply-queue coordination in the
+  rustfmt-clean 851-line private `engine_dml_concurrent/lane.rs` child, reducing the parent from 3,277 to 2,414
+  lines. Rustfmt-normalized executable source matches old lines 1176–2020 after the sole authorized `pub(super)`
+  on parent-called `maybe_resize_lanes`; existing `pub(crate)` drive/submit paths are stable, the other two moved
+  methods remain private, and dependency direction is one-way. The inherited old lines 1158–1175 D3b group-flush
+  prose were proven attached to the unrelated lane-drive entry and deleted. Single-writer guards, adaptive resize/
+  barrier and hold rescue, sequence/timestamp claims, async/strict settlement, device validate/apply handoff, stats,
+  poison, and outcomes are source-equivalent. Seven affected GPU routes passed 21 sequential plus 14 concurrent
+  executions without CUDA 700/716/717; both engine modes passed 505/487 and the complete include-ignored suite
+  passed 992/992. Workspace all-target/all-feature check, strict engine clippy, private-item rustdoc, scoped source/
+  visibility/caller/dependency/format/diff checks, 68 GiB generated-residue cleanup, and independent audit are clean.
+  Strict rustdoc remains the same pre-existing broken/private-link baseline recorded at IW. Runtime behavior is
+  unchanged, so HAZARD/report card were inapplicable. STRUCT-001IY owns the final exact lane validation/device-
+  apply/settlement extraction that will complete this file below 2,000 lines without an exception.
+
 ## Known boundaries
 
 | Boundary | Work ID |

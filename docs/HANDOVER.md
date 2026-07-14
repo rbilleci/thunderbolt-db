@@ -334,14 +334,20 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   is `sequence_commit_wave`; normalized source, 24 sequential plus 16 concurrent focused GPU executions, both
   505/487 engine modes, the complete 992-test GPU suite, static/source/cleanup gates, and independent audit pass.
   STRUCT-001IX owns the exact lane coordinator and deletion of its proven-misattributed D3b prose.
+- STRUCT-001IX is closed. Exact lane drive/resize/submit/rescue/apply-queue coordination now lives in the
+  rustfmt-clean 851-line private `engine_dml_concurrent/lane.rs` child, reducing the parent to 2,414 lines. Existing
+  crate paths remain; only parent-called `maybe_resize_lanes` gained sibling visibility. The 18-line D3b group-flush
+  prose proven misattached to lane drive was deleted. Seven GPU routes passed 21 sequential plus 14 concurrent
+  executions; both 505/487 modes, the complete 992-test suite, static/source/cleanup gates, and audit pass.
+  STRUCT-001IY owns the final lane validation/device-apply/settlement boundary.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IX:** move current `engine_dml_concurrent.rs` lines 1158–2020 into private `lane.rs`, deleting the
-   misattached D3b group-flush prose at 1158–1175 and preserving executable lines 1176–2020 exact.
+1. **STRUCT-001IY:** move current `engine_dml_concurrent.rs` lines 1159–1811 into private `lane_apply.rs`, exposing
+   only the three exact sibling-called methods and completing the parent below 2,000 lines.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
