@@ -2297,6 +2297,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   check, security preflight, scoped gates, and independent audit are clean. Production bytes/API/visibility and
   runtime are unchanged, so GPU, HAZARD, and report-card gates were not applicable.
 
+  STRUCT-001HP then moved the exact three-test session-lifecycle and ready-loop family into the rustfmt-clean
+  86-line `crates/protocol/src/tests/session_lifecycle.rs` child, reducing the protocol root from 8,276 to 8,196
+  lines. Normalized reconstruction is exact; default and complete accepted/auth/ready/transaction/terminate/close
+  transitions, exact invalid state/event payloads, ready-loop dispatch/status, extended-error skip-until-Sync,
+  Sync-clear booleans, transaction flags, names, bodies, and errors are unchanged. The exact 71-test name-tail
+  inventory is preserved. Three focused tests and the full protocol package (71 library, 127 binary, and both
+  one-test driver integrations), protocol all-target check/strict clippy, server check, security preflight, scoped
+  gates, and independent audit are clean. Production bytes/API/visibility and runtime are unchanged, so GPU,
+  HAZARD, and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
