@@ -3128,6 +3128,21 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   inventory, and independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The actionable
   inventory remains 13; STRUCT-001JV owns the exact single-key grouping family at current lines 93–625.
 
+  STRUCT-001JV then isolated the exact complete non-null single-key `GROUP BY` breadth matrix in the rustfmt-clean
+  537-line private `tests/resident_expr/single_key_grouping.rs` child, reducing the PLAN-owned test root from
+  6,187 to 5,654 lines after deleting the single now-redundant trailing separator blank. Child lines 5–537 are
+  byte-identical to old parent lines 93–625 (SHA-256 `ba81de56…`) and full-file reconstruction is exact. Exactly
+  ten ignored actual-GPU tests moved with no helper and three explicit import declarations/four names; both fully
+  qualified UUID parses and the unqualified design-document test-name evidence remain exact. Test paths
+  intentionally gained the child segment, with no facade, visibility bridge, sibling/parent dependency, unsafe,
+  include/path indirection, or production change. Int4 and derived-expression grouping, empty/overflow behavior,
+  grouped MIN/MAX including UUID, numeric keys, bool keys/values, exact metadata/order/errors/targets remain exact.
+  All ten paths passed 30 focused local actual-GPU executions and 20 independent-audit executions. Both modes
+  passed 505/487, the complete include-ignored suite passed 992/992, and workspace check, strict engine Clippy,
+  private rustdoc with the known 25-link warning baseline, scoped source/reference/format/diff/cleanup, fresh
+  inventory, and independent audit are clean. Pure movement makes HAZARD/report card inapplicable. The actionable
+  inventory remains 13; STRUCT-001JW owns the exact composite-grouping matrix at current lines 94–1063.
+
 ## Known boundaries
 
 | Boundary | Work ID |
