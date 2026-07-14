@@ -2651,6 +2651,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   root remains critical and PLAN-owned; STRUCT-001IR owns SELECT contracts and parsing. Runtime behavior did not
   change, so HAZARD/report-card/GPU-kernel gates were inapplicable.
 
+  STRUCT-001IR then isolated all SELECT contracts and projection/filter/order parsing in the rustfmt-clean 607-line
+  private `sql/src/select.rs` leaf, reducing the SQL root from 5,684 to 5,094 lines. The exact old contract/parser
+  blocks reconstruct after only three `pub(super)` tokens and rustfmt's corresponding multiline signature. Seven
+  public contract paths remain through one explicit re-export; root privately imports exactly `parse_select`,
+  `parse_select_filter`, and `parse_select_filter_groups` for six existing callers, while every subordinate parser
+  remains private. Catalog-aware normalization, DISTINCT/projection/aggregate rules, WHERE/HAVING precedence,
+  flipped comparisons, BETWEEN/IN/LIKE, LIMIT/OFFSET, ORDER, and errors are source-equivalent. Both 23-test SQL
+  modes, both ten-test protocol relational and seven-test catalog modes, both 21-test engine bridge and CHECK bridge
+  modes, affected/workspace all-target/all-feature checks, strict scoped clippy, rustdoc, exact source/API/bridge/
+  dependency/reference/format/diff gates, and independent audit are clean. STRUCT-001IS owns scalar types/values and
+  parsing and will take SQL below 5,000; the root will remain PLAN-owned above 2,000. Runtime behavior did not change,
+  so HAZARD/report-card/GPU-kernel gates were inapplicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |
