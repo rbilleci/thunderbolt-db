@@ -2469,6 +2469,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   checks, strict clippy, exact source/comment/format/reference gates, cleanup, and independent audit are clean.
   Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001IE then isolated scalar partial planning, chunk reduction, and final device combine in the rustfmt-clean
+  521-line private `engine_streaming_exec/streaming_reduction_fold.rs` descendant, reducing the root from 5,643 to
+  5,138 lines. Three old blocks reconstruct exactly after rustfmt plus one required route/admission `pub(super)`
+  token; planner, chunk, and combine helpers stay private. Type ladder/declines, GPU selection, cold/scan/ranges/
+  capture, lookahead/drain/empty sentinel, device COUNT guard and reductions, NULL/all-NULL and overflow behavior,
+  partial budget, final synthesized device aggregate, checked narrow/Numeric preservation, telemetry/results,
+  dependencies, and multi-GPU deferral are exact. Four stale comments now accurately distinguish at most two
+  budget/2-target chunks from the largest-single-descriptor peak gauge and state the device final combine; the audit
+  required and passed a precision rewrite that preserves overhead/one-row overshoot truth. Five controls passed
+  three serial plus two concurrent rounds each; both engine modes passed 505/487 and all 992 passed together.
+  Engine/workspace all-target/all-feature checks, strict clippy, exact source/comment/format/reference gates, cleanup,
+  and independent audit are clean. Runtime behavior did not change, so HAZARD/report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

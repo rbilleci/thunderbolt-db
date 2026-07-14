@@ -254,15 +254,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   live in the rustfmt-clean 567-line `engine_streaming_exec/streaming_ordered_fold.rs` descendant with exactly route
   and projection-sibling bridges. The 15-run GPU matrix, both engine modes, complete 992 suite, static/source/comment
   gates, cleanup, and audit are clean; the root is 5,643 lines. STRUCT-001IE owns scalar reduction.
+- STRUCT-001IE is closed. Scalar partial planning, chunk reduction, and final device combine now live in the
+  rustfmt-clean 521-line `engine_streaming_exec/streaming_reduction_fold.rs` descendant with one route/admission
+  bridge. The 25-run GPU matrix, both engine modes, complete 992 suite, static/source/comment gates, precise overlap/
+  gauge prose, cleanup, and audit are clean; the root is 5,138 lines. STRUCT-001IF owns the cold lifecycle.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001IE:** move exact current scalar blocks 549–598, 646–946, and 1740–1891 into
-   `streaming_reduction_fold.rs`, preserving complete partial/chunk/final-device-combine semantics with only one
-   route/admission sibling bridge; correct four stale host-combine/one-chunk comments and keep multi-GPU deferred.
+1. **STRUCT-001IF:** move exact current cold-lifecycle lines 596–1386 into `streaming_cold_lifecycle.rs`, preserving
+   stage/build/replay/patch/commit/load/install/spill/publication semantics, two crate APIs, and seven sibling bridges;
+   correct two stale commit-frontier mutex comments and keep multi-GPU deferred.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.

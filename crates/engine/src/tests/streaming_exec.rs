@@ -3,10 +3,11 @@
 //! A table whose bytes exceed the configured per-GPU residency budget has no all-resident representation,
 //! so today its aggregate would de-elide to the CPU host engine (the ADR-006 charter violation). The
 //! streaming fold serves `COUNT(*)`/`SUM`/`MIN`/`MAX` OUT-OF-CORE: the visible rows are chunked to the
-//! budget, each chunk uploaded + reduced ON THE DEVICE, partials combined host-side (control plane). The
+//! budget, each chunk uploaded + reduced ON THE DEVICE, and partials combined by one final device pass. The
 //! non-vacuity proof is the fired counter + `streaming_fold_chunks > 1` (a genuine multi-chunk fold) +
-//! `streaming_fold_peak_chunk_bytes <= budget` (only one chunk ever resident). The differential is the
-//! SAME engine's CPU-pinned answer with the budget cleared.
+//! `streaming_fold_peak_chunk_bytes <= budget` (the largest single descriptor stays bounded). S-E.5
+//! lookahead overlaps at most two chunks, each targeted at budget/2. The differential is the SAME engine's
+//! CPU-pinned answer with the budget cleared.
 
 use super::*;
 
