@@ -3772,6 +3772,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and independent audit pass. Runtime behavior is unchanged, so HAZARD and report card were inapplicable.
   STRUCT-001LH owns the final retained runtime leaf.
 
+  STRUCT-001LH then moved the planned 659-line retained runtime payload plus its attached `Clone` attribute into
+  the rustfmt-clean 683-line private `p8_engine_pgwire_benchmark_endpoint/retained_runtime.rs` leaf, reducing the
+  root from 3,515 to 2,856 lines and completing the example disposition without an exception. After removing the
+  explicit root-confined visibility and rustfmt-only signature wrapping, the payload hash is `1ad2b0d2…`; reversing
+  module/import scaffolding and reinserting that payload reproduces the complete post-LG parent hash `1a7c6b7a…`.
+  The final graph is `root -> {runtime, retained_batch, result_rows}` plus
+  `runtime -> {retained_batch, result_rows}`, with no back-edge, duplicate, glob, path/include indirection, or
+  external API. Generation/in-flight fencing, lane hashing and batching, queue timing/stats, fixed/text/null layout,
+  detached completion, protocol bytes, errors, and fall-loud GPU behavior are source-equivalent. Default example
+  check/build, strict Clippy, the server suite, the full 505-passing/487-GPU-ignored engine suite, 16-row benchmark
+  and 1/2-client concurrency smokes, and three sequential plus two concurrent endpoint GPU executions pass. All
+  12 concurrency metrics report correct retained GPU routes with positive CUDA timing; all HAZARD runs retain zero
+  H2D facts and have no CUDA 700/716/717, error artifact, process, listener, or PID residue. Scoped formatting,
+  dependency/static checks, fresh inventory, and independent adversarial audit pass. Runtime behavior is unchanged,
+  so the report card was inapplicable. The 3,137-line probe script is now the sole required-analysis outlier and is
+  owned by STRUCT-001LI.
+
   GitHub's `ubuntu-latest` CI now reflects the GPU-required product boundary: branch-diff whitespace and strict
   all-target/all-feature Clippy always run, as does the 13-crate host-neutral runtime suite with CUDA hidden; the
   complete 992-test engine suite runs only when the runner exposes an NVIDIA device. The former unconditional
@@ -3783,7 +3800,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 | Boundary | Work ID |
 |---|---|
-| 2 actionable source files exceed the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
+| 1 actionable source file exceeds the production/test/tool analysis envelopes in `CODE_SIZE.md` | **STRUCT-001** |
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
