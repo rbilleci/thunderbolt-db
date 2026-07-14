@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -17,7 +19,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client
       - name: fmt
-        run: cargo fmt --all -- --check
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base_sha="$PR_BASE_SHA"
+          else
+            base_sha="$PUSH_BEFORE_SHA"
+          fi
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]] || \
+             ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            base_sha="$(git merge-base HEAD "origin/$DEFAULT_BRANCH")"
+          fi
+          git diff --check "$base_sha" HEAD
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: test
