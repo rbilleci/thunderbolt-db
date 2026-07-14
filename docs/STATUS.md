@@ -2161,6 +2161,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   serial GPU suite, all-target check, strict clippy, static/scoped gates, and independent audit. Generated residue
   was removed. Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
 
+  STRUCT-001HD then re-homed the history-proven general dispatcher rustdocs and isolated exact predicate dispatch
+  plus bool/standalone-NULL fast paths in the rustfmt-clean 639-line private
+  `engine_expr/predicate_dispatch.rs` leaf, reducing the expression root to 4,400 lines and below the mandatory
+  5,000-line threshold. Commit history proves the eight general lines originally documented
+  `lower_resident_predicate`; they and the bool-specific lines are byte-identical at their corrected owners. Three
+  helpers remain private and the dispatcher remains `pub(crate)`. MVCC visibility composition, bare-bool/IS NULL,
+  nullable and typed dispatch order, AND/OR VM, arithmetic/int4 peepholes, bounds, offsets/validity, errors, retained
+  device references, GPU-only fail-loud behavior, six consumers, and one-way dependencies are source-exact; four
+  now-leaf-only compiler imports were removed from the root. Fifteen focused GPU visibility/bool/NULL/3VL/mixed-width/
+  typed/arithmetic/DML/streaming controls pass, as do both 505/487 engine modes, the complete 992-test serial GPU
+  suite, all-target check, strict clippy, static/scoped gates, and independent audit. Generated residue was removed.
+  Runtime behavior did not change, so HAZARD and report-card gates were not applicable.
+
 ## Known boundaries
 
 | Boundary | Work ID |

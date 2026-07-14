@@ -134,14 +134,19 @@ backlog, slice plan, or historical narrative. Replace it when the active task ch
   both 505/487 engine modes, the complete 992-test GPU suite, all-target/strict-clippy/static/scoped gates, and
   independent audit pass; generated residue was removed. The expression root is 5,014 lines; HAZARD/report card were
   not applicable. Audit found history-proven orphaned dispatcher docs and promoted their repair as STRUCT-001HD.
+- STRUCT-001HD is closed. History-proven general dispatcher docs are restored to their owner, and exact predicate
+  dispatch plus bool/NULL fast paths now live in the rustfmt-clean 639-line private
+  `engine_expr/predicate_dispatch.rs` leaf. Fifteen focused GPU controls, both 505/487 engine modes, the complete
+  992-test GPU suite, all-target/strict-clippy/static/scoped gates, and independent audit pass; generated residue was
+  removed. The expression root is 4,400 lines and below 5,000; HAZARD/report card were not applicable.
 - Multi-GPU work remains explicitly user-deferred to the end of every non-MULTI plan item.
 - Exact current behavior, measurements, and closeout evidence live in `STATUS.md`; the ordered backlog lives only
   in `PLAN.md`.
 
 ## Resume here
 
-1. **STRUCT-001HD:** re-home the history-proven orphaned dispatcher docs and isolate exact predicate dispatch plus
-   bool/NULL fast paths; preserve GPU-only dispatch order, bounds/validity/errors, consumers, and visibility.
+1. **STRUCT-001HE:** isolate the exact nine typed predicate lowerers plus numeric scale helper; preserve effective
+   sibling visibility and every fallthrough/type/width/scale/validity/layout/program/error invariant.
 2. **STRUCT-001:** continue the ordered oversized-file inventory without letting extraction decide **R3-001**.
 3. **R3-001:** reconcile the live write implementation with the GPU-native write/MVCC design in an accepted ADR.
 4. **BENCH-001:** complete the open-loop OLTP comparison when benchmark capacity is available.
