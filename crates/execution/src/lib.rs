@@ -58,8 +58,7 @@ use resident_sort::{
 };
 #[cfg(test)]
 use resident_sort::{
-    launch_cuda_order_by_sort_i64_radix, validate_i64_argsort_host_len,
-    validate_i64_argsort_input,
+    launch_cuda_order_by_sort_i64_radix, validate_i64_argsort_host_len, validate_i64_argsort_input,
 };
 #[cfg(test)]
 mod argsort_test_support;
@@ -78,28 +77,25 @@ use resident_count::{
 mod resident_window;
 pub use resident_window::CudaGroupTextSource;
 mod resident_compare_ordered;
-use resident_compare_ordered::{
-    launch_cuda_buffer_i32_compare_indices_ordered,
-    launch_cuda_resident_i32_compare_indices_ordered,
-    launch_cuda_resident_i32_compare_project,
-};
 #[cfg(test)]
 use resident_compare_ordered::{
-    COMPARE_ORDERED_PTX, i32_bits_into_u32,
-    launch_cuda_resident_i32_compare_buffers_indices_ordered,
+    i32_bits_into_u32, launch_cuda_resident_i32_compare_buffers_indices_ordered,
     validate_ordered_i32_comparison, validate_ordered_i32_context_identity,
-    validate_ordered_i32_index_domain, validate_ordered_i32_input_window,
+    validate_ordered_i32_index_domain, validate_ordered_i32_input_window, COMPARE_ORDERED_PTX,
 };
-mod resident_text;
+use resident_compare_ordered::{
+    launch_cuda_buffer_i32_compare_indices_ordered,
+    launch_cuda_resident_i32_compare_indices_ordered, launch_cuda_resident_i32_compare_project,
+};
 mod resident_scalar;
+mod resident_text;
 pub use resident_scalar::CudaI32Stats;
 mod expression_vm;
-use expression_vm::{ExprTerminal, run_resident_arith_program};
+use expression_vm::{run_resident_arith_program, ExprTerminal};
 pub use expression_vm::{ExprStep, ResidentElemType};
 mod expression_filter;
 use expression_filter::{
-    launch_cuda_arith_value_column_at_indices,
-    launch_cuda_arith_value_column_at_indices_nullable,
+    launch_cuda_arith_value_column_at_indices, launch_cuda_arith_value_column_at_indices_nullable,
     launch_cuda_resident_expr_arith_filter, launch_cuda_resident_expr_compare_buffers_filter,
     launch_cuda_resident_expr_two_col_filter,
 };
@@ -127,7 +123,8 @@ mod resident_filter;
 use resident_filter::{
     launch_cuda_resident_bool_to_mask_filter, launch_cuda_resident_i128_compare_columns_filter,
     launch_cuda_resident_i128_compare_scalar_filter,
-    launch_cuda_resident_i64_compare_columns_filter, launch_cuda_resident_i64_compare_scalar_filter,
+    launch_cuda_resident_i64_compare_columns_filter,
+    launch_cuda_resident_i64_compare_scalar_filter,
     launch_cuda_resident_text_compare_scalar_filter, launch_cuda_resident_text_eq_scalar_filter,
     launch_cuda_resident_text_like_scalar_filter, launch_cuda_resident_uuid_compare_columns_filter,
     launch_cuda_resident_uuid_compare_scalar_filter,
@@ -135,17 +132,15 @@ use resident_filter::{
 mod resident_aggregate;
 use resident_aggregate::{
     launch_cuda_resident_i128_minmax_partials_at_indices,
-    launch_cuda_resident_i128_sum_partials_at_indices,
-    launch_cuda_resident_i32_minmax_at_indices,
-    launch_cuda_resident_i32_sum_at_indices,
-    launch_cuda_resident_i64_minmax_at_indices,
+    launch_cuda_resident_i128_sum_partials_at_indices, launch_cuda_resident_i32_minmax_at_indices,
+    launch_cuda_resident_i32_sum_at_indices, launch_cuda_resident_i64_minmax_at_indices,
     launch_cuda_resident_i64_sum_at_indices_i128,
 };
 mod resident_group;
-use resident_group::{launch_cuda_group_by_i32_count_sum, launch_cuda_group_by_kernel_timed};
 pub use resident_group::GroupByI32Row;
+use resident_group::{launch_cuda_group_by_i32_count_sum, launch_cuda_group_by_kernel_timed};
 mod group_input;
-use group_input::{ValidatedGroupInput, validate_group_input};
+use group_input::{validate_group_input, ValidatedGroupInput};
 pub use group_input::{
     CudaGroupByInput, CudaGroupFixedSource, CudaGroupKeySource, CudaGroupTextDescriptorBuffer,
     CudaGroupTextDescriptors, CudaGroupValueSource, CudaGroupWideSource,
@@ -199,8 +194,8 @@ mod point_read_rows;
 use point_read_rows::launch_cuda_resident_i32_equal_row_indices;
 mod point_read_submission;
 pub use point_read_submission::{
-    CudaI32BatchProjectionColumns, CudaI32BatchProjectionRow,
-    CudaI32EqualAnyProjectSubmission, CudaI32TextBatchProjectionRow,
+    CudaI32BatchProjectionColumns, CudaI32BatchProjectionRow, CudaI32EqualAnyProjectSubmission,
+    CudaI32TextBatchProjectionRow,
 };
 impl CudaResidentDeviceMemoryReadView {
     pub fn submit_match_project_i32_equal_any_from_payload(
@@ -282,28 +277,82 @@ fn launch_validated_group_by(
         return Ok(Vec::new());
     }
     let ValidatedGroupInput {
-        key_byte_offset, value_byte_offset, value_is_int8, key_is_int8, value_is_numeric,
-        value_is_uuid, key_is_i128, key_is_text, key_offsets_off, key_bytes_off, key_bytes_len,
-        value_is_text, value_offsets_off, value_bytes_off, value_bytes_len, key_base_override,
-        value_base_override, comp_w, n_text, text_desc_ptr, value_null_off, key_null_off,
+        key_byte_offset,
+        value_byte_offset,
+        value_is_int8,
+        key_is_int8,
+        value_is_numeric,
+        value_is_uuid,
+        key_is_i128,
+        key_is_text,
+        key_offsets_off,
+        key_bytes_off,
+        key_bytes_len,
+        value_is_text,
+        value_offsets_off,
+        value_bytes_off,
+        value_bytes_len,
+        key_base_override,
+        value_base_override,
+        comp_w,
+        n_text,
+        text_desc_ptr,
+        value_null_off,
+        key_null_off,
     } = validate_group_input(resident, input, indices)?;
-    if matches!(input.value, CudaGroupValueSource::Unused { .. }) && (agg_mask & !grouped_agg_mask::COUNT) != 0 {
+    if matches!(input.value, CudaGroupValueSource::Unused { .. })
+        && (agg_mask & !grouped_agg_mask::COUNT) != 0
+    {
         return Err(CudaRuntimeProbeError::InvalidInputLength(agg_mask as usize));
     }
     if two_level
-        && (value_is_int8 || key_is_int8 || value_is_numeric || value_is_uuid || key_is_i128
-            || key_is_text || value_is_text || key_base_override != 0 || value_base_override != 0
-            || comp_w != 0 || n_text != 0 || value_null_off.is_some() || key_null_off.is_some())
+        && (value_is_int8
+            || key_is_int8
+            || value_is_numeric
+            || value_is_uuid
+            || key_is_i128
+            || key_is_text
+            || value_is_text
+            || key_base_override != 0
+            || value_base_override != 0
+            || comp_w != 0
+            || n_text != 0
+            || value_null_off.is_some()
+            || key_null_off.is_some())
     {
         return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
     }
     launch_cuda_group_by_i32_count_sum(
-        resident, key_byte_offset, value_byte_offset, indices,
-        if two_level { c"gpu_db_group_by_i32_count_sum_twolevel" } else { c"gpu_db_group_by_i32_count_sum" },
-        value_is_int8, key_is_int8, value_is_numeric, value_is_uuid, key_is_i128, key_is_text,
-        key_offsets_off, key_bytes_off, key_bytes_len, value_is_text, value_offsets_off,
-        value_bytes_off, value_bytes_len, key_base_override, value_base_override, comp_w, n_text,
-        text_desc_ptr, value_null_off, key_null_off, agg_mask,
+        resident,
+        key_byte_offset,
+        value_byte_offset,
+        indices,
+        if two_level {
+            c"gpu_db_group_by_i32_count_sum_twolevel"
+        } else {
+            c"gpu_db_group_by_i32_count_sum"
+        },
+        value_is_int8,
+        key_is_int8,
+        value_is_numeric,
+        value_is_uuid,
+        key_is_i128,
+        key_is_text,
+        key_offsets_off,
+        key_bytes_off,
+        key_bytes_len,
+        value_is_text,
+        value_offsets_off,
+        value_bytes_off,
+        value_bytes_len,
+        key_base_override,
+        value_base_override,
+        comp_w,
+        n_text,
+        text_desc_ptr,
+        value_null_off,
+        key_null_off,
+        agg_mask,
     )
 }
 
@@ -711,7 +760,6 @@ impl CudaResidentDeviceMemory {
         Ok(greater_or_equal_lower_count.saturating_sub(greater_than_upper_count))
     }
 
-
     /// `SUM` of a resident int4 column over a FILTERED set of row indices (the operator axis, doc 19):
     /// gather `col[indices[k]]` and reduce on the GPU (each thread sums its strided slice locally, then
     /// one `atom.add.u64` -> a single i64), returned as bigint. The caller must pass a NON-empty
@@ -872,11 +920,19 @@ impl CudaResidentDeviceMemory {
             return Err(CudaRuntimeProbeError::InvalidInputLength(agg_mask as usize));
         }
         let validated = validate_group_input(self, input, indices)?;
-        if validated.value_is_int8 || validated.key_is_int8 || validated.value_is_numeric
-            || validated.value_is_uuid || validated.key_is_i128 || validated.key_is_text
-            || validated.value_is_text || validated.key_base_override != 0
-            || validated.value_base_override != 0 || validated.comp_w != 0 || validated.n_text != 0
-            || validated.value_null_off.is_some() || validated.key_null_off.is_some()
+        if validated.value_is_int8
+            || validated.key_is_int8
+            || validated.value_is_numeric
+            || validated.value_is_uuid
+            || validated.key_is_i128
+            || validated.key_is_text
+            || validated.value_is_text
+            || validated.key_base_override != 0
+            || validated.value_base_override != 0
+            || validated.comp_w != 0
+            || validated.n_text != 0
+            || validated.value_null_off.is_some()
+            || validated.key_null_off.is_some()
         {
             return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
         }
@@ -1247,12 +1303,7 @@ impl CudaResidentDeviceMemory {
         needles: &[i32],
         read_snapshot: u64,
     ) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
-        submit_cuda_resident_i32_multi_shard_index_probe_dense(
-            self,
-            shards,
-            needles,
-            read_snapshot,
-        )
+        submit_cuda_resident_i32_multi_shard_index_probe_dense(self, shards, needles, read_snapshot)
     }
 
     /// P5-later: probe compact per-chunk Bloom filters on-device and return candidate chunk indexes per needle.
@@ -1299,7 +1350,6 @@ impl CudaResidentDeviceMemory {
             row_count,
         )
     }
-
 
     pub fn project_i32_compare_from_payload(
         &self,
@@ -1423,7 +1473,6 @@ pub mod grouped_agg_mask {
     pub const ALL: u32 = COUNT | SUM | MIN | MAX;
 }
 
-
 /// Queue ONE stream-ordered (async) D2H of `dst.len() * size_of::<T>()` bytes from `device_ptr`
 /// into a pooled pinned host staging buffer if one can be leased (truly-async + DMA-fast), else
 /// directly into `dst` (still async, just from pageable memory). Returns the pinned lease (kept
@@ -1467,7 +1516,6 @@ fn copy_pinned_into<T>(pinned: &Option<PinnedHostLease<'_>>, dst: &mut [T]) {
         }
     }
 }
-
 
 #[cfg(test)]
 fn launch_with_optional_cuda_event_timing<R, F>(

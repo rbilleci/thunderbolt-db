@@ -1,4 +1,4 @@
-use crate::{CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, check_cuda};
+use crate::{check_cuda, CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError};
 use std::{ffi::c_void, sync::Arc};
 
 #[derive(Debug, Clone)]

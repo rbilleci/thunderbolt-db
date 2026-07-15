@@ -18,9 +18,7 @@ fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() 
     let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
     assert!(snapshot.is_valid());
     let before = e.metrics().snapshot();
-    let resident = e
-        .execute_resident_select_via_general(&select)
-        .unwrap();
+    let resident = e.execute_resident_select_via_general(&select).unwrap();
     let after = e.metrics().snapshot();
     // Closed-form oracle (S9): `SELECT label FROM events WHERE id = 2 LIMIT 1` over {1:'alpha',2:'beta'}.
     assert_eq!(
@@ -122,10 +120,7 @@ fn resident_snapshot_budget_rejects_oversized_snapshot_without_mutation() {
         table.last_decision_current_bytes_after,
         Some(original_allocated)
     );
-    assert_eq!(
-        e.relational_resident_bytes_for_gpu(0),
-        original_allocated
-    );
+    assert_eq!(e.relational_resident_bytes_for_gpu(0), original_allocated);
 }
 
 /// S-F/R-1 audit gate: all public benchmark installers allocate first and admit with allocator
@@ -146,7 +141,11 @@ fn benchmark_installers_reject_actual_bytes_without_evicting_existing_residency(
     if keep.device_memory_proof.is_none() {
         return;
     }
-    for (seq, table) in [(3, "borrowed_bench"), (4, "owned_bench"), (5, "sharded_bench")] {
+    for (seq, table) in [
+        (3, "borrowed_bench"),
+        (4, "owned_bench"),
+        (5, "sharded_bench"),
+    ] {
         e.execute_text(seq, &format!("CREATE TABLE {table} (id INT)"))
             .unwrap();
     }
@@ -161,27 +160,24 @@ fn benchmark_installers_reject_actual_bytes_without_evicting_existing_residency(
         bytes: &payload,
     }];
     let err = e
-        .install_benchmark_relational_residency_chunks(
-            BenchmarkRelationalResidencyChunkInstall {
-                table: "borrowed_bench",
-                gpu_id: 0,
-                row_count: 1,
-                resident_bytes: payload.len() as u64,
-                resident_device_int4_columns: vec!["id".to_string()],
-                resident_device_int4_column_stats: vec![ResidentDeviceInt4ColumnStats {
-                    name: "id".to_string(),
-                    min: 7,
-                    max: 7,
-                }],
-                resident_device_text_columns: Vec::new(),
-                allocated_bytes: oversized_allocation,
-                chunks: &borrowed,
-            },
-        )
+        .install_benchmark_relational_residency_chunks(BenchmarkRelationalResidencyChunkInstall {
+            table: "borrowed_bench",
+            gpu_id: 0,
+            row_count: 1,
+            resident_bytes: payload.len() as u64,
+            resident_device_int4_columns: vec!["id".to_string()],
+            resident_device_int4_column_stats: vec![ResidentDeviceInt4ColumnStats {
+                name: "id".to_string(),
+                min: 7,
+                max: 7,
+            }],
+            resident_device_text_columns: Vec::new(),
+            allocated_bytes: oversized_allocation,
+            chunks: &borrowed,
+        })
         .unwrap_err();
     assert!(
-        err.to_string()
-            .contains("exceeding GPU 0 residency budget"),
+        err.to_string().contains("exceeding GPU 0 residency budget"),
         "unexpected borrowed installer error: {err}"
     );
 
@@ -208,8 +204,7 @@ fn benchmark_installers_reject_actual_bytes_without_evicting_existing_residency(
         )
         .unwrap_err();
     assert!(
-        err.to_string()
-            .contains("exceeding GPU 0 residency budget"),
+        err.to_string().contains("exceeding GPU 0 residency budget"),
         "unexpected owned installer error: {err}"
     );
 
@@ -235,8 +230,7 @@ fn benchmark_installers_reject_actual_bytes_without_evicting_existing_residency(
         )
         .unwrap_err();
     assert!(
-        err.to_string()
-            .contains("exceeding GPU 0 residency budget"),
+        err.to_string().contains("exceeding GPU 0 residency budget"),
         "unexpected shard installer error: {err}"
     );
 
@@ -2095,10 +2089,7 @@ fn status_and_telemetry_surface_relational_residency_state() {
             .memory_pressured_snapshot_count(),
         1
     );
-    assert_eq!(
-        e.relational_resident_bytes_for_gpu(0),
-        events_allocated
-    );
+    assert_eq!(e.relational_resident_bytes_for_gpu(0), events_allocated);
     assert!(aux.resident_bytes > 0);
 }
 

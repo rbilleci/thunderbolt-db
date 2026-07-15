@@ -468,8 +468,7 @@ impl Engine {
             self.deauthoritize_chunk_table(&select.table, false)
                 .map_err(ExecuteError::Engine)?;
         }
-        let (table, bound, copin_s) =
-            self.bind_relational_select_at(select, statement_copin_s)?;
+        let (table, bound, copin_s) = self.bind_relational_select_at(select, statement_copin_s)?;
         on_bound_before_pin();
         let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =
@@ -574,13 +573,13 @@ impl Engine {
         }
         #[cfg(test)]
         {
-        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-        let pin = self.pin_relational_read_at(&select.table, copin_s);
-        let (query, access_path) =
-            self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
-        let result =
-            self.execute_mvcc_query_with_cuda_driver_probe_on_store(pin.store(), &query)?;
-        self.finalize_relational_select(select, table, bound, access_path, result)
+            let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+            let pin = self.pin_relational_read_at(&select.table, copin_s);
+            let (query, access_path) =
+                self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
+            let result =
+                self.execute_mvcc_query_with_cuda_driver_probe_on_store(pin.store(), &query)?;
+            self.finalize_relational_select(select, table, bound, access_path, result)
         }
     }
 

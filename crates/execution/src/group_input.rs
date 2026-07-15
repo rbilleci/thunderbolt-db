@@ -1,5 +1,5 @@
 use super::derived_column::{CudaGroupDeviceView, DeviceArithBuffer};
-use super::resident_window::{CudaGroupTextSource, validate_aligned_window, validate_text_windows};
+use super::resident_window::{validate_aligned_window, validate_text_windows, CudaGroupTextSource};
 use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError};
 
 #[derive(Debug, Clone, Copy)]
@@ -399,10 +399,10 @@ fn validate_group_input_parts(
 #[cfg(test)]
 mod tests {
     use super::{
-        CudaGroupByInput, CudaGroupDeviceView, CudaGroupFixedSource, CudaGroupKeySource,
-        CudaGroupTextDescriptors, CudaGroupTextSource, CudaGroupValueSource, CudaGroupWideSource,
         checked_end, validate_bitmap, validate_fixed, validate_group_input_parts, validate_text,
-        validate_view,
+        validate_view, CudaGroupByInput, CudaGroupDeviceView, CudaGroupFixedSource,
+        CudaGroupKeySource, CudaGroupTextDescriptors, CudaGroupTextSource, CudaGroupValueSource,
+        CudaGroupWideSource,
     };
 
     #[test]
@@ -434,45 +434,39 @@ mod tests {
             3,
         )
         .unwrap();
-        assert!(
-            validate_fixed(
-                0,
-                7,
-                CudaGroupFixedSource::Derived {
-                    buffer: view,
-                    width: 8,
-                    row_count: 5,
-                },
-                4,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_fixed(
-                64,
-                7,
-                CudaGroupFixedSource::Resident {
-                    byte_offset: 60,
-                    width: 4,
-                    row_count: 2,
-                },
-                1,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_fixed(
-                64,
-                7,
-                CudaGroupFixedSource::Resident {
-                    byte_offset: 1,
-                    width: 4,
-                    row_count: 2,
-                },
-                1,
-            )
-            .is_err()
-        );
+        assert!(validate_fixed(
+            0,
+            7,
+            CudaGroupFixedSource::Derived {
+                buffer: view,
+                width: 8,
+                row_count: 5,
+            },
+            4,
+        )
+        .is_err());
+        assert!(validate_fixed(
+            64,
+            7,
+            CudaGroupFixedSource::Resident {
+                byte_offset: 60,
+                width: 4,
+                row_count: 2,
+            },
+            1,
+        )
+        .is_err());
+        assert!(validate_fixed(
+            64,
+            7,
+            CudaGroupFixedSource::Resident {
+                byte_offset: 1,
+                width: 4,
+                row_count: 2,
+            },
+            1,
+        )
+        .is_err());
     }
 
     #[test]
@@ -494,19 +488,17 @@ mod tests {
         validate_text(32, source, 1).unwrap();
         assert!(validate_text(31, source, 1).is_err());
         assert!(validate_text(32, source, 2).is_err());
-        assert!(
-            validate_text(
-                40,
-                CudaGroupTextSource {
-                    offsets_byte_offset: 4,
-                    bytes_byte_offset: 28,
-                    bytes_len: 8,
-                    row_count: 2,
-                },
-                1,
-            )
-            .is_err()
-        );
+        assert!(validate_text(
+            40,
+            CudaGroupTextSource {
+                offsets_byte_offset: 4,
+                bytes_byte_offset: 28,
+                bytes_len: 8,
+                row_count: 2,
+            },
+            1,
+        )
+        .is_err());
     }
 
     #[test]
@@ -586,46 +578,40 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            validate_group_input_parts(
-                80,
-                7,
-                input(
-                    CudaGroupKeySource::Composite {
-                        fixed: None,
-                        text: None,
-                        row_count: 2,
-                    },
-                    CudaGroupValueSource::Unused { row_count: 2 },
-                ),
-                &[1],
-            )
-            .is_err()
-        );
-        assert!(
-            validate_group_input_parts(
-                80,
-                7,
-                input(
-                    CudaGroupKeySource::Fixed(fixed4),
-                    CudaGroupValueSource::Fixed(fixed16),
-                ),
-                &[1],
-            )
-            .is_err()
-        );
-        assert!(
-            validate_group_input_parts(
-                80,
-                7,
-                input(
-                    CudaGroupKeySource::Fixed(fixed4),
-                    CudaGroupValueSource::Unused { row_count: 3 },
-                ),
-                &[1],
-            )
-            .is_err()
-        );
+        assert!(validate_group_input_parts(
+            80,
+            7,
+            input(
+                CudaGroupKeySource::Composite {
+                    fixed: None,
+                    text: None,
+                    row_count: 2,
+                },
+                CudaGroupValueSource::Unused { row_count: 2 },
+            ),
+            &[1],
+        )
+        .is_err());
+        assert!(validate_group_input_parts(
+            80,
+            7,
+            input(
+                CudaGroupKeySource::Fixed(fixed4),
+                CudaGroupValueSource::Fixed(fixed16),
+            ),
+            &[1],
+        )
+        .is_err());
+        assert!(validate_group_input_parts(
+            80,
+            7,
+            input(
+                CudaGroupKeySource::Fixed(fixed4),
+                CudaGroupValueSource::Unused { row_count: 3 },
+            ),
+            &[1],
+        )
+        .is_err());
         let mut nullable_unused = input(
             CudaGroupKeySource::Fixed(fixed4),
             CudaGroupValueSource::Unused { row_count: 2 },

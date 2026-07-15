@@ -248,9 +248,11 @@ impl Engine {
         // an E2.5c+ concern).
         let stat_start = Instant::now();
         let first_seq = if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
-            lanes
-                .seq_oracle
-                .fetch_add(k, std::sync::atomic::Ordering::AcqRel)
+            lanes.seq_oracle.fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |next| next.checked_add(k),
+            )
         } else {
             // AUDIT F1 (CRITICAL): double-checked activation UNDER the commit
             // lock. peek_next_index does not advance, so two lanes' first
@@ -262,21 +264,43 @@ impl Engine {
             let commit = self.commit_state();
             if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
                 drop(commit);
-                lanes
-                    .seq_oracle
-                    .fetch_add(k, std::sync::atomic::Ordering::AcqRel)
+                lanes.seq_oracle.fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |next| next.checked_add(k),
+                )
             } else {
                 let first = commit.repl.peek_next_index();
+                let Some(next) = first.checked_add(k) else {
+                    drop(commit);
+                    for item in winners {
+                        item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                            "intent-lane commit sequence exhausted before WAL append".to_string(),
+                        ))));
+                    }
+                    return true;
+                };
                 lanes
                     .seq_oracle
-                    .store(first + k, std::sync::atomic::Ordering::Release);
+                    .store(next, std::sync::atomic::Ordering::Release);
                 lanes
                     .base_seq
                     .store(first, std::sync::atomic::Ordering::Release);
                 lanes
                     .activated
                     .store(true, std::sync::atomic::Ordering::Release);
-                first
+                Ok(first)
+            }
+        };
+        let first_seq = match first_seq {
+            Ok(first) => first,
+            Err(_) => {
+                for item in winners {
+                    item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                        "intent-lane commit sequence exhausted before WAL append".to_string(),
+                    ))));
+                }
+                return true;
             }
         };
         lanes.stat_claim_ns.fetch_add(
@@ -616,9 +640,6 @@ impl Engine {
             }
         }
         if drained {
-            lanes
-                .active_lanes
-                .store(target, std::sync::atomic::Ordering::Release);
             // AUDIT (async-commit slice, MUST-FIX): the loop above waits for
             // the VISIBLE cut to cover the claimed frontier, but committed_seq
             // is only published inside settle — a fence completing between the
@@ -627,14 +648,31 @@ impl Engine {
             // committed_seq) would miss a just-fenced async commit: the
             // duplicate-key hole again. Publish the covering cut HERE, before
             // any held intent re-routes.
-            self.publish_committed_seq(lanes.visible_global_cut());
-            lanes
-                .stat_resizes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            lanes.stat_resize_ns.fetch_add(
-                drain_started.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            match lanes.visible_inclusive_seq() {
+                Ok(visible_seq) => {
+                    lanes
+                        .active_lanes
+                        .store(target, std::sync::atomic::Ordering::Release);
+                    if let Some(visible_seq) = visible_seq {
+                        self.publish_committed_seq(visible_seq);
+                    }
+                    lanes
+                        .stat_resizes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    lanes.stat_resize_ns.fetch_add(
+                        drain_started.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                Err(_) => {
+                    lanes
+                        .apply_poisoned
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    for lane in 0..lanes.lane_count {
+                        self.settle_intent_lane(lanes, lane);
+                    }
+                }
+            }
         }
         lanes
             .resize_holding

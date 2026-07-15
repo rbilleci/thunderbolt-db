@@ -372,17 +372,12 @@ fn gpu_cold_checkpoint_boundary_mismatch_is_skipped() {
     assert!(e.streaming_cold_builds() >= 1);
 }
 
-/// AUDIT HIGH regression (the boundary convention): the LIVE lane pump publishes committed_seq
-/// as the EXCLUSIVE frontier (`visible_global_cut = base_seq + cut`), while the recovery seam's
-/// replay publishes the INCLUSIVE last record index (`base_seq + cut - 1`) — one less. The
-/// pre-fix code stamped the artifact with the live watermark verbatim, so every artifact captured
-/// from a pump-published engine carried a boundary ONE HIGH and the restore silently never fired
-/// in production (the four sibling tests replay-derive their watermark on BOTH sides, so they
-/// cannot see it). This test emulates the pump's convention exactly — it re-publishes the
-/// watermark at the frontier before checkpointing — and requires the restore to land anyway.
+/// R3-006 regression: an EXCLUSIVE lane next-slot frontier is not an inclusive `committed_seq`.
+/// If a caller artificially advances the live watermark one slot above the checkpoint's last
+/// durable/applied record, the cold artifact must be refused rather than blessing the mismatch.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_cold_checkpoint_restores_under_lane_pump_frontier_watermark() {
+fn gpu_cold_checkpoint_rejects_exclusive_next_watermark() {
     let Some((base, expected, _next_row)) = p1_lanes_streaming_fixture("frontier", 300) else {
         return;
     };
@@ -392,32 +387,29 @@ fn gpu_cold_checkpoint_restores_under_lane_pump_frontier_watermark() {
         p1_force_streaming(&mut e, budget);
         assert_eq!(p1_count(&e), expected);
         assert!(e.streaming_cold_builds() >= 1);
-        // Emulate the pump: publish the EXCLUSIVE frontier (base_seq + cut), the value
-        // engine_dml_concurrent's settle path publishes after a quiesced wave. The visible set
-        // is unchanged (no stamp exists at the frontier).
+        // Inject the pre-R3-006 bug: publish the EXCLUSIVE frontier one above the inclusive last
+        // record. Production lane settlement must never do this after the correction.
         let lanes = e.intent_lanes.as_ref().expect("lanes installed");
         let frontier = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire) + 24;
         e.publish_committed_seq(frontier);
         assert_eq!(
             e.committed_seq(),
             frontier,
-            "premise: frontier-convention watermark"
+            "premise: injected one-high watermark"
         );
         let cut = e.checkpoint_intent_lanes().expect("lanes checkpoint");
         assert_eq!(cut, 24);
         assert!(
-            e.streaming_cold_checkpointed() >= 1,
-            "the frontier watermark must be ACCEPTED as the quiescence proof"
+            e.streaming_cold_checkpointed() == 0,
+            "an exclusive-next watermark must not qualify an inclusive-boundary artifact"
         );
     }
     let mut e = Engine::open_durable_wal_segment(&base).expect("reopen after frontier checkpoint");
     assert!(
-        e.streaming_cold_restored() >= 1,
-        "the artifact must carry the SEAM boundary (inclusive last index), not the live \
-         frontier — a frontier-stamped artifact never restores"
+        e.streaming_cold_restored() == 0,
+        "the mismatched artifact must not exist or restore"
     );
     p1_force_streaming(&mut e, budget);
     assert_eq!(p1_count(&e), expected);
-    assert!(e.streaming_cold_hits() >= 1);
-    assert_eq!(e.streaming_cold_builds(), 0);
+    assert!(e.streaming_cold_builds() >= 1);
 }

@@ -167,11 +167,7 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
     // A comma join WITH an equi-join condition is supported now (gpu_inner_join_comma_join_from_where);
     // an unqualified column present on both sides is ambiguous before the disconnected graph can be
     // classified (qualifying it would then expose the missing equi-join condition).
-    assert_sql_err_contains(
-        &e,
-        "SELECT a FROM t x, t y WHERE a > 0",
-        "ambiguous",
-    );
+    assert_sql_err_contains(&e, "SELECT a FROM t x, t y WHERE a > 0", "ambiguous");
     // count(*) / sum / min / max / avg are supported now (operator axis, GPU-tested); count(col) and
     // other functions are follow-ons, still rejected at the parser.
     assert_sql_err_contains(

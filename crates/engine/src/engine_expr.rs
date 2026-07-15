@@ -23,11 +23,11 @@ pub(crate) use crate::engine_join_ir::{
 };
 
 mod normalization;
-use normalization::{having_op_to_resident, having_value_to_resident_literal};
 pub(crate) use normalization::{
     grouped_projection_to_aggregates, like_pattern_for_literal_prefix,
     resident_predicate_from_bound_filters,
 };
+use normalization::{having_op_to_resident, having_value_to_resident_literal};
 
 mod shard_pruning;
 pub(crate) use shard_pruning::shard_point_lookup_int4_eq;
@@ -48,32 +48,30 @@ pub(crate) use execution_source::{
     ResidentExecSource, ResidentVisibility, ShardedUnifiedExecSource,
 };
 
-mod sharded_source;
-mod sharded_route;
-mod select_bridge;
 #[cfg(test)]
 mod group_bench;
+mod select_bridge;
+mod sharded_route;
+mod sharded_source;
 
 mod join_source;
 pub(crate) use join_source::{JoinDeviceMemory, JoinExecSide};
 
-mod join_side;
-mod join_plan;
-mod join_incremental;
-mod join_projection;
-mod join_coordinate_filter;
 mod join_coordinate_exec;
+mod join_coordinate_filter;
+mod join_incremental;
+mod join_plan;
+mod join_projection;
+mod join_side;
 
 mod predicate_operands;
 use predicate_operands::{expr_mentions_int4_column, expr_mentions_int8};
 
 mod predicate_compiler;
-use predicate_compiler::{
-    collect_expr_columns, compile_arith_program,
-};
+use predicate_compiler::{collect_expr_columns, compile_arith_program};
 
-mod predicate_mask;
 mod predicate_dispatch;
+mod predicate_mask;
 mod predicate_typed_lowering;
 
 mod resident_dml;
@@ -384,7 +382,6 @@ impl Engine {
             }
         };
         let indices_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
-
 
         // Grouped aggregate (GROUP BY <int4 key>): GPU hash aggregation over the filtered rows -> one
         // row per distinct key. COUNT/SUM/AVG share the count+sum kernel; grouped MIN/MAX is a
@@ -1921,8 +1918,7 @@ impl Engine {
                     (0..key_types.len()).map(|c| (c, false)).collect();
                 let key_nulls: Vec<Option<bool>> = vec![Some(true); key_types.len()];
                 for pass in passes.iter_mut() {
-                    let key_rows: Vec<Vec<SqlValue>> =
-                        pass.groups.iter().map(&full_key).collect();
+                    let key_rows: Vec<Vec<SqlValue>> = pass.groups.iter().map(&full_key).collect();
                     let perm = gpu_sort_permutation(
                         &key_rows,
                         &key_order,
@@ -1930,10 +1926,7 @@ impl Engine {
                         &key_types,
                         &device_memory,
                     )?;
-                    pass.groups = perm
-                        .iter()
-                        .map(|&p| pass.groups[p as usize])
-                        .collect();
+                    pass.groups = perm.iter().map(|&p| pass.groups[p as usize]).collect();
                 }
             }
             // S2.2b-i: MIN/MAX over a TEXT value, materialized ON-DEVICE. For each text value pass, gather

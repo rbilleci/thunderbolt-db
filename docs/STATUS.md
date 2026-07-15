@@ -44,10 +44,68 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 ## Write path, durability, and recovery
 
-- WAL-before-visibility is enforced. The durable path includes append-only/checkpointed WAL, FUA intent lanes,
-  contiguous durable cuts, lane recovery/recycle, group commit, and fused device apply for eligible shapes.
+- The classic serial/replay paths enforce WAL-before-visibility, and strict lane acknowledgements wait behind the
+  durability/apply join. The durable path includes append-only/checkpointed WAL, FUA intent lanes, contiguous
+  exclusive durable-next prefixes, lane recovery/recycle, group commit, and fused device apply for eligible shapes.
+  R3-006 reproduced the live exclusive-next/inclusive-snapshot defect: local `[0,1)` at global base 41 published
+  42 instead of 41. The pump and resize barrier now convert the joined exclusive prefix to the checked inclusive
+  sequence before publication; claims refuse wrap before WAL append, and the cold-checkpoint writer accepts only
+  the same inclusive recovery boundary. Seven CPU boundary tests cover empty/first/normal/exhausted conversion and
+  both durable/apply lag directions. The ordinary engine suite passes 509/509 with 487 GPU tests ignored; focused
+  real-GPU lane recovery, UPDATE, async-drain, and cold-checkpoint mismatch gates pass 4/4.
 - Covered int4-PK INSERT/UPDATE/DELETE intent paths and mixed GPU read/write execution are live. Wider write
   shapes and the final GPU-native write/MVCC model remain **R3-001**, **R3-002**, and **R3-003**.
+- The non-authoritative **R3-001** package is reconciled against source commit `f701d8b6`: it includes explicit
+  identity/STRATA/conveyor/transaction/host-debt traceability, normative row/transaction/isolation/publication/
+  recovery/migration state machines, a snapshot-age capacity model, and fresh focused GPU/CPU correctness results.
+  Separate 2026-07-15 adversarial performance, durability/resilience, transactional ACID, and consistency/accuracy
+  audits all returned **REVISE before acceptance**. Their findings are incorporated as bounded adaptation; an explicit
+  autocommit/predeclared/interactive lifecycle; RC/RR semantics with fail-loud serializable; failed-transaction and
+  transaction-characteristic/DDL-overlay rules; minimum per-token validation floors owned through ticket drop;
+  documented RC `40001` target-recheck deviation; shared/exclusive FK guards; transactional sequence restart versus
+  nontransactional SQL sequence values plus private-CREATE/RESTART versus ordinary stable-ID effects and
+  operation-specific `currval`; transactional session defaults; in-transaction statement versus terminal
+  completion; explicit genesis/exhaustion; the RR stable-catalog deviation; stable-ID object lifecycle ordering;
+  semantic metadata/rewrite classification with typed missing values; PG16 non-MVCC rewrite guards/fences;
+  ordered statement/enclosing outcomes; non-circular typed commit/no-op/abort
+  markers; pre-side-effect claims plus checkpointed/reconciled digest-bound statement/terminal status; lane-local
+  physical/global logical WAL ordering; exclusive conveyor-next versus inclusive MVCC-sequence conversion;
+  placement exposed only through atomic `{visible_next, database_root, publication_epoch}` acquisition; cut-exact
+  checkpoints; immutable
+  artifact/pointer reachability; allocator/format lineage; indeterminate post-log resolution; recovery supervision;
+  bounded non-commit tickets; and explicit local/replicated RPO scope. The live facade/server still commits DML per
+  statement under transaction-state bookkeeping, erases requested isolation modes, lacks ReadyForQuery `E`, and can
+  return current async SQL-like success before visibility; these are R3-003/DUR-002 gaps, not target evidence. The
+  reviewed decision-level ACID/failure trace matrix is complete: 115 compact trace rows cover row/object overlays,
+  transaction/session/isolation, constraints/sequences, conveyor/publication/acknowledgement, WAL/checkpoint/
+  activation/recovery/migration, and service/GC pressure with explicit authority and graduation owners. The current
+  Candidate-A current-implementation measurement has run and returned **FAIL**: strict 1,000-offered INSERT p50 is 2.88 ms;
+  100,000-offered INSERT p99 is 210.29 ms; the measured mixed path achieves 92,744 TPS with 44.88-ms p99; and the
+  actual narrow insert allocation is 244,897,808 bytes for 300,003 appended versions (816.3 B/version), with
+  433.3 physical FUA WAL bytes/op. The current intent route rejects non-INT4 widths. A same-physics fixed-record
+  harness measures the queue-depth-one durability distribution at 1.662-ms p50/1.723-ms p99; the actual
+  engine-facing `FuaFrameLog` completes 4,000 queue-depth-one fences in 6.169 seconds (1.542 ms/fence average).
+  The fixed-record harness is supporting fence-physics evidence, not the relational lane. A build-only
+  resident-input comparison across 8/32/128-byte rows, 1/3/6 indexes, and batch sizes 1/256/4,096 fences the odd/
+  even seqlock transitions, ends undo at the replacement commit, asserts old/current visibility, and selects compact
+  append/tombstone in every p50 cell; the semantically complete formats are byte-tied. The build-only 12-family
+  controller injection model also passes cold/index preclaim, both lag directions, sparse/global skew, wave caps,
+  hard credits, durability qualification, held-snapshot pressure, hysteresis, cold-quota/disabled-maintenance
+  rejection, overlap/yield, starvation override, and global-drain-resize refusal.
+  This selects the physical design without accepting the current 816-B allocation or relabeling its end-to-end SLO
+  failure. The five-minute capacity argument is explicit: the
+  current serial/FUA replay paths measure about 38–40k outcomes/s; a two-attempt profile uses a 19,200/s floor,
+  32-GiB artifact cap, 1,000,000-outcome suffix cap, and future 512-MiB/s canonical restore floor to bound recovery
+  at 292.18 seconds. The current rotated checkpoint still replays O(full history), so DUR-001/002 must implement and
+  qualify the bounded canonical path after acceptance. Final packet reviews v1/v2/v3 returned **REJECT**; their
+  selection/provenance/task-reference, undo-visibility/seqlock/adaptation-evidence, and pressure-state/wave-trigger
+  blockers are corrected. The controller model now tests soft/high/hard/lower recovery, pre-deadline byte/service
+  shipment, and oversized-item pre-claim rejection. Frozen packet v4 passed fresh independent review with
+  **ACCEPT** and no remaining pre-acceptance blocker. Explicit user acceptance remains; the ADR is still proposed.
+  `DECISIONS.md` and `ARCHITECTURE.md` remain unchanged. The implemented standalone canonical
+  campaign follows acceptance under R3-003, DUR-001/002, and RETIRE-002 before production authority or
+  host-store removal;
+  HA-001 is additional only for replicated/node-loss-RPO deployment.
 - Crash-durable replay exists; the broader fault campaign, automatic lane checkpointing, PITR timestamps, and
   multi-node quorum integration are **DUR-001**, **DUR-002**, and **HA-001**.
 

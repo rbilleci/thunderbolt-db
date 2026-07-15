@@ -2,8 +2,8 @@ use std::os::raw::c_void;
 
 use super::resident_window::{validate_aligned_window, validate_text_windows, validate_window};
 use super::{
-    CudaResidentDeviceMemory, CudaRuntimeProbeError, PooledBufferLease, check_cuda,
-    launch_on_pooled_stream,
+    check_cuda, launch_on_pooled_stream, CudaResidentDeviceMemory, CudaRuntimeProbeError,
+    PooledBufferLease,
 };
 
 /// One step of the resident expression bytecode (docs/architecture/17 section 2.3): a postfix

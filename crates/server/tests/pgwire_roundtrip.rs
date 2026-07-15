@@ -17,7 +17,9 @@ use tokio_postgres::{NoTls, SimpleQueryMessage};
 #[tokio::test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 async fn pgwire_gpu_point_route_is_non_vacuous_across_shards_and_null_data() {
-    let Ok(runtime) = CudaDriverRuntime::probe() else { return };
+    let Ok(runtime) = CudaDriverRuntime::probe() else {
+        return;
+    };
     let runtime = runtime.snapshot();
     if !runtime.driver_available || runtime.device_count == 0 {
         return;
@@ -42,7 +44,7 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_shards_and_null_data() {
             &shared,
             "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, nullable_note INT)",
         )
-            .unwrap();
+        .unwrap();
         let row_values = (0..130)
             .map(|id| {
                 let note = if id == 1 { "NULL" } else { "9" };
@@ -73,7 +75,8 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_shards_and_null_data() {
         let port = listener.local_addr().unwrap().port();
         let served = Arc::clone(&shared);
         tokio::spawn(async move {
-            let _ = gpu_db_server::serve_async_with_engine_batching(listener, served, 64, true).await;
+            let _ =
+                gpu_db_server::serve_async_with_engine_batching(listener, served, 64, true).await;
         });
         let (client, connection) = tokio_postgres::connect(
             &format!("host=127.0.0.1 port={port} user=postgres dbname=postgres"),
@@ -81,7 +84,9 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_shards_and_null_data() {
         )
         .await
         .unwrap();
-        tokio::spawn(async move { let _ = connection.await; });
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
         let payload_messages = client
             .simple_query("SELECT balance FROM accounts WHERE id = 100")
             .await
@@ -120,12 +125,21 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_shards_and_null_data() {
     assert_eq!(host.0, vec!["700"]);
     assert_eq!(host.1, vec![None]);
     assert_eq!(host.3, 0, "host parity arm is explicitly non-resident");
-    assert_eq!(host.4, 0, "host parity arm has no unified resident snapshot");
-    assert_eq!((one.0.clone(), one.1.clone()), (host.0.clone(), host.1.clone()));
+    assert_eq!(
+        host.4, 0,
+        "host parity arm has no unified resident snapshot"
+    );
+    assert_eq!(
+        (one.0.clone(), one.1.clone()),
+        (host.0.clone(), host.1.clone())
+    );
     assert_eq!((many.0.clone(), many.1.clone()), (host.0, host.1));
     assert_eq!(one.3, 1, "single-shard arm");
     assert!(many.3 >= 2, "multi-shard arm");
-    assert!(one.2 > 0 && many.2 > 0, "wire reads fired the dense GPU route");
+    assert!(
+        one.2 > 0 && many.2 > 0,
+        "wire reads fired the dense GPU route"
+    );
 }
 
 #[tokio::test]

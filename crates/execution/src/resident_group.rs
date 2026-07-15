@@ -1,8 +1,8 @@
 use std::ffi::CStr;
 use std::os::raw::c_void;
 
-use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError, check_cuda, launch_on_pooled_stream};
 use super::cuda_context::CudaEventGuard;
+use super::{check_cuda, launch_on_pooled_stream, CudaResidentDeviceMemory, CudaRuntimeProbeError};
 
 /// One GROUP BY output group: the int4 key, the row COUNT, and the SUM of the value column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -994,8 +994,8 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
     }
     let count = indices.len();
     let idx_bytes = std::mem::size_of_val(indices);
-    let count_u64 = u64::try_from(count)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(count))?;
+    let count_u64 =
+        u64::try_from(count).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(count))?;
     let nslots = count
         .checked_mul(2)
         .and_then(usize::checked_next_power_of_two)
@@ -1106,12 +1106,20 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
     }
     let mut start = std::ptr::null_mut::<c_void>();
     check_cuda(unsafe { (primary.cu_event_create)(&mut start, 0) })?;
-    let start = CudaEventGuard { event: start, destroy: primary.cu_event_destroy };
+    let start = CudaEventGuard {
+        event: start,
+        destroy: primary.cu_event_destroy,
+    };
     let mut stop = std::ptr::null_mut::<c_void>();
     check_cuda(unsafe { (primary.cu_event_create)(&mut stop, 0) })?;
-    let stop = CudaEventGuard { event: stop, destroy: primary.cu_event_destroy };
+    let stop = CudaEventGuard {
+        event: stop,
+        destroy: primary.cu_event_destroy,
+    };
     // Declared after the events so reverse drop order drains the stream before destroying either.
-    let _stream_drain = DefaultStreamDrain { sync: cu_stream_sync };
+    let _stream_drain = DefaultStreamDrain {
+        sync: cu_stream_sync,
+    };
 
     const BLOCK: u32 = 256;
     let fill_grid = nslots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
@@ -1163,8 +1171,8 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
         u64::MAX, // M3 value_null_off = sentinel (the timed bench is non-nullable -> no value skip)
         u64::MAX, // M3 key_null_off = sentinel (the timed bench is non-nullable -> no NULL-key group)
         u64::from(agg_mask), // query-aware aggregate-selection mask (a37, LAST kernel arg)
-        0, // key_bytes_limit (unused by fixed-width timed input)
-        0, // value_bytes_limit (unused by fixed-width timed input)
+        0,        // key_bytes_limit (unused by fixed-width timed input)
+        0,        // value_bytes_limit (unused by fixed-width timed input)
         input_error.ptr,
     ];
     let mut group_args: Vec<*mut c_void> = a
@@ -1248,9 +1256,7 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
         check_cuda(unsafe { (primary.cu_event_record)(stop.event, null) })?;
         check_cuda(unsafe { cu_stream_sync(null) })?;
         let mut ms = 0f32;
-        check_cuda(unsafe {
-            (primary.cu_event_elapsed_time)(&mut ms, start.event, stop.event)
-        })?;
+        check_cuda(unsafe { (primary.cu_event_elapsed_time)(&mut ms, start.event, stop.event) })?;
         best = best.min(ms);
     }
 

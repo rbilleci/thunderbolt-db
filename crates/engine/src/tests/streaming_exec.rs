@@ -91,7 +91,11 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
         .unwrap();
     let left = (0..600)
         .map(|i| {
-            let key = if i % 97 == 0 { "NULL".to_string() } else { i.to_string() };
+            let key = if i % 97 == 0 {
+                "NULL".to_string()
+            } else {
+                i.to_string()
+            };
             let note = if i % 17 == 0 {
                 "NULL".to_string()
             } else {
@@ -103,7 +107,11 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
         .join(",");
     let right = (300..900)
         .map(|i| {
-            let key = if i % 89 == 0 { "NULL".to_string() } else { i.to_string() };
+            let key = if i % 89 == 0 {
+                "NULL".to_string()
+            } else {
+                i.to_string()
+            };
             format!("({key}, {i})")
         })
         .collect::<Vec<_>>()
@@ -136,7 +144,11 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
         .unwrap();
     let nnc = (0..30)
         .map(|i| {
-            let key = if i == 29 { "NULL".to_string() } else { (i % 3).to_string() };
+            let key = if i == 29 {
+                "NULL".to_string()
+            } else {
+                (i % 3).to_string()
+            };
             let note = if i % 5 == 0 {
                 "NULL".to_string()
             } else {
@@ -205,7 +217,10 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
         .expect("streaming join");
     assert_eq!(streamed.executed_target, DeviceTarget::Gpu(0));
     assert!(e.streaming_join_hits() > 0, "streaming join route fired");
-    assert!(e.streaming_join_block_pairs() > 1, "genuine multi-block fold");
+    assert!(
+        e.streaming_join_block_pairs() > 1,
+        "genuine multi-block fold"
+    );
     assert!(
         e.streaming_join_peak_device_bytes() <= 4096,
         "all simultaneously live join payload/scratch allocations stay within budget"
@@ -237,7 +252,9 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
             ref other => panic!("aliased value: {other:?}"),
         })
         .collect::<Vec<_>>();
-    assert!(aliased_values.windows(2).all(|values| values[0] >= values[1]));
+    assert!(aliased_values
+        .windows(2)
+        .all(|values| values[0] >= values[1]));
     let ambiguous_where = e
         .execute_resident_expr_select_sql(
             "SELECT l.lv FROM jl l JOIN jr r ON l.k = r.k WHERE k > 350",
@@ -314,7 +331,10 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
     let streamed_nway_right = e
         .execute_resident_expr_select_sql(nway_right_sql)
         .expect("streaming RIGHT step over a multi-relation accumulated side");
-    assert_eq!(streamed_nway_right.rows.row(0), &[SqlValue::Null, SqlValue::Null, SqlValue::Int4(9)]);
+    assert_eq!(
+        streamed_nway_right.rows.row(0),
+        &[SqlValue::Null, SqlValue::Null, SqlValue::Int4(9)]
+    );
     let nway_two_right_sql = "SELECT a.x, b.y, d.q \
                               FROM jna a RIGHT JOIN jnb b ON a.k = b.k \
                                          FULL JOIN jnd d ON b.k = d.k \
@@ -323,18 +343,24 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
     let streamed_nway_two_right = e
         .execute_resident_expr_select_sql(nway_two_right_sql)
         .expect("streaming prefix replay across two RIGHT/FULL steps");
-    assert!(streamed_nway_two_right.rows.iter().any(|row| {
-        row == [SqlValue::Null, SqlValue::Int4(777), SqlValue::Int4(9)]
-    }));
+    assert!(streamed_nway_two_right
+        .rows
+        .iter()
+        .any(|row| { row == [SqlValue::Null, SqlValue::Int4(777), SqlValue::Int4(9)] }));
     e.set_relational_residency_budget_bytes(0, 4096);
-    let outer_sql =
-        "SELECT a.k, a.x, b.k, b.y FROM joa a FULL JOIN job b ON a.k = b.k";
+    let outer_sql = "SELECT a.k, a.x, b.k, b.y FROM joa a FULL JOIN job b ON a.k = b.k";
     let streamed_outer = e
         .execute_resident_expr_select_sql(outer_sql)
         .expect("streaming FULL OUTER join");
     assert_eq!(streamed_outer.rows.len(), 600);
-    assert!(streamed_outer.rows.iter().any(|row| row[0] == SqlValue::Null));
-    assert!(streamed_outer.rows.iter().any(|row| row[2] == SqlValue::Null));
+    assert!(streamed_outer
+        .rows
+        .iter()
+        .any(|row| row[0] == SqlValue::Null));
+    assert!(streamed_outer
+        .rows
+        .iter()
+        .any(|row| row[2] == SqlValue::Null));
     let outer_where_sql = "SELECT a.k, a.x, b.y FROM joa a LEFT JOIN job b ON a.k = b.k \
                            WHERE b.y IS NULL";
     let streamed_outer_where = e
@@ -430,9 +456,8 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
     let sort_pair_rows = |result: &RelationalSelectResult| {
         let mut rows = result.rows.clone().into_boxed();
         rows.sort_by(|a, b| {
-            crate::rel_exec_helpers::compare_sql_values(&a[0], &b[0]).then_with(|| {
-                crate::rel_exec_helpers::compare_sql_values(&a[1], &b[1])
-            })
+            crate::rel_exec_helpers::compare_sql_values(&a[0], &b[0])
+                .then_with(|| crate::rel_exec_helpers::compare_sql_values(&a[1], &b[1]))
         });
         rows
     };
@@ -488,9 +513,10 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
             .collect::<Vec<_>>(),
         "outer unmatched tails participate in bounded top-N compaction"
     );
-    assert!(streamed_outer_ordered.rows.iter().all(|row| {
-        resident_outer.rows.iter().any(|candidate| candidate == row)
-    }));
+    assert!(streamed_outer_ordered
+        .rows
+        .iter()
+        .all(|row| { resident_outer.rows.iter().any(|candidate| candidate == row) }));
     for row in streamed_outer_limit.rows.iter() {
         assert!(
             resident_outer.rows.iter().any(|candidate| candidate == row),
@@ -519,11 +545,14 @@ fn gpu_streaming_join_mixed_int4_int8_keys() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE mix4 (k INT, v INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE mix4 (k INT, v INT)")
+        .unwrap();
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE mix8 (k BIGINT, v INT)").unwrap();
+    e.execute_text(seq, "CREATE TABLE mix8 (k BIGINT, v INT)")
+        .unwrap();
     seq += 1;
-    e.execute_text(seq, "INSERT INTO mix4 VALUES (-1, 10), (2, 20)").unwrap();
+    e.execute_text(seq, "INSERT INTO mix4 VALUES (-1, 10), (2, 20)")
+        .unwrap();
     seq += 1;
     e.execute_text(
         seq,
@@ -1117,7 +1146,10 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
     assert!(format!("{fk_error:?}").contains("foreign key constraint"));
     seq += 1;
     let check_error = e
-        .execute_text(seq, "INSERT INTO cc VALUES (100002, 100000, -1, 'bad-check')")
+        .execute_text(
+            seq,
+            "INSERT INTO cc VALUES (100002, 100000, -1, 'bad-check')",
+        )
         .expect_err("CHECK violation must reject");
     assert!(format!("{check_error:?}").contains("check constraint"));
     assert_eq!(e.chunk_class_deauths(), 0);
@@ -1170,8 +1202,11 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
         return;
     }
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE kb (a INT PRIMARY KEY, u INT UNIQUE, v INT)")
-        .unwrap();
+    e.execute_text(
+        seq,
+        "CREATE TABLE kb (a INT PRIMARY KEY, u INT UNIQUE, v INT)",
+    )
+    .unwrap();
     const N: i32 = 1200;
     let mut values = String::new();
     for i in 0..N {
@@ -1190,9 +1225,16 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
     seq += 1;
     e.execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (100000, 150000, -1)")
         .unwrap();
-    assert_eq!(e.chunk_class_entries(), 1, "over-cap keyed table enters via Bloom set");
+    assert_eq!(
+        e.chunk_class_entries(),
+        1,
+        "over-cap keyed table enters via Bloom set"
+    );
     assert!(e.table_chunk_authoritative("kb").is_some());
-    assert!(e.chunk_class_reclaimed_rows() > 0, "host row chains were reclaimed");
+    assert!(
+        e.chunk_class_reclaimed_rows() > 0,
+        "host row chains were reclaimed"
+    );
 
     let bloom_0 = e.chunk_key_bloom_probes();
     let exact_0 = e.chunk_class_device_exact_rechecks();
@@ -1201,8 +1243,14 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
         .execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (1100, 999999, 1)")
         .expect_err("base-chunk duplicate must reject");
     assert!(format!("{err:?}").contains("duplicate key value"));
-    assert!(e.chunk_key_bloom_probes() > bloom_0, "candidate decision ran on GPU Bloom");
-    assert!(e.chunk_class_device_exact_rechecks() > exact_0, "conflict was exactly rechecked");
+    assert!(
+        e.chunk_key_bloom_probes() > bloom_0,
+        "candidate decision ran on GPU Bloom"
+    );
+    assert!(
+        e.chunk_class_device_exact_rechecks() > exact_0,
+        "conflict was exactly rechecked"
+    );
     assert_eq!(e.chunk_class_deauths(), 0);
 
     // The entry-triggering row is a later tail chunk. Its Bloom is built on demand and must not
@@ -1240,7 +1288,11 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
         .unwrap();
     assert!(e.chunk_key_bloom_probes() >= bloom_2 + 2);
     assert!(e.chunk_class_dml_key_locates() >= locates_2 + 2);
-    assert_eq!(e.chunk_class_deauths(), 0, "Bloom route stays chunk-authoritative");
+    assert_eq!(
+        e.chunk_class_deauths(),
+        0,
+        "Bloom route stays chunk-authoritative"
+    );
     assert!(e.table_chunk_authoritative("kb").is_some());
     let bloom_ids_before: std::collections::BTreeSet<u64> = e
         .read_state
@@ -1253,7 +1305,10 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
         .collect();
     seq += 1;
     e.execute_text(seq, "DELETE FROM kb WHERE a < 400").unwrap();
-    assert!(e.chunk_class_compactions() > 0, "range delete compacts a keyed chunk");
+    assert!(
+        e.chunk_class_compactions() > 0,
+        "range delete compacts a keyed chunk"
+    );
     let bloom_ids_after: std::collections::BTreeSet<u64> = e
         .read_state
         .residency
@@ -1264,13 +1319,19 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
         .filter_map(|(table, chunk_id, _)| (table == "kb").then_some(*chunk_id))
         .collect();
     assert!(
-        bloom_ids_before.difference(&bloom_ids_after).next().is_some(),
+        bloom_ids_before
+            .difference(&bloom_ids_after)
+            .next()
+            .is_some(),
         "compaction publication purges the replaced chunk-id Bloom"
     );
     let row = e
         .execute_relational_select(&select("SELECT v FROM kb WHERE a = 1100"))
         .unwrap();
-    assert_eq!(row.rows.clone().into_boxed(), vec![vec![SqlValue::Int4(4242)]]);
+    assert_eq!(
+        row.rows.clone().into_boxed(),
+        vec![vec![SqlValue::Int4(4242)]]
+    );
 }
 
 /// The Bloom cap is global. A second table that cannot reserve a complete set must roll back every
@@ -1300,8 +1361,11 @@ fn gpu_chunk_bloom_global_cap_rolls_back_failed_admission() {
     e.execute_text(seq, &format!("INSERT INTO bca (a, v) VALUES {}", rows(0)))
         .unwrap();
     seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO bcb (a, v) VALUES {}", rows(200000)))
-        .unwrap();
+    e.execute_text(
+        seq,
+        &format!("INSERT INTO bcb (a, v) VALUES {}", rows(200000)),
+    )
+    .unwrap();
     e.set_relational_residency_budget_bytes(0, 4096);
     let _ = e
         .execute_relational_select(&select("SELECT COUNT(*) FROM bca"))
@@ -1369,7 +1433,10 @@ fn gpu_chunk_bloom_spill_is_primed_before_class_entry() {
         let _ = e
             .execute_relational_select(&select("SELECT COUNT(*) FROM kbs"))
             .unwrap();
-        assert!(e.streaming_cold_spills() > 0, "fixture must be spill-backed");
+        assert!(
+            e.streaming_cold_spills() > 0,
+            "fixture must be spill-backed"
+        );
         assert!(e.chunk_key_bloom_bytes() > 0, "Bloom set primed off-lock");
         seq += 1;
         e.execute_text(seq, "INSERT INTO kbs (a, v) VALUES (100000, -1)")
@@ -1418,9 +1485,15 @@ fn gpu_chunk_bloom_offlock_prime_cannot_strand_stale_ids() {
     seq += 1;
     e.execute_text(seq, "UPDATE kbr SET v = 999999 WHERE a < 400")
         .unwrap();
-    assert!(e.streaming_cold_patches() > 0, "interposed UPDATE published E2");
+    assert!(
+        e.streaming_cold_patches() > 0,
+        "interposed UPDATE published E2"
+    );
     resume_prime.wait();
-    capture.join().expect("capture thread").expect("streaming read");
+    capture
+        .join()
+        .expect("capture thread")
+        .expect("streaming read");
     assert_eq!(
         e.stale_chunk_key_candidate_count("kbr"),
         0,
@@ -1520,7 +1593,10 @@ fn gpu_chunk_class_unique_batch_bound_deauthorizes_257() {
     let err = e
         .execute_text(
             seq,
-            &format!("INSERT INTO bound_dup VALUES {}", duplicate_values.join(",")),
+            &format!(
+                "INSERT INTO bound_dup VALUES {}",
+                duplicate_values.join(",")
+            ),
         )
         .expect_err("the restored host reference must reject the 257-row duplicate");
     assert!(format!("{err:?}").contains("duplicate key value"));
@@ -1807,7 +1883,11 @@ fn gpu_chunk_class_keyed_null_unique_stays_device_native() {
         )
         .expect_err("the second NULL is a device-detected structural dup");
     assert!(format!("{err:?}").contains("duplicate key value"));
-    assert_eq!(e.chunk_class_deauths(), 0, "the class remains authoritative");
+    assert_eq!(
+        e.chunk_class_deauths(),
+        0,
+        "the class remains authoritative"
+    );
     assert!(
         e.chunk_class_device_exact_rechecks() > exact_before,
         "the matching NULL tuple was confirmed by an exact device predicate"
@@ -2429,8 +2509,7 @@ fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_compaction() {
     assert_eq!(engine.chunk_class_entries(), 1, "premise: classed");
 
     let engine = std::sync::Arc::new(engine);
-    let (pinned, resume) =
-        crate::engine_streaming_exec::install_class_resolve_pin_hook();
+    let (pinned, resume) = crate::engine_streaming_exec::install_class_resolve_pin_hook();
     let deleting = std::sync::Arc::clone(&engine);
     let delete_seq = seq + 1;
     let delete = std::thread::spawn(move || {
@@ -2440,10 +2519,7 @@ fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_compaction() {
 
     let update_seq = seq + 2;
     engine
-        .execute_text(
-            update_seq,
-            "DELETE FROM epoch_t WHERE a < 200 OR a = 900",
-        )
+        .execute_text(update_seq, "DELETE FROM epoch_t WHERE a < 200 OR a = 900")
         .unwrap();
     assert!(
         engine.chunk_class_compactions() > 0,

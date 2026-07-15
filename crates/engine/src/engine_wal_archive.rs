@@ -323,17 +323,11 @@ impl Engine {
     /// install — see `write_streaming_cold_checkpoint`). Best-effort by design: the artifact is a
     /// warm-start cache in P1, so a failure must not fail the WAL checkpoint.
     ///
-    /// THE BOUNDARY CONVENTION (audit HIGH, adopted): the artifact must be stamped with the value
-    /// the RECOVERY SEAM's `committed_seq()` reaches after replaying exactly the checkpoint's
-    /// records — the INCLUSIVE index of the last record, `base_seq + cut - 1` — because replay
-    /// publishes each record's own index. The LIVE watermark, however, has TWO conventions:
-    /// serial/replay-derived engines publish the inclusive last index (`base_seq + cut - 1`) while
-    /// the lane pump publishes the EXCLUSIVE frontier (`visible_global_cut = base_seq + cut`).
-    /// Both bound the same visible set at a quiesced cut (no stamp above `base_seq + cut - 1`
-    /// exists), so BOTH are accepted as the quiescence proof — but the artifact always carries the
-    /// seam value. Comparing the live watermark to the seam value directly (the pre-audit code)
-    /// left the artifact one high whenever the pump had published, silently disabling every
-    /// production restore.
+    /// THE BOUNDARY CONVENTION (R3-006): the artifact and live/recovery watermark are the same
+    /// INCLUSIVE index of the last record, `base_seq + cut - 1`. The lane/WAL cut remains an
+    /// EXCLUSIVE next-slot frontier, but it is converted before `committed_seq` publication.
+    /// Accepting the exclusive frontier here would hide the publication bug and could qualify an
+    /// artifact while the next slot is applied but not durable.
     fn maybe_write_streaming_cold_checkpoint(
         &self,
         lanes: &crate::engine_intent_lanes::IntentLaneState,
@@ -348,11 +342,14 @@ impl Engine {
             return;
         }
         let base_seq = lanes.base_seq.load(Ordering::Acquire);
-        let seam_index = (base_seq + cut).saturating_sub(1);
-        let frontier_index = base_seq + cut;
-        if let Err(err) =
-            self.write_streaming_cold_checkpoint(base, cut, seam_index, frontier_index)
-        {
+        let Some(seam_index) = cut
+            .checked_sub(1)
+            .and_then(|last_local| base_seq.checked_add(last_local))
+        else {
+            crate::engine_streaming_exec::remove_stale_cold_checkpoints(base, cut);
+            return;
+        };
+        if let Err(err) = self.write_streaming_cold_checkpoint(base, cut, seam_index) {
             eprintln!(
                 "[gpu-db] cold checkpoint beside {} (cut {cut}) failed: {err}; streaming reads \
                  will rebuild the cache after a reopen",

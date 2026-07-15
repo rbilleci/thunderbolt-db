@@ -6,7 +6,7 @@
 
 use std::os::raw::c_void;
 
-use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError, check_cuda, launch_on_pooled_stream};
+use super::{check_cuda, launch_on_pooled_stream, CudaResidentDeviceMemory, CudaRuntimeProbeError};
 
 /// Outcome of [`CudaResidentDeviceMemory::hash_join_inner_i64`]: the matched row-index pairs, or a
 /// signal that the build-side join key is not unique (N:N many-to-many fan-out is a follow-up).

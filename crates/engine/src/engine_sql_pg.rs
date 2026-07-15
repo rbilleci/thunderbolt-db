@@ -51,7 +51,10 @@ enum GpuOffsetWindowKind {
 }
 
 enum GpuRankTarget {
-    Column { source: String, output: String },
+    Column {
+        source: String,
+        output: String,
+    },
     Window(GpuRankWindowKind, String),
     OffsetWindow {
         kind: GpuOffsetWindowKind,
@@ -117,7 +120,8 @@ impl Engine {
                 None => (0..plan.relations.len()).map(|_| None).collect(),
             };
             if rows.iter().all(Option::is_none) {
-                if let Some(result) = self.try_streaming_inner_join(&plan, &tables, &predicates, s) {
+                if let Some(result) = self.try_streaming_inner_join(&plan, &tables, &predicates, s)
+                {
                     return result;
                 }
             }
@@ -165,7 +169,8 @@ impl Engine {
                 offset,
             };
             if rows.iter().all(Option::is_none) {
-                if let Some(result) = self.try_streaming_inner_join(&plan, &tables, &predicates, s) {
+                if let Some(result) = self.try_streaming_inner_join(&plan, &tables, &predicates, s)
+                {
                     return result;
                 }
             }
@@ -356,8 +361,7 @@ impl Engine {
                                 .to_string(),
                         ));
                     };
-                    let resolved_over =
-                        resolve_rank_window_def(raw_over, &stmt.window_clause, 0)?;
+                    let resolved_over = resolve_rank_window_def(raw_over, &stmt.window_clause, 0)?;
                     let over = &resolved_over;
                     const FRAMEOPTION_NONDEFAULT: i32 = 0x00001;
                     if over.frame_options & FRAMEOPTION_NONDEFAULT != 0
@@ -388,7 +392,9 @@ impl Engine {
                     }
                     let name = match func.funcname.last().map(node_enum).transpose()? {
                         Some(NodeEnum::String(name)) => name.sval.to_ascii_lowercase(),
-                        _ => return Err(sql_pg_error("malformed window function name".to_string())),
+                        _ => {
+                            return Err(sql_pg_error("malformed window function name".to_string()))
+                        }
                     };
                     let output_name = if target.name.is_empty() {
                         name.clone()
@@ -530,9 +536,7 @@ impl Engine {
                         window_partition = Some(partition);
                     }
                     if let Some(existing) = &window_order {
-                        if existing != &order
-                            || window_order_nulls.as_ref() != Some(&order_nulls)
-                        {
+                        if existing != &order || window_order_nulls.as_ref() != Some(&order_nulls) {
                             return Err(sql_pg_error(
                                 "all GPU rank functions in one SELECT must share the same window ORDER BY"
                                     .to_string(),
@@ -569,9 +573,7 @@ impl Engine {
         physical_nulls.extend(order_nulls.iter().copied());
         let top_order = parse_order_by(&stmt.sort_clause, &qualifier)?;
         let top_nulls = parse_order_by_null_placement(&stmt.sort_clause)?;
-        if !top_order.is_empty()
-            && (top_order != physical_order || top_nulls != physical_nulls)
-        {
+        if !top_order.is_empty() && (top_order != physical_order || top_nulls != physical_nulls) {
             return Err(sql_pg_error(
                 "top-level ORDER BY must match PARTITION BY + window ORDER BY on this path"
                     .to_string(),
@@ -661,12 +663,8 @@ impl Engine {
         };
         let gpu_id = self.planner.default_gpu_id();
         let budget = self.relational_residency_budget_bytes(gpu_id)?;
-        let cold = self.ensure_streaming_join_cold(
-            table,
-            statement_copin_s,
-            gpu_id,
-            (budget / 2).max(1),
-        )?;
+        let cold =
+            self.ensure_streaming_join_cold(table, statement_copin_s, gpu_id, (budget / 2).max(1))?;
         let input_peak = cold
             .chunks
             .iter()
@@ -714,18 +712,11 @@ impl Engine {
             let mut specs = Vec::with_capacity(projected.len());
             for name in projected {
                 let column = relational_column_index(table, name)?;
-                let validity = resident_device_null_column_offset(
-                    &src.descriptor,
-                    table,
-                    column,
-                )?;
+                let validity = resident_device_null_column_offset(&src.descriptor, table, column)?;
                 specs.push(match table.columns[column].ty {
                     SqlType::Text => {
-                        let layout = resident_device_text_column_layout(
-                            &src.descriptor,
-                            table,
-                            column,
-                        )?;
+                        let layout =
+                            resident_device_text_column_layout(&src.descriptor, table, column)?;
                         CudaMaterializeJoinColumn::Text {
                             relation: 0,
                             payload: &src.device_memory,
@@ -748,11 +739,7 @@ impl Engine {
                     ty => {
                         let (byte_offset, width) = match ty {
                             SqlType::Int8 | SqlType::Timestamp => (
-                                resident_device_int8_column_offset(
-                                    &src.descriptor,
-                                    table,
-                                    column,
-                                )?,
+                                resident_device_int8_column_offset(&src.descriptor, table, column)?,
                                 8,
                             ),
                             SqlType::Numeric { .. } | SqlType::Uuid => (
@@ -764,11 +751,7 @@ impl Engine {
                                 16,
                             ),
                             SqlType::Int2 | SqlType::Int4 | SqlType::Date => (
-                                resident_device_int4_column_offset(
-                                    &src.descriptor,
-                                    table,
-                                    column,
-                                )?,
+                                resident_device_int4_column_offset(&src.descriptor, table, column)?,
                                 4,
                             ),
                             SqlType::Text | SqlType::Bool => unreachable!(),
@@ -844,9 +827,7 @@ impl Engine {
                         })?,
                         descending,
                         nulls_first,
-                        lexicographic_16: table.columns
-                            [relational_column_index(table, name)?]
-                            .ty
+                        lexicographic_16: table.columns[relational_column_index(table, name)?].ty
                             == SqlType::Uuid,
                     })
                 })
@@ -864,18 +845,12 @@ impl Engine {
                 .map(|name| {
                     let column = relational_column_index(table, name)?;
                     let ty = table.columns[column].ty;
-                    let validity = resident_device_null_column_offset(
-                        &src.descriptor,
-                        table,
-                        column,
-                    )?;
+                    let validity =
+                        resident_device_null_column_offset(&src.descriptor, table, column)?;
                     let key = match ty {
                         SqlType::Text => {
-                            let layout = resident_device_text_column_layout(
-                                &src.descriptor,
-                                table,
-                                column,
-                            )?;
+                            let layout =
+                                resident_device_text_column_layout(&src.descriptor, table, column)?;
                             gpu_db_execution::CudaJoinPayloadKey {
                                 payload: &src.device_memory,
                                 byte_offset: layout.offsets_byte_offset,
@@ -950,12 +925,15 @@ impl Engine {
 
         let mut accumulator: Option<CudaMaterializedRelation> = None;
         let mut peak = 0_u64;
-        for chunk in cold.chunks.iter().filter(|chunk| {
-            chunk.payload_copin_s <= statement_copin_s && chunk.row_count > 0
-        }) {
-            let (src, visibility) = match self.stage_cold_chunk(chunk, statement_copin_s).and_then(
-                crate::engine_streaming_exec::StagedChunk::ready,
-            ) {
+        for chunk in cold
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.payload_copin_s <= statement_copin_s && chunk.row_count > 0)
+        {
+            let (src, visibility) = match self
+                .stage_cold_chunk(chunk, statement_copin_s)
+                .and_then(crate::engine_streaming_exec::StagedChunk::ready)
+            {
                 Ok(source) => source,
                 Err(_) => {
                     return Some(Err(sql_pg_error(
@@ -981,25 +959,21 @@ impl Engine {
                 Ok(value) => value,
                 Err(err) => return Some(Err(map_err(err))),
             };
-            let source_keys = match source_order(
-                &src,
-                &physical_names,
-                table,
-                order,
-                order_nulls,
-            ) {
+            let source_keys = match source_order(&src, &physical_names, table, order, order_nulls) {
                 Ok(keys) => keys,
                 Err(err) => return Some(Err(err)),
             };
-            let sorted = match src.device_memory.sort_join_coordinates(&identity, &source_keys) {
+            let sorted = match src
+                .device_memory
+                .sort_join_coordinates(&identity, &source_keys)
+            {
                 Ok(value) => value,
                 Err(err) => return Some(Err(map_err(err))),
             };
-            let top = match src.device_memory.window_join_coordinates(
-                &sorted,
-                0,
-                Some(fetch_u32),
-            ) {
+            let top = match src
+                .device_memory
+                .window_join_coordinates(&sorted, 0, Some(fetch_u32))
+            {
                 Ok(value) => value,
                 Err(err) => return Some(Err(map_err(err))),
             };
@@ -1073,9 +1047,7 @@ impl Engine {
                         combined
                             .allocated_bytes()
                             .saturating_add(next.allocated_bytes())
-                            .saturating_add(
-                                u64::from(combined.row_count()).saturating_mul(12),
-                            ),
+                            .saturating_add(u64::from(combined.row_count()).saturating_mul(12)),
                     );
                     Some(next)
                 }
@@ -1105,7 +1077,10 @@ impl Engine {
                 lexicographic_16: false,
             }
         };
-        let partition_keys = partition.iter().map(|name| rank_key(name)).collect::<Vec<_>>();
+        let partition_keys = partition
+            .iter()
+            .map(|name| rank_key(name))
+            .collect::<Vec<_>>();
         let order_keys = order
             .iter()
             .map(|item| rank_key(&item.column))
@@ -1148,8 +1123,7 @@ impl Engine {
                 "rank-window allocator high-water ({peak}) exceeds the query budget ({budget})"
             ))));
         }
-        let mut source_values =
-            std::collections::BTreeMap::<String, Vec<SqlValue>>::new();
+        let mut source_values = std::collections::BTreeMap::<String, Vec<SqlValue>>::new();
         for (index, name) in projected.iter().enumerate() {
             let layout = run.columns()[index];
             let ty = table.columns[relational_column_index(table, name).expect("bound")].ty;
@@ -1194,9 +1168,10 @@ impl Engine {
                                     SqlType::Bool => SqlValue::Bool(
                                         i32::from_le_bytes(bytes.try_into().unwrap()) != 0,
                                     ),
-                                    SqlType::Int2 => SqlValue::Int2(
-                                        i32::from_le_bytes(bytes.try_into().unwrap()) as i16,
-                                    ),
+                                    SqlType::Int2 => SqlValue::Int2(i32::from_le_bytes(
+                                        bytes.try_into().unwrap(),
+                                    )
+                                        as i16),
                                     SqlType::Int4 => SqlValue::Int4(i32::from_le_bytes(
                                         bytes.try_into().unwrap(),
                                     )),
@@ -1209,12 +1184,12 @@ impl Engine {
                                     SqlType::Timestamp => SqlValue::Timestamp(i64::from_le_bytes(
                                         bytes.try_into().unwrap(),
                                     )),
-                                    SqlType::Numeric { scale, .. } => SqlValue::Numeric(
-                                        gpu_db_sql::Decimal128::new(
+                                    SqlType::Numeric { scale, .. } => {
+                                        SqlValue::Numeric(gpu_db_sql::Decimal128::new(
                                             i128::from_le_bytes(bytes.try_into().unwrap()),
                                             scale,
-                                        ),
-                                    ),
+                                        ))
+                                    }
                                     SqlType::Uuid => {
                                         SqlValue::Uuid(bytes.try_into().expect("uuid"))
                                     }
@@ -1267,13 +1242,14 @@ impl Engine {
                 GpuOffsetWindowKind::Lag => -(*offset as i32),
                 GpuOffsetWindowKind::Lead => *offset as i32,
             };
-            let shifted = match run
-                .memory()
-                .shift_join_coordinates(&identity, &partition_keys, delta)
-            {
-                Ok(value) => value,
-                Err(err) => return Some(Err(map_err(err))),
-            };
+            let shifted =
+                match run
+                    .memory()
+                    .shift_join_coordinates(&identity, &partition_keys, delta)
+                {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(map_err(err))),
+                };
             let shifted_window = match run.memory().window_join_coordinates(
                 &shifted,
                 offset_u32,
@@ -1295,28 +1271,67 @@ impl Engine {
         for (attnum, target) in targets.iter().enumerate() {
             let mut column = match target {
                 GpuRankTarget::Column { source, output } => {
-                    let mut column = table.columns[relational_column_index(table, source).expect("bound")].clone();
-                    column.name = output.clone(); column
-                }
-                GpuRankTarget::Window(_, name) => {
-                    let mut column=table.columns[0].clone();column.name=name.clone();column.ty=SqlType::Int8;column.domain=None;column.default=None;column.type_oid=20;column.type_size=8;column
-                }
-                GpuRankTarget::OffsetWindow { source, output, .. } => {
-                    let mut column = table.columns[relational_column_index(table, source).expect("bound")].clone();
+                    let mut column = table.columns
+                        [relational_column_index(table, source).expect("bound")]
+                    .clone();
                     column.name = output.clone();
                     column
                 }
-            };column.attnum=(attnum+1) as i16;columns.push(column);
+                GpuRankTarget::Window(_, name) => {
+                    let mut column = table.columns[0].clone();
+                    column.name = name.clone();
+                    column.ty = SqlType::Int8;
+                    column.domain = None;
+                    column.default = None;
+                    column.type_oid = 20;
+                    column.type_size = 8;
+                    column
+                }
+                GpuRankTarget::OffsetWindow { source, output, .. } => {
+                    let mut column = table.columns
+                        [relational_column_index(table, source).expect("bound")]
+                    .clone();
+                    column.name = output.clone();
+                    column
+                }
+            };
+            column.attnum = (attnum + 1) as i16;
+            columns.push(column);
         }
-        let rows=(0..window.row_count() as usize).map(|row|targets.iter().enumerate().map(|(target_index,target)|match target{
-            GpuRankTarget::Column{source,..}=>source_values[source][row].clone(),
-            GpuRankTarget::Window(kind,_)=>SqlValue::Int8(rank_values[&(*kind as u8)][row] as i64),
-            GpuRankTarget::OffsetWindow { .. } => offset_values[&target_index][row].clone(),
-        }).collect::<Vec<_>>()).collect::<Vec<_>>();
+        let rows = (0..window.row_count() as usize)
+            .map(|row| {
+                targets
+                    .iter()
+                    .enumerate()
+                    .map(|(target_index, target)| match target {
+                        GpuRankTarget::Column { source, .. } => source_values[source][row].clone(),
+                        GpuRankTarget::Window(kind, _) => {
+                            SqlValue::Int8(rank_values[&(*kind as u8)][row] as i64)
+                        }
+                        GpuRankTarget::OffsetWindow { .. } => {
+                            offset_values[&target_index][row].clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         peak = peak.max(input_peak.saturating_add(allocation_scope.peak_bytes()));
-        self.read_state.residency.streaming_fold_peak_chunk_bytes.fetch_max(peak,std::sync::atomic::Ordering::Relaxed);
-        self.read_state.residency.streaming_window_hits.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
-        Some(Ok(RelationalSelectResult{columns:Arc::new(columns),rows:rows.into(),planned_target:DeviceTarget::Gpu(gpu_id),executed_target:DeviceTarget::Gpu(gpu_id),fallback_reason:None,access_path:Arc::new(RelationalAccessPath::FullTableScan)}))
+        self.read_state
+            .residency
+            .streaming_fold_peak_chunk_bytes
+            .fetch_max(peak, std::sync::atomic::Ordering::Relaxed);
+        self.read_state
+            .residency
+            .streaming_window_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(Ok(RelationalSelectResult {
+            columns: Arc::new(columns),
+            rows: rows.into(),
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            fallback_reason: None,
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1334,9 +1349,7 @@ impl Engine {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        use gpu_db_execution::{
-            CudaJoinOrderKey, CudaJoinPayloadKey, CudaWindowRankKind,
-        };
+        use gpu_db_execution::{CudaJoinOrderKey, CudaJoinPayloadKey, CudaWindowRankKind};
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
@@ -1374,18 +1387,12 @@ impl Engine {
          -> Result<CudaJoinOrderKey<'_>, ExecuteError> {
             let column = relational_column_index(table, name)?;
             let ty = table.columns[column].ty;
-            let validity_bitmap_offset = resident_device_null_column_offset(
-                &side.0.descriptor,
-                table,
-                column,
-            )?;
+            let validity_bitmap_offset =
+                resident_device_null_column_offset(&side.0.descriptor, table, column)?;
             let key = match ty {
                 SqlType::Text => {
-                    let layout = resident_device_text_column_layout(
-                        &side.0.descriptor,
-                        table,
-                        column,
-                    )?;
+                    let layout =
+                        resident_device_text_column_layout(&side.0.descriptor, table, column)?;
                     CudaJoinPayloadKey {
                         payload,
                         byte_offset: layout.offsets_byte_offset,
@@ -1432,9 +1439,7 @@ impl Engine {
                     text_bytes_len: 0,
                 },
                 SqlType::Bool => {
-                    return Err(sql_pg_error(
-                        "bool rank keys are not supported".to_string(),
-                    ))
+                    return Err(sql_pg_error("bool rank keys are not supported".to_string()))
                 }
             };
             Ok(CudaJoinOrderKey {
@@ -1475,11 +1480,7 @@ impl Engine {
             let column = relational_column_index(table, name)?;
             if matches!(
                 table.columns[column].ty,
-                SqlType::Int2
-                    | SqlType::Int4
-                    | SqlType::Int8
-                    | SqlType::Date
-                    | SqlType::Timestamp
+                SqlType::Int2 | SqlType::Int4 | SqlType::Int8 | SqlType::Date | SqlType::Timestamp
             ) {
                 physical_order.push(key(name, false, false)?);
             }
@@ -1502,7 +1503,8 @@ impl Engine {
 
         let mut estimated_live = u64::from(identity.row_count())
             .saturating_mul(
-                4 + 8 + 24
+                4 + 8
+                    + 24
                     + if targets
                         .iter()
                         .any(|target| matches!(target, GpuRankTarget::OffsetWindow { .. }))
@@ -1513,9 +1515,8 @@ impl Engine {
                     },
             )
             .saturating_add((physical_order.len() as u64).saturating_mul(72));
-        estimated_live = input_bytes.saturating_add(
-            estimated_live.max(allocation_scope.peak_bytes()),
-        );
+        estimated_live =
+            input_bytes.saturating_add(estimated_live.max(allocation_scope.peak_bytes()));
         if estimated_live > budget {
             return Err(sql_pg_error(format!(
                 "rank-window live device bytes ({estimated_live}) exceed the query budget ({budget})"
@@ -1529,19 +1530,12 @@ impl Engine {
         let mut source_values = std::collections::BTreeMap::<String, Vec<SqlValue>>::new();
         for name in projected {
             let column = relational_column_index(table, name)?;
-            let validity = resident_device_null_column_offset(
-                &side.0.descriptor,
-                table,
-                column,
-            )?;
+            let validity = resident_device_null_column_offset(&side.0.descriptor, table, column)?;
             let ty = table.columns[column].ty;
             let values = match ty {
                 SqlType::Text => {
-                    let layout = resident_device_text_column_layout(
-                        &side.0.descriptor,
-                        table,
-                        column,
-                    )?;
+                    let layout =
+                        resident_device_text_column_layout(&side.0.descriptor, table, column)?;
                     payload
                         .project_text_from_join_coordinates(
                             &window,
@@ -1558,19 +1552,10 @@ impl Engine {
                         .collect()
                 }
                 SqlType::Bool => {
-                    let bitmap = resident_device_bool_column_offset(
-                        &side.0.descriptor,
-                        table,
-                        column,
-                    )?;
+                    let bitmap =
+                        resident_device_bool_column_offset(&side.0.descriptor, table, column)?;
                     payload
-                        .project_bool_from_join_coordinates(
-                            &window,
-                            0,
-                            payload,
-                            bitmap,
-                            validity,
-                        )
+                        .project_bool_from_join_coordinates(&window, 0, payload, bitmap, validity)
                         .map_err(map_err)?
                         .into_iter()
                         .map(|value| value.map_or(SqlValue::Null, SqlValue::Bool))
@@ -1579,11 +1564,7 @@ impl Engine {
                 _ => {
                     let (byte_offset, width) = match ty {
                         SqlType::Int8 | SqlType::Timestamp => (
-                            resident_device_int8_column_offset(
-                                &side.0.descriptor,
-                                table,
-                                column,
-                            )?,
+                            resident_device_int8_column_offset(&side.0.descriptor, table, column)?,
                             8_u8,
                         ),
                         SqlType::Numeric { .. } | SqlType::Uuid => (
@@ -1595,11 +1576,7 @@ impl Engine {
                             16_u8,
                         ),
                         SqlType::Int2 | SqlType::Int4 | SqlType::Date => (
-                            resident_device_int4_column_offset(
-                                &side.0.descriptor,
-                                table,
-                                column,
-                            )?,
+                            resident_device_int4_column_offset(&side.0.descriptor, table, column)?,
                             4_u8,
                         ),
                         SqlType::Text | SqlType::Bool => unreachable!(),
@@ -1621,27 +1598,28 @@ impl Engine {
                                 return SqlValue::Null;
                             }
                             match ty {
-                                SqlType::Int2 => SqlValue::Int2(
-                                    i32::from_le_bytes(bytes.try_into().unwrap()) as i16,
-                                ),
-                                SqlType::Int4 => SqlValue::Int4(i32::from_le_bytes(
+                                SqlType::Int2 => SqlValue::Int2(i32::from_le_bytes(
                                     bytes.try_into().unwrap(),
-                                )),
-                                SqlType::Date => SqlValue::Date(i32::from_le_bytes(
-                                    bytes.try_into().unwrap(),
-                                )),
-                                SqlType::Int8 => SqlValue::Int8(i64::from_le_bytes(
-                                    bytes.try_into().unwrap(),
-                                )),
+                                )
+                                    as i16),
+                                SqlType::Int4 => {
+                                    SqlValue::Int4(i32::from_le_bytes(bytes.try_into().unwrap()))
+                                }
+                                SqlType::Date => {
+                                    SqlValue::Date(i32::from_le_bytes(bytes.try_into().unwrap()))
+                                }
+                                SqlType::Int8 => {
+                                    SqlValue::Int8(i64::from_le_bytes(bytes.try_into().unwrap()))
+                                }
                                 SqlType::Timestamp => SqlValue::Timestamp(i64::from_le_bytes(
                                     bytes.try_into().unwrap(),
                                 )),
-                                SqlType::Numeric { scale, .. } => SqlValue::Numeric(
-                                    gpu_db_sql::Decimal128::new(
+                                SqlType::Numeric { scale, .. } => {
+                                    SqlValue::Numeric(gpu_db_sql::Decimal128::new(
                                         i128::from_le_bytes(bytes.try_into().unwrap()),
                                         scale,
-                                    ),
-                                ),
+                                    ))
+                                }
                                 SqlType::Uuid => {
                                     SqlValue::Uuid(bytes.try_into().expect("uuid width"))
                                 }
@@ -1779,9 +1757,7 @@ fn resolve_rank_window_def(
         clauses
             .iter()
             .find_map(|node| match node.node.as_ref() {
-                Some(NodeEnum::WindowDef(window)) if window.name == name => {
-                    Some(window.as_ref())
-                }
+                Some(NodeEnum::WindowDef(window)) if window.name == name => Some(window.as_ref()),
                 _ => None,
             })
             .ok_or_else(|| sql_pg_error(format!("window \"{name}\" does not exist")))

@@ -1,4 +1,4 @@
-use super::{ExprStep, ExprTerminal, ResidentElemType, validate_resident_arith_program};
+use super::{validate_resident_arith_program, ExprStep, ExprTerminal, ResidentElemType};
 
 fn validate(
     bytes: u64,

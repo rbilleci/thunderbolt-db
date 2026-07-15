@@ -1,4 +1,4 @@
-use crate::{CudaResidentDeviceMemory, CudaRuntimeProbeError, check_cuda, launch_on_pooled_stream};
+use crate::{check_cuda, launch_on_pooled_stream, CudaResidentDeviceMemory, CudaRuntimeProbeError};
 use std::ffi::c_void;
 
 /// Device-final uniqueness verdict over packed `(chunk, slot)` coordinates. One thread is

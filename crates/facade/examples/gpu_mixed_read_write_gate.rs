@@ -42,11 +42,7 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 
 fn expect_id(outcome: QueryOutcome, expected: i32) -> Result<(), String> {
     match outcome {
-        QueryOutcome::Rows { rows, .. }
-            if rows == vec![vec![DbValue::Int4(expected)]] =>
-        {
-            Ok(())
-        }
+        QueryOutcome::Rows { rows, .. } if rows == vec![vec![DbValue::Int4(expected)]] => Ok(()),
         other => Err(format!(
             "point read for id={expected} returned an unexpected outcome: {other:?}"
         )),
@@ -104,7 +100,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     engine.set_shard_index_probe_enabled(true);
     engine.set_shard_batched_point_read_enabled(true);
     if !engine.auto_admit_on_commit_enabled() {
-        return Err("STRATA S-F regression: production auto-admission is not enabled by default".into());
+        return Err(
+            "STRATA S-F regression: production auto-admission is not enabled by default".into(),
+        );
     }
     engine.set_host_install_elision_enabled(true);
     let shared = Arc::new(SharedEngine::from_engine(engine));
@@ -146,7 +144,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         match execute_on_shared_engine_batched(&shared, &batcher, &sql) {
             BatchedDispatch::Batched(receiver) => warmup_receivers.push((id, receiver)),
             BatchedDispatch::Immediate(_) => {
-                return Err(format!("warmup point read id={id} bypassed the production batcher").into())
+                return Err(
+                    format!("warmup point read id={id} bypassed the production batcher").into(),
+                )
             }
         }
     }
@@ -252,8 +252,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let overlapping_reads = Arc::clone(&overlapping_reads);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || -> Result<(Vec<u64>, Vec<u64>), String> {
-                let mut state = 0x9e37_79b9_7f4a_7c15_u64
-                    ^ (reader as u64 + 1).wrapping_mul(2_654_435_761);
+                let mut state =
+                    0x9e37_79b9_7f4a_7c15_u64 ^ (reader as u64 + 1).wrapping_mul(2_654_435_761);
                 let mut latencies = Vec::with_capacity(reads_per);
                 let mut writer_active_latencies = Vec::new();
                 barrier.wait();

@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError, check_cuda, launch_on_pooled_stream};
+use super::{check_cuda, launch_on_pooled_stream, CudaResidentDeviceMemory, CudaRuntimeProbeError};
 
 fn validate_index_window(
     allocated_bytes: u64,
