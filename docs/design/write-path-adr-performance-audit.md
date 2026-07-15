@@ -17,8 +17,10 @@ verdict into acceptance.
 
 ### CRITICAL — the selected physical representation lacks its performance gate
 
-The charter requires more than 100,000 sustained TPS, a 400,000 TPS burst, and simple-OLTP p99 below 1 ms
-([`CHARTER.md`](../CHARTER.md)). The pre-review evidence has focused correctness tests and a static two-int4
+At audit time the charter required more than 100,000 sustained TPS, a 400,000 TPS burst, and a uniform simple-OLTP
+p99 below 1 ms. The accepted 2026-07-15 target refinement now keeps 1 ms for R1 reads, uses 1.5 ms for W1 single
+mutations, 3 ms for T8, and 6 ms for T32 ([`CHARTER.md`](../CHARTER.md)); this historical finding and its adopted
+bounded-controller disposition remain valid. The pre-review evidence had focused correctness tests and a static two-int4
 64-byte/version estimate, but no update-heavy synchronous-commit TPS/tail distribution. It therefore cannot claim
 that append/tombstone meets the binding latency, throughput, footprint, or write-amplification requirements.
 
@@ -44,7 +46,8 @@ The live conveyor has useful population-scaled wave formation, fence-slot-driven
 lane resizing. They do not form a tail-safe contract:
 
 - the grouping deadline can reach 2,000 microseconds in
-  [`lane.rs`](../../crates/engine/src/engine_dml_concurrent/lane.rs), already above the complete p99 target;
+  [`lane.rs`](../../crates/engine/src/engine_dml_concurrent/lane.rs), already above both the former uniform target and
+  the current complete W1 p99 target;
 - validation/apply coalescers can drain an unbounded matching/pending queue; and
 - active-lane resize performs a global drain whose source records 0.6–1.2 second spikes and permits a five-second
   drain window.

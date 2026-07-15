@@ -51,14 +51,20 @@ chronology or future sequencing. The full pre-unification record is archived at
 
 ## ADR-008 — Product workload bet is GPU-native OLTP
 
-- **Status:** Accepted, 2026-06-26.
+- **Status:** Accepted, 2026-06-26; latency-class refinement accepted 2026-07-15.
 - **Decision:** Optimize for OLTP entity reads, filtered pages, bounded joins, and deterministic write waves—not
-  only analytical scans. Judge the bet against tuned CPU OLTP at offered load and tail latency.
+  only analytical scans. Judge the bet against tuned CPU OLTP at offered load and tail latency. The charter's
+  latency contract is classed: R1 bounded reads retain 0.5/1/5-ms p50/p99/p99.9; W1 single keyed synchronous
+  mutations use 0.8/1.5/5 ms; bounded predeclared T8 and T32 transactions use 1.5/3/10 ms and 3/6/20 ms. Each class
+  and each W1 operation passes independently; mixed-workload pooling cannot hide a failing class. Interactive/
+  data-dependent work remains a separately reported slow class without a generic wall-time promise.
 - **Evidence:** Persistent-kernel experiments proved GPU point-read/index ceilings, while launch-per-batch dense
   indexing won the production integration tradeoff. The persistent SQL wave engine was retired; its source and
   experimental chronology are archived.
 - **Consequence:** Do not resurrect retired wave work from historical reviews. Complete **BENCH-001** before using
-  performance intuition to reorder major architecture work.
+  performance intuition to reorder major architecture work. Admission and scheduling derive residual budgets from
+  the request's advertised latency class; a durability profile that cannot fit is explicitly unqualified rather
+  than repaired through asynchronous acknowledgement.
 
 ## ADR-007 — Full GPU-native execution, including eventual oracle retirement
 

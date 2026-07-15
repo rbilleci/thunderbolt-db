@@ -25,9 +25,32 @@ coherence) so it **closes as GPU hardware advances** while the CPU path sits nea
 |---|---|
 | Sustained OLTP throughput | > 100,000 TPS |
 | Peak burst | ≥ 400,000 TPS |
-| p50 / p99 / p99.9 latency (simple OLTP) | < 0.5 ms / < 1 ms / < 5 ms |
+| R1 prepared bounded read p50 / p99 / p99.9 | < 0.5 ms / < 1 ms / < 5 ms |
+| W1 single keyed synchronous INSERT, UPDATE, or DELETE p50 / p99 / p99.9 | < 0.8 ms / < 1.5 ms / < 5 ms |
+| T8 predeclared atomic transaction p50 / p99 / p99.9 | < 1.5 ms / < 3 ms / < 10 ms |
+| T32 predeclared atomic transaction p50 / p99 / p99.9 | < 3 ms / < 6 ms / < 20 ms |
 | Concurrent connections | > 100,000 (up to 1,000,000) |
 | RPO / RTO | 0 (no committed loss) / < 30 s failover, < 5 min full GPU recovery |
+
+Latency classes are explicit acceptance envelopes, not percentiles pooled across unlike work:
+
+- **R1** is one prepared bounded point/page read through the final client-visible result.
+- **W1** is one keyed autocommit INSERT, UPDATE, or DELETE through publication-covered synchronous acknowledgement.
+  INSERT, UPDATE, DELETE, and the declared I/U/D mix each pass independently.
+- **T8** is 2–8 predeclared relational operations with at most four mutations; **T32** is 9–32 predeclared
+  operations with at most 16 mutations. Both remain within route-declared post-image/WAL bytes, maintained-index
+  fanout, touched-table, cold-access, and result bounds. Work outside those bounds is not admitted under the class
+  merely because its operation count fits.
+- Data-dependent or client-interactive transactions remain the supported slow class. Arbitrary client think time is
+  excluded from database service latency; statement latency, terminal commit/rollback latency, database-active time,
+  and wall time are reported separately. There is no generic whole-transaction latency promise for this class.
+
+Every advertised class measures open-loop latency from scheduled arrival, includes producer slip and queueing, and
+passes independently at its declared offered load. Mixed read/write tests report R1, each W1 operation, T8/T32, the
+actual achieved mix, TPS, and logical operations/s separately; their pooled distribution is supplementary only.
+`p99.99` is reported by BENCH-001 but has no binding threshold yet. A synchronous write/transaction profile qualifies
+only when its measured durability percentile plus all bounded downstream work fits its class target; otherwise the
+profile is explicit non-SLO service or is refused, never silently acknowledged asynchronously.
 
 ## The invariant — host is control plane ONLY
 - Every relational decision and every result value is computed on, and read back from, the **device**.

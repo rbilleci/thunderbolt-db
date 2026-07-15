@@ -79,7 +79,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   reviewed decision-level ACID/failure trace matrix is complete: 115 compact trace rows cover row/object overlays,
   transaction/session/isolation, constraints/sequences, conveyor/publication/acknowledgement, WAL/checkpoint/
   activation/recovery/migration, and service/GC pressure with explicit authority and graduation owners. The current
-  Candidate-A current-implementation measurement has run and returned **FAIL**: strict 1,000-offered INSERT p50 is 2.88 ms;
+  Candidate-A current-implementation measurement has run and remains **FAIL** under the revised W1
+  0.8/1.5/5-ms target: strict 1,000-offered INSERT p50 is 2.88 ms;
   100,000-offered INSERT p99 is 210.29 ms; the measured mixed path achieves 92,744 TPS with 44.88-ms p99; and the
   actual narrow insert allocation is 244,897,808 bytes for 300,003 appended versions (816.3 B/version), with
   433.3 physical FUA WAL bytes/op. The current intent route rejects non-INT4 widths. A same-physics fixed-record
@@ -90,7 +91,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   even seqlock transitions, ends undo at the replacement commit, asserts old/current visibility, and selects compact
   append/tombstone in every p50 cell; the semantically complete formats are byte-tied. The build-only 12-family
   controller injection model also passes cold/index preclaim, both lag directions, sparse/global skew, wave caps,
-  hard credits, durability qualification, held-snapshot pressure, hysteresis, cold-quota/disabled-maintenance
+  hard credits, class-aware strict W1/T8/T32 durability qualification, held-snapshot pressure, hysteresis, cold-quota/disabled-maintenance
   rejection, overlap/yield, starvation override, and global-drain-resize refusal.
   This selects the physical design without accepting the current 816-B allocation or relabeling its end-to-end SLO
   failure. The five-minute capacity argument is explicit: the
@@ -101,8 +102,12 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   selection/provenance/task-reference, undo-visibility/seqlock/adaptation-evidence, and pressure-state/wave-trigger
   blockers are corrected. The controller model now tests soft/high/hard/lower recovery, pre-deadline byte/service
   shipment, and oversized-item pre-claim rejection. Frozen packet v4 passed fresh independent review with
-  **ACCEPT** and no remaining pre-acceptance blocker. Explicit user acceptance remains; the ADR is still proposed.
-  `DECISIONS.md` and `ARCHITECTURE.md` remain unchanged. The implemented standalone canonical
+  **ACCEPT** and no remaining pre-acceptance blocker under the prior uniform latency target. The accepted target
+  policy now separates R1 reads (0.5/1/5 ms), W1 single keyed synchronous mutations (0.8/1.5/5 ms), T8 bounded
+  predeclared transactions (1.5/3/10 ms), and T32 bounded predeclared transactions (3/6/20 ms); W1 operations and
+  all classes qualify independently. The target-policy amendments in `DECISIONS.md` and `ARCHITECTURE.md` do not
+  accept the proposed write-path ADR. A focused post-v4 target-consistency re-review now precedes explicit write-path
+  acceptance. The implemented standalone canonical
   campaign follows acceptance under R3-003, DUR-001/002, and RETIRE-002 before production authority or
   host-store removal;
   HA-001 is additional only for replicated/node-loss-RPO deployment.

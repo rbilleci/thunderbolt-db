@@ -56,6 +56,12 @@ before reconciling these rules would multiply the incompatible states that R3-00
 The charter requires the GPU to make relational decisions while the host remains the sequencing, durability,
 protocol, and orchestration control plane. ADR-009 already selects deterministic predeclarable waves as the fast
 transaction class; this proposal supplies the missing row/version/storage contract beneath that execution model.
+The binding latency envelopes are classed rather than pooled: R1 prepared bounded reads use 0.5/1/5-ms
+p50/p99/p99.9; W1 single keyed synchronous mutations use 0.8/1.5/5 ms; T8 transactions contain 2–8 predeclared
+operations with at most four mutations and use 1.5/3/10 ms; T32 contains 9–32 predeclared operations with at most
+16 mutations and uses 3/6/20 ms. T8/T32 also require declared byte, index-fanout, touched-table, cold-access, and
+result bounds. Interactive or data-dependent slow work has no generic client-wall-time SLO; statement, terminal,
+database-active, and wall time remain separately observable.
 The 2026-07-15 current-path measurement failed the end-to-end SLO at low load, target load, and update/delete mixes,
 and its current intent route cannot supply non-INT4/index-fanout coverage. A same-physics fixed-record FUA harness
 measured 1.662-ms p50/1.723-ms p99 at queue depth one, while the actual engine-facing variable-payload
@@ -722,10 +728,12 @@ asynchronous ticket mode is never enabled automatically to recover latency.
 
 Automatic batching and stage-credit admission are required. A wave ships when its intent/byte/predicted-kernel
 target is reached **or** its oldest item reaches the wave budget, whichever happens first. The wave budget is the
-simple-OLTP end-to-end p99 target minus measured downstream fence, apply, publication, and response margins; a
-fixed grouping cap that alone exceeds the p99 target is invalid. Validation and apply coalescers obey the same
-intent, byte, predicted-service, and oldest-age bounds. Age-aware fairness across lanes, tables, tenants, and fast/
-slow classes prevents a sparse lane or prepared fast route from waiting behind global population or an unbounded
+admitted R1/W1/T8/T32 end-to-end p99 target minus measured downstream fence, apply, publication, and response
+margins; a fixed grouping cap that alone exceeds that class target is invalid. Validation and apply coalescers obey
+the same intent, byte, predicted-service, and oldest-age bounds. A class may use its larger transaction envelope only
+after admission proves its operation, mutation, byte, fanout, table, cold-access, and result bounds; it cannot borrow
+another class's residual budget opportunistically. Age-aware fairness across lanes, tables, tenants, and fast/slow
+classes prevents a sparse lane or prepared fast route from waiting behind global population or an unbounded
 coalesced launch.
 
 The controller is deliberately small and explainable:
@@ -1195,7 +1203,7 @@ commits exist.
 It adds atomic cross-column overwrite, undo lookup, undo-index, checkpoint, and old-snapshot reconstruction machinery
 while discarding substantial live append/tombstone correctness evidence. The first current-path Candidate-A matrix
 failed, but it combined the present allocation/controller restrictions with a synchronous-durability envelope that
-exceeds the complete charter latency target on this host. It was therefore not a valid physical A/B.
+exceeds the applicable W1 charter latency target on this host. It was therefore not a valid physical A/B.
 
 The corrected resident-input comparison in
 [`write-path-adr-physical-selection.md`](write-path-adr-physical-selection.md) executes both mutation mechanics on
@@ -1258,7 +1266,7 @@ ADR acceptance selects a design; it does not claim that the canonical WAL/checkp
 or has passed production fault qualification. Before this proposal becomes an accepted ADR, review must establish:
 
 - source-level agreement that every live identity, durability mechanism, and host fallback is accounted for;
-- the current synchronous-commit SLO matrix plus a direct common-durability-floor measurement, so a platform or
+- the current synchronous-commit W1 SLO matrix plus a direct common-durability-floor measurement, so a platform or
   controller failure is not misattributed to the row representation and no failed result is relabeled as a product
   pass;
 - a bounded same-kernel-boundary physical comparison across latency-oriented and throughput batches, row widths,
@@ -1306,8 +1314,11 @@ accepting the current allocation or claiming an end-to-end SLO pass. The paramet
 argument is complete in [`write-path-adr-rto-capacity.md`](write-path-adr-rto-capacity.md); its canonical artifact/
 index rates remain post-acceptance qualification rather than current facts. The 12-family build-only controller
 injection model now passes the required cold/index/lag/skew/pressure/hysteresis/maintenance schedules without an
-async or post-WAL escape. Frozen review packet v4 received an independent **ACCEPT** with no pre-acceptance blocker;
-the explicit user acceptance decision remains. Independent performance,
+async or post-WAL escape. Frozen review packet v4 received an independent **ACCEPT** with no pre-acceptance blocker
+under the prior uniform latency target. The subsequent classed R1/W1/T8/T32 target revision does not accept this
+proposal and requires the focused post-v4 target-consistency re-review in
+[`write-path-adr-review-packet-v5.md`](write-path-adr-review-packet-v5.md) before the explicit user acceptance
+decision. Independent performance,
 durability/resilience, transactional ACID, and consistency/accuracy reviews all returned **REVISE**; every design
 finding is incorporated, but that does not itself accept the proposal.
 The tuned PostgreSQL comparison is separately owned by **BENCH-001** and is not a substitute for this internal
@@ -1320,8 +1331,10 @@ contract; **HA-001** additionally qualifies replicated/node-loss-RPO deployment.
 path can become production authority or **R3-004** can delete the host recovery store, implementation evidence must
 include:
 
-- the selected append/tombstone SLO matrix repeated on canonical bytes and controllers, including disabled compaction/index-
-  maintenance sabotage that fails admission instead of silently degrading a prepared route;
+- the selected append/tombstone W1/T8/T32 SLO matrices repeated on canonical bytes and controllers, with INSERT,
+  UPDATE, DELETE, declared I/U/D mix, and each transaction envelope passing independently; mixed read/write runs also
+  report R1 separately, and disabled compaction/index-maintenance sabotage fails admission instead of silently
+  degrading a prepared route;
 - apply-before-durable checkpoint sabotage: pause FUA after a hidden future birth/death/index stamp, checkpoint at
   the old cut, tear the frame, crash, recover, reuse the abandoned sequence, and prove exact C projection;
 - crash injection after every physical WAL fragment/marker and rollover boundary, including missing, duplicate,
@@ -1384,6 +1397,7 @@ The acceptance review should pay particular attention to these choices:
 15. one stable-ID/statement-ordered catalog-table lifecycle, metadata-only missing values versus semantic rewrites,
     non-MVCC rewrite fences, reset/rewrite/DML composition, and checkpoint persistence of their authority;
 16. explicit empty/first/exhausted frontier conversion and the intentional RR stable-catalog compatibility deviation;
-    and
 17. replacing the architecture's serial durability/apply arrow with the cut-join rule while keeping bounded
-    asynchronous tickets and standalone-versus-replicated failure claims explicit.
+    asynchronous tickets and standalone-versus-replicated failure claims explicit; and
+18. class-specific R1/W1/T8/T32 measurement and residual-budget qualification, including independent W1 operation
+    gates, resource-bounded T8/T32 admission, strict percentile boundaries, and no pooled-distribution escape.

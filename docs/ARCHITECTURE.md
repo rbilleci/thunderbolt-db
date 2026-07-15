@@ -122,6 +122,15 @@ Interactive transactions whose access sets are not predeclarable remain supporte
 the throughput mechanism; low latency still requires concurrent execution over resident snapshots rather than
 waiting for very large batches.
 
+The binding latency classes are defined in `CHARTER.md`: R1 bounded reads target 0.5/1/5-ms p50/p99/p99.9; W1
+single keyed synchronous mutations target 0.8/1.5/5 ms; T8 transactions contain 2–8 predeclared operations with at
+most four mutations and target 1.5/3/10 ms; T32 contains 9–32 predeclared operations with at most 16 mutations and
+targets 3/6/20 ms. T8/T32 also require route-declared byte, index-fanout, touched-table, cold-access, and result
+bounds. The scheduler uses the admitted class's residual end-to-end budget after measured downstream margins.
+Results are never pooled across read, mutation, and transaction classes for acceptance. Interactive/client-paced
+wall time is reported separately from statement, terminal, and database-active service time and has no generic
+low-latency promise.
+
 The open-loop evidence gate is **BENCH-001**. Product route classes beyond PK microbenchmarks are **ROUTE-001**.
 
 ## 7. MVCC and write state

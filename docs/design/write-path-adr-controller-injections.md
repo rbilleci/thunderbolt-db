@@ -13,13 +13,13 @@ one bounded, non-semantic-changing response before implementation begins under R
 
 | Injection | Bound/action asserted | Result |
 |---|---|---|
-| Sparse fast lane beside a young high-population lane and an older slow-class item | The sparse fast item ships as a one-intent partial wave exactly at its 800-us oldest-age budget; global population and slow-class age cannot hold it. | PASS |
-| Wave byte/predicted-service overflow | Independent byte-only and service-only two-item candidates ship one-item partial waves before the 800-us age deadline when the next item would cross 1,000 bytes or 500 us. A single item that exceeds either cap is classified and rejected before claim rather than waiting forever. | PASS |
+| Sparse fast lane beside a young high-population lane and an older slow-class item | The W1 example reserves 700 us of its 1,500-us p99 for downstream work; the sparse item ships as a one-intent partial wave exactly at its 800-us residual oldest-age budget. Global population and slow-class age cannot hold it. | PASS |
+| Wave byte/predicted-service overflow | Independent byte-only and service-only two-item candidates ship one-item partial waves before the W1 example's 800-us residual age deadline when the next item would cross 1,000 bytes or 500 us. A single item that exceeds either cap is classified and rejected before claim rather than waiting forever. | PASS |
 | Cold staging incomplete | Cold/repair work remains `HoldColdBeforeClaim`; it cannot acquire a sequence or WAL position. A separately prepared resident-fast item remains claimable. | PASS |
 | Latest-head/index unavailable | The fast route becomes explicitly unready before claim; no scan or host lookup is selected. Once ready, the same resident-fast class may claim. | PASS |
 | Apply leads durability by the hard gap | Visibility stays at `min(durable_next, applied_next)`, durability gets priority, and new work is throttled before WAL. | PASS |
 | Durability leads apply by the hard gap | Visibility stays at the applied prefix, apply gets priority, and new work is throttled before WAL. | PASS |
-| Durability floor exceeds residual p99 budget | The synchronous low-latency profile becomes explicitly unqualified; a fitting floor qualifies. No outcome contains an asynchronous-mode action. | PASS |
+| Durability floor exceeds residual p99 budget | The measured 1,723-us fence plus 200-us margin is unqualified for W1's 1,500-us p99 but qualified for T8's 3,000-us p99. Exact equality with T32's strict 6,000-us target fails while one microsecond below qualifies. No outcome contains an asynchronous-mode action. | PASS |
 | Held snapshot at resident high watermark | Reclaim remains false, device-format STRATA demotion becomes true, and admission throttles before WAL while cold quota fits. | PASS |
 | Pressure hysteresis, cold-quota exhaustion, and disabled-maintenance sabotage | Resident and cold budgets each have soft/high/hard/lower thresholds: soft starts maintenance while admitting, high throttles, hard rejects, and lower resumes. `Maintaining` stays armed above either lower; both `Throttling` and `Rejecting` recover to throttling above lower and ordinary admission only at/below both lowers. Exhausted cold quota or disabled required maintenance rejects before WAL. | PASS |
 | Intent/byte credits including internally retained work | A request that would cross either hard cap rejects before claim; an exact-bound request is admitted. Client-ticket release does not enter the decision. | PASS |
@@ -36,6 +36,8 @@ prints two pressure families; with the three maintenance/resize rows this totals
 - Every overload, unavailable-index, cold-stall, or pressure failure acts before the sequence/WAL boundary.
 - `visible_next` never passes the lesser of durable/applied prefixes.
 - Fast and slow classes do not share an unbounded coalescer or global-age decision.
+- W1/T8/T32 synchronous qualification uses the admitted class's strict p99 target; a request cannot borrow a larger
+  class budget without first satisfying that class's operation, mutation, and resource envelope.
 - Oldest age, bytes, predicted service, intent credits, and byte credits are independent caps. Reaching a wave cap
   ships before the age deadline; an individually oversized item rejects before claim.
 - Soft/high/hard/lower-resume actions are distinct for both resident and cold budgets, and prior rejecting/

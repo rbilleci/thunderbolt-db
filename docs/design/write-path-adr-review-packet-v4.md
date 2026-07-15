@@ -11,6 +11,10 @@ This manifest freezes the packet submitted after review v3. The worktree contain
 this list; they are not part of R3-001 evidence. `docs/DECISIONS.md` and `docs/ARCHITECTURE.md` have no diff from the
 baseline and remain authoritative until a separate explicit acceptance decision.
 
+**Historical scope note:** these hashes and the resulting v4 review apply to the tree at commit `e1861025` and the
+then-uniform simple-OLTP latency target. The later accepted R1/W1/T8/T32 target refinement does not rewrite this
+frozen evidence and is not covered by the v4 verdict; R3-001 owns its focused post-v4 target-consistency review.
+
 ## Review inputs and SHA-256
 
 | SHA-256 | File |

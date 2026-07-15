@@ -148,12 +148,29 @@ enum DurabilityProfile {
     UnqualifiedSync,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncLatencyClass {
+    W1,
+    T8,
+    T32,
+}
+
+impl SyncLatencyClass {
+    fn p99_budget_us(self) -> u64 {
+        match self {
+            Self::W1 => 1_500,
+            Self::T8 => 3_000,
+            Self::T32 => 6_000,
+        }
+    }
+}
+
 fn qualify_sync_profile(
     fence_p99_us: u64,
     fixed_margin_us: u64,
-    target_p99_us: u64,
+    class: SyncLatencyClass,
 ) -> DurabilityProfile {
-    if fence_p99_us.saturating_add(fixed_margin_us) <= target_p99_us {
+    if fence_p99_us.saturating_add(fixed_margin_us) < class.p99_budget_us() {
         DurabilityProfile::QualifiedSync
     } else {
         DurabilityProfile::UnqualifiedSync
@@ -349,7 +366,8 @@ fn pass(name: &str) {
 }
 
 fn main() {
-    // Sparse/global skew: the one old resident-fast item ships at its deadline even while a
+    // Sparse/global skew: this W1 example reserves 700 us of its 1,500-us p99 for downstream work,
+    // so the one old resident-fast item ships at its 800-us residual deadline even while a
     // different lane has a young throughput population. Slow-class work is not coalesced into it.
     let mut skew = vec![Pending {
         lane: 0,
@@ -508,16 +526,28 @@ fn main() {
     );
     pass("durable/apply lag directions preserve first-gap visibility");
 
-    // Fence-slot/latency degradation subframes and paces. A floor beyond the complete budget also
-    // makes the advertised low-latency profile unavailable; neither action changes acknowledgement.
-    let unqualified = qualify_sync_profile(1_723, 200, 1_000);
+    // Fence-slot/latency degradation subframes and paces. Qualification uses the request's class,
+    // and equality with a strict target fails. Neither action changes acknowledgement semantics.
+    let unqualified = qualify_sync_profile(1_723, 200, SyncLatencyClass::W1);
     assert_eq!(unqualified, DurabilityProfile::UnqualifiedSync);
     assert_eq!(
         decide_fence(0, 1_723, 600, unqualified),
         FenceDecision::UnqualifiedAndPace
     );
     assert_eq!(
-        qualify_sync_profile(500, 200, 1_000),
+        qualify_sync_profile(500, 200, SyncLatencyClass::W1),
+        DurabilityProfile::QualifiedSync
+    );
+    assert_eq!(
+        qualify_sync_profile(1_723, 200, SyncLatencyClass::T8),
+        DurabilityProfile::QualifiedSync
+    );
+    assert_eq!(
+        qualify_sync_profile(5_800, 200, SyncLatencyClass::T32),
+        DurabilityProfile::UnqualifiedSync
+    );
+    assert_eq!(
+        qualify_sync_profile(5_799, 200, SyncLatencyClass::T32),
         DurabilityProfile::QualifiedSync
     );
     assert_eq!(

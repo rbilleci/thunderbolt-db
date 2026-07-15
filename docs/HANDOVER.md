@@ -28,7 +28,8 @@ lives in `PLAN.md`.
   sequence effects with operation-specific `currval`, non-circular digests, lane/global WAL ordering, and
   checkpointed orphan/status reconciliation. The ADR is not
   accepted: its decision-level ACID/failure traces are complete, and the current Candidate-A implementation gate
-  has returned **FAIL** (including low-load latency, target/mixed tails, about 816 B per narrow appended insert, and
+  remains **FAIL** under W1's revised 0.8/1.5/5-ms target (including low-load latency, target/mixed tails, pooled
+  rather than independently qualified I/U/D latency, about 816 B per narrow appended insert, and
   unsupported non-INT4/fanout coverage). A same-physics fixed-record harness measures a 1.662-ms p50/1.723-ms p99
   queue-depth-one durability distribution, while the actual engine-facing frame log measures 1.542 ms/fence on
   average; neither cost depends on row representation. The bounded resident-input A/B covers 8/32/128-byte rows, 1/3/6 indexes, and
@@ -43,23 +44,28 @@ lives in `PLAN.md`.
   cold/index preclaim, both lag directions, sparse/global skew, hard credits, durability qualification,
   soft/high/hard/lower pressure recovery, pre-deadline byte/service shipment, oversized-item rejection, held
   snapshots, disabled maintenance, overlap/yield, starvation, and drain-resize refusal. Frozen packet v4 passed
-  fresh independent review with **ACCEPT** and no remaining pre-acceptance blocker. Explicit user acceptance remains.
+  fresh independent review with **ACCEPT** and no remaining pre-acceptance blocker under the prior uniform latency
+  target. The accepted target refinement now separates R1 0.5/1/5-ms reads, W1 0.8/1.5/5-ms single keyed synchronous
+  mutations, T8 1.5/3/10-ms bounded transactions, and T32 3/6/20-ms bounded transactions. Its target-policy edits do
+  not accept the write-path ADR; a focused post-v4 target-consistency re-review now precedes explicit acceptance.
   Full standalone
   implementation/graduation follows acceptance under
   R3-003, DUR-001/002, and RETIRE-002 before production authority or host-store deletion; HA-001 is additional
   only for replicated/node-loss-RPO deployment.
 - **BENCH-001** remains the parallel evidence task when a quiet benchmark window and reproducible PostgreSQL setup
   are available. Its acceptance first reconciles the inherited protocol-boundary post-mutation metric with the
-  live accepted resident route; `STATUS.md` records the exact mismatch.
+  live accepted resident route, then reports R1; each W1 operation and declared I/U/D mix; T8/T32; mixed read/write;
+  and interactive slow work independently. `STATUS.md` records the exact inherited mismatch.
 - Physical multi-GPU work (**MULTI-001/002/003**) remains user-deferred until every non-MULTI plan item completes or
   the user explicitly promotes it.
 
 ## Resume here
 
-1. **R3-001:** request the explicit user acceptance decision. Do not edit `DECISIONS.md` or `ARCHITECTURE.md`
-   without it. If accepted, R3-001
-   owns that same-slice reconciliation; afterward follow PLAN ownership for R3-003, DUR-001/002, RETIRE-002,
-   and conditional HA-001 implementation/fault qualification.
+1. **R3-001:** run the focused post-v4 target-consistency re-review, then request the explicit user acceptance
+   decision. The accepted target-policy edits in `DECISIONS.md` and `ARCHITECTURE.md` are not write-path ADR
+   acceptance. If the write-path ADR is accepted, R3-001 owns the remaining same-slice reconciliation; afterward
+   follow PLAN ownership for R3-003, DUR-001/002, RETIRE-002, and conditional HA-001 implementation/fault
+   qualification.
 2. **BENCH-001:** reconcile the inherited probe claim, then complete the identical open-loop PostgreSQL/GPU
    comparison when benchmark capacity is available.
 3. Follow `PLAN.md` for all subsequent sequencing; archived `NEXT`, `TODO`, `OPEN`, or blocker prose is historical.

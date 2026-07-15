@@ -8,6 +8,10 @@
 The reviewer verified all 39 frozen hashes, the pinned baseline, the absence of a baseline diff in
 `docs/DECISIONS.md` and `docs/ARCHITECTURE.md`, and `git diff --check`. Both build-only executables passed.
 
+**Historical scope note:** this verdict covers packet v4 at commit `e1861025` under the then-uniform simple-OLTP
+latency target. It does not review the later accepted R1/W1/T8/T32 target refinement or accept the write-path ADR;
+R3-001 now requires a focused post-v4 target-consistency review before the user's acceptance decision.
+
 ## Findings
 
 - Independent byte and predicted-service limits ship partial waves before the age deadline; individually oversized

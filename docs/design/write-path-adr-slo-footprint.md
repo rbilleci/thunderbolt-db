@@ -10,7 +10,10 @@ This is R3-001 decision evidence, not a product benchmark or an implementation a
 real covered `t(id INT PRIMARY KEY, v INT)` GPU intent route: prepared typed parameters, device validation and
 append/tombstone apply, FUA lane durability, publication, and optional crash replay. Open-loop latency starts at the
 scheduled arrival, so producer slip and queueing are included. The charter thresholds are peak burst at least
-400,000 TPS and simple-OLTP p50/p99/p99.9 below 0.5/1/5 ms.
+400,000 TPS and W1 single keyed synchronous mutation p50/p99/p99.9 below 0.8/1.5/5 ms. This report predates the
+classed target decision but its raw measurements remain valid. Its “mixed” rows are I/U/D-only, not read/write,
+and the harness pools DML latency samples rather than reporting INSERT, UPDATE, and DELETE distributions separately.
+That pooling is insufficient for future graduation, where each operation and the declared mix must pass W1.
 
 ## End-to-end matrix
 
@@ -36,14 +39,15 @@ tombstone applies, and two PK-index rebuilds. Recovery reconstructed the exact 1
 
 The low-load result alone rejects the candidate against the declared matrix: its mean FUA fence was about 3.13 ms
 per frame and mean publish-to-settle was about 3.14 ms per wave, so batching policy cannot turn the present strict
-durability path into a sub-0.5-ms median. At the 100,000 mixed point the mean fence improved to 0.92 ms and
+durability path into a sub-0.8-ms W1 median. At the 100,000 mixed point the mean fence improved to 0.92 ms and
 publish-to-settle to 1.76 ms, but p99/p99.9 still diverged. The existing population/deadline policy, automatic FUA
 subframing, and one active-lane resize did not keep the tail within the residual client deadline.
 
-The harness currently records end-to-end tails plus stage averages, not p50/p99/p99.9 for every stage or a separate
-read-after-write distribution. That missing attribution cannot change the rejection: the binding end-to-end
-threshold already fails at every required load point. It remains post-selection implementation evidence only if a
-future candidate first passes the end-to-end gate.
+The harness currently records one pooled DML end-to-end distribution plus stage averages, not separate INSERT,
+UPDATE, and DELETE p50/p99/p99.9, every-stage percentiles, or a read-after-write distribution. That missing
+attribution cannot change the rejection: the binding W1 end-to-end threshold already fails at every required load
+point. It remains post-selection implementation evidence only if a future candidate first passes the independent
+operation and declared-mix end-to-end gates.
 
 ## Actual narrow-path bytes
 
@@ -90,7 +94,7 @@ The first final independent review correctly rejected using this combined failur
 append/tombstone canonical. [`write-path-adr-physical-selection.md`](write-path-adr-physical-selection.md) now
 measures the common conveyor/FUA floor directly and compares append/tombstone with dense-latest/undo at the same
 resident GPU boundary across width, fanout, and batch dimensions. That evidence selects compact append/tombstone.
-This report's end-to-end and actual-current-allocation **FAIL** remains unchanged as a production graduation result;
+This report's end-to-end and actual-current-allocation **FAIL** remains unchanged under W1 as a production graduation result;
 it is no longer treated as proof that no physical design can be selected.
 
 ## Reproduction
