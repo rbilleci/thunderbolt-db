@@ -59,8 +59,9 @@ lives in `PLAN.md`.
   and T32 pair/amount assignments were not fully defined. Immutable workload v1 now also fixes the evenly paced
   3,300,000/66,000,000 warm-up/measurement timestamps, excludes warm-up completions from sustained TPS, and fixes
   exact parameter-consumption rules. Peak cohort TPS and
-  wall completion throughput remain distinct. Its target-policy edits do not accept the write-path ADR; replacement
-  packet v8 now precedes explicit acceptance.
+  wall completion throughput remain distinct. Replacement packet v8 is frozen at `c9628766`; all 24 hashes and
+  executable gates passed, and fresh independent review returned **ACCEPT** with no material blocker. Its target-
+  policy edits do not accept the write-path ADR; explicit user acceptance remains.
   Full standalone
   implementation/graduation follows acceptance under
   R3-003, DUR-001/002, and RETIRE-002 before production authority or host-store deletion; HA-001 is additional
@@ -78,8 +79,8 @@ lives in `PLAN.md`.
 
 ## Resume here
 
-1. **R3-001:** run frozen packet v8's focused target-consistency re-review, then request the explicit user acceptance
-   decision. The accepted target-policy edits in `DECISIONS.md` and `ARCHITECTURE.md` are not write-path ADR
+1. **R3-001:** request the explicit user acceptance decision against frozen packet v8 and its independent **ACCEPT**
+   verdict. The accepted target-policy edits in `DECISIONS.md` and `ARCHITECTURE.md` are not write-path ADR
    acceptance. If the write-path ADR is accepted, R3-001 owns the remaining same-slice reconciliation; afterward
    follow PLAN ownership for R3-003, DUR-001/002, RETIRE-002, and conditional HA-001 implementation/fault
    qualification.

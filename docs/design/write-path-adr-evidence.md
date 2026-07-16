@@ -321,7 +321,9 @@ ordinal/pair/amount assignments were not fully executable; the finding is retain
 [`write-path-adr-final-independent-review-v7.md`](write-path-adr-final-independent-review-v7.md). Immutable
 [`oltp-benchmark-workload-v1.md`](oltp-benchmark-workload-v1.md) now additionally fixes every sustained arrival
 timestamp, zero-based generated ledger/DELETE ordinal, parameter-stream consumption, T8/T32 pairing, and amount
-assignment for replacement packet v8. The decision-level
+assignment for replacement packet v8. The exact packet is preserved at `c9628766`; all 24 hashes and executable
+gates passed, and [`write-path-adr-final-independent-review-v8.md`](write-path-adr-final-independent-review-v8.md)
+records fresh independent **ACCEPT** with no remaining material pre-acceptance blocker. The decision-level
 ACID/failure traces are complete in
 [`write-path-adr-traces.md`](write-path-adr-traces.md). The ADR remains proposed.
 Full canonical standalone fault evidence follows acceptance under DUR-001/002 and RETIRE-002 before production

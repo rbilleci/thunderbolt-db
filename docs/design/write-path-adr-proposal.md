@@ -1338,7 +1338,8 @@ initial classed-target integration and its incomplete benchmark manifest/account
 `write-path-adr-final-independent-review-v5.md` and `write-path-adr-final-independent-review-v6.md`. Packet v7
 returned **REVISE** because the sustained arrival timestamps and generated transaction parameters were not fully
 executable; `write-path-adr-final-independent-review-v7.md` records the finding. The complete correction is frozen in
-packet v8 before the explicit user acceptance decision. Independent performance,
+packet v8 at `c9628766`, and `write-path-adr-final-independent-review-v8.md` records fresh independent **ACCEPT**
+with no remaining material blocker before the explicit user acceptance decision. Independent performance,
 durability/resilience, transactional ACID, and consistency/accuracy reviews all returned **REVISE**; every design
 finding is incorporated, but that does not itself accept the proposal.
 The tuned PostgreSQL comparison is separately owned by **BENCH-001** and is not a substitute for this internal

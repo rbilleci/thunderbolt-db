@@ -125,8 +125,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   consumption, and debit/credit amount assignment. Peak TPS is committed
   cohort count divided by the fixed arrival second; wall completion throughput is diagnostic, every cohort must
   pass, and the active route gate is explicitly local. The target-policy amendments in `DECISIONS.md` and
-  `ARCHITECTURE.md` do not accept the proposed write-path ADR. Replacement packet v8 now precedes explicit write-path
-  acceptance. The implemented standalone canonical
+  `ARCHITECTURE.md` do not accept the proposed write-path ADR. Replacement packet v8 is frozen at `c9628766`; all 24
+  hashes and executable gates passed, and fresh independent review returned **ACCEPT** with no material blocker.
+  Explicit user write-path acceptance remains. The implemented standalone canonical
   campaign follows acceptance under R3-003, DUR-001/002, and RETIRE-002 before production authority or
   host-store removal;
   HA-001 is additional only for replicated/node-loss-RPO deployment.
