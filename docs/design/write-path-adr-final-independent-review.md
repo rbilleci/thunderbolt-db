@@ -1,7 +1,7 @@
 # Final independent adversarial acceptance review
 
-**Date:** 2026-07-15  
-**Reviewed packet:** [`write-path-adr-review-packet.md`](write-path-adr-review-packet.md) at its listed hashes  
+**Date:** 2026-07-15\
+**Reviewed packet:** [`write-path-adr-review-packet.md`](write-path-adr-review-packet.md) at its listed hashes\
 **Verdict:** **REJECT for acceptance now**
 
 The reviewer independently read the frozen proposal, evidence, audits, traces, measurement reports, PLAN/STATUS

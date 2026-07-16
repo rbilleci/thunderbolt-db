@@ -4,6 +4,38 @@ Accepted decisions that are expensive to reverse. This file records rules and ra
 chronology or future sequencing. The full pre-unification record is archived at
 `archive/decisions/DECISIONS-full-pre-unification-2026-07-12.md`. Current work lives only in `PLAN.md`.
 
+## ADR-014 — Canonical GPU-native append/tombstone write model
+
+- **Status:** Accepted, 2026-07-16. The exact reviewed target/workload snapshot is `c9628766`; the final independent
+  verdict is [`design/write-path-adr-final-independent-review-v8.md`](design/write-path-adr-final-independent-review-v8.md).
+- **Decision:** Logical identity is stable `(table_id,row_id)`; version identity adds `created_by`; physical GPU
+  coordinates are generation-scoped and never durable identity. INSERT appends, UPDATE tombstones the visible old
+  version and appends one complete final image with the same row identity, and DELETE tombstones. A transaction's
+  repeated writes compose in a private device data/catalog overlay and publish at most one final transition per row.
+  Dense latest-image plus undo and the retired per-wave blocking mega-fuse are rejected.
+- **Transaction contract:** Autocommit, predeclared, and interactive work each have one stable user-transaction
+  envelope. Interactive DML+DDL commits through one ordered outcome, `commit_seq`, and atomic publication object or
+  rolls back together. `READ COMMITTED` uses statement snapshots plus minimum dependency floors and retryable
+  `40001` on target races; `REPEATABLE READ` is first-committer-wins snapshot isolation with the documented stable-
+  catalog deviation; `SERIALIZABLE`, unsupported savepoints, and unimplemented deferrable/cascade shapes fail loud.
+  Constraint and sequence effects follow the typed guard, private-child, and durable ordinary-transition rules in
+  the accepted detailed design.
+- **Publication and recovery contract:** Visibility is `created_by <= snapshot < deleted_by`. Durability and hidden
+  GPU apply may overlap, but acknowledgement waits for one atomic `{visible_next,database_root,publication_epoch}`
+  object covering the contiguous durable and applied prefixes plus terminal status. Typed non-circular WAL,
+  cut-exact C-projected checkpoints, content-addressed artifact activation, fresh-context GPU recovery, and offline
+  one-way legacy migration reconstruct the device data plane without a host relational mirror. STRATA placement and
+  hot/cold encoding never change identity, visibility, index, transaction, or recovery semantics.
+- **Evidence:** The accepted detailed design is
+  [`design/write-path-adr-proposal.md`](design/write-path-adr-proposal.md); its matrix, traces, physical comparison,
+  controller injections, recovery bound, and review history remain the decision evidence. Candidate A's current
+  implementation measurements still fail W1 and production graduation; acceptance selects the target, not the live
+  implementation.
+- **Consequence:** **R3-002/003** implement device-native coverage, transactions, conflict control, adaptation, and
+  maintenance; **DUR-001/002** implement and fault-qualify checkpoint/WAL/recovery; **RETIRE-002** removes host repair;
+  **R3-004** removes the host write/store path only after those standalone gates. **HA-001** is additionally required
+  for replicated/node-loss-RPO deployment. **BENCH-001** remains the immutable performance evidence gate.
+
 ## ADR-013 — Universal birth stamps and generation-atomic shard publication
 
 - **Status:** Accepted, 2026-07-02.
@@ -47,7 +79,8 @@ chronology or future sequencing. The full pre-unification record is archived at
   transactions remain supported as a slower class.
 - **Reason:** GPU throughput comes from many transactions at once, while deterministic ordering simplifies
   conflicts, replication, and recovery.
-- **Consequence:** The write/CC completion is **R3-001..003**; the evidence gate is **BENCH-001**.
+- **Consequence:** ADR-014 selects the write/MVCC/transaction/recovery model; **R3-002/003** implement its write and
+  concurrency surface, and **BENCH-001** remains the evidence gate.
 
 ## ADR-008 — Product workload bet is GPU-native OLTP
 

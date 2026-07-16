@@ -1,10 +1,10 @@
 # Five-minute recovery-capacity argument
 
-**Date:** 2026-07-15  
-**Scope:** standalone restart/recovery on the reviewed host; replicated node-loss recovery remains HA-001  
+**Date:** 2026-07-15\
+**Scope:** standalone restart/recovery on the reviewed host; replicated node-loss recovery remains HA-001\
 **Disposition:** **DESIGN BOUND ESTABLISHED; current recovery implementation does not satisfy it.**
 
-This report supplies the R3-001 byte/time argument. It defines a configuration that is mathematically bounded below
+This report supplies ADR-014's R3-001 byte/time argument. It defines a configuration mathematically bounded below
 five minutes, identifies the measurements behind its replay coefficient, and makes every unimplemented throughput
 assumption a hard qualification/refusal condition. It does not claim that canonical checkpoint artifacts, direct
 GPU replay, or automatic cadence already exist.
@@ -106,8 +106,8 @@ The design closes the capacity argument only with these fail-loud rules:
    If their reachable set exceeds 32 GiB, this profile is unavailable until a measured higher-throughput profile or
    a smaller recovery working set is activated.
 
-These are durability/admission rules, not prose-owned work. R3-001 owns the design selection; DUR-001/002 own the
-canonical implementation and qualification after acceptance, as recorded in `PLAN.md`.
+These are accepted ADR-014 durability/admission rules, not prose-owned work. DUR-001/002 own their canonical
+implementation and qualification, as recorded in `PLAN.md`.
 
 ## Reproduction
 

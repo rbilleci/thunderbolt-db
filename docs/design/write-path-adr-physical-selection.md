@@ -1,14 +1,14 @@
 # R3-001 physical-representation selection report
 
-**Date:** 2026-07-15  
-**Source:** baseline `f701d8b6` plus the review-only diff recorded in the next frozen packet  
-**Host:** NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition; local synchronous-FUA WAL device  
+**Date:** 2026-07-15\
+**Source:** baseline `f701d8b6` plus the review-only diff recorded in the next frozen packet\
+**Host:** NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition; local synchronous-FUA WAL device\
 **Disposition:** **SELECT CANDIDATE A — compact append/tombstone**
 
-This report resolves the physical-selection blocker from the first final independent review. It does not claim that
-the current engine implementation meets the product SLO, that the compact layout already serves durable state, or
-that R3-001 has been accepted. The prototype is build-only decision evidence and never migrates or serves engine
-state.
+This report resolved the physical-selection blocker from the first final independent review. It did not itself
+accept ADR-014 and does not claim that the current engine implementation meets the product SLO or that the compact
+layout already serves durable state. The prototype is build-only decision evidence and never migrates or serves
+engine state.
 
 ## Correct decision boundary
 

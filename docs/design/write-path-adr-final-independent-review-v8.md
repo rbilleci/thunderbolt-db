@@ -8,6 +8,8 @@
 
 **Verdict:** **ACCEPT**
 
+**User disposition:** **ADR-014 accepted, 2026-07-16**
+
 No material blocker remains before the user's explicit ADR review decision. This verdict does not accept the ADR,
 claim the current implementation meets the targets, or waive post-acceptance implementation and fault graduation.
 
@@ -35,6 +37,6 @@ claim the current implementation meets the targets, or waive post-acceptance imp
 
 ## Disposition
 
-The focused target/workload pre-acceptance gate is closed. The proposed write-path ADR remains awaiting the user's
-explicit final review and acceptance. If accepted, the implementation and graduation owners remain those recorded
-in `PLAN.md`; BENCH-001 still executes the immutable comparison rather than selecting its workload.
+The focused target/workload pre-acceptance gate closed with this verdict, and the user's subsequent explicit
+acceptance made the write-path decision ADR-014. Implementation and graduation remain under the owners recorded in
+`PLAN.md`; BENCH-001 still executes the immutable comparison rather than selecting its workload.

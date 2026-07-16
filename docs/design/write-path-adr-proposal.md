@@ -1,20 +1,19 @@
-# Proposed ADR — Canonical GPU-native append/tombstone write model
+# ADR-014 — Canonical GPU-native append/tombstone write model
 
-**Status:** Proposed under **R3-001**; independent performance, durability/resilience, transactional ACID, and
-consistency/accuracy reviews all returned **REVISE**; final packet reviews v1, v2, and v3 returned **REJECT**, and
-fresh packet-v4 review returned **ACCEPT** with no remaining pre-acceptance blocker.
-The v1 provenance/task-reference/selection blockers, v2 undo-visibility/seqlock/adaptation-evidence blockers, and
-v3 pressure-state/wave-trigger blockers are corrected. An explicit user acceptance decision is still required. This
-proposal is not
-accepted and is not an implementation authority.
+**Status:** **Accepted, 2026-07-16**, completing **R3-001**. Independent performance, durability/resilience,
+transactional ACID, and consistency/accuracy reviews returned **REVISE** and their findings were incorporated. Final
+packet reviews v1–v3 returned **REJECT**; packet v4 accepted the prior target; focused v5–v7 reviews returned
+**REVISE**; frozen packet v8 at `c9628766` passed all 24 hashes and executable gates and received fresh independent
+**ACCEPT**. The user then explicitly reviewed and accepted the ADR. Acceptance selects this target design; it does
+not claim the current implementation passes its performance, fault, coverage, or host-retirement gates.
 
 **Decision scope:** relational row/version identity, transaction/isolation semantics, mutation representation,
 index visibility, deterministic conflict control, latency/throughput adaptation, publication, GC,
 checkpoint/recovery, and transition from the current write representations.
 
-If accepted, the binding rationale is distilled into a new accepted entry in `../DECISIONS.md`. Until then,
-`../DECISIONS.md`, `../ARCHITECTURE.md`, and the existing implementation remain authoritative, and R3-001 stays
-active in `../PLAN.md`.
+The concise binding rationale is in ADR-014 of `../DECISIONS.md`; stable system contracts are reconciled into
+`../ARCHITECTURE.md`. This document retains the accepted detailed state machines and evidence boundary. Built facts
+remain in `../STATUS.md`, and all implementation/graduation work remains exclusively in `../PLAN.md`.
 
 The source reconciliation and evidence ledger are in
 [`write-path-adr-evidence.md`](write-path-adr-evidence.md). They pin the audited source tree, distinguish current
@@ -35,9 +34,8 @@ The bounded cold/index/lag/skew/pressure/controller injections are in
 [`write-path-adr-controller-injections.md`](write-path-adr-controller-injections.md).
 The five-minute recovery-capacity model is in
 [`write-path-adr-rto-capacity.md`](write-path-adr-rto-capacity.md).
-Its post-integration re-audit found no residual high/medium consistency defect. Final reviews v1/v2/v3 and their
-remediations are retained as decision history; v4 returned **ACCEPT**. Explicit user acceptance is the remaining
-decision gate.
+Its post-integration re-audit found no residual high/medium consistency defect. Final reviews v1–v8 and their
+remediations remain decision history; v8 plus the explicit user decision closed the acceptance gate.
 
 ## Context
 
@@ -96,7 +94,7 @@ and corrected the pump, resize barrier, sequence exhaustion, and cold-checkpoint
 recorded in [`write-path-adr-evidence.md`](write-path-adr-evidence.md); the target still uses an atomic exclusive
 `visible_next` publication object rather than treating the current inclusive scalar as its final representation.
 
-## Proposed decision
+## Accepted decision
 
 ### 1. Identity has three explicit levels
 
@@ -568,9 +566,9 @@ it is decided before WAL or represented by a durable typed outcome.
 
 Fast-class admission is also bounded by declared post-image bytes, WAL bytes, variable-length bytes, maintained-
 index fanout, and predicted device service. Wider work remains semantically identical but enters the measured slow
-class. If full-image amplification for an accepted workload crosses the SLO gate, R3-001 reopens the physical
-encoding choice for immutable column-group sharing or device-native deltas without changing logical row/version
-identity or visibility.
+class. If full-image amplification for an accepted workload crosses a binding SLO because of the chosen physical
+representation, the active PLAN must open a new ADR-014 revision; implementation may not silently switch to column-
+group sharing or device-native deltas, and any revision preserves logical row/version identity and visibility.
 
 ### 8. Publication joins durability and hidden device apply
 
@@ -1239,7 +1237,7 @@ recovery semantics by temperature would duplicate correctness machinery and make
 ### Per-wave blocking mega-fuse — rejected
 
 The historical implementation reduced one launch but lost to cross-lane validation and asynchronous apply
-coalescing at both measured load ends. R3-001 does not revive it. A future fused replacement requires separate PLAN
+coalescing at both measured load ends. ADR-014 rejects it. A future fused replacement requires separate PLAN
 authority and evidence that cross-lane coalescing plus WAL-first ordering reverses those economics.
 
 ## Consequences and PLAN boundaries
@@ -1276,10 +1274,10 @@ ledger or acceptance decision. The reviewed decision-level transactional and fai
 [`write-path-adr-slo-footprint.md`](write-path-adr-slo-footprint.md), and the bounded recovery profile lives in
 [`write-path-adr-rto-capacity.md`](write-path-adr-rto-capacity.md).
 
-### Design acceptance evidence for R3-001
+### ADR-014 design acceptance evidence — R3-001 closeout
 
 ADR acceptance selects a design; it does not claim that the canonical WAL/checkpoint/recovery implementation exists
-or has passed production fault qualification. Before this proposal becomes an accepted ADR, review must establish:
+or has passed production fault qualification. R3-001 acceptance established:
 
 - source-level agreement that every live identity, durability mechanism, and host fallback is accounted for;
 - the current synchronous-commit W1 SLO matrix plus a direct common-durability-floor measurement, so a platform or
@@ -1315,9 +1313,9 @@ or has passed production fault qualification. Before this proposal becomes an ac
 - a byte/time capacity argument showing the checkpoint/replay policy can be configured to meet the recovery RTO; and
 - a final independent adversarial design re-review followed by an explicit acceptance decision.
 
-R3-001 may add bounded build/test-only probes, fault-model harnesses, or disposable evidence prototypes needed for
-those measurements. They cannot be enabled in production, migrate durable state, or become a compatibility promise
-before acceptance. No production implementation begins from the proposed ADR.
+R3-001 used bounded build/test-only probes, fault-model harnesses, and disposable evidence prototypes for those
+measurements. They remain non-production decision evidence: they cannot migrate or serve durable state and do not
+satisfy the implementation/graduation owners below.
 
 The companion [`write-path-adr-evidence.md`](write-path-adr-evidence.md) supplies the pinned source crosswalk,
 revised state-machine/format design, static capacity model, and fresh current correctness results;
@@ -1339,9 +1337,9 @@ initial classed-target integration and its incomplete benchmark manifest/account
 returned **REVISE** because the sustained arrival timestamps and generated transaction parameters were not fully
 executable; `write-path-adr-final-independent-review-v7.md` records the finding. The complete correction is frozen in
 packet v8 at `c9628766`, and `write-path-adr-final-independent-review-v8.md` records fresh independent **ACCEPT**
-with no remaining material blocker before the explicit user acceptance decision. Independent performance,
-durability/resilience, transactional ACID, and consistency/accuracy reviews all returned **REVISE**; every design
-finding is incorporated, but that does not itself accept the proposal.
+with no remaining material blocker. The user's explicit 2026-07-16 acceptance completed R3-001. Independent
+performance, durability/resilience, transactional ACID, and consistency/accuracy reviews all returned **REVISE**;
+every design finding was incorporated before acceptance.
 The tuned PostgreSQL comparison is separately owned by **BENCH-001** and is not a substitute for this internal
 representation gate.
 
@@ -1394,12 +1392,13 @@ include:
 
 Every synchronous acknowledged transaction must recover exactly once, rejected work must never appear, and
 indeterminate work must resolve from durable authority. Failure of a binding throughput, latency, capacity,
-durability, RPO, or RTO gate blocks production graduation and reopens R3-001 if the chosen representation or
-contract—not an implementation defect—is responsible.
+durability, RPO, or RTO gate blocks production graduation. If the chosen representation or contract—not an
+implementation defect—is responsible, PLAN must open a new ADR-014 revision rather than mutating the accepted
+decision implicitly.
 
-## Review focus
+## Retained review focus
 
-The acceptance review should pay particular attention to these choices:
+The acceptance review paid particular attention to these choices; implementation reviews must preserve them:
 
 1. stable row identity across UPDATE/PK change versus the current lane/classic split;
 2. the one-final-version-per-row rule, minimum validation-floor merge/removal, and device transaction overlay for

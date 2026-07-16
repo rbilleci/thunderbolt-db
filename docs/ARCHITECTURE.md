@@ -122,6 +122,32 @@ Interactive transactions whose access sets are not predeclarable remain supporte
 the throughput mechanism; low latency still requires concurrent execution over resident snapshots rather than
 waiting for very large batches.
 
+ADR-014 makes the user-transaction envelope and isolation boundary explicit:
+
+- Autocommit is one statement/transaction. A predeclared transaction submits one statically bounded program and
+  access-set envelope. An interactive transaction owns one stable identity, characteristics, snapshots, and private
+  device data/catalog overlay; its statements do not become separate user commits.
+- The shared protocol/engine lifecycle is `Idle -> Active -> CommitPending -> Committed|Aborted`, with `Failed` for
+  an explicit block after statement error and `Indeterminate` whenever a durable claim/log boundary was crossed but
+  publication-covered terminal status is not yet known. Only rollback is accepted from `Failed`; dependent session
+  work waits for `Indeterminate` resolution.
+- Each statement uses a reversible sub-overlay. Commit composes repeated row/object/sequence effects into one typed
+  ordered envelope, one terminal commit/no-op/abort outcome, one global `commit_seq`, and one publication object.
+  DML and transactional DDL publish or roll back together; separately durable ordinary SQL-sequence transitions
+  retain PostgreSQL's nontransactional value-consumption semantics.
+- `READ UNCOMMITTED` maps to `READ COMMITTED`. `READ COMMITTED` captures one publication object per statement and
+  retains the minimum validation floor for every row/index/FK/catalog dependency; a changed target fails the whole
+  transaction with retryable `40001` rather than host-side wait/re-evaluation. `REPEATABLE READ` is first-committer-
+  wins snapshot isolation with a transaction-held data/catalog snapshot and the documented stable-catalog/rewrite-
+  fence deviation. `SERIALIZABLE` and `DEFERRABLE` fail before state change until separately designed and accepted.
+- Shared/read versus exclusive/write dependency guards serialize FK parent/child, unique-key, table-rewrite,
+  catalog, and sequence-DDL races, but exact row/key/NULL/constraint verdicts remain GPU operations. Unsupported
+  savepoints, cascades, deferrable constraints, or temporary-relation semantics reject rather than approximate.
+
+The full accepted lifecycle, SQL-sequence, retry-identity, and compatibility contract is ADR-014's detailed design
+[`design/write-path-adr-proposal.md`](design/write-path-adr-proposal.md). Implementation ownership remains in
+**R3-002/003** and **DUR-002**; this architecture contract does not claim those paths are built.
+
 The binding latency classes are defined in `CHARTER.md`: R1 bounded reads target 0.5/1/5-ms p50/p99/p99.9; W1
 single keyed synchronous mutations target 0.8/1.5/5 ms; T8 transactions contain 2–8 predeclared operations with at
 most four mutations and target 1.5/3/10 ms; T32 contains 9–32 predeclared operations with at most 16 mutations and
@@ -161,27 +187,59 @@ The open-loop evidence gate is **BENCH-001**. Product route classes beyond PK mi
 - The host tuple store, `CachedShardPkIndex`, host write/constraint probes for uncovered shapes, and repair
   reconstruction still exist.
 
-### Binding target properties
+### Accepted canonical model
 
-- Latest-version data and hot indexes remain device-resident.
-- INSERT/UPDATE/DELETE cost scales with rows touched, not table size.
-- Transaction-held snapshots, write-write conflicts, old-version access, and GC remain correct under concurrent
-  readers.
-- VACUUM/GC is fenced by the oldest active snapshot and bounded by device-memory pressure.
-- Recovery reconstructs device-native state from durable records/checkpoints without requiring a host relational
-  mirror.
+ADR-014 selects compact append/tombstone MVCC:
 
-The unresolved write/version/index choice is deliberately not made here. **R3-001** owns the ADR using
-[`design/write-path-design-inputs.md`](design/write-path-design-inputs.md); coverage and CC are **R3-002** and
-**R3-003**; host-store/index/probe deletion is **R3-004**.
+- Logical row identity is durable `(table_id,row_id)` and survives UPDATE, PK change, compaction, eviction,
+  recovery, and placement movement. Version identity is `(table_id,row_id,created_by)`. Physical
+  `(generation_id,gpu_id,shard_id,slot)` coordinates are valid only under their captured generation and never become
+  durable identity.
+- INSERT appends one version. UPDATE locates one visible old version on-device, appends one complete final image with
+  the same row identity, and stamps the old version's death. DELETE stamps the old version's death. Repeated writes
+  compose in the transaction-private overlay, so a committed transaction contributes at most one final transition
+  per logical row; insert-then-delete publishes none but never reuses its consumed identity.
+- Visibility is exactly `created_by <= snapshot < deleted_by`, with absent death equal to infinity. Every resident,
+  streamed, transient, cold, recovery, index, and catalog path implements that law against one captured publication
+  object. Hot/cold encodings and summaries may accelerate it but cannot alter semantics.
+- Latest-head, unique, FK, and lookup indexes are generation-owned GPU structures derived from the same identity and
+  visibility truth. Host caches/probes cannot become correctness authority. Index-key movement and row-version
+  publication are atomic at one commit boundary.
+- STRATA may place immutable base columns, death metadata, append generations, history, and indexes differently, but
+  placement changes never change MVCC, transaction, equality/NULL, constraint, or recovery rules. Publication makes
+  a new placement generation authoritative; movement never mutates a reader's captured generation.
+- GC/compaction is fenced by the oldest reader, validation floor, recovery/PITR/replication pin, transaction claim,
+  status/response pin, and publication generation that can still reference an object. Hot GPU, overlay, cold-history,
+  scratch, WAL, and status bytes are independently bounded; pressure rejects before WAL rather than reclaiming live
+  authority.
+
+Dense latest-image plus undo and the retired per-wave blocking mega-fuse are rejected by ADR-014. **R3-002/003**
+implement coverage and concurrency; **R3-004** removes host store/index/probe authority only after the accepted
+graduation dependencies pass.
 
 ## 8. Durability and recovery
 
-The publication law is:
+The ADR-014 publication law is:
 
 ```text
-sequence -> durable/replicated log cut -> device/metadata apply -> publish visible cut -> acknowledge
+claim + exact revalidation + sequence
+    -> typed WAL fragments + terminal outcome marker
+        -> join contiguous durable_next and applied_next
+            -> atomically publish {visible_next, database_root, publication_epoch}
+                -> publication-covered terminal status -> acknowledge
 ```
+
+Durability and hidden GPU apply may overlap, but neither alone authorizes visibility or success. `visible_next` is
+the checked exclusive prefix after the durability/apply join; its derived inclusive snapshot is used only where an
+inclusive sequence is required. A marker-durable but unpublished commit/no-op is pending. An early response can only
+be an explicitly bounded non-commit ticket; synchronous SQL success waits for publication-covered terminal status.
+
+The canonical durable envelope separates lane-local physical coordinates from global logical `commit_seq`. An
+outcome-free pre-apply header, typed ordered fragments/leaves/root, and final commit/no-op/abort marker use
+non-circular digests. They carry enough row/catalog/reset/rewrite/sequence/allocator/claim/status semantics for GPU
+replay to reproduce and compare the named result without a host relational mirror. A stable claimed transaction ID
+and statement/digest chain make same-ID retry exact; mismatched retry fails closed, and unclaimed pre-WAL rejection
+has no exactly-once promise.
 
 ### Built
 
@@ -189,11 +247,31 @@ sequence -> durable/replicated log cut -> device/metadata apply -> publish visib
   durable cuts, lane recycle/reopen, group commit, and cold-artifact recovery contracts.
 - Recovery suppresses intermediate admission/elision and publishes resident state only after replay settles.
 
-### Target contracts
+### Accepted recovery contract
 
-- Automatic lane checkpoints and timestamped archival/PITR: **DUR-001**.
-- Crash/power-fail and post-durable-apply fault campaign: **DUR-002**.
-- Device-native DDL/recovery/import repair replacing reverse gather/deauthorization: **RETIRE-002**.
+- A checkpoint at inclusive cut `C` pins one publication object at exclusive `C+1`, omits births above `C`, turns
+  deaths above `C` back into infinity, and excludes every unpublished catalog/index/allocator/status effect. Its
+  manifest names exact typed sections, logical identities, lineage, digests, predecessor/PITR/status pins, and the
+  WAL suffix required to recover the acknowledged cut.
+- Immutable content-addressed artifacts are synced and directory-synced before a generation manifest; one verified
+  active-pointer rename is the durable activation point. Reachability GC preserves the active generation, a verified
+  predecessor, backup/PITR/replication pins, transaction status/response pins, and in-flight readers.
+- Recovery verifies pointer/manifest/lineage and every lane/range/outcome, selects the newest checkpoint with a
+  complete suffix, reconciles incomplete and later orphan claims, stages encoded bytes, and uses a fresh GPU context
+  to decode/replay typed operators into one unpublished database root. Service begins only after one atomic
+  publication-object install. Corruption, missing authority, an unknown committed format, or exhausted retry/RTO
+  capacity refuses service; it never silently chooses an older state or CPU relational execution.
+- Legacy-to-canonical conversion is offline, restartable, cut-exact, and one-way. It GPU-selects survivors at the
+  drained cut, assigns deterministic new stable identities, validates the candidate, and switches authority once;
+  no table-by-table mixed identity mode or automatic downgrade is permitted after canonical WAL begins.
+- The standalone recovery profile admits at most 32 GiB of serving artifacts and 1,000,000 suffix outcomes, with
+  minimum 512 MiB/s artifact restore and 19,200 outcomes/s replay, one complete fresh-context retry, and a 292.18-s
+  bound. A deployment that cannot satisfy a configured term fails qualification/admission rather than weakening the
+  five-minute contract.
+
+Automatic cut-exact checkpoint cadence and PITR are **DUR-001**; the canonical WAL/status format and complete crash,
+power-fail, filesystem, orphan, publication, migration, and GPU-context-loss campaign are **DUR-002**; device-native
+repair replacing reverse gather/deauthorization is **RETIRE-002**.
 
 A post-durable repair failure may poison availability, but it may not discard or make an acknowledged commit
 unrecoverable.
@@ -209,11 +287,23 @@ commit, fences stale leaders, and supports follower catch-up/promotion without d
 ## 10. Serving, resource bounds, and operations
 
 - Session admission, mutation queues, GPU residency admission, and result budgets are distinct controls.
-- Overload uses bounded queues/timeouts; it never bypasses WAL or relational correctness.
+- Every prepared mutation declares operation/mutation count, encoded post-image plus logical-WAL bytes, index
+  fanout, touched tables, cold accesses, and result bytes. Admission verifies the full envelope and derives its
+  R1/W1/T8/T32 class before any sequence/WAL claim; the caller cannot select a larger latency budget.
+- Intent, byte, index, cold-staging, result, durability, apply, maintenance, and retained-history populations have
+  hard credits. Oldest age, byte/service limits, durable/apply lag, and sparse/global skew may close a wave earlier;
+  they may not acknowledge early, change class, omit work, or admit beyond the strict residual latency budget.
+- Resident and cold pressure use explicit soft/high/hard/lower hysteresis with pre-WAL throttle/rejection.
+  Index/compaction/GC/STRATA maintenance is automatic, byte-bounded, snapshot-fenced, starvation-aware, and yields
+  to foreground deadlines; disabling required maintenance makes affected routes unready instead of silently slow.
+- Overload uses bounded queues/timeouts and fail-loud preclaim refusal; it never bypasses WAL, publication, or
+  relational correctness.
 - Large results stream through bounded framing rather than unbounded host duplication.
 - GPU health transitions return typed errors or fail over to another GPU; they never activate CPU relational
   execution.
-- Metrics attribute queue wait, transfer bytes, kernel time, result time, WAL cuts, replication lag, and errors.
+- Metrics attribute scheduled-arrival/producer slip, queue wait/age, per-stage populations and credits, transfer
+  bytes, kernel/result time, WAL durable/applied/visible cuts, maintenance and pressure state, replication lag,
+  transaction status, and errors. Direct open-loop end-to-end class latency remains the qualification authority.
 
 Connection/runtime scale is **SCALE-001**. Security, packaging, observability, and release hardening are
 **PRODUCT-003**.
@@ -223,8 +313,12 @@ Connection/runtime scale is **SCALE-001**. Security, packaging, observability, a
 - **Facade:** typed command outcome independent of PostgreSQL wire encoding.
 - **Planner to executor:** typed expression/route plus snapshot and device-source handles.
 - **Residency:** immutable generation descriptor owning all resources required by a read.
-- **Transaction to durability:** ordered intent batch and durable/replicated cut.
-- **Recovery:** checkpoint/artifact boundary plus ordered log suffix.
+- **Transaction to durability:** claimed typed user envelope, ordered statement/outcome vector, declared resources
+  and dependency floors, lane-local physical range, and global logical commit mapping.
+- **Publication:** one atomically acquired `{visible_next, database_root, publication_epoch}` owner covering exact
+  data/catalog/index/status authority.
+- **Recovery:** C-projected checkpoint/manifest/artifact authority plus ordered typed WAL/status suffix and fresh-
+  context publication result.
 - **Execution result:** bounded device framing plus one final host readback.
 
 Interface changes must preserve layer direction and must not smuggle relational computation into the host control

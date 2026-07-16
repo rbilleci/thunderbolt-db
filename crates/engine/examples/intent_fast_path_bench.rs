@@ -279,8 +279,10 @@ fn run_arm(
                                     let global_arrival = scheduled_arrivals
                                         .saturating_mul(writers as u64)
                                         .saturating_add(w as u64);
-                                    let due_ns =
-                                        global_arrival.saturating_mul(1_000_000_000) / offered_tps;
+                                    let due_ns = global_arrival
+                                        .saturating_mul(1_000_000_000)
+                                        .checked_div(offered_tps)
+                                        .expect("offered_tps is nonzero");
                                     let due = run_started + Duration::from_nanos(due_ns);
                                     if Instant::now() < due {
                                         break;

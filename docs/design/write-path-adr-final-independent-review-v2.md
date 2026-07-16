@@ -1,7 +1,7 @@
 # Final independent adversarial acceptance review — packet v2
 
-**Date:** 2026-07-15  
-**Reviewed packet:** [`write-path-adr-review-packet-v2.md`](write-path-adr-review-packet-v2.md) at its frozen hashes  
+**Date:** 2026-07-15\
+**Reviewed packet:** [`write-path-adr-review-packet-v2.md`](write-path-adr-review-packet-v2.md) at its frozen hashes\
 **Verdict:** **REJECT for acceptance**
 
 The independent reviewer verified all 33 frozen hashes, baseline `f701d8b6`, the absence of a

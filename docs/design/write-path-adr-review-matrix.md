@@ -1,7 +1,7 @@
-# R3-001 write-path ADR compatibility and evidence matrix
+# ADR-014 write-path compatibility and evidence matrix — R3-001 closeout
 
-This companion is a review index for the proposed
-[`write-path-adr-proposal.md`](write-path-adr-proposal.md). It does not own work and does not accept the ADR. Open
+This companion is the retained review index for accepted
+[`write-path-adr-proposal.md`](write-path-adr-proposal.md). It does not own work or implementation sequencing. Open
 work and sequencing remain exclusively in [`../PLAN.md`](../PLAN.md). The source baseline is commit
 `f701d8b6e9e0a9a1904bc990f23162632f382045`.
 
@@ -9,7 +9,7 @@ work and sequencing remain exclusively in [`../PLAN.md`](../PLAN.md). The source
 
 | Class | Meaning at design acceptance |
 |---|---|
-| **P — proved current** | A source audit or reproducible test proves a property of the pinned implementation. It is not evidence that a proposed replacement already exists. |
+| **P — proved current** | A source audit or reproducible test proves a property of the pinned implementation. It is not evidence that the accepted replacement already exists. |
 | **T — bounded trace** | A complete decision-level state/failure trace has no unresolved transition, authority, or ordering contradiction. This is sufficient to select a design where the proposal explicitly leaves implementation to a PLAN item. |
 | **M — measured prototype** | A build/test-only probe or disposable model measures a decision input without becoming production authority or a compatibility promise. |
 | **G — post-acceptance graduation** | The design rule is specified, but production implementation and fault/performance qualification belong to the named PLAN item after acceptance. This is not an acceptance gap when the proposal explicitly separates design selection from implementation. |
@@ -23,7 +23,7 @@ trace, and later implementation qualification are all relevant. Only **X** block
 The table separates deliberate semantic deviations from unsupported features. Unsupported syntax must fail before
 state change or sequencing; it must not be silently normalized to a weaker mode.
 
-| ID | Class | PostgreSQL behavior | Proposed behavior and user-visible contract | Rationale | PLAN owner |
+| ID | Class | PostgreSQL behavior | Accepted behavior and user-visible contract | Rationale | PLAN owner |
 |---|---|---|---|---|---|
 | CD-01 | intentional concurrency deviation | Under `READ COMMITTED`, a concurrent updater commonly waits and then re-evaluates the target predicate/expression against the new row version. | Deterministic first-committer-wins aborts the whole user transaction with retryable `40001 serialization_failure`; it never advertises target-row re-evaluation. | Bounds dependency lifetime, queueing, and GPU work while preserving correctness. | R3-003; any later wait/re-evaluation policy requires a separate accepted design. |
 | CD-02 | intentional catalog-snapshot deviation | PostgreSQL does not promise that every catalog lookup follows one transaction-held MVCC catalog snapshot. | `REPEATABLE READ` holds one publication object for user and GPU-resident catalog relations; later catalog DDL is hidden, except that a committed non-MVCC table-rewrite fence makes the rewritten identity appear empty. | Gives data and GPU catalog execution one explicit, pin-safe snapshot law. | R3-003, DUR-002 |
@@ -43,7 +43,8 @@ sequence nontransactionality, and `NULLS DISTINCT` defaults are target compatibi
 ## Normative design evidence matrix
 
 The rule IDs below are stable review handles. A later implementation may add evidence without silently changing the
-rule. Any normative change must update the proposal, this matrix, and the R3-001 review disposition together.
+rule. Any normative change requires a PLAN-owned ADR-014 revision that updates the detailed design and this matrix,
+then receives fresh independent review and explicit acceptance.
 
 | Rule | Normative contract | Proposal locus | Evidence class and artifact | Remaining graduation owner |
 |---|---|---|---|---|
@@ -70,9 +71,9 @@ rule. Any normative change must update the proposal, this matrix, and the R3-001
 | N-21 | Legacy-to-canonical migration is offline, restartable, cut-exact, and switches authority once; no mixed legacy/canonical serving or automatic downgrade follows canonical WAL. | §12 | **T+G** — migration traces MIG-01 through MIG-08. | R3-004, DUR-002 |
 | N-22 | Physical selection separates the common synchronous-durability envelope from candidate-specific GPU mutation and retained-history costs; compact append/tombstone must win a bounded width/fanout/batch comparison without weakening latency, durability, identity, visibility, or recovery rules. | §Alternatives, §Evidence | **P+M+G** — `write-path-adr-slo-footprint.md` retains the current implementation failure; the corrected A/B fences both seqlock transitions, ends undo at the replacement commit, asserts old/current snapshot visibility, compares exact byte-tied formats, and selects A in every p50 cell. The canonical full-path matrix remains fail-loud production graduation. | R3-002/003 and DUR-001/002 qualification |
 | N-23 | Checkpoint cadence and replay capacity must be configurable to meet a declared recovery RTO with explicit bytes/time assumptions. | §9, §11, §Evidence | **M+G** — `write-path-adr-rto-capacity.md` fits current replay, defines a 292.18-second two-attempt profile, and makes artifact/replay rates plus byte/record caps fail-loud configuration terms. Canonical enforcement/qualification remains graduation. | DUR-001/002 |
-| N-24 | The ADR is accepted only after every design-acceptance X is closed, the packet is source-pinned/frozen, and a fresh independent adversarial review returns no unresolved acceptance blocker. | §Evidence, §Review focus | **P** — packet v4 passed under the prior target; v5/v6/v7 REVISE findings were retained and corrected. The complete target/workload correction is frozen at `c9628766` in `write-path-adr-review-packet-v8.md`; all 24 hashes and executable gates passed, and `write-path-adr-final-independent-review-v8.md` records fresh independent **ACCEPT** with no remaining material blocker. Explicit user acceptance remains a decision, not an evidence gap. | R3-001 |
+| N-24 | The ADR is accepted only after every design-acceptance X is closed, the packet is source-pinned/frozen, and a fresh independent adversarial review returns no unresolved acceptance blocker. | §Evidence, §Review focus | **P** — packet v4 passed under the prior target; v5/v6/v7 REVISE findings were retained and corrected. The complete target/workload correction is frozen at `c9628766` in `write-path-adr-review-packet-v8.md`; all 24 hashes and executable gates passed, `write-path-adr-final-independent-review-v8.md` records fresh independent **ACCEPT**, and the user explicitly accepted ADR-014 on 2026-07-16. | ADR-014 |
 
 The trace identifiers are defined and design-reviewed in
 [`write-path-adr-traces.md`](write-path-adr-traces.md). Rows marked **T** are therefore closed at decision level;
-their named **G** owners still provide implementation/fault graduation after acceptance. The matrix is updated after
-each ordered gate and frozen immediately before N-24 review.
+their named **G** owners provide implementation/fault graduation under `PLAN.md`. The accepted matrix remains
+decision evidence; a normative change requires a new PLAN-owned ADR-014 revision and fresh review.

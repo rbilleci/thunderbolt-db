@@ -1,11 +1,11 @@
 # Frozen R3-001 independent-review packet — remediation 3
 
-**Frozen:** 2026-07-15  
-**Baseline commit:** `f701d8b6e9e0a9a1904bc990f23162632f382045`  
-**Decision state:** proposed, explicitly not accepted  
+**Frozen:** 2026-07-15\
+**Baseline commit:** `f701d8b6e9e0a9a1904bc990f23162632f382045`\
+**Decision state:** proposed, explicitly not accepted\
 **Prior reviews:**
 [`write-path-adr-final-independent-review.md`](write-path-adr-final-independent-review.md) and
-[`write-path-adr-final-independent-review-v2.md`](write-path-adr-final-independent-review-v2.md), both **REJECT**  
+[`write-path-adr-final-independent-review-v2.md`](write-path-adr-final-independent-review-v2.md), both **REJECT**\
 **Review question:** Does the remediated packet contain a coherent, source-grounded GPU-native write design that may
 be accepted, or does any design-acceptance blocker remain?
 

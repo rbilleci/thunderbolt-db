@@ -11,7 +11,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   GPU paths. A decline or device fault fails loudly; it never executes relational work on the host.
 - Test-only CPU semantic infrastructure remains under `cfg(test)` pending **RETIRE-001**.
 - The host write/commit/MVCC tuple-store path, host DML indexes/probes, generic CUDA-MVCC host result
-  post-processing, and recovery repair operators remain pending **R3-001**, **R3-002**, **R3-003**,
+  post-processing, and recovery repair operators remain pending **R3-002**, **R3-003**,
   **R3-004**, **RETIRE-002**, and **RETIRE-003**.
 
 ## Read path and STRATA
@@ -54,8 +54,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   both durable/apply lag directions. The ordinary engine suite passes 509/509 with 487 GPU tests ignored; focused
   real-GPU lane recovery, UPDATE, async-drain, and cold-checkpoint mismatch gates pass 4/4.
 - Covered int4-PK INSERT/UPDATE/DELETE intent paths and mixed GPU read/write execution are live. Wider write
-  shapes and the final GPU-native write/MVCC model remain **R3-001**, **R3-002**, and **R3-003**.
-- The non-authoritative **R3-001** package is reconciled against source commit `f701d8b6`: it includes explicit
+  shapes and implementation of the accepted GPU-native write/MVCC model remain **R3-002** and **R3-003**.
+- **ADR-014 is accepted as of 2026-07-16**, completing **R3-001**. The accepted package is reconciled against source
+  commit `f701d8b6`: it includes explicit
   identity/STRATA/conveyor/transaction/host-debt traceability, normative row/transaction/isolation/publication/
   recovery/migration state machines, a snapshot-age capacity model, and fresh focused GPU/CPU correctness results.
   Separate 2026-07-15 adversarial performance, durability/resilience, transactional ACID, and consistency/accuracy
@@ -101,7 +102,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   current serial/FUA replay paths measure about 38–40k outcomes/s; a two-attempt profile uses a 19,200/s floor,
   32-GiB artifact cap, 1,000,000-outcome suffix cap, and future 512-MiB/s canonical restore floor to bound recovery
   at 292.18 seconds. The current rotated checkpoint still replays O(full history), so DUR-001/002 must implement and
-  qualify the bounded canonical path after acceptance. Final packet reviews v1/v2/v3 returned **REJECT**; their
+  qualify the accepted bounded canonical path. Final packet reviews v1/v2/v3 returned **REJECT**; their
   selection/provenance/task-reference, undo-visibility/seqlock/adaptation-evidence, and pressure-state/wave-trigger
   blockers are corrected. The controller model now tests soft/high/hard/lower recovery, pre-deadline byte/service
   shipment, and oversized-item pre-claim rejection. Frozen packet v4 passed fresh independent review with
@@ -124,15 +125,23 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   excludes warm-up completions from sustained TPS, and fixes every zero-based generated ordinal, parameter-stream
   consumption, and debit/credit amount assignment. Peak TPS is committed
   cohort count divided by the fixed arrival second; wall completion throughput is diagnostic, every cohort must
-  pass, and the active route gate is explicitly local. The target-policy amendments in `DECISIONS.md` and
-  `ARCHITECTURE.md` do not accept the proposed write-path ADR. Replacement packet v8 is frozen at `c9628766`; all 24
-  hashes and executable gates passed, and fresh independent review returned **ACCEPT** with no material blocker.
-  Explicit user write-path acceptance remains. The implemented standalone canonical
-  campaign follows acceptance under R3-003, DUR-001/002, and RETIRE-002 before production authority or
+  pass, and the active route gate is explicitly local. Replacement packet v8 is frozen at `c9628766`; all 24 hashes
+  and executable gates passed, fresh independent review
+  returned **ACCEPT** with no material blocker, and the user explicitly accepted ADR-014. `DECISIONS.md` and
+  `ARCHITECTURE.md` now carry the binding ledger and stable system contracts. The implemented standalone canonical
+  campaign remains under R3-002/003, DUR-001/002, and RETIRE-002 before production authority or
   host-store removal;
   HA-001 is additional only for replicated/node-loss-RPO deployment.
 - Crash-durable replay exists; the broader fault campaign, automatic lane checkpointing, PITR timestamps, and
   multi-node quorum integration are **DUR-001**, **DUR-002**, and **HA-001**.
+
+## ADR-014 acceptance closeout verification — 2026-07-16
+
+- PR-wide whitespace validation from base `f701d8b6`, strict workspace all-target/all-feature Clippy, and the
+  CPU-neutral workspace CI suite pass.
+- The complete serial all-feature engine library gate passes **996/996**, including the GPU intent-lane,
+  residency, recovery, transaction-adjacent, and STRATA paths. This verifies the acceptance/documentation closeout;
+  it does not replace the R3-002/003 and DUR-001/002 production graduation evidence.
 
 ## Verification snapshot — 2026-07-14
 
@@ -2101,7 +2110,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and generation capture, zone-map/local-slot correctness, W0 liveness, the already-dead filter, exact-one fingerprint
   tuple verification, zero-row handling, partial-failure re-admit, tombstone-before-append ordering, multi-row identity,
   the SV6 `created_by` stamp, and churn accounting are unchanged. Dependencies flow one-way to shard pruning,
-  predicate lowering, and existing resident mutation/read primitives; R3-001 remains the sole future-design owner.
+  predicate lowering, and existing resident mutation/read primitives; the then-future R3-001 design boundary is now
+  accepted as ADR-014, while this extracted code remains current implementation rather than target authority.
   Twelve focused GPU transition tests pass, as do both 505/487 engine modes, the complete 992-test GPU suite,
   all-target check, strict clippy, exact-source/consumer/visibility/dependency/scoped-format/diff/docs gates, and
   independent audit. Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and
@@ -3951,7 +3961,6 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Boundary | Work ID |
 |---|---|
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
-| Current write implementation and target MVCC/write design need one accepted reconciliation | **R3-001** |
 | Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
 | Deterministic CC, transaction-held snapshots, VACUUM/GC | **R3-003** |
 | Host write/store deletion | **R3-004** |

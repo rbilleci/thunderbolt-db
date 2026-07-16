@@ -1,12 +1,13 @@
 # Candidate-A SLO and footprint decision report
 
-**Date:** 2026-07-15  
+**Date:** 2026-07-15\
 **Source:** committed baseline `f701d8b6` plus the review-only R3-006 correction and benchmark/probe diff listed
-in the frozen packet  
-**Host:** NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, synchronous FUA lane WAL  
-**Disposition:** **FAIL — Candidate A is not selected by this evidence and the ADR is not acceptable.**
+in the frozen packet\
+**Host:** NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, synchronous FUA lane WAL\
+**Disposition:** **FAIL — the current Candidate-A implementation does not satisfy production graduation; this
+report alone did not select the ADR.**
 
-This is R3-001 decision evidence, not a product benchmark or an implementation authority. The harness drives the
+This is retained ADR-014 decision evidence, not a product benchmark or an implementation authority. The harness drives the
 real covered `t(id INT PRIMARY KEY, v INT)` GPU intent route: prepared typed parameters, device validation and
 append/tombstone apply, FUA lane durability, publication, and optional crash replay. Open-loop latency starts at the
 scheduled arrival, so producer slip and queueing are included. The binding latency threshold is W1 single keyed
@@ -83,13 +84,12 @@ already fails the binding low-load and mixed-load matrix, lacks the required row
 shows a large current allocation. More permutations can diagnose the losing implementation but cannot satisfy the
 physical-selection gate.
 
-This evidence therefore reopens the physical choice exactly as the proposal requires. It does not prove that
-append/tombstone is intrinsically incapable; it proves that the proposed ADR cannot select it from the current
-implementation and controller evidence. A revised R3-001 decision needs a bounded competing representation or a
-materially revised Candidate-A durability/control/index implementation, followed by the same offered-load and
-actual-byte matrix. Automated adaptation remains necessary—the proposal's bounded stage credits, oldest-age
-deadlines, cut-lag admission, and hysteretic maintenance rules are directionally correct—but adaptation alone
-cannot erase the measured low-load FUA floor.
+At this gate, the evidence therefore reopened the physical choice exactly as the then-proposal required. It did not
+prove that append/tombstone was intrinsically incapable; it proved that the ADR could not select it from only the
+current implementation and controller evidence. Selection then required the bounded competing representation and
+corrected Candidate-A comparison recorded below. Automated adaptation remains necessary—the accepted design's
+bounded stage credits, oldest-age deadlines, cut-lag admission, and hysteretic maintenance rules are directionally
+correct—but adaptation alone cannot erase the measured low-load FUA floor.
 
 ## Subsequent physical-selection correction
 

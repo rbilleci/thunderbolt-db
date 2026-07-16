@@ -5,10 +5,10 @@ The consolidated PostgreSQL compatibility register and normative proof ledger ar
 [`../PLAN.md`](../PLAN.md). Reviewed decision-level transactional, publication, checkpoint, recovery, migration,
 and service-pressure schedules are recorded in [`write-path-adr-traces.md`](write-path-adr-traces.md).
 
-This is non-authoritative review evidence for
+This is non-authoritative review evidence retained for accepted
 [`write-path-adr-proposal.md`](write-path-adr-proposal.md). It records the code baseline, the current-to-target
-crosswalk, the bounded-memory model, and reproducible gates. It does not accept the ADR or own follow-up work;
-only `../PLAN.md` owns work.
+crosswalk, the bounded-memory model, and reproducible gates. It did not itself accept the ADR and does not own
+follow-up work; only `../PLAN.md` owns work.
 
 ## Audited baseline
 
@@ -27,14 +27,14 @@ only `../PLAN.md` owns work.
   part of the scoped R3-001 diff. Baseline commands: `git rev-parse HEAD`, `git status --short`, frozen SHA-256
   verification, source searches with `rg`, and direct reads of every symbol linked below.
 
-The baseline pin matters: the proposal is a reconciliation target, not a claim that the source already implements
-canonical identity, direct GPU recovery, or bounded transaction-held history.
+The baseline pin matters: the accepted design is an implementation target, not a claim that the source already
+implements canonical identity, direct GPU recovery, or bounded transaction-held history.
 
 ## Source traceability
 
 ### Transaction, isolation, and protocol boundary
 
-| Live source | Current fact at the audited commit | Proposed rule and disposition |
+| Live source | Current fact at the audited commit | Accepted target rule and disposition |
 |---|---|---|
 | [`EngineFacade::execute`](../../crates/facade/src/lib.rs) and its session state | The facade documents that transaction control does not drive real MVCC. It allocates an unrelated monotonic ID per execute call, so `BEGIN`, two DML statements, and `COMMIT` do not share an identity, snapshot, or overlay. | R3-003 gives one stable identity and private device data/catalog overlay to the session transaction; autocommit remains one statement/transaction. Current facade tests are bookkeeping evidence only. |
 | [`TxnManager`](../../crates/txn/src/lib.rs) and engine transaction dispatch in [`engine_dml_concurrent.rs`](../../crates/engine/src/engine_dml_concurrent.rs) | The manager stores only Active/Committed/Aborted state with bounded terminal retention. DML calls its commit path per statement; later `ROLLBACK` cannot undo those writes. | The target lifecycle owns snapshots/overlay/status and logs one envelope at user `COMMIT`. Durable digest-bound status replaces the in-memory map as retry authority. |
@@ -53,7 +53,7 @@ statement call. The proposal is a target that removes this gap; no current `BEGI
 
 ### Identity, versioning, and indexes
 
-| Live source | Current fact at the audited commit | Proposed rule and disposition |
+| Live source | Current fact at the audited commit | Accepted target rule and disposition |
 |---|---|---|
 | [`Engine::apply_update`](../../crates/engine/src/engine_write_apply.rs) and [`AppliedRowMutation::Update`](../../crates/engine/src/engine_commit.rs) | Classic UPDATE installs an MVCC replacement under the old relational row key; the commit path explicitly records `old_row_ids: None` because identity is reused. | The stable-row-id target preserves this behavior while replacing the host tuple store under R3-004. |
 | [`LaneUpdate`](../../crates/engine/src/engine_intent_lanes.rs), [`drive_intent_lane`](../../crates/engine/src/engine_dml_concurrent/lane.rs), and [`apply_lane_updates_device`](../../crates/engine/src/engine_dml_concurrent/lane_apply.rs) | Lane UPDATE claims a fresh `new_row_id`, logs it, tombstones the old slot, and conditionally appends the new image under that fresh id. A zero-row UPDATE still consumes the id. | Incompatible identity: canonical UPDATE retains the located old `row_id`; genuinely new logical rows come from durable non-reused allocator leases, and replay takes the maximum recorded/referenced high-water. R3-003/DUR-002 implement the transition. |
@@ -65,7 +65,7 @@ statement call. The proposal is a target that removes this gap; no current `BEGI
 
 ### STRATA placement and lifecycle
 
-| Live source | Current fact at the audited commit | Proposed rule and disposition |
+| Live source | Current fact at the audited commit | Accepted target rule and disposition |
 |---|---|---|
 | [`ColdChunk` and streaming executor state](../../crates/engine/src/engine_streaming_exec.rs) | STRATA stores encoded chunks in RAM/NVMe and stages them for GPU execution under a byte budget. Chunks carry payload boundary and optional `deleted_by`, but not canonical row/version identity. | Preserve the storage/execution split; add canonical identity/birth/death sections and content-addressed manifest tokens. |
 | [`locate_streaming_cold_slots_in_entry`](../../crates/engine/src/engine_streaming_exec/streaming_dml_class.rs) | Cold DML predicate and visibility run on-device and return bounded `(chunk,slot)` coordinates. | Retained as the locate mechanism; output must also carry version identity and the captured manifest hash before it can authorize a stamp. |
@@ -89,7 +89,7 @@ engine intent lanes
 relational data store. The engine consumes the variable-payload FUA frame log through
 [`gpu_db_wal`](../../crates/wal/src/fua_lanes.rs).
 
-| Live source | Current fact at the audited commit | Proposed rule and disposition |
+| Live source | Current fact at the audited commit | Accepted target rule and disposition |
 |---|---|---|
 | [`drive_intent_lane`](../../crates/engine/src/engine_dml_concurrent/lane.rs) | Forms key-routed waves, checks the private conflict ledger, creates WAL backing before sequence claim, claims sequence/id blocks, appends encoded frames, then queues GPU apply. | Preserved temporal architecture; canonical conflict tokens include old/new keys and table/row identity, and every capacity category is reserved before claim. |
 | [`FuaWalLaneSet::append_encoded`](../../crates/wal/src/fua_lanes.rs) and [`FuaFrameLog`](../../crates/write_conveyor/src/fua_frame_log.rs) | Variable payload frames publish to prewritten FUA segments; fence workers advance an exclusive contiguous durable-next prefix `[base,next)` and poison/wedge on failure. | Preserved host durability plane and fail-closed behavior; the target keeps the exclusive prefix and never interprets `next` as an inclusive MVCC snapshot. |
@@ -99,7 +99,7 @@ relational data store. The engine consumes the variable-payload FUA frame log th
 
 ### Durability and recovery boundary
 
-| Live source | Current fact at the audited commit | Proposed rule and disposition |
+| Live source | Current fact at the audited commit | Accepted target rule and disposition |
 |---|---|---|
 | [`FuaFrameLog`](../../crates/write_conveyor/src/fua_frame_log.rs) | Prewritten O_DIRECT/O_DSYNC frames carry header/payload CRCs; fence completion advances only a contiguous prefix, and scan recovery stops at the first invalid frame. | Preserve the strong local framing/fence precedent. Canonical fragmented envelopes add a distinct physical `wal_pos` range and typed final commit/no-op/abort outcome marker above this layer. |
 | [`FuaWalLaneSet::append_encoded`](../../crates/wal/src/fua_lanes.rs), lane merge recovery, and orphan repair | Every frame owns a unique sequence interval; recovery maps each decoded record to a unique position and discards durable orphans above the first global gap. | This disproves the earlier same-`commit_seq`-per-fragment wording. Physical positions are now separate from relational commit sequence, and retirement cuts only at complete markers. |
@@ -244,8 +244,8 @@ The tests return early only when no device proof exists; on this host their devi
 | first-committer-wins row/unique write-set coverage | `cargo test -q -p gpu_db_engine --lib tests::write_half -- --test-threads=1`; same command with `tests::write_set` | **PASS, 15/15 + 11/11 CPU** | Current SI conflict-ledger evidence and stale-snapshot behavior; it does not cover repeated-RC minimum-floor retention, queued work after ticket drop, FK guard modes, read/predicate dependencies, write skew, or serializable isolation. |
 | checkpoint horizon and binary replay | exact CPU tests `tests::recovery::{checkpoint_vacuum_prunes_mvcc_versions_only_at_durable_safe_boundary, w5a_binary_wal_records_replay_identically_to_text}` | **PASS, 2/2 CPU** | Current host-first recovery parity, not direct-GPU recovery. |
 | current churn compaction restores exact rows/index serving | `engine_residency::capacity_payload_tests::vacuum_restores_pk_index_after_update_churn` | **PASS, 1/1 GPU** | Current bounded-churn mechanism; does not claim transaction-held history. |
-| repeated same-transaction mutations | proposal overlay transition table | row-state component specified; lifecycle implementation absent | R3-003 implements the device overlay plus session/statement/error/commit lifecycle and differentials after ADR acceptance. |
-| direct canonical GPU recovery and migration | revised proposal format, cut projection, fragment/marker, typed catalog/outcome, activation, recovery, and migration state machines | specification revised; implementation and fault proof absent | DUR-001/002, RETIRE-002, and R3-004 implement and run the standalone host-store-free fault campaign after acceptance; HA-001 is additional only for replicated/node-loss-RPO deployment. |
+| repeated same-transaction mutations | accepted overlay transition table | row-state component specified; lifecycle implementation absent | R3-003 implements the device overlay plus session/statement/error/commit lifecycle and differentials under ADR-014. |
+| direct canonical GPU recovery and migration | accepted format, cut projection, fragment/marker, typed catalog/outcome, activation, recovery, and migration state machines | specification accepted; implementation and fault proof absent | DUR-001/002, RETIRE-002, and R3-004 implement and run the standalone host-store-free fault campaign; HA-001 is additional only for replicated/node-loss-RPO deployment. |
 
 The physical-selection report supplies a bounded update-mechanics and snapshot-age comparison, not a canonical
 production performance or durability fault-injection result. In particular,
@@ -257,9 +257,9 @@ isolation result, sparse-lane/global-skew result, pressure-controller hysteresis
 durable/apply imbalance, or sabotage failure. The build-only controller model supplies those bounded decision
 injections without claiming current production behavior. The current SLO/durability-envelope evidence, bounded
 physical-footprint comparison, 13-family controller injections, reviewed decision-level failure traces, RTO
-capacity argument, and final design re-review are R3-001 acceptance gates. The canonical end-to-end SLO/controller
-matrix and implemented canonical
-fault campaign is a post-acceptance DUR-001/002 and RETIRE-002 graduation gate before standalone R3-004,
+capacity argument, and final design re-review closed the R3-001 acceptance gates. The canonical end-to-end SLO/
+controller matrix and implemented canonical fault campaign remain DUR-001/002 and RETIRE-002 graduation gates before
+standalone R3-004,
 not a circular ADR prerequisite. HA-001 is additional only for replicated/node-loss-RPO deployment.
 
 Nor does any current test prove multi-statement rollback, failed-transaction state, characteristic-preserving RC/RR
@@ -268,14 +268,14 @@ the RR stable-catalog deviation, serializable/deferrable rejection, stable-ID DD
 metadata-only missing values versus semantic table rewrites, FK parent/child dependency guards, PG16 `TRUNCATE`
 old-snapshot-empty fences and reset/DML statement composition, private CREATE/RESTART versus ordinary sequence
 rollback and operation-specific `currval`, atomic `{visible_next, database_root, publication_epoch}` acquisition, or a
-durable pre-side-effect claim plus digest-bound retry after a lost response. Those are reviewed design traces before
-acceptance and R3-003/DUR-002 implementation evidence afterward.
+durable pre-side-effect claim plus digest-bound retry after a lost response. Those are accepted ADR-014 design
+traces and remain R3-003/DUR-002 implementation evidence.
 
 Nor does current evidence prove checkpoint-retained claim/status resolution, non-circular digest construction,
 multi-lane physical/global ordering, PostgreSQL-target-recheck compatibility behavior, ordered multi-statement
 outcomes, bounded `RETURNING` replay, read-only/no-op separation, shared/read versus exclusive/write FK guards, or
-the empty/first/exhausted and live exclusive-next/inclusive-snapshot lane boundaries. Those remain reviewed design
-traces before acceptance and implementation/fault evidence afterward.
+the empty/first/exhausted and live exclusive-next/inclusive-snapshot lane boundaries. Those remain accepted design
+traces and outstanding implementation/fault evidence.
 
 ## Independent review disposition
 
@@ -323,9 +323,10 @@ ordinal/pair/amount assignments were not fully executable; the finding is retain
 timestamp, zero-based generated ledger/DELETE ordinal, parameter-stream consumption, T8/T32 pairing, and amount
 assignment for replacement packet v8. The exact packet is preserved at `c9628766`; all 24 hashes and executable
 gates passed, and [`write-path-adr-final-independent-review-v8.md`](write-path-adr-final-independent-review-v8.md)
-records fresh independent **ACCEPT** with no remaining material pre-acceptance blocker. The decision-level
+records fresh independent **ACCEPT** with no remaining material pre-acceptance blocker. The user's explicit
+2026-07-16 acceptance made the decision ADR-014 and completed R3-001. The decision-level
 ACID/failure traces are complete in
-[`write-path-adr-traces.md`](write-path-adr-traces.md). The ADR remains proposed.
-Full canonical standalone fault evidence follows acceptance under DUR-001/002 and RETIRE-002 before production
+[`write-path-adr-traces.md`](write-path-adr-traces.md). Full canonical standalone fault evidence remains under
+DUR-001/002 and RETIRE-002 before production
 authority or host-store deletion; HA-001 is conditional for
 replicated/node-loss-RPO deployment.

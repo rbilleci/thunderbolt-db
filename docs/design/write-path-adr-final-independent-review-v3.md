@@ -1,8 +1,8 @@
 # R3-001 final independent review v3
 
-**Date:** 2026-07-15  
-**Packet:** [`write-path-adr-review-packet-v3.md`](write-path-adr-review-packet-v3.md)  
-**Verdict:** **REJECT**  
+**Date:** 2026-07-15\
+**Packet:** [`write-path-adr-review-packet-v3.md`](write-path-adr-review-packet-v3.md)\
+**Verdict:** **REJECT**\
 **Reviewer edits:** none
 
 The reviewer verified all 37 frozen hashes, the pinned baseline, the absence of a baseline diff in

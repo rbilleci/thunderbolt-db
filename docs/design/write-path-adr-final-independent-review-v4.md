@@ -1,8 +1,8 @@
 # R3-001 final independent review v4
 
-**Date:** 2026-07-15  
-**Packet:** [`write-path-adr-review-packet-v4.md`](write-path-adr-review-packet-v4.md)  
-**Verdict:** **ACCEPT — no remaining pre-acceptance blocker**  
+**Date:** 2026-07-15\
+**Packet:** [`write-path-adr-review-packet-v4.md`](write-path-adr-review-packet-v4.md)\
+**Verdict:** **ACCEPT — no remaining pre-acceptance blocker**\
 **Reviewer edits:** none
 
 The reviewer verified all 39 frozen hashes, the pinned baseline, the absence of a baseline diff in
