@@ -5,6 +5,8 @@
 //! by the batcher with no per-query fallback, GPU multi-shard index-probe batches fired inside the exact
 //! writer-active interval, every write elided its host install, and resident device append waves fired.
 //! Visibility-sensitive append windows must remain on the dense probe; any host-gather batch fails the gate.
+//! Its >100k read-QPS floor is a gate-local non-vacuity/capacity control, not the charter's aggregate
+//! committed-TPS target; BENCH-001 alone owns the canonical mixed-system throughput decision.
 //!
 //! Env: `GPU_DB_MIX_GPU_READERS` (32), `GPU_DB_MIX_GPU_WRITERS` (4),
 //! `GPU_DB_MIX_GPU_READS_PER` (500), `GPU_DB_MIX_GPU_WRITES_PER` (40),
@@ -401,7 +403,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let writer_active_p999 = percentile(&writer_active_latencies, 0.999);
     if read_qps <= 100_000.0 || p50 >= 500 || p99 >= 1_000 || p999 >= 5_000 {
         return Err(format!(
-            "mixed OLTP SLO failed: throughput={read_qps:.0}/s (target >100000) \
+            "mixed GPU route gate failed: read_qps={read_qps:.0}/s (gate-local floor >100000; not system TPS) \
              p50={p50}us (target <500) p99={p99}us (target <1000) \
              p99.9={p999}us (target <5000); writer-active samples={} \
              p99={writer_active_p99}us p99.9={writer_active_p999}us",

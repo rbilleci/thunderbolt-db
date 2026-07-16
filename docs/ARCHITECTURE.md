@@ -126,10 +126,27 @@ The binding latency classes are defined in `CHARTER.md`: R1 bounded reads target
 single keyed synchronous mutations target 0.8/1.5/5 ms; T8 transactions contain 2–8 predeclared operations with at
 most four mutations and target 1.5/3/10 ms; T32 contains 9–32 predeclared operations with at most 16 mutations and
 targets 3/6/20 ms. T8/T32 also require route-declared byte, index-fanout, touched-table, cold-access, and result
-bounds. The scheduler uses the admitted class's residual end-to-end budget after measured downstream margins.
-Results are never pooled across read, mutation, and transaction classes for acceptance. Interactive/client-paced
-wall time is reported separately from statement, terminal, and database-active service time and has no generic
-low-latency promise.
+bounds. Admission derives W1/T8/T32 from the request's exact operation/mutation shape and verifies every declared
+resource dimension before producing the class value consumed by the scheduler; callers cannot request a larger
+budget directly. The scheduler uses that admitted class's residual p99 budget after measured downstream p99 margin,
+while deployment qualification independently checks p50, p99, and p99.9 durability plus percentile-matched bounded
+downstream margins. Margins are hard bounds or joint residuals from correlated end-to-end traces, not sums of
+independent stage percentiles; direct open-loop end-to-end latency is authoritative. Results are never pooled across
+read, mutation, and transaction classes for acceptance.
+Interactive/client-paced wall time is reported separately from statement, terminal, and database-active service
+time and has no generic low-latency promise.
+
+System throughput uses aggregate committed TPS for the immutable
+[`oltp-benchmark-workload-v1.md`](design/oltp-benchmark-workload-v1.md) contract: 120 R1; 50 W1 split 35/10/5
+INSERT/UPDATE/DELETE; 20 maximum-shape eight-operation/four-mutation T8; and 10 maximum-shape 32-operation/16-
+mutation T32 per 200 transactions. Its frozen schema/data, seed/skew, SQL/order, and resource manifests remove
+workload selection from the benchmark run. The exact 650 operations make >100,000 sustained TPS imply >325,000
+logical operations/s and the 400,000-TPS peak imply 1,300,000 logical operations/s. Sustained TPS counts only
+measurement-scheduled terminal completions inside the fixed 600-second window; fixed warm-up arrivals cannot inflate
+it. Peak TPS is committed cohort count divided by each fixed one-
+second arrival interval for named cohorts `B01`–`B10`; completion throughput is separate, every cohort must pass, and
+stage populations must drain to their pre-run bounds. Standalone class sweeps characterize capacity but cannot
+satisfy the system throughput target.
 
 The open-loop evidence gate is **BENCH-001**. Product route classes beyond PK microbenchmarks are **ROUTE-001**.
 

@@ -20,7 +20,11 @@ verdict into acceptance.
 At audit time the charter required more than 100,000 sustained TPS, a 400,000 TPS burst, and a uniform simple-OLTP
 p99 below 1 ms. The accepted 2026-07-15 target refinement now keeps 1 ms for R1 reads, uses 1.5 ms for W1 single
 mutations, 3 ms for T8, and 6 ms for T32 ([`CHARTER.md`](../CHARTER.md)); this historical finding and its adopted
-bounded-controller disposition remain valid. The pre-review evidence had focused correctness tests and a static two-int4
+bounded-controller disposition remain valid. The later throughput clarification binds 100,000/400,000 aggregate
+committed TPS to immutable `oltp-benchmark-workload-v1.md`, including the deterministic 60/25/10/5 R1/W1/T8/T32
+system mix, exact route/data/access envelopes, sustained window, and named peak cohorts; standalone class TPS is
+diagnostic.
+The pre-review evidence had focused correctness tests and a static two-int4
 64-byte/version estimate, but no update-heavy synchronous-commit TPS/tail distribution. It therefore cannot claim
 that append/tombstone meets the binding latency, throughput, footprint, or write-amplification requirements.
 
@@ -144,10 +148,11 @@ Subsequent R3-001 remediation preserves the failed current end-to-end matrix, me
 synchronous-durability envelope with the actual engine-facing frame-log rate plus a labeled same-physics percentile
 harness, and supplies the bounded Candidate-A/B width/fanout/batch/footprint comparison in
 [`write-path-adr-physical-selection.md`](write-path-adr-physical-selection.md). Compact append/tombstone wins that
-physical comparison. The bounded 12-family decision-policy sabotage in
+physical comparison. The corrected bounded 13-family decision-policy sabotage in
 [`write-path-adr-controller-injections.md`](write-path-adr-controller-injections.md) now covers the required
-cold/index preclaim, sparse/global skew, lag-direction, pressure/hysteresis, credit, maintenance, starvation, and
-drain-resize transitions. The strict end-to-end SLO and canonical controller/maintenance fault campaign remain
+cold/index preclaim, full-envelope class admission, class-escalation/count/resource sabotage, all-percentile strict
+qualification, sparse/global skew, lag-direction, pressure/hysteresis, credit, maintenance, starvation, and drain-
+resize transitions. The strict end-to-end SLO and canonical controller/maintenance fault campaign remain
 mandatory production graduation; a durability
 floor that consumes the budget now makes the advertised low-latency profile explicitly unqualified rather than
 causing an async or semantic switch. This historical audit verdict remains **REVISE**; only the later fresh final

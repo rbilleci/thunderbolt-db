@@ -26,7 +26,8 @@ The pre-rotation least-squares fit is `T = -0.0326 s + 24.965 us * records` (`R�
 records/s. Post-rotation remains linear at 26.579 us/row, about 37,624 rows/s: the current checkpoint rotation
 bounds the live suffix but still replays the full historical checkpoint. It therefore does not establish a
 long-running five-minute bound. At the post-rotation rate, 300 seconds covers only about 11.29 million rows—roughly
-28 seconds of history at 400,000 TPS—before fixed work and any safety factor.
+28 seconds of history at a conservative 400,000 write-outcomes/s stress rate—before fixed work and any safety
+factor. That rate is deliberately harsher than, and is not a relabeling of, the charter's mixed-system peak TPS.
 
 The real FUA intent-lane path independently recovered 300,001 INSERT operations in 7.57 seconds (39,630 ops/s) and
 285,878 mixed operations in 7.44 seconds (38,425 ops/s), both with exact row-count parity. Agreement between the two
@@ -74,13 +75,14 @@ suffix_limit = min(1,000,000 outcomes, floor(512 MiB / measured_worst_WAL_bytes_
 ```
 
 The measured narrow FUA path writes about 433 physical bytes/op, so one million outcomes is about 433 MB and the
-record cap wins. The checkpoint activation interval must therefore be at most 10 seconds at 100,000 TPS or 2.5
-seconds at 400,000 TPS. Wider records shorten the interval through the byte cap. Immutable content-addressed
+record cap wins. Under conservative write-only stress, the checkpoint activation interval must therefore be at
+most 10 seconds at 100,000 outcomes/s or 2.5 seconds at 400,000 outcomes/s. Wider records shorten the interval
+through the byte cap. Immutable content-addressed
 payloads and manifests must reuse unchanged artifacts; this cadence is not permission to rewrite 32 GiB every 2.5
 seconds.
 
 The actual narrow allocation measurement also makes checkpoint bandwidth part of physical selection. At 816.3
-retained bytes per appended INSERT plus about 433 physical WAL bytes/op, 400,000 TPS would create approximately
+retained bytes per appended INSERT plus about 433 physical WAL bytes/op, 400,000 write outcomes/s would create approximately
 326.5 MB/s of retained-allocation pressure and 173.2 MB/s of WAL writes before compaction/reuse and wider rows. A
 candidate whose incremental checkpoint/index work cannot remain below the qualified storage and GPU budgets cannot
 join this RTO profile even if raw replay is fast enough.

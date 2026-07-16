@@ -19,7 +19,7 @@ only `../PLAN.md` owns work.
   intent benchmark's offered-load/p99.9/recovery/footprint instrumentation; the build-only residency-byte probe;
   the recovery-time probe correction; the actual engine-facing frame-log rate plus same-physics fixed-record FUA
   distribution measurements; the build-only resident-input physical A/B example, including its embedded
-  decision-probe PTX; the build-only 12-family adaptation/pressure injection model; and all three prior final-review
+  decision-probe PTX; the corrected build-only 13-family adaptation/pressure/admission injection model; and all prior final-review
   dispositions. The next frozen packet lists and
   hashes every in-scope file. Other pre-existing user worktree changes are outside the packet and are not treated as
   R3-001 evidence.
@@ -256,7 +256,7 @@ not supply a canonical synchronous-commit offered-load matrix, stage tail distri
 isolation result, sparse-lane/global-skew result, pressure-controller hysteresis result, either direction of
 durable/apply imbalance, or sabotage failure. The build-only controller model supplies those bounded decision
 injections without claiming current production behavior. The current SLO/durability-envelope evidence, bounded
-physical-footprint comparison, 12-family controller injections, reviewed decision-level failure traces, RTO
+physical-footprint comparison, 13-family controller injections, reviewed decision-level failure traces, RTO
 capacity argument, and final design re-review are R3-001 acceptance gates. The canonical end-to-end SLO/controller
 matrix and implemented canonical
 fault campaign is a post-acceptance DUR-001/002 and RETIRE-002 graduation gate before standalone R3-004,
@@ -301,7 +301,7 @@ seconds. The first final independent review returned **REJECT** and is retained 
 were remediated in replacement packet v2. The v2 review in
 [`write-path-adr-final-independent-review-v2.md`](write-path-adr-final-independent-review-v2.md) also returned
 **REJECT**: it found the Candidate-B undo-end/fence defect and the missing pre-acceptance controller injections.
-Both are corrected, the A/B is rerun, and the 12-family injection model passes. The v3 review in
+Both are corrected, the A/B is rerun, and the original 12-family injection model passed. The v3 review in
 [`write-path-adr-final-independent-review-v3.md`](write-path-adr-final-independent-review-v3.md) returned
 **REJECT** because the model omitted soft/Rejecting pressure transitions and its wave-cap case shipped on an already
 expired age deadline. The model now covers soft/high/hard/lower recovery, independent byte/service pre-deadline
@@ -309,7 +309,20 @@ shipment, and oversized-item pre-claim rejection. Frozen
 [`write-path-adr-review-packet-v4.md`](write-path-adr-review-packet-v4.md) received an independent **ACCEPT** with no
 remaining pre-acceptance blocker, recorded in
 [`write-path-adr-final-independent-review-v4.md`](write-path-adr-final-independent-review-v4.md). Explicit user
-acceptance remains. The decision-level ACID/failure traces are complete in
+acceptance remained. Focused packet v5 then returned **REVISE** because the target-delta model did not derive class
+from the complete request envelope, checked only p99 for profile qualification, left the throughput unit/reference
+mix ambiguous, and missed one active benchmark's retired write target. Those findings are recorded in
+[`write-path-adr-final-independent-review-v5.md`](write-path-adr-final-independent-review-v5.md); the corrected
+13-family model and initial system mix were frozen in packet v6. That review also returned **REVISE** because route/
+data/access details remained deferred, peak cohort accounting was ambiguous, and an active read-QPS gate retained a
+conflicting label. [`write-path-adr-final-independent-review-v6.md`](write-path-adr-final-independent-review-v6.md)
+records the verdict. Packet v7 then returned **REVISE** because the sustained arrival process and generated
+ordinal/pair/amount assignments were not fully executable; the finding is retained in
+[`write-path-adr-final-independent-review-v7.md`](write-path-adr-final-independent-review-v7.md). Immutable
+[`oltp-benchmark-workload-v1.md`](oltp-benchmark-workload-v1.md) now additionally fixes every sustained arrival
+timestamp, zero-based generated ledger/DELETE ordinal, parameter-stream consumption, T8/T32 pairing, and amount
+assignment for replacement packet v8. The decision-level
+ACID/failure traces are complete in
 [`write-path-adr-traces.md`](write-path-adr-traces.md). The ADR remains proposed.
 Full canonical standalone fault evidence follows acceptance under DUR-001/002 and RETIRE-002 before production
 authority or host-store deletion; HA-001 is conditional for

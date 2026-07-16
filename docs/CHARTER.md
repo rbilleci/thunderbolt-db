@@ -32,6 +32,37 @@ coherence) so it **closes as GPU hardware advances** while the CPU path sits nea
 | Concurrent connections | > 100,000 (up to 1,000,000) |
 | RPO / RTO | 0 (no committed loss) / < 30 s failover, < 5 min full GPU recovery |
 
+The throughput targets are aggregate **committed transactions per second** for the immutable
+[`oltp-benchmark-workload-v1.md`](design/oltp-benchmark-workload-v1.md) BENCH-001 core-banking workload, not a per-
+class TPS promise and not a logical-operations/s target. Its repeating 200-transaction schedule is binding:
+
+| Class | Transactions / 200 | Canonical work |
+|---|---:|---|
+| R1 | 120 (60%) | one prepared bounded point/page read |
+| W1 | 50 (25%) | 35 INSERT, 10 UPDATE, 5 DELETE (70/20/10 within W1) |
+| T8 | 20 (10%) | the frozen eight-operation route, with exactly four mutations |
+| T32 | 10 (5%) | the frozen 32-operation route, with exactly 16 mutations |
+
+The schedule executes 650 logical operations per 200 transactions: 3.25 operations/transaction. Consequently the
+same run must report more than 325,000 logical operations/s at the strict sustained target and at least 1,300,000
+logical operations/s at peak; those figures are consequences of the TPS gate, not substitute acceptance units.
+Read-only R1 requests count as committed read-only transactions. Workload v1 freezes the schema/cardinality, seed
+and 80/20 hot/cold account selection, exact SQL and operation order, and numeric post-image/WAL-byte, index-fanout,
+touched-table, cold-access, and result bounds. A different or missing manifest invalidates the comparison.
+
+The sustained gate is the manifest's fixed, evenly paced 3,300,000-transaction warm-up followed by 66,000,000
+measurement arrivals over 30+600 contiguous seconds at 110,000 scheduled TPS. Measurement-scheduled transactions
+whose terminal committed completions are timestamped inside the measurement window, divided by 600, must exceed
+100,000 TPS; warm-up completions are excluded. Class latency is scheduled-arrival through terminal completion, and
+stage populations must finish at/below their starting values and drain to idle within one second. Peak bursts are the fixed sequence
+`B01`–`B10`; each schedules exactly 400,000 arrivals over one second. Peak **cohort TPS** is eventual terminal
+committed cohort count divided by that fixed arrival second, not completions timestamped inside the same second.
+Every named cohort must commit all 400,000 transactions, preserve the mix, pass every class latency envelope, and
+return stage populations to/below their pre-burst values within one second of the last arrival. Wall-clock completion
+throughput is an additional diagnostic. Best-window extrapolation, an omitted/failed cohort, a different workload,
+or standalone class saturation cannot satisfy either system throughput gate. Standalone R1/W1/T8/T32 sweeps remain
+mandatory diagnostics in both TPS and logical operations/s, but have no separate charter throughput threshold.
+
 Latency classes are explicit acceptance envelopes, not percentiles pooled across unlike work:
 
 - **R1** is one prepared bounded point/page read through the final client-visible result.
@@ -46,11 +77,14 @@ Latency classes are explicit acceptance envelopes, not percentiles pooled across
   and wall time are reported separately. There is no generic whole-transaction latency promise for this class.
 
 Every advertised class measures open-loop latency from scheduled arrival, includes producer slip and queueing, and
-passes independently at its declared offered load. Mixed read/write tests report R1, each W1 operation, T8/T32, the
-actual achieved mix, TPS, and logical operations/s separately; their pooled distribution is supplementary only.
-`p99.99` is reported by BENCH-001 but has no binding threshold yet. A synchronous write/transaction profile qualifies
-only when its measured durability percentile plus all bounded downstream work fits its class target; otherwise the
-profile is explicit non-SLO service or is refused, never silently acknowledged asynchronously.
+passes independently in the canonical sustained and peak runs. Mixed read/write tests report R1, each W1 operation,
+T8/T32, the actual achieved mix, TPS, and logical operations/s separately; their pooled latency distribution is
+supplementary only. `p99.99` is reported by BENCH-001 but has no binding threshold yet. A synchronous write/
+transaction profile qualifies only when its measured p50, p99, and p99.9 durability values plus percentile-matched
+bounded downstream margins each fit the corresponding strict class target; otherwise the profile is explicit
+non-SLO service or is refused, never silently acknowledged asynchronously. A downstream margin is a hard bound or a
+joint residual distribution from the same correlated end-to-end traces; adding independently sampled stage
+percentiles cannot qualify a profile. Direct open-loop end-to-end class latency is the final authority.
 
 ## The invariant — host is control plane ONLY
 - Every relational decision and every result value is computed on, and read back from, the **device**.

@@ -57,14 +57,22 @@ chronology or future sequencing. The full pre-unification record is archived at
   latency contract is classed: R1 bounded reads retain 0.5/1/5-ms p50/p99/p99.9; W1 single keyed synchronous
   mutations use 0.8/1.5/5 ms; bounded predeclared T8 and T32 transactions use 1.5/3/10 ms and 3/6/20 ms. Each class
   and each W1 operation passes independently; mixed-workload pooling cannot hide a failing class. Interactive/
-  data-dependent work remains a separately reported slow class without a generic wall-time promise.
+  data-dependent work remains a separately reported slow class without a generic wall-time promise. The 100,000
+  sustained and 400,000 burst targets are aggregate committed TPS for the charter's deterministic 60% R1 / 25% W1 /
+  10% T8 / 5% T32 mix. They are neither per-class TPS targets nor logical-operations/s targets; the fixed maximum-
+  operation T8/T32 routes make the same gates imply 325,000 and 1,300,000 logical operations/s respectively. The
+  immutable `design/oltp-benchmark-workload-v1.md` fixes schema/data, seed/skew, SQL/order, route resources, exact
+  evenly paced sustained-arrival timestamps, and named `B01`–`B10` cohorts. Sustained TPS excludes warm-up
+  completions; peak TPS is terminal committed cohort count divided by the fixed one-second arrival interval, and
+  wall-clock completion throughput is reported separately.
 - **Evidence:** Persistent-kernel experiments proved GPU point-read/index ceilings, while launch-per-batch dense
   indexing won the production integration tradeoff. The persistent SQL wave engine was retired; its source and
   experimental chronology are archived.
 - **Consequence:** Do not resurrect retired wave work from historical reviews. Complete **BENCH-001** before using
-  performance intuition to reorder major architecture work. Admission and scheduling derive residual budgets from
-  the request's advertised latency class; a durability profile that cannot fit is explicitly unqualified rather
-  than repaired through asynchronous acknowledgement.
+  performance intuition to reorder major architecture work. Admission derives the class from the predeclared
+  operation/mutation shape and every declared resource bound before scheduling derives a residual budget. A
+  durability profile qualifies only when p50, p99, and p99.9 plus percentile-matched downstream margins all fit;
+  failure is explicit rather than repaired through class escalation or asynchronous acknowledgement.
 
 ## ADR-007 — Full GPU-native execution, including eventual oracle retirement
 

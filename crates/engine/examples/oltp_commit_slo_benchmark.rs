@@ -1,7 +1,9 @@
 //! Phase-D CONCURRENT-COMMIT SLO benchmark (HANDOVER (D); the write-side analog of
 //! `r2_wave_engine_ab`): measures sustained + burst commit TPS and per-commit latency
-//! percentiles for the concurrent DML path (`execute_dml_concurrent`) against the charter SLO —
-//! **>100k TPS sustained, ≥400k TPS burst, p50/p99/p99.9 < 0.5/1/5 ms**.
+//! percentiles for the concurrent DML path (`execute_dml_concurrent`). This is an isolated W1
+//! INSERT characterization: its latency reference is **p50/p99/p99.9 < 0.8/1.5/5 ms**, while its
+//! TPS is diagnostic only. The binding >100k sustained / ≥400k burst gate belongs to the
+//! canonical mixed-system BENCH-001 workload, not this CPU-only single-operation benchmark.
 //!
 //! Closed-loop: N writer threads each drive single-row INSERTs on a plain (constraint-free)
 //! table — the ADR-009 homogeneous fast-path wave shape — for a fixed duration, timing every
@@ -68,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Phase-D concurrent-commit SLO benchmark (closed-loop, single-row INSERT waves)");
     println!(
-        "  arm={}  duration/point={seconds}s  SLO: >100k sustained / >=400k burst / p50 p99 p99.9 < 0.5 1 5 ms",
+        "  arm={}  duration/point={seconds}s  W1 latency: p50 p99 p99.9 < 0.8 1.5 5 ms; TPS diagnostic only",
         if durable { "DURABLE WAL (fsync-bound)" } else { "in-memory WAL (CC ceiling)" }
     );
     println!();

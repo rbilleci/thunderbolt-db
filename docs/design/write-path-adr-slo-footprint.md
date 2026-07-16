@@ -9,8 +9,11 @@ in the frozen packet
 This is R3-001 decision evidence, not a product benchmark or an implementation authority. The harness drives the
 real covered `t(id INT PRIMARY KEY, v INT)` GPU intent route: prepared typed parameters, device validation and
 append/tombstone apply, FUA lane durability, publication, and optional crash replay. Open-loop latency starts at the
-scheduled arrival, so producer slip and queueing are included. The charter thresholds are peak burst at least
-400,000 TPS and W1 single keyed synchronous mutation p50/p99/p99.9 below 0.8/1.5/5 ms. This report predates the
+scheduled arrival, so producer slip and queueing are included. The binding latency threshold is W1 single keyed
+synchronous mutation p50/p99/p99.9 below 0.8/1.5/5 ms. The charter's >100,000 sustained aggregate target and fixed
+400,000-transaction peak cohort now apply only to the deterministic R1/W1/T8/T32 system mix; this standalone/I/U/D-only harness reports TPS
+as diagnostic capacity and cannot pass or fail that aggregate gate. The binding schema/data/access/routes/timing are
+frozen separately in `oltp-benchmark-workload-v1.md`. This report predates the
 classed target decision but its raw measurements remain valid. Its “mixed” rows are I/U/D-only, not read/write,
 and the harness pools DML latency samples rather than reporting INSERT, UPDATE, and DELETE distributions separately.
 That pooling is insufficient for future graduation, where each operation and the declared mix must pass W1.
@@ -24,11 +27,11 @@ reported one-second peak is not treated as success when backlog makes scheduled-
 |---|---:|---:|---:|---:|---|
 | INSERT, 1,000 offered | 1,000 / 1,270 | 2.88 ms | 6.57 ms | 27.64 ms | **FAIL** all latency thresholds |
 | INSERT, 100,000 offered | 99,902 / 328,610 | 1.20 ms | 210.29 ms | 228.04 ms | **FAIL** all latency thresholds |
-| INSERT, 400,000 offered | 399,318 / 883,180 | 3.99 ms | 239.82 ms | 250.98 ms | **FAIL** latency; offered rate not sustained exactly |
+| INSERT, 400,000 offered | 399,318 / 883,180 | 3.99 ms | 239.82 ms | 250.98 ms | **FAIL** latency; achieved-rate diagnostic |
 | INSERT, closed-loop saturation, 32 drivers x 128 | 473,619 / 560,180 | 6.54 ms | 12.04 ms | 244.25 ms | throughput observed; **FAIL** latency |
-| 80% INSERT / 20% UPDATE, saturation | 312,763 / 397,140 | 1.33 ms | 5.56 ms | 10.22 ms | **FAIL** throughput and latency |
-| 80% INSERT / 20% DELETE, saturation | 275,892 / 387,800 | 1.36 ms | 6.97 ms | 13.71 ms | **FAIL** throughput and latency |
-| mixed requested 70/20/10 I/U/D, 100,000 offered; actual 73.5/18.4/8.2 | 92,744 / 155,600 | 1.28 ms | 44.88 ms | 223.92 ms | **FAIL** throughput and latency |
+| 80% INSERT / 20% UPDATE, saturation | 312,763 / 397,140 | 1.33 ms | 5.56 ms | 10.22 ms | **FAIL** latency; TPS diagnostic |
+| 80% INSERT / 20% DELETE, saturation | 275,892 / 387,800 | 1.36 ms | 6.97 ms | 13.71 ms | **FAIL** latency; TPS diagnostic |
+| mixed requested 70/20/10 I/U/D, 100,000 offered; actual 73.5/18.4/8.2 | 92,744 / 155,600 | 1.28 ms | 44.88 ms | 223.92 ms | **FAIL** latency; TPS diagnostic |
 | same mixed workload, 400,000 offered | 237,110 / 609,900 | 412.14 ms | 1,209.26 ms | 1,222.49 ms | **FAIL**, unstable overload/backlog |
 
 The mixed percentages differ from the requested weights because the harness preserves a lagged committed live-key

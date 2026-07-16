@@ -9,6 +9,119 @@ enum WorkClass {
     ColdOrRepairSlow,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncLatencyClass {
+    W1,
+    T8,
+    T32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LatencyPercentiles {
+    p50_us: u64,
+    p99_us: u64,
+    p999_us: u64,
+}
+
+impl LatencyPercentiles {
+    fn is_monotonic(self) -> bool {
+        self.p50_us <= self.p99_us && self.p99_us <= self.p999_us
+    }
+
+    fn fits_strictly_with_margin(self, margin: Self, budget: Self) -> bool {
+        self.is_monotonic()
+            && margin.is_monotonic()
+            && self.p50_us.saturating_add(margin.p50_us) < budget.p50_us
+            && self.p99_us.saturating_add(margin.p99_us) < budget.p99_us
+            && self.p999_us.saturating_add(margin.p999_us) < budget.p999_us
+    }
+}
+
+impl SyncLatencyClass {
+    fn latency_budget_us(self) -> LatencyPercentiles {
+        match self {
+            Self::W1 => LatencyPercentiles {
+                p50_us: 800,
+                p99_us: 1_500,
+                p999_us: 5_000,
+            },
+            Self::T8 => LatencyPercentiles {
+                p50_us: 1_500,
+                p99_us: 3_000,
+                p999_us: 10_000,
+            },
+            Self::T32 => LatencyPercentiles {
+                p50_us: 3_000,
+                p99_us: 6_000,
+                p999_us: 20_000,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SyncResourceEnvelope {
+    post_image_wal_bytes: u64,
+    maintained_index_fanout: u16,
+    touched_tables: u16,
+    cold_accesses: u16,
+    result_bytes: u64,
+}
+
+impl SyncResourceEnvelope {
+    fn fits_within(self, bounds: Self) -> bool {
+        self.post_image_wal_bytes <= bounds.post_image_wal_bytes
+            && self.maintained_index_fanout <= bounds.maintained_index_fanout
+            && self.touched_tables <= bounds.touched_tables
+            && self.cold_accesses <= bounds.cold_accesses
+            && self.result_bytes <= bounds.result_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SyncRequestEnvelope {
+    predeclared: bool,
+    keyed_single_mutation: bool,
+    operations: u8,
+    mutations: u8,
+    resources: SyncResourceEnvelope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeclaredSyncRoute {
+    class: SyncLatencyClass,
+    resource_bounds: SyncResourceEnvelope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmittedSyncRequest {
+    class: SyncLatencyClass,
+}
+
+impl AdmittedSyncRequest {
+    fn residual_p99_budget_us(self, downstream_p99_us: u64) -> Option<u64> {
+        let target = self.class.latency_budget_us().p99_us;
+        (downstream_p99_us < target).then(|| target - downstream_p99_us)
+    }
+}
+
+fn admit_sync_request(
+    request: SyncRequestEnvelope,
+    route: DeclaredSyncRoute,
+) -> Option<AdmittedSyncRequest> {
+    if !request.predeclared || !request.resources.fits_within(route.resource_bounds) {
+        return None;
+    }
+    let shape_matches = match route.class {
+        SyncLatencyClass::W1 => {
+            request.operations == 1 && request.mutations == 1 && request.keyed_single_mutation
+        }
+        SyncLatencyClass::T8 => (2..=8).contains(&request.operations) && request.mutations <= 4,
+        SyncLatencyClass::T32 => (9..=32).contains(&request.operations) && request.mutations <= 16,
+    };
+    shape_matches.then_some(AdmittedSyncRequest { class: route.class })
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Pending {
     lane: u8,
@@ -23,16 +136,21 @@ enum WaveDecision {
     Wait,
     Ship { lane: u8, intents: usize },
     RejectOversizedBeforeClaim { lane: u8 },
+    RejectUnqualifiedBeforeClaim,
 }
 
 fn choose_wave(
     pending: &[Pending],
     class: WorkClass,
-    oldest_budget_us: u64,
+    admitted: AdmittedSyncRequest,
+    downstream_p99_us: u64,
     target_intents: usize,
     max_bytes: u64,
     max_predicted_us: u64,
 ) -> WaveDecision {
+    let Some(oldest_budget_us) = admitted.residual_p99_budget_us(downstream_p99_us) else {
+        return WaveDecision::RejectUnqualifiedBeforeClaim;
+    };
     let Some(oldest) = pending
         .iter()
         .filter(|item| item.class == class)
@@ -148,29 +266,12 @@ enum DurabilityProfile {
     UnqualifiedSync,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SyncLatencyClass {
-    W1,
-    T8,
-    T32,
-}
-
-impl SyncLatencyClass {
-    fn p99_budget_us(self) -> u64 {
-        match self {
-            Self::W1 => 1_500,
-            Self::T8 => 3_000,
-            Self::T32 => 6_000,
-        }
-    }
-}
-
 fn qualify_sync_profile(
-    fence_p99_us: u64,
-    fixed_margin_us: u64,
-    class: SyncLatencyClass,
+    fence: LatencyPercentiles,
+    downstream_margin: LatencyPercentiles,
+    admitted: AdmittedSyncRequest,
 ) -> DurabilityProfile {
-    if fence_p99_us.saturating_add(fixed_margin_us) < class.p99_budget_us() {
+    if fence.fits_strictly_with_margin(downstream_margin, admitted.class.latency_budget_us()) {
         DurabilityProfile::QualifiedSync
     } else {
         DurabilityProfile::UnqualifiedSync
@@ -366,6 +467,178 @@ fn pass(name: &str) {
 }
 
 fn main() {
+    let w1_route = DeclaredSyncRoute {
+        class: SyncLatencyClass::W1,
+        resource_bounds: SyncResourceEnvelope {
+            post_image_wal_bytes: 512,
+            maintained_index_fanout: 2,
+            touched_tables: 1,
+            cold_accesses: 0,
+            result_bytes: 64,
+        },
+    };
+    let t8_route = DeclaredSyncRoute {
+        class: SyncLatencyClass::T8,
+        resource_bounds: SyncResourceEnvelope {
+            post_image_wal_bytes: 4_096,
+            maintained_index_fanout: 8,
+            touched_tables: 3,
+            cold_accesses: 0,
+            result_bytes: 2_048,
+        },
+    };
+    let t32_route = DeclaredSyncRoute {
+        class: SyncLatencyClass::T32,
+        resource_bounds: SyncResourceEnvelope {
+            post_image_wal_bytes: 16_384,
+            maintained_index_fanout: 32,
+            touched_tables: 3,
+            cold_accesses: 0,
+            result_bytes: 8_192,
+        },
+    };
+    let w1_request = SyncRequestEnvelope {
+        predeclared: true,
+        keyed_single_mutation: true,
+        operations: 1,
+        mutations: 1,
+        resources: w1_route.resource_bounds,
+    };
+    let t8_request = SyncRequestEnvelope {
+        predeclared: true,
+        keyed_single_mutation: false,
+        operations: 8,
+        mutations: 4,
+        resources: t8_route.resource_bounds,
+    };
+    let t32_request = SyncRequestEnvelope {
+        predeclared: true,
+        keyed_single_mutation: false,
+        operations: 32,
+        mutations: 16,
+        resources: t32_route.resource_bounds,
+    };
+    let admitted_w1 = admit_sync_request(w1_request, w1_route).expect("W1 must admit");
+    let admitted_t8 = admit_sync_request(t8_request, t8_route).expect("T8 must admit");
+    let admitted_t32 = admit_sync_request(t32_request, t32_route).expect("T32 must admit");
+    assert!(admit_sync_request(
+        SyncRequestEnvelope {
+            operations: 2,
+            mutations: 0,
+            ..t8_request
+        },
+        t8_route,
+    )
+    .is_some());
+    assert!(admit_sync_request(
+        SyncRequestEnvelope {
+            operations: 9,
+            mutations: 0,
+            ..t32_request
+        },
+        t32_route,
+    )
+    .is_some());
+
+    // A caller cannot select a larger latency budget. The admitted class is derived from the
+    // exact operation/mutation shape plus every route-declared resource dimension.
+    assert_eq!(admit_sync_request(w1_request, t8_route), None);
+    assert_eq!(admit_sync_request(w1_request, t32_route), None);
+    for request in [
+        SyncRequestEnvelope {
+            operations: 0,
+            ..w1_request
+        },
+        SyncRequestEnvelope {
+            operations: 2,
+            ..w1_request
+        },
+        SyncRequestEnvelope {
+            mutations: 0,
+            ..w1_request
+        },
+        SyncRequestEnvelope {
+            mutations: 2,
+            ..w1_request
+        },
+        SyncRequestEnvelope {
+            keyed_single_mutation: false,
+            ..w1_request
+        },
+    ] {
+        assert_eq!(admit_sync_request(request, w1_route), None);
+    }
+    for request in [
+        SyncRequestEnvelope {
+            operations: 1,
+            ..t8_request
+        },
+        SyncRequestEnvelope {
+            operations: 9,
+            ..t8_request
+        },
+        SyncRequestEnvelope {
+            mutations: 5,
+            ..t8_request
+        },
+        SyncRequestEnvelope {
+            predeclared: false,
+            ..t8_request
+        },
+    ] {
+        assert_eq!(admit_sync_request(request, t8_route), None);
+    }
+    for request in [
+        SyncRequestEnvelope {
+            operations: 8,
+            ..t32_request
+        },
+        SyncRequestEnvelope {
+            operations: 33,
+            ..t32_request
+        },
+        SyncRequestEnvelope {
+            mutations: 17,
+            ..t32_request
+        },
+    ] {
+        assert_eq!(admit_sync_request(request, t32_route), None);
+    }
+    for resources in [
+        SyncResourceEnvelope {
+            post_image_wal_bytes: t8_route.resource_bounds.post_image_wal_bytes + 1,
+            ..t8_request.resources
+        },
+        SyncResourceEnvelope {
+            maintained_index_fanout: t8_route.resource_bounds.maintained_index_fanout + 1,
+            ..t8_request.resources
+        },
+        SyncResourceEnvelope {
+            touched_tables: t8_route.resource_bounds.touched_tables + 1,
+            ..t8_request.resources
+        },
+        SyncResourceEnvelope {
+            cold_accesses: t8_route.resource_bounds.cold_accesses + 1,
+            ..t8_request.resources
+        },
+        SyncResourceEnvelope {
+            result_bytes: t8_route.resource_bounds.result_bytes + 1,
+            ..t8_request.resources
+        },
+    ] {
+        assert_eq!(
+            admit_sync_request(
+                SyncRequestEnvelope {
+                    resources,
+                    ..t8_request
+                },
+                t8_route,
+            ),
+            None
+        );
+    }
+    pass("sync class admission derives budgets from the full envelope");
+
     // Sparse/global skew: this W1 example reserves 700 us of its 1,500-us p99 for downstream work,
     // so the one old resident-fast item ships at its 800-us residual deadline even while a
     // different lane has a young throughput population. Slow-class work is not coalesced into it.
@@ -391,7 +664,15 @@ fn main() {
         predicted_us: 600,
     });
     assert_eq!(
-        choose_wave(&skew, WorkClass::ResidentFast, 800, 32, 16_384, 800),
+        choose_wave(
+            &skew,
+            WorkClass::ResidentFast,
+            admitted_w1,
+            700,
+            32,
+            16_384,
+            800,
+        ),
         WaveDecision::Ship {
             lane: 0,
             intents: 1
@@ -418,7 +699,15 @@ fn main() {
         },
     ];
     assert_eq!(
-        choose_wave(&byte_bounded, WorkClass::ResidentFast, 800, 32, 1_000, 500),
+        choose_wave(
+            &byte_bounded,
+            WorkClass::ResidentFast,
+            admitted_w1,
+            700,
+            32,
+            1_000,
+            500,
+        ),
         WaveDecision::Ship {
             lane: 3,
             intents: 1
@@ -444,7 +733,8 @@ fn main() {
         choose_wave(
             &service_bounded,
             WorkClass::ResidentFast,
-            800,
+            admitted_w1,
+            700,
             32,
             1_000,
             500
@@ -465,7 +755,8 @@ fn main() {
         choose_wave(
             &oversized_bytes,
             WorkClass::ResidentFast,
-            800,
+            admitted_w1,
+            700,
             32,
             1_000,
             500
@@ -483,12 +774,25 @@ fn main() {
         choose_wave(
             &oversized_service,
             WorkClass::ResidentFast,
-            800,
+            admitted_w1,
+            700,
             32,
             1_000,
             500
         ),
         WaveDecision::RejectOversizedBeforeClaim { lane: 5 }
+    );
+    assert_eq!(
+        choose_wave(
+            &service_bounded,
+            WorkClass::ResidentFast,
+            admitted_w1,
+            1_500,
+            32,
+            1_000,
+            500,
+        ),
+        WaveDecision::RejectUnqualifiedBeforeClaim
     );
     pass("wave byte/service trigger and oversized pre-claim rejection");
 
@@ -526,30 +830,94 @@ fn main() {
     );
     pass("durable/apply lag directions preserve first-gap visibility");
 
-    // Fence-slot/latency degradation subframes and paces. Qualification uses the request's class,
-    // and equality with a strict target fails. Neither action changes acknowledgement semantics.
-    let unqualified = qualify_sync_profile(1_723, 200, SyncLatencyClass::W1);
+    // Fence-slot/latency degradation subframes and paces. Qualification uses the admitted class
+    // and independently checks p50, p99, and p99.9. Equality fails for every class/percentile.
+    let downstream_margin = LatencyPercentiles {
+        p50_us: 200,
+        p99_us: 200,
+        p999_us: 200,
+    };
+    let unqualified = qualify_sync_profile(
+        LatencyPercentiles {
+            p50_us: 1_662,
+            p99_us: 1_723,
+            p999_us: 1_723,
+        },
+        downstream_margin,
+        admitted_w1,
+    );
     assert_eq!(unqualified, DurabilityProfile::UnqualifiedSync);
     assert_eq!(
         decide_fence(0, 1_723, 600, unqualified),
         FenceDecision::UnqualifiedAndPace
     );
     assert_eq!(
-        qualify_sync_profile(500, 200, SyncLatencyClass::W1),
+        qualify_sync_profile(
+            LatencyPercentiles {
+                p50_us: 500,
+                p99_us: 1_000,
+                p999_us: 4_000,
+            },
+            downstream_margin,
+            admitted_w1,
+        ),
         DurabilityProfile::QualifiedSync
     );
     assert_eq!(
-        qualify_sync_profile(1_723, 200, SyncLatencyClass::T8),
+        qualify_sync_profile(
+            LatencyPercentiles {
+                p50_us: 900,
+                p99_us: 1_723,
+                p999_us: 4_000,
+            },
+            downstream_margin,
+            admitted_t8,
+        ),
         DurabilityProfile::QualifiedSync
     );
-    assert_eq!(
-        qualify_sync_profile(5_800, 200, SyncLatencyClass::T32),
-        DurabilityProfile::UnqualifiedSync
-    );
-    assert_eq!(
-        qualify_sync_profile(5_799, 200, SyncLatencyClass::T32),
-        DurabilityProfile::QualifiedSync
-    );
+    let equality_margin = LatencyPercentiles {
+        p50_us: 100,
+        p99_us: 100,
+        p999_us: 100,
+    };
+    for admitted in [admitted_w1, admitted_t8, admitted_t32] {
+        let budget = admitted.class.latency_budget_us();
+        let equality_profiles = [
+            LatencyPercentiles {
+                p50_us: budget.p50_us - 100,
+                p99_us: budget.p50_us - 100,
+                p999_us: budget.p50_us - 100,
+            },
+            LatencyPercentiles {
+                p50_us: 0,
+                p99_us: budget.p99_us - 100,
+                p999_us: budget.p99_us - 100,
+            },
+            LatencyPercentiles {
+                p50_us: 0,
+                p99_us: 0,
+                p999_us: budget.p999_us - 100,
+            },
+        ];
+        for fence in equality_profiles {
+            assert_eq!(
+                qualify_sync_profile(fence, equality_margin, admitted),
+                DurabilityProfile::UnqualifiedSync
+            );
+        }
+        assert_eq!(
+            qualify_sync_profile(
+                LatencyPercentiles {
+                    p50_us: budget.p50_us - 101,
+                    p99_us: budget.p99_us - 101,
+                    p999_us: budget.p999_us - 101,
+                },
+                equality_margin,
+                admitted,
+            ),
+            DurabilityProfile::QualifiedSync
+        );
+    }
     assert_eq!(
         decide_fence(0, 500, 600, DurabilityProfile::QualifiedSync),
         FenceDecision::SubframeAndPace
@@ -558,7 +926,7 @@ fn main() {
         decide_fence(1, 500, 600, DurabilityProfile::QualifiedSync),
         FenceDecision::Normal
     );
-    pass("fence degradation and sync qualification are bounded");
+    pass("fence degradation and full-profile sync qualification are bounded");
 
     // Held snapshots block reclaim but permit bounded STRATA demotion while cold quota fits.
     let high = PressureInput {
@@ -766,5 +1134,5 @@ fn main() {
     assert_eq!(lane_resize_action, "keep-fixed-lanes");
     pass("global-drain lane resize is refused");
 
-    println!("PASS all 12 R3-001 adaptation injection families");
+    println!("PASS all 13 R3-001 adaptation injection families");
 }

@@ -213,7 +213,7 @@ the controller rules; real queue/device/STRATA latency and sabotage remain post-
 | cut-exact checkpoint and empty/first/exhausted conversion | CKP-01–07, PUB-01/07–10 | R3-006 current proof distinguished from target graduation |
 | activation/retention, indeterminate clients, terminal pins, fresh context | ACT-01–10, REC-01–18 | one authority or explicit unavailability |
 | migration crash/rollback boundary | MIG-01–08 | no mixed-mode serving |
-| cold/index/lag/skew/pressure injections and controller rules | PERF-01–09, GC-01–07 | bounded 12-family M pass; canonical runtime qualification remains G |
+| class admission plus cold/index/lag/skew/pressure injections and controller rules | PERF-01–09, GC-01–07 | bounded 13-family M pass with full-envelope class derivation and all-percentile qualification; canonical runtime qualification remains G |
 
 ## Review disposition
 

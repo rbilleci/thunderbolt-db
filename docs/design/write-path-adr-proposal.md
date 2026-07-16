@@ -62,6 +62,15 @@ operations with at most four mutations and use 1.5/3/10 ms; T32 contains 9–32 
 16 mutations and uses 3/6/20 ms. T8/T32 also require declared byte, index-fanout, touched-table, cold-access, and
 result bounds. Interactive or data-dependent slow work has no generic client-wall-time SLO; statement, terminal,
 database-active, and wall time remain separately observable.
+The 100,000 sustained and 400,000 burst targets bind aggregate committed TPS for immutable
+[`oltp-benchmark-workload-v1.md`](oltp-benchmark-workload-v1.md): exact schema/data, seed/skew, prepared SQL/order,
+numeric route envelopes, and a 200-transaction mix of 120 R1, 50 W1 split 35/10/5 INSERT/UPDATE/DELETE, 20 eight-
+operation/four-mutation T8, and 10 32-operation/16-mutation T32. Its exact 650 logical operations make the same gates
+imply 325,000 and 1,300,000 logical operations/s; per-class saturation is diagnostic rather than an alternative
+acceptance path. Sustained TPS counts only measurement-scheduled terminal completions inside the fixed 600-second
+window. Peak cohort TPS is all
+400,000 terminal committed outcomes divided by each fixed one-second arrival interval for `B01`–`B10`; wall-clock
+completion throughput is reported separately and every named cohort must pass.
 The 2026-07-15 current-path measurement failed the end-to-end SLO at low load, target load, and update/delete mixes,
 and its current intent route cannot supply non-INT4/index-fanout coverage. A same-physics fixed-record FUA harness
 measured 1.662-ms p50/1.723-ms p99 at queue depth one, while the actual engine-facing variable-payload
@@ -726,7 +735,10 @@ asynchronous ticket mode is never enabled automatically to recover latency.
 
 ### 9. Automatic adaptation is bounded by the end-to-end latency budget
 
-Automatic batching and stage-credit admission are required. A wave ships when its intent/byte/predicted-kernel
+Automatic batching and stage-credit admission are required. Admission first derives W1/T8/T32 from the request's
+predeclared operation/mutation shape and checks post-image/WAL bytes, index fanout, touched tables, cold accesses,
+and result bytes against the frozen route manifest. Only that admitted value can select a latency budget. A wave
+ships when its intent/byte/predicted-kernel
 target is reached **or** its oldest item reaches the wave budget, whichever happens first. The wave budget is the
 admitted R1/W1/T8/T32 end-to-end p99 target minus measured downstream fence, apply, publication, and response
 margins; a fixed grouping cap that alone exceeds that class target is invalid. Validation and apply coalescers obey
@@ -747,14 +759,18 @@ The controller is deliberately small and explainable:
 | free/reserved VRAM, dead bytes, horizon lag, snapshot age, cold quota, and scratch demand | invoke the watermarked GC/STRATA controller in section 10 |
 
 The synchronous durability floor is a qualification input, not a batching variable. At startup and continuously
-from real fenced frames, the runtime maintains the durable-fence distribution for each advertised durability
-profile. A low-latency synchronous route is qualified only while its configured fence percentile plus bounded
-validation, apply, publication, and response margins fits the corresponding end-to-end budget. If the floor alone
-does not fit, admission pacing cannot manufacture a pass: the deployment reports the profile unqualified and may
-continue only under a separately advertised non-SLO synchronous class or refuse the route. It never silently enables
-asynchronous acknowledgement, weakens RPO, or changes MVCC representation. Transient fence pressure still causes
-bounded subframing and pre-WAL pacing; persistent failure trips the qualification state with hysteresis so clients
-receive an explicit capability result instead of unbounded queueing.
+from real fenced frames, the runtime maintains p50, p99, and p99.9 durable-fence values for each advertised
+durability profile. A low-latency synchronous route is qualified only while each value plus its percentile-matched
+bounded validation, apply, publication, and response margin is strictly below the corresponding end-to-end class
+target. The scheduler's residual oldest-age calculation uses the admitted class's p99 values, but that one control
+calculation cannot qualify the complete profile. Downstream margins are hard bounds or joint residual distributions
+from the same correlated end-to-end traces, never sums of independently sampled stage percentiles; the binding
+open-loop end-to-end measurement remains final. If any floor does not fit, admission pacing cannot manufacture a
+pass: the deployment reports the profile unqualified and may continue only under a separately advertised non-SLO
+synchronous class or refuse the route. It never silently enables asynchronous acknowledgement, weakens RPO, changes
+MVCC representation, or relabels work into a larger class. Transient fence pressure still causes bounded subframing
+and pre-WAL pacing; persistent failure trips the qualification state with hysteresis so clients receive an explicit
+capability result instead of unbounded queueing.
 
 Adaptation constants are measured internal policy, not workload feature flags. They have lower/upper bounds,
 hysteresis where state can oscillate, and telemetry proving both the chosen action and oldest-age outcome. Runtime
@@ -1312,13 +1328,17 @@ graduation failure. [`write-path-adr-physical-selection.md`](write-path-adr-phys
 common durability envelope, supplies the bounded width/fanout/batch/footprint A/B, and selects compact append/tombstone without
 accepting the current allocation or claiming an end-to-end SLO pass. The parameterized five-minute RTO capacity
 argument is complete in [`write-path-adr-rto-capacity.md`](write-path-adr-rto-capacity.md); its canonical artifact/
-index rates remain post-acceptance qualification rather than current facts. The 12-family build-only controller
-injection model now passes the required cold/index/lag/skew/pressure/hysteresis/maintenance schedules without an
-async or post-WAL escape. Frozen review packet v4 received an independent **ACCEPT** with no pre-acceptance blocker
-under the prior uniform latency target. The subsequent classed R1/W1/T8/T32 target revision does not accept this
-proposal and requires the focused post-v4 target-consistency re-review in
-[`write-path-adr-review-packet-v5.md`](write-path-adr-review-packet-v5.md) before the explicit user acceptance
-decision. Independent performance,
+index rates remain post-acceptance qualification rather than current facts. The corrected 13-family build-only
+controller injection model derives W1/T8/T32 from the complete envelope, sabotages class escalation plus every
+count/resource boundary, derives the wave age from the admitted p99 budget, checks all strict class/percentile
+qualification boundaries, and passes the required cold/index/lag/skew/pressure/hysteresis/maintenance schedules
+without an async or post-WAL escape. Frozen review packet v4 received an independent **ACCEPT** with no pre-
+acceptance blocker under the prior uniform latency target. Focused packets v5 and v6 returned **REVISE** on the
+initial classed-target integration and its incomplete benchmark manifest/accounting; their findings are recorded in
+`write-path-adr-final-independent-review-v5.md` and `write-path-adr-final-independent-review-v6.md`. Packet v7
+returned **REVISE** because the sustained arrival timestamps and generated transaction parameters were not fully
+executable; `write-path-adr-final-independent-review-v7.md` records the finding. The complete correction is frozen in
+packet v8 before the explicit user acceptance decision. Independent performance,
 durability/resilience, transactional ACID, and consistency/accuracy reviews all returned **REVISE**; every design
 finding is incorporated, but that does not itself accept the proposal.
 The tuned PostgreSQL comparison is separately owned by **BENCH-001** and is not a substitute for this internal
@@ -1335,6 +1355,13 @@ include:
   UPDATE, DELETE, declared I/U/D mix, and each transaction envelope passing independently; mixed read/write runs also
   report R1 separately, and disabled compaction/index-maintenance sabotage fails admission instead of silently
   degrading a prepared route;
+- exact execution of `oltp-benchmark-workload-v1.md`: schedule its fixed evenly paced 3,300,000 warm-up and
+  66,000,000 measured arrivals at 110,000 TPS over 30+600 seconds; measurement-scheduled terminal completions inside
+  the measurement window exceed 100,000 TPS with no queue growth; every named peak
+  cohort `B01`–`B10` schedules 400,000 arrivals over one second, commits all 400,000, passes each class latency
+  envelope, and drains stage populations to/below pre-burst values within one second. Report cohort TPS separately
+  from wall-clock completion throughput, the implied >325,000/1,300,000 logical operations/s, and reject manifest,
+  best-window, omitted-cohort, or per-class substitution;
 - apply-before-durable checkpoint sabotage: pause FUA after a hidden future birth/death/index stamp, checkpoint at
   the old cut, tear the frame, crash, recover, reuse the abandoned sequence, and prove exact C projection;
 - crash injection after every physical WAL fragment/marker and rollover boundary, including missing, duplicate,
@@ -1400,4 +1427,6 @@ The acceptance review should pay particular attention to these choices:
 17. replacing the architecture's serial durability/apply arrow with the cut-join rule while keeping bounded
     asynchronous tickets and standalone-versus-replicated failure claims explicit; and
 18. class-specific R1/W1/T8/T32 measurement and residual-budget qualification, including independent W1 operation
-    gates, resource-bounded T8/T32 admission, strict percentile boundaries, and no pooled-distribution escape.
+    gates, derived resource-bounded T8/T32 admission, strict full-profile percentile boundaries, the binding
+    immutable workload-v1 system-mix/cohort TPS/operations accounting, and no pooled-distribution, omitted-burst, or
+    per-class-throughput escape.

@@ -89,10 +89,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   The fixed-record harness is supporting fence-physics evidence, not the relational lane. A build-only
   resident-input comparison across 8/32/128-byte rows, 1/3/6 indexes, and batch sizes 1/256/4,096 fences the odd/
   even seqlock transitions, ends undo at the replacement commit, asserts old/current visibility, and selects compact
-  append/tombstone in every p50 cell; the semantically complete formats are byte-tied. The build-only 12-family
-  controller injection model also passes cold/index preclaim, both lag directions, sparse/global skew, wave caps,
-  hard credits, class-aware strict W1/T8/T32 durability qualification, held-snapshot pressure, hysteresis, cold-quota/disabled-maintenance
-  rejection, overlap/yield, starvation override, and global-drain-resize refusal.
+  append/tombstone in every p50 cell; the semantically complete formats are byte-tied. The corrected build-only
+  13-family controller injection model derives W1/T8/T32 only after complete operation/mutation/resource admission,
+  rejects class escalation and every count/resource overflow, derives the wave deadline from that admitted class,
+  and qualifies p50/p99/p99.9 independently with strict equality failure for every class and percentile. It also
+  passes cold/index preclaim, both lag directions, sparse/global skew, wave caps, hard credits, held-snapshot
+  pressure, hysteresis, cold-quota/disabled-maintenance rejection, overlap/yield, starvation override, and global-
+  drain-resize refusal.
   This selects the physical design without accepting the current 816-B allocation or relabeling its end-to-end SLO
   failure. The five-minute capacity argument is explicit: the
   current serial/FUA replay paths measure about 38–40k outcomes/s; a two-attempt profile uses a 19,200/s floor,
@@ -105,8 +108,24 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   **ACCEPT** and no remaining pre-acceptance blocker under the prior uniform latency target. The accepted target
   policy now separates R1 reads (0.5/1/5 ms), W1 single keyed synchronous mutations (0.8/1.5/5 ms), T8 bounded
   predeclared transactions (1.5/3/10 ms), and T32 bounded predeclared transactions (3/6/20 ms); W1 operations and
-  all classes qualify independently. The target-policy amendments in `DECISIONS.md` and `ARCHITECTURE.md` do not
-  accept the proposed write-path ADR. A focused post-v4 target-consistency re-review now precedes explicit write-path
+  all classes qualify independently. Focused packet v5 returned **REVISE**: the executable did not derive class from
+  the full envelope, treated p99-only compatibility as complete profile qualification, the throughput targets did
+  not select TPS versus operations/s or a reference mix, and an active isolated benchmark retained 0.5/1/5-ms write
+  prose. The corrections bind >100,000 sustained aggregate committed TPS and a 400,000-transaction peak cohort to a
+  deterministic
+  60% R1 / 25% W1 / 10% maximum-shape T8 / 5% maximum-shape T32 mix. Its 3.25 operations/transaction imply
+  >325,000 and 1,300,000 logical operations/s; standalone class sweeps are diagnostic only. Focused packet v6
+  returned **REVISE** because exact route/data/access manifests remained deferred, one-second peak cohort accounting
+  and burst enumeration were ambiguous, and an active read-QPS gate retained a conflicting system-SLO label.
+  Immutable `docs/design/oltp-benchmark-workload-v1.md` now fixes schema/cardinality, seed/skew, exact SQL/order,
+  numeric route envelopes, 30+600-second sustained timing, and named `B01`–`B10` cohorts. Focused packet v7 returned
+  **REVISE** because the sustained arrival timestamps, generated ledger/DELETE ordinals, and T32 pair/amount
+  assignments were not fully executable. Workload v1 now also fixes every warm-up/measurement arrival timestamp,
+  excludes warm-up completions from sustained TPS, and fixes every zero-based generated ordinal, parameter-stream
+  consumption, and debit/credit amount assignment. Peak TPS is committed
+  cohort count divided by the fixed arrival second; wall completion throughput is diagnostic, every cohort must
+  pass, and the active route gate is explicitly local. The target-policy amendments in `DECISIONS.md` and
+  `ARCHITECTURE.md` do not accept the proposed write-path ADR. Replacement packet v8 now precedes explicit write-path
   acceptance. The implemented standalone canonical
   campaign follows acceptance under R3-003, DUR-001/002, and RETIRE-002 before production authority or
   host-store removal;
@@ -121,7 +140,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Production transient GPU integrations: catalog and bounded-function routes pass.
 - Pgwire: ordinary suite **3 passed** plus the ignored non-vacuous sharded/NULL GPU golden passes.
 - Production mixed gate: **116.2k reads/s**, p50 **246us**, p99 **501us**, p99.9 **671us**; zero host gathers,
-  zero fallback groups, and 160/160 host-install-elided writes.
+  zero fallback groups, and 160/160 host-install-elided writes. Its read-QPS floor is gate-local non-vacuity
+  evidence, not the charter's aggregate mixed-system TPS gate.
 - Read roofline: in-L2 `count_i32_compare` approximately **0.87x** the same-run `sum_i32` roofline; grouped
   kernel approximately **1,678 M elements/s**.
 - Canonical report card: 48M-row out-of-L2 batched route **250.2M lookups/s at batch 65,536, p50 132us**;
