@@ -51,9 +51,9 @@ use std::sync::atomic::Ordering;
 
 mod materialized_column_decode;
 mod materialized_join_run;
+mod streaming_chunk_keys;
 mod streaming_cold_admission;
 mod streaming_cold_lifecycle;
-mod streaming_chunk_keys;
 mod streaming_dml_class;
 mod streaming_grouped_fold;
 mod streaming_join;
@@ -250,10 +250,7 @@ fn chunk_key_bloom_cap_bytes() -> u64 {
 const CLASS_DEVICE_UNIQUE_BATCH_MAX_ROWS: usize = 256;
 
 #[cfg(test)]
-type ClassResolvePinHook = (
-    Arc<std::sync::Barrier>,
-    Arc<std::sync::Barrier>,
-);
+type ClassResolvePinHook = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
 
 #[cfg(test)]
 fn class_resolve_pin_hook() -> &'static std::sync::Mutex<Option<ClassResolvePinHook>> {
@@ -274,10 +271,7 @@ pub(crate) fn install_class_resolve_pin_hook() -> ClassResolvePinHook {
 }
 
 #[cfg(test)]
-type ChunkKeyPrimePinHook = (
-    Arc<std::sync::Barrier>,
-    Arc<std::sync::Barrier>,
-);
+type ChunkKeyPrimePinHook = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
 
 #[cfg(test)]
 fn chunk_key_prime_pin_hook() -> &'static std::sync::Mutex<Option<ChunkKeyPrimePinHook>> {
@@ -799,12 +793,10 @@ impl Engine {
 
     /// Write the cold-tier checkpoint artifact beside the lanes checkpoint. `boundary_index` is
     /// the RECOVERY-SEAM value stamped into the artifact — the INCLUSIVE index of the
-    /// checkpoint's last record, which is what the seam's `committed_seq()` reaches (replay
-    /// publishes each record's own index). The LIVE watermark is accepted in EITHER convention
-    /// (audit HIGH): `boundary_index` (serial/replay-derived engines) or `frontier_index` (the
-    /// lane pump's exclusive `visible_global_cut = base_seq + cut`) — both prove every stamp is
-    /// <= `boundary_index` at a quiesced cut, so a generation-current entry's content IS the
-    /// boundary state. A table qualifies when its entry's pinned generation is ptr-equal current
+    /// checkpoint's last record, which is what both recovery replay and the corrected R3-006 lane
+    /// publication reach. The lane/WAL cut is an EXCLUSIVE next-slot frontier but is never a
+    /// `committed_seq`; only the converted inclusive boundary qualifies the artifact. A table
+    /// qualifies when its entry's pinned generation is ptr-equal current
     /// (untouched since its settled install), or the 6c-1 patcher brings it current at the
     /// observed watermark (the patch install re-proves settledness; a concurrent commit fails
     /// it — a safe exclusion). A watermark moved by a racing commit after qualification ABORTS
@@ -817,12 +809,11 @@ impl Engine {
         base: &std::path::Path,
         cut: u64,
         boundary_index: Index,
-        frontier_index: Index,
     ) -> Result<usize, EngineError> {
         use std::io::Write;
         let path = streaming_cold_checkpoint_path(base, cut);
         let watermark = self.committed_seq();
-        if watermark != boundary_index && watermark != frontier_index {
+        if watermark != boundary_index {
             // Not quiesced at the cut (a commit raced the checkpoint): skip — the artifact would
             // never match the recovery seam. Stale artifacts from older cuts still get swept.
             remove_stale_cold_checkpoints(base, cut);
@@ -834,8 +825,7 @@ impl Engine {
             let current = self.read_state.mvcc.table_rows(name).generation_payload();
             let entry = if Arc::ptr_eq(&entry.generation, &current) {
                 // Untouched since its settled install: every live stamp is <= boundary (the
-                // watermark guard above), so its content is the boundary state whatever
-                // watermark convention its own build pinned.
+                // watermark guard above), so its content is the boundary state.
                 Arc::clone(entry)
             } else {
                 // Written since its build: bring it current through the 6c-1 patcher (also lands

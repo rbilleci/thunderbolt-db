@@ -156,7 +156,11 @@ mod tests {
 
     #[test]
     fn date_epoch_and_neighbors() {
-        assert_eq!(parse_date("2000-01-01"), Some(0), "the PG date epoch is day 0");
+        assert_eq!(
+            parse_date("2000-01-01"),
+            Some(0),
+            "the PG date epoch is day 0"
+        );
         assert_eq!(parse_date("2000-01-02"), Some(1));
         assert_eq!(parse_date("1999-12-31"), Some(-1));
         assert_eq!(format_date(0), "2000-01-01");
@@ -180,9 +184,20 @@ mod tests {
     fn date_leap_year_rules() {
         assert!(parse_date("2024-02-29").is_some(), "2024 is a leap year");
         assert_eq!(parse_date("2023-02-29"), None, "2023 is not a leap year");
-        assert_eq!(parse_date("2000-02-29"), parse_date("2000-02-29"), "2000 IS a leap year");
-        assert!(parse_date("2000-02-29").is_some(), "2000 is divisible by 400 -> leap");
-        assert_eq!(parse_date("1900-02-29"), None, "1900 is divisible by 100 not 400 -> not leap");
+        assert_eq!(
+            parse_date("2000-02-29"),
+            parse_date("2000-02-29"),
+            "2000 IS a leap year"
+        );
+        assert!(
+            parse_date("2000-02-29").is_some(),
+            "2000 is divisible by 400 -> leap"
+        );
+        assert_eq!(
+            parse_date("1900-02-29"),
+            None,
+            "1900 is divisible by 100 not 400 -> not leap"
+        );
     }
 
     #[test]
@@ -199,37 +214,93 @@ mod tests {
         assert_eq!(parse_date("+2024-01-15"), None, "leading + on the year");
         assert_eq!(parse_date("2024-+01-15"), None, "leading + on the month");
         assert_eq!(parse_date("2024-01-+15"), None, "leading + on the day");
-        assert_eq!(parse_date("2024- 01-15"), None, "embedded space in a component");
+        assert_eq!(
+            parse_date("2024- 01-15"),
+            None,
+            "embedded space in a component"
+        );
     }
 
     #[test]
     fn timestamp_epoch_and_units() {
-        assert_eq!(parse_timestamp("2000-01-01 00:00:00"), Some(0), "the timestamp epoch is micro 0");
-        assert_eq!(parse_timestamp("2000-01-01 00:00:01"), Some(1_000_000), "one second");
-        assert_eq!(parse_timestamp("2000-01-01 00:01:00"), Some(60_000_000), "one minute");
-        assert_eq!(parse_timestamp("2000-01-01 01:00:00"), Some(3_600_000_000), "one hour");
-        assert_eq!(parse_timestamp("2000-01-02 00:00:00"), Some(MICROS_PER_DAY), "one day");
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:00:00"),
+            Some(0),
+            "the timestamp epoch is micro 0"
+        );
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:00:01"),
+            Some(1_000_000),
+            "one second"
+        );
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:01:00"),
+            Some(60_000_000),
+            "one minute"
+        );
+        assert_eq!(
+            parse_timestamp("2000-01-01 01:00:00"),
+            Some(3_600_000_000),
+            "one hour"
+        );
+        assert_eq!(
+            parse_timestamp("2000-01-02 00:00:00"),
+            Some(MICROS_PER_DAY),
+            "one day"
+        );
         // no time part -> midnight; 'T' separator accepted; HH:MM defaults seconds to 0.
-        assert_eq!(parse_timestamp("2000-01-02"), Some(MICROS_PER_DAY), "date-only => midnight");
+        assert_eq!(
+            parse_timestamp("2000-01-02"),
+            Some(MICROS_PER_DAY),
+            "date-only => midnight"
+        );
         assert_eq!(
             parse_timestamp("2000-01-01T00:01:00"),
             Some(60_000_000),
             "'T' separator"
         );
-        assert_eq!(parse_timestamp("2000-01-01 00:01"), Some(60_000_000), "HH:MM (no seconds)");
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:01"),
+            Some(60_000_000),
+            "HH:MM (no seconds)"
+        );
     }
 
     #[test]
     fn timestamp_fractional_seconds() {
-        assert_eq!(parse_timestamp("2000-01-01 00:00:00.5"), Some(500_000), ".5 => 500000 us");
-        assert_eq!(parse_timestamp("2000-01-01 00:00:00.000001"), Some(1), "one microsecond");
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:00:00.5"),
+            Some(500_000),
+            ".5 => 500000 us"
+        );
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:00:00.000001"),
+            Some(1),
+            "one microsecond"
+        );
         assert_eq!(parse_timestamp("2000-01-01 00:00:00.123456"), Some(123_456));
         // A 7th fractional digit rounds half-up (PG rounds, not truncates).
-        assert_eq!(parse_timestamp("2000-01-01 00:00:00.1234564"), Some(123_456), "round down");
-        assert_eq!(parse_timestamp("2000-01-01 00:00:00.1234565"), Some(123_457), "round half up");
-        assert_eq!(parse_timestamp("2000-01-01 00:00:00.1234567"), Some(123_457), "round up");
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:00:00.1234564"),
+            Some(123_456),
+            "round down"
+        );
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:00:00.1234565"),
+            Some(123_457),
+            "round half up"
+        );
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:00:00.1234567"),
+            Some(123_457),
+            "round up"
+        );
         // Rounding that carries: .9999995 -> 1_000_000 us = one second past the epoch.
-        assert_eq!(parse_timestamp("2000-01-01 00:00:00.9999995"), Some(1_000_000), "carry into seconds");
+        assert_eq!(
+            parse_timestamp("2000-01-01 00:00:00.9999995"),
+            Some(1_000_000),
+            "carry into seconds"
+        );
         // Carry across the end of a day rolls into the next day's midnight.
         assert_eq!(
             parse_timestamp("2024-01-15 23:59:59.9999995"),
@@ -274,9 +345,25 @@ mod tests {
         assert_eq!(parse_timestamp("2024-01-15 25:00:00"), None, "hour 25");
         assert_eq!(parse_timestamp("2024-01-15 10:60:00"), None, "minute 60");
         assert_eq!(parse_timestamp("2024-01-15 10:00:60"), None, "second 60");
-        assert_eq!(parse_timestamp("2024-13-01 10:00:00"), None, "bad date part");
-        assert_eq!(parse_timestamp("2024-01-15 10:00:00:00"), None, "too many time parts");
-        assert_eq!(parse_timestamp("2024-01-15 10:xx:00"), None, "non-numeric minute");
-        assert_eq!(parse_timestamp("2024-01-15 10:00:00.abc"), None, "non-numeric fraction");
+        assert_eq!(
+            parse_timestamp("2024-13-01 10:00:00"),
+            None,
+            "bad date part"
+        );
+        assert_eq!(
+            parse_timestamp("2024-01-15 10:00:00:00"),
+            None,
+            "too many time parts"
+        );
+        assert_eq!(
+            parse_timestamp("2024-01-15 10:xx:00"),
+            None,
+            "non-numeric minute"
+        );
+        assert_eq!(
+            parse_timestamp("2024-01-15 10:00:00.abc"),
+            None,
+            "non-numeric fraction"
+        );
     }
 }

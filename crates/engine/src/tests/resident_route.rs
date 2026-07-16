@@ -2234,11 +2234,7 @@ fn wave_index_declines_at_residency_budget_without_losing_gpu_scan() {
     let budget = e.relational_resident_bytes_for_gpu(0);
     e.set_relational_residency_budget_bytes(0, budget);
     e.set_index_probe_enabled(true);
-    let select = match parse_command(
-        "SELECT id, balance FROM capped_index WHERE id = 1",
-    )
-    .unwrap()
-    {
+    let select = match parse_command("SELECT id, balance FROM capped_index WHERE id = 1").unwrap() {
         Command::Select(select) => select,
         _ => unreachable!(),
     };

@@ -10,11 +10,11 @@ use arc_swap::ArcSwap;
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CudaCompoundFoldColumn, CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime,
-    CudaI32BatchProjectionColumns,
-    CudaI32Comparison, CudaI32EqualAnyProjectSubmission, CudaI32IndexProbeDenseSubmission,
-    CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory,
-    CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, MockGpuRuntime,
-    PlannedOp, ResidentElemType, RouteDecision, VisibleLocateShard, WriteLocateShard,
+    CudaI32BatchProjectionColumns, CudaI32Comparison, CudaI32EqualAnyProjectSubmission,
+    CudaI32IndexProbeDenseSubmission, CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk,
+    CudaResidentDeviceMemory, CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget,
+    MockGpuRuntime, PlannedOp, ResidentElemType, RouteDecision, VisibleLocateShard,
+    WriteLocateShard,
 };
 #[cfg(test)]
 use gpu_db_execution::{
@@ -102,15 +102,15 @@ pub use engine_dml_intent::{
 };
 mod engine_dml_prepare;
 pub(crate) use engine_dml_prepare::InsertPrepareValidation;
-mod engine_result_sort;
-mod engine_expr_ir;
-mod engine_join_ir;
 mod engine_expr;
+mod engine_expr_ir;
 mod engine_introspection;
+mod engine_join_ir;
 mod engine_lifecycle;
 mod engine_mvcc_dispatch;
 mod engine_residency;
 mod engine_resident_probe;
+mod engine_result_sort;
 mod engine_retained_read;
 mod engine_select_bind;
 mod engine_select_exec;

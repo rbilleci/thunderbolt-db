@@ -1037,7 +1037,8 @@ impl Engine {
     /// section (the resident-route planner runs there for a materialized-view create/refresh internal
     /// read; the latched read self-deadlocked — THE FLIP burn-in caught it).
     pub fn relational_residency_budget_bytes(&self, gpu_id: u16) -> Option<u64> {
-        let explicit = self.read_state
+        let explicit = self
+            .read_state
             .residency
             .admission_budget_bytes_by_gpu
             .load()
@@ -1047,14 +1048,14 @@ impl Engine {
         return explicit;
         #[cfg(not(test))]
         explicit.or_else(|| {
-                self.cuda_driver_probe_runtime()
-                    .snapshot()
-                    .devices
-                    .into_iter()
-                    .find(|device| device.id == gpu_id)
-                    .map(|device| device.total_memory_bytes.saturating_mul(4) / 5)
-                    .filter(|budget| *budget > 0)
-            })
+            self.cuda_driver_probe_runtime()
+                .snapshot()
+                .devices
+                .into_iter()
+                .find(|device| device.id == gpu_id)
+                .map(|device| device.total_memory_bytes.saturating_mul(4) / 5)
+                .filter(|budget| *budget > 0)
+        })
     }
 
     pub fn relational_resident_bytes_for_gpu(&self, gpu_id: u16) -> u64 {

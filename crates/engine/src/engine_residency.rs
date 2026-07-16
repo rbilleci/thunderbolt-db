@@ -23,15 +23,14 @@ mod routes;
 mod transient;
 
 pub(crate) use payload::{
-    AppendCreatedBy, COMPOUND_KEY_ID_FLAG, CREATED_BY_VISIBLE_FILL_BYTE,
-    DELETED_BY_LIVE_FILL_BYTE, ROW_ID_UNSTAMPED_FILL_BYTE, UnifiedResidentSnapshotParts,
     build_relational_device_payload, build_relational_device_payload_with_capacity,
     compound_index_row_fingerprint, compound_key_fingerprint, compound_key_type_supported,
-    compound_unique_slot_id, compute_open_shard_int4_append_chunks,
-    i32_section_needle, index_all_key_columns_foldable, index_is_compound,
-    index_key_column_positions, index_probe_key_id, key_column_width_words,
-    parse_relational_row_id, probe_key_id_positions, sql_value_as_int4,
-    sql_value_from_i32_section, sql_value_from_i64_section, sql_value_key_words,
+    compound_unique_slot_id, compute_open_shard_int4_append_chunks, i32_section_needle,
+    index_all_key_columns_foldable, index_is_compound, index_key_column_positions,
+    index_probe_key_id, key_column_width_words, parse_relational_row_id, probe_key_id_positions,
+    sql_value_as_int4, sql_value_from_i32_section, sql_value_from_i64_section, sql_value_key_words,
+    AppendCreatedBy, UnifiedResidentSnapshotParts, COMPOUND_KEY_ID_FLAG,
+    CREATED_BY_VISIBLE_FILL_BYTE, DELETED_BY_LIVE_FILL_BYTE, ROW_ID_UNSTAMPED_FILL_BYTE,
 };
 
 #[cfg(test)]
@@ -436,6 +435,16 @@ impl Engine {
     /// same payload/region/index categories counted by `relational_resident_bytes_for_gpu_excluding`,
     /// so the chosen prefix is known to fit before any descriptor is retired.
     fn relational_resident_table_bytes_for_gpu(&self, table: &str, gpu_id: u16) -> u64 {
+        let (payload_and_regions, indexes) =
+            self.relational_resident_table_byte_components_for_gpu(table, gpu_id);
+        payload_and_regions.saturating_add(indexes)
+    }
+
+    fn relational_resident_table_byte_components_for_gpu(
+        &self,
+        table: &str,
+        gpu_id: u16,
+    ) -> (u64, u64) {
         let snapshot_bytes = self
             .read_state
             .residency
@@ -489,10 +498,22 @@ impl Engine {
             .filter(|memory| memory.metadata().gpu_id == gpu_id)
             .map(|memory| memory.metadata().allocated_bytes)
             .sum::<u64>();
-        snapshot_bytes
-            .saturating_add(shard_bytes)
-            .saturating_add(single_index_bytes)
-            .saturating_add(shard_index_bytes)
+        (
+            snapshot_bytes.saturating_add(shard_bytes),
+            single_index_bytes.saturating_add(shard_index_bytes),
+        )
+    }
+
+    /// Build-only footprint instrumentation for ADR/benchmark probes. Returns exact retained
+    /// `(payload_and_mvcc_region_bytes, device_index_bytes)` for `table` on `gpu_id`; it is absent
+    /// from normal builds so analysis code cannot become a product API accidentally.
+    #[cfg(feature = "probe-timing")]
+    pub fn probe_relational_resident_table_byte_components(
+        &self,
+        table: &str,
+        gpu_id: u16,
+    ) -> (u64, u64) {
+        self.relational_resident_table_byte_components_for_gpu(table, gpu_id)
     }
 
     pub fn relational_residency_snapshot(

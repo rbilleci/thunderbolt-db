@@ -1,10 +1,10 @@
 use std::marker::PhantomData;
 use std::os::raw::c_void;
 
-use super::resident_window::{CudaGroupTextSource, validate_aligned_window, validate_text_windows};
+use super::resident_window::{validate_aligned_window, validate_text_windows, CudaGroupTextSource};
 use super::{
-    CudaResidentDeviceMemory, CudaRuntimeProbeError, ExprStep, ExprTerminal, PooledBufferLease,
-    ResidentElemType, check_cuda, launch_on_pooled_stream, run_resident_arith_program,
+    check_cuda, launch_on_pooled_stream, run_resident_arith_program, CudaResidentDeviceMemory,
+    CudaRuntimeProbeError, ExprStep, ExprTerminal, PooledBufferLease, ResidentElemType,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -1169,8 +1169,8 @@ pub(super) fn launch_cuda_mark_new_distinct_text_device<'r>(
 #[cfg(test)]
 mod tests {
     use super::{
-        CudaGroupDeviceView, CudaWideKeyDescriptor, CudaWideKeySource, CudaWideKeyValidity,
-        validate_permutation, validate_wide_key_descriptor_parts,
+        validate_permutation, validate_wide_key_descriptor_parts, CudaGroupDeviceView,
+        CudaWideKeyDescriptor, CudaWideKeySource, CudaWideKeyValidity,
     };
 
     #[test]
@@ -1231,17 +1231,15 @@ mod tests {
             destination_byte_offset: 0,
         }];
         assert!(validate_wide_key_descriptor_parts(64, 7, &misaligned_bool, 8, 4, &[]).is_err());
-        assert!(
-            validate_wide_key_descriptor_parts(
-                64,
-                7,
-                &descriptors[..1],
-                16,
-                4,
-                &[CudaWideKeyValidity::Bitmap { byte_offset: 1 }],
-            )
-            .is_err()
-        );
+        assert!(validate_wide_key_descriptor_parts(
+            64,
+            7,
+            &descriptors[..1],
+            16,
+            4,
+            &[CudaWideKeyValidity::Bitmap { byte_offset: 1 }],
+        )
+        .is_err());
     }
 
     #[test]

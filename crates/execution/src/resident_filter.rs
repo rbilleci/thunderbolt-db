@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use super::resident_window::{validate_text_windows, validate_window};
 use super::{
-    CudaResidentDeviceMemory, CudaRuntimeProbeError, PooledBufferLease,
-    compact_mask_i32_to_indices, launch_on_pooled_stream,
+    compact_mask_i32_to_indices, launch_on_pooled_stream, CudaResidentDeviceMemory,
+    CudaRuntimeProbeError, PooledBufferLease,
 };
 
 fn validate_bitmap_windows(

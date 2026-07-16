@@ -1,9 +1,9 @@
 use std::os::raw::c_void;
 
 use super::{
-    CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, ExprStep, ExprTerminal,
-    PooledBufferLease, PooledDeviceBufferOwned, Probe, ResidentElemType, check_cuda,
-    launch_cuda_buffer_i32_compare_indices_ordered, run_resident_arith_program,
+    check_cuda, launch_cuda_buffer_i32_compare_indices_ordered, run_resident_arith_program,
+    CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, ExprStep,
+    ExprTerminal, PooledBufferLease, PooledDeviceBufferOwned, Probe, ResidentElemType,
 };
 
 impl CudaResidentDeviceMemory {

@@ -946,12 +946,17 @@ mod tests {
         engine.set_shard_batched_point_read_enabled(true);
         engine.set_shard_index_probe_enabled(true);
         engine.set_shard_size_target(64); // 200 rows -> several shards
-        engine.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        engine
+            .execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200i64 {
             engine
                 .execute_text(
                     (i as u64) + 2,
-                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                    &format!(
+                        "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                        i * 10
+                    ),
                 )
                 .unwrap();
         }
@@ -978,7 +983,11 @@ mod tests {
         }
         let got: Vec<QueryOutcome> = rxs
             .into_iter()
-            .map(|rx| recv_within(rx, Duration::from_secs(5)).expect("answered").expect("ok"))
+            .map(|rx| {
+                recv_within(rx, Duration::from_secs(5))
+                    .expect("answered")
+                    .expect("ok")
+            })
             .collect();
         assert!(
             shared.read_engine().unwrap().sharded_point_batch_hits() > hb,
@@ -997,20 +1006,24 @@ mod tests {
         // Per-query FALLBACK: a duplicate int4 key -> the gather declines -> per-query fallback (multi-row),
         // NOT a group failure.
         execute_on_shared_engine(&shared, "CREATE TABLE dup (id INT, balance INT)").unwrap();
-        execute_on_shared_engine(&shared, "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)")
-            .unwrap();
+        execute_on_shared_engine(
+            &shared,
+            "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)",
+        )
+        .unwrap();
         if shared.read_engine().unwrap().resident_shard_count("dup") > 0 {
             let want_dup =
-                execute_on_shared_engine(&shared, "SELECT id, balance FROM dup WHERE id = 1").unwrap();
+                execute_on_shared_engine(&shared, "SELECT id, balance FROM dup WHERE id = 1")
+                    .unwrap();
             let fallback_before = batcher.activity_snapshot();
             let got_dup = match execute_on_shared_engine_batched(
                 &shared,
                 &batcher,
                 "SELECT id, balance FROM dup WHERE id = 1",
             ) {
-                BatchedDispatch::Batched(rx) => {
-                    recv_within(rx, Duration::from_secs(5)).expect("answered").expect("ok")
-                }
+                BatchedDispatch::Batched(rx) => recv_within(rx, Duration::from_secs(5))
+                    .expect("answered")
+                    .expect("ok"),
                 BatchedDispatch::Immediate(_) => {
                     panic!("resident duplicate-key shape must enter the batcher before its gather declines")
                 }
@@ -1021,9 +1034,16 @@ mod tests {
                 fallback_before.sharded_per_query_fallback_groups + 1,
                 "positive control: a declined sharded gather advances the per-query fallback counter"
             );
-            assert_eq!(got_dup, want_dup, "dup-key batched (per-query fallback) == per-query");
+            assert_eq!(
+                got_dup, want_dup,
+                "dup-key batched (per-query fallback) == per-query"
+            );
             if let QueryOutcome::Rows { rows, .. } = &want_dup {
-                assert_eq!(rows.len(), 2, "id=1 has 2 rows (fallback served the multi-row result)");
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "id=1 has 2 rows (fallback served the multi-row result)"
+                );
             }
         }
     }
@@ -1045,8 +1065,11 @@ mod tests {
         engine.set_auto_admit_on_commit(true);
         engine.set_host_install_elision_enabled(true);
         let shared = Arc::new(SharedEngine::from_engine(engine));
-        execute_on_shared_engine(&shared, "CREATE TABLE mix (id INT PRIMARY KEY, balance INT)")
-            .unwrap();
+        execute_on_shared_engine(
+            &shared,
+            "CREATE TABLE mix (id INT PRIMARY KEY, balance INT)",
+        )
+        .unwrap();
         for id in 0..100usize {
             let balance = if id == 1 {
                 "NULL".to_owned()
@@ -1140,10 +1163,7 @@ mod tests {
                     let id = 10_000 + offset;
                     execute_on_shared_engine(
                         &shared,
-                        &format!(
-                            "INSERT INTO mix (id, balance) VALUES ({id}, {})",
-                            id * 3
-                        ),
+                        &format!("INSERT INTO mix (id, balance) VALUES ({id}, {})", id * 3),
                     )
                     .unwrap();
                     if active_readers.load(Ordering::Acquire) > 0 {
@@ -1166,7 +1186,10 @@ mod tests {
         let gpu_batches = after.sharded_gpu_probe_batches - before.sharded_gpu_probe_batches;
         let sharded_batches = after.sharded_point_batches - before.sharded_point_batches;
         let activity = batcher.activity_snapshot();
-        assert!(gpu_batches > 0, "the fully-GPU multi-shard point probe fired");
+        assert!(
+            gpu_batches > 0,
+            "the fully-GPU multi-shard point probe fired"
+        );
         assert!(
             gpu_batches_during_writes > 0,
             "a fully-GPU point batch completed inside the exact writer-active interval"
@@ -1384,10 +1407,9 @@ mod tests {
                 thread::spawn(move || {
                     start.wait();
                     receiver_tx
-                        .send(batcher.enqueue(
-                            select("SELECT id FROM t WHERE id = 1"),
-                            needle as i32,
-                        ))
+                        .send(
+                            batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), needle as i32),
+                        )
                         .unwrap();
                 })
             })

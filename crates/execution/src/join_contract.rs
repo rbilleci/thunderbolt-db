@@ -1,9 +1,9 @@
 #[cfg(test)]
 use std::os::raw::c_void;
 
-use super::{CudaResidentDeviceMemory, PooledDeviceBufferOwned};
 #[cfg(test)]
-use super::{CudaRuntimeProbeError, check_cuda};
+use super::{check_cuda, CudaRuntimeProbeError};
+use super::{CudaResidentDeviceMemory, PooledDeviceBufferOwned};
 
 /// One fixed-width equi-join key read directly from a resident payload.  The descriptor is host-side
 /// launch metadata only: key bytes and NULL validity remain in the referenced device allocation.

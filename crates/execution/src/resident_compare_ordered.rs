@@ -2,9 +2,9 @@ use std::os::raw::c_void;
 
 use super::resident_window;
 use super::{
+    check_cuda, copy_pinned_into, launch_on_pooled_stream, stage_result_dtoh_async,
     CudaI32Comparison, CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError,
-    GpuPrimaryContext, PooledBufferLease, PooledStream, check_cuda, copy_pinned_into,
-    launch_on_pooled_stream, stage_result_dtoh_async,
+    GpuPrimaryContext, PooledBufferLease, PooledStream,
 };
 
 /// Ordered parallel-compaction PTX shared by the VALUE-emit launch

@@ -5,6 +5,8 @@
 //! by the batcher with no per-query fallback, GPU multi-shard index-probe batches fired inside the exact
 //! writer-active interval, every write elided its host install, and resident device append waves fired.
 //! Visibility-sensitive append windows must remain on the dense probe; any host-gather batch fails the gate.
+//! Its >100k read-QPS floor is a gate-local non-vacuity/capacity control, not the charter's aggregate
+//! committed-TPS target; BENCH-001 alone owns the canonical mixed-system throughput decision.
 //!
 //! Env: `GPU_DB_MIX_GPU_READERS` (32), `GPU_DB_MIX_GPU_WRITERS` (4),
 //! `GPU_DB_MIX_GPU_READS_PER` (500), `GPU_DB_MIX_GPU_WRITES_PER` (40),
@@ -42,11 +44,7 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 
 fn expect_id(outcome: QueryOutcome, expected: i32) -> Result<(), String> {
     match outcome {
-        QueryOutcome::Rows { rows, .. }
-            if rows == vec![vec![DbValue::Int4(expected)]] =>
-        {
-            Ok(())
-        }
+        QueryOutcome::Rows { rows, .. } if rows == vec![vec![DbValue::Int4(expected)]] => Ok(()),
         other => Err(format!(
             "point read for id={expected} returned an unexpected outcome: {other:?}"
         )),
@@ -104,7 +102,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     engine.set_shard_index_probe_enabled(true);
     engine.set_shard_batched_point_read_enabled(true);
     if !engine.auto_admit_on_commit_enabled() {
-        return Err("STRATA S-F regression: production auto-admission is not enabled by default".into());
+        return Err(
+            "STRATA S-F regression: production auto-admission is not enabled by default".into(),
+        );
     }
     engine.set_host_install_elision_enabled(true);
     let shared = Arc::new(SharedEngine::from_engine(engine));
@@ -146,7 +146,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         match execute_on_shared_engine_batched(&shared, &batcher, &sql) {
             BatchedDispatch::Batched(receiver) => warmup_receivers.push((id, receiver)),
             BatchedDispatch::Immediate(_) => {
-                return Err(format!("warmup point read id={id} bypassed the production batcher").into())
+                return Err(
+                    format!("warmup point read id={id} bypassed the production batcher").into(),
+                )
             }
         }
     }
@@ -252,8 +254,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let overlapping_reads = Arc::clone(&overlapping_reads);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || -> Result<(Vec<u64>, Vec<u64>), String> {
-                let mut state = 0x9e37_79b9_7f4a_7c15_u64
-                    ^ (reader as u64 + 1).wrapping_mul(2_654_435_761);
+                let mut state =
+                    0x9e37_79b9_7f4a_7c15_u64 ^ (reader as u64 + 1).wrapping_mul(2_654_435_761);
                 let mut latencies = Vec::with_capacity(reads_per);
                 let mut writer_active_latencies = Vec::new();
                 barrier.wait();
@@ -401,7 +403,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let writer_active_p999 = percentile(&writer_active_latencies, 0.999);
     if read_qps <= 100_000.0 || p50 >= 500 || p99 >= 1_000 || p999 >= 5_000 {
         return Err(format!(
-            "mixed OLTP SLO failed: throughput={read_qps:.0}/s (target >100000) \
+            "mixed GPU route gate failed: read_qps={read_qps:.0}/s (gate-local floor >100000; not system TPS) \
              p50={p50}us (target <500) p99={p99}us (target <1000) \
              p99.9={p999}us (target <5000); writer-active samples={} \
              p99={writer_active_p99}us p99.9={writer_active_p999}us",

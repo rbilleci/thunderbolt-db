@@ -1,4 +1,4 @@
-use crate::{CudaResidentDeviceMemory, CudaRuntimeProbeError, launch_on_pooled_stream};
+use crate::{launch_on_pooled_stream, CudaResidentDeviceMemory, CudaRuntimeProbeError};
 use std::ffi::c_void;
 
 pub(super) fn launch_cuda_resident_row_count(

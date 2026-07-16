@@ -77,7 +77,10 @@ mod tests {
     fn uuid_accepts_variants() {
         let canonical = parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap();
         // Bare 32-hex, braces, and uppercase all parse to the same bytes.
-        assert_eq!(parse_uuid("550e8400e29b41d4a716446655440000"), Some(canonical));
+        assert_eq!(
+            parse_uuid("550e8400e29b41d4a716446655440000"),
+            Some(canonical)
+        );
         assert_eq!(
             parse_uuid("{550e8400-e29b-41d4-a716-446655440000}"),
             Some(canonical)
@@ -100,7 +103,10 @@ mod tests {
         let hi = parse_uuid("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
         let mid = parse_uuid("80000000-0000-0000-0000-000000000000").unwrap();
         assert!(lo < mid && mid < hi, "byte-wise unsigned ordering");
-        assert_eq!(parse_uuid("00000000-0000-0000-0000-000000000000").unwrap(), [0u8; 16]);
+        assert_eq!(
+            parse_uuid("00000000-0000-0000-0000-000000000000").unwrap(),
+            [0u8; 16]
+        );
     }
 
     #[test]

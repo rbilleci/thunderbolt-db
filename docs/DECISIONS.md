@@ -4,6 +4,42 @@ Accepted decisions that are expensive to reverse. This file records rules and ra
 chronology or future sequencing. The full pre-unification record is archived at
 `archive/decisions/DECISIONS-full-pre-unification-2026-07-12.md`. Current work lives only in `PLAN.md`.
 
+## ADR-014 — Canonical GPU-native append/tombstone write model
+
+- **Status:** Accepted, 2026-07-16. The exact reviewed target/workload snapshot is `c9628766`; the final independent
+  verdict is preserved in the
+  [`ADR-014 acceptance archive`](archive/reviews/write-path-adr-014-acceptance/README.md).
+- **Decision:** Logical identity is stable `(table_id,row_id)`; version identity adds `created_by`; physical GPU
+  coordinates are generation-scoped and never durable identity. INSERT appends, UPDATE tombstones the visible old
+  version and appends one complete final image with the same row identity, and DELETE tombstones. A transaction's
+  repeated writes compose in a private device data/catalog overlay and publish at most one final transition per row.
+  Dense latest-image plus undo and the retired per-wave blocking mega-fuse are rejected.
+- **Transaction contract:** Autocommit, predeclared, and interactive work each have one stable user-transaction
+  envelope. Interactive DML+DDL commits through one ordered outcome, `commit_seq`, and atomic publication object or
+  rolls back together. `READ COMMITTED` uses statement snapshots plus minimum dependency floors and retryable
+  `40001` on target races; `REPEATABLE READ` is first-committer-wins snapshot isolation with the documented stable-
+  catalog deviation; `SERIALIZABLE`, unsupported savepoints, and unimplemented deferrable/cascade shapes fail loud.
+  Constraint and sequence effects follow the typed guard, private-child, and durable ordinary-transition rules in
+  the accepted detailed design.
+- **Publication and recovery contract:** Visibility is `created_by <= snapshot < deleted_by`. Durability and hidden
+  GPU apply may overlap, but acknowledgement waits for one atomic `{visible_next,database_root,publication_epoch}`
+  object covering the contiguous durable and applied prefixes plus terminal status. Typed non-circular WAL,
+  cut-exact C-projected checkpoints, content-addressed artifact activation, fresh-context GPU recovery, and offline
+  one-way legacy migration reconstruct the device data plane without a host relational mirror. STRATA placement and
+  hot/cold encoding never change identity, visibility, index, transaction, or recovery semantics.
+- **Evidence:** The accepted detailed design is
+  [`design/write-path-adr-014.md`](design/write-path-adr-014.md); its
+  [`compatibility matrix`](design/write-path-adr-014-compatibility.md),
+  [`decision traces`](design/write-path-adr-014-traces.md), and
+  [`recovery profile`](design/write-path-adr-014-recovery-profile.md) remain active implementation contracts. The
+  physical comparison, controller models, source crosswalk, packet manifests, and reviews are historical evidence
+  in the acceptance archive. Candidate A's current implementation measurements still fail W1 and production
+  graduation; acceptance selects the target, not the live implementation.
+- **Consequence:** **R3-002/003** implement device-native coverage, transactions, conflict control, adaptation, and
+  maintenance; **DUR-001/002** implement and fault-qualify checkpoint/WAL/recovery; **RETIRE-002** removes host repair;
+  **R3-004** removes the host write/store path only after those standalone gates. **HA-001** is additionally required
+  for replicated/node-loss-RPO deployment. **BENCH-001** remains the immutable performance evidence gate.
+
 ## ADR-013 — Universal birth stamps and generation-atomic shard publication
 
 - **Status:** Accepted, 2026-07-02.
@@ -47,18 +83,33 @@ chronology or future sequencing. The full pre-unification record is archived at
   transactions remain supported as a slower class.
 - **Reason:** GPU throughput comes from many transactions at once, while deterministic ordering simplifies
   conflicts, replication, and recovery.
-- **Consequence:** The write/CC completion is **R3-001..003**; the evidence gate is **BENCH-001**.
+- **Consequence:** ADR-014 selects the write/MVCC/transaction/recovery model; **R3-002/003** implement its write and
+  concurrency surface, and **BENCH-001** remains the evidence gate.
 
 ## ADR-008 — Product workload bet is GPU-native OLTP
 
-- **Status:** Accepted, 2026-06-26.
+- **Status:** Accepted, 2026-06-26; latency-class refinement accepted 2026-07-15.
 - **Decision:** Optimize for OLTP entity reads, filtered pages, bounded joins, and deterministic write waves—not
-  only analytical scans. Judge the bet against tuned CPU OLTP at offered load and tail latency.
+  only analytical scans. Judge the bet against tuned CPU OLTP at offered load and tail latency. The charter's
+  latency contract is classed: R1 bounded reads retain 0.5/1/5-ms p50/p99/p99.9; W1 single keyed synchronous
+  mutations use 0.8/1.5/5 ms; bounded predeclared T8 and T32 transactions use 1.5/3/10 ms and 3/6/20 ms. Each class
+  and each W1 operation passes independently; mixed-workload pooling cannot hide a failing class. Interactive/
+  data-dependent work remains a separately reported slow class without a generic wall-time promise. The 100,000
+  sustained and 400,000 burst targets are aggregate committed TPS for the charter's deterministic 60% R1 / 25% W1 /
+  10% T8 / 5% T32 mix. They are neither per-class TPS targets nor logical-operations/s targets; the fixed maximum-
+  operation T8/T32 routes make the same gates imply 325,000 and 1,300,000 logical operations/s respectively. The
+  immutable `design/oltp-benchmark-workload-v1.md` fixes schema/data, seed/skew, SQL/order, route resources, exact
+  evenly paced sustained-arrival timestamps, and named `B01`–`B10` cohorts. Sustained TPS excludes warm-up
+  completions; peak TPS is terminal committed cohort count divided by the fixed one-second arrival interval, and
+  wall-clock completion throughput is reported separately.
 - **Evidence:** Persistent-kernel experiments proved GPU point-read/index ceilings, while launch-per-batch dense
   indexing won the production integration tradeoff. The persistent SQL wave engine was retired; its source and
   experimental chronology are archived.
 - **Consequence:** Do not resurrect retired wave work from historical reviews. Complete **BENCH-001** before using
-  performance intuition to reorder major architecture work.
+  performance intuition to reorder major architecture work. Admission derives the class from the predeclared
+  operation/mutation shape and every declared resource bound before scheduling derives a residual budget. A
+  durability profile qualifies only when p50, p99, and p99.9 plus percentile-matched downstream margins all fit;
+  failure is explicit rather than repaired through class escalation or asynchronous acknowledgement.
 
 ## ADR-007 — Full GPU-native execution, including eventual oracle retirement
 

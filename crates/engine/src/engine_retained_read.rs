@@ -8,8 +8,8 @@ use super::*;
 
 mod device_index_append;
 mod shard_point_lookup;
-mod template;
 mod submission;
+mod template;
 mod wave_index;
 mod wave_locate;
 
@@ -373,8 +373,6 @@ impl Engine {
         }))
     }
 
-
-
     /// CROSS-SHARD PK INDEX (sub-slice 1): resolve `filter_idx = key` to the resident `(shard_id, LOCAL row)`
     /// positions via a PER-SHARD host-built PK hash index. Thin projection of
     /// [`Self::locate_resident_pk_via_shard_index_detailed`] to just `(shard_id, slot)` -- the shape the
@@ -532,9 +530,6 @@ impl Engine {
         }
         Some(out)
     }
-
-
-
 
     /// Step 1 (lpb-for-shards) benchmark + telemetry entry: resolve the table + columns, run the BATCHED
     /// cross-shard point-lookup gather over `needles`, and return the number of needles that materialized a

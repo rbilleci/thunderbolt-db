@@ -2,7 +2,7 @@ use std::os::raw::c_void;
 use std::sync::Arc;
 
 use super::resident_memory::CudaResidentReadSource;
-use super::{CudaResidentDeviceMemory, CudaRuntimeProbeError, check_cuda};
+use super::{check_cuda, CudaResidentDeviceMemory, CudaRuntimeProbeError};
 
 /// M1 (charter-pure device WRITE-LOCATE): one shard's DEVICE hash index + its packing params. The
 /// write path (A2 DML resolve, A3 validators) probes these ON THE DEVICE — replacing the host
@@ -55,7 +55,9 @@ fn validate_index_geometry(
         .checked_add(1)
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     if table_slots < 2 || !table_slots.is_power_of_two() {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(table_mask as usize));
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            table_mask as usize,
+        ));
     }
     let expected_shift = 32 - table_slots.trailing_zeros();
     let required_bytes = table_slots
@@ -702,8 +704,18 @@ impl CudaResidentDeviceMemory {
             }
             desc.push(shard.index.device_ptr());
             desc.push((shard.table_mask as u64) | ((shard.hash_shift as u64) << 32));
-            desc.push(shard.created_by.as_ref().map_or(0, |region| region.device_ptr()));
-            desc.push(shard.deleted_by.as_ref().map_or(0, |region| region.device_ptr()));
+            desc.push(
+                shard
+                    .created_by
+                    .as_ref()
+                    .map_or(0, |region| region.device_ptr()),
+            );
+            desc.push(
+                shard
+                    .deleted_by
+                    .as_ref()
+                    .map_or(0, |region| region.device_ptr()),
+            );
             desc.push(u64::from(shard.row_count));
             index_guards.push(Arc::clone(&shard.index));
         }

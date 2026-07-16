@@ -205,7 +205,7 @@ fn gpu_cold_sidecar_mixed_workload_and_v2_artifact_roundtrip() {
     let base = dir.join("db.wal");
     let boundary = e.committed_seq();
     let written = e
-        .write_streaming_cold_checkpoint(&base, 1, boundary, boundary + 1)
+        .write_streaming_cold_checkpoint(&base, 1, boundary)
         .expect("capture runs");
     assert_eq!(
         written, 1,

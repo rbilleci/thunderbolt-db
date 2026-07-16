@@ -17,6 +17,8 @@
 //!       GPU_DB_BENCH_ARM (classic|intent|both, default both),
 //!       GPU_DB_BENCH_WAL_DIR (default target/wal-intent-bench),
 //!       GPU_DB_BENCH_RECOVER=1 (post-run crash-recovery replay + row-count parity check),
+//!       GPU_DB_BENCH_OFFERED_TPS=N (Driver arm: evenly paced open-loop arrivals across drivers;
+//!       reported latency starts at the scheduled arrival and therefore includes producer/queue slip),
 //!       GPU_DB_BENCH_HOSTPHASE=1 / GPU_DB_BENCH_DEVPHASE=1 (per-stage attribution),
 //!       GPU_DB_WAL_DURABILITY (defaulted to `fua` by this bench; set `serial` to A/B).
 
@@ -150,6 +152,10 @@ fn run_arm(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let offered_tps: u64 = std::env::var("GPU_DB_BENCH_OFFERED_TPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let self_pump = !(arm == Arm::Driver && pumps > 0);
     // U1 MIXED I/D WORKLOAD (Driver arm only, bench-only knob): GPU_DB_BENCH_MIX_DELETE=P
     // makes ~P% of the driver's ops covered DELETEs of an OLDER, fully-committed live key
@@ -248,7 +254,12 @@ fn run_arm(
                     // cursor) with a settle lag so their target is always a fully-committed live key.
                     let mut d = 0_i64;
                     let mut u = 0_i64;
-                    const DELETE_LAG: i64 = 4096;
+                    let mutation_lag = if offered_tps > 0 {
+                        (window as i64 * 4).max(64)
+                    } else {
+                        4096
+                    };
+                    let mut scheduled_arrivals = 0_u64;
                     let mut deletes = 0_u64;
                     let mut updates = 0_u64;
                     // U2: this writer's OWN update route (re-prepared on drift — see mix_update).
@@ -264,20 +275,39 @@ fn run_arm(
                     while !stop.load(Ordering::Relaxed) {
                         for slot in inflight.iter_mut() {
                             if slot.is_none() {
+                                let scheduled = if offered_tps > 0 {
+                                    let global_arrival = scheduled_arrivals
+                                        .saturating_mul(writers as u64)
+                                        .saturating_add(w as u64);
+                                    let due_ns = global_arrival
+                                        .saturating_mul(1_000_000_000)
+                                        .checked_div(offered_tps)
+                                        .expect("offered_tps is nonzero");
+                                    let due = run_started + Duration::from_nanos(due_ns);
+                                    if Instant::now() < due {
+                                        break;
+                                    }
+                                    scheduled_arrivals += 1;
+                                    due
+                                } else {
+                                    Instant::now()
+                                };
                                 let txn_id = txn_ids.fetch_add(1, Ordering::Relaxed);
                                 // Delete OR update an older live key iff its mix quota is under
                                 // target AND a lagged committed target exists; else insert a fresh
                                 // key. Delete takes priority when both quotas want a slot.
+                                let delete_target = d.saturating_mul(2);
+                                let update_target = u.saturating_mul(2).saturating_add(1);
                                 let want_delete = mix_delete > 0
-                                    && d + DELETE_LAG < i
+                                    && delete_target + mutation_lag < i
                                     && d * 100 < mix_delete * (i + d);
                                 let want_update = !want_delete
                                     && mix_update > 0
-                                    && u + DELETE_LAG < i
+                                    && update_target + mutation_lag < i
                                     && u * 100 < mix_update * (i + u);
-                                let submitted = Instant::now();
+                                let submitted = scheduled;
                                 let (ticket, op) = if want_delete {
-                                    let key = (w as i64 * stride + d) as i32;
+                                    let key = (w as i64 * stride + delete_target) as i32;
                                     d += 1;
                                     let route = delete_route
                                         .as_ref()
@@ -294,7 +324,7 @@ fn run_arm(
                                         }
                                     }
                                 } else if want_update {
-                                    let key = (w as i64 * stride + u) as i32;
+                                    let key = (w as i64 * stride + update_target) as i32;
                                     // Full-row replace (key, key+1). On DRIFT (the dead-twin
                                     // de-elision cliff) re-prepare the route (elision re-entry) and
                                     // SKIP this slot — the next iteration retries with the fresh
@@ -543,7 +573,7 @@ fn run_arm(
 
     let stats = engine.wal_group_commit_stats();
     println!(
-        "  {:>7} | {:>7} | {:>13.0} | {:>9} | {:>5.2}ms | {:>5.2}ms | {:>5.2}ms | {:>6.1}ms | {:>7} | {:>8.1}",
+        "  {:>7} | {:>7} | {:>13.0} | {:>9} | {:>5.2}ms | {:>5.2}ms | {:>5.2}ms | {:>5.2}ms | {:>6.1}ms | {:>7} | {:>8.1}",
         name,
         writers,
         total as f64 / elapsed.as_secs_f64(),
@@ -551,6 +581,7 @@ fn run_arm(
         percentile(&latencies, 0.50) as f64 / 1e6,
         percentile(&latencies, 0.90) as f64 / 1e6,
         percentile(&latencies, 0.99) as f64 / 1e6,
+        percentile(&latencies, 0.999) as f64 / 1e6,
         latencies.last().copied().unwrap_or(0) as f64 / 1e6,
         stats.flush_groups,
         stats.mean_group_size(),
@@ -675,7 +706,32 @@ fn run_arm(
         }
     }
 
-    let committed = total + warmed;
+    #[cfg(feature = "probe-timing")]
+    {
+        let (payload_and_regions, indexes) =
+            engine.probe_relational_resident_table_byte_components("t", 0);
+        let frames = engine
+            .intent_lane_fence_stats()
+            .map_or(0, |(_, frames)| frames);
+        let physical_wal_bytes = frames.saturating_mul(4096);
+        let appended_versions = total
+            .saturating_add(warmed)
+            .saturating_sub(total_deletes as usize);
+        eprintln!(
+            "    [footprint: payload+regions {payload_and_regions}B  device-index {indexes}B  \
+             appended-versions {appended_versions}  FUA-frames {frames}  physical-WAL {physical_wal_bytes}B ({:.1}B/op)]",
+            physical_wal_bytes as f64 / total.max(1) as f64,
+        );
+    }
+
+    // Final visible rows = warm-up + INSERTs - DELETEs. `total` also includes UPDATE and DELETE
+    // operations, so remove updates once and deletes twice (once to exclude the non-insert op,
+    // once for the row it removed). The former insert-only formula falsely reported recovery
+    // mismatch for mixed workloads even when replay was exact.
+    let committed = total
+        .saturating_add(warmed)
+        .saturating_sub(total_updates as usize)
+        .saturating_sub((total_deletes as usize).saturating_mul(2));
     drop(samples);
     drop(engine);
 
@@ -730,15 +786,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("E2.1 covered-INSERT intent fast-path benchmark (durable, closed-loop)");
     println!(
-        "  wal-durability={}  duration/point={seconds}s  table=t(id INT PRIMARY KEY, v INT)",
-        std::env::var("GPU_DB_WAL_DURABILITY").unwrap_or_default()
+        "  wal-durability={}  duration/point={seconds}s  offered-tps={}  table=t(id INT PRIMARY KEY, v INT)",
+        std::env::var("GPU_DB_WAL_DURABILITY").unwrap_or_default(),
+        std::env::var("GPU_DB_BENCH_OFFERED_TPS").unwrap_or_else(|_| "closed-loop".to_string()),
     );
     println!();
     println!(
-        "      arm | writers | sustained TPS | burst TPS |    p50 |    p90 |    p99 |     max | fsyncs | mean grp"
+        "      arm | writers | sustained TPS | burst TPS |    p50 |    p90 |    p99 |  p99.9 |     max | fsyncs | mean grp"
     );
     println!(
-        "  ------- | ------- | ------------- | --------- | ------ | ------ | ------ | ------- | ------ | --------"
+        "  ------- | ------- | ------------- | --------- | ------ | ------ | ------ | ------ | ------- | ------ | --------"
     );
 
     for &writers in &writers_sweep {

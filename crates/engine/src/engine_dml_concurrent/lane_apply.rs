@@ -568,13 +568,21 @@ impl Engine {
         // would hang their clients forever instead of wedging loudly like the
         // classic path. The probes are lock-free flags; the mutex-walking
         // reason fetch (N poison locks) is paid only on an actual wedge.
+        let visible_seq = lanes.visible_inclusive_seq();
+        if visible_seq.is_err() {
+            lanes
+                .apply_poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let wal_poisoned = lanes.wal_peek().is_some_and(|wal| wal.is_poisoned());
         if wal_poisoned
             || lanes
                 .apply_poisoned
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            let reason = if wal_poisoned {
+            let reason = if let Err(err) = &visible_seq {
+                format!("intent lane visibility boundary invalid: {err}")
+            } else if wal_poisoned {
                 let inner = lanes
                     .wal_peek()
                     .and_then(|wal| wal.poison_reason())
@@ -598,9 +606,8 @@ impl Engine {
             return settled;
         }
         let local_cut = lanes.visible_local_cut();
-        let global_cut = lanes.visible_global_cut();
-        if global_cut > 0 {
-            self.publish_committed_seq(global_cut);
+        if let Some(visible_seq) = visible_seq.expect("visibility error drained above") {
+            self.publish_committed_seq(visible_seq);
         }
         let mut settled = false;
         let mut queue = lanes.settle[lane]

@@ -143,7 +143,7 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
     );
     println!("\n# (1) RESIDENT-INPUT scans -- kernel-clean, wall ~= kernel (vs the sum_i32 read roofline) ---");
     let needles_miss: Vec<i32> = (0..8).map(|k| -(k + 1)).collect(); // negative -> never match A
-                                                                              // ROOFLINE = sum_i32: a pure 1-pass read+reduce over the same i32 column -> the HBM streaming peak.
+                                                                     // ROOFLINE = sum_i32: a pure 1-pass read+reduce over the same i32 column -> the HBM streaming peak.
     let roof = bench(
         "sum_i32 (ROOFLINE: pure 1-pass read+reduce)",
         g4,

@@ -19,15 +19,15 @@ impl Engine {
         return self.execute_mvcc_query_with_cuda_driver_probe(query);
         #[cfg(test)]
         {
-        let backend = CpuMvccExecutionBackend;
-        let kv = self.read_state.mvcc.load_kv();
-        self.execute_mvcc_query_with_fallback_reason(
-            kv.get(),
-            query,
-            &backend,
-            Some(FallbackReason::GpuMvccReadParityGap),
-            false,
-        )
+            let backend = CpuMvccExecutionBackend;
+            let kv = self.read_state.mvcc.load_kv();
+            self.execute_mvcc_query_with_fallback_reason(
+                kv.get(),
+                query,
+                &backend,
+                Some(FallbackReason::GpuMvccReadParityGap),
+                false,
+            )
         }
     }
 

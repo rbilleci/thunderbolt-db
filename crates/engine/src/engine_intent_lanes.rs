@@ -7,10 +7,12 @@
 //! WAL lane with its own fence pool), and the only shared-state touch is ONE
 //! brief `CommitState` lock per WAVE (global commit-seq block claim via
 //! `propose_batch` + timestamp merge). Visibility publishes exclusively at the
-//! CROSS-LANE CONTIGUOUS CUT: `committed_seq` advances to S only when every
-//! global seq < S is durable in its WAL lane (the lane set's cut) AND applied
-//! (this module's `SeqCut`), so a reader can never observe seq N ahead of any
-//! seq below N — the fence-pool law, lifted to the engine.
+//! CROSS-LANE CONTIGUOUS CUT: when the exclusive next-slot frontier is S,
+//! `committed_seq` advances to inclusive sequence S-1 only when every global
+//! sequence below S is durable in its WAL lane (the lane set's cut) AND
+//! applied (this module's `SeqCut`). A reader can therefore never observe
+//! sequence N ahead of any sequence below N — the fence-pool law, lifted to
+//! the engine.
 //!
 //! V1 scoping (honest, enforced): lanes mode is INTENT-ONLY once the first
 //! lane seq is claimed. Classic/DDL writes before lane activation (schema DDL,
@@ -78,6 +80,24 @@ impl SeqCut {
     pub(crate) fn cut(&self) -> u64 {
         self.cut
     }
+}
+
+/// Convert a lane-local EXCLUSIVE next-slot prefix to the GLOBAL INCLUSIVE
+/// sequence consumed by the current MVCC watermark. `u64::MAX` is reserved as
+/// the live `deleted_by` infinity sentinel: it may be the exclusive next value
+/// covering the last valid commit (`u64::MAX - 1`), but is never itself a
+/// commit sequence.
+fn inclusive_seq_from_exclusive_prefix(
+    base_seq: u64,
+    local_next: u64,
+) -> Result<Option<u64>, &'static str> {
+    if local_next == 0 {
+        return Ok(None);
+    }
+    let visible_next = base_seq
+        .checked_add(local_next)
+        .ok_or("intent-lane visible-next frontier overflow")?;
+    Ok(Some(visible_next - 1))
 }
 
 /// Runtime state for lanes mode. Constructed only when
@@ -551,13 +571,21 @@ impl IntentLaneState {
             .min(self.applied_mirror.load(Ordering::Acquire))
     }
 
-    /// The GLOBAL visibility frontier the engine may publish for lane-claimed
-    /// seqs: base + local cut (0 pre-activation: nothing to publish).
-    pub(crate) fn visible_global_cut(&self) -> u64 {
+    /// The GLOBAL INCLUSIVE commit sequence the engine may publish for
+    /// lane-claimed records. `visible_local_cut` is an EXCLUSIVE local
+    /// next-slot frontier, so `[0, cut)` maps to global last sequence
+    /// `base_seq + cut - 1`. `None` means no lane record is yet both durable
+    /// and applied (including pre-activation); publishing `base_seq + cut`
+    /// would expose the next, uncovered slot.
+    pub(crate) fn visible_inclusive_seq(&self) -> Result<Option<u64>, crate::EngineError> {
         if !self.activated.load(Ordering::Acquire) {
-            return 0;
+            return Ok(None);
         }
-        self.base_seq.load(Ordering::Acquire) + self.visible_local_cut()
+        inclusive_seq_from_exclusive_prefix(
+            self.base_seq.load(Ordering::Acquire),
+            self.visible_local_cut(),
+        )
+        .map_err(|message| crate::EngineError::Durability(message.to_string()))
     }
 
     /// Record a lane wave's applied block and refresh the lock-free mirror.
@@ -751,6 +779,161 @@ mod tests {
         assert_eq!(cut.record(30, 30), 30);
         assert_eq!(cut.record(31, 40), 30);
         assert_eq!(cut.record(30, 31), 40);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn visible_lane_prefix_publishes_inclusive_last_commit_not_exclusive_next() {
+        let base = std::env::temp_dir().join(format!(
+            "gpu-db-r3-006-prefix-{}-{:?}.wal",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        gpu_db_wal::remove_stale_lane_files(&base).expect("clear stale lane files");
+        let wal = gpu_db_wal::FuaWalLaneSet::create(&base, 2, 1, 1 << 20)
+            .expect("create bounded test lane set");
+        wal.append(
+            0,
+            0,
+            &[gpu_db_wal::WalRecord {
+                txn_id: 7,
+                payload: b"r3-006".to_vec().into(),
+            }],
+        )
+        .expect("append first local record");
+        wal.wait_durable(1).expect("fence first local record");
+
+        let state = IntentLaneState::with_backing(2, 1, wal, 1 << 20);
+        state.base_seq.store(41, Ordering::Release);
+        state.activated.store(true, Ordering::Release);
+        state.record_applied(0, 1);
+
+        assert_eq!(state.visible_local_cut(), 1);
+        assert_eq!(
+            state.visible_inclusive_seq().expect("valid prefix"),
+            Some(41),
+            "[0, 1) covers global commit 41; 42 is the exclusive next slot and must stay hidden"
+        );
+
+        drop(state);
+        gpu_db_wal::remove_stale_lane_files(&base).expect("remove bounded test lane files");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn visible_lane_prefix_holds_when_apply_leads_durability() {
+        let base = std::env::temp_dir().join(format!(
+            "gpu-db-r3-006-apply-leads-{}-{:?}.wal",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        gpu_db_wal::remove_stale_lane_files(&base).expect("clear stale lane files");
+        let wal = gpu_db_wal::FuaWalLaneSet::create(&base, 2, 1, 1 << 20)
+            .expect("create bounded test lane set");
+        let state = IntentLaneState::with_backing(2, 1, wal, 1 << 20);
+        state.base_seq.store(41, Ordering::Release);
+        state.activated.store(true, Ordering::Release);
+
+        state.record_applied(0, 2);
+        assert_eq!(
+            state.visible_inclusive_seq().expect("valid empty prefix"),
+            None,
+            "applied work is hidden while the durable prefix is empty"
+        );
+        let wal = state.wal_peek().expect("installed WAL");
+        for local in 0..2 {
+            wal.append(
+                local as usize,
+                local,
+                &[gpu_db_wal::WalRecord {
+                    txn_id: 10 + local,
+                    payload: format!("apply-leads-{local}").into_bytes().into(),
+                }],
+            )
+            .expect("append local record");
+            wal.wait_durable(local + 1).expect("fence local record");
+            assert_eq!(
+                state.visible_inclusive_seq().expect("valid joined prefix"),
+                Some(41 + local),
+                "only the newly durable member of the applied prefix may publish"
+            );
+        }
+
+        drop(state);
+        gpu_db_wal::remove_stale_lane_files(&base).expect("remove bounded test lane files");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn visible_lane_prefix_holds_when_durability_leads_apply() {
+        let base = std::env::temp_dir().join(format!(
+            "gpu-db-r3-006-durable-leads-{}-{:?}.wal",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        gpu_db_wal::remove_stale_lane_files(&base).expect("clear stale lane files");
+        let wal = gpu_db_wal::FuaWalLaneSet::create(&base, 2, 1, 1 << 20)
+            .expect("create bounded test lane set");
+        for local in 0..2 {
+            wal.append(
+                local as usize,
+                local,
+                &[gpu_db_wal::WalRecord {
+                    txn_id: 20 + local,
+                    payload: format!("durable-leads-{local}").into_bytes().into(),
+                }],
+            )
+            .expect("append local record");
+        }
+        wal.wait_durable(2).expect("fence both local records");
+        let state = IntentLaneState::with_backing(2, 1, wal, 1 << 20);
+        state.base_seq.store(41, Ordering::Release);
+        state.activated.store(true, Ordering::Release);
+
+        assert_eq!(
+            state.visible_inclusive_seq().expect("valid empty prefix"),
+            None,
+            "durable work is hidden while the applied prefix is empty"
+        );
+        state.record_applied(0, 1);
+        assert_eq!(
+            state.visible_inclusive_seq().expect("valid first prefix"),
+            Some(41),
+            "the durable second slot stays hidden behind apply lag"
+        );
+        state.record_applied(1, 2);
+        assert_eq!(
+            state.visible_inclusive_seq().expect("valid second prefix"),
+            Some(42)
+        );
+
+        drop(state);
+        gpu_db_wal::remove_stale_lane_files(&base).expect("remove bounded test lane files");
+    }
+
+    #[test]
+    fn exclusive_prefix_conversion_covers_genesis_normal_and_exhaustion_boundaries() {
+        assert_eq!(
+            inclusive_seq_from_exclusive_prefix(1, 0).expect("empty prefix"),
+            None
+        );
+        assert_eq!(
+            inclusive_seq_from_exclusive_prefix(1, 1).expect("first commit"),
+            Some(1)
+        );
+        assert_eq!(
+            inclusive_seq_from_exclusive_prefix(41, 9).expect("normal prefix"),
+            Some(49)
+        );
+        assert_eq!(
+            inclusive_seq_from_exclusive_prefix(u64::MAX - 1, 1)
+                .expect("last representable commit"),
+            Some(u64::MAX - 1)
+        );
+        assert!(
+            inclusive_seq_from_exclusive_prefix(u64::MAX - 1, 2).is_err(),
+            "the infinity sentinel must never become an inclusive commit sequence"
+        );
     }
 
     #[test]
