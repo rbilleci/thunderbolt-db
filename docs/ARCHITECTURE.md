@@ -145,7 +145,7 @@ ADR-014 makes the user-transaction envelope and isolation boundary explicit:
   savepoints, cascades, deferrable constraints, or temporary-relation semantics reject rather than approximate.
 
 The full accepted lifecycle, SQL-sequence, retry-identity, and compatibility contract is ADR-014's detailed design
-[`design/write-path-adr-proposal.md`](design/write-path-adr-proposal.md). Implementation ownership remains in
+[`design/write-path-adr-014.md`](design/write-path-adr-014.md). Implementation ownership remains in
 **R3-002/003** and **DUR-002**; this architecture contract does not claim those paths are built.
 
 The binding latency classes are defined in `CHARTER.md`: R1 bounded reads target 0.5/1/5-ms p50/p99/p99.9; W1

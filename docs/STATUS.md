@@ -142,6 +142,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - The complete serial all-feature engine library gate passes **996/996**, including the GPU intent-lane,
   residency, recovery, transaction-adjacent, and STRATA paths. This verifies the acceptance/documentation closeout;
   it does not replace the R3-002/003 and DUR-001/002 production graduation evidence.
+- Post-acceptance documentation compaction retains five active ADR/workload contracts, archives 25 source-crosswalk,
+  audit, candidate, packet, and verdict documents under `docs/archive/reviews/write-path-adr-014-acceptance/`, and
+  removes the two disposable decision models from Cargo example discovery while preserving them in that archive.
 
 ## Verification snapshot — 2026-07-14
 

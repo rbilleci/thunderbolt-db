@@ -7,7 +7,8 @@ chronology or future sequencing. The full pre-unification record is archived at
 ## ADR-014 — Canonical GPU-native append/tombstone write model
 
 - **Status:** Accepted, 2026-07-16. The exact reviewed target/workload snapshot is `c9628766`; the final independent
-  verdict is [`design/write-path-adr-final-independent-review-v8.md`](design/write-path-adr-final-independent-review-v8.md).
+  verdict is preserved in the
+  [`ADR-014 acceptance archive`](archive/reviews/write-path-adr-014-acceptance/README.md).
 - **Decision:** Logical identity is stable `(table_id,row_id)`; version identity adds `created_by`; physical GPU
   coordinates are generation-scoped and never durable identity. INSERT appends, UPDATE tombstones the visible old
   version and appends one complete final image with the same row identity, and DELETE tombstones. A transaction's
@@ -27,10 +28,13 @@ chronology or future sequencing. The full pre-unification record is archived at
   one-way legacy migration reconstruct the device data plane without a host relational mirror. STRATA placement and
   hot/cold encoding never change identity, visibility, index, transaction, or recovery semantics.
 - **Evidence:** The accepted detailed design is
-  [`design/write-path-adr-proposal.md`](design/write-path-adr-proposal.md); its matrix, traces, physical comparison,
-  controller injections, recovery bound, and review history remain the decision evidence. Candidate A's current
-  implementation measurements still fail W1 and production graduation; acceptance selects the target, not the live
-  implementation.
+  [`design/write-path-adr-014.md`](design/write-path-adr-014.md); its
+  [`compatibility matrix`](design/write-path-adr-014-compatibility.md),
+  [`decision traces`](design/write-path-adr-014-traces.md), and
+  [`recovery profile`](design/write-path-adr-014-recovery-profile.md) remain active implementation contracts. The
+  physical comparison, controller models, source crosswalk, packet manifests, and reviews are historical evidence
+  in the acceptance archive. Candidate A's current implementation measurements still fail W1 and production
+  graduation; acceptance selects the target, not the live implementation.
 - **Consequence:** **R3-002/003** implement device-native coverage, transactions, conflict control, adaptation, and
   maintenance; **DUR-001/002** implement and fault-qualify checkpoint/WAL/recovery; **RETIRE-002** removes host repair;
   **R3-004** removes the host write/store path only after those standalone gates. **HA-001** is additionally required
