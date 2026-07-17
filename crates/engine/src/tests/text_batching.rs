@@ -501,7 +501,14 @@ fn durable_wal_records_exclude_failed_commit_attempts() {
     let durable = e.durable_wal_records();
     assert_eq!(durable.len(), 1);
     assert_eq!(durable[0].txn_id, 1);
-    assert_eq!(&durable[0].payload[..], &b"SET a=1"[..]);
+    let envelope = gpu_db_wal::decode_canonical_record_payload(&durable[0].payload)
+        .unwrap()
+        .expect("durable success uses canonical authority");
+    let replay = Engine::decode_engine_operation(&envelope.fragments[0].body).unwrap();
+    assert_eq!(
+        Engine::decode_engine_command(&replay).unwrap(),
+        Some(parse_command("SET a=1").unwrap())
+    );
 }
 
 #[test]
@@ -719,6 +726,179 @@ fn batch_flush_is_one_wal_fsync_group_for_all_items() {
     assert_eq!(recovered.get("c").as_deref(), Some("3"));
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn multi_entry_apply_uses_the_working_catalog_before_publication() {
+    // DUR-002: grouped apply holds the catalog latch and publishes only after every entry. Every
+    // nested existence/dependency lookup must therefore bind to the evolving working catalog, not
+    // the still-published pre-batch generation. This deliberately uses the internal grouped commit
+    // seam: public statement preflight cannot manufacture the dependency because entry 1 has not
+    // published when entry 2 is submitted.
+    let e = Engine::new_local_cpu_oracle();
+    let batch = [
+        (
+            1,
+            std::sync::Arc::from(
+                b"CREATE TABLE working_batch (id INT PRIMARY KEY, value INT)".as_slice(),
+            ),
+        ),
+        (
+            2,
+            std::sync::Arc::from(
+                b"INSERT INTO working_batch (id, value) VALUES (1, 10)".as_slice(),
+            ),
+        ),
+        (
+            3,
+            std::sync::Arc::from(b"CREATE SEQUENCE working_batch_seq".as_slice()),
+        ),
+        (
+            4,
+            std::sync::Arc::from(b"SELECT nextval('working_batch_seq'::regclass)".as_slice()),
+        ),
+    ];
+    if let Err(failure) = e.commit_mutation_batch(&batch) {
+        panic!("working-catalog batch failed: {}", failure.error);
+    }
+
+    assert_eq!(e.visible_up_to(), 4);
+    let rows = e
+        .execute_relational_select_text("SELECT value FROM working_batch WHERE id = 1")
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.row(0)[0], SqlValue::Int4(10));
+    let sequence = e.relational_catalog_sequence("working_batch_seq").unwrap();
+    assert_eq!((sequence.last_value, sequence.is_called), (1, true));
+
+    let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+    assert!(recovered
+        .relational_catalog_table("working_batch")
+        .is_some());
+    let rows = recovered
+        .execute_relational_select_text("SELECT value FROM working_batch WHERE id = 1")
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.row(0)[0], SqlValue::Int4(10));
+    let sequence = recovered
+        .relational_catalog_sequence("working_batch_seq")
+        .unwrap();
+    assert_eq!((sequence.last_value, sequence.is_called), (1, true));
+
+    let reset_and_rewrite = [
+        (
+            5,
+            std::sync::Arc::from(b"TRUNCATE TABLE working_batch".as_slice()),
+        ),
+        (
+            6,
+            std::sync::Arc::from(
+                b"INSERT INTO working_batch (id, value) VALUES (2, 20)".as_slice(),
+            ),
+        ),
+        (
+            7,
+            std::sync::Arc::from(
+                b"ALTER TABLE working_batch ADD COLUMN extra INT DEFAULT 7".as_slice(),
+            ),
+        ),
+        (
+            8,
+            std::sync::Arc::from(
+                b"INSERT INTO working_batch (id, value, extra) VALUES (3, 30, 8)".as_slice(),
+            ),
+        ),
+    ];
+    if let Err(failure) = e.commit_mutation_batch(&reset_and_rewrite) {
+        panic!(
+            "working-catalog reset/rewrite batch failed: {}",
+            failure.error
+        );
+    }
+    let rows = e
+        .execute_relational_select_text("SELECT id, value, extra FROM working_batch ORDER BY id")
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.row(0),
+        &[SqlValue::Int4(2), SqlValue::Int4(20), SqlValue::Int4(7)]
+    );
+    assert_eq!(
+        rows.row(1),
+        &[SqlValue::Int4(3), SqlValue::Int4(30), SqlValue::Int4(8)]
+    );
+
+    let dependencies = [
+        (
+            9,
+            std::sync::Arc::from(b"CREATE ROLE working_batch_reader".as_slice()),
+        ),
+        (
+            10,
+            std::sync::Arc::from(
+                b"GRANT SELECT ON TABLE working_batch TO working_batch_reader".as_slice(),
+            ),
+        ),
+        (
+            11,
+            std::sync::Arc::from(
+                b"REVOKE SELECT ON TABLE working_batch FROM working_batch_reader".as_slice(),
+            ),
+        ),
+        (
+            12,
+            std::sync::Arc::from(b"DROP ROLE working_batch_reader".as_slice()),
+        ),
+    ];
+    if let Err(failure) = e.commit_mutation_batch(&dependencies) {
+        panic!("working-catalog dependency batch failed: {}", failure.error);
+    }
+    assert!(e.relational_role("working_batch_reader").is_none());
+
+    let lifecycle = [
+        (
+            13,
+            std::sync::Arc::from(b"CREATE TABLE transient_batch (id INT)".as_slice()),
+        ),
+        (
+            14,
+            std::sync::Arc::from(b"DROP TABLE transient_batch".as_slice()),
+        ),
+        (
+            15,
+            std::sync::Arc::from(b"CREATE TABLE transient_batch (name TEXT)".as_slice()),
+        ),
+    ];
+    if let Err(failure) = e.commit_mutation_batch(&lifecycle) {
+        panic!("create/drop/recreate batch failed: {}", failure.error);
+    }
+    let table = e.relational_catalog_table("transient_batch").unwrap();
+    assert_eq!(table.columns.len(), 1);
+    assert_eq!(table.columns[0].name, "name");
+
+    let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+    assert!(recovered.relational_role("working_batch_reader").is_none());
+    let table = recovered
+        .relational_catalog_table("transient_batch")
+        .unwrap();
+    assert_eq!(table.columns.len(), 1);
+    assert_eq!(table.columns[0].name, "name");
+    let rows = recovered
+        .execute_relational_select_text("SELECT id, value, extra FROM working_batch ORDER BY id")
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.row(0),
+        &[SqlValue::Int4(2), SqlValue::Int4(20), SqlValue::Int4(7)]
+    );
+    assert_eq!(
+        rows.row(1),
+        &[SqlValue::Int4(3), SqlValue::Int4(30), SqlValue::Int4(8)]
+    );
 }
 
 #[test]

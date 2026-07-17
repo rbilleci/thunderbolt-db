@@ -61,7 +61,10 @@ fn cold_checkpoint_descriptor_round_trips() {
     };
     let mut w = crate::engine_streaming_exec::ColdCkptWriter {
         inner: Vec::<u8>::new(),
-        hash: crate::engine_streaming_exec::FNV_OFFSET,
+        hash: {
+            use sha2::Digest as _;
+            sha2::Sha256::new()
+        },
     };
     crate::engine_streaming_exec::encode_cold_descriptor(&mut w, &descriptor).unwrap();
     let mut r = crate::engine_streaming_exec::ColdCkptReader {
@@ -294,7 +297,7 @@ fn gpu_cold_checkpoint_corrupt_artifact_is_skipped_never_wrong() {
         assert!(e.streaming_cold_checkpointed() >= 1);
         cut
     };
-    // Flip one byte in the artifact BODY (past the magic): the FNV trailer must reject it.
+    // Flip one byte in the artifact BODY (past the magic): the SHA-256 trailer must reject it.
     let artifact = base.with_file_name(format!(
         "{}.cold-checkpoint.{cut}",
         base.file_name().unwrap().to_string_lossy()
@@ -337,7 +340,7 @@ fn gpu_cold_checkpoint_boundary_mismatch_is_skipped() {
         assert!(e.streaming_cold_checkpointed() >= 1);
         cut
     };
-    // Tamper the artifact's BOUNDARY field (u64 right after the magic) and RECOMPUTE the FNV
+    // Tamper the artifact's BOUNDARY field (u64 right after the magic) and RECOMPUTE the SHA-256
     // trailer — a checksum-valid artifact whose boundary does not match the replay seam. The
     // strict-equality guard must skip it (installing would replay bytes from the WRONG commit
     // index — the one guard corruption cannot exercise).
@@ -349,12 +352,12 @@ fn gpu_cold_checkpoint_boundary_mismatch_is_skipped() {
     let magic_len = b"GPUDBCOLDCKPT1\n".len();
     let boundary = u64::from_le_bytes(bytes[magic_len..magic_len + 8].try_into().unwrap());
     bytes[magic_len..magic_len + 8].copy_from_slice(&(boundary + 1).to_le_bytes());
-    let body_len = bytes.len() - 8;
-    let mut hash = crate::engine_streaming_exec::FNV_OFFSET;
-    for b in &bytes[..body_len] {
-        hash = (hash ^ u64::from(*b)).wrapping_mul(0x100000001b3);
-    }
-    bytes[body_len..].copy_from_slice(&hash.to_le_bytes());
+    let body_len = bytes.len() - 32;
+    let hash = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(&bytes[..body_len])
+    };
+    bytes[body_len..].copy_from_slice(&hash);
     std::fs::write(&artifact, &bytes).unwrap();
 
     let mut e = Engine::open_durable_wal_segment(&base).expect("reopen with tampered boundary");

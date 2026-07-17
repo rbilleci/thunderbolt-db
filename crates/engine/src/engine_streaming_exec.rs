@@ -823,7 +823,7 @@ impl Engine {
         if watermark != boundary_index {
             // Not quiesced at the cut (a commit raced the checkpoint): skip — the artifact would
             // never match the recovery seam. Stale artifacts from older cuts still get swept.
-            remove_stale_cold_checkpoints(base, cut);
+            remove_stale_cold_checkpoints(base, cut)?;
             return Ok(0);
         }
         let map = self.read_state.residency.streaming_cold_chunks.load();
@@ -863,11 +863,11 @@ impl Engine {
         if self.committed_seq() != watermark {
             // A commit landed DURING qualification: a mid-loop fresh install could have embedded
             // a stamp above the boundary — abort this artifact (a later checkpoint retries).
-            remove_stale_cold_checkpoints(base, cut);
+            remove_stale_cold_checkpoints(base, cut)?;
             return Ok(0);
         }
         if qualified.is_empty() {
-            remove_stale_cold_checkpoints(base, cut);
+            remove_stale_cold_checkpoints(base, cut)?;
             return Ok(0);
         }
         // Stream-encode to a temp sibling, fsync, then atomically rename into place (the artifact
@@ -882,7 +882,10 @@ impl Engine {
         })?;
         let mut w = ColdCkptWriter {
             inner: std::io::BufWriter::new(file),
-            hash: FNV_OFFSET,
+            hash: {
+                use sha2::Digest as _;
+                sha2::Sha256::new()
+            },
         };
         let write_all = (|| -> std::io::Result<()> {
             w.put(COLD_CHECKPOINT_MAGIC)?;
@@ -920,8 +923,9 @@ impl Engine {
                     w.put(&payload)?;
                 }
             }
-            let hash = w.hash;
-            w.inner.write_all(&hash.to_le_bytes())?;
+            use sha2::Digest as _;
+            let hash = w.hash.finalize();
+            w.inner.write_all(&hash)?;
             w.inner.flush()?;
             w.inner.get_ref().sync_all()
         })();
@@ -938,12 +942,8 @@ impl Engine {
                 path.display()
             ))
         })?;
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-        remove_stale_cold_checkpoints(base, cut);
+        gpu_db_wal::sync_wal_parent_dir(&path)?;
+        remove_stale_cold_checkpoints(base, cut)?;
         self.read_state
             .residency
             .streaming_cold_checkpointed
@@ -967,7 +967,7 @@ impl Engine {
         let Ok(mut file) = std::fs::File::open(&path) else {
             return 0;
         };
-        // PASS 1: verify the FNV trailer over the whole stream (bounded RAM), then re-read and
+        // PASS 1: verify the collision-resistant trailer over the whole stream (bounded RAM), then re-read and
         // decode trusting the content. Startup-time sequential IO; two passes beat buffering a
         // possibly spill-class (over-RAM) artifact.
         if !cold_checkpoint_checksum_ok(&mut file) {
@@ -989,7 +989,7 @@ impl Engine {
         let decode_all = (|| -> std::io::Result<()> {
             let mut magic = [0u8; COLD_CHECKPOINT_MAGIC.len()];
             r.take(&mut magic)?;
-            if &magic != COLD_CHECKPOINT_MAGIC {
+            if &magic != COLD_CHECKPOINT_MAGIC && &magic != COLD_CHECKPOINT_MAGIC_V2 {
                 return Ok(());
             }
             let boundary = r.take_u64()?;
@@ -1421,9 +1421,8 @@ pub(crate) fn decode_cold_chunk_rows(
 // ---------------- P1: the cold-checkpoint artifact encoding (control plane, no serde) ----------------
 
 /// Artifact magic — version-suffixed like the WAL magics (`GPUDBWAL1`); bump on layout change.
-const COLD_CHECKPOINT_MAGIC: &[u8; 15] = b"GPUDBCOLDCKPT2\n";
-pub(crate) const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
+const COLD_CHECKPOINT_MAGIC_V2: &[u8; 15] = b"GPUDBCOLDCKPT2\n";
+const COLD_CHECKPOINT_MAGIC: &[u8; 15] = b"GPUDBCOLDCKPT3\n";
 
 /// `<base>.cold-checkpoint.<cut>` beside the WAL — mirrors the lanes-checkpoint naming
 /// (`<base>.lanes-checkpoint.seg.<cut>`), keyed by the SAME cut so recovery pairs them.
@@ -1445,35 +1444,61 @@ fn streaming_cold_checkpoint_tmp_path(base: &std::path::Path) -> std::path::Path
 
 /// Sweep artifacts for OTHER cuts (and the tmp) — the previous checkpoint generation's artifact
 /// is dead once a newer cut committed (its seam can never be replayed again).
-pub(crate) fn remove_stale_cold_checkpoints(base: &std::path::Path, keep_cut: u64) {
-    let Some(parent) = base.parent() else { return };
-    let Some(stem) = base.file_name() else { return };
+pub(crate) fn remove_stale_cold_checkpoints(
+    base: &std::path::Path,
+    keep_cut: u64,
+) -> Result<(), EngineError> {
+    let Some(parent) = base.parent() else {
+        return Ok(());
+    };
+    let Some(stem) = base.file_name() else {
+        return Ok(());
+    };
     let prefix = format!("{}.cold-checkpoint.", stem.to_string_lossy());
     let keep = keep_cut.to_string();
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(parent).map_err(|err| {
+        EngineError::Durability(format!(
+            "cold checkpoint: enumerate {} failed: {err}",
+            parent.display()
+        ))
+    })?;
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            EngineError::Durability(format!(
+                "cold checkpoint: enumerate entry in {} failed: {err}",
+                parent.display()
+            ))
+        })?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(suffix) = name.strip_prefix(&prefix) {
             if suffix != keep {
-                let _ = std::fs::remove_file(entry.path());
+                std::fs::remove_file(entry.path()).map_err(|err| {
+                    EngineError::Durability(format!(
+                        "cold checkpoint: remove stale artifact {} failed: {err}",
+                        entry.path().display()
+                    ))
+                })?;
+                removed = true;
             }
         }
     }
+    if removed {
+        gpu_db_wal::sync_wal_parent_dir(base)?;
+    }
+    Ok(())
 }
 
-/// FNV-1a-hashing writer: every byte written folds into the running trailer checksum.
+/// SHA-256 hashing writer: every byte written folds into the running trailer authority.
 pub(crate) struct ColdCkptWriter<W: std::io::Write> {
     pub(crate) inner: W,
-    pub(crate) hash: u64,
+    pub(crate) hash: sha2::Sha256,
 }
 
 impl<W: std::io::Write> ColdCkptWriter<W> {
     fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        for b in bytes {
-            self.hash = (self.hash ^ u64::from(*b)).wrapping_mul(FNV_PRIME);
-        }
+        use sha2::Digest as _;
+        self.hash.update(bytes);
         self.inner.write_all(bytes)
     }
     fn put_u8(&mut self, v: u8) -> std::io::Result<()> {
@@ -1581,9 +1606,9 @@ impl<R: std::io::Read> ColdCkptReader<R> {
     }
 }
 
-/// Verify the trailing FNV-1a checksum over everything before it. Streams in 64KiB blocks
-/// (bounded RAM for spill-class artifacts).
+/// Verify the v3 SHA-256 trailer (or legacy v2 FNV trailer). Streams in 64KiB blocks.
 fn cold_checkpoint_checksum_ok(file: &mut std::fs::File) -> bool {
+    use sha2::Digest as _;
     use std::io::{Read, Seek};
     let Ok(total) = file.seek(std::io::SeekFrom::End(0)) else {
         return false;
@@ -1594,25 +1619,45 @@ fn cold_checkpoint_checksum_ok(file: &mut std::fs::File) -> bool {
     if file.seek(std::io::SeekFrom::Start(0)).is_err() {
         return false;
     }
-    let body = total - 8;
-    let mut hash = FNV_OFFSET;
+    let mut magic = [0_u8; COLD_CHECKPOINT_MAGIC.len()];
+    if file.read_exact(&mut magic).is_err() || file.seek(std::io::SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let trailer_len = if &magic == COLD_CHECKPOINT_MAGIC {
+        32
+    } else if &magic == COLD_CHECKPOINT_MAGIC_V2 {
+        8
+    } else {
+        return false;
+    };
+    let body = total - trailer_len;
     let mut remaining = body;
     let mut buf = vec![0u8; 64 << 10];
+    let mut sha = sha2::Sha256::new();
+    let mut fnv = 0xcbf29ce484222325_u64;
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
         if file.read_exact(&mut buf[..want]).is_err() {
             return false;
         }
-        for b in &buf[..want] {
-            hash = (hash ^ u64::from(*b)).wrapping_mul(FNV_PRIME);
+        if trailer_len == 32 {
+            use sha2::Digest as _;
+            sha.update(&buf[..want]);
+        } else {
+            for b in &buf[..want] {
+                fnv = (fnv ^ u64::from(*b)).wrapping_mul(0x100000001b3);
+            }
         }
         remaining -= want as u64;
     }
-    let mut trailer = [0u8; 8];
-    if file.read_exact(&mut trailer).is_err() {
-        return false;
+    if trailer_len == 32 {
+        use sha2::Digest as _;
+        let mut trailer = [0_u8; 32];
+        file.read_exact(&mut trailer).is_ok() && trailer == sha.finalize().as_slice()
+    } else {
+        let mut trailer = [0_u8; 8];
+        file.read_exact(&mut trailer).is_ok() && fnv == u64::from_le_bytes(trailer)
     }
-    hash == u64::from_le_bytes(trailer)
 }
 
 /// Serialize the chunk DESCRIPTOR ([`RelationalResidencySnapshot`]) — the device-layout contract

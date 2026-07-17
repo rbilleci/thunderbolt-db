@@ -8,6 +8,12 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_CONTEXT_LOSS_INJECTIONS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static RECOVERY_ATTEMPT_COUNT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 impl Engine {
     pub fn new_local() -> Self {
         Self::with_planner_config(PlannerConfig::default())
@@ -50,9 +56,17 @@ impl Engine {
         self.set_host_install_elision_enabled(false);
     }
 
-    fn finish_recovery_replay(&self) {
-        self.set_host_install_elision_enabled(true);
-        self.set_auto_admit_on_commit(true);
+    fn finish_recovery_replay(&self) -> Result<(), EngineError> {
+        #[cfg(test)]
+        RECOVERY_CONTEXT_LOSS_INJECTIONS.with(|remaining| {
+            if remaining.get() > 0 {
+                remaining.set(remaining.get() - 1);
+                return Err(EngineError::ApplyFailed(
+                    "CUDA kernel launch failed: 719".to_string(),
+                ));
+            }
+            Ok(())
+        })?;
         let tables: Vec<String> = self
             .catalog_snapshot()
             .relational_catalog
@@ -60,20 +74,82 @@ impl Engine {
             .cloned()
             .collect();
         for table in tables {
-            let _ = self.populate_relational_residency_snapshot_shared(&table);
+            self.populate_relational_residency_snapshot_shared(&table)
+                .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+        }
+        self.set_host_install_elision_enabled(true);
+        self.set_auto_admit_on_commit(true);
+        Ok(())
+    }
+
+    fn is_cuda_context_loss(error: &EngineError) -> bool {
+        let message = error.to_string().to_ascii_lowercase();
+        if message.contains("cuda_error_invalid_context")
+            || message.contains("cuda_error_context_is_destroyed")
+            || message.contains("cuda context is destroyed")
+            || message.contains("cuda illegal address")
+            || message.contains("cuda misaligned address")
+        {
+            return true;
+        }
+        let Some(code) = message
+            .split("cuda kernel launch failed:")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|code| code.parse::<i32>().ok())
+        else {
+            return false;
+        };
+        matches!(code, 201 | 700 | 702 | 709 | 710 | 716 | 717 | 718 | 719)
+    }
+
+    fn recover_with_fresh_context_retry<F>(mut attempt: F) -> Result<Self, EngineError>
+    where
+        F: FnMut() -> Result<Self, EngineError>,
+    {
+        #[cfg(test)]
+        RECOVERY_ATTEMPT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        match attempt() {
+            Err(error) if Self::is_cuda_context_loss(&error) => {
+                // The failed engine is dropped before this second call. Construction reacquires
+                // runtime/context ownership and replay starts from immutable durable authority;
+                // no state from the possibly poisoned attempt is served or reused.
+                #[cfg(test)]
+                RECOVERY_ATTEMPT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+                attempt()
+            }
+            result => result,
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_one_recovery_context_loss() {
+        Self::inject_recovery_context_losses(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_recovery_context_losses(count: u8) {
+        RECOVERY_CONTEXT_LOSS_INJECTIONS.with(|remaining| remaining.set(count));
+        RECOVERY_ATTEMPT_COUNT.with(|count| count.set(0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_attempt_count() -> u8 {
+        RECOVERY_ATTEMPT_COUNT.with(std::cell::Cell::get)
+    }
+
     pub fn recover_from_durable_wal(records: &[WalRecord]) -> Result<Self, EngineError> {
+        Self::recover_with_fresh_context_retry(|| Self::recover_from_durable_wal_once(records))
+    }
+
+    fn recover_from_durable_wal_once(records: &[WalRecord]) -> Result<Self, EngineError> {
         let engine = Self::new_local();
         // Recovery reconstructs the durable host/store image first. Per-record admission would
         // repeatedly upload partial generations and can enter device-authoritative elision while
         // later WAL records still need the host image. Admit once, after the complete replay.
         engine.begin_recovery_replay();
-        for record in records {
-            engine.commit_mutation(record.txn_id, record.payload.clone())?;
-        }
-        engine.finish_recovery_replay();
+        engine.replay_durable_records(records)?;
+        engine.finish_recovery_replay()?;
         Ok(engine)
     }
 
@@ -96,7 +172,14 @@ impl Engine {
             return Self::open_durable_wal_segment(path);
         }
         let records = read_wal_segment(path)?;
-        Self::recover_from_durable_wal(&records)
+        Self::recover_with_fresh_context_retry(|| {
+            let engine = Self::new_local();
+            engine.bind_durable_identity_for_recovery(path, &records)?;
+            engine.begin_recovery_replay();
+            engine.replay_durable_records(&records)?;
+            engine.finish_recovery_replay()?;
+            Ok(engine)
+        })
     }
 
     pub fn recover_from_durable_wal_checkpoint(
@@ -200,6 +283,11 @@ impl Engine {
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
             commit: Mutex::new(CommitState {
+                canonical_identity: Self::fresh_canonical_identity(),
+                canonical_lineage_bound: false,
+                canonical_replay_seen: false,
+                transaction_status: HashMap::new(),
+                last_applied_outcome: None,
                 repl: LocalReplicator::leader(),
                 wal: WalBuffer::default(),
                 wal_commit_timestamps_micros: HashMap::new(),
@@ -490,6 +578,9 @@ impl Engine {
         // `GPU_DB_WAL_FUA_SEGMENT_BYTES`). The FUA backend admits MULTIPLE durable jobs in flight;
         // the concurrent-flush seam in `wait_group_durable` keys off `durability_is_concurrent()`.
         let segment_path = segment_path.into();
+        engine
+            .install_fresh_durable_identity(&segment_path)
+            .expect("failed to install durable database identity");
         #[cfg(unix)]
         let lane_base_path = segment_path.clone();
         let wal = match WalDurability::from_env() {
@@ -608,7 +699,16 @@ impl Engine {
         segment_path: impl AsRef<std::path::Path>,
         planner_cfg: PlannerConfig,
     ) -> Result<Self, EngineError> {
-        let segment_path = segment_path.as_ref();
+        let segment_path = segment_path.as_ref().to_path_buf();
+        Self::recover_with_fresh_context_retry(|| {
+            Self::open_durable_wal_segment_with_planner_config_once(&segment_path, planner_cfg)
+        })
+    }
+
+    fn open_durable_wal_segment_with_planner_config_once(
+        segment_path: &std::path::Path,
+        planner_cfg: PlannerConfig,
+    ) -> Result<Self, EngineError> {
         // E2.5c-1: intent-lane files beside the base identify a LANES-MODE database. Its history
         // is the serial log (pre-activation DDL/warm-up) followed by the lane merge (explicit
         // global seqs above `base_seq`); reopen replays serial-then-lanes and continues appending
@@ -655,12 +755,11 @@ impl Engine {
                 };
                 let records = gpu_db_wal::recover_fua_wal_records(segment_path)?;
                 let mut engine = Self::with_planner_config(planner_cfg);
+                engine.bind_durable_identity_for_recovery(segment_path, &records)?;
                 engine.begin_recovery_replay();
                 // Replay the durable prefix WITHOUT a durable backing (no segment I/O), then install
                 // a reopened FUA backend that appends above the recovered history in a fresh segment.
-                for record in &records {
-                    engine.commit_mutation(record.txn_id, record.payload.clone())?;
-                }
+                engine.replay_durable_records(&records)?;
                 let wal = WalBuffer::with_recovered_fua_durable_segment(
                     segment_path,
                     records,
@@ -673,25 +772,24 @@ impl Engine {
                 // files existed here, so the set is created fresh; activation seeds base_seq
                 // from the recovered commit index).
                 engine.attach_fresh_intent_lanes(segment_path, false)?;
-                engine.finish_recovery_replay();
+                engine.finish_recovery_replay()?;
                 return Ok(engine);
             }
         }
         let recovery = recover_wal_segment(segment_path)?;
         let mut engine = Self::with_planner_config(planner_cfg);
+        engine.bind_durable_identity_for_recovery(segment_path, &recovery.records)?;
         engine.begin_recovery_replay();
         // Replay the durable prefix WITHOUT a durable backing so the replay does no segment I/O;
         // then install the recovered segment so post-recovery commits keep appending to the same
         // file (the torn tail, if any, is durably truncated at install time).
-        for record in &recovery.records {
-            engine.commit_mutation(record.txn_id, record.payload.clone())?;
-        }
+        engine.replay_durable_records(&recovery.records)?;
         let records = recovery.records.clone();
         engine.commit_state_mut().wal =
             WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
         #[cfg(unix)]
         engine.attach_fresh_intent_lanes(segment_path, false)?;
-        engine.finish_recovery_replay();
+        engine.finish_recovery_replay()?;
         Ok(engine)
     }
 
@@ -771,6 +869,13 @@ impl Engine {
             serial_records = Vec::new();
             serial_recovery = None;
         }
+        let mut identity_records = lanes_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.records.clone())
+            .unwrap_or_else(|| serial_records.clone());
+        identity_records.extend_from_slice(&lane_records);
+        engine.bind_durable_identity_for_recovery(segment_path, &identity_records)?;
+        let reconciled_statuses = engine.install_reconciled_transaction_statuses(segment_path)?;
         let initial_index = engine.commit_state().repl.peek_next_index();
         let serial_count = if let Some(checkpoint) = &lanes_checkpoint {
             // CHECKPOINT REPLAY: the checkpoint segment holds serial ++ lanes[0, lane_cut)
@@ -788,26 +893,27 @@ impl Engine {
                     checkpoint.serial_records
                 )));
             }
-            for record in &checkpoint.records {
-                engine.commit_mutation(record.txn_id, record.payload.clone())?;
-            }
+            engine.replay_durable_records(&checkpoint.records)?;
             checkpoint.serial_records
         } else {
-            for record in &serial_records {
-                engine.commit_mutation(record.txn_id, record.payload.clone())?;
-            }
+            engine.replay_durable_records(&serial_records)?;
             serial_records.len() as u64
         };
-        let base_seq = initial_index + serial_count;
+        let base_seq = initial_index.checked_add(serial_count).ok_or_else(|| {
+            EngineError::Durability("lane recovery base sequence overflow".to_string())
+        })?;
         let replayed_prefix = engine.commit_state().repl.peek_next_index();
-        if replayed_prefix != base_seq + baseline {
+        let expected_replayed_prefix = base_seq.checked_add(baseline).ok_or_else(|| {
+            EngineError::Durability("lane recovery checkpoint prefix overflow".to_string())
+        })?;
+        if replayed_prefix != expected_replayed_prefix {
             return Err(EngineError::Durability(format!(
                 "lanes reopen of {}: prefix replay advanced the commit index to \
                  {replayed_prefix} (started at {initial_index}) but expected {} (serial \
                  {serial_count} + lane baseline {baseline}); the lane base seq would be wrong — \
                  refusing",
                 segment_path.display(),
-                base_seq + baseline
+                expected_replayed_prefix
             )));
         }
         // P1 (sealed-shards-primary): restore the durable COLD TIER at the SEAM — the store now
@@ -819,18 +925,24 @@ impl Engine {
         if lanes_checkpoint.is_some() {
             engine.restore_streaming_cold_checkpoint(segment_path, baseline);
         }
-        for record in &lane_records {
-            engine.commit_mutation(record.txn_id, record.payload.clone())?;
-        }
+        engine.replay_durable_records(&lane_records)?;
         // Lane-local history length: checkpointed lane records + the recovered suffix.
-        let lane_record_count = baseline + lane_records.len() as u64;
+        let recovered_lane_count = u64::try_from(lane_records.len()).map_err(|_| {
+            EngineError::Durability("lane recovery record count exceeds u64".to_string())
+        })?;
+        let lane_record_count = baseline.checked_add(recovered_lane_count).ok_or_else(|| {
+            EngineError::Durability("lane recovery local prefix overflow".to_string())
+        })?;
         let next_seq = engine.commit_state().repl.peek_next_index();
-        if next_seq != base_seq + lane_record_count {
+        let expected_next_seq = base_seq.checked_add(lane_record_count).ok_or_else(|| {
+            EngineError::Durability("lane recovery global prefix overflow".to_string())
+        })?;
+        if next_seq != expected_next_seq {
             return Err(EngineError::Durability(format!(
                 "lanes reopen of {}: lane replay advanced the commit index to {next_seq}, \
                  expected {} — refusing an inconsistent seq space",
                 segment_path.display(),
-                base_seq + lane_record_count
+                expected_next_seq
             )));
         }
 
@@ -902,12 +1014,48 @@ impl Engine {
             wal_lanes,
             lane_segment_bytes,
         );
+        state
+            .canonical_identity
+            .set(engine.commit_state().canonical_identity)
+            .map_err(|_| {
+                EngineError::Durability(
+                    "reopened intent-lane canonical identity was initialized twice".to_string(),
+                )
+            })?;
+        let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
+            engine.commit_state().canonical_identity,
+            identity_records.last(),
+        )?;
+        state
+            .canonical_catalog_digest
+            .set(catalog_digest)
+            .map_err(|_| {
+                EngineError::Durability(
+                    "reopened intent-lane catalog binding was initialized twice".to_string(),
+                )
+            })?;
+        state
+            .canonical_catalog_epoch
+            .store(catalog_epoch, std::sync::atomic::Ordering::Release);
+        for record in &identity_records {
+            let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)?
+            else {
+                continue;
+            };
+            state.install_recovered_transaction(
+                record.txn_id,
+                envelope.header.request_digest,
+                envelope.header.commit_seq,
+                envelope.outcome.affected_rows,
+            )?;
+        }
+        for status in reconciled_statuses {
+            state.install_recovered_aborted_transaction(status.txn_id, status.request_digest)?;
+        }
         if lane_record_count > 0 {
             use std::sync::atomic::Ordering;
             state.base_seq.store(base_seq, Ordering::Release);
-            state
-                .seq_oracle
-                .store(base_seq + lane_record_count, Ordering::Release);
+            state.seq_oracle.store(expected_next_seq, Ordering::Release);
             *state.applied.lock().unwrap_or_else(|p| p.into_inner()) =
                 engine_intent_lanes::SeqCut::with_base(lane_record_count);
             state
@@ -917,7 +1065,7 @@ impl Engine {
             state.activated.store(true, Ordering::Release);
         }
         engine.intent_lanes = Some(std::sync::Arc::new(state));
-        engine.finish_recovery_replay();
+        engine.finish_recovery_replay()?;
         Ok(engine)
     }
 
@@ -929,7 +1077,17 @@ impl Engine {
         control_path: impl AsRef<std::path::Path>,
         segment_path: impl AsRef<std::path::Path>,
     ) -> Result<Self, EngineError> {
-        let segment_path = segment_path.as_ref();
+        let control_path = control_path.as_ref().to_path_buf();
+        let segment_path = segment_path.as_ref().to_path_buf();
+        Self::recover_with_fresh_context_retry(|| {
+            Self::open_durable_wal_segment_with_checkpoint_once(&control_path, &segment_path)
+        })
+    }
+
+    fn open_durable_wal_segment_with_checkpoint_once(
+        control_path: &std::path::Path,
+        segment_path: &std::path::Path,
+    ) -> Result<Self, EngineError> {
         // Checkpoint rotation is a SERIAL-log mechanism; a lanes-mode database's history spans
         // the serial log AND the lane logs, and cross-lane checkpoint/truncation is the E2.5c-2
         // slice. Refuse loudly rather than replay a checkpoint that silently drops lane commits.
@@ -974,13 +1132,14 @@ impl Engine {
             recovery.records.drain(..overlap);
         }
         let mut engine = Self::new_local();
+        let mut identity_records = checkpoint_records.clone();
+        identity_records.extend_from_slice(&recovery.records);
+        engine.bind_durable_identity_for_recovery(segment_path, &identity_records)?;
         engine.begin_recovery_replay();
-        for record in checkpoint_records.iter().chain(recovery.records.iter()) {
-            engine.commit_mutation(record.txn_id, record.payload.clone())?;
-        }
         let checkpoint_count = checkpoint_records.len();
         let mut records = checkpoint_records;
         records.extend_from_slice(&recovery.records);
+        engine.replay_durable_records(&records)?;
         engine.commit_state_mut().wal =
             WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
         if overlap > 0 {
@@ -993,7 +1152,7 @@ impl Engine {
                 .wal
                 .truncate_durable_segment_prefix(checkpoint_count);
         }
-        engine.finish_recovery_replay();
+        engine.finish_recovery_replay()?;
         Ok(engine)
     }
 

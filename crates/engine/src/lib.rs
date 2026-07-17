@@ -96,6 +96,7 @@ mod engine_ddl_pubsub_role;
 mod engine_ddl_table;
 mod engine_dml_concurrent;
 mod engine_dml_intent;
+mod engine_durability;
 mod engine_intent_lanes;
 pub use engine_dml_intent::{
     CoveredDeleteRoute, CoveredInsertRoute, CoveredUpdateRoute, IntentTicket, SynchronousCommit,
@@ -130,93 +131,91 @@ pub struct KvStateMachine {
 impl ReplicatedStateMachine for KvStateMachine {
     fn apply(&mut self, entry: &LogEntry) -> Result<(), EngineError> {
         self.applied.push(entry.payload.to_vec());
-        if let Ok(s) = std::str::from_utf8(&entry.payload) {
-            if let Ok(cmd) = parse_command(s) {
-                match cmd {
-                    Command::SetKv { key, value } => {
-                        self.kv.insert(key, value);
-                    }
-                    Command::DeleteKv { key } => {
-                        self.kv.remove(&key);
-                    }
-                    Command::Begin
-                    | Command::Commit { .. }
-                    | Command::Rollback { .. }
-                    | Command::Flush
-                    | Command::ResetAll
-                    | Command::SetRole { .. }
-                    | Command::GetKv { .. }
-                    | Command::CreateSchema(_)
-                    | Command::DropSchema(_)
-                    | Command::CreateDatabase(_)
-                    | Command::DropDatabase(_)
-                    | Command::RenameDatabase(_)
-                    | Command::CreateTablespace(_)
-                    | Command::DropTablespace(_)
-                    | Command::RenameTablespace(_)
-                    | Command::CreateTable(_)
-                    | Command::AddPrimaryKey(_)
-                    | Command::AddUniqueConstraint(_)
-                    | Command::AddCheckConstraint(_)
-                    | Command::AddForeignKey(_)
-                    | Command::AddColumn(_)
-                    | Command::RenameTable(_)
-                    | Command::RenameColumn(_)
-                    | Command::RenameConstraint(_)
-                    | Command::DropColumn(_)
-                    | Command::DropConstraint(_)
-                    | Command::CreateIndex(_)
-                    | Command::RenameIndex(_)
-                    | Command::CreateView(_)
-                    | Command::RenameView(_)
-                    | Command::CreateMaterializedView(_)
-                    | Command::RefreshMaterializedView(_)
-                    | Command::RenameMaterializedView(_)
-                    | Command::CreateFunction(_)
-                    | Command::RenameFunction(_)
-                    | Command::DropFunction(_)
-                    | Command::SelectFunction(_)
-                    | Command::CreateExtension(_)
-                    | Command::DropExtension(_)
-                    | Command::CreateSequence(_)
-                    | Command::CreateDomain(_)
-                    | Command::SequenceNextVal(_)
-                    | Command::SequenceCurrVal(_)
-                    | Command::SequenceSetVal(_)
-                    | Command::RenameSequence(_)
-                    | Command::CreatePublication(_)
-                    | Command::DropPublication(_)
-                    | Command::CreateSubscription(_)
-                    | Command::DropSubscription(_)
-                    | Command::CreateRole(_)
-                    | Command::DropRole(_)
-                    | Command::RenameRole(_)
-                    | Command::DropTable(_)
-                    | Command::TruncateTable(_)
-                    | Command::DropIndex(_)
-                    | Command::DropView(_)
-                    | Command::DropMaterializedView(_)
-                    | Command::DropSequence(_)
-                    | Command::DropDomain(_)
-                    | Command::GrantTable(_)
-                    | Command::RevokeTable(_)
-                    | Command::GrantSchema(_)
-                    | Command::RevokeSchema(_)
-                    | Command::GrantDatabase(_)
-                    | Command::RevokeDatabase(_)
-                    | Command::GrantTablespace(_)
-                    | Command::RevokeTablespace(_)
-                    | Command::GrantFunction(_)
-                    | Command::RevokeFunction(_)
-                    | Command::GrantDefaultTablePrivileges(_)
-                    | Command::RevokeDefaultTablePrivileges(_)
-                    | Command::AlterColumnDefault(_)
-                    | Command::CommentOn(_)
-                    | Command::Insert(_)
-                    | Command::Delete(_)
-                    | Command::Update(_)
-                    | Command::Select(_) => {}
+        if let Some(cmd) = Engine::decode_engine_command(&entry.payload)? {
+            match cmd {
+                Command::SetKv { key, value } => {
+                    self.kv.insert(key, value);
                 }
+                Command::DeleteKv { key } => {
+                    self.kv.remove(&key);
+                }
+                Command::Begin
+                | Command::Commit { .. }
+                | Command::Rollback { .. }
+                | Command::Flush
+                | Command::ResetAll
+                | Command::SetRole { .. }
+                | Command::GetKv { .. }
+                | Command::CreateSchema(_)
+                | Command::DropSchema(_)
+                | Command::CreateDatabase(_)
+                | Command::DropDatabase(_)
+                | Command::RenameDatabase(_)
+                | Command::CreateTablespace(_)
+                | Command::DropTablespace(_)
+                | Command::RenameTablespace(_)
+                | Command::CreateTable(_)
+                | Command::AddPrimaryKey(_)
+                | Command::AddUniqueConstraint(_)
+                | Command::AddCheckConstraint(_)
+                | Command::AddForeignKey(_)
+                | Command::AddColumn(_)
+                | Command::RenameTable(_)
+                | Command::RenameColumn(_)
+                | Command::RenameConstraint(_)
+                | Command::DropColumn(_)
+                | Command::DropConstraint(_)
+                | Command::CreateIndex(_)
+                | Command::RenameIndex(_)
+                | Command::CreateView(_)
+                | Command::RenameView(_)
+                | Command::CreateMaterializedView(_)
+                | Command::RefreshMaterializedView(_)
+                | Command::RenameMaterializedView(_)
+                | Command::CreateFunction(_)
+                | Command::RenameFunction(_)
+                | Command::DropFunction(_)
+                | Command::SelectFunction(_)
+                | Command::CreateExtension(_)
+                | Command::DropExtension(_)
+                | Command::CreateSequence(_)
+                | Command::CreateDomain(_)
+                | Command::SequenceNextVal(_)
+                | Command::SequenceCurrVal(_)
+                | Command::SequenceSetVal(_)
+                | Command::RenameSequence(_)
+                | Command::CreatePublication(_)
+                | Command::DropPublication(_)
+                | Command::CreateSubscription(_)
+                | Command::DropSubscription(_)
+                | Command::CreateRole(_)
+                | Command::DropRole(_)
+                | Command::RenameRole(_)
+                | Command::DropTable(_)
+                | Command::TruncateTable(_)
+                | Command::DropIndex(_)
+                | Command::DropView(_)
+                | Command::DropMaterializedView(_)
+                | Command::DropSequence(_)
+                | Command::DropDomain(_)
+                | Command::GrantTable(_)
+                | Command::RevokeTable(_)
+                | Command::GrantSchema(_)
+                | Command::RevokeSchema(_)
+                | Command::GrantDatabase(_)
+                | Command::RevokeDatabase(_)
+                | Command::GrantTablespace(_)
+                | Command::RevokeTablespace(_)
+                | Command::GrantFunction(_)
+                | Command::RevokeFunction(_)
+                | Command::GrantDefaultTablePrivileges(_)
+                | Command::RevokeDefaultTablePrivileges(_)
+                | Command::AlterColumnDefault(_)
+                | Command::CommentOn(_)
+                | Command::Insert(_)
+                | Command::Delete(_)
+                | Command::Update(_)
+                | Command::Select(_) => {}
             }
         }
         Ok(())
@@ -547,6 +546,19 @@ struct DdlCatalogState {
 /// then (back in the engine) publish and bump `committed_seq`. Code holding `&mut Engine` reaches it
 /// lock-free via `Mutex::get_mut`.
 struct CommitState {
+    /// Durable ADR-014 lineage copied into every canonical WAL envelope. Recovery replaces the
+    /// freshly generated value from the first validated canonical record before replay.
+    canonical_identity: gpu_db_wal::CanonicalIdentity,
+    canonical_lineage_bound: bool,
+    /// Set after the first canonical record is admitted during chunked recovery. Unlike the live
+    /// status index, this is solely the one-way legacy-prefix migration barrier.
+    canonical_replay_seen: bool,
+    /// Non-pruned terminal claim index. The canonical WAL envelope is the durable authority; this
+    /// map is its live/recovered lookup index for exact same-id retry resolution.
+    transaction_status: HashMap<TxnId, DurableTransactionStatus>,
+    /// Most recently applied entry and its exact relational row count. Recovery consumes this
+    /// immediately to compare device/engine replay with the canonical terminal marker.
+    last_applied_outcome: Option<(Index, u64)>,
     /// The commit-`Index` oracle + log: `propose` assigns the next monotonic `commit_seq` inside the
     /// critical section (Stage 0 unification — `commit_seq == commit Index`).
     repl: LocalReplicator,
@@ -581,7 +593,65 @@ struct CommitState {
     txn_manager: TxnManager,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableTransactionStatus {
+    request_digest: gpu_db_wal::CanonicalDigest,
+    outcome: DurableTransactionOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableTransactionOutcome {
+    Committed { commit_seq: Index },
+    AbortedDiscardedOrphan,
+}
+
 impl CommitState {
+    fn resolve_transaction_retry(
+        &self,
+        txn_id: TxnId,
+        payload: &[u8],
+    ) -> Result<Option<CommitToken>, EngineError> {
+        let Some(status) = self.transaction_status.get(&txn_id) else {
+            return Ok(None);
+        };
+        let request_digest = gpu_db_wal::canonical_request_digest(payload);
+        if request_digest != status.request_digest {
+            return Err(EngineError::Durability(format!(
+                "transaction id {txn_id} is already durably claimed by a different request"
+            )));
+        }
+        match status.outcome {
+            DurableTransactionOutcome::Committed { commit_seq } => {
+                Ok(Some(CommitToken { index: commit_seq }))
+            }
+            DurableTransactionOutcome::AbortedDiscardedOrphan => Err(EngineError::Durability(
+                format!("transaction id {txn_id} was durably aborted during crash recovery"),
+            )),
+        }
+    }
+
+    fn record_transaction_status(&mut self, txn_id: TxnId, payload: &[u8], commit_seq: Index) {
+        self.record_transaction_status_digest(
+            txn_id,
+            gpu_db_wal::canonical_request_digest(payload),
+            commit_seq,
+        );
+    }
+
+    fn record_transaction_status_digest(
+        &mut self,
+        txn_id: TxnId,
+        request_digest: gpu_db_wal::CanonicalDigest,
+        commit_seq: Index,
+    ) {
+        let status = DurableTransactionStatus {
+            request_digest,
+            outcome: DurableTransactionOutcome::Committed { commit_seq },
+        };
+        let prior = self.transaction_status.insert(txn_id, status);
+        debug_assert!(prior.is_none() || prior == Some(status));
+    }
+
     /// Record a commit's wall-clock timestamp in the PITR map AND advance the O(1) running max
     /// (`max_commit_timestamp_micros`) in lock-step. EVERY writer of `wal_commit_timestamps_micros`
     /// must go through here so the max can never lag the map — that is the invariant

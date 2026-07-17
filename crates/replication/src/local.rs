@@ -129,11 +129,26 @@ impl LocalReplicator {
             return Err(EngineError::NotLeader);
         }
         let first = self.next_index;
-        let payloads = payloads.into_iter();
-        self.entries.reserve(payloads.size_hint().0);
+        let payloads: Vec<_> = payloads.into_iter().collect();
+        let count = u64::try_from(payloads.len()).map_err(|_| {
+            EngineError::ProposalFailed("commit sequence batch length overflow".to_string())
+        })?;
+        if count > 0 {
+            let last = first.checked_add(count - 1).ok_or_else(|| {
+                EngineError::ProposalFailed("commit sequence space exhausted".to_string())
+            })?;
+            if last == u64::MAX {
+                return Err(EngineError::ProposalFailed(
+                    "commit sequence space exhausted".to_string(),
+                ));
+            }
+        }
+        self.entries.reserve(payloads.len());
         for payload in payloads {
             let idx = self.next_index;
-            self.next_index += 1;
+            self.next_index = self.next_index.checked_add(1).ok_or_else(|| {
+                EngineError::ProposalFailed("commit sequence space exhausted".to_string())
+            })?;
             self.entries.push(LogEntry {
                 term: self.term,
                 index: idx,
@@ -157,7 +172,7 @@ impl LocalReplicator {
             .last()
             .map(|e| e.index)
             .unwrap_or(self.applied_index);
-        self.next_index = self.commit_index + 1;
+        self.next_index = self.commit_index.saturating_add(1);
     }
 
     pub fn export_snapshot_meta(&mut self) -> SnapshotMeta {
@@ -190,7 +205,7 @@ impl LocalReplicator {
             .last()
             .map(|entry| entry.index)
             .unwrap_or(self.commit_index);
-        self.next_index = tail_index + 1;
+        self.next_index = tail_index.saturating_add(1);
     }
 
     pub fn progress(&self) -> ReplicationProgress {
@@ -237,9 +252,17 @@ impl LogReplicator for LocalReplicator {
         if self.role != Role::Leader {
             return Err(EngineError::NotLeader);
         }
+        if self.next_index == u64::MAX {
+            return Err(EngineError::ProposalFailed(
+                "commit sequence space exhausted".to_string(),
+            ));
+        }
 
         let idx = self.next_index;
-        self.next_index += 1;
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .expect("reserved maximum commit sequence was refused");
 
         let entry = LogEntry {
             term: self.term,
@@ -290,5 +313,29 @@ impl LogReplicator for LocalReplicator {
             last_included_term: self.applied_term,
             snapshot_id: self.snapshot_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn last_valid_commit_is_checkpointable_but_reserved_sentinel_is_not_claimed() {
+        let mut repl = LocalReplicator::leader();
+        repl.install_snapshot(SnapshotMeta {
+            last_included_index: u64::MAX - 1,
+            last_included_term: 1,
+            snapshot_id: 1,
+        });
+        let before = repl.progress();
+        let error = repl.propose(std::sync::Arc::from(&b"x"[..])).unwrap_err();
+        assert!(error.to_string().contains("sequence space exhausted"));
+        assert_eq!(repl.progress(), before);
+        let error = repl
+            .propose_batch([std::sync::Arc::from(&b"x"[..])])
+            .unwrap_err();
+        assert!(error.to_string().contains("sequence space exhausted"));
+        assert_eq!(repl.progress(), before);
     }
 }

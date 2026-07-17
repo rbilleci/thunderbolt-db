@@ -86,26 +86,83 @@ impl Engine {
         // `commit_state()` (commit_mutex) FIRST, then `ddl_catalog()` (catalog latch) acquired INSIDE.
         // `next_commit_timestamp_micros` (which itself locks the commit_mutex) is computed by the
         // caller BEFORE this, so we never re-enter the non-reentrant commit_mutex.
-        let mut commit = self.commit_state();
+        // Serialized relational DML can run beside classic commit waves (for example an UPDATE
+        // falling back from an elided device table). Its exact canonical terminal outcome and
+        // subsequent apply must bind after every earlier wave's durability publication and
+        // residency maintenance. Wait off-lock, then prove the same condition again while owning
+        // the publication lock so a newly applied wave cannot occupy the acquisition gap.
+        let serialized_relational_dml = matches!(
+            Self::decode_engine_command(&payload),
+            Ok(Some(
+                Command::Insert(_) | Command::Delete(_) | Command::Update(_)
+            ))
+        );
+        let mut commit = if serialized_relational_dml {
+            loop {
+                if !self.wait_wave_tail_quiescence() {
+                    return Err(self.commit_path_unavailable_error());
+                }
+                let commit = self.commit_state();
+                let applied = self.commit_wave.tails_applied.load(AtomicOrdering::Acquire);
+                let finished = self
+                    .commit_wave
+                    .tails_finished
+                    .load(AtomicOrdering::Acquire);
+                let maintenance = self
+                    .commit_wave
+                    .tail_maintenance_pending
+                    .load(AtomicOrdering::Acquire);
+                if applied == finished && maintenance == 0 {
+                    break commit;
+                }
+                drop(commit);
+            }
+        } else {
+            self.commit_state()
+        };
         self.ensure_commit_path_available()?;
         // Reciprocal activation fence: a classic writer may have passed the optimistic guard while
         // the first lane was waiting to acquire this lock. Activation publishes under this same
         // lock, so rechecking here makes the handoff linearizable.
         self.intent_lanes_write_guard()?;
+        if let Some(token) = commit.resolve_transaction_retry(txn_id, &payload)? {
+            return Ok(token);
+        }
         self.preflight_serialized_dml_under_commit_lock(&payload)?;
         let token = {
             let wal_len_before = commit.wal.len();
-            commit.wal.append(WalRecord {
-                txn_id,
-                payload: payload.clone(),
-            });
-            let token = match commit.repl.propose(payload) {
+            let commit_seq = commit.repl.peek_next_index();
+            // The exact terminal outcome re-prepares relational DML at the proposed commit
+            // boundary. We already own the commit mutex here, so mark that preparation as an
+            // internal under-lock read: an elided-table device decline may rehydrate, and the
+            // lock-aware rehydration seam must not try to acquire this non-reentrant mutex again.
+            let (outcome_kind, affected_rows) =
+                self.skip_leader_check_during_internal_read(|engine| {
+                    engine.canonical_serialized_outcome(&payload, commit_seq)
+                })?;
+            let token = match commit.repl.propose(payload.clone()) {
                 Ok(token) => token,
                 Err(err) => {
-                    commit.wal.truncate(wal_len_before);
                     return Err(err);
                 }
             };
+            let record = match Self::canonical_wal_record_with_commit_outcome(
+                &commit,
+                txn_id,
+                token.index,
+                0,
+                &payload,
+                gpu_db_wal::canonical_request_digest(&payload),
+                outcome_kind,
+                affected_rows,
+            ) {
+                Ok(record) => record,
+                Err(err) => {
+                    commit.repl.rollback_unapplied_from(token.index);
+                    return Err(err);
+                }
+            };
+            commit.wal.append(record);
             if let Err(err) = commit.wal.flush_all() {
                 commit.repl.rollback_unapplied_from(token.index);
                 commit.wal.truncate(wal_len_before);
@@ -114,6 +171,7 @@ impl Engine {
             commit
                 .repl
                 .wait_committed(token, Duration::from_millis(0))?;
+            commit.record_transaction_status(txn_id, &payload, token.index);
             // `txn_id` (the façade `next_txn_id`) is the durable transaction *identity* — recorded in
             // the WAL record and keyed here for PITR lookups. Intentionally DECOUPLED from the MVCC
             // version stamp, which uses the commit `Index` (see `apply_mvcc_entry`).
@@ -195,14 +253,24 @@ impl Engine {
             let mut first_index: Option<Index> = None;
             let mut last_index = 0;
             for (txn_id, payload) in items {
-                commit.wal.append(WalRecord {
-                    txn_id: *txn_id,
-                    payload: payload.clone(),
-                });
                 match commit.repl.propose(payload.clone()) {
                     Ok(token) => {
                         first_index.get_or_insert(token.index);
                         last_index = token.index;
+                        match Self::canonical_wal_record(&commit, *txn_id, token.index, 0, payload)
+                        {
+                            Ok(record) => commit.wal.append(record),
+                            Err(error) => {
+                                commit.repl.rollback_unapplied_from(
+                                    first_index.expect("the current proposal established it"),
+                                );
+                                commit.wal.truncate(wal_len_before);
+                                return Err(BatchCommitFailure {
+                                    rolled_back: true,
+                                    error,
+                                });
+                            }
+                        }
                     }
                     Err(error) => {
                         if let Some(first) = first_index {
@@ -240,10 +308,16 @@ impl Engine {
             }
             // Per-item strictly-monotonic commit timestamps (same formula as
             // `next_commit_timestamp_micros`, inlined because the commit_mutex is already held).
-            for (txn_id, _) in items {
+            let batch_first_index = first_index.expect("non-empty batch proposed");
+            for (offset, (txn_id, payload)) in items.iter().enumerate() {
                 let timestamp_micros =
                     wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
                 commit.record_commit_timestamp(*txn_id, timestamp_micros);
+                commit.record_transaction_status(
+                    *txn_id,
+                    payload,
+                    batch_first_index + offset as u64,
+                );
             }
             last_index
         };
@@ -394,9 +468,21 @@ impl Engine {
             let mut applied: Vec<AppliedRowMutation> = Vec::new();
             let mut recorded_write_set = false;
             let mut insert_batch: BTreeMap<String, InsertAccum> = BTreeMap::new();
+            let mut working_catalog_changed = false;
             for e in &to_apply {
-                commit.sm.apply(e)?;
-                for m in self.apply_mvcc_entry(e, cat)? {
+                let working_catalog = working_catalog_changed
+                    .then(|| Self::catalog_snapshot_from_working(cat, e.index.saturating_sub(1)));
+                let applied_entry = self.with_apply_catalog(working_catalog, || {
+                    commit.sm.apply(e)?;
+                    self.apply_mvcc_entry(e, cat)
+                })?;
+                let affected_rows = applied_entry
+                    .iter()
+                    .map(AppliedRowMutation::rows_affected)
+                    .sum();
+                commit.last_applied_outcome = Some((e.index, affected_rows));
+                working_catalog_changed |= Self::entry_mutates_working_catalog(e, cat);
+                for m in applied_entry {
                     // C2 (write-path assessment): record the SERIALIZED path's write-set into the
                     // SI recent-commits ledger, exactly as the concurrent path records its own —
                     // so a concurrent committer whose read snapshot predates this commit sees the
@@ -881,19 +967,26 @@ impl Engine {
         let mut commit = self.commit_state();
         self.ensure_commit_path_available()?;
         self.intent_lanes_write_guard()?;
+        if let Some(token) = commit.resolve_transaction_retry(txn_id, &payload)? {
+            return Ok((token, 0));
+        }
         let token = {
             let wal_len_before = commit.wal.len();
-            commit.wal.append(WalRecord {
-                txn_id,
-                payload: payload.clone(),
-            });
-            let token = match commit.repl.propose(payload) {
+            let token = match commit.repl.propose(payload.clone()) {
                 Ok(token) => token,
                 Err(err) => {
-                    commit.wal.truncate(wal_len_before);
                     return Err(err);
                 }
             };
+            let record = match Self::canonical_wal_record(&commit, txn_id, token.index, 0, &payload)
+            {
+                Ok(record) => record,
+                Err(err) => {
+                    commit.repl.rollback_unapplied_from(token.index);
+                    return Err(err);
+                }
+            };
+            commit.wal.append(record);
             if let Err(err) = commit.wal.flush_all() {
                 commit.repl.rollback_unapplied_from(token.index);
                 commit.wal.truncate(wal_len_before);
@@ -902,6 +995,7 @@ impl Engine {
             commit
                 .repl
                 .wait_committed(token, Duration::from_millis(0))?;
+            commit.record_transaction_status(txn_id, &payload, token.index);
             // `txn_id` is the durable transaction identity (decoupled from the MVCC `commit_seq`).
             commit.record_commit_timestamp(txn_id, timestamp_micros);
             token
@@ -978,27 +1072,26 @@ impl Engine {
         {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
+            let mut working_catalog_changed = false;
             for e in &to_apply {
-                if e.index == token.index {
-                    // The caller applies the current entry directly through Engine state. Avoid
-                    // cloning and reparsing the large SQL payload through the generic KV state
-                    // machine on the COPY hot path while preserving WAL/replay records. Pass the
-                    // commit sequence (`e.index`) so the stamp matches `apply_mvcc_entry`'s replay
-                    // stamp, plus the held catalog latch for any working-map mutation.
-                    if let Err(error) = apply_current(self, cat, e.index) {
-                        self.wedge_commit_path();
-                        return Err(error);
+                let working_catalog = working_catalog_changed
+                    .then(|| Self::catalog_snapshot_from_working(cat, e.index.saturating_sub(1)));
+                let apply_entry = || {
+                    if e.index == token.index {
+                        // Apply directly: avoid COPY payload clone/reparse while preserving WAL.
+                        // Its sequence matches replay; the catalog latch permits map mutation.
+                        apply_current(self, cat, e.index)
+                    } else {
+                        commit.sm.apply(e)?;
+                        self.apply_mvcc_entry(e, cat).map(|_| ())
                     }
-                } else {
-                    if let Err(error) = commit.sm.apply(e) {
-                        self.wedge_commit_path();
-                        return Err(error);
-                    }
-                    if let Err(error) = self.apply_mvcc_entry(e, cat) {
-                        self.wedge_commit_path();
-                        return Err(error);
-                    }
+                };
+                let apply_result = self.with_apply_catalog(working_catalog, apply_entry);
+                if let Err(error) = apply_result {
+                    self.wedge_commit_path();
+                    return Err(error);
                 }
+                working_catalog_changed |= Self::entry_mutates_working_catalog(e, cat);
                 commit.repl.mark_applied(e.index);
             }
 
@@ -1223,8 +1316,7 @@ impl Engine {
                     Err(_) => return None,
                 }
             }
-            let text = std::str::from_utf8(&entry.payload).ok()?;
-            let command = parse_command(text).ok()?;
+            let command = Self::decode_engine_command(&entry.payload).ok()??;
             match command {
                 Command::Insert(insert) => {
                     tables.insert(insert.table);
@@ -1326,10 +1418,7 @@ impl Engine {
                 }
                 continue;
             }
-            let Ok(text) = std::str::from_utf8(&entry.payload) else {
-                return BTreeSet::new();
-            };
-            let Ok(command) = parse_command(text) else {
+            let Ok(Some(command)) = Self::decode_engine_command(&entry.payload) else {
                 return BTreeSet::new();
             };
             match command {
@@ -1663,10 +1752,7 @@ impl Engine {
                     .map(|mutation| mutation.into_iter().collect()),
             };
         }
-        let Ok(text) = std::str::from_utf8(&entry.payload) else {
-            return Ok(Vec::new());
-        };
-        let Ok(cmd) = parse_command(text) else {
+        let Some(cmd) = Self::decode_engine_command(&entry.payload)? else {
             return Ok(Vec::new());
         };
 
@@ -1897,96 +1983,5 @@ impl Engine {
         }
 
         Ok(applied.into_iter().collect())
-    }
-}
-
-#[cfg(test)]
-mod commit_timestamp_tests {
-    use crate::Engine;
-
-    fn engine_with_commits(n: u64) -> Engine {
-        let engine = Engine::new_local();
-        engine
-            .execute_text(1, "CREATE TABLE t (id INT)")
-            .expect("create table");
-        for i in 0..n {
-            engine
-                .execute_text(i + 2, &format!("INSERT INTO t (id) VALUES ({i})"))
-                .expect("insert");
-        }
-        engine
-    }
-
-    /// NON-VACUOUS DIFFERENTIAL: the O(1) `max_commit_timestamp_micros` must equal the O(n)
-    /// `wal_commit_timestamps_micros.values().max()` it replaced, after a real commit sequence.
-    /// This is byte-identity by construction — if `record_commit_timestamp` ever fails to bump the
-    /// running max, the two diverge and this fails. The length assert proves commits actually ran
-    /// (so the equality is not vacuously over an empty map).
-    #[test]
-    fn running_max_equals_full_scan_of_map() {
-        let engine = engine_with_commits(64);
-        let commit = engine.commit_state();
-        let scan_max = commit
-            .wal_commit_timestamps_micros
-            .values()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        assert!(
-            commit.wal_commit_timestamps_micros.len() >= 64,
-            "expected the commit-timestamp map to be populated (got {})",
-            commit.wal_commit_timestamps_micros.len()
-        );
-        assert_ne!(
-            scan_max, 0,
-            "non-vacuity: the scanned max must be a real timestamp"
-        );
-        assert_eq!(
-            commit.max_commit_timestamp_micros, scan_max,
-            "O(1) running max diverged from the O(n) scan it replaced"
-        );
-    }
-
-    /// The assignment property the O(n) scan guaranteed is preserved: commit timestamps are strictly
-    /// increasing in COMMIT ORDER. txn_ids are assigned monotonically here, so sorting by txn_id
-    /// recovers commit order explicitly (the map is a HashMap; `values()` order is arbitrary —
-    /// the old BTreeMap iteration only happened to coincide with commit order).
-    #[test]
-    fn assigned_timestamps_are_strictly_monotonic() {
-        let engine = engine_with_commits(32);
-        let commit = engine.commit_state();
-        let mut by_txn: Vec<(gpu_db_types::TxnId, u64)> = commit
-            .wal_commit_timestamps_micros
-            .iter()
-            .map(|(txn_id, stamp)| (*txn_id, *stamp))
-            .collect();
-        by_txn.sort_unstable_by_key(|(txn_id, _)| *txn_id);
-        let stamps: Vec<u64> = by_txn.into_iter().map(|(_, stamp)| stamp).collect();
-        assert!(stamps.len() >= 32, "expected commits to be recorded");
-        for pair in stamps.windows(2) {
-            assert!(
-                pair[1] > pair[0],
-                "commit timestamps must be strictly increasing: {} !> {}",
-                pair[1],
-                pair[0]
-            );
-        }
-    }
-
-    /// Fresh engine (empty map): the running max is 0 and `next_commit_timestamp_micros` returns the
-    /// wall clock — reproducing the old `unwrap_or(wall_clock)` arm (wall micros >> 1).
-    #[test]
-    fn fresh_engine_next_timestamp_is_wall_clock() {
-        let engine = Engine::new_local();
-        {
-            let commit = engine.commit_state();
-            assert_eq!(commit.max_commit_timestamp_micros, 0);
-            assert!(commit.wal_commit_timestamps_micros.is_empty());
-        }
-        let ts = engine.next_commit_timestamp_micros();
-        assert!(
-            ts > 1,
-            "fresh-engine timestamp should be the wall clock, got {ts}"
-        );
     }
 }

@@ -338,7 +338,13 @@ impl Engine {
         if lanes.applied_mirror.load(Ordering::Acquire) != cut {
             // Not quiesced: no artifact — but still sweep older cuts' artifacts (audit LOW: a
             // never-quiescent workload would otherwise accrete one dead artifact per cut).
-            crate::engine_streaming_exec::remove_stale_cold_checkpoints(base, cut);
+            if let Err(err) = crate::engine_streaming_exec::remove_stale_cold_checkpoints(base, cut)
+            {
+                eprintln!(
+                    "[gpu-db] stale cold checkpoint cleanup beside {} failed: {err}",
+                    base.display()
+                );
+            }
             return;
         }
         let base_seq = lanes.base_seq.load(Ordering::Acquire);
@@ -346,7 +352,13 @@ impl Engine {
             .checked_sub(1)
             .and_then(|last_local| base_seq.checked_add(last_local))
         else {
-            crate::engine_streaming_exec::remove_stale_cold_checkpoints(base, cut);
+            if let Err(err) = crate::engine_streaming_exec::remove_stale_cold_checkpoints(base, cut)
+            {
+                eprintln!(
+                    "[gpu-db] stale cold checkpoint cleanup beside {} failed: {err}",
+                    base.display()
+                );
+            }
             return;
         };
         if let Err(err) = self.write_streaming_cold_checkpoint(base, cut, seam_index) {
@@ -395,6 +407,97 @@ impl Engine {
         segment_path: impl AsRef<std::path::Path>,
         record_timestamps: &[WalArchiveRecordTimestamp],
     ) -> Result<WalArchiveManifest, EngineError> {
+        let manifest_path = manifest_path.as_ref();
+        let segment_path = segment_path.as_ref();
+        let (_manifest, archived) = read_wal_archive(manifest_path)?;
+        let mut identity = None;
+        let mut next_commit_seq = None;
+        let mut catalog_boundary = None;
+        for record in &archived {
+            let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)?
+            else {
+                continue;
+            };
+            match identity {
+                None => identity = Some(envelope.header.identity),
+                Some(expected) if expected == envelope.header.identity => {}
+                Some(_) => {
+                    return Err(EngineError::Durability(
+                        "archive lineage changes before ingest boundary".to_string(),
+                    ));
+                }
+            }
+            next_commit_seq = Some(envelope.header.commit_seq.checked_add(1).ok_or_else(|| {
+                EngineError::Durability(
+                    "archive commit sequence is exhausted at ingest boundary".to_string(),
+                )
+            })?);
+            catalog_boundary = Some((
+                envelope.header.catalog_after_epoch,
+                envelope.header.catalog_after_digest,
+            ));
+        }
+        if let (Some(identity), Some(mut commit_seq)) = (identity, next_commit_seq) {
+            let (mut catalog_epoch, mut catalog_digest) = catalog_boundary.ok_or_else(|| {
+                EngineError::Durability(
+                    "canonical archive has no catalog boundary at ingest".to_string(),
+                )
+            })?;
+            let incoming = read_wal_segment(segment_path)?;
+            let mut canonical = Vec::with_capacity(incoming.len());
+            let mut converted = false;
+            for record in incoming {
+                if let Some(envelope) =
+                    gpu_db_wal::decode_canonical_record_payload(&record.payload)?
+                {
+                    if envelope.header.identity != identity
+                        || envelope.header.commit_seq != commit_seq
+                        || envelope.header.catalog_before_epoch != catalog_epoch
+                        || envelope.header.catalog_before_digest != catalog_digest
+                    {
+                        return Err(EngineError::Durability(format!(
+                            "archive ingest canonical record {} has foreign lineage, sequence, or catalog boundary",
+                            record.txn_id
+                        )));
+                    }
+                    catalog_epoch = envelope.header.catalog_after_epoch;
+                    catalog_digest = envelope.header.catalog_after_digest;
+                    canonical.push(record);
+                } else {
+                    let converted_record =
+                        Self::canonical_wal_record_with_boundary_and_request_digest(
+                            identity,
+                            catalog_epoch,
+                            catalog_digest,
+                            record.txn_id,
+                            commit_seq,
+                            0,
+                            &record.payload,
+                            gpu_db_wal::canonical_request_digest(&record.payload),
+                        )?;
+                    let envelope =
+                        gpu_db_wal::decode_canonical_record_payload(&converted_record.payload)?
+                            .ok_or_else(|| {
+                                EngineError::Durability(
+                                    "archive legacy conversion did not produce canonical WAL"
+                                        .to_string(),
+                                )
+                            })?;
+                    catalog_epoch = envelope.header.catalog_after_epoch;
+                    catalog_digest = envelope.header.catalog_after_digest;
+                    canonical.push(converted_record);
+                    converted = true;
+                }
+                commit_seq = commit_seq.checked_add(1).ok_or_else(|| {
+                    EngineError::Durability("archive ingest commit sequence overflow".to_string())
+                })?;
+            }
+            if converted {
+                // Offline one-way upgrade at the archive boundary. The rewritten segment and its
+                // identity anchor are durable before the manifest atomically references it.
+                write_wal_segment(segment_path, &canonical)?;
+            }
+        }
         append_wal_archive_segment_with_timestamps(manifest_path, segment_path, record_timestamps)
     }
 

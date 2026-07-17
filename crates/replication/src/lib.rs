@@ -620,9 +620,17 @@ impl LogReplicator for RaftReplicator {
         if self.role != Role::Leader {
             return Err(EngineError::NotLeader);
         }
+        if self.next_index == u64::MAX {
+            return Err(EngineError::ProposalFailed(
+                "commit sequence space exhausted".to_string(),
+            ));
+        }
 
         let idx = self.next_index;
-        self.next_index += 1;
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .expect("reserved maximum commit sequence was refused");
 
         self.entries.push(LogEntry {
             term: self.term,
@@ -684,6 +692,20 @@ impl LogReplicator for RaftReplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raft_refuses_reserved_maximum_commit_sequence_without_mutation() {
+        let mut repl = RaftReplicator::single_node_leader();
+        repl.install_snapshot(SnapshotMeta {
+            last_included_index: u64::MAX - 1,
+            last_included_term: 1,
+            snapshot_id: 1,
+        });
+        let before = repl.progress();
+        let error = repl.propose(std::sync::Arc::from(&b"x"[..])).unwrap_err();
+        assert!(error.to_string().contains("sequence space exhausted"));
+        assert_eq!(repl.progress(), before);
+    }
 
     include!("tests/rpc.rs");
     include!("tests/transport.rs");

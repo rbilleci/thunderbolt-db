@@ -2,7 +2,8 @@
 
 use super::*;
 
-const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
+const WAL_CONTROL_MAGIC_V1: &str = "GPUDBWALCONTROL1";
+const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalCheckpointMeta {
@@ -67,7 +68,8 @@ pub fn lanes_checkpoint_segment_path(segment_path: &Path, lane_cut: u64) -> Path
     segment_path.with_file_name(format!("{file_name}.lanes-checkpoint.seg.{lane_cut}"))
 }
 
-const LANES_CHECKPOINT_MAGIC: &str = "gpu-db-lanes-checkpoint v1";
+const LANES_CHECKPOINT_MAGIC_V1: &str = "gpu-db-lanes-checkpoint v1";
+const LANES_CHECKPOINT_MAGIC: &str = "GPUDBLANESCHECKPOINT2";
 
 /// A committed lanes checkpoint: the frozen serial prefix length, the lane baseline, and the
 /// full merged record history `serial ++ lanes[0, lane_cut)`.
@@ -96,8 +98,7 @@ pub fn write_lanes_checkpoint(
         )));
     }
     let seg_path = lanes_checkpoint_segment_path(segment_path, lane_cut);
-    write_wal_segment(&seg_path, records)?; // atomic temp + rename
-    sync_wal_parent_dir(&seg_path)?;
+    write_wal_segment(&seg_path, records)?; // atomic temp + rename + parent-directory sync
     let seg_name = seg_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -112,7 +113,9 @@ pub fn write_lanes_checkpoint(
     // none); after it, the new one.
     let path = lanes_checkpoint_sidecar_path(segment_path);
     let temp = path.with_extension("lanes-checkpoint.tmp");
-    let body = format!("{LANES_CHECKPOINT_MAGIC} {serial_records} {lane_cut} {seg_name}\n");
+    let body = append_sha256_trailer(format!(
+        "{LANES_CHECKPOINT_MAGIC}\nserial_records={serial_records}\nlane_cut={lane_cut}\nsegment={seg_name}\n"
+    ));
     (|| -> std::io::Result<()> {
         {
             let mut file = fs::File::create(&temp)?;
@@ -131,25 +134,47 @@ pub fn write_lanes_checkpoint(
             path.display()
         ))
     })?;
-    // Retire older generations (best-effort; a leftover is re-collected next checkpoint).
+    // Retire older generations only after the new sidecar is authoritative. A failure is a safe
+    // leak, but it is reported loudly so an operator never mistakes incomplete pruning for a
+    // completed checkpoint-maintenance cycle. Persist every successful unlink in the directory.
     if let (Some(parent), Some(stem)) = (
         segment_path.parent().filter(|p| !p.as_os_str().is_empty()),
         segment_path.file_name().and_then(|n| n.to_str()),
     ) {
         let prefix = format!("{stem}.lanes-checkpoint.seg.");
-        if let Ok(entries) = fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Some(gen) = name
-                        .strip_prefix(&prefix)
-                        .and_then(|g| g.parse::<u64>().ok())
-                    {
-                        if gen < lane_cut {
-                            let _ = fs::remove_file(entry.path());
-                        }
+        let entries = fs::read_dir(parent).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to enumerate old lanes checkpoint generations in {}: {err}",
+                parent.display()
+            ))
+        })?;
+        let mut removed = false;
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                EngineError::Durability(format!(
+                    "failed to enumerate an old lanes checkpoint generation in {}: {err}",
+                    parent.display()
+                ))
+            })?;
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(gen) = name
+                    .strip_prefix(&prefix)
+                    .and_then(|g| g.parse::<u64>().ok())
+                {
+                    if gen < lane_cut {
+                        fs::remove_file(entry.path()).map_err(|err| {
+                            EngineError::Durability(format!(
+                                "failed to remove old lanes checkpoint generation {}: {err}",
+                                entry.path().display()
+                            ))
+                        })?;
+                        removed = true;
                     }
                 }
             }
+        }
+        if removed {
+            sync_wal_parent_dir(&path)?;
         }
     }
     Ok(())
@@ -177,22 +202,43 @@ pub fn read_lanes_checkpoint(segment_path: &Path) -> Result<Option<LanesCheckpoi
             path.display()
         ))
     };
-    let rest = content
-        .strip_prefix(LANES_CHECKPOINT_MAGIC)
-        .ok_or_else(malformed)?;
-    let mut fields = rest.split_whitespace();
-    let serial_records = fields
-        .next()
-        .and_then(|f| f.parse::<u64>().ok())
-        .ok_or_else(malformed)?;
-    let lane_cut = fields
-        .next()
-        .and_then(|f| f.parse::<u64>().ok())
-        .ok_or_else(malformed)?;
-    let seg_name = fields.next().ok_or_else(malformed)?.to_string();
-    if fields.next().is_some() {
-        return Err(malformed());
-    }
+    let (serial_records, lane_cut, seg_name) =
+        if content.lines().next() == Some(LANES_CHECKPOINT_MAGIC) {
+            let verified = verify_sha256_trailer(&content, &path)?;
+            let mut lines = verified.lines();
+            if lines.next() != Some(LANES_CHECKPOINT_MAGIC) {
+                return Err(malformed());
+            }
+            let serial_records = parse_control_value(lines.next(), "serial_records", &path)?
+                .parse::<u64>()
+                .map_err(|_| malformed())?;
+            let lane_cut = parse_control_value(lines.next(), "lane_cut", &path)?
+                .parse::<u64>()
+                .map_err(|_| malformed())?;
+            let seg_name = parse_control_value(lines.next(), "segment", &path)?.to_string();
+            if lines.next().is_some() {
+                return Err(malformed());
+            }
+            (serial_records, lane_cut, seg_name)
+        } else {
+            let rest = content
+                .strip_prefix(LANES_CHECKPOINT_MAGIC_V1)
+                .ok_or_else(malformed)?;
+            let mut fields = rest.split_whitespace();
+            let serial_records = fields
+                .next()
+                .and_then(|f| f.parse::<u64>().ok())
+                .ok_or_else(malformed)?;
+            let lane_cut = fields
+                .next()
+                .and_then(|f| f.parse::<u64>().ok())
+                .ok_or_else(malformed)?;
+            let seg_name = fields.next().ok_or_else(malformed)?.to_string();
+            if fields.next().is_some() {
+                return Err(malformed());
+            }
+            (serial_records, lane_cut, seg_name)
+        };
     let seg_path = path.with_file_name(&seg_name);
     let records = read_wal_segment(&seg_path)?;
     if records.len() as u64 != serial_records + lane_cut {
@@ -216,7 +262,7 @@ pub fn write_wal_control_file(
 ) -> Result<(), EngineError> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+        create_wal_dir_all(parent).map_err(|err| {
             EngineError::Durability(format!(
                 "failed to create WAL control directory {}: {err}",
                 parent.display()
@@ -230,11 +276,11 @@ pub fn write_wal_control_file(
         .last_durable_txn_id
         .map(|txn_id| txn_id.to_string())
         .unwrap_or_else(|| "none".to_string());
-    let body = format!(
+    let body = append_sha256_trailer(format!(
         "{WAL_CONTROL_MAGIC}\nsegment={}\ndurable_record_count={}\nlast_durable_txn_id={last_txn}\n",
         control.segment_path.display(),
         control.checkpoint.durable_record_count,
-    );
+    ));
 
     let write_result = (|| {
         let mut file = File::create(&tmp_path).map_err(|err| {
@@ -269,7 +315,8 @@ pub fn write_wal_control_file(
             "failed to install WAL control file {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    sync_wal_parent_dir(path)
 }
 
 pub fn read_wal_control_file(path: impl AsRef<Path>) -> Result<WalControlFile, EngineError> {
@@ -280,13 +327,18 @@ pub fn read_wal_control_file(path: impl AsRef<Path>) -> Result<WalControlFile, E
             path.display()
         ))
     })?;
+    let body = match body.lines().next() {
+        Some(WAL_CONTROL_MAGIC) => verify_sha256_trailer(&body, path)?,
+        Some(WAL_CONTROL_MAGIC_V1) => body,
+        _ => {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL control header {}",
+                path.display()
+            )))
+        }
+    };
     let mut lines = body.lines();
-    if lines.next() != Some(WAL_CONTROL_MAGIC) {
-        return Err(EngineError::Durability(format!(
-            "invalid WAL control header {}",
-            path.display()
-        )));
-    }
+    let _magic = lines.next();
 
     let segment_path = parse_control_value(lines.next(), "segment", path).map(PathBuf::from)?;
     let durable_record_count = parse_control_value(lines.next(), "durable_record_count", path)?
@@ -307,6 +359,12 @@ pub fn read_wal_control_file(path: impl AsRef<Path>) -> Result<WalControlFile, E
             ))
         })?),
     };
+    if lines.next().is_some() {
+        return Err(EngineError::Durability(format!(
+            "unexpected trailing WAL control fields in {}",
+            path.display()
+        )));
+    }
 
     Ok(WalControlFile {
         segment_path,

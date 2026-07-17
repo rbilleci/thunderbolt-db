@@ -271,7 +271,10 @@ fn wal_archive_object_backup_rejects_manifest_metadata_drift_before_install() {
     let _ = fs::remove_dir_all(dir);
 
     let err = err.to_string();
-    assert!(err.contains("manifest object does not match backup manifest metadata"));
+    assert!(
+        err.contains("manifest object does not match backup manifest metadata")
+            || err.contains("SHA-256 checksum mismatch")
+    );
     assert!(!manifest_installed);
     assert!(!segment_dir_installed);
 }
@@ -1840,4 +1843,88 @@ fn wal_archive_rejects_non_increasing_transaction_order() {
     let _ = fs::remove_dir_all(dir);
 
     assert!(err.to_string().contains("non-increasing transaction order"));
+}
+
+#[test]
+fn v2_archive_manifest_timeline_registry_and_backup_manifest_reject_tampering() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-wal-v2-authority-{}-{}",
+        std::process::id(),
+        NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let manifest_path = dir.join("archive").join("MANIFEST");
+    let segment_dir = dir.join("archive").join("segments");
+    let records = vec![WalRecord {
+        txn_id: 1,
+        payload: b"SET v2=1".to_vec().into(),
+    }];
+    write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+    let manifest_body = fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest_body.starts_with("GPUDBWALARCHIVE2\n"));
+    let legacy_manifest = manifest_body
+        .replace("GPUDBWALARCHIVE2", "GPUDBWALARCHIVE1")
+        .lines()
+        .filter(|line| !line.starts_with("sha256="))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&manifest_path, legacy_manifest).unwrap();
+    assert_eq!(
+        read_wal_archive_manifest(&manifest_path)
+            .unwrap()
+            .checkpoint
+            .durable_record_count,
+        1
+    );
+    fs::write(&manifest_path, &manifest_body).unwrap();
+    fs::write(
+        &manifest_path,
+        manifest_body.replace("durable_record_count=1", "durable_record_count=2"),
+    )
+    .unwrap();
+    assert!(read_wal_archive_manifest(&manifest_path).is_err());
+    fs::write(&manifest_path, &manifest_body).unwrap();
+
+    let timeline_path = dir.join("TIMELINE");
+    let timeline = WalArchiveTimeline {
+        timeline_id: "main".to_string(),
+        parent_timeline_id: None,
+        fork_txn_id: 1,
+        fork_timestamp_micros: None,
+        source_manifest_path: manifest_path.clone(),
+        branch_manifest_path: manifest_path.clone(),
+    };
+    write_wal_archive_timeline(&timeline_path, &timeline).unwrap();
+    let timeline_body = fs::read_to_string(&timeline_path).unwrap();
+    assert!(timeline_body.starts_with("GPUDBWALTIMELINE2\n"));
+    fs::write(&timeline_path, timeline_body.replace("timeline_id=main", "timeline_id=evil"))
+        .unwrap();
+    assert!(read_wal_archive_timeline(&timeline_path).is_err());
+
+    let registry_path = dir.join("REGISTRY");
+    write_wal_archive_timeline_registry(
+        &registry_path,
+        &WalArchiveTimelineRegistry {
+            timelines: Vec::new(),
+        },
+    )
+    .unwrap();
+    let registry_body = fs::read_to_string(&registry_path).unwrap();
+    assert!(registry_body.starts_with("GPUDBWALTIMELINEREGISTRY2\n"));
+    fs::write(
+        &registry_path,
+        registry_body.replace("timeline_count=0", "timeline_count=1"),
+    )
+    .unwrap();
+    assert!(read_wal_archive_timeline_registry(&registry_path).is_err());
+
+    let backup_path = dir.join("backup").join("BACKUP");
+    let object_dir = dir.join("backup").join("objects");
+    export_wal_archive_object_backup(&manifest_path, &backup_path, &object_dir).unwrap();
+    let backup_body = fs::read_to_string(&backup_path).unwrap();
+    assert!(backup_body.starts_with("GPUDBWALOBJECTBACKUP2\n"));
+    fs::write(&backup_path, backup_body.replace("objects=2", "objects=3")).unwrap();
+    assert!(read_wal_archive_object_backup_manifest(&backup_path).is_err());
+
+    let _ = fs::remove_dir_all(dir);
 }

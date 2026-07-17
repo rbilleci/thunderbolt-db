@@ -9,6 +9,7 @@ use gpu_db_observability::InMemoryTelemetrySink;
 
 // Shared test fixtures, helpers, and tests-wide state (re-exported so every
 // feature submodule reaches them via `use super::*`).
+mod commit_timestamps;
 mod common;
 use common::*;
 

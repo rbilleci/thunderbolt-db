@@ -37,6 +37,29 @@ impl Engine {
         self.ensure_commit_path_available()?;
         if !lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
             let first = commit.repl.peek_next_index();
+            let (catalog_epoch, catalog_digest) = Self::canonical_catalog_boundary(
+                commit.canonical_identity,
+                commit.wal.last_record(),
+            )?;
+            lanes
+                .canonical_identity
+                .set(commit.canonical_identity)
+                .map_err(|_| {
+                    EngineError::Durability(
+                        "intent-lane canonical identity was initialized twice".to_string(),
+                    )
+                })?;
+            lanes
+                .canonical_catalog_digest
+                .set(catalog_digest)
+                .map_err(|_| {
+                    EngineError::Durability(
+                        "intent-lane canonical catalog binding was initialized twice".to_string(),
+                    )
+                })?;
+            lanes
+                .canonical_catalog_epoch
+                .store(catalog_epoch, std::sync::atomic::Ordering::Release);
             lanes
                 .base_seq
                 .store(first, std::sync::atomic::Ordering::Release);
@@ -178,7 +201,7 @@ impl Engine {
         // increments the epoch after device publication and before bridge removal. A changed epoch
         // retries the complete probe; a stable epoch lets this pass arbitrate and install its own
         // provisional bridge atomically with respect to removal.
-        let (winner_positions, winner_slots) = {
+        let (winner_positions, winner_slots, target_counts) = {
             loop {
                 let epoch_before = lanes
                     .device_publication_epoch
@@ -187,7 +210,8 @@ impl Engine {
                 // device visible-locate verdict per key. DELETE/UPDATE target resolution remains
                 // at apply.
                 let stat_start = Instant::now();
-                let (violations, device_conflicts) = self.lane_validate_unique(&batch);
+                let (violations, device_conflicts, target_counts) =
+                    self.lane_validate_unique(&batch);
                 lanes.stat_validate_ns.fetch_add(
                     stat_start.elapsed().as_nanos() as u64,
                     AtomicOrdering::Relaxed,
@@ -266,13 +290,24 @@ impl Engine {
                     conflict_started.elapsed().as_nanos() as u64,
                     AtomicOrdering::Relaxed,
                 );
-                break (winner_positions, winner_slots);
+                break (winner_positions, winner_slots, target_counts);
             }
         };
         let mut winners: Vec<LaneIntent> = batch
             .into_iter()
             .zip(winner_positions)
-            .filter_map(|(item, winner)| winner.then_some(item))
+            .zip(target_counts)
+            .filter_map(|((mut item, winner), target_count)| {
+                if !winner {
+                    return None;
+                }
+                item.rows_affected = match item.op {
+                    LaneOpKind::Insert => 1,
+                    LaneOpKind::Delete | LaneOpKind::Update => target_count
+                        .expect("a selected lane mutation has an exact GPU target cardinality"),
+                };
+                Some(item)
+            })
             .collect();
         let k = winners.len() as u64;
         if k == 0 {
@@ -318,21 +353,32 @@ impl Engine {
             .filter(|item| item.op != LaneOpKind::Delete)
             .count() as u64;
         let row_id_base = if row_consuming_count > 0 {
-            self.read_state.mvcc.claim_row_id_block(row_consuming_count)
+            let Some(base) = self.read_state.mvcc.claim_row_id_block(row_consuming_count) else {
+                let mut inflight = lanes.inflight_slots[lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for slot in &winner_slots {
+                    inflight.remove(slot);
+                }
+                drop(inflight);
+                for item in winners {
+                    item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "row identity space exhausted before WAL sequence claim".to_string(),
+                    ))));
+                }
+                return true;
+            };
+            base
         } else {
             0 // no insert/update in this wave; never read
         };
-        // FUSED patch+envelope pass: the frame payload is assembled in the same
-        // loop that patches each record (bytes are cache-warm), replacing the
-        // separate encode_record_into pass that was measured at ~1.4us/record
-        // of cold Arc re-walks (1.4ms of a 1000-record wave).
-        let mut frame_payload: Vec<u8> = Vec::with_capacity(winners.len() * 24 + 4096);
-        // Per-record end offsets: sub-frame publishing splits the payload on
-        // record boundaries (see `intent_lane_subframes`).
-        let mut record_ends: Vec<usize> = Vec::with_capacity(winners.len());
+        // Patch each resolved operation before the global sequence block is claimed. Canonical
+        // headers need that global sequence, so physical envelope construction follows the claim.
+        let mut raw_records = Vec::with_capacity(winners.len());
+        let mut request_digests = Vec::with_capacity(winners.len());
         let mut row_alloc_offset = 0u64;
         for item in winners.iter() {
-            match item.op {
+            let payload = match item.op {
                 LaneOpKind::Insert | LaneOpKind::Update => {
                     // INSERT patches its entity/row id; UPDATE patches the v1 record's legacy
                     // allocator reservation. Both occupy `row_id_offset` (8 LE bytes) and draw the
@@ -345,22 +391,18 @@ impl Engine {
                     std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
                         [off..off + 8]
                         .copy_from_slice(&row_id.to_le_bytes());
-                    gpu_db_wal::encode_wal_record_parts_into(
-                        &mut frame_payload,
-                        item.txn_id,
-                        &payload,
-                    );
+                    payload
                 }
                 LaneOpKind::Delete => {
                     // W5b by-key record: complete at build time, nothing to patch.
-                    gpu_db_wal::encode_wal_record_parts_into(
-                        &mut frame_payload,
-                        item.txn_id,
-                        &item.template[..],
-                    );
+                    std::sync::Arc::from(&item.template[..])
                 }
-            }
-            record_ends.push(frame_payload.len());
+            };
+            raw_records.push(gpu_db_wal::WalRecord {
+                txn_id: item.txn_id,
+                payload,
+            });
+            request_digests.push(gpu_db_wal::canonical_request_digest(&item.template));
         }
         lanes.stat_patch_ns.fetch_add(
             patch_started.elapsed().as_nanos() as u64,
@@ -401,6 +443,79 @@ impl Engine {
         );
         let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
         let local_first = first_seq - base;
+        let Some(identity) = lanes.canonical_identity.get().copied() else {
+            self.wedge_commit_path();
+            for item in winners {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                    "intent lane claimed a sequence block without canonical lineage".to_string(),
+                ))));
+            }
+            return true;
+        };
+        let canonical_lane = match u32::try_from(lane).ok().and_then(|id| id.checked_add(1)) {
+            Some(id) => id,
+            None => {
+                self.wedge_commit_path();
+                for item in winners {
+                    item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                        "intent lane id exceeds canonical WAL range".to_string(),
+                    ))));
+                }
+                return true;
+            }
+        };
+        let mut frame_payload = Vec::with_capacity(raw_records.len() * 768);
+        let mut record_ends = Vec::with_capacity(raw_records.len());
+        for (offset, raw) in raw_records.iter().enumerate() {
+            let commit_seq = first_seq + offset as u64;
+            winners[offset].commit_seq = Some(commit_seq);
+            debug_assert_eq!(winners[offset].request_digest, request_digests[offset]);
+            let outcome_kind = if winners[offset].rows_affected == 0 {
+                gpu_db_wal::CanonicalOutcomeKind::CommitNoOp
+            } else {
+                gpu_db_wal::CanonicalOutcomeKind::CommitSuccess
+            };
+            let Some(catalog_digest) = lanes.canonical_catalog_digest.get().copied() else {
+                self.wedge_commit_path();
+                for item in winners {
+                    item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                        "intent lane has no canonical catalog binding".to_string(),
+                    ))));
+                }
+                return true;
+            };
+            let canonical = match Self::canonical_wal_record_with_boundary_and_outcome(
+                identity,
+                lanes
+                    .canonical_catalog_epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
+                catalog_digest,
+                raw.txn_id,
+                commit_seq,
+                canonical_lane,
+                &raw.payload,
+                request_digests[offset],
+                outcome_kind,
+                winners[offset].rows_affected,
+            ) {
+                Ok(record) => record,
+                Err(err) => {
+                    self.wedge_commit_path();
+                    for item in winners {
+                        item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                            format!("intent-lane canonical WAL encode failed: {err}"),
+                        ))));
+                    }
+                    return true;
+                }
+            };
+            gpu_db_wal::encode_wal_record_parts_into(
+                &mut frame_payload,
+                canonical.txn_id,
+                &canonical.payload,
+            );
+            record_ends.push(frame_payload.len());
+        }
 
         // OFF-LOCK: durable lane append (envelope already fused into the patch
         // pass above; stat_encode retired into the claim-adjacent patch time).
@@ -467,6 +582,7 @@ impl Engine {
             }
         }
         if let Some(message) = append_error {
+            self.wedge_commit_path();
             let mut inflight = lanes.inflight_slots[lane]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -503,6 +619,7 @@ impl Engine {
             let mut row_ids = Vec::with_capacity(winners.len());
             let mut tombstones: Vec<crate::engine_intent_lanes::LaneTombstone> = Vec::new();
             let mut updates: Vec<crate::engine_intent_lanes::LaneUpdate> = Vec::new();
+            let mut expected_rows_affected = Vec::new();
             let table_name = winners
                 .first()
                 .map(|item| item.table.to_string())
@@ -535,6 +652,7 @@ impl Engine {
                             .rows_affected_cell
                             .clone()
                             .expect("a delete intent carries its rows-affected cell");
+                        expected_rows_affected.push((cell.clone(), item.rows_affected));
                         tombstones.push(crate::engine_intent_lanes::LaneTombstone {
                             seq,
                             filter_idx: item.filter_idx,
@@ -554,6 +672,7 @@ impl Engine {
                             .rows_affected_cell
                             .clone()
                             .expect("an update intent carries its rows-affected cell");
+                        expected_rows_affected.push((cell.clone(), item.rows_affected));
                         updates.push(crate::engine_intent_lanes::LaneUpdate {
                             seq,
                             filter_idx: item.filter_idx,
@@ -574,6 +693,7 @@ impl Engine {
                 txn_ids,
                 tombstones,
                 updates,
+                expected_rows_affected,
                 seq_first: first_seq,
                 seq_len: k,
                 unique_slots: winner_slots,
@@ -588,12 +708,11 @@ impl Engine {
         // covers the failure path. Same-slot safety holds without the device
         // index seeing this wave: the bounded in-flight set owns the gap from validation selection
         // through device publication, and clean pre-durable failures explicitly release it.
-        // Partition by commit mode (pg `synchronous_commit`): async winners
-        // ack at the APPLIED cut, strict winners at the visible (durable AND
-        // applied) cut. Same wave, same WAL frames, same apply — only the
-        // ack gate differs.
-        let (async_winners, winners): (Vec<LaneIntent>, Vec<LaneIntent>) =
-            winners.into_iter().partition(|item| !item.synchronous);
+        // ADR-014 standalone RPO-0: every successful SQL acknowledgement is strict. The public
+        // `Off` compatibility setting currently behaves like `On`; keep the old settle slot empty
+        // so no internal/test-constructed intent can bypass the durable ∧ applied publication cut.
+        let winners: Vec<LaneIntent> = winners.into_iter().collect();
+        let async_winners = Vec::new();
         // Publish the apply request and its owning outcomes atomically with respect to the central
         // wedge drain. The drain takes these locks in the same order; either it observes both, or
         // this under-lock gate observes the sticky flag and fails the local wave itself.
@@ -959,7 +1078,19 @@ impl Engine {
                 leader_started.elapsed().as_nanos() as u64,
                 AtomicOrdering::Relaxed,
             );
-            let failed = outcome.is_err();
+            let mut failed = outcome.is_err();
+            if !failed
+                && batch.iter().any(|request| {
+                    request
+                        .expected_rows_affected
+                        .iter()
+                        .any(|(actual, expected)| {
+                            actual.load(std::sync::atomic::Ordering::Acquire) != *expected
+                        })
+                })
+            {
+                failed = true;
+            }
             // Publish the seqlock witness after every apply attempt that may have touched resident
             // state and before removing any request bridge. A validator whose device probe
             // overlapped this attempt must retry, including after a partial-apply panic.

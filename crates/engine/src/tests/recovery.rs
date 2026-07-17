@@ -15,6 +15,44 @@ fn serial_durable_engine(path: impl AsRef<std::path::Path>) -> Engine {
     engine
 }
 
+fn canonical_test_lane_record(
+    base: &std::path::Path,
+    lane_id: u32,
+    local_seq: u64,
+    txn_id: u64,
+    payload: Vec<u8>,
+) -> gpu_db_wal::WalRecord {
+    let serial = gpu_db_wal::read_wal_segment(base).expect("serial canonical prefix");
+    let boundary = serial
+        .iter()
+        .rev()
+        .find_map(|record| {
+            gpu_db_wal::decode_canonical_record_payload(&record.payload)
+                .expect("canonical prefix decode")
+                .map(|envelope| {
+                    (
+                        envelope.header.identity,
+                        envelope.header.catalog_after_epoch,
+                        envelope.header.catalog_after_digest,
+                    )
+                })
+        })
+        .expect("serial prefix carries durable identity");
+    let commit_seq = serial.len() as u64 + 1 + local_seq;
+    let request_digest = gpu_db_wal::canonical_request_digest(&payload);
+    Engine::canonical_wal_record_with_boundary_and_request_digest(
+        boundary.0,
+        boundary.1,
+        boundary.2,
+        txn_id,
+        commit_seq,
+        lane_id + 1,
+        &std::sync::Arc::from(payload),
+        request_digest,
+    )
+    .expect("canonical test lane record")
+}
+
 #[test]
 fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
     let path = test_wal_path("restart");
@@ -2420,10 +2458,13 @@ fn lanes_reopen_replays_serial_then_lane_merge_and_guards_classic_writes() {
                 &[(row_base + seq as u64, values.as_slice())],
             )
             .expect("binary encode");
-            let record = gpu_db_wal::WalRecord {
-                txn_id: 100 + seq as u64,
-                payload: payload.into(),
-            };
+            let record = canonical_test_lane_record(
+                &path,
+                (seq % 2) as u32,
+                seq as u64,
+                100 + seq as u64,
+                payload,
+            );
             set.append(seq % 2, seq as u64, &[record]).expect("append");
         }
         set.wait_durable(4).expect("lane records durable");
@@ -2502,16 +2543,20 @@ fn lanes_reopen_discards_unacked_orphans_above_the_cut() {
                 &[(row_base + seq, values.as_slice())],
             )
             .expect("binary encode");
-            gpu_db_wal::WalRecord {
-                txn_id: 200 + seq,
-                payload: payload.into(),
-            }
+            canonical_test_lane_record(&path, 0, seq, 200 + seq, payload)
         };
         for seq in 0..3u64 {
             set.append(0, seq, &[make_record(seq)]).expect("lane 0");
         }
         for seq in 5..8u64 {
-            set.append(1, seq, &[make_record(seq)]).expect("lane 1");
+            let values = vec![SqlValue::Int4(1000 + seq as i32), SqlValue::Int4(0)];
+            let payload = crate::wal_binary::try_encode_binary_insert(
+                "t",
+                &[(row_base + seq, values.as_slice())],
+            )
+            .expect("binary encode");
+            let record = canonical_test_lane_record(&path, 1, seq, 200 + seq, payload);
+            set.append(1, seq, &[record]).expect("lane 1");
         }
         // Cut holds at the gap: only [0, 3) is contiguous.
         set.wait_durable(3).expect("contiguous prefix durable");
@@ -2525,6 +2570,26 @@ fn lanes_reopen_discards_unacked_orphans_above_the_cut() {
         "premise: the contiguous prefix ends at the gap"
     );
     let reopened = Engine::open_durable_wal_segment(&path).expect("orphaned lanes reopen");
+    let reconciled = gpu_db_wal::read_reconciled_transaction_statuses(&path)
+        .expect("orphan repair persists stable-ID reconciliation first");
+    assert_eq!(
+        reconciled
+            .iter()
+            .map(|status| status.txn_id)
+            .collect::<Vec<_>>(),
+        vec![205, 206, 207],
+        "every complete transaction above the gap remains durably memoized as aborted"
+    );
+    for txn_id in 205..=207 {
+        assert!(matches!(
+            reopened
+                .commit_state()
+                .transaction_status
+                .get(&txn_id)
+                .map(|status| status.outcome),
+            Some(DurableTransactionOutcome::AbortedDiscardedOrphan)
+        ));
+    }
     let Command::Select(count) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
         unreachable!()
     };
@@ -2556,11 +2621,29 @@ fn lanes_reopen_discards_unacked_orphans_above_the_cut() {
         3,
         "orphan frames were durably discarded"
     );
+    let status_path = gpu_db_wal::reconciled_status_path(&path);
+    let status_body = std::fs::read_to_string(&status_path).expect("reconciliation sidecar");
+    std::fs::write(&status_path, status_body.replace("txn=205", "txn=999"))
+        .expect("tamper reconciliation sidecar");
+    assert!(
+        Engine::open_durable_wal_segment(&path).is_err(),
+        "tampered stable-ID reconciliation authority must fail closed"
+    );
+    std::fs::write(&status_path, status_body).expect("restore reconciliation sidecar");
     let again = Engine::open_durable_wal_segment(&path).expect("second reopen after repair");
     assert_eq!(counted(&again), vec![vec![SqlValue::Int8(4)]]);
+    for txn_id in 205..=207 {
+        let payload = format!("different request for discarded {txn_id}");
+        let error = again
+            .commit_state()
+            .resolve_transaction_retry(txn_id, payload.as_bytes())
+            .expect_err("an abandoned stable ID cannot be reused with another request");
+        assert!(error.to_string().contains("different request"), "{error}");
+    }
     drop(again);
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(status_path);
     cleanup_lane_files(&path);
 }
 
@@ -2603,10 +2686,7 @@ fn lanes_checkpoint_truncates_prunes_and_reopens_with_suffix() {
             &[(row_base + seq, values.as_slice())],
         )
         .expect("binary encode");
-        gpu_db_wal::WalRecord {
-            txn_id: 300 + seq,
-            payload: payload.into(),
-        }
+        canonical_test_lane_record(&path, (seq % 2) as u32, seq, 300 + seq, payload)
     };
     {
         let set = gpu_db_wal::FuaWalLaneSet::create(&path, 2, 2, tiny).expect("create lanes");

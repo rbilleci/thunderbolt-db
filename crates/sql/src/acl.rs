@@ -6,7 +6,9 @@ use super::{
     strip_keyword_prefix_case_insensitive, Command, ParseError,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum AclRelationKind {
     Relation,
     Table,
@@ -15,7 +17,9 @@ pub enum AclRelationKind {
     Sequence,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum TablePrivilege {
     Select,
     Insert,
@@ -23,29 +27,37 @@ pub enum TablePrivilege {
     Delete,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum SchemaPrivilege {
     Usage,
     Create,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum DatabasePrivilege {
     Connect,
     Temporary,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum TablespacePrivilege {
     Create,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum FunctionPrivilege {
     Execute,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GrantTable {
     pub relation: String,
     pub kind: AclRelationKind,
@@ -53,7 +65,7 @@ pub struct GrantTable {
     pub privileges: Vec<TablePrivilege>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RevokeTable {
     pub relation: String,
     pub kind: AclRelationKind,
@@ -61,35 +73,35 @@ pub struct RevokeTable {
     pub privileges: Vec<TablePrivilege>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SchemaPrivileges {
     pub schema: String,
     pub grantee: String,
     pub privileges: Vec<SchemaPrivilege>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DatabasePrivileges {
     pub database: String,
     pub grantee: String,
     pub privileges: Vec<DatabasePrivilege>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TablespacePrivileges {
     pub tablespace: String,
     pub grantee: String,
     pub privileges: Vec<TablespacePrivilege>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FunctionPrivileges {
     pub function: String,
     pub grantee: String,
     pub privileges: Vec<FunctionPrivilege>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DefaultTablePrivileges {
     pub grantee: String,
     pub privileges: Vec<TablePrivilege>,

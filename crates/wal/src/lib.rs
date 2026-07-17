@@ -56,8 +56,32 @@ pub use checkpoint::{
     WalCheckpointMeta, WalControlFile,
 };
 
+mod canonical;
+pub use canonical::{
+    canonical_request_digest, decode_canonical_envelope, decode_canonical_record_payload,
+    encode_canonical_envelope, pack_canonical_record_payload, CanonicalDigest, CanonicalEnvelope,
+    CanonicalFragment, CanonicalFragmentKind, CanonicalIdentity, CanonicalIsolation,
+    CanonicalOutcome, CanonicalOutcomeKind, CanonicalPhysicalRange, CanonicalPreApplyHeader,
+    EncodedCanonicalEnvelope,
+};
+
+mod identity;
+pub use identity::{
+    bind_or_install_durable_identity, durable_identity_path, read_durable_identity,
+    write_durable_identity,
+};
+
+mod reconciled_status;
+pub use reconciled_status::{
+    read_reconciled_transaction_statuses, reconciled_status_path, ReconciledTransactionStatus,
+};
+
+mod sidecar_checksum;
+pub(crate) use sidecar_checksum::{append_sha256_trailer, verify_sha256_trailer};
+
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
-const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE1";
+const WAL_ARCHIVE_MANIFEST_MAGIC_V1: &str = "GPUDBWALARCHIVE1";
+const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE2";
 const WAL_RECORD_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +204,36 @@ pub fn sync_wal_parent_dir(path: &Path) -> Result<(), EngineError> {
     sync_segment_parent_dir(path)
 }
 
+/// Recursively create a durability directory and persist every newly created directory entry.
+/// `create_dir_all` alone does not make a new directory name power-fail durable in its parent.
+pub fn create_wal_dir_all(path: &Path) -> Result<(), EngineError> {
+    if path.as_os_str().is_empty() || path.exists() {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        cursor = parent;
+    }
+    for directory in missing.iter().rev() {
+        match fs::create_dir(directory) {
+            Ok(()) => sync_segment_parent_dir(directory)?,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(EngineError::Durability(format!(
+                    "failed to create durability directory {}: {err}",
+                    directory.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 fn sync_segment_parent_dir(segment_path: &Path) -> Result<(), EngineError> {
     let parent = segment_path.parent().filter(|p| !p.as_os_str().is_empty());
     let Some(parent) = parent else {
@@ -203,8 +257,9 @@ fn sync_segment_parent_dir(segment_path: &Path) -> Result<(), EngineError> {
 
 pub fn write_wal_segment(path: impl AsRef<Path>, records: &[WalRecord]) -> Result<(), EngineError> {
     let path = path.as_ref();
+    bind_or_install_durable_identity(path, records)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+        create_wal_dir_all(parent).map_err(|err| {
             EngineError::Durability(format!(
                 "failed to create WAL segment directory {}: {err}",
                 parent.display()
@@ -249,7 +304,8 @@ pub fn write_wal_segment(path: impl AsRef<Path>, records: &[WalRecord]) -> Resul
             "failed to install WAL segment {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    sync_segment_parent_dir(path)
 }
 
 pub fn read_wal_segment(path: impl AsRef<Path>) -> Result<Vec<WalRecord>, EngineError> {
@@ -561,7 +617,7 @@ pub fn write_wal_archive_with_timestamps(
     let manifest_path = manifest_path.as_ref();
     let segment_dir = segment_dir.as_ref();
     validate_timestamp_metadata(manifest_path, records, record_timestamps)?;
-    fs::create_dir_all(segment_dir).map_err(|err| {
+    create_wal_dir_all(segment_dir).map_err(|err| {
         EngineError::Durability(format!(
             "failed to create WAL archive segment directory {}: {err}",
             segment_dir.display()
@@ -670,7 +726,7 @@ pub fn write_wal_archive_manifest(
 ) -> Result<(), EngineError> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+        create_wal_dir_all(parent).map_err(|err| {
             EngineError::Durability(format!(
                 "failed to create WAL archive manifest directory {}: {err}",
                 parent.display()
@@ -678,7 +734,7 @@ pub fn write_wal_archive_manifest(
         })?;
     }
 
-    let body = render_wal_archive_manifest_body(manifest)?;
+    let body = append_sha256_trailer(render_wal_archive_manifest_body(manifest)?);
 
     let tmp_path = temporary_control_path(path);
     let write_result = (|| {
@@ -714,7 +770,8 @@ pub fn write_wal_archive_manifest(
             "failed to install WAL archive manifest {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    sync_wal_parent_dir(path)
 }
 
 fn render_wal_archive_manifest_body(manifest: &WalArchiveManifest) -> Result<String, EngineError> {
@@ -758,8 +815,22 @@ pub fn read_wal_archive_manifest(
             path.display()
         ))
     })?;
+    let first = body.lines().next();
+    let body = match first {
+        Some(WAL_ARCHIVE_MANIFEST_MAGIC) => verify_sha256_trailer(&body, path)?,
+        Some(WAL_ARCHIVE_MANIFEST_MAGIC_V1) => body,
+        _ => {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive manifest header {}",
+                path.display()
+            )))
+        }
+    };
     let mut lines = body.lines();
-    if lines.next() != Some(WAL_ARCHIVE_MANIFEST_MAGIC) {
+    if !matches!(
+        lines.next(),
+        Some(WAL_ARCHIVE_MANIFEST_MAGIC) | Some(WAL_ARCHIVE_MANIFEST_MAGIC_V1)
+    ) {
         return Err(EngineError::Durability(format!(
             "invalid WAL archive manifest header {}",
             path.display()
@@ -1267,7 +1338,7 @@ pub fn apply_wal_archive_retention_from_txn(
     )?;
     for removed_segment in &plan.removed_segments {
         match fs::remove_file(removed_segment) {
-            Ok(()) => {}
+            Ok(()) => sync_wal_parent_dir(removed_segment)?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(EngineError::Durability(format!(
@@ -1308,7 +1379,7 @@ pub fn apply_wal_archive_retention_to_timestamp_micros(
     )?;
     for removed_segment in &plan.removed_segments {
         match fs::remove_file(removed_segment) {
-            Ok(()) => {}
+            Ok(()) => sync_wal_parent_dir(removed_segment)?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(EngineError::Durability(format!(
@@ -1348,7 +1419,7 @@ pub fn apply_wal_archive_retention_to_txn(
     )?;
     for removed_segment in &plan.removed_segments {
         match fs::remove_file(removed_segment) {
-            Ok(()) => {}
+            Ok(()) => sync_wal_parent_dir(removed_segment)?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(EngineError::Durability(format!(

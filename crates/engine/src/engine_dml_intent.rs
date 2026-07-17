@@ -38,19 +38,9 @@ use super::*;
 ///
 /// * `On` (the default): the ack waits for the wave's WAL frames to be
 ///   FUA-durable AND device-applied — a returned `Ok` survives power failure.
-/// * `Off` (ASYNC COMMIT, opt-in): the ack waits only for device apply; the
-///   WAL frames are still published in commit order and fenced by the
-///   pipeline behind the ack. A power failure may lose a suffix of
-///   async-acked intents (bounded by the fence pipeline depth, typically a
-///   few milliseconds), but NEVER consistency: recovery replays the ordered
-///   durable prefix, exactly like PostgreSQL's async commit. A process crash
-///   (without power loss) loses nothing the drive completed.
-///
-/// Deliberate deviation from PostgreSQL, documented: visibility stays gated
-/// on the STRICT cut, so readers can never observe a row a power failure
-/// could revoke; an async writer's own read-back lags its ack by at most
-/// about one fence (~1ms on consumer NVMe). The engine-wide default is
-/// `GPU_DB_SYNCHRONOUS_COMMIT` (on) / [`Engine::set_synchronous_commit_default`].
+/// * `Off` is accepted as a compatibility setting but currently behaves exactly like `On`.
+///   ADR-014 forbids acknowledging an intent before its terminal marker is durable and applied;
+///   a future unstable-visible/async contract requires a separate accepted design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SynchronousCommit {
     On,
@@ -177,10 +167,10 @@ impl Engine {
     /// No-op on a non-lanes engine (the classic path is always strict).
     pub fn set_synchronous_commit_default(&self, mode: SynchronousCommit) {
         if let Some(lanes) = &self.intent_lanes {
-            lanes.synchronous_commit_default.store(
-                mode == SynchronousCommit::On,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let _ = mode;
+            lanes
+                .synchronous_commit_default
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -411,6 +401,9 @@ impl Engine {
             template,
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
+            request_digest: [0; 32],
+            transaction_claims: None,
+            commit_seq: None,
             outstanding: None,
             synchronous: true,
             rows_affected: 1,
@@ -457,7 +450,23 @@ impl Engine {
             let snapshot_hold =
                 Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
             if let Some(mut intent) = self.build_lane_intent(txn_id, route, params, read_snapshot) {
-                intent.synchronous = mode == SynchronousCommit::On;
+                let _ = mode;
+                intent.synchronous = true;
+                let retry = match self.claim_lane_intent(lanes, &mut intent) {
+                    Ok(retry) => retry,
+                    Err(error) => {
+                        self.deregister_active_snapshot(read_snapshot);
+                        return Err(error);
+                    }
+                };
+                if let Some(affected_rows) = retry {
+                    self.deregister_active_snapshot(read_snapshot);
+                    return Ok(IntentTicket {
+                        outcome: None,
+                        snapshot_hold: None,
+                        resolved: Some(Ok(affected_rows)),
+                    });
+                }
                 let outcome = std::sync::Arc::clone(&intent.outcome);
                 // Single lane-ingress point: `submit_lane_intent` carries the
                 // resize-barrier Dekker protocol (count-then-check, hold-queue
@@ -613,7 +622,23 @@ impl Engine {
         let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
         match self.build_lane_delete_intent(txn_id, route, pk, read_snapshot) {
             Some(mut intent) => {
-                intent.synchronous = mode == SynchronousCommit::On;
+                let _ = mode;
+                intent.synchronous = true;
+                let retry = match self.claim_lane_intent(lanes, &mut intent) {
+                    Ok(retry) => retry,
+                    Err(error) => {
+                        self.deregister_active_snapshot(read_snapshot);
+                        return Err(error);
+                    }
+                };
+                if let Some(affected_rows) = retry {
+                    self.deregister_active_snapshot(read_snapshot);
+                    return Ok(IntentTicket {
+                        outcome: None,
+                        snapshot_hold: None,
+                        resolved: Some(Ok(affected_rows)),
+                    });
+                }
                 let outcome = std::sync::Arc::clone(&intent.outcome);
                 self.submit_lane_intent(lanes, intent);
                 Ok(IntentTicket {
@@ -666,6 +691,9 @@ impl Engine {
             template: std::sync::Arc::from(record.as_slice()),
             values: Vec::new(),
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
+            request_digest: [0; 32],
+            transaction_claims: None,
+            commit_seq: None,
             outstanding: None,
             synchronous: true,
             // WAL-FIRST: the delete's rows-affected (0 or 1) is resolved at APPLY (the locate
@@ -781,7 +809,23 @@ impl Engine {
         let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
         match self.build_lane_update_intent(txn_id, route, new_values, read_snapshot) {
             Some(mut intent) => {
-                intent.synchronous = mode == SynchronousCommit::On;
+                let _ = mode;
+                intent.synchronous = true;
+                let retry = match self.claim_lane_intent(lanes, &mut intent) {
+                    Ok(retry) => retry,
+                    Err(error) => {
+                        self.deregister_active_snapshot(read_snapshot);
+                        return Err(error);
+                    }
+                };
+                if let Some(affected_rows) = retry {
+                    self.deregister_active_snapshot(read_snapshot);
+                    return Ok(IntentTicket {
+                        outcome: None,
+                        snapshot_hold: None,
+                        resolved: Some(Ok(affected_rows)),
+                    });
+                }
                 let outcome = std::sync::Arc::clone(&intent.outcome);
                 self.submit_lane_intent(lanes, intent);
                 Ok(IntentTicket {
@@ -852,6 +896,9 @@ impl Engine {
             template: std::sync::Arc::from(record.as_slice()),
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
+            request_digest: [0; 32],
+            transaction_claims: None,
+            commit_seq: None,
             outstanding: None,
             synchronous: true,
             // WAL-FIRST: the update's rows-affected (0 or 1) is resolved at APPLY (the locate moved
@@ -881,6 +928,54 @@ impl Engine {
         ticket.outcome = None;
         ticket.release_snapshot();
         Some(result)
+    }
+
+    fn claim_lane_intent(
+        &self,
+        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
+        intent: &mut crate::engine_dml_concurrent::LaneIntent,
+    ) -> Result<Option<u64>, ExecuteError> {
+        let request_digest = gpu_db_wal::canonical_request_digest(&intent.template);
+        // Before the activation fence, classic commits and lane submissions share the same stable
+        // transaction-id namespace. Import the still-mutable serial prefix while holding its
+        // commit lock; once ACTIVE is published no classic writer can extend that prefix.
+        if !lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
+            let commit = self.commit_state();
+            for record in commit.wal.flushed_records() {
+                let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(&record.payload)
+                    .map_err(ExecuteError::Engine)?
+                else {
+                    continue;
+                };
+                lanes
+                    .install_recovered_transaction(
+                        record.txn_id,
+                        envelope.header.request_digest,
+                        envelope.header.commit_seq,
+                        envelope.outcome.affected_rows,
+                    )
+                    .map_err(ExecuteError::Engine)?;
+            }
+        }
+        match lanes
+            .claim_transaction(intent.txn_id, request_digest)
+            .map_err(ExecuteError::Engine)?
+        {
+            crate::engine_intent_lanes::LaneClaimResolution::New => {
+                intent.request_digest = request_digest;
+                intent.transaction_claims = Some(std::sync::Arc::clone(&lanes.transaction_claims));
+                Ok(None)
+            }
+            crate::engine_intent_lanes::LaneClaimResolution::Pending => {
+                Err(ExecuteError::Engine(EngineError::Durability(format!(
+                    "transaction id {} is durably pending/indeterminate",
+                    intent.txn_id
+                ))))
+            }
+            crate::engine_intent_lanes::LaneClaimResolution::Terminal(affected_rows) => {
+                Ok(Some(affected_rows))
+            }
+        }
     }
 
     fn check_intent_params(

@@ -7,6 +7,27 @@
 
 use super::*;
 
+thread_local! {
+    /// Catalog view for one entry in a serialized multi-entry apply. The catalog latch stays held
+    /// across the whole apply loop, so publishing between entries would expose a partial commit.
+    /// Nested preflight/DML helpers nevertheless need to observe the entries already applied to the
+    /// working catalog rather than the last globally published generation.
+    static APPLY_WORKING_CATALOG:
+        std::cell::RefCell<Vec<(*const Engine, Arc<CatalogSnapshot>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct ApplyWorkingCatalogGuard;
+
+impl Drop for ApplyWorkingCatalogGuard {
+    fn drop(&mut self) {
+        APPLY_WORKING_CATALOG.with(|catalogs| {
+            let popped = catalogs.borrow_mut().pop();
+            debug_assert!(popped.is_some(), "working catalog scope must be balanced");
+        });
+    }
+}
+
 impl Engine {
     pub fn visible_up_to(&self) -> Index {
         self.committed_seq()
@@ -25,28 +46,47 @@ impl Engine {
     /// boundary instead (PART B), but the off-latch DML preflight and a handful of admin reads that are
     /// not boundary-pinned use this. A statement that does pin loads its boundary once and threads it.
     pub(crate) fn catalog_snapshot(&self) -> Arc<CatalogSnapshot> {
+        let working_catalog = APPLY_WORKING_CATALOG.with(|catalogs| {
+            catalogs
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(engine, _)| std::ptr::eq(*engine, self))
+                .map(|(_, catalog)| Arc::clone(catalog))
+        });
+        if let Some(catalog) = working_catalog {
+            return catalog;
+        }
         self.current_transaction_read_snapshot().map_or_else(
             || self.read_state.latest_catalog(),
             |snapshot| Arc::clone(&snapshot.catalog),
         )
     }
 
-    /// Build a fresh immutable catalog generation from `cat` (the DDL working maps, held under the
-    /// catalog latch) stamped at `commit_seq`, push it onto the catalog ring (pruning generations the
-    /// oldest active read snapshot can no longer need), and return it (Stage 2 — blocker #1; PART B
-    /// co-pinning). Called by the catalog-latch apply path AFTER it has mutated the working maps and
-    /// BEFORE it release-stores `committed_seq` — the publish ordering is now: data gen → residency
-    /// tombstones → **catalog ring push (this)** → `publish_committed_seq` LAST. Because the ring push
-    /// happens before `committed_seq` is bumped, a reader that loads `committed_seq = commit_seq` and
-    /// selects `catalog_as_of(commit_seq)` is guaranteed to find this generation (catalog visible no
-    /// later than `committed_seq`). DDL is the only publisher and runs under the exclusive latch.
-    pub(crate) fn publish_catalog_snapshot(
+    /// Run one serialized apply entry with every nested catalog lookup bound to the immutable view
+    /// of the transaction's current working catalog. The thread-local scope is intentional: helper
+    /// APIs are deep and read-only, apply is serialized under `commit_mutex -> catalog_latch`, and
+    /// other threads must continue to see only the last atomically published generation.
+    pub(crate) fn with_apply_catalog<T>(
         &self,
+        catalog: Option<Arc<CatalogSnapshot>>,
+        apply: impl FnOnce() -> T,
+    ) -> T {
+        let Some(catalog) = catalog else {
+            return apply();
+        };
+        APPLY_WORKING_CATALOG.with(|catalogs| {
+            catalogs.borrow_mut().push((self, catalog));
+        });
+        let _guard = ApplyWorkingCatalogGuard;
+        apply()
+    }
+
+    pub(crate) fn catalog_snapshot_from_working(
         cat: &DdlCatalogState,
         commit_seq: Index,
-        prune_below: Index,
-    ) {
-        let generation = Arc::new(CatalogSnapshot {
+    ) -> Arc<CatalogSnapshot> {
+        Arc::new(CatalogSnapshot {
             commit_seq,
             relational_catalog: cat.relational_catalog.clone(),
             relational_views: cat.relational_views.clone(),
@@ -64,7 +104,60 @@ impl Engine {
             relational_schema_acl: cat.relational_schema_acl.clone(),
             relational_default_table_acl: cat.relational_default_table_acl.clone(),
             relational_comments: cat.relational_comments.clone(),
-        });
+        })
+    }
+
+    /// Whether applying `entry` can change catalog metadata used by a later entry in the same
+    /// unpublished group. Pure DML/KV batches stay on their existing zero-catalog-clone path;
+    /// sequence-default INSERTs and every catalog command bind following entries to `cat`.
+    pub(crate) fn entry_mutates_working_catalog(entry: &LogEntry, cat: &DdlCatalogState) -> bool {
+        if is_binary_wal_record(&entry.payload) {
+            return matches!(
+                decode_binary_record(&entry.payload),
+                Ok(crate::wal_binary::BinaryWalRecord::Transaction(record))
+                    if !record.sequence_advances.is_empty()
+            );
+        }
+        let Ok(Some(command)) = Self::decode_engine_command(&entry.payload) else {
+            return true;
+        };
+        match command {
+            Command::SetKv { .. }
+            | Command::DeleteKv { .. }
+            | Command::Update(_)
+            | Command::Delete(_) => false,
+            Command::Insert(insert) => {
+                cat.relational_catalog
+                    .get(&insert.table)
+                    .is_some_and(|table| {
+                        table.columns.iter().any(|column| {
+                            matches!(
+                                column.default.as_ref(),
+                                Some(ColumnDefault::SequenceNextVal { .. })
+                            )
+                        })
+                    })
+            }
+            _ => true,
+        }
+    }
+
+    /// Build a fresh immutable catalog generation from `cat` (the DDL working maps, held under the
+    /// catalog latch) stamped at `commit_seq`, push it onto the catalog ring (pruning generations the
+    /// oldest active read snapshot can no longer need), and return it (Stage 2 — blocker #1; PART B
+    /// co-pinning). Called by the catalog-latch apply path AFTER it has mutated the working maps and
+    /// BEFORE it release-stores `committed_seq` — the publish ordering is now: data gen → residency
+    /// tombstones → **catalog ring push (this)** → `publish_committed_seq` LAST. Because the ring push
+    /// happens before `committed_seq` is bumped, a reader that loads `committed_seq = commit_seq` and
+    /// selects `catalog_as_of(commit_seq)` is guaranteed to find this generation (catalog visible no
+    /// later than `committed_seq`). DDL is the only publisher and runs under the exclusive latch.
+    pub(crate) fn publish_catalog_snapshot(
+        &self,
+        cat: &DdlCatalogState,
+        commit_seq: Index,
+        prune_below: Index,
+    ) {
+        let generation = Self::catalog_snapshot_from_working(cat, commit_seq);
         let history = self.read_state.catalog_history.load();
         self.read_state
             .catalog_history

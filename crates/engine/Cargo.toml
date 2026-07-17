@@ -8,6 +8,8 @@ license.workspace = true
 thiserror.workspace = true
 imbl.workspace = true
 arc-swap.workspace = true
+sha2 = "0.10"
+serde_json = "1"
 gpu_db_types = { path = "../types" }
 gpu_db_replication = { path = "../replication" }
 gpu_db_wal = { path = "../wal" }

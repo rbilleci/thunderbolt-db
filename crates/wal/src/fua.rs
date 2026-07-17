@@ -145,7 +145,7 @@ impl FuaWalBackend {
             ));
         }
         if let Some(parent) = base_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|err| {
+            crate::create_wal_dir_all(parent).map_err(|err| {
                 EngineError::Durability(format!(
                     "failed to create FUA WAL directory {}: {err}",
                     parent.display()
@@ -222,7 +222,7 @@ impl FuaWalBackend {
             ));
         }
         if let Some(parent) = base_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|err| {
+            crate::create_wal_dir_all(parent).map_err(|err| {
                 EngineError::Durability(format!(
                     "failed to create FUA WAL directory {}: {err}",
                     parent.display()
@@ -364,6 +364,12 @@ impl FuaWalBackend {
                 std::fs::remove_file(&path).map_err(|err| {
                     EngineError::Durability(format!(
                         "failed to delete retired FUA WAL segment {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                sync_parent_dir(&path).map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to fsync FUA WAL directory after retiring {}: {err}",
                         path.display()
                     ))
                 })?;
@@ -512,7 +518,11 @@ impl FuaWalBackend {
                 || -> std::io::Result<(Arc<FuaFrameLog>, bool)> {
                     // A stale temp from a crashed prior life (or an unrolled leftover) is ours
                     // to clobber.
-                    let _ = std::fs::remove_file(&temp);
+                    match std::fs::remove_file(&temp) {
+                        Ok(()) => sync_parent_dir(&temp)?,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
                     // RECYCLE arm (E2.5c-2): reuse a retired segment file when one is offered —
                     // its extents are already written, so the whole prewrite (fallocate +
                     // zero-fill + the fsync that lands a device-wide NVMe FLUSH during live
@@ -520,28 +530,39 @@ impl FuaWalBackend {
                     // previous life's frames are scan-rejected. Any recycle failure (geometry
                     // drift, rename error) falls back to the fresh-create arm — recycle is an
                     // optimization, never a correctness gate.
-                    let recycled = recycle_pool
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .pop()
-                        .and_then(|retired| {
-                            std::fs::rename(&retired, &temp).ok()?;
-                            let config = FuaFrameLogConfig {
-                                path: temp.clone(),
-                                segment_id: id,
-                                capacity_bytes: segment_bytes,
-                            };
-                            // Safety: the temp path is owned exclusively by this backend (one
-                            // prestage in flight; renamed to its final segment name before any
-                            // other opener).
-                            unsafe { FuaFrameLog::recycle(config) }.ok()
-                        });
+                    let retired = recycle_pool.lock().unwrap_or_else(|p| p.into_inner()).pop();
+                    let recycled = if let Some(retired) = retired {
+                        std::fs::rename(&retired, &temp)?;
+                        sync_parent_dir(&temp)?;
+                        let config = FuaFrameLogConfig {
+                            path: temp.clone(),
+                            segment_id: id,
+                            capacity_bytes: segment_bytes,
+                        };
+                        // Safety: the temp path is owned exclusively by this backend (one
+                        // prestage in flight; renamed to its final segment name before any
+                        // other opener).
+                        match unsafe { FuaFrameLog::recycle(config) } {
+                            Ok(log) => Some(log),
+                            Err(_) => {
+                                std::fs::remove_file(&temp)?;
+                                sync_parent_dir(&temp)?;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     match recycled {
                         Some(log) => Ok((log, true)),
                         None => {
                             // Fresh create (a failed recycle above may have left a stale temp —
                             // clobber).
-                            let _ = std::fs::remove_file(&temp);
+                            match std::fs::remove_file(&temp) {
+                                Ok(()) => sync_parent_dir(&temp)?,
+                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(err) => return Err(err),
+                            }
                             let config = FuaFrameLogConfig {
                                 path: temp.clone(),
                                 segment_id: id,
@@ -942,12 +963,19 @@ fn open_segment(
     };
     // Safety: this backend owns the segment path exclusively for the log's lifetime (fresh
     // create-only in step 1; the WalBuffer holds the sole appender/pool).
-    unsafe { FuaFrameLog::create(config) }.map_err(|err| {
+    let log = unsafe { FuaFrameLog::create(config) }.map_err(|err| {
         EngineError::Durability(format!(
             "failed to create FUA WAL segment {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    sync_parent_dir(&path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to fsync FUA WAL directory after creating {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(log)
 }
 
 /// Remove any `<base>.fua.*` segment files left by a previous database at this path (fresh-create
@@ -963,12 +991,17 @@ fn remove_stale_segments(base: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
+    let mut removed = false;
     for entry in entries.flatten() {
         if let Some(name) = entry.file_name().to_str() {
-            if parse_segment_id(name, stem).is_some() {
-                let _ = std::fs::remove_file(entry.path());
+            if parse_segment_id(name, stem).is_some() && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed = true;
             }
         }
+    }
+    if removed {
+        let _ = sync_parent_dir(base);
     }
 }
 

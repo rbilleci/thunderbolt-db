@@ -169,7 +169,7 @@ impl WalDurableCore {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
         {
-            fs::create_dir_all(parent).map_err(|err| {
+            crate::create_wal_dir_all(parent).map_err(|err| {
                 EngineError::Durability(format!(
                     "failed to create WAL segment directory {}: {err}",
                     parent.display()
@@ -666,6 +666,12 @@ impl WalBuffer {
         self.records.len()
     }
 
+    /// Last logical record, including an unflushed member of the current group. Canonical WAL
+    /// construction uses its catalog-after binding as the next record's catalog-before binding.
+    pub fn last_record(&self) -> Option<&WalRecord> {
+        self.records.last()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
@@ -754,6 +760,9 @@ impl WalBuffer {
     /// leaves the on-disk tail state unknowable poisons the backing (fail-closed until restart
     /// recovery truncates the torn tail at [`recover_wal_segment`] time).
     pub fn flush_all(&mut self) -> Result<(), EngineError> {
+        if let Some(path) = self.durable_segment_path() {
+            bind_or_install_durable_identity(path, &self.records)?;
+        }
         // FUA backend: the inline serial-path flush is just a group flush that also WAITS for the
         // durable cut. Delegating keeps one publish/wait path (and one `fail_next_flush`
         // consumption, handled by `begin_group_flush`).
@@ -864,6 +873,9 @@ impl WalBuffer {
     /// stay totally ordered) and the returned job's fence-pool wait runs concurrently with any
     /// other FUA job — multiple groups may be durable in flight at once.
     pub fn begin_group_flush(&mut self) -> Result<WalGroupFlushBegin, EngineError> {
+        if let Some(path) = self.durable_segment_path() {
+            bind_or_install_durable_identity(path, &self.records)?;
+        }
         if self.fail_next_flush {
             self.fail_next_flush = false;
             return Err(EngineError::Durability(

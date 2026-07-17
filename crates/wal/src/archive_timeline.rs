@@ -2,8 +2,10 @@
 
 use super::*;
 
-const WAL_ARCHIVE_TIMELINE_MAGIC: &str = "GPUDBWALTIMELINE1";
-const WAL_ARCHIVE_TIMELINE_REGISTRY_MAGIC: &str = "GPUDBWALTIMELINEREGISTRY1";
+const WAL_ARCHIVE_TIMELINE_MAGIC_V1: &str = "GPUDBWALTIMELINE1";
+const WAL_ARCHIVE_TIMELINE_MAGIC: &str = "GPUDBWALTIMELINE2";
+const WAL_ARCHIVE_TIMELINE_REGISTRY_MAGIC_V1: &str = "GPUDBWALTIMELINEREGISTRY1";
+const WAL_ARCHIVE_TIMELINE_REGISTRY_MAGIC: &str = "GPUDBWALTIMELINEREGISTRY2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalArchiveTimeline {
@@ -146,7 +148,7 @@ pub fn write_wal_archive_timeline(
     validate_timeline_path(path, "source_manifest_path", &timeline.source_manifest_path)?;
     validate_timeline_path(path, "branch_manifest_path", &timeline.branch_manifest_path)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+        create_wal_dir_all(parent).map_err(|err| {
             EngineError::Durability(format!(
                 "failed to create WAL timeline directory {}: {err}",
                 parent.display()
@@ -154,7 +156,7 @@ pub fn write_wal_archive_timeline(
         })?;
     }
 
-    let body = format!(
+    let body = append_sha256_trailer(format!(
         "{WAL_ARCHIVE_TIMELINE_MAGIC}\ntimeline_id={}\nparent_timeline_id={}\nfork_txn_id={}\nfork_timestamp_micros={}\nsource_manifest_path={}\nbranch_manifest_path={}\n",
         timeline.timeline_id,
         timeline
@@ -165,7 +167,7 @@ pub fn write_wal_archive_timeline(
         format_optional_u64(timeline.fork_timestamp_micros),
         timeline.source_manifest_path.display(),
         timeline.branch_manifest_path.display()
-    );
+    ));
 
     let tmp_path = temporary_control_path(path);
     let write_result = (|| {
@@ -201,7 +203,8 @@ pub fn write_wal_archive_timeline(
             "failed to install WAL archive timeline {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    sync_wal_parent_dir(path)
 }
 
 pub fn read_wal_archive_timeline(
@@ -214,13 +217,18 @@ pub fn read_wal_archive_timeline(
             path.display()
         ))
     })?;
+    let body = match body.lines().next() {
+        Some(WAL_ARCHIVE_TIMELINE_MAGIC) => verify_sha256_trailer(&body, path)?,
+        Some(WAL_ARCHIVE_TIMELINE_MAGIC_V1) => body,
+        _ => {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive timeline header {}",
+                path.display()
+            )))
+        }
+    };
     let mut lines = body.lines();
-    if lines.next() != Some(WAL_ARCHIVE_TIMELINE_MAGIC) {
-        return Err(EngineError::Durability(format!(
-            "invalid WAL archive timeline header {}",
-            path.display()
-        )));
-    }
+    let _magic = lines.next();
 
     let timeline_id = parse_control_value(lines.next(), "timeline_id", path)?.to_string();
     let parent_timeline_id = match parse_control_value(lines.next(), "parent_timeline_id", path)? {
@@ -511,7 +519,7 @@ pub fn write_wal_archive_timeline_registry(
     let path = path.as_ref();
     validate_timeline_registry_shape(path, registry)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+        create_wal_dir_all(parent).map_err(|err| {
             EngineError::Durability(format!(
                 "failed to create WAL archive timeline registry directory {}: {err}",
                 parent.display()
@@ -534,6 +542,7 @@ pub fn write_wal_archive_timeline_registry(
             entry.branch_manifest_path.display()
         ));
     }
+    let body = append_sha256_trailer(body);
 
     let tmp_path = temporary_control_path(path);
     let write_result = (|| {
@@ -569,7 +578,8 @@ pub fn write_wal_archive_timeline_registry(
             "failed to install WAL archive timeline registry {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    sync_wal_parent_dir(path)
 }
 
 pub fn read_wal_archive_timeline_registry(
@@ -582,13 +592,18 @@ pub fn read_wal_archive_timeline_registry(
             path.display()
         ))
     })?;
+    let body = match body.lines().next() {
+        Some(WAL_ARCHIVE_TIMELINE_REGISTRY_MAGIC) => verify_sha256_trailer(&body, path)?,
+        Some(WAL_ARCHIVE_TIMELINE_REGISTRY_MAGIC_V1) => body,
+        _ => {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive timeline registry header {}",
+                path.display()
+            )))
+        }
+    };
     let mut lines = body.lines();
-    if lines.next() != Some(WAL_ARCHIVE_TIMELINE_REGISTRY_MAGIC) {
-        return Err(EngineError::Durability(format!(
-            "invalid WAL archive timeline registry header {}",
-            path.display()
-        )));
-    }
+    let _magic = lines.next();
     let expected_count: usize = parse_control_value(lines.next(), "timeline_count", path)?
         .parse()
         .map_err(|err| {
@@ -775,7 +790,7 @@ fn validate_registered_timeline_entry(
 
 fn remove_wal_archive_timeline_artifact(kind: &str, path: &Path) -> Result<(), EngineError> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_wal_parent_dir(path),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(EngineError::Durability(format!(
             "failed to remove obsolete WAL archive timeline {kind} {}: {err}",

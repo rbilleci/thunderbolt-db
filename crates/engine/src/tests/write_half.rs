@@ -523,7 +523,6 @@ fn concurrent_commits_share_group_fsyncs_and_recover_durably() {
     for handle in handles {
         handle.join().unwrap();
     }
-
     let total = WRITERS * COMMITS_PER_WRITER;
     let Command::Select(select) = parse_command("SELECT id FROM t ORDER BY id").unwrap() else {
         panic!("expected SELECT plan");
@@ -812,7 +811,6 @@ fn commit_wave_mixed_fast_and_slow_items_stay_correct_and_recover() {
     for handle in handles {
         handle.join().unwrap();
     }
-
     let total = (WRITERS * OPS_PER_WRITER) as i64;
     let count = |e: &Engine, sql: &str| -> usize {
         let Command::Select(select) = parse_command(sql).unwrap() else {

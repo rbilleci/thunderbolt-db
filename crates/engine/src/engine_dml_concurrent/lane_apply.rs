@@ -52,11 +52,13 @@ impl Engine {
     ) -> (
         std::collections::BTreeMap<usize, String>,
         std::collections::BTreeSet<usize>,
+        Vec<Option<u64>>,
     ) {
         let mut violations = std::collections::BTreeMap::new();
         let mut conflicts = std::collections::BTreeSet::new();
+        let mut target_counts = vec![None; batch.len()];
         if batch.is_empty() {
-            return (violations, conflicts);
+            return (violations, conflicts, target_counts);
         }
         let catalog = self.catalog_snapshot();
         // group needles per (table, filter_idx); usually exactly one group
@@ -136,6 +138,11 @@ impl Engine {
                     conflicts.insert(position);
                     continue;
                 }
+                if count > 1 {
+                    conflicts.insert(position);
+                    continue;
+                }
+                target_counts[position] = Some(u64::from(count));
                 if batch[position].op == LaneOpKind::Insert && count > 0 {
                     let index_name = table
                         .columns
@@ -149,7 +156,7 @@ impl Engine {
                 }
             }
         }
-        (violations, conflicts)
+        (violations, conflicts, target_counts)
     }
 
     /// APPLY LEADER body: merge every pending lane request per table and run
@@ -661,14 +668,8 @@ impl Engine {
         let mut queue = lanes.settle[lane]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // ASYNC COMMIT tier (pg `synchronous_commit = off`): winners that
-        // opted out of the durability wait ack as soon as the APPLIED cut
-        // covers their wave — the WAL fence keeps running behind them.
-        // Visibility (`publish_committed_seq` above) stays gated on the
-        // STRICT cut, so readers never observe a row a power failure could
-        // revoke; the async writer's own read-back lags by <= ~one fence
-        // (documented deviation from pg, which exposes async commits
-        // immediately).
+        // Compatibility slot only: ADR-014 production formation leaves `async_winners` empty, so
+        // no SQL success can settle at the applied-only cut ahead of durable publication.
         let applied_cut = lanes
             .applied_mirror
             .load(std::sync::atomic::Ordering::Acquire);

@@ -3,8 +3,8 @@ use super::{
     relational_key_prefix, try_encode_binary_insert, wave_device_phase_timing_enabled,
     wave_host_phase_timing_enabled, Command, CommitState, CommitWaveItem, CommitWaveTail,
     DmlReadSnapshot, Engine, EngineError, ExecuteError, Index, Insert, InsertPrepareValidation,
-    LogReplicator, RelationalIndex, RelationalTable, SqlValue, WalRecord, WriteDelta,
-    WAVE_DEVICE_STATS, WAVE_HOST_STATS,
+    LogReplicator, RelationalIndex, RelationalTable, SqlValue, WriteDelta, WAVE_DEVICE_STATS,
+    WAVE_HOST_STATS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -699,19 +699,30 @@ impl Engine {
                     payload
                 };
                 let wal_len_before = commit.wal.len();
-                commit.wal.append(WalRecord {
-                    txn_id: batch[position].txn_id,
-                    payload: wal_payload.clone(),
-                });
-                let wal_position = commit.wal.len();
-                let token = match commit.repl.propose(wal_payload) {
+                let token = match commit.repl.propose(wal_payload.clone()) {
                     Ok(token) => token,
                     Err(err) => {
-                        commit.wal.truncate(wal_len_before);
                         batch[position].set_outcome(Err(ExecuteError::Engine(err)));
                         continue;
                     }
                 };
+                let record = match Self::canonical_wal_record_with_commit_request_digest(
+                    &commit,
+                    batch[position].txn_id,
+                    token.index,
+                    0,
+                    &wal_payload,
+                    gpu_db_wal::canonical_request_digest(&batch[position].payload),
+                ) {
+                    Ok(record) => record,
+                    Err(err) => {
+                        commit.repl.rollback_unapplied_from(token.index);
+                        batch[position].set_outcome(Err(ExecuteError::Engine(err)));
+                        continue;
+                    }
+                };
+                commit.wal.append(record);
+                let wal_position = commit.wal.len();
                 debug_assert_eq!(
                     token.index, commit_seq,
                     "the sequencer is the single proposer: the proposed index must equal the peek"
@@ -722,6 +733,11 @@ impl Engine {
                     batch[position].set_outcome(Err(ExecuteError::Engine(err)));
                     continue;
                 }
+                commit.record_transaction_status_digest(
+                    batch[position].txn_id,
+                    gpu_db_wal::canonical_request_digest(&batch[position].payload),
+                    token.index,
+                );
                 let timestamp_micros =
                     wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
                 commit.record_commit_timestamp(batch[position].txn_id, timestamp_micros);
@@ -870,6 +886,7 @@ impl Engine {
                     continue;
                 }
             };
+            let item_rows = delta.rows_affected();
             hp!(2);
 
             // (3c) Assign the seq for real: WAL append + propose (the sequencer is the single
@@ -934,19 +951,36 @@ impl Engine {
                 item.payload.clone()
             };
             let wal_len_before = commit.wal.len();
-            commit.wal.append(WalRecord {
-                txn_id: item.txn_id,
-                payload: wal_payload.clone(),
-            });
-            let wal_position = commit.wal.len();
-            let token = match commit.repl.propose(wal_payload) {
+            let token = match commit.repl.propose(wal_payload.clone()) {
                 Ok(token) => token,
                 Err(err) => {
-                    commit.wal.truncate(wal_len_before);
                     item.set_outcome(Err(ExecuteError::Engine(err)));
                     continue;
                 }
             };
+            let record = match Self::canonical_wal_record_with_commit_outcome(
+                &commit,
+                item.txn_id,
+                token.index,
+                0,
+                &wal_payload,
+                gpu_db_wal::canonical_request_digest(&item.payload),
+                if item_rows == 0 {
+                    gpu_db_wal::CanonicalOutcomeKind::CommitNoOp
+                } else {
+                    gpu_db_wal::CanonicalOutcomeKind::CommitSuccess
+                },
+                item_rows,
+            ) {
+                Ok(record) => record,
+                Err(err) => {
+                    commit.repl.rollback_unapplied_from(token.index);
+                    item.set_outcome(Err(ExecuteError::Engine(err)));
+                    continue;
+                }
+            };
+            commit.wal.append(record);
+            let wal_position = commit.wal.len();
             debug_assert_eq!(
                 token.index, commit_seq,
                 "the sequencer is the single proposer: the proposed index must equal the peek"
@@ -957,6 +991,11 @@ impl Engine {
                 item.set_outcome(Err(ExecuteError::Engine(err)));
                 continue;
             }
+            commit.record_transaction_status_digest(
+                item.txn_id,
+                gpu_db_wal::canonical_request_digest(&item.payload),
+                token.index,
+            );
             let timestamp_micros =
                 wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
             commit.record_commit_timestamp(item.txn_id, timestamp_micros);
@@ -1032,7 +1071,6 @@ impl Engine {
                     }
                     _ => None,
                 };
-            let item_rows = delta.rows_affected();
             self.apply_delta(delta, commit_seq, None)
                 .unwrap_or_else(|err| {
                     panic!(
@@ -1451,10 +1489,28 @@ impl Engine {
                 wal_record[*wal_offset..*wal_offset + 8].copy_from_slice(&row_id.to_le_bytes());
                 let wal_payload: std::sync::Arc<[u8]> =
                     std::sync::Arc::from(std::mem::take(wal_record));
-                commit.wal.append(WalRecord {
-                    txn_id: batch[*position].txn_id,
-                    payload: wal_payload.clone(),
-                });
+                let canonical = match Self::canonical_wal_record_with_commit_request_digest(
+                    &commit,
+                    batch[*position].txn_id,
+                    first_seq + offset as u64,
+                    0,
+                    &wal_payload,
+                    gpu_db_wal::canonical_request_digest(&batch[*position].payload),
+                ) {
+                    Ok(record) => record,
+                    Err(err) => {
+                        commit.wal.truncate(wal_len_before);
+                        for (position, _table, _values, _record, _offset) in winners.into_iter() {
+                            batch[position].set_outcome(Err(ExecuteError::Engine(
+                                EngineError::Durability(format!(
+                                    "canonical wave WAL encode failed: {err}"
+                                )),
+                            )));
+                        }
+                        return None;
+                    }
+                };
+                commit.wal.append(canonical);
                 payloads.push(wal_payload);
             }
             match commit.repl.propose_batch(payloads) {
@@ -1474,6 +1530,11 @@ impl Engine {
                         winners.into_iter().enumerate()
                     {
                         let commit_seq = first_seq + offset as u64;
+                        commit.record_transaction_status_digest(
+                            batch[position].txn_id,
+                            gpu_db_wal::canonical_request_digest(&batch[position].payload),
+                            commit_seq,
+                        );
                         commit.record_commit_timestamp(
                             batch[position].txn_id,
                             base_timestamp_micros + offset as u64,

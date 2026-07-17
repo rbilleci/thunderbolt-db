@@ -6,7 +6,7 @@ use super::{find_matching_paren, Decimal128, ParseError};
 /// (`precision`/`scale`); every variant's payload is `Copy`, so `SqlType` stays
 /// `Copy` exactly like the original `Int4`/`Text`-only enum (the ~60 `== SqlType::Int4`
 /// guards and by-value passes are unaffected by the widening).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlType {
     /// PostgreSQL `smallint` (int2) — stored widened to i32 in the int4 device section (so it reuses
     /// the int4 compare path); arithmetic (int16-bounds overflow) is a follow-on.
@@ -96,7 +96,7 @@ impl SqlType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SqlValue {
     /// SQL `NULL` — the typeless absence of a value. Placed first so the *derived*
     /// `Ord`/`Eq` (used only for internal value-index keys and dedup, never for SQL

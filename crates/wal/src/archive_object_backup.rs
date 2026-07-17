@@ -1,15 +1,20 @@
 //! WAL archive object export, verified storage, and restore.
 
 use super::*;
+use sha2::{Digest, Sha256};
 
-const WAL_ARCHIVE_OBJECT_BACKUP_MAGIC: &str = "GPUDBWALOBJECTBACKUP1";
+const WAL_ARCHIVE_OBJECT_BACKUP_MAGIC_V1: &str = "GPUDBWALOBJECTBACKUP1";
+const WAL_ARCHIVE_OBJECT_BACKUP_MAGIC: &str = "GPUDBWALOBJECTBACKUP2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalArchiveObject {
     pub source_path: PathBuf,
     pub object_path: PathBuf,
     pub byte_len: u64,
+    /// Legacy v1 compatibility checksum.
     pub checksum: u64,
+    /// Collision-resistant v2 object authority.
+    pub sha256: Option<CanonicalDigest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +33,7 @@ pub fn export_wal_archive_object_backup(
     let object_dir = object_dir.as_ref();
     let (archive_manifest, _records) = read_wal_archive(manifest_path)?;
 
-    fs::create_dir_all(object_dir).map_err(|err| {
+    create_wal_dir_all(object_dir).map_err(|err| {
         EngineError::Durability(format!(
             "failed to create WAL archive object directory {}: {err}",
             object_dir.display()
@@ -85,7 +90,8 @@ pub fn restore_wal_archive_object_backup(
     let manifest_bytes =
         read_verified_wal_archive_backup_object(backup_manifest_path, manifest_object)?;
     let expected_manifest_bytes =
-        render_wal_archive_manifest_body(&backup.archive_manifest)?.into_bytes();
+        append_sha256_trailer(render_wal_archive_manifest_body(&backup.archive_manifest)?)
+            .into_bytes();
     if manifest_bytes != expected_manifest_bytes {
         return Err(EngineError::Durability(format!(
             "WAL archive object backup {} manifest object does not match backup manifest metadata",
@@ -102,7 +108,7 @@ pub fn restore_wal_archive_object_backup(
     let restored_segment_parent = restored_segment_dir
         .parent()
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(restored_segment_parent).map_err(|err| {
+    create_wal_dir_all(restored_segment_parent).map_err(|err| {
         EngineError::Durability(format!(
             "failed to create restored WAL archive segment parent {}: {err}",
             restored_segment_parent.display()
@@ -117,7 +123,7 @@ pub fn restore_wal_archive_object_backup(
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&staging_segment_dir);
-    fs::create_dir_all(&staging_segment_dir).map_err(|err| {
+    create_wal_dir_all(&staging_segment_dir).map_err(|err| {
         EngineError::Durability(format!(
             "failed to create staging WAL archive segment directory {}: {err}",
             staging_segment_dir.display()
@@ -166,6 +172,7 @@ pub fn restore_wal_archive_object_backup(
                 restored_segment_dir.display()
             ))
         })?;
+        sync_wal_parent_dir(restored_segment_dir)?;
         Ok::<_, EngineError>(restored_segments)
     })();
     let restored_segments = match restore_result {
@@ -193,7 +200,7 @@ pub fn write_wal_archive_object_backup_manifest(
     let path = path.as_ref();
     validate_archive_manifest_shape(path, &backup.archive_manifest)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+        create_wal_dir_all(parent).map_err(|err| {
             EngineError::Durability(format!(
                 "failed to create WAL archive object backup directory {}: {err}",
                 parent.display()
@@ -232,14 +239,22 @@ pub fn write_wal_archive_object_backup_manifest(
     for object in &backup.objects {
         validate_backup_path(path, "object source", &object.source_path)?;
         validate_backup_path(path, "object path", &object.object_path)?;
+        let sha256 = object.sha256.ok_or_else(|| {
+            EngineError::Durability(format!(
+                "WAL archive object {} lacks its v2 SHA-256 authority",
+                object.object_path.display()
+            ))
+        })?;
         body.push_str(&format!(
-            "object={}|{}|{}|{}\n",
+            "object={}|{}|{}|{}|{}\n",
             object.source_path.display(),
             object.object_path.display(),
             object.byte_len,
-            object.checksum
+            object.checksum,
+            format_sha256(sha256)
         ));
     }
+    let body = append_sha256_trailer(body);
 
     let tmp_path = temporary_control_path(path);
     let write_result = (|| {
@@ -275,7 +290,8 @@ pub fn write_wal_archive_object_backup_manifest(
             "failed to install WAL archive object backup {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    sync_wal_parent_dir(path)
 }
 
 pub fn read_wal_archive_object_backup_manifest(
@@ -288,13 +304,19 @@ pub fn read_wal_archive_object_backup_manifest(
             path.display()
         ))
     })?;
+    let is_v2 = body.lines().next() == Some(WAL_ARCHIVE_OBJECT_BACKUP_MAGIC);
+    let body = match body.lines().next() {
+        Some(WAL_ARCHIVE_OBJECT_BACKUP_MAGIC) => verify_sha256_trailer(&body, path)?,
+        Some(WAL_ARCHIVE_OBJECT_BACKUP_MAGIC_V1) => body,
+        _ => {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive object backup header {}",
+                path.display()
+            )))
+        }
+    };
     let mut lines = body.lines();
-    if lines.next() != Some(WAL_ARCHIVE_OBJECT_BACKUP_MAGIC) {
-        return Err(EngineError::Durability(format!(
-            "invalid WAL archive object backup header {}",
-            path.display()
-        )));
-    }
+    let _magic = lines.next();
 
     let durable_record_count = parse_control_value(lines.next(), "durable_record_count", path)?
         .parse()
@@ -484,6 +506,19 @@ pub fn read_wal_archive_object_backup_manifest(
                     path.display()
                 ))
             })?;
+        let sha256 = if is_v2 {
+            Some(parse_sha256(
+                parts.next().ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "missing WAL archive object backup SHA-256 in {}",
+                        path.display()
+                    ))
+                })?,
+                path,
+            )?)
+        } else {
+            None
+        };
         if parts.next().is_some() {
             return Err(EngineError::Durability(format!(
                 "invalid WAL archive object backup object field count in {}",
@@ -495,6 +530,7 @@ pub fn read_wal_archive_object_backup_manifest(
             object_path,
             byte_len,
             checksum,
+            sha256,
         });
     }
     if lines.next().is_some() {
@@ -547,6 +583,7 @@ fn write_wal_archive_backup_object(
         object_path,
         byte_len: bytes.len() as u64,
         checksum: wal_object_checksum(&bytes),
+        sha256: Some(wal_object_sha256(&bytes)),
     })
 }
 
@@ -569,8 +606,11 @@ fn read_verified_wal_archive_backup_object(
             bytes.len()
         )));
     }
-    let actual_checksum = wal_object_checksum(&bytes);
-    if actual_checksum != object.checksum {
+    let checksum_matches = match object.sha256 {
+        Some(expected) => wal_object_sha256(&bytes) == expected,
+        None => wal_object_checksum(&bytes) == object.checksum,
+    };
+    if !checksum_matches {
         return Err(EngineError::Durability(format!(
             "WAL archive backup object {} checksum mismatch",
             object_path.display()
@@ -581,7 +621,7 @@ fn read_verified_wal_archive_backup_object(
 
 fn write_verified_backup_bytes(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+        create_wal_dir_all(parent).map_err(|err| {
             EngineError::Durability(format!(
                 "failed to create WAL archive backup object directory {}: {err}",
                 parent.display()
@@ -620,7 +660,8 @@ fn write_verified_backup_bytes(path: &Path, bytes: &[u8]) -> Result<(), EngineEr
             "failed to install WAL archive backup object {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    sync_wal_parent_dir(path)
 }
 
 fn validate_backup_path(path: &Path, field: &str, value: &Path) -> Result<(), EngineError> {
@@ -645,4 +686,36 @@ fn wal_object_checksum(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+fn wal_object_sha256(bytes: &[u8]) -> CanonicalDigest {
+    Sha256::digest(bytes).into()
+}
+
+fn format_sha256(digest: CanonicalDigest) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn parse_sha256(raw: &str, path: &Path) -> Result<CanonicalDigest, EngineError> {
+    if raw.len() != 64 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(EngineError::Durability(format!(
+            "invalid WAL archive object SHA-256 in {}",
+            path.display()
+        )));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, slot) in digest.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&raw[index * 2..index * 2 + 2], 16).map_err(|_| {
+            EngineError::Durability(format!(
+                "invalid WAL archive object SHA-256 in {}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(digest)
 }

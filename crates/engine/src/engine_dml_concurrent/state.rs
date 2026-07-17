@@ -122,6 +122,15 @@ pub(crate) struct LaneIntent {
     pub(crate) template: Arc<[u8]>,
     pub(crate) values: Vec<SqlValue>,
     pub(crate) outcome: CommitWaveOutcome,
+    /// Stable request identity and shared lane status authority. Installed at ingress before the
+    /// item can claim a sequence; successful settlement publishes the terminal response here.
+    pub(crate) request_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) transaction_claims: Option<
+        Arc<
+            Mutex<std::collections::HashMap<u64, crate::engine_intent_lanes::LaneTransactionClaim>>,
+        >,
+    >,
+    pub(crate) commit_seq: Option<Index>,
     /// Live-population decrement handle (see `IntentLaneState::outstanding`);
     /// None outside lanes mode.
     pub(crate) outstanding: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -157,6 +166,41 @@ impl LaneIntent {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.outcome.done.load(AtomicOrdering::Acquire) {
             return;
+        }
+        if let Some(claims) = &self.transaction_claims {
+            let mut claims = claims
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match &result {
+                Ok(affected_rows) => {
+                    if let Some(commit_seq) = self.commit_seq {
+                        claims.insert(
+                            self.txn_id,
+                            crate::engine_intent_lanes::LaneTransactionClaim {
+                                request_digest: self.request_digest,
+                                state: crate::engine_intent_lanes::LaneTransactionClaimState::Terminal {
+                                    commit_seq,
+                                    affected_rows: *affected_rows,
+                                },
+                            },
+                        );
+                    }
+                }
+                Err(_) if self.commit_seq.is_none() => {
+                    if claims.get(&self.txn_id).is_some_and(|claim| {
+                        claim.request_digest == self.request_digest
+                            && claim.state
+                                == crate::engine_intent_lanes::LaneTransactionClaimState::Pending
+                    }) {
+                        claims.remove(&self.txn_id);
+                    }
+                }
+                Err(_) => {
+                    // A sequence was assigned. Failure from here is indeterminate until restart
+                    // reconciles durable authority; never delete the stable-ID pin and permit a
+                    // duplicate append in the live process.
+                }
+            }
         }
         *outcome = Some(result);
         self.outcome.done.store(true, AtomicOrdering::Release);

@@ -247,6 +247,21 @@ pub(crate) fn binary_update_new_row_id_offset(table: &str, pk_column: &str) -> u
 /// Decode ANY binary record (op dispatch). Errors are LOUD (`Durability`) — a tagged record
 /// that fails to decode is corruption-or-version-skew, never silently skipped.
 pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, EngineError> {
+    if let Some(envelope) = gpu_db_wal::decode_canonical_record_payload(payload)? {
+        let operation = envelope
+            .fragments
+            .iter()
+            .find(|fragment| {
+                fragment.kind != gpu_db_wal::CanonicalFragmentKind::TransactionClaimStatus
+            })
+            .ok_or_else(|| {
+                EngineError::Durability(
+                    "canonical binary WAL record has no operation fragment".to_string(),
+                )
+            })?;
+        let inner = Engine::decode_engine_operation(&operation.body)?;
+        return decode_binary_record(&inner);
+    }
     let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
     match payload.get(2) {
         Some(&OP_INSERT) => decode_binary_insert(payload).map(BinaryWalRecord::Insert),

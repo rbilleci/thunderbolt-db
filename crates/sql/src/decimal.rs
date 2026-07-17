@@ -12,7 +12,7 @@
 /// `1.0` and `1.00` collide. Overflow beyond the i128 mantissa range is a clean
 /// errored edge (no bignum fallback) — values needing >38 significant digits are a
 /// documented future milestone.
-#[derive(Debug, Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
 pub struct Decimal128 {
     pub mantissa: i128,
     pub scale: u8,
@@ -20,7 +20,9 @@ pub struct Decimal128 {
 
 /// Error raised when a `numeric` value or operation exceeds the i128 mantissa range
 /// (or its column `precision`). Mirrors PostgreSQL's `22003 numeric_value_out_of_range`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, thiserror::Error,
+)]
 #[error("numeric field overflow")]
 pub struct NumericOverflow;
 

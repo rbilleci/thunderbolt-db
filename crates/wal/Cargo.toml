@@ -10,3 +10,4 @@ gpu_db_types = { path = "../types" }
 # variable-payload `FuaFrameLog` (control-plane WAL/durability I/O). Only referenced behind
 # `#[cfg(unix)]` — the frame log itself is a unix-only (O_DIRECT|O_DSYNC) construct.
 gpu_db_write_conveyor = { path = "../write_conveyor" }
+sha2 = "0.10"

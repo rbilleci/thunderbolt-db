@@ -10,8 +10,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Production relational reads execute through resident, streaming, transient-relation, or CUDA-native MVCC
   GPU paths. A decline or device fault fails loudly; it never executes relational work on the host.
 - Test-only CPU semantic infrastructure remains under `cfg(test)` pending **RETIRE-001**.
-- The host write/commit/MVCC tuple-store path and bootstrap DML indexes/probes remain pending **R3-004** and
-  **DUR-002**; generic CUDA-MVCC host result post-processing and recovery repair operators remain pending
+- The host write/commit/MVCC tuple-store path and bootstrap DML indexes/probes remain pending **R3-004**;
+  generic CUDA-MVCC host result post-processing and recovery repair operators remain pending
   **RETIRE-002** and **RETIRE-003**. R3-002/R3-003 passed independent adversarial acceptance on 2026-07-17.
 
 ## Read path and STRATA
@@ -142,18 +142,44 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and never double-count. It also proves that a zero-row DELETE of a never-existing key leaves no stale arbitration
   slot: a subsequent same-key covered INSERT succeeds with one affected row. The target passes three sequential
   plus two simultaneous GPU executions, with non-vacuous visible-locate and tombstone counters.
-- Crash-durable replay exists; the broader fault campaign, automatic lane checkpointing, PITR timestamps, and
-  multi-node quorum integration are **DUR-001**, **DUR-002**, and **HA-001**.
+- **DUR-002 is complete.** Serialized multi-entry apply still holds the catalog
+  latch and publishes one generation only after the group, but nested existence, dependency, DML, and sequence
+  helpers now see an engine-scoped immutable snapshot of the evolving unpublished catalog after the first
+  catalog-mutating entry. Pure KV/DML groups retain the zero-clone path. One regression covers CREATE+INSERT,
+  CREATE SEQUENCE+`nextval`, TRUNCATE+INSERT+ALTER+INSERT, role GRANT/REVOKE/DROP, create/drop/recreate, and fresh
+  recovery; it fails against the former published-generation lookup. The canonical WAL is a SHA-256-bound,
+  non-circular typed envelope with ordered operation/status fragments and an exact terminal outcome; typed AST
+  replay does not parse SQL. Database/timeline/epoch identity, catalog epoch/digest lineage, operation class,
+  table count, allocator high-water, request digest, lane-local physical coordinates, and global commit range are
+  checked before apply. FUA recovery maps checked exclusive lane prefixes to the inclusive MVCC boundary, rejects
+  inconsistent ranges and overflow, and persists a checksummed stable-ID abort authority before discarding an
+  unacknowledged orphan. Transaction claims survive reopen and resolve same-request retry exactly; mismatched
+  reuse fails closed. Classic and lane success acknowledgements both require durable-and-applied publication;
+  the legacy `synchronous_commit=off` setting is compatibility-only until a separately accepted async contract
+  exists. Identity anchors, status/checkpoint/archive/cold-artifact sidecars, and fresh-file installation use
+  checksummed atomic replacement plus containing-directory synchronization. Recovery validates the complete
+  catalog chain, advances allocator high-water monotonically, is repeatable from immutable durable authority, and
+  performs one bounded fresh Engine/runtime reacquisition only for recognized CUDA context-loss codes; a second
+  failure leaves the engine unavailable. The campaign covers every canonical fragment/marker truncation and
+  corruption boundary, FUA lane/orphan/fence and prune/recycle seams, checkpoint pointer/control and WAL-tail
+  damage, cold artifact suffix repair, durability/apply ordering, retry/status retention, numeric exhaustion,
+  repeated recovery, and injected context loss. No accepted commit is dropped, and rejected or reconciled-aborted
+  work does not become visible.
+- Crash-durable replay and the ADR-014 bounded fault campaign are accepted. Automatic lane checkpointing and PITR
+  timestamps remain **DUR-001**; multi-node quorum integration remains **HA-001**.
 
 ## Verification snapshot — 2026-07-17
 
-- Engine library: **523 ordinary + 514 actual-GPU = 1,037/1,037** passed. Execution library:
+- The current live-GPU engine library gate passes **533**, ignores **514** separately qualified GPU tests, and fails
+  none. DUR-002's focused actual-GPU recovery gates pass for the intent/FUA insert route, strict compatibility
+  acknowledgement, lane DELETE replay, and lane UPDATE replay. WAL passes **96/96**, replication **189/189**, and
+  SQL **23/23**. Execution library:
   **56 ordinary + 79 actual-GPU = 135/135** passed. Facade library:
   **39 ordinary + 8 actual-GPU = 47/47** passed.
 - Nine high-risk device-history, transaction, tail-handoff, lane-probe, sharded-publication, and retained-completion
   families passed three sequential plus two concurrent HAZARD invocations. The corrected class-FK TOCTOU and
-  pinned-history epoch/compaction tests each passed ten consecutive GPU invocations. A broader facade
-  concurrency-stress run previously passed 9, failed 4, and left 1 ignored; its
+  pinned-history epoch/compaction tests each passed ten consecutive GPU invocations. The broader facade
+  concurrency-stress run reproduces 9 passed, 4 failed, and 1 ignored; its
   shape-changing-DDL/read route declines and elided-rehydration race are verification debt under **READ-001**, not
   acceptance evidence for this transaction slice.
 - Production transient GPU integrations: catalog and bounded-function routes pass.
@@ -3988,7 +4014,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Two physical GPUs have not executed the scheduler, device-locate, or typed sidecar context gates | **MULTI-001**, **MULTI-002**, **MULTI-003** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |
 | Empty-aggregate pgwire NULL seam requires focused disposition | **READ-003** |
-| Lanes auto-checkpoint/PITR and full crash campaign | **DUR-001**, **DUR-002** |
+| Lanes automatic checkpoint/PITR policy | **DUR-001** |
 | Multi-node Raft/quorum serving is not integrated | **HA-001** |
 | Connection/runtime scale and bounded result streaming | **SCALE-001** |
 | Historical scalability-ledger findings require current-tree disposition | **SCALE-002** |

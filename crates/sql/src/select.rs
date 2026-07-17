@@ -7,7 +7,7 @@ use super::{
     strip_keyword_prefix_case_insensitive, ParseError, SqlValue,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Select {
     pub table: String,
     pub distinct: bool,
@@ -25,7 +25,7 @@ pub struct Select {
     pub offset: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SelectProjection {
     All,
     Columns(Vec<String>),
@@ -78,14 +78,14 @@ pub enum SelectProjection {
 }
 
 /// One aggregate within a `GroupedAggregates` projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GroupedAggregate {
     pub kind: GroupedAggKind,
     /// The aggregated value column, or `None` for COUNT(*).
     pub value_column: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupedAggKind {
     Count,
     Sum,
@@ -97,14 +97,14 @@ pub enum GroupedAggKind {
     CountDistinct,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SelectFilter {
     pub column: String,
     pub op: SelectFilterOp,
     pub value: SqlValue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectFilterOp {
     Eq,
     Lt,
@@ -127,7 +127,7 @@ impl SelectFilterOp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SelectOrder {
     pub column: String,
     pub descending: bool,

@@ -257,6 +257,15 @@ impl AppliedRowMutation {
             | Self::Update { write_set, .. } => write_set,
         }
     }
+
+    /// Exact relational row count produced by replay/apply. This is compared with the canonical
+    /// terminal marker before a recovered engine is returned to service.
+    pub(crate) fn rows_affected(&self) -> u64 {
+        match self {
+            Self::Insert { rows, .. } | Self::Delete { rows, .. } => rows.len() as u64,
+            Self::Update { old_rows, .. } => old_rows.len() as u64,
+        }
+    }
 }
 
 /// A prepared (but not yet installed) write: the [`WriteSet`] for conflict detection plus the

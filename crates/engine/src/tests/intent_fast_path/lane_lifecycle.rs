@@ -98,6 +98,8 @@ fn visible_entity_id(engine: &Engine, key: i32) -> u64 {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
+    const RETRY_TXN: u64 = 9_000_001;
+    const RETRY_ROW: [i32; 2] = [2_000_000, 77];
     let path = test_wal_path("intent-fua");
     let prior_durability = std::env::var("GPU_DB_WAL_DURABILITY").ok();
     std::env::set_var("GPU_DB_WAL_DURABILITY", "fua");
@@ -182,6 +184,40 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         }
     });
 
+    if lanes_mode {
+        let mut first = engine
+            .submit_covered_insert_intent(RETRY_TXN, &route, &RETRY_ROW)
+            .expect("stable-id first submission");
+        loop {
+            engine.drive_commit_wave();
+            if let Some(result) = engine.poll_intent(&mut first) {
+                assert_eq!(result.unwrap(), 1);
+                break;
+            }
+        }
+        let durable_cut = engine.intent_lane_stats().unwrap().7;
+        let mut retry = engine
+            .submit_covered_insert_intent(RETRY_TXN, &route, &RETRY_ROW)
+            .expect("same-id same-digest retry");
+        assert_eq!(engine.poll_intent(&mut retry).unwrap().unwrap(), 1);
+        assert_eq!(
+            engine.intent_lane_stats().unwrap().7,
+            durable_cut,
+            "terminal retry must not append another lane record"
+        );
+        let mismatch =
+            match engine.submit_covered_insert_intent(RETRY_TXN, &route, &[RETRY_ROW[0] + 1, 77]) {
+                Err(error) => error,
+                Ok(_) => panic!("same stable id with a different request must fail"),
+            };
+        assert!(
+            mismatch
+                .to_string()
+                .contains("claimed by a different request"),
+            "{mismatch}"
+        );
+    }
+
     // SQL semantics: a duplicate PK through the intent path raises the same
     // 23505 the classic path raises (wave-batched device locate verdict), and
     // commits nothing.
@@ -260,6 +296,22 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         let route = recovered
             .prepare_covered_insert_route("t")
             .expect("route re-prepares after reopen (elision re-entry)");
+        let cut_before_retry = recovered.intent_lane_stats().unwrap().7;
+        let mut recovered_retry = recovered
+            .submit_covered_insert_intent(RETRY_TXN, &route, &RETRY_ROW)
+            .expect("recovered same-id retry");
+        assert_eq!(
+            recovered
+                .poll_intent(&mut recovered_retry)
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            recovered.intent_lane_stats().unwrap().7,
+            cut_before_retry,
+            "recovered terminal retry must not append another lane record"
+        );
         for i in 0..50_i32 {
             commit_intent_via_submit(&recovered, &txn_ids, &route, &[10_000 + i, i])
                 .expect("post-reopen intent commits");
@@ -432,6 +484,9 @@ fn central_commit_wedge_drains_queued_lane_intents() {
             template: std::sync::Arc::from(&b""[..]),
             values: Vec::new(),
             outcome: std::sync::Arc::clone(&outcome),
+            request_digest: [0; 32],
+            transaction_claims: None,
+            commit_seq: None,
             outstanding: Some(std::sync::Arc::clone(&lanes.outstanding)),
             synchronous: true,
             rows_affected: 1,
@@ -483,6 +538,9 @@ fn lane_activation_fails_locally_drained_batch_if_commit_path_wedges_while_waiti
             template: std::sync::Arc::from(&b""[..]),
             values: Vec::new(),
             outcome: std::sync::Arc::clone(&outcome),
+            request_digest: [0; 32],
+            transaction_claims: None,
+            commit_seq: None,
             outstanding: Some(std::sync::Arc::clone(&lanes.outstanding)),
             synchronous: true,
             rows_affected: 1,
@@ -986,15 +1044,11 @@ fn warm_count(rows: &[Vec<SqlValue>]) -> usize {
         .count()
 }
 
-/// PG-MODEL ASYNC COMMIT (`SynchronousCommit::Off`, per statement): async
-/// intents ack at the APPLIED cut while their WAL frames fence behind the
-/// ack; a clean drain + reopen recovers EVERY acked row (the loss window
-/// exists only under power failure, by contract). Mixed sync/async waves
-/// settle both tiers; the engine default flips via
-/// `set_synchronous_commit_default` and per-statement mode overrides it.
+/// ADR-014 RPO-0 compatibility: `SynchronousCommit::Off` is accepted but remains strict. Mixed
+/// settings and the engine default must still recover every acknowledged row.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_async_commit_acks_early_and_recovers_clean_drain() {
+fn gpu_synchronous_commit_off_remains_durable_and_recovers() {
     let path = test_wal_path("intent-async-commit");
     let mut engine = Engine::with_durable_wal_segment(&path);
     engine

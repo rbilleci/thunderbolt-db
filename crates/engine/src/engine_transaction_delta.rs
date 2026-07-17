@@ -321,7 +321,15 @@ impl Engine {
         self.validate_transaction_device_row_conflicts(&snapshot, &deltas, &provisional_inserts)?;
 
         let insert_count = provisional_inserts.len() as u64;
-        let final_base = self.read_state.mvcc.claim_row_id_block(insert_count);
+        let final_base = self
+            .read_state
+            .mvcc
+            .claim_row_id_block(insert_count)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "transaction row identity space exhausted".to_string(),
+                ))
+            })?;
         let allocator_high_water = final_base.checked_add(insert_count).ok_or_else(|| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "transaction row identity space exhausted".to_string(),
@@ -343,17 +351,20 @@ impl Engine {
         let payload: Arc<[u8]> = Arc::from(payload);
 
         let wal_len_before = commit.wal.len();
-        commit.wal.append(WalRecord {
-            txn_id,
-            payload: Arc::clone(&payload),
-        });
-        let token = match commit.repl.propose(payload) {
+        let token = match commit.repl.propose(Arc::clone(&payload)) {
             Ok(token) => token,
             Err(err) => {
-                commit.wal.truncate(wal_len_before);
                 return Err(ExecuteError::Engine(err));
             }
         };
+        let record = match Self::canonical_wal_record(&commit, txn_id, token.index, 0, &payload) {
+            Ok(record) => record,
+            Err(err) => {
+                commit.repl.rollback_unapplied_from(token.index);
+                return Err(ExecuteError::Engine(err));
+            }
+        };
+        commit.wal.append(record);
         if let Err(err) = commit.wal.flush_all() {
             commit.repl.rollback_unapplied_from(token.index);
             commit.wal.truncate(wal_len_before);
@@ -363,6 +374,7 @@ impl Engine {
             .repl
             .wait_committed(token, Duration::from_millis(0))
             .map_err(ExecuteError::Engine)?;
+        commit.record_transaction_status(txn_id, &payload, token.index);
         commit.record_commit_timestamp(txn_id, timestamp_micros);
         #[cfg(test)]
         let apply_result =

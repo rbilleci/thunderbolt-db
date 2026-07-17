@@ -775,6 +775,71 @@ fn wal_control_file_round_trips_checkpoint_metadata() {
 }
 
 #[test]
+fn v2_control_and_lanes_checkpoint_sidecars_fail_closed_on_tamper_or_truncation() {
+    let base = test_wal_path("checksummed-sidecars");
+    let control_path = base.with_extension("control");
+    let control = WalControlFile {
+        segment_path: PathBuf::from("segment-0001.wal"),
+        checkpoint: WalCheckpointMeta {
+            durable_record_count: 2,
+            last_durable_txn_id: Some(42),
+        },
+    };
+    write_wal_control_file(&control_path, &control).unwrap();
+    let original = fs::read_to_string(&control_path).unwrap();
+    assert!(original.starts_with("GPUDBWALCONTROL2\n"));
+    let legacy = original
+        .replace("GPUDBWALCONTROL2", "GPUDBWALCONTROL1")
+        .lines()
+        .filter(|line| !line.starts_with("sha256="))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&control_path, legacy).unwrap();
+    assert_eq!(read_wal_control_file(&control_path).unwrap(), control);
+    fs::write(
+        &control_path,
+        original.replace("durable_record_count=2", "durable_record_count=3"),
+    )
+    .unwrap();
+    assert!(read_wal_control_file(&control_path).is_err());
+    let without_trailer = original
+        .lines()
+        .filter(|line| !line.starts_with("sha256="))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&control_path, without_trailer).unwrap();
+    assert!(read_wal_control_file(&control_path).is_err());
+
+    let records = vec![WalRecord {
+        txn_id: 1,
+        payload: b"SET sidecar=1".to_vec().into(),
+    }];
+    write_lanes_checkpoint(&base, 1, 0, &records).unwrap();
+    let sidecar = lanes_checkpoint_sidecar_path(&base);
+    let original = fs::read_to_string(&sidecar).unwrap();
+    assert!(original.starts_with("GPUDBLANESCHECKPOINT2\n"));
+    let segment_name = lanes_checkpoint_segment_path(&base, 0)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    fs::write(
+        &sidecar,
+        format!("gpu-db-lanes-checkpoint v1 1 0 {segment_name}\n"),
+    )
+    .unwrap();
+    assert!(read_lanes_checkpoint(&base).unwrap().is_some());
+    fs::write(&sidecar, original.replace("serial_records=1", "serial_records=2")).unwrap();
+    assert!(read_lanes_checkpoint(&base).is_err());
+
+    let _ = fs::remove_file(control_path);
+    let _ = fs::remove_file(sidecar);
+    let _ = fs::remove_file(lanes_checkpoint_segment_path(&base, 0));
+}
+
+#[test]
 fn wal_checkpoint_reads_segment_named_by_control_file() {
     let dir = std::env::temp_dir().join(format!(
         "gpu-db-wal-checkpoint-{}-{}",

@@ -623,6 +623,8 @@ dependencies = [
  "gpu_db_wal",
  "imbl",
  "pg_query",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tikv-jemallocator",
  "tokio",
@@ -729,6 +731,7 @@ dependencies = [
 name = "gpu_db_sql"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "thiserror 1.0.69",
 ]
 
@@ -761,6 +764,7 @@ version = "0.1.0"
 dependencies = [
  "gpu_db_types",
  "gpu_db_write_conveyor",
+ "sha2 0.10.9",
 ]
 
 [[package]]

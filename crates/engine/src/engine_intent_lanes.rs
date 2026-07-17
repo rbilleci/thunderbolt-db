@@ -28,9 +28,9 @@
 // stage-3 lane pump loop.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 fn inclusive_global_boundary(base: u64, exclusive_local_cut: u64) -> u64 {
     base.saturating_add(exclusive_local_cut).saturating_sub(1)
@@ -190,6 +190,17 @@ pub(crate) struct IntentLaneState {
     /// serial WAL from the pre-activation warm-up; recovery replays serial
     /// then lanes over disjoint ranges).
     pub(crate) base_seq: AtomicU64,
+    /// Canonical database lineage captured at the serialized activation fence. Lane pumps run
+    /// off-lock and copy this immutable identity into every durable envelope.
+    pub(crate) canonical_identity: OnceLock<gpu_db_wal::CanonicalIdentity>,
+    /// Catalog binding frozen at the serial-to-lane activation fence. Activated lanes are
+    /// intent-only, so no catalog transition may change this boundary afterward.
+    pub(crate) canonical_catalog_epoch: AtomicU64,
+    pub(crate) canonical_catalog_digest: OnceLock<gpu_db_wal::CanonicalDigest>,
+    /// Stable transaction-id claims for the live lane path. Pending claims deduplicate concurrent
+    /// submissions; terminal entries are rebuilt from canonical WAL on reopen and retained for
+    /// exact same-id/same-digest retry resolution.
+    pub(crate) transaction_claims: std::sync::Arc<Mutex<HashMap<u64, LaneTransactionClaim>>>,
     /// Per-lane ingress queues (single-consumer: the lane's pump; multi-producer
     /// submitters). Items route by PK hash, so same-PK contention stays in-lane.
     pub(crate) queues:
@@ -299,6 +310,25 @@ pub(crate) struct IntentLaneState {
     pub(crate) checkpoint_lock: Mutex<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaneTransactionClaimState {
+    Pending,
+    Terminal { commit_seq: u64, affected_rows: u64 },
+    AbortedDiscardedOrphan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LaneTransactionClaim {
+    pub(crate) request_digest: gpu_db_wal::CanonicalDigest,
+    pub(crate) state: LaneTransactionClaimState,
+}
+
+pub(crate) enum LaneClaimResolution {
+    New,
+    Pending,
+    Terminal(u64),
+}
+
 /// One lane's pending locate request (see `IntentLaneState::validate_queue`).
 pub(crate) struct ValidateRequest {
     pub(crate) table: String,
@@ -337,6 +367,10 @@ pub(crate) struct ApplyRequest {
     /// the apply LOCATES the visible old version, tombstones it, and CONDITIONALLY appends the new
     /// version (only if the old located to one row), off the pump's critical path.
     pub(crate) updates: Vec<LaneUpdate>,
+    /// Exact pre-WAL GPU target cardinalities for unresolved delete/update operations. The apply
+    /// stage must reproduce these marker-authoritative outcomes before it may advance the applied
+    /// prefix; a mismatch wedges the unpublished generation for recovery.
+    pub(crate) expected_rows_affected: Vec<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
     /// The wave's WHOLE claimed seq block `[seq_first, seq_first + seq_len)` — the applied-cut
     /// advance covers every claimed seq regardless of the insert/delete mix (U1: `stamps` is
     /// insert-only and can no longer stand in for the block).
@@ -415,18 +449,11 @@ pub(crate) fn intent_lane_subframes() -> usize {
     0
 }
 
-/// Server default for the commit mode (`GPU_DB_SYNCHRONOUS_COMMIT`, default
-/// `on` — the PostgreSQL model): `off`/`0`/`false` makes ASYNC COMMIT the
-/// default for intents that don't specify a mode. Strict mode is always
-/// available per statement regardless of the default.
+/// ADR-014 standalone durability is strict: the compatibility environment setting is parsed by
+/// callers but cannot lower the acknowledgement gate until a separate async-visibility design is
+/// accepted. Returning `true` makes both configured modes wait for durable + applied publication.
 pub(crate) fn synchronous_commit_default_from_env() -> bool {
-    !matches!(
-        std::env::var("GPU_DB_SYNCHRONOUS_COMMIT")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "off" | "0" | "false"
-    )
+    true
 }
 
 /// Adaptive ship-target divisor: a lane ships when its queue reaches
@@ -453,12 +480,8 @@ pub(crate) struct LaneSettle {
     pub(crate) end_seq: u64,
     /// Winners acking at the STRICT gate (visible cut = durable AND applied).
     pub(crate) winners: Vec<crate::engine_dml_concurrent::LaneIntent>,
-    /// Winners that opted into ASYNC COMMIT (`SynchronousCommit::Off`, the
-    /// PostgreSQL `synchronous_commit = off` model): acked as soon as the
-    /// APPLIED cut covers the wave — their WAL frames are still published in
-    /// order and fenced by the pipeline, but the ack does not wait for the
-    /// fence. Power failure may lose a suffix of async-acked intents (never
-    /// consistency: recovery replays the ordered durable prefix).
+    /// Retained layout slot from the pre-ADR-014 async experiment. Production formation leaves
+    /// this empty: `SynchronousCommit::Off` is strict until a separate design is accepted.
     pub(crate) async_winners: Vec<crate::engine_dml_concurrent::LaneIntent>,
     /// True once `async_winners` were settled (the entry then waits only for
     /// the strict gate to settle `winners` and pop).
@@ -504,6 +527,10 @@ impl IntentLaneState {
             applied_mirror: AtomicU64::new(0),
             activated: AtomicBool::new(false),
             base_seq: AtomicU64::new(0),
+            canonical_identity: OnceLock::new(),
+            canonical_catalog_epoch: AtomicU64::new(0),
+            canonical_catalog_digest: OnceLock::new(),
+            transaction_claims: std::sync::Arc::new(Mutex::new(HashMap::new())),
             queues: (0..lane_count).map(|_| Default::default()).collect(),
             inflight_slots: (0..lane_count).map(|_| Default::default()).collect(),
             settle: (0..lane_count).map(|_| Default::default()).collect(),
@@ -582,6 +609,107 @@ impl IntentLaneState {
             .wal_lanes
             .get()
             .expect("just installed under the init lock"))
+    }
+
+    pub(crate) fn claim_transaction(
+        &self,
+        txn_id: u64,
+        request_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Result<LaneClaimResolution, crate::EngineError> {
+        let mut claims = self
+            .transaction_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match claims.get(&txn_id).copied() {
+            Some(claim) if claim.request_digest != request_digest => {
+                Err(crate::EngineError::Durability(format!(
+                    "transaction id {txn_id} is already durably claimed by a different request"
+                )))
+            }
+            Some(LaneTransactionClaim {
+                state: LaneTransactionClaimState::Pending,
+                ..
+            }) => Ok(LaneClaimResolution::Pending),
+            Some(LaneTransactionClaim {
+                state: LaneTransactionClaimState::Terminal { affected_rows, .. },
+                ..
+            }) => Ok(LaneClaimResolution::Terminal(affected_rows)),
+            Some(LaneTransactionClaim {
+                state: LaneTransactionClaimState::AbortedDiscardedOrphan,
+                ..
+            }) => Err(crate::EngineError::Durability(format!(
+                "transaction id {txn_id} was durably aborted during crash recovery"
+            ))),
+            None => {
+                claims.insert(
+                    txn_id,
+                    LaneTransactionClaim {
+                        request_digest,
+                        state: LaneTransactionClaimState::Pending,
+                    },
+                );
+                Ok(LaneClaimResolution::New)
+            }
+        }
+    }
+
+    pub(crate) fn install_recovered_transaction(
+        &self,
+        txn_id: u64,
+        request_digest: gpu_db_wal::CanonicalDigest,
+        commit_seq: u64,
+        affected_rows: u64,
+    ) -> Result<(), crate::EngineError> {
+        let mut claims = self
+            .transaction_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let recovered = LaneTransactionClaim {
+            request_digest,
+            state: LaneTransactionClaimState::Terminal {
+                commit_seq,
+                affected_rows,
+            },
+        };
+        match claims.get(&txn_id).copied() {
+            Some(existing) if existing != recovered => {
+                return Err(crate::EngineError::Durability(format!(
+                    "recovered transaction claim {txn_id} conflicts with an existing lane claim"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                claims.insert(txn_id, recovered);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_recovered_aborted_transaction(
+        &self,
+        txn_id: u64,
+        request_digest: gpu_db_wal::CanonicalDigest,
+    ) -> Result<(), crate::EngineError> {
+        let mut claims = self
+            .transaction_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let recovered = LaneTransactionClaim {
+            request_digest,
+            state: LaneTransactionClaimState::AbortedDiscardedOrphan,
+        };
+        match claims.get(&txn_id).copied() {
+            Some(existing) if existing != recovered => {
+                Err(crate::EngineError::Durability(format!(
+                    "reconciled transaction claim {txn_id} conflicts with an existing lane claim"
+                )))
+            }
+            Some(_) => Ok(()),
+            None => {
+                claims.insert(txn_id, recovered);
+                Ok(())
+            }
+        }
     }
 
     /// Non-creating peek for pollers (stats, settle, visibility): `None` means the intent
@@ -1003,6 +1131,28 @@ mod tests {
             inclusive_seq_from_exclusive_prefix(u64::MAX - 1, 2).is_err(),
             "the infinity sentinel must never become an inclusive commit sequence"
         );
+    }
+
+    #[test]
+    fn synchronous_commit_off_compatibility_setting_keeps_the_strict_gate() {
+        let mut engine = crate::Engine::new_local_cpu_oracle();
+        let base = std::env::temp_dir().join(format!(
+            "gpu-db-strict-commit-setting-{}-{:?}.wal",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        engine.attach_test_intent_lanes(base, 2);
+        engine.set_synchronous_commit_default(crate::SynchronousCommit::Off);
+        assert!(
+            engine
+                .intent_lanes
+                .as_ref()
+                .unwrap()
+                .synchronous_commit_default
+                .load(Ordering::Relaxed),
+            "Off must behave synchronously until an async durability design is accepted"
+        );
+        assert!(synchronous_commit_default_from_env());
     }
 
     #[test]

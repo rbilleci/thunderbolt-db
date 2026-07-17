@@ -290,7 +290,14 @@ impl FuaWalLaneSet {
             EngineError::Durability("FUA WAL lane frame record count exceeds u32".to_string())
         })?;
         let payload = encode_lane_frame_payload(records)?;
-        let end = first_seq + records.len() as u64;
+        let record_count = u64::try_from(records.len()).map_err(|_| {
+            EngineError::Durability("FUA WAL lane frame record count exceeds u64".to_string())
+        })?;
+        let end = first_seq.checked_add(record_count).ok_or_else(|| {
+            EngineError::Durability(
+                "FUA WAL lane sequence range overflow before append".to_string(),
+            )
+        })?;
         self.append_encoded_inner(lane_ref, &payload, first_seq, end, seq_count)
     }
 
@@ -321,6 +328,16 @@ impl FuaWalLaneSet {
         end: u64,
         seq_count: u32,
     ) -> Result<(), EngineError> {
+        let declared_end = first_seq.checked_add(u64::from(seq_count)).ok_or_else(|| {
+            EngineError::Durability(
+                "FUA WAL lane encoded sequence range overflow before append".to_string(),
+            )
+        })?;
+        if seq_count == 0 || end != declared_end {
+            return Err(EngineError::Durability(format!(
+                "FUA WAL lane encoded range [{first_seq}, {end}) does not match record count {seq_count}"
+            )));
+        }
         // Record the interval BEFORE publishing so the cut can never observe a durable frame whose
         // interval it has not yet seen. If the publish then fails, the interval sits un-absorbable
         // in the queue (its frame never becomes durable) and the cut holds — fail-closed.
@@ -444,6 +461,9 @@ impl FuaWalLaneSet {
 struct LaneRecovery {
     /// Records in ascending GLOBAL seq from the baseline, up to (exclusive) the first missing seq.
     records: Vec<WalRecord>,
+    /// Complete records above the first missing sequence. They were never acknowledgeable, but
+    /// their stable IDs remain durable reconciliation authority until explicitly memoized.
+    discarded_records: Vec<WalRecord>,
     /// Total records AT/ABOVE the baseline scanned across all lanes (>= `records.len()`; a
     /// surplus means orphans above the cut — a torn tail). Below-baseline records (checkpoint-
     /// covered, possibly not yet pruned) are skipped and not counted.
@@ -473,6 +493,7 @@ fn recover_lanes_detailed(
         // No lane segments at all: a fresh (never-flushed) database.
         return Ok(LaneRecovery {
             records: Vec::new(),
+            discarded_records: Vec::new(),
             total_scanned: 0,
             next_seq: baseline,
             lane_ends,
@@ -515,11 +536,40 @@ fn recover_lanes_detailed(
                     )));
                 }
                 for (offset, record) in decoded.into_iter().enumerate() {
-                    let seq = frame.first_seq + offset as u64;
+                    let offset = u64::try_from(offset).map_err(|_| {
+                        EngineError::Durability(
+                            "FUA WAL lane recovery record offset exceeds u64".to_string(),
+                        )
+                    })?;
+                    let seq = frame.first_seq.checked_add(offset).ok_or_else(|| {
+                        EngineError::Durability(format!(
+                            "FUA WAL lane {lane_id} sequence overflow in segment {} frame {}",
+                            segment_path.display(),
+                            frame.frame_id
+                        ))
+                    })?;
                     if seq < baseline {
                         // Checkpoint-covered (the prune may not have removed this frame yet —
                         // the checkpoint-then-prune crash window). Skip, don't count.
                         continue;
+                    }
+                    if let Some(envelope) = crate::decode_canonical_record_payload(&record.payload)?
+                    {
+                        let expected_lane = u32::try_from(lane_id)
+                            .ok()
+                            .and_then(|value| value.checked_add(1))
+                            .ok_or_else(|| {
+                                EngineError::Durability(
+                                    "FUA WAL lane id exceeds canonical coordinate range"
+                                        .to_string(),
+                                )
+                            })?;
+                        if envelope.physical.lane_id != expected_lane {
+                            return Err(EngineError::Durability(format!(
+                                "canonical WAL range at local seq {seq} names lane {} but was recovered from physical lane {lane_id}",
+                                envelope.physical.lane_id
+                            )));
+                        }
                     }
                     if by_seq.insert(seq, record).is_some() {
                         return Err(EngineError::Durability(format!(
@@ -529,7 +579,16 @@ fn recover_lanes_detailed(
                         )));
                     }
                 }
-                let end = frame.first_seq + frame.seq_count as u64;
+                let end = frame
+                    .first_seq
+                    .checked_add(u64::from(frame.seq_count))
+                    .ok_or_else(|| {
+                        EngineError::Durability(format!(
+                            "FUA WAL lane {lane_id} frame range overflow in segment {} frame {}",
+                            segment_path.display(),
+                            frame.frame_id
+                        ))
+                    })?;
                 *lane_end = (*lane_end).max(end);
             }
         }
@@ -539,15 +598,29 @@ fn recover_lanes_detailed(
     // Contiguous global prefix from the baseline; the first missing seq (a torn tail in some
     // lane, or an unclaimed seq) truncates the global history there — fail-closed.
     let mut records = Vec::new();
-    for (expected_seq, (seq, record)) in (baseline..).zip(by_seq) {
+    let mut discarded_records = Vec::new();
+    let mut expected_seq = baseline;
+    let mut merged = by_seq.into_iter();
+    while let Some((seq, record)) = merged.next() {
         if seq != expected_seq {
+            discarded_records.push(record);
+            discarded_records.extend(merged.map(|(_, record)| record));
             break;
         }
         records.push(record);
+        expected_seq = expected_seq.checked_add(1).ok_or_else(|| {
+            EngineError::Durability("FUA WAL lane global sequence exhausted".to_string())
+        })?;
     }
-    let next_seq = baseline + records.len() as u64;
+    let recovered_count = u64::try_from(records.len()).map_err(|_| {
+        EngineError::Durability("FUA WAL lane recovery count exceeds u64".to_string())
+    })?;
+    let next_seq = baseline.checked_add(recovered_count).ok_or_else(|| {
+        EngineError::Durability("FUA WAL lane recovery prefix overflow".to_string())
+    })?;
     Ok(LaneRecovery {
         records,
+        discarded_records,
         total_scanned,
         next_seq,
         lane_ends,
@@ -648,6 +721,10 @@ pub fn repair_lane_orphans_from(
     if orphans == 0 {
         return Ok(0);
     }
+    crate::reconciled_status::persist_reconciled_discarded_transactions(
+        base,
+        &recovery.discarded_records,
+    )?;
     let cut = recovery.next_seq;
     for lane_id in 0..lane_count {
         let lane_base = lane_base_path(base, lane_id);
@@ -706,6 +783,8 @@ pub fn remove_stale_lane_files(base_path: impl AsRef<Path>) -> Result<(), Engine
     let checkpoint_name = format!("{stem}.lanes-checkpoint");
     let checkpoint_seg_prefix = format!("{stem}.lanes-checkpoint.seg.");
     let checkpoint_tmp = format!("{stem}.lanes-checkpoint.tmp");
+    let reconciled_status = format!("{stem}.reconciled-status");
+    let reconciled_status_tmp_prefix = format!(".{stem}.reconciled-status.tmp.");
     let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -716,7 +795,14 @@ pub fn remove_stale_lane_files(base_path: impl AsRef<Path>) -> Result<(), Engine
             )));
         }
     };
-    for entry in entries.flatten() {
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to enumerate a stale lane file in {}: {err}",
+                parent.display()
+            ))
+        })?;
         let Some(name) = entry.file_name().to_str().map(|n| n.to_string()) else {
             continue;
         };
@@ -730,14 +816,22 @@ pub fn remove_stale_lane_files(base_path: impl AsRef<Path>) -> Result<(), Engine
             || name
                 .strip_prefix(&checkpoint_seg_prefix)
                 .is_some_and(|gen| gen.parse::<u64>().is_ok());
-        if is_lane_segment || is_checkpoint_artifact {
+        if is_lane_segment
+            || is_checkpoint_artifact
+            || name == reconciled_status
+            || name.starts_with(&reconciled_status_tmp_prefix)
+        {
             std::fs::remove_file(entry.path()).map_err(|err| {
                 EngineError::Durability(format!(
                     "failed to remove stale lane file {}: {err}",
                     entry.path().display()
                 ))
             })?;
+            removed = true;
         }
+    }
+    if removed {
+        crate::sync_wal_parent_dir(base)?;
     }
     Ok(())
 }
@@ -808,6 +902,90 @@ mod tests {
             let lane = (seq % set.lane_count() as u64) as usize;
             set.append(lane, seq, &[record(seq)]).expect("append");
         }
+    }
+
+    fn canonical_record_for_physical_lane(physical_lane_id: u32) -> WalRecord {
+        let identity = crate::CanonicalIdentity {
+            database_id: [1; 16],
+            cluster_id: [2; 16],
+            timeline_id: [3; 16],
+            format_epoch: 1,
+        };
+        let operation = crate::CanonicalFragment {
+            kind: crate::CanonicalFragmentKind::RowMutation,
+            body: b"resolved-row".to_vec(),
+        };
+        let target_digest = crate::canonical_request_digest(&operation.body);
+        let encoded = crate::encode_canonical_envelope(
+            crate::CanonicalPhysicalRange {
+                log_epoch: 1,
+                lane_id: physical_lane_id,
+                segment_id: 1,
+                first_frame_ordinal: 0,
+            },
+            &crate::CanonicalPreApplyHeader {
+                identity,
+                leader_epoch: 1,
+                commit_seq: 1,
+                stable_transaction_id: 91,
+                request_digest: [4; 32],
+                isolation: crate::CanonicalIsolation::ReadCommitted,
+                flags: 1,
+                catalog_before_epoch: 0,
+                catalog_after_epoch: 0,
+                catalog_before_digest: [5; 32],
+                catalog_after_digest: [5; 32],
+                operation_count: 1,
+                table_block_count: 1,
+                allocator_high_water: 0,
+            },
+            &[operation],
+            &crate::CanonicalOutcome {
+                kind: crate::CanonicalOutcomeKind::CommitSuccess,
+                affected_rows: 1,
+                sqlstate: None,
+                constraint_id: 0,
+                target_digest,
+                returning_digest: [0; 32],
+            },
+        )
+        .expect("canonical envelope");
+        WalRecord {
+            txn_id: 91,
+            payload: crate::pack_canonical_record_payload(&encoded)
+                .expect("pack canonical record")
+                .into(),
+        }
+    }
+
+    #[test]
+    fn append_rejects_sequence_overflow_and_inconsistent_encoded_ranges() {
+        let base = test_base("append-boundaries");
+        let set = FuaWalLaneSet::create(&base, 1, 2, SEGMENT_BYTES).expect("create");
+        let error = set
+            .append(0, u64::MAX, &[record(1)])
+            .expect_err("range overflow must fail before append");
+        assert!(error.to_string().contains("range overflow"));
+        let payload = encode_lane_frame_payload(&[record(1)]).expect("encoded payload");
+        assert!(set.append_encoded(0, 0, 2, 1, &payload).is_err());
+        assert!(set.append_encoded(0, 0, 0, 0, &payload).is_err());
+        assert_eq!(recover_lanes(&base, 1).expect("empty recovery"), vec![]);
+        drop(set);
+        cleanup(&base, 1);
+    }
+
+    #[test]
+    fn recovery_rejects_canonical_record_stored_in_the_wrong_physical_lane() {
+        let base = test_base("canonical-physical-lane");
+        {
+            let set = FuaWalLaneSet::create(&base, 1, 2, SEGMENT_BYTES).expect("create");
+            set.append(0, 0, &[canonical_record_for_physical_lane(2)])
+                .expect("physical frame append");
+            set.wait_durable(1).expect("durable");
+        }
+        let error = recover_lanes(&base, 1).expect_err("foreign physical lane must fail");
+        assert!(error.to_string().contains("names lane 2"), "{error}");
+        cleanup(&base, 1);
     }
 
     #[test]
