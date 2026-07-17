@@ -537,21 +537,9 @@ pub(crate) struct ResidencyReadState {
     /// `ArcSwap` the hot path uses) because the index route is opt-in + the lock is taken only off the
     /// fast cache-hit path; staleness is handled by the per-entry `generation` tag, not by eviction.
     pub(crate) wave_index: Mutex<BTreeMap<String, WaveResidentIndex>>,
-    /// Cross-shard PK index (sub-slice 3): per-`(table, shard_id, column_idx)` host hash+bloom index reuse
-    /// cache, built lazily + validated by `resident_device_ptr` (a re-admit/rollover's new ptr -> rebuild)
-    /// and by `row_count` (an in-place append EXTENDS the entry incrementally — writer-side at the
-    /// append chokepoint, prober-side via the tail-DtoH fallback; ledger #3). Purged at all
-    /// residency-retire sites via `purge_shard_pk_index_for_table` (`5303f478`).
-    ///
-    /// An `RwLock` (was Mutex): the constrained-elision slice put TWO validator probes on every DML
-    /// commit (prepare + under-lock re-resolve), and 32 writers CONVOYED on the Mutex (measured: 32w
-    /// regressed below 16w). Probes take `read()` (pure lookups); extend/rebuild/purge take `write()`.
-    pub(crate) shard_pk_index:
-        std::sync::RwLock<BTreeMap<(String, u32, usize), CachedShardPkIndex>>,
-    /// Sub-slice 8 (GPU-native probe): per-shard PK hash index resident ON THE DEVICE (uploaded once per
-    /// generation), so the batched point lookup probes+gathers+emits on the GPU. Keyed `(table, shard_id,
-    /// col_idx)`, validated by `(ptr, row_count)` + ABA `_resident_guard`, PURGED at the same lifecycle sites
-    /// as `shard_pk_index` (via `purge_shard_pk_index_for_table`). Parallel to the host `shard_pk_index`.
+    /// Per-shard PK hash index resident on the device. Keyed `(table, shard_id, col_idx)`,
+    /// validated by `(ptr, row_count)` plus the ABA resident guard, and purged at every
+    /// residency-retire site.
     pub(crate) shard_pk_device_index:
         Mutex<BTreeMap<(String, u32, usize), CachedShardPkDeviceIndex>>,
     /// S-F/R-1 hard-cap serialization. Every allocation that becomes part of the durable
@@ -564,11 +552,7 @@ pub(crate) struct ResidencyReadState {
     /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe (vs the atomic
     /// kernel). The test signal that proves the dense route actually ran (output equality alone can't, since
     /// dense and atomic are byte-identical by design). `Relaxed` monotonic counter.
-    /// TYPE-COVERAGE track 1 diagnostics: how the shard PK-index cache converges under append
-    /// churn — writer-side extensions applied at the flush, prober-side tail-DtoH extensions,
-    /// and full O(shard) rebuilds. Steady state = writer extends dominating, rebuilds ~doublings.
-    /// M1: count of PK locates served by the DEVICE write-locate kernel (non-vacuity: proves the
-    /// device path FIRED, not a silent fallback to the host probe / scan).
+    /// M1: count of PK locates served by the device write-locate kernel.
     pub(crate) device_write_locate_hits: std::sync::atomic::AtomicU64,
     /// U1: count of coalesced VISIBLE-LOCATE launches (lane DELETE target resolution with
     /// on-device MVCC visibility — the fired-counter for the delete-intent device path).
@@ -577,12 +561,8 @@ pub(crate) struct ResidencyReadState {
     /// fired-counter for the device tombstone path — a silent rehydrate fallback would pass
     /// output equality while abandoning the in-place design).
     pub(crate) lane_tombstone_applies: std::sync::atomic::AtomicU64,
-    /// E2.5b-2 diagnostics: PK device-index REBUILDS (cache miss -> DtoH column
-    /// read + host hash build + HtoD upload — the expensive path).
+    /// E2.5b-2 diagnostics: PK device-index rebuilds.
     pub(crate) lane_diag_rebuilds: std::sync::atomic::AtomicU64,
-    pub(crate) pk_index_writer_extends: std::sync::atomic::AtomicU64,
-    pub(crate) pk_index_prober_extends: std::sync::atomic::AtomicU64,
-    pub(crate) pk_index_rebuilds: std::sync::atomic::AtomicU64,
     pub(crate) dense_index_probe_hits: std::sync::atomic::AtomicU64,
     /// Slice 1b-ii-c: count of commits served by the IN-PLACE open-shard APPEND (vs a whole-table
     /// re-admit). The test signal that the append actually fired — output equality can't prove it
@@ -774,17 +754,9 @@ pub(crate) struct ResidencyReadState {
 }
 
 impl ResidencyReadState {
-    /// Sub-slice 3b (cache lifecycle cleanup): drop every cached per-shard PK index for `table` -- mirrors
-    /// `shard_deleted_by_memory` cleanup at the evict / invalidate / drop / re-admit lifecycle sites so a
-    /// wired index route does not LEAK the pinned shard buffers (`_resident_guard`) of a table whose
-    /// residency changed. Cheap `retain` over the small cache; INERT for a delete/index-free table (empty).
+    /// Drop every cached device PK index for `table` at residency-retire sites so the cache does
+    /// not retain a stale shard buffer or device allocation across a generation replacement.
     pub(crate) fn purge_shard_pk_index_for_table(&self, table: &str) {
-        self.shard_pk_index
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|(cached_table, _, _), _| cached_table != table);
-        // Sub-slice 8: the parallel DEVICE index cache is purged at the SAME lifecycle sites (it pins the
-        // shard buffer + holds a device allocation), 1:1 with the host `shard_pk_index`.
         self.shard_pk_device_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

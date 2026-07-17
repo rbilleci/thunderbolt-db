@@ -31,38 +31,10 @@ pub(crate) struct WaveResidentIndex {
     pub(crate) hash_shift: u32,
 }
 
-/// Cross-shard PK index (sub-slice 3): the cached per-shard host PK index (open-addressing hash table +
-/// bloom), built ONCE per shard generation and reused across point lookups. Keyed `(table, shard_id,
-/// column_idx)` in the `shard_pk_index` cache; VALIDATED by `resident_device_ptr` -- a re-admit / rollover
-/// allocates a new device buffer with a new ptr -> cache miss -> rebuild against the live bytes (exactly the
-/// R1 `WaveResidentIndex` staleness discipline, mirrored per shard). `index = None` caches a DECLINED shard
-/// (duplicate / oversize key column -> the caller scans) so a dup shard is not rebuilt every lookup.
-#[derive(Debug)]
-pub(crate) struct CachedShardPkIndex {
-    pub(crate) resident_device_ptr: u64,
-    /// The shard's live `row_count` the index was built over. An in-place open-shard APPEND grows `row_count`
-    /// WITHOUT changing the device ptr, so validating ptr alone would serve a stale index MISSING the appended
-    /// rows. Re-validate `(ptr, row_count)` together: append/rollover/re-admit all change one -> rebuild; a
-    /// DELETE/UPDATE tombstone (out-of-line, same ptr + row_count, key column unchanged) correctly does NOT
-    /// rebuild (the key->slot map is still valid; the SV3b `deleted_by[slot]` gate hides the tombstoned row).
-    pub(crate) row_count: usize,
-    /// PINS the shard's device buffer the index was built from (like R1's `WaveResidentIndex._resident_guard`)
-    /// so its address CANNOT be reused by a later allocation while this entry lives -- otherwise a re-admit
-    /// that frees the old buffer + reallocates at the SAME address (ABA) would pass the `resident_device_ptr`
-    /// check and serve a STALE index (wrong slots). Held here, the old buffer stays alive until the entry is
-    /// replaced, so the re-admit's new buffer gets a DIFFERENT address -> ptr mismatch -> rebuild.
-    pub(crate) _resident_guard: Arc<CudaResidentDeviceMemory>,
-    pub(crate) index: Option<CachedShardPkIndexData>,
-}
-
-/// Sub-slice 8 (GPU-NATIVE probe): a per-shard PK hash index resident ON THE DEVICE, so the batched point
-/// lookup PROBES + GATHERS + DENSE-EMITS entirely on the GPU (the `gpu_db_resident_i32_index_probe_dense`
-/// kernel) with no host per-needle probe — mirrors R1's single-buffer `WaveResidentIndex`, per shard. The
-/// host hash table (`(key<<32)|(row+1)`, same format the device kernel probes) is uploaded once per shard
-/// generation via `retain_device_memory_copy`. `_resident_guard` PINS the shard's column buffer (ABA guard);
-/// validated by `(resident_device_ptr, row_count)` exactly like the host `CachedShardPkIndex`. `device_index
-/// = None` = the shard DECLINED at build (duplicate / oversize key column) -> the caller falls back to the
-/// host path (cached so it is not retried every batch).
+/// A per-shard PK hash index built and retained on the device. Point reads probe, gather, and dense-emit
+/// through the GPU index route, while `_resident_guard` pins the source shard as an ABA guard.
+/// `(resident_device_ptr, row_count)` validates the exact generation. `device_index = None` means the
+/// device build declined, so the caller uses the GPU scan route.
 #[derive(Debug)]
 pub(crate) struct CachedShardPkDeviceIndex {
     pub(crate) resident_device_ptr: u64,
@@ -71,19 +43,6 @@ pub(crate) struct CachedShardPkDeviceIndex {
     pub(crate) device_index: Option<Arc<CudaResidentDeviceMemory>>,
     pub(crate) table_mask: u32,
     pub(crate) hash_shift: u32,
-}
-
-/// The built per-shard PK index payload: the int4 hash table (`(key<<32)|(row+1)`) + its mask/shift, and the
-/// membership bloom (words + size + hash count). Host-resident (probed on the host; the row is then gathered
-/// from the device). Sub-slice 8 migrates the build/probe on-device.
-#[derive(Debug)]
-pub(crate) struct CachedShardPkIndexData {
-    pub(crate) hash_table: Vec<u64>,
-    pub(crate) table_mask: u32,
-    pub(crate) hash_shift: u32,
-    pub(crate) bloom_words: Vec<u64>,
-    pub(crate) bloom_num_bits: u64,
-    pub(crate) bloom_num_hashes: u32,
 }
 
 /// Per-table GPU-resident device memory, each table behind its own [`SnapshotCell`]

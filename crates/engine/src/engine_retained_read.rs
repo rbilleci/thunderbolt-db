@@ -26,17 +26,6 @@ fn retained_completion_post_hook() -> &'static Mutex<Option<RetainedCompletionPo
     HOOK.get_or_init(|| Mutex::new(None))
 }
 
-/// One generation-validated host PK-cache source. The cache key, resident owner, exact column
-/// offset, and live row extent travel together so probe helpers cannot mix shard generations.
-struct ShardPkCacheSource<'a> {
-    table_name: &'a str,
-    shard_id: u32,
-    col_idx: usize,
-    device_memory: &'a Arc<CudaResidentDeviceMemory>,
-    filter_offset: u64,
-    row_count: usize,
-}
-
 /// Device index key layout. The parallel slices are validated together before any device read.
 struct ShardDeviceIndexKey<'a> {
     key_id: usize,
@@ -515,99 +504,12 @@ impl Engine {
         key_id: usize,
         key: i32,
     ) -> Option<Vec<ShardPkHit>> {
-        // M1 (charter ruling 2026-07-03): the DEVICE write-locate replaces the host PK-hash probe.
-        // Same Vec<ShardPkHit> output (region-Arc capture unchanged) -> a drop-in the consumers
-        // never see. The host-probe path below is the flag-off oracle until M3 deletes it.
+        // R3-004: the device locate is the only indexed route. The temporary A/B-off arm declines
+        // to the GPU scan; it never probes a host index or reconstructs a host relational view.
         if self.device_write_locate_enabled() {
             return self.locate_resident_pk_via_device(table, key_id, key);
         }
-        // COMPOUND KEYS: the host-oracle probe below is single-column (`probe_shard_pk_index_cached`
-        // keys on one filter column); a compound key can't ride it, so decline -> the recheck falls
-        // to the host rehydrate+scan ladder (correct, just not device-accelerated when the device
-        // write-locate is disabled).
-        if key_id & crate::engine_residency::COMPOUND_KEY_ID_FLAG != 0 {
-            return None;
-        }
-        let filter_idx = key_id;
-        let shards = self.read_residency_shards();
-        let table_shards = shards.get(&table.name)?;
-        if table_shards.is_empty() {
-            return None;
-        }
-        let runtime_snapshot = self.router.runtime().snapshot();
-        let mut out: Vec<ShardPkHit> = Vec::new();
-        for shard in table_shards.iter() {
-            // Identity/validity prechecks (mirror `locate_resident_delete_slots` / the scan's `source_for`):
-            // an invalidated / memory-pressured / catalog-mismatched shard forces None so the caller scans,
-            // rather than reading a stale generation's device bytes (audit P3).
-            if shard.schema != table.schema || shard.table != table.name {
-                return None;
-            }
-            let memory_pressure_active = runtime_snapshot
-                .memory_pressured_gpu_ids
-                .contains(&shard.gpu_id);
-            if !shard.is_valid(memory_pressure_active) {
-                return None;
-            }
-            // An empty shard contributes no keys (the scan matches 0 rows there): SKIP it -- both to match the
-            // scan (which continues to other rows) and to avoid the 0-row hash-build decline that would
-            // otherwise drop hits from OTHER shards (audit P2).
-            if shard.row_count == 0 {
-                continue;
-            }
-            // The filter column's BYTE offset within this shard's own (capacity-strided) buffer -- the SAME
-            // offset the scan reads, so the row indices line up 1:1 with the scan + the deleted_by gather.
-            let descriptor = self.resident_snapshot_for_shard(shard, table);
-            let filter_offset =
-                resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
-            // D4 (ADR-013 pre2): the buffer rides the loaded descriptor — the SAME generation as
-            // the metadata/zone-map this loop already read (no second map load to race a re-admit).
-            let device_memory = shard.device_memory.clone()?;
-            // W0: the descriptor flags don't see concurrent invalidations — require the
-            // authoritative cell to still publish THIS buffer, else decline to the host ladder.
-            if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
-                return None;
-            }
-            // Sub-slice 3: probe the CACHED per-shard hash+bloom index (built once per shard generation,
-            // ptr-validated) instead of a per-lookup DtoH + rebuild. Bloom-prunes then hash-probes.
-            match self.probe_shard_pk_index_cached(
-                ShardPkCacheSource {
-                    table_name: &table.name,
-                    shard_id: shard.shard_id,
-                    col_idx: filter_idx,
-                    device_memory: &device_memory,
-                    filter_offset,
-                    row_count: shard.row_count,
-                },
-                key,
-            ) {
-                ShardPkProbe::Hit(row) => {
-                    // D4: the regions ride the SAME loaded descriptor as the buffer — the
-                    // visibility gates read `deleted_by[slot]`/`created_by[slot]` aligned to the
-                    // SAME generation as the slot + buffer, by construction (previously three
-                    // separate map loads could straddle a republish).
-                    let deleted_by = shard.deleted_by_region.clone();
-                    let created_by = shard.created_by_region.clone();
-                    let row_id = shard.row_id_region.clone();
-                    out.push(ShardPkHit {
-                        shard_id: shard.shard_id,
-                        slot: row,
-                        descriptor,
-                        device_memory,
-                        deleted_by,
-                        created_by,
-                        row_id,
-                    });
-                }
-                ShardPkProbe::Miss => {}
-                // A duplicate key in ANY shard declines the whole locate (the scan returns every match; a
-                // hash holds one row/key) -> the caller scans.
-                ShardPkProbe::Declined => {
-                    return None;
-                }
-            }
-        }
-        Some(out)
+        None
     }
 
     /// Step 1 (lpb-for-shards) benchmark + telemetry entry: resolve the table + columns, run the BATCHED
@@ -1174,71 +1076,12 @@ pub(crate) fn build_int4_pk_hash_table_host_visible(
     Some((index, table_mask, hash_shift))
 }
 
-/// TYPE-COVERAGE track 1 (ledger #3 incremental-maintenance gate, measured on the PK'd-table SLO):
-/// EXTEND an existing host hash table with the shard's APPENDED tail keys — the in-place
-/// open-shard append grows `row_count` under the SAME device ptr every commit/wave-flush, and a
-/// full O(shard) rebuild per probe made the constrained-INSERT prepare ~1ms (923→5.5k TPS was the
-/// scan fix alone; this is the rest). IDENTICAL probing scheme to the builder (Fibonacci hash +
-/// linear probe, 256 cap, `(key<<32)|(row+1)` packing). Returns `false` on a DUPLICATE tail key or
-/// probe overflow — the shard has become dup-bearing and the entry must transition to the
-/// monotone DECLINED state (exactly what a full rebuild would conclude, without paying O(shard)
-/// to re-discover it). The caller enforces the builder's load rule (`2*count <= table_size`)
-/// BEFORE calling; within it, insertion is always possible absent dups/overflow.
-fn extend_int4_pk_hash_table_host(
-    index: &mut [u64],
-    table_mask: u32,
-    hash_shift: u32,
-    tail_keys: &[i32],
-    base_row: usize,
-) -> bool {
-    for (offset, &key) in tail_keys.iter().enumerate() {
-        let row = base_row + offset;
-        let key_bits = key as u32;
-        let mut slot = (key_bits.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
-        let mut probes = 0_u32;
-        loop {
-            let occupant = index[slot as usize];
-            if occupant == 0 {
-                index[slot as usize] = ((key_bits as u64) << 32) | (row as u64 + 1);
-                break;
-            }
-            if (occupant >> 32) as u32 == key_bits {
-                return false; // duplicate: the shard declines (monotone under appends)
-            }
-            slot = (slot + 1) & table_mask;
-            probes += 1;
-            if probes >= 256 {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// TYPE-COVERAGE track 1: set the bloom bits for appended tail keys. The bit array is sized at
-/// build time (10 bits/key THEN), so post-append inserts raise the false-POSITIVE rate slightly
-/// (perf-only: an FP costs one hash probe of the shard) — never a false NEGATIVE, the
-/// load-bearing invariant. The periodic load-factor rebuild re-sizes both structures. A `(0,0)`
-/// fallback bloom (num_bits == 0) means "maybe contains everything": extending it is a no-op and
-/// stays conservative.
-fn extend_int4_pk_bloom_host(words: &mut [u64], num_bits: u64, num_hashes: u32, tail_keys: &[i32]) {
-    if num_bits == 0 || words.is_empty() {
-        return;
-    }
-    for &key in tail_keys {
-        let (h1, h2) = bloom_hashes(key);
-        for i in 0..num_hashes {
-            let bit = bloom_bit(h1, h2, i, num_bits);
-            words[(bit / 64) as usize] |= 1_u64 << (bit % 64);
-        }
-    }
-}
-
 /// Cross-shard PK index (sub-slice 1): probe the host hash table built by `build_int4_pk_hash_table_host`
 /// for `key`, returning the LOCAL row index (0-based) or `None` (absent). Mirrors the device probe kernel:
 /// Fibonacci hash → linear probe up to the 256 cap, matching the high 32 bits (the key) and unpacking
 /// `row = (entry & 0xFFFF_FFFF) - 1`. An empty slot (0) terminates the probe = not found. A NULL int4 is
 /// materialized as `0`, so `key = 0` probes exactly as the build indexed it (agrees with the scan).
+#[cfg(test)]
 pub(crate) fn probe_int4_pk_hash_table(
     table: &[u64],
     table_mask: u32,
@@ -1258,31 +1101,6 @@ pub(crate) fn probe_int4_pk_hash_table(
         slot = (slot + 1) & table_mask;
     }
     None
-}
-
-/// Cross-shard PK index (sub-slice 2): two well-distributed 64-bit hashes of an int4 key for the bloom's
-/// double hashing (Kirsch-Mitzenmacher `bit_i = h1 + i*h2`). Each key is run through a splitmix64-style
-/// finalizer -- a PLAIN multiplicative hash leaves poorly-distributed LOW bits, so we mix and the bit index
-/// is taken from the HIGH bits (see `bloom_bit`). Key is zero-extended (NULL-as-0 hashes as key 0,
-/// consistent with the hash index + the scan's `WHERE col = 0`).
-fn bloom_hashes(key: i32) -> (u64, u64) {
-    let mix = |mut z: u64| -> u64 {
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    let k = key as u32 as u64;
-    let h1 = mix(k.wrapping_add(0x9E37_79B9_7F4A_7C15));
-    // h2 forced ODD so the k probes land on distinct bit slots.
-    let h2 = mix(k.wrapping_add(0x1234_5678_9ABC_DEF0)) | 1;
-    (h1, h2)
-}
-
-/// The i-th bloom bit index for a key with double-hash `(h1, h2)` over `num_bits = 2^b`: take the HIGH `b`
-/// bits of the 64-bit `h1 + i*h2` (`>> (64 - b)`), where the entropy of the mixed hash lives.
-fn bloom_bit(h1: u64, h2: u64, i: u32, num_bits: u64) -> u64 {
-    let shift = 64 - num_bits.trailing_zeros();
-    h1.wrapping_add((i as u64).wrapping_mul(h2)) >> shift
 }
 
 /// M1 (perf): the i32-SECTION byte offset of column `filter_idx` in a shard's payload, computed
@@ -1444,59 +1262,6 @@ fn shard_key_column_blob_len(
     }
 }
 
-/// Cross-shard PK index (sub-slice 2): build a per-shard membership BLOOM over the int4 key column. `m` =
-/// 10 bits/key rounded up to a power of two (mask-friendly, >= 64), `k` = 7 double-hashed probes. A false
-/// POSITIVE (all k bits set by OTHER keys) only costs one extra hash-index probe of a shard; there is NEVER
-/// a false NEGATIVE -- every inserted key sets ALL k of its bits, so `bloom_maybe_contains` returns true for
-/// it. That no-false-negative property is the LOAD-BEARING correctness invariant: the bloom may only SKIP a
-/// shard it PROVES cannot hold the key. Sizing (10 bits/key, k=7 → ~1% FP) is a tunable perf/memory knob,
-/// NOT a correctness parameter. `None` on 0 rows / oversize (>2^34 bits). Returns `(words, num_bits, k)`.
-pub(crate) fn build_int4_pk_bloom_host(keys: &[i32]) -> Option<(Vec<u64>, u64, u32)> {
-    let n = keys.len() as u64;
-    if n == 0 {
-        return None;
-    }
-    const BITS_PER_KEY: u64 = 10;
-    const NUM_HASHES: u32 = 7;
-    let num_bits = n
-        .saturating_mul(BITS_PER_KEY)
-        .checked_next_power_of_two()?
-        .max(64);
-    if num_bits > (1_u64 << 34) {
-        return None;
-    }
-    let mut words = vec![0_u64; (num_bits / 64) as usize];
-    for &key in keys {
-        let (h1, h2) = bloom_hashes(key);
-        for i in 0..NUM_HASHES {
-            let bit = bloom_bit(h1, h2, i, num_bits);
-            words[(bit / 64) as usize] |= 1_u64 << (bit % 64);
-        }
-    }
-    Some((words, num_bits, NUM_HASHES))
-}
-
-/// Cross-shard PK index (sub-slice 2): `true` = key MAYBE present (probe the shard's hash), `false` =
-/// DEFINITELY absent (skip the shard). No false negatives by construction (see `build_int4_pk_bloom_host`).
-pub(crate) fn bloom_maybe_contains(
-    words: &[u64],
-    num_bits: u64,
-    num_hashes: u32,
-    key: i32,
-) -> bool {
-    if num_bits == 0 {
-        return true; // no bloom -> can't prune -> conservatively "maybe" (never skip)
-    }
-    let (h1, h2) = bloom_hashes(key);
-    for i in 0..num_hashes {
-        let bit = bloom_bit(h1, h2, i, num_bits);
-        if words[(bit / 64) as usize] & (1_u64 << (bit % 64)) == 0 {
-            return false;
-        }
-    }
-    true
-}
-
 /// U1: the batched visible-locate verdicts for one wave's delete needles. Parallel per-needle
 /// vectors (`counts[i]` visible matches at needle i's snapshot; `shard_ids[i]`/`slots[i]` = the
 /// first visible target and `row_ids[i]` = its stable entity identity, meaningful iff
@@ -1538,18 +1303,6 @@ pub(crate) struct ShardPkHit {
     pub(crate) row_id: Option<Arc<CudaResidentDeviceMemory>>,
 }
 
-/// Step 1 (lpb-for-shards): a shard's BATCHED hits — the generation-consistent captured handles (descriptor,
-/// PINNED int4 buffer, deleted_by region, all from ONE `shards.load()` snapshot) + the `(needle_index, slot)`
-/// list of the batch's needles that Hit in this shard. Same pin/consistency discipline as `ShardPkHit`.
-struct BatchShardGroup {
-    descriptor: RelationalResidencySnapshot,
-    device_memory: Arc<CudaResidentDeviceMemory>,
-    deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
-    /// SV6: the shard's `created_by` region (same snapshot/pin discipline) for the batched lower-bound gate.
-    created_by: Option<Arc<CudaResidentDeviceMemory>>,
-    hits: Vec<(u32, u32)>, // (needle_index, local slot)
-}
-
 /// Step 1 (lpb-for-shards): the batched point-lookup projection. `values` is row-major int4, `ncols` wide, in
 /// NEEDLE ORDER; `needle_ranges[i] = (start_row, row_count)` slices needle i's rows (unique-PK -> count 0 or
 /// 1). The schema (columns / access_path) is shape metadata the caller wraps around this raw projection.
@@ -1561,46 +1314,9 @@ pub(crate) struct BatchedShardProjection {
     pub(crate) needle_ranges: Vec<(u32, u32)>,
 }
 
-/// Sub-slice 3: the result of probing a shard's cached PK index for a key.
-enum ShardPkProbe {
-    /// Local row index of the (unique) matching row in the shard.
-    Hit(u32),
-    /// Absent in this shard (bloom-pruned, or the hash found no match).
-    Miss,
-    /// The shard's key column has duplicates / oversize -> the caller must fall back to the scan.
-    Declined,
-}
-
-/// Probe a cached shard PK index entry for `key`: bloom-prune, then hash-probe. `index = None` = the shard
-/// declined at build (dup/oversize) -> `Declined`. No false negative (see the bloom/hash builds), so a
-/// present key is never wrongly Missed.
-fn probe_cached_shard_pk(entry: &CachedShardPkIndex, key: i32) -> ShardPkProbe {
-    match &entry.index {
-        None => ShardPkProbe::Declined,
-        Some(data) => {
-            if !bloom_maybe_contains(
-                &data.bloom_words,
-                data.bloom_num_bits,
-                data.bloom_num_hashes,
-                key,
-            ) {
-                return ShardPkProbe::Miss;
-            }
-            match probe_int4_pk_hash_table(&data.hash_table, data.table_mask, data.hash_shift, key)
-            {
-                Some(row) => ShardPkProbe::Hit(row),
-                None => ShardPkProbe::Miss,
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod cross_shard_pk_index_tests {
-    use super::{
-        bloom_maybe_contains, build_int4_pk_bloom_host, build_int4_pk_hash_table_host,
-        probe_int4_pk_hash_table,
-    };
+    use super::{build_int4_pk_hash_table_host, probe_int4_pk_hash_table};
 
     /// The pure per-shard PK hash index (sub-slice 1) round-trips: every built key probes back to its own
     /// row; an absent key returns None; NULL-as-0 is indexed + found; a DUPLICATE key declines the build
@@ -1723,37 +1439,4 @@ mod cross_shard_pk_index_tests {
         );
     }
 
-    /// The per-shard bloom (sub-slice 2) has NO FALSE NEGATIVES (every built key -> maybe_contains true --
-    /// the load-bearing membership-prune invariant, so a present key's shard is NEVER skipped) and a sane
-    /// false-positive rate (most absent keys -> false = skippable). Includes 0, negatives, and a large set.
-    #[test]
-    fn pk_bloom_no_false_negatives_and_sane_fp() {
-        let keys: Vec<i32> = (0..1000_i32).map(|i| i * 3 - 500).collect(); // -500..2497, incl 0-adjacent + neg
-        let (words, num_bits, k) = build_int4_pk_bloom_host(&keys).expect("build");
-        // NO FALSE NEGATIVES: every inserted key MUST test present. A single miss = a dropped hit = WRONG.
-        for &key in &keys {
-            assert!(
-                bloom_maybe_contains(&words, num_bits, k, key),
-                "bloom false negative for a BUILT key {key} -- would drop a real hit"
-            );
-        }
-        // False-positive sanity: 10k absent candidates far from the built range -> mostly "definitely absent".
-        let (mut fp, mut total) = (0_usize, 0_usize);
-        for cand in 1_000_000..1_010_000_i32 {
-            total += 1;
-            if bloom_maybe_contains(&words, num_bits, k, cand) {
-                fp += 1;
-            }
-        }
-        let fp_rate = fp as f64 / total as f64;
-        assert!(
-            fp_rate < 0.05,
-            "bloom FP rate {fp_rate:.4} must be well under 5% at 10 bits/key, k=7"
-        );
-        // Empty -> None (no bloom to prune with).
-        assert!(build_int4_pk_bloom_host(&[]).is_none());
-        // A single-key bloom still contains its key (>= 64-bit min size, no sub-word issue).
-        let (w1, b1, k1) = build_int4_pk_bloom_host(&[42]).unwrap();
-        assert!(bloom_maybe_contains(&w1, b1, k1, 42));
-    }
 }

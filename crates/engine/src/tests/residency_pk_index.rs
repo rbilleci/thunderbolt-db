@@ -143,9 +143,9 @@ fn cross_shard_pk_index_cache_rebuilds_on_generation_change() {
     assert!(
         !e.read_state
             .residency
-            .shard_pk_index
-            .read()
-            .unwrap()
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty(),
         "the per-shard PK index cache is populated after a locate"
     );
@@ -239,7 +239,7 @@ fn cross_shard_pk_index_cache_rebuilds_on_in_place_append() {
     assert_eq!(appended.len(), 1, "appended id=250 is located");
 }
 
-/// CROSS-SHARD PK INDEX sub-slice 3b (cache LIFECYCLE CLEANUP): the shard_pk_index cache is PURGED for a
+/// CROSS-SHARD PK INDEX sub-slice 3b (cache LIFECYCLE CLEANUP): the device index cache is PURGED for a
 /// table on the residency-change lifecycle events (an invalidating commit's re-admit, and DROP), so a
 /// wired index route can't leak the pinned shard buffers of a no-longer-resident table. Sabotage: make
 /// `purge_shard_pk_index_for_table` a no-op and the post-DELETE / post-DROP "cache empty" asserts FAIL.
@@ -272,9 +272,9 @@ fn cross_shard_pk_index_cache_purged_on_lifecycle() {
     let entries = |t: &str| {
         e.read_state
             .residency
-            .shard_pk_index
-            .read()
-            .unwrap()
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .keys()
             .filter(|(cached, _, _)| cached == t)
             .count()

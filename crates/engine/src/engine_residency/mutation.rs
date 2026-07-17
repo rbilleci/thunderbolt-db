@@ -149,9 +149,8 @@ impl Engine {
     /// Empty + NULL-bearing rows are already rejected by the caller. Returns false (caller invalidates +
     /// re-admits) when the open shard isn't int4-appendable, is invalid, or has no headroom (seal + a fresh
     /// open shard on overflow is S-d2c), or the device append fails. Shard tables read via device
-    /// recompaction and have no single-buffer `wave_index` to drop.
-    /// (The sub-slice-3a `shard_pk_index` per-shard cache IS ptr-keyed but ALSO row_count-validated, so an
-    /// in-place append grows row_count -> next probe misses -> rebuild; no explicit invalidation needed here.)
+    /// recompaction and have no single-buffer `wave_index` to drop. The device PK-index cache is
+    /// `(ptr,row_count)`-validated, so an in-place append makes the next probe rebuild or extend it.
     fn try_append_to_resident_open_shard(
         &self,
         table: &str,
@@ -439,24 +438,6 @@ impl Engine {
                     })
                 })
                 .collect();
-            // TYPE-COVERAGE track 1 (ledger #3): writer-side PK-index cache maintenance — the
-            // appended values are in hand, so cached (table, shard, col) entries extend O(k)
-            // with no device read. ORDER (measured): extend BEFORE the row_count publish below.
-            // Post-publish extension opened a per-flush window where preparers pinned to the
-            // FRESH count found a stale entry and raced into tail-DtoH reads against this very
-            // extension (run-to-run TPS swung 51-84k @32w); pre-publish, probers at the old
-            // count read the AHEAD entry via the slot-bound rule and probers at the new count
-            // find the cache already current. Stage (ii): entries are keyed by CATALOG col_idx;
-            // i64 columns produce inert placeholder vecs (their probes decline pre-cache, so no
-            // entry can exist to extend). NULL-free by the guard above, so `sql_value_as_int4`
-            // yields exactly the bytes the chunks wrote for the i32 columns.
-            self.extend_shard_pk_index_cache_on_append(
-                table,
-                shard_id,
-                shard_device_memory.device_ptr(),
-                row_count,
-                &column_values,
-            );
             // M1 (ledger #24): incrementally maintain the DEVICE PK index too (the index_insert
             // kernel), so the wave-batched device locate never triggers the O(rows) rebuild.
             // Only fires when a device index is cached (device_write_locate on); no-op otherwise.

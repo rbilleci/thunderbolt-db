@@ -502,25 +502,6 @@ impl Engine {
             .contains(table)
     }
 
-    /// TYPE-COVERAGE track 1 diagnostics: shard PK-index cache convergence counters
-    /// (writer-side flush extensions / prober-side tail-DtoH extensions / full O(shard) rebuilds).
-    pub fn pk_index_maintenance_stats(&self) -> (u64, u64, u64) {
-        (
-            self.read_state
-                .residency
-                .pk_index_writer_extends
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.read_state
-                .residency
-                .pk_index_prober_extends
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.read_state
-                .residency
-                .pk_index_rebuilds
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
-    }
-
     /// RETIREMENT A4e: commits that skipped the host install (non-vacuity telemetry).
     pub fn host_install_elisions(&self) -> u64 {
         self.read_state

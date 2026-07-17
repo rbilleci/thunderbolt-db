@@ -4,8 +4,7 @@ impl Engine {
     /// M1 (ledger #24): INCREMENTALLY maintain a cached DEVICE PK index over an in-place append —
     /// insert only the k appended keys via the `index_insert` kernel (O(k)) instead of the O(rows)
     /// rebuild (`ensure_shard_pk_device_index`) the (ptr,row_count) validation would otherwise force
-    /// every wave (the measured 305us/wave bottleneck). Device analog of the host
-    /// `extend_shard_pk_index_cache_on_append`. Called at the append chokepoint with the appended
+    /// every wave (the measured 305us/wave bottleneck). Called at the append chokepoint with the appended
     /// values in hand (no DtoH). Per entry: a different ptr (re-admit) or a basis != `base_row_count`
     /// (a prober rebuilt) is skipped; a DECLINED entry stays declined (monotone); probe overflow ->
     /// DECLINED; past the load rule (`2*new_count > table_size`) the entry is DROPPED (the next probe
