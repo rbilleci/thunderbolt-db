@@ -23,12 +23,11 @@ This file records only the current boundary and where the next agent resumes. `P
 - **STRUCT-001 is closed.** The only production size exception is the registered 2,423-line `engine_expr.rs`.
   Physical multi-GPU work remains user-parked under **MULTI-001/002/003**.
 
-## Working tree — preserve it
+## Integrated baseline — preserve it
 
-- The accepted R3 slice remains **uncommitted on local `main`**, and local `main` is **one commit behind
-  `origin/main`**. Nothing in this slice is committed, pushed, rebased, or merged. Treat the entire dirty tree as
-  accepted work in progress; do not reset, checkout, discard, or casually merge across it. At this handover the
-  tree has **113 modified/untracked paths, including 11 untracked paths**.
+- Local `main` is clean and contains canonical ADR commit `84cbab44`, accepted R3 integration commit `7e9e1568`,
+  and this qualification/handover update. The exact pre-integration accepted tree remains recoverable at
+  `preserve/r3-audited-20260717` (`eb6f0319`). Nothing has been pushed; `origin/main` remains at `84cbab44`.
 - High-value R3 entry points are execution `write_locate.rs`/`resident_index_build.rs`; engine
   `engine_dml_concurrent/{state,wave,lane,lane_apply}.rs`, `engine_dml_prepare/{device_tuple,unique_conflict}.rs`,
   `engine_transaction_{delta,commit}.rs`, `engine_streaming_exec/streaming_{dml_class,transaction_cow}.rs`, and
@@ -38,8 +37,8 @@ This file records only the current boundary and where the next agent resumes. `P
 
 ## Resume here
 
-1. Read the required project documents and the complete dirty-tree diff, then start **DUR-002**. Preserve the
-   accepted R3 boundary and its fail-closed GPU-native authority.
+1. Read the required project documents and the integrated R3 diff from `84cbab44..main`, then start **DUR-002**.
+   Preserve the accepted R3 boundary and its fail-closed GPU-native authority.
 2. Fix multi-entry DDL preflight so existence and dependency decisions use the transaction's working catalog before
    apply. Add a regression that would fail if any entry consults only the published catalog.
 3. Run the bounded crash/power-fail campaign at every DUR-002 boundary. Prove no acknowledged commit is lost, no
@@ -53,7 +52,7 @@ This file records only the current boundary and where the next agent resumes. `P
 ## Last green evidence — 2026-07-17
 
 - Execution library: **56 ordinary + 79 actual-GPU = 135/135** passed.
-- Engine library: **519 ordinary + 514 actual-GPU = 1,033/1,033** passed.
+- Engine library: **523 ordinary + 514 actual-GPU = 1,037/1,037** passed.
 - Facade library: **39 ordinary + 8 actual-GPU = 47/47** passed.
 - Nine high-risk device-history, transaction, tail, lane, publication-lock, and retained-completion families passed
   three sequential plus two concurrent HAZARD invocations. The corrected FK race and pinned-history epoch tests
@@ -61,8 +60,8 @@ This file records only the current boundary and where the next agent resumes. `P
 - Workspace all-target/all-feature `cargo check` and strict workspace Clippy passed. Changed Rust sources pass
   global rustfmt; `git diff --check` and source-size gates pass. `engine_dml_concurrent.rs` is 1,999 lines,
   `engine_commit.rs` is 1,992, and `tests/streaming_exec.rs` is 2,950.
-- The canonical report card completed both layers and cache regimes. Batched point reads reached **268.4M/s at
-  p50 119us** in-L2 and **276.7M/s at p50 108us** out-of-L2; exact figures and raw-kernel ratios are in `STATUS.md`.
+- The canonical report card completed both layers and cache regimes. Batched point reads reached **264.2M/s at
+  p50 118us** in-L2 and **275.7M/s at p50 110us** out-of-L2; exact figures and raw-kernel ratios are in `STATUS.md`.
 
 ## Required operations
 

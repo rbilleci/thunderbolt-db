@@ -76,8 +76,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   same identity, the rare rehydrate fallback resolves key-to-identity without inventing one, and replay migrates
   existing v1 `new_row_id` records by treating that field only as the legacy allocator reservation. The PTX
   fail-closed/identity control, lane UPDATE identity gate (three sequential plus two concurrent executions),
-  recovery, and sustained version-aware-index controls pass. The current engine library inventory is 519 ordinary
-  plus 514 GPU-ignored tests, the complete serial inventory passes 1,033/1,033, and workspace
+  recovery, and sustained version-aware-index controls pass. The current engine library inventory is 523 ordinary
+  plus 514 GPU-ignored tests, the complete serial inventory passes 1,037/1,037, and workspace
   all-target/all-feature check plus strict workspace Clippy
   are clean. The identity-only sub-slice did not change a read-kernel family or residency layout.
 - **R3-003 transaction snapshot ownership now has a real lifetime boundary.** `ActiveSnapshots` folds keyed
@@ -147,7 +147,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 ## Verification snapshot — 2026-07-17
 
-- Engine library: **519 ordinary + 514 actual-GPU = 1,033/1,033** passed. Execution library:
+- Engine library: **523 ordinary + 514 actual-GPU = 1,037/1,037** passed. Execution library:
   **56 ordinary + 79 actual-GPU = 135/135** passed. Facade library:
   **39 ordinary + 8 actual-GPU = 47/47** passed.
 - Nine high-risk device-history, transaction, tail-handoff, lane-probe, sharded-publication, and retained-completion
@@ -160,17 +160,19 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Pgwire: ordinary suite **3 passed** plus the ignored non-vacuous sharded/NULL GPU golden passes.
 - Production mixed gate: **116.2k reads/s**, p50 **246us**, p99 **501us**, p99.9 **671us**; zero host gathers,
   zero fallback groups, and 160/160 host-install-elided writes.
-- Read roofline repeat: in-L2 ratios are `equal_any` **0.462x**, ordered projection **0.133x**, ordered compaction
-  **0.026x**, arithmetic filter **0.024x**, compare count **0.880x**, and between count **0.442x** the same-run
-  **1,383.1 GB/s** `sum_i32` roofline; out-of-L2 roofline is **1,426.8 GB/s**, gather is **349.5/155.3 GB/s**
-  in/out of L2, constant-mask output is **1,152.6/1,497.1 GB/s**, and grouped kernel is **1,677.0 M elements/s**.
+- Read roofline repeat: in-L2 ratios are `equal_any` **0.437x**, ordered projection **0.126x**, ordered compaction
+  **0.023x**, arithmetic filter **0.023x**, compare count **0.880x**, and between count **0.450x** the same-run
+  **1,464.0 GB/s** `sum_i32` roofline; out-of-L2 roofline is **1,451.9 GB/s**, gather is **349.5/155.3 GB/s**
+  in/out of L2, constant-mask output is **1,141.7/1,497.4 GB/s**, and grouped kernel is **1,677.3 M elements/s**.
 - The canonical two-layer/two-cache-regime report card completes. Its 48M-row out-of-L2 batched route reaches
-  **276.7M lookups/s, p50 108us** at batch 65,536; indexed single-flight reaches **38.2M lookups/s, p50 1,588us**
-  and **3.22x** the scan route. The corresponding in-L2 batched route reaches **268.4M lookups/s, p50 119us**.
-  The 48M-row build completes in **165.1s**. No material same-run baseline ratio regression is present.
+  **275.7M lookups/s, p50 110us** at batch 65,536; indexed single-flight reaches **37.7M lookups/s, p50 1,616us**
+  and **3.19x** the scan route. The corresponding in-L2 batched route reaches **264.2M lookups/s, p50 118us**.
+  The 48M-row build completes in **155.9s**. No material same-run baseline ratio regression is present.
 - Workspace all-target/all-feature check, strict workspace all-target/all-feature Clippy, global formatting,
   source size, and diff whitespace gates pass. The independent R3-002/R3-003 audit returned **ACCEPT** with no
-  remaining blocker.
+  remaining blocker. The accepted R3 tree was preserved at `eb6f0319`, rebased onto the canonical ADR commit
+  `84cbab44`, and requalified as integration commit `7e9e1568`; four conflict-sensitive GPU controls and all
+  complete serialized library inventories above pass on that integrated tree.
 
 ## Structural decomposition
 
