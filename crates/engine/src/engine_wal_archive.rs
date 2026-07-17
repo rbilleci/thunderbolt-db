@@ -323,11 +323,11 @@ impl Engine {
     /// install — see `write_streaming_cold_checkpoint`). Best-effort by design: the artifact is a
     /// warm-start cache in P1, so a failure must not fail the WAL checkpoint.
     ///
-    /// THE BOUNDARY CONVENTION (R3-006): the artifact and live/recovery watermark are the same
-    /// INCLUSIVE index of the last record, `base_seq + cut - 1`. The lane/WAL cut remains an
-    /// EXCLUSIVE next-slot frontier, but it is converted before `committed_seq` publication.
-    /// Accepting the exclusive frontier here would hide the publication bug and could qualify an
-    /// artifact while the next slot is applied but not durable.
+    /// The artifact is stamped with the value the recovery seam's `committed_seq()` reaches after
+    /// replaying exactly the checkpoint's records: the inclusive last record index
+    /// `base_seq + cut - 1`. The live watermark must equal that same boundary. A one-high watermark
+    /// now denotes a genuinely newer visible commit; accepting it as a legacy convention would let
+    /// a raced checkpoint encode future-state bytes at the older seam.
     fn maybe_write_streaming_cold_checkpoint(
         &self,
         lanes: &crate::engine_intent_lanes::IntentLaneState,

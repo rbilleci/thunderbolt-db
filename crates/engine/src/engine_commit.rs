@@ -51,6 +51,7 @@ impl Engine {
         txn_id: u64,
         payload: std::sync::Arc<[u8]>,
     ) -> Result<CommitToken, EngineError> {
+        self.ensure_commit_path_available()?;
         let timestamp_micros = self.next_commit_timestamp_micros();
         self.commit_mutation_at(txn_id, payload, timestamp_micros)
     }
@@ -72,6 +73,7 @@ impl Engine {
         payload: std::sync::Arc<[u8]>,
         timestamp_micros: u64,
     ) -> Result<CommitToken, EngineError> {
+        self.ensure_commit_path_available()?;
         self.intent_lanes_write_guard()?;
         if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
@@ -85,6 +87,12 @@ impl Engine {
         // `next_commit_timestamp_micros` (which itself locks the commit_mutex) is computed by the
         // caller BEFORE this, so we never re-enter the non-reentrant commit_mutex.
         let mut commit = self.commit_state();
+        self.ensure_commit_path_available()?;
+        // Reciprocal activation fence: a classic writer may have passed the optimistic guard while
+        // the first lane was waiting to acquire this lock. Activation publishes under this same
+        // lock, so rechecking here makes the handoff linearizable.
+        self.intent_lanes_write_guard()?;
+        self.preflight_serialized_dml_under_commit_lock(&payload)?;
         let token = {
             let wal_len_before = commit.wal.len();
             commit.wal.append(WalRecord {
@@ -113,7 +121,10 @@ impl Engine {
             token
         };
 
-        self.apply_and_publish_committed(&mut commit, txn_id, token.index)?;
+        if let Err(error) = self.apply_and_publish_committed(&mut commit, txn_id, token.index) {
+            self.wedge_commit_path();
+            return Err(error);
+        }
         self.metrics.inc_commit();
         drop(commit);
 
@@ -143,6 +154,12 @@ impl Engine {
             return Ok(());
         };
         let last_txn_id = *last_txn_id;
+        if let Err(error) = self.ensure_commit_path_available() {
+            return Err(BatchCommitFailure {
+                rolled_back: true,
+                error,
+            });
+        }
         // AUDIT F4: the batch committer is a serial-WAL appender + repl
         // proposer like commit_mutation_at — same lanes-activation guard, or
         // its repl seqs would collide with oracle-claimed lane seqs.
@@ -161,6 +178,18 @@ impl Engine {
         let wall_clock = current_timestamp_micros();
 
         let mut commit = self.commit_state();
+        if let Err(error) = self.ensure_commit_path_available() {
+            return Err(BatchCommitFailure {
+                rolled_back: true,
+                error,
+            });
+        }
+        if let Err(error) = self.intent_lanes_write_guard() {
+            return Err(BatchCommitFailure {
+                rolled_back: true,
+                error,
+            });
+        }
         let last_index = {
             let wal_len_before = commit.wal.len();
             let mut first_index: Option<Index> = None;
@@ -219,11 +248,13 @@ impl Engine {
             last_index
         };
 
-        self.apply_and_publish_committed(&mut commit, last_txn_id, last_index)
-            .map_err(|error| BatchCommitFailure {
+        if let Err(error) = self.apply_and_publish_committed(&mut commit, last_txn_id, last_index) {
+            self.wedge_commit_path();
+            return Err(BatchCommitFailure {
                 rolled_back: false,
                 error,
-            })?;
+            });
+        }
         for _ in items {
             self.metrics.inc_commit();
         }
@@ -244,7 +275,7 @@ impl Engine {
     /// table during a single-entry `CREATE UNIQUE INDEX` commit's fsync window (the off-lock
     /// execute_text sweep had de-elided it earlier); the apply-time unique validator then hit
     /// the rehydrate seam under the held lock and wedged the commit path permanently.
-    fn apply_and_publish_committed(
+    pub(crate) fn apply_and_publish_committed(
         &self,
         commit: &mut CommitState,
         txn_id: TxnId,
@@ -293,13 +324,16 @@ impl Engine {
                             continue;
                         };
                         let seq = self.committed_seq();
-                        self.rehydrate_elided_table(
+                        if let Err(error) = self.rehydrate_elided_table(
                             &table,
                             seq,
                             &Default::default(),
                             &Default::default(),
                             seq,
-                        )?;
+                        ) {
+                            self.wedge_commit_path();
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -352,12 +386,17 @@ impl Engine {
         let (handled, maintained) = {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
-            let mut applied: Option<AppliedRowMutation> = None;
+            let atomic_transaction = to_apply.len() == 1
+                && matches!(
+                    decode_binary_record(&to_apply[0].payload),
+                    Ok(crate::wal_binary::BinaryWalRecord::Transaction(_))
+                );
+            let mut applied: Vec<AppliedRowMutation> = Vec::new();
             let mut recorded_write_set = false;
             let mut insert_batch: BTreeMap<String, InsertAccum> = BTreeMap::new();
             for e in &to_apply {
                 commit.sm.apply(e)?;
-                if let Some(m) = self.apply_mvcc_entry(e, cat)? {
+                for m in self.apply_mvcc_entry(e, cat)? {
                     // C2 (write-path assessment): record the SERIALIZED path's write-set into the
                     // SI recent-commits ledger, exactly as the concurrent path records its own —
                     // so a concurrent committer whose read snapshot predates this commit sees the
@@ -381,7 +420,7 @@ impl Engine {
                             acc.seqs.extend(std::iter::repeat_n(e.index, rows.len()));
                         }
                     }
-                    applied = Some(m);
+                    applied.push(m);
                 }
                 commit.repl.mark_applied(e.index);
             }
@@ -421,207 +460,237 @@ impl Engine {
             // and we invalidate + re-admit (which rebuilds all-live from the host store = always correct).
             // DELETE-tombstoning is gated behind `resident_delete_tombstone_enabled` (default OFF, nested under
             // the shard path) so its A/B lever is independent; OFF => a DELETE re-admits exactly as before.
-            let handled = self.auto_admit_on_commit_enabled()
-                && to_apply.len() == 1
-                && match applied.as_ref() {
-                    Some(AppliedRowMutation::Insert {
-                        table,
-                        rows,
-                        row_ids,
-                        ..
-                    }) => {
-                        // D3 (ADR-013 pre1): INSERT appends are STAMPED `created_by = commit_seq`
-                        // like every other append — a reader pinned at an older snapshot no longer
-                        // sees a decided-but-unpublished insert. RETIREMENT A1: identities ride the
-                        // mutation (parsed from the delta's installed keys).
-                        self.try_append_resident_int4_open_shard(
+            let mut maintained: BTreeSet<String> = BTreeSet::new();
+            let handled = if atomic_transaction {
+                maintained =
+                    self.try_maintain_transaction_residency(cat, &applied, publish_index)?;
+                let touched = applied
+                    .iter()
+                    .map(Self::applied_mutation_table)
+                    .collect::<BTreeSet<_>>();
+                maintained == touched
+            } else {
+                self.auto_admit_on_commit_enabled()
+                    && to_apply.len() == 1
+                    && match applied.last() {
+                        Some(AppliedRowMutation::Insert {
                             table,
                             rows,
-                            crate::engine_residency::AppendCreatedBy::InsertUniform(publish_index),
-                            Some(row_ids),
-                        )
-                    }
-                    Some(AppliedRowMutation::Delete { table, rows, .. })
-                        if self.resident_delete_tombstone_enabled() =>
-                    {
-                        self.try_tombstone_resident_delete_commit(cat, table, rows, publish_index)
-                    }
-                    Some(AppliedRowMutation::Update {
-                        table,
-                        old_rows,
-                        new_rows,
-                        row_ids,
-                        ..
-                    }) if self.resident_update_tombstone_enabled() => {
-                        // RETIREMENT A1/A4b: the appended new versions keep the ORIGINAL rows'
-                        // identities — parsed from the installs' keys (exact parallel to
-                        // old_rows/new_rows), surfaced on the mutation.
-                        self.try_update_resident_commit(
-                            cat,
+                            row_ids,
+                            ..
+                        }) => {
+                            // D3 (ADR-013 pre1): INSERT appends are STAMPED `created_by = commit_seq`
+                            // like every other append — a reader pinned at an older snapshot no longer
+                            // sees a decided-but-unpublished insert. RETIREMENT A1: identities ride the
+                            // mutation (parsed from the delta's installed keys).
+                            self.try_append_resident_int4_open_shard(
+                                table,
+                                rows,
+                                crate::engine_residency::AppendCreatedBy::InsertUniform(
+                                    publish_index,
+                                ),
+                                Some(row_ids),
+                            )
+                        }
+                        Some(AppliedRowMutation::Delete { table, rows, .. })
+                            if self.resident_delete_tombstone_enabled() =>
+                        {
+                            self.try_tombstone_resident_delete_commit(
+                                cat,
+                                table,
+                                rows,
+                                publish_index,
+                            )
+                        }
+                        Some(AppliedRowMutation::Update {
                             table,
                             old_rows,
                             new_rows,
-                            publish_index,
-                            row_ids.as_deref(),
-                        )
+                            row_ids,
+                            ..
+                        }) if self.resident_update_tombstone_enabled() => {
+                            // RETIREMENT A1/A4b: the appended new versions keep the ORIGINAL rows'
+                            // identities — parsed from the installs' keys (exact parallel to
+                            // old_rows/new_rows), surfaced on the mutation.
+                            self.try_update_resident_commit(
+                                cat,
+                                table,
+                                old_rows,
+                                new_rows,
+                                publish_index,
+                                row_ids.as_deref(),
+                            )
+                        }
+                        _ => false,
                     }
-                    _ => false,
-                };
+            };
             // RETIREMENT A4e: the ELIDED lifecycle. A handled incremental commit on an eligible
             // strictly-Int4 table ENTERS elision (subsequent applies skip the host install); an
             // UNHANDLED commit on an elided table REHYDRATES FIRST (device gather @ C-1 + this
             // commit's delta -> the host store is complete again, sticky de-elision) so the
             // invalidate+re-admit below rebuilds from a truthful store.
-            if let Some(applied_ref) = applied.as_ref() {
-                let table_name = match applied_ref {
-                    AppliedRowMutation::Insert { table, .. }
-                    | AppliedRowMutation::Delete { table, .. }
-                    | AppliedRowMutation::Update { table, .. } => table.as_str(),
-                };
-                // ADR-006: a ZERO-ROW DELETE/UPDATE now reports HANDLED (`true`) so it does NOT de-elide an
-                // already-elided table (the no-op is byte-unchanged). But `handled` ALSO drives elision-
-                // ENTER below, and ENTER requires the device residency to be CONFIRMED CURRENT — which only
-                // a NON-EMPTY append/tombstone establishes (they return `false` when the table is not
-                // device-resident; `table_elision_eligible` is catalog-only and checks no residency). A
-                // zero-row op touches the device not at all, so it must NEVER drive ENTER (that would elide a
-                // possibly-non-resident table -> a later rehydrate hard-errors "device-authoritative
-                // invariant broken"). Gate ENTER on the applied set being non-empty; the no-op leaves the
-                // elision state unchanged (neither enters nor exits).
-                let applied_changed_rows = match applied_ref {
-                    AppliedRowMutation::Insert { rows, .. } => !rows.is_empty(),
-                    AppliedRowMutation::Delete { rows, .. } => !rows.is_empty(),
-                    AppliedRowMutation::Update { old_rows, .. } => !old_rows.is_empty(),
-                };
-                if handled
-                    && applied_changed_rows
-                    && self.host_install_elision_enabled()
-                    && !self.table_install_elided(table_name)
-                {
-                    // Audit B1: eligibility = device-authoritative types AND FK-free both directions
-                    // (CHECK is row-local and no longer blocks — ADR-006; the published snapshot is
-                    // the same catalog `cat` mirrors here).
-                    let snapshot = self.catalog_snapshot();
-                    if self.table_elision_eligible(&snapshot, table_name) {
-                        self.set_table_install_elided(table_name, true);
-                    }
-                } else if !handled
-                    && self.table_install_elided(table_name)
-                    && !keep_elided.contains(table_name)
-                {
-                    // ADR-006 (multi-statement elision): a keep-elided table is maintained by the
-                    // multi-entry INSERT append below (on the FULL batch), NOT rehydrated/de-elided
-                    // here on just the last entry's delta. `keep_elided` is empty for the single-entry
-                    // and imprecise-scope cases, so this is inert there (behavior preserved); and the
-                    // ENTER arm above needs `handled`, which is false for a multi-entry commit, so a
-                    // keep-elided table never enters via the single-`applied` hook either.
-                    let (upserts, removals) = Self::elided_commit_delta(applied_ref);
-                    if let Some(table) = cat.relational_catalog.get(table_name) {
-                        self.rehydrate_elided_table(
-                            table,
-                            publish_index.saturating_sub(1),
-                            &upserts,
-                            &removals,
-                            publish_index,
-                        )?;
-                    }
-                }
-                // P4-2b (S-E.P4): the CHUNK-AUTHORITATIVE lifecycle — strictly the elision arm's
-                // ELSE (mutual exclusion, design review H1). A class INSERT materializes as a
-                // TAIL APPEND from the statement's own rows (the store install was skipped; the
-                // WAL is durability, this is the representation). A failed append — or any
-                // DELETE/UPDATE that somehow reached apply with the flag still set (the prepare
-                // guard de-authoritizes first; this is the backstop) — exits the class LOUDLY.
-                // Class ENTRY happens after the cold maintenance below (the entry must be fresh).
-                if !self.table_install_elided(table_name)
-                    && self.table_chunk_authoritative(table_name).is_some()
-                {
-                    match applied_ref {
-                        AppliedRowMutation::Insert { rows, .. } if !rows.is_empty() => {
-                            let appended = cat
-                                .relational_catalog
-                                .get(table_name)
-                                .map(|table| {
-                                    self.append_streaming_cold_tail(table, rows, publish_index)
-                                })
-                                .unwrap_or(false);
-                            if !appended {
-                                self.deauthoritize_chunk_table(table_name, true)?;
-                            }
+            if !atomic_transaction {
+                if let Some(applied_ref) = applied.last() {
+                    let table_name = match applied_ref {
+                        AppliedRowMutation::Insert { table, .. }
+                        | AppliedRowMutation::Delete { table, .. }
+                        | AppliedRowMutation::Update { table, .. } => table.as_str(),
+                    };
+                    // ADR-006: a ZERO-ROW DELETE/UPDATE now reports HANDLED (`true`) so it does NOT de-elide an
+                    // already-elided table (the no-op is byte-unchanged). But `handled` ALSO drives elision-
+                    // ENTER below, and ENTER requires the device residency to be CONFIRMED CURRENT — which only
+                    // a NON-EMPTY append/tombstone establishes (they return `false` when the table is not
+                    // device-resident; `table_elision_eligible` is catalog-only and checks no residency). A
+                    // zero-row op touches the device not at all, so it must NEVER drive ENTER (that would elide a
+                    // possibly-non-resident table -> a later rehydrate hard-errors "device-authoritative
+                    // invariant broken"). Gate ENTER on the applied set being non-empty; the no-op leaves the
+                    // elision state unchanged (neither enters nor exits).
+                    let applied_changed_rows = match applied_ref {
+                        AppliedRowMutation::Insert { rows, .. } => !rows.is_empty(),
+                        AppliedRowMutation::Delete { rows, .. } => !rows.is_empty(),
+                        AppliedRowMutation::Update { old_rows, .. } => !old_rows.is_empty(),
+                    };
+                    if handled
+                        && applied_changed_rows
+                        && self.host_install_elision_enabled()
+                        && !self.table_install_elided(table_name)
+                    {
+                        // Audit B1: eligibility = device-authoritative types AND FK-free both directions
+                        // (CHECK is row-local and no longer blocks — ADR-006; the published snapshot is
+                        // the same catalog `cat` mirrors here).
+                        let snapshot = self.catalog_snapshot();
+                        if self.table_elision_eligible(&snapshot, table_name) {
+                            self.set_table_install_elided(table_name, true);
                         }
-                        AppliedRowMutation::Insert { .. } => {}
-                        // P4-2b-ii: class DELETE — stamp the packed coordinates iff the
-                        // installed entry still carries the prepare-time epoch (the P4-2a
-                        // coordinate token); any mismatch/failure exits the class LOUDLY.
-                        AppliedRowMutation::Delete {
-                            rows, class_stamp, ..
-                        } => match class_stamp {
-                            Some((coords, epoch)) if !rows.is_empty() => {
-                                if !self.stamp_class_coordinates(
-                                    table_name,
-                                    coords,
-                                    *epoch,
-                                    publish_index,
-                                ) {
-                                    // ⚠️ AUDIT CONTRACT (MEDIUM, latent): this fallback DROPS
-                                    // the in-flight delete from the LIVE store (the apply
-                                    // skipped it; the de-auth replay lacks its stamps — WAL
-                                    // replay recovers it). UNREACHABLE today: single-entry
-                                    // class DML runs prepare→apply→hook under ONE held commit
-                                    // mutex, so the epoch cannot drift. The OFF-LOCK-PREPARE
-                                    // future (see the write-path plan) MUST replace this arm
-                                    // with re-resolve+stamp under the lock — never a drop.
-                                    eprintln!(
-                                        "[gpu-db] class stamp REFUSED for \"{table_name}\" \
-                                         (epoch drift) — de-authoritizing; the live store \
-                                         DROPS this delete until WAL replay (latent-unreachable \
-                                         path, see the P4-2b-ii audit contract)"
-                                    );
-                                    self.deauthoritize_chunk_table(table_name, true)?;
-                                }
-                            }
-                            Some(_) => {} // a 0-row class delete: nothing to stamp
-                            // Resolved via a non-class arm while classed (a de-auth raced the
-                            // prepare): the store now holds the truth — exit.
-                            None => {
-                                self.deauthoritize_chunk_table(table_name, true)?;
-                            }
-                        },
-                        // P4-2b-ii: class UPDATE = stamp the OLD coordinates + tail-append the
-                        // NEW images at this commit (the U2 tombstone-old/append-new shape).
-                        AppliedRowMutation::Update {
-                            new_rows,
-                            row_ids,
-                            class_epoch,
-                            ..
-                        } => match (class_epoch, row_ids) {
-                            (Some(epoch), Some(coords)) if !new_rows.is_empty() => {
-                                let stamped = self.stamp_class_coordinates(
-                                    table_name,
-                                    coords,
-                                    *epoch,
-                                    publish_index,
-                                );
-                                let appended = stamped
-                                    && cat
-                                        .relational_catalog
-                                        .get(table_name)
-                                        .map(|table| {
-                                            self.append_streaming_cold_tail(
-                                                table,
-                                                new_rows,
-                                                publish_index,
-                                            )
-                                        })
-                                        .unwrap_or(false);
+                    } else if !handled
+                        && self.table_install_elided(table_name)
+                        && !keep_elided.contains(table_name)
+                    {
+                        // ADR-006 (multi-statement elision): a keep-elided table is maintained by the
+                        // multi-entry INSERT append below (on the FULL batch), NOT rehydrated/de-elided
+                        // here on just the last entry's delta. `keep_elided` is empty for the single-entry
+                        // and imprecise-scope cases, so this is inert there (behavior preserved); and the
+                        // ENTER arm above needs `handled`, which is false for a multi-entry commit, so a
+                        // keep-elided table never enters via the single-`applied` hook either.
+                        let (upserts, removals) = Self::elided_commit_delta(applied_ref);
+                        if let Some(table) = cat.relational_catalog.get(table_name) {
+                            self.rehydrate_elided_table(
+                                table,
+                                publish_index.saturating_sub(1),
+                                &upserts,
+                                &removals,
+                                publish_index,
+                            )?;
+                        }
+                    }
+                    // P4-2b (S-E.P4): the CHUNK-AUTHORITATIVE lifecycle — strictly the elision arm's
+                    // ELSE (mutual exclusion, design review H1). A class INSERT materializes as a
+                    // TAIL APPEND from the statement's own rows (the store install was skipped; the
+                    // WAL is durability, this is the representation). A failed append — or any
+                    // DELETE/UPDATE that somehow reached apply with the flag still set (the prepare
+                    // guard de-authoritizes first; this is the backstop) — exits the class LOUDLY.
+                    // Class ENTRY happens after the cold maintenance below (the entry must be fresh).
+                    if !self.table_install_elided(table_name)
+                        && self.table_chunk_authoritative(table_name).is_some()
+                    {
+                        match applied_ref {
+                            AppliedRowMutation::Insert { rows, row_ids, .. }
+                                if !rows.is_empty() =>
+                            {
+                                let appended = cat
+                                    .relational_catalog
+                                    .get(table_name)
+                                    .map(|table| {
+                                        self.append_streaming_cold_tail(
+                                            table,
+                                            rows,
+                                            row_ids,
+                                            publish_index,
+                                        )
+                                    })
+                                    .unwrap_or(false);
                                 if !appended {
                                     self.deauthoritize_chunk_table(table_name, true)?;
                                 }
                             }
-                            (Some(_), _) => {} // 0-row class update: nothing to do
-                            _ => {
-                                self.deauthoritize_chunk_table(table_name, true)?;
-                            }
-                        },
+                            AppliedRowMutation::Insert { .. } => {}
+                            // P4-2b-ii: class DELETE — stamp the packed coordinates iff the
+                            // installed entry still carries the prepare-time epoch (the P4-2a
+                            // coordinate token); any mismatch/failure exits the class LOUDLY.
+                            AppliedRowMutation::Delete {
+                                rows, class_stamp, ..
+                            } => match class_stamp {
+                                Some((coords, epoch)) if !rows.is_empty() => {
+                                    if !self.stamp_class_coordinates(
+                                        table_name,
+                                        coords,
+                                        *epoch,
+                                        publish_index,
+                                    ) {
+                                        // ⚠️ AUDIT CONTRACT (MEDIUM, latent): this fallback DROPS
+                                        // the in-flight delete from the LIVE store (the apply
+                                        // skipped it; the de-auth replay lacks its stamps — WAL
+                                        // replay recovers it). UNREACHABLE today: single-entry
+                                        // class DML runs prepare→apply→hook under ONE held commit
+                                        // mutex, so the epoch cannot drift. The OFF-LOCK-PREPARE
+                                        // future (see the write-path plan) MUST replace this arm
+                                        // with re-resolve+stamp under the lock — never a drop.
+                                        eprintln!(
+                                            "[gpu-db] class stamp REFUSED for \"{table_name}\" \
+                                         (epoch drift) — de-authoritizing; the live store \
+                                         DROPS this delete until WAL replay (latent-unreachable \
+                                         path, see the P4-2b-ii audit contract)"
+                                        );
+                                        self.deauthoritize_chunk_table(table_name, true)?;
+                                    }
+                                }
+                                Some(_) => {} // a 0-row class delete: nothing to stamp
+                                // Resolved via a non-class arm while classed (a de-auth raced the
+                                // prepare): the store now holds the truth — exit.
+                                None => {
+                                    self.deauthoritize_chunk_table(table_name, true)?;
+                                }
+                            },
+                            // P4-2b-ii: class UPDATE = stamp the OLD coordinates + tail-append the
+                            // NEW images at this commit (the U2 tombstone-old/append-new shape).
+                            AppliedRowMutation::Update {
+                                new_rows,
+                                row_ids,
+                                class_stamp,
+                                ..
+                            } => match (class_stamp, row_ids) {
+                                (Some((coords, epoch)), Some(entity_ids))
+                                    if !new_rows.is_empty() =>
+                                {
+                                    let stamped = self.stamp_class_coordinates(
+                                        table_name,
+                                        coords,
+                                        *epoch,
+                                        publish_index,
+                                    );
+                                    let appended = stamped
+                                        && cat
+                                            .relational_catalog
+                                            .get(table_name)
+                                            .map(|table| {
+                                                self.append_streaming_cold_tail(
+                                                    table,
+                                                    new_rows,
+                                                    entity_ids,
+                                                    publish_index,
+                                                )
+                                            })
+                                            .unwrap_or(false);
+                                    if !appended {
+                                        self.deauthoritize_chunk_table(table_name, true)?;
+                                    }
+                                }
+                                (Some(_), _) => {} // 0-row class update: nothing to do
+                                _ => {
+                                    self.deauthoritize_chunk_table(table_name, true)?;
+                                }
+                            },
+                        }
                     }
                 }
             }
@@ -633,7 +702,6 @@ impl Engine {
             // decline NONE of these rows reached the device and the gather @ C-1 is the pre-commit
             // state; the de-elided table then falls into the invalidate+re-admit set below. `handled`
             // is false for a multi-entry commit, so the single-entry lifecycle above skipped these.
-            let mut maintained: BTreeSet<String> = BTreeSet::new();
             for (table_name, acc) in insert_batch {
                 if acc.rows.is_empty() {
                     continue;
@@ -674,7 +742,7 @@ impl Engine {
             // the same invalidate+re-admit a declined commit would do — pre-publish, so its
             // all-live born-visible semantics match the existing re-admit class).
             if handled && self.auto_vacuum_enabled() {
-                if let Some(applied_ref) = applied.as_ref() {
+                if let Some(applied_ref) = applied.last() {
                     let table_name = match applied_ref {
                         AppliedRowMutation::Insert { table, .. }
                         | AppliedRowMutation::Delete { table, .. }
@@ -764,21 +832,11 @@ impl Engine {
                 }
             }
             AppliedRowMutation::Update {
-                new_rows,
-                row_ids,
-                old_row_ids,
-                ..
+                new_rows, row_ids, ..
             } => {
                 if let Some(ids) = row_ids {
                     for (row_id, row) in ids.iter().zip(new_rows.iter()) {
                         upserts.insert(*row_id, row.clone());
-                    }
-                }
-                // U2: remove the tombstoned OLD versions (the new versions ride fresh ids). Classic
-                // in-place updates set this `None` (reused id -> the upsert above overwrites).
-                if let Some(olds) = old_row_ids {
-                    for old in olds {
-                        removals.insert(*old);
                     }
                 }
             }
@@ -812,6 +870,8 @@ impl Engine {
         // byte-identical to a WAL replay of the same record (Stage 0 stamp/boundary unification).
         F: FnMut(&Self, &mut DdlCatalogState, Index) -> Result<(), EngineError>,
     {
+        self.ensure_commit_path_available()?;
+        self.intent_lanes_write_guard()?;
         if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
@@ -819,6 +879,8 @@ impl Engine {
         // A.4 unification: `&self`, the whole critical section under the commit_mutex (held in
         // `commit`); the catalog latch is acquired INSIDE (fixed lock order).
         let mut commit = self.commit_state();
+        self.ensure_commit_path_available()?;
+        self.intent_lanes_write_guard()?;
         let token = {
             let wal_len_before = commit.wal.len();
             commit.wal.append(WalRecord {
@@ -886,7 +948,10 @@ impl Engine {
                     if self.table_chunk_authoritative(table_name).is_some() {
                         // Audit C1: this path HOLDS the commit mutex without the internal-read
                         // flag — the explicit lock statement prevents the re-lock deadlock.
-                        self.deauthoritize_chunk_table(table_name, true)?;
+                        if let Err(error) = self.deauthoritize_chunk_table(table_name, true) {
+                            self.wedge_commit_path();
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -900,7 +965,10 @@ impl Engine {
                     .cloned()
                     .collect();
                 for table_name in class_tables {
-                    self.deauthoritize_chunk_table(&table_name, true)?;
+                    if let Err(error) = self.deauthoritize_chunk_table(&table_name, true) {
+                        self.wedge_commit_path();
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -917,10 +985,19 @@ impl Engine {
                     // machine on the COPY hot path while preserving WAL/replay records. Pass the
                     // commit sequence (`e.index`) so the stamp matches `apply_mvcc_entry`'s replay
                     // stamp, plus the held catalog latch for any working-map mutation.
-                    apply_current(self, cat, e.index)?;
+                    if let Err(error) = apply_current(self, cat, e.index) {
+                        self.wedge_commit_path();
+                        return Err(error);
+                    }
                 } else {
-                    commit.sm.apply(e)?;
-                    self.apply_mvcc_entry(e, cat)?;
+                    if let Err(error) = commit.sm.apply(e) {
+                        self.wedge_commit_path();
+                        return Err(error);
+                    }
+                    if let Err(error) = self.apply_mvcc_entry(e, cat) {
+                        self.wedge_commit_path();
+                        return Err(error);
+                    }
                 }
                 commit.repl.mark_applied(e.index);
             }
@@ -1132,6 +1209,17 @@ impl Engine {
                         tables.insert(record.table);
                         continue;
                     }
+                    Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => {
+                        for mutation in record.mutations {
+                            let table = match mutation {
+                                BinaryTransactionMutation::Insert { table, .. }
+                                | BinaryTransactionMutation::Update { table, .. }
+                                | BinaryTransactionMutation::Delete { table, .. } => table,
+                            };
+                            tables.insert(table);
+                        }
+                        continue;
+                    }
                     Err(_) => return None,
                 }
             }
@@ -1230,6 +1318,9 @@ impl Engine {
                     }
                     Ok(crate::wal_binary::BinaryWalRecord::UpdateByKey(record)) => {
                         has_other.insert(record.table);
+                    }
+                    Ok(crate::wal_binary::BinaryWalRecord::Transaction(_)) => {
+                        return BTreeSet::new();
                     }
                     Err(_) => return BTreeSet::new(),
                 }
@@ -1385,14 +1476,12 @@ impl Engine {
                 }));
             }
             crate::wal_binary::BinaryWalRecord::UpdateByKey(record) => {
-                // U2 (W5b) replay — allocator lock-step, BYTE-IDENTICAL to the live lane apply
-                // (tombstone-OLD + append-NEW at the pump-claimed `new_row_id`, a dead twin sharing
-                // the pk). Re-resolve the key against the replayed state (deterministic: all ops on
-                // a key are lane-serialized in this same seq order). A 1-row update tombstones the
-                // visible old + installs the new image at the EXPLICIT `new_row_id`; a 0-row update
-                // installs nothing BUT still consumes the row id — the live pump claimed it BEFORE
-                // the apply-time locate found 0, so replay MUST advance the allocator by 1 in BOTH
-                // branches or every later record's identity collides.
+                // U2/R3 replay — re-resolve the key against the replayed state (deterministic: all
+                // ops on a key are lane-serialized in this same seq order), tombstone the visible
+                // old, and install the replacement with that old version's stable entity identity.
+                // The v1 record's `new_row_id` is retained as an allocator reservation for backward
+                // WAL/high-water compatibility only. A 0-row update still consumes it, so replay
+                // advances the allocator by one in both branches.
                 let table = cat
                     .relational_catalog
                     .get(&record.table)
@@ -1410,16 +1499,21 @@ impl Engine {
                             record.table
                         ))
                     })?;
+                if record.new_row_id == 0 {
+                    return Err(EngineError::Durability(format!(
+                        "binary WAL update record for \"{}\" carries an unpatched allocator reservation",
+                        record.table
+                    )));
+                }
                 // NOTE (audit CRITICAL): do NOT assert `current_row_id() == new_row_id`. The pump
                 // claims the row-id block (`claim_row_id_block`) and the seq block
                 // (`seq_oracle.fetch_add`) as SEPARATE lock-free fetch_adds with no lock spanning
                 // them, and lanes pump CONCURRENTLY — so global row-id order is NOT global seq
                 // order (a lower-seq wave can hold a higher row-id base). Replay walks records in
                 // seq order, so the allocator position need not equal a given record's claimed id.
-                // Correctness does NOT need it to: like the INSERT replay arm, we install at the
-                // EXPLICIT `new_row_id` (globally unique from the live fetch_add — no collision) and
-                // advance the allocator by exactly 1 (both branches), so the final high-water =
-                // base + (row-consuming records) regardless of order. An assert here would
+                // Correctness does NOT need it: the update reuses its resolved stable entity id and
+                // advances the legacy allocator by exactly 1 (both branches), so the final high-water
+                // remains base + (row-consuming records) regardless of order. An assert here would
                 // manufacture a spurious, unrecoverable `Durability` failure under ordinary
                 // concurrent update/insert traffic.
                 // Tombstone the visible old version by key (the delete arm's re-resolve, verbatim).
@@ -1433,11 +1527,10 @@ impl Engine {
                     }],
                     filter_groups: Vec::new(),
                 };
-                // Capture the old version's row-id(s) from the delete's write-set (same parse as
-                // `elided_commit_delta::Delete`) so an elided-rehydrate fallback REMOVES the old —
-                // the new version lands at a FRESH `new_row_id`, so without this the rehydrate
-                // would leave two live rows sharing the pk (audit MEDIUM).
-                let (old_rows, old_row_ids) = match self.apply_delete(cat, delete, entry.index)? {
+                // Capture the old version's stable entity identity from the delete's write-set.
+                // Replay reuses it for the replacement version, migrating pre-ADR-014 lane WAL
+                // away from fresh per-update identities without changing the v1 record framing.
+                let (old_rows, entity_ids) = match self.apply_delete(cat, delete, entry.index)? {
                     Some((_, rows, del_write_set, _class_stamp)) => {
                         let prefix = relational_key_prefix(&record.table);
                         let ids: Vec<u64> = del_write_set
@@ -1459,9 +1552,16 @@ impl Engine {
                     self.read_state.mvcc.advance_row_id(1);
                     return Ok(None);
                 }
-                // 1-row update: install the new version at the EXPLICIT `new_row_id` (byte-identical
-                // to live); the Insert delta advances the allocator by `rows_consumed = 1`.
-                let row_key = relational_row_key(&record.table, record.new_row_id);
+                if old_rows.len() != 1 || entity_ids.len() != 1 {
+                    return Err(EngineError::Durability(format!(
+                        "binary WAL update for \"{}\" resolved one row but not one stable entity identity",
+                        record.table
+                    )));
+                }
+                // The encoded `new_row_id` remains a consumed v1 allocator reservation only. The
+                // replacement version keeps the old row's stable entity identity.
+                let entity_id = entity_ids[0];
+                let row_key = relational_row_key(&record.table, entity_id);
                 let mut write_set = WriteSet::default();
                 write_set.add_unique_slots(&table, &new_values);
                 let delta = WriteDelta {
@@ -1476,16 +1576,18 @@ impl Engine {
                 };
                 self.apply_delta(delta, entry.index, None)?;
                 return Ok(Some(AppliedRowMutation::Update {
-                    class_epoch: None, // replay: never a class table (process-local flag)
+                    class_stamp: None, // replay: never a class table (process-local flag)
                     table: record.table,
                     old_rows,
                     new_rows: vec![new_values],
-                    row_ids: Some(vec![record.new_row_id]),
-                    // U2: the new version rides a FRESH id -> the elided-rehydrate must remove the
-                    // tombstoned old (which apply_delete no-op'd on an elided table) explicitly.
-                    old_row_ids: Some(old_row_ids),
+                    row_ids: Some(vec![entity_id]),
                     write_set,
                 }));
+            }
+            crate::wal_binary::BinaryWalRecord::Transaction(_) => {
+                return Err(EngineError::Durability(
+                    "transaction WAL record reached the single-mutation applier".to_string(),
+                ));
             }
         };
         let table = cat
@@ -1542,7 +1644,7 @@ impl Engine {
         &self,
         entry: &LogEntry,
         cat: &mut DdlCatalogState,
-    ) -> Result<Option<AppliedRowMutation>, EngineError> {
+    ) -> Result<Vec<AppliedRowMutation>, EngineError> {
         // Returns the APPLIED row mutation for a single INSERT or DELETE entry (the caller maintains GPU
         // residency incrementally for a single-entry commit: Insert -> append in place, Delete -> tombstone
         // in place; Slice 1b-ii-c / SV4b); `None` for every other command (and for a non-UTF-8 /
@@ -1552,13 +1654,20 @@ impl Engine {
         // below, and the defensive no-op arm would otherwise SILENTLY SKIP an acknowledged
         // insert's apply (data loss at replay). A tagged record that fails to decode is loud.
         if is_binary_wal_record(&entry.payload) {
-            return self.apply_binary_wal_entry(entry, cat);
+            return match decode_binary_record(&entry.payload)? {
+                BinaryWalRecord::Transaction(record) => {
+                    self.apply_binary_transaction_record(entry, cat, record)
+                }
+                _ => self
+                    .apply_binary_wal_entry(entry, cat)
+                    .map(|mutation| mutation.into_iter().collect()),
+            };
         }
         let Ok(text) = std::str::from_utf8(&entry.payload) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let Ok(cmd) = parse_command(text) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
 
         // Stage 0 (write-half MVCC): the version stamp is the commit sequence, which is the
@@ -1772,17 +1881,13 @@ impl Engine {
             }
             Command::Update(update) => {
                 applied = self.apply_update(cat, update, commit_seq)?.map(
-                    |(table, old_rows, new_rows, row_ids, write_set, class_epoch)| {
+                    |(table, old_rows, new_rows, row_ids, write_set, class_stamp)| {
                         AppliedRowMutation::Update {
                             table,
                             old_rows,
                             new_rows,
                             row_ids,
-                            class_epoch,
-                            // Classic in-place update REUSES the old row-id for the new
-                            // version, so the elided-rehydrate upsert overwrites it — no
-                            // separate removal needed.
-                            old_row_ids: None,
+                            class_stamp,
                             write_set,
                         }
                     },
@@ -1791,7 +1896,7 @@ impl Engine {
             _ => {}
         }
 
-        Ok(applied)
+        Ok(applied.into_iter().collect())
     }
 }
 

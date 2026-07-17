@@ -37,10 +37,7 @@ impl Engine {
         // Load the table's resident shards in published order (sorted by (row_start, shard_id)).
         // Error text mirrors the retired probes.
         let mut shards = self
-            .read_state
-            .residency
-            .shards
-            .load()
+            .read_residency_shards()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {

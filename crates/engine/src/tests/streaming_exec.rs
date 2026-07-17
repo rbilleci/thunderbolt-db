@@ -1171,11 +1171,21 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
         .unwrap();
     let exact_before = e.chunk_class_device_exact_rechecks();
     seq += 1;
+    let wal_before_reject = e.durable_wal_records().len();
     let inbound_error = e
         .execute_text(seq, "DELETE FROM cp WHERE id = 100003")
         .expect_err("referenced provider delete must reject");
     assert!(format!("{inbound_error:?}").contains("foreign key constraint"));
     assert!(e.chunk_class_device_exact_rechecks() > exact_before);
+    assert_eq!(
+        e.durable_wal_records().len(),
+        wal_before_reject,
+        "the class inbound-FK rejection must happen before WAL"
+    );
+    assert!(!e.is_commit_path_poisoned());
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO cp VALUES (100004, 'after-reject')")
+        .expect("a pre-WAL constraint rejection must not wedge later writes");
     let provider_after_reject = e
         .execute_relational_select(&select("SELECT id FROM cp WHERE id = 100003"))
         .unwrap();
@@ -1187,6 +1197,95 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
     assert_eq!(e.chunk_class_deauths(), 0);
     assert!(e.table_chunk_authoritative("cp").is_some());
     assert!(e.table_chunk_authoritative("cc").is_some());
+
+    // Facade transaction identities are not MVCC indices. Rebuild from WAL, re-enter both cold
+    // classes, then use deliberately low/reused facade ids: the parent must still resolve at the
+    // recovered committed boundary and reject before adding a durable record.
+    let durable = e.durable_wal_records();
+    let mut recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+    recovered.set_relational_residency_budget_bytes(0, 8192);
+    {
+        let catalog = recovered.ddl_catalog();
+        for table in ["cp", "cc"] {
+            catalog.relational_resident_cache.remove_table(
+                table,
+                &recovered.read_state.residency,
+                &recovered.read_state.route_telemetry,
+            );
+        }
+    }
+    let _ = recovered
+        .execute_relational_select(&select("SELECT COUNT(*) FROM cp"))
+        .unwrap();
+    let _ = recovered
+        .execute_relational_select(&select("SELECT COUNT(*) FROM cc"))
+        .unwrap();
+    let _ = recovered
+        .execute_relational_select(&select("SELECT SUM(id) FROM cp"))
+        .unwrap();
+    let _ = recovered
+        .execute_relational_select(&select("SELECT SUM(id) FROM cc"))
+        .unwrap();
+    recovered
+        .execute_text(10_001, "INSERT INTO cp VALUES (100005, 'recovered')")
+        .unwrap();
+    recovered
+        .execute_text(
+            10_002,
+            "INSERT INTO cc VALUES (100005, 100005, 1, 'recovered')",
+        )
+        .unwrap();
+    assert!(recovered.table_chunk_authoritative("cp").is_some());
+    assert!(recovered.table_chunk_authoritative("cc").is_some());
+    let recovered_wal_before = recovered.durable_wal_records().len();
+    let recovered_error = recovered
+        .execute_text(1, "DELETE FROM cp WHERE id = 100005")
+        .expect_err("decoupled facade id must not hide the current provider");
+    assert!(format!("{recovered_error:?}").contains("foreign key constraint"));
+    assert_eq!(recovered.durable_wal_records().len(), recovered_wal_before);
+    assert!(!recovered.is_commit_path_poisoned());
+
+    // Deterministic TOCTOU: pause after the parent's provisional class preflight and immediately
+    // before commit_mutex acquisition, commit a child in the gap, then resume. The definitive
+    // check under commit_mutex must see the child and reject the parent DELETE without appending
+    // its WAL record.
+    recovered
+        .execute_text(10_003, "INSERT INTO cp VALUES (100006, 'racing')")
+        .unwrap();
+    let recovered = std::sync::Arc::new(recovered);
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    recovered.set_intent_lanes_classic_prelock_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let deleting = std::sync::Arc::clone(&recovered);
+    let delete = std::thread::spawn(move || {
+        deleting.execute_text(10_004, "DELETE FROM cp WHERE id = 100006")
+    });
+    reached.wait();
+    let race_wal_before = recovered.durable_wal_records().len();
+    recovered
+        .execute_text(
+            10_005,
+            "INSERT INTO cc VALUES (100006, 100006, 1, 'racing')",
+        )
+        .unwrap();
+    resume.wait();
+    let race_error = delete
+        .join()
+        .expect("parent delete thread")
+        .expect_err("child committed in the preflight gap must block the parent delete");
+    assert!(format!("{race_error:?}").contains("foreign key constraint"));
+    assert_eq!(
+        recovered.durable_wal_records().len(),
+        race_wal_before + 1,
+        "only the racing child INSERT may reach WAL"
+    );
+    assert!(!recovered.is_commit_path_poisoned());
+    recovered
+        .execute_text(10_006, "INSERT INTO cp VALUES (100007, 'after-race')")
+        .expect("the raced pre-WAL rejection must not wedge later writes");
 }
 
 /// P5-later — OVER-CAP KEYED CLASS: when the complete retained exact-index set cannot co-reside,
@@ -2156,12 +2255,12 @@ fn gpu_chunk_class_keyed_replay_differential() {
     }
 }
 
-/// P5-2 — THE TRANSACTION PATH: an explicit-txn INSERT's ONLY unique guard is the preflight
-/// (the commit-time de-auth runs AFTER it), so the class probe must reject a dup at statement
-/// time inside BEGIN/COMMIT, and accept fresh keys.
+/// R3-003 / P5-2 — a class INSERT publishes only a transaction-private device-format tail. SELECT
+/// and later unique validation consume it, rollback discards it, and COMMIT emits one resolved
+/// transaction record before appending the row at the real commit boundary.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_chunk_class_keyed_txn_insert_dup_rejected() {
+fn gpu_chunk_class_keyed_txn_insert_is_private_atomic_and_recoverable() {
     let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
@@ -2190,6 +2289,57 @@ fn gpu_chunk_class_keyed_txn_insert_dup_rejected() {
         .unwrap();
     assert_eq!(e.chunk_class_entries(), 1);
 
+    // A claim followed by a release after BEGIN is absent from the current visible chunks but
+    // remains a physical version history conflict. This is the cold-class twin of the resident
+    // key-away regression and proves COMMIT no longer depends on the CPU unique-slot ledger.
+    seq += 1;
+    let history_txn = seq;
+    e.execute_text(history_txn, "BEGIN").unwrap();
+    e.execute_text(
+        history_txn,
+        "INSERT INTO kt (a, t) VALUES (800000, 'stale-private')",
+    )
+    .unwrap();
+    seq += 1;
+    let compactions_before_history = e.chunk_class_compactions();
+    e.execute_text(
+        seq,
+        "INSERT INTO kt (a, t) VALUES \
+         (800000, 'external'), (800001, 'x1'), (800002, 'x2'), (800003, 'x3'), \
+         (800004, 'x4'), (800005, 'x5'), (800006, 'x6'), (800007, 'x7')",
+    )
+    .unwrap();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM kt WHERE a >= 800000 AND a <= 800002")
+        .unwrap();
+    assert_eq!(
+        e.chunk_class_compactions(),
+        compactions_before_history,
+        "the oldest active writer must fence a >=25%-dead current-only chunk rebuild"
+    );
+    let exact_before = e.chunk_class_device_exact_rechecks();
+    let history_error = e
+        .execute_text(history_txn, "COMMIT")
+        .expect_err("cold claim/release history must serialize the stale transaction");
+    assert!(
+        matches!(&history_error, ExecuteError::Serialization(message)
+            if message.contains("device unique conflict") && message.contains("write history")),
+        "unexpected cold history verdict: {history_error:?}"
+    );
+    assert!(e.chunk_class_device_exact_rechecks() > exact_before);
+    e.execute_text(history_txn, "ROLLBACK").unwrap();
+    e.maybe_compact_chunk_class("kt");
+    assert!(
+        e.chunk_class_compactions() > compactions_before_history,
+        "non-vacuity: the same >=25%-dead chunk compacts after the old snapshot retires"
+    );
+    assert!(e
+        .execute_relational_select(&select("SELECT a FROM kt WHERE a = 800000"))
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(e.chunk_class_entries(), 1, "history check stays classed");
+
     // The dup rejects INSIDE the transaction (the preflight probe). A txn's statements all
     // carry the BEGIN's seq — the txn id.
     seq += 1;
@@ -2200,18 +2350,153 @@ fn gpu_chunk_class_keyed_txn_insert_dup_rejected() {
     assert!(format!("{err:?}").contains("duplicate key value"));
     e.execute_text(seq, "ROLLBACK").unwrap();
 
-    // A fresh key commits through the txn path.
+    let fresh = select("SELECT a, t FROM kt WHERE a = 700000");
+
+    // A fresh row is visible only through the retained transaction generation. A later statement
+    // probes that private tail too, proving constraint read-your-writes without a CPU index.
     seq += 1;
     e.execute_text(seq, "BEGIN").unwrap();
-    e.execute_text(seq, "INSERT INTO kt (a, t) VALUES (700000, 'fresh')")
+    e.execute_text(seq, "INSERT INTO kt (a, t) VALUES (700000, NULL)")
         .unwrap();
+    assert_eq!(
+        e.execute_relational_select_in_transaction(seq, &fresh)
+            .unwrap()
+            .rows
+            .row(0),
+        &[SqlValue::Int4(700000), SqlValue::Null]
+    );
+    assert!(e.execute_relational_select(&fresh).unwrap().rows.is_empty());
+    let own_dup = e
+        .execute_text(seq, "INSERT INTO kt (a, t) VALUES (700000, 'dup-own')")
+        .expect_err("private tail must participate in unique validation");
+    assert!(format!("{own_dup:?}").contains("duplicate key value"));
+    e.execute_text(seq, "ROLLBACK").unwrap();
+    assert!(e.execute_relational_select(&fresh).unwrap().rows.is_empty());
+
+    seq += 1;
+    e.execute_text(seq, "BEGIN").unwrap();
+    let wal_before = e.durable_wal_records().len();
+    e.execute_text(seq, "INSERT INTO kt (a, t) VALUES (700000, NULL)")
+        .unwrap();
+    e.execute_text(seq, "UPDATE kt SET t = 'final' WHERE a = 700000")
+        .unwrap();
+    e.execute_text(seq, "UPDATE kt SET t = NULL WHERE a = 45")
+        .unwrap();
+    e.execute_text(seq, "DELETE FROM kt WHERE a = 46").unwrap();
+    assert_eq!(
+        e.execute_relational_select_in_transaction(seq, &fresh)
+            .unwrap()
+            .rows
+            .row(0),
+        &[SqlValue::Int4(700000), SqlValue::Text("final".to_string())]
+    );
     e.execute_text(seq, "COMMIT").unwrap();
-    let q = select("SELECT COUNT(*) FROM kt WHERE a = 700000");
-    let got = match e.execute_relational_select(&q).unwrap().rows.row(0)[0] {
-        SqlValue::Int8(n) => n,
-        ref other => panic!("count: {other:?}"),
-    };
-    assert_eq!(got, 1, "the txn insert landed");
+    assert_eq!(e.durable_wal_records().len(), wal_before + 1);
+    assert_eq!(e.chunk_class_deauths(), 0, "atomic insert stays classed");
+    assert_eq!(
+        e.execute_relational_select(&fresh).unwrap().rows.row(0),
+        &[SqlValue::Int4(700000), SqlValue::Text("final".to_string())]
+    );
+    assert_eq!(
+        e.execute_relational_select(&select("SELECT t FROM kt WHERE a = 45"))
+            .unwrap()
+            .rows
+            .row(0),
+        &[SqlValue::Null]
+    );
+    assert!(e
+        .execute_relational_select(&select("SELECT a FROM kt WHERE a = 46"))
+        .unwrap()
+        .rows
+        .is_empty());
+    let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+    assert_eq!(
+        recovered
+            .execute_relational_select(&fresh)
+            .unwrap()
+            .rows
+            .row(0),
+        &[SqlValue::Int4(700000), SqlValue::Text("final".to_string())]
+    );
+    assert_eq!(
+        recovered
+            .execute_relational_select(&select("SELECT t FROM kt WHERE a = 45"))
+            .unwrap()
+            .rows
+            .row(0),
+        &[SqlValue::Null]
+    );
+    assert!(recovered
+        .execute_relational_select(&select("SELECT a FROM kt WHERE a = 46"))
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+/// A transaction touching one cold table more than once builds one private table entry. Failure
+/// on the second operation is post-durable fail-stop, but the globally installed cold Arc remains
+/// the exact pre-transaction entry; restart replay installs both resolved mutations exactly once.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_transaction_second_cow_failure_publishes_nothing_and_recovers_exactly() {
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE kt_fail (a INT PRIMARY KEY, t TEXT)")
+        .unwrap();
+    let values = (0..1000)
+        .map(|i| format!("({i}, 'v{i:04}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO kt_fail VALUES {values}"))
+        .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM kt_fail"))
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, "INSERT INTO kt_fail VALUES (100000, 'enter')")
+        .unwrap();
+    assert!(e.table_chunk_authoritative("kt_fail").is_some());
+
+    let before = e.read_streaming_cold_chunks()["kt_fail"].clone();
+    seq += 1;
+    let txn = seq;
+    e.execute_text(txn, "BEGIN").unwrap();
+    e.execute_text(txn, "UPDATE kt_fail SET t = 'changed' WHERE a = 40")
+        .unwrap();
+    e.execute_text(txn, "DELETE FROM kt_fail WHERE a = 41")
+        .unwrap();
+    e.fail_transaction_cold_mutation_at(2);
+    let error = e.execute_text(txn, "COMMIT").unwrap_err();
+    assert!(error.to_string().contains("restart recovery required"));
+    let after = e.read_state.residency.streaming_cold_chunks.load_full();
+    assert!(
+        Arc::ptr_eq(&before, &after["kt_fail"]),
+        "a second-operation decline must leave the original cold table entry installed"
+    );
+
+    let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+    assert_eq!(
+        recovered
+            .execute_relational_select(&select("SELECT t FROM kt_fail WHERE a = 40"))
+            .unwrap()
+            .rows
+            .row(0),
+        &[SqlValue::Text("changed".to_string())]
+    );
+    assert!(
+        recovered
+            .execute_relational_select(&select("SELECT a FROM kt_fail WHERE a = 41"))
+            .unwrap()
+            .rows
+            .is_empty(),
+        "recovery must replay the complete resolved transaction, not the first cold COW only"
+    );
 }
 
 /// P5-2 (audit MEDIUM) — TEXT UNIQUE KEY through the class probe: a text key folds to ONE
@@ -2475,12 +2760,12 @@ fn gpu_chunk_class_keyed_dml_key_locate() {
 
 /// Audit C1 — off-lock class prepare must keep one entry Arc from coordinate locate through
 /// row-image materialization and the epoch token. Pause a DELETE after it pins E1, publish E2 by
-/// deleting enough rows to compact the chunk (including the paused DELETE's key), then resume. The E1
-/// write-set must conflict with E2; reloading E2 under the old snapshot would born-skip the
-/// compacted chunk, miss the key, and let the stale DELETE erase the concurrent update.
+/// tombstone-republishing the chunk (including the paused DELETE's key), then resume. The E1
+/// write-set must conflict with E2. The active old snapshot must also defer physical compaction:
+/// reclaiming that history while the writer is pinned would make the conflict unverifiable.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_compaction() {
+fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_sidecar_republish() {
     let mut engine = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut engine, &mut seq) {
@@ -2517,13 +2802,20 @@ fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_compaction() {
     });
     pinned.wait(); // DELETE pinned E1 and its read snapshot; it has not located yet.
 
+    let stamps_before = engine.streaming_cold_stamps();
+    let compactions_before = engine.chunk_class_compactions();
     let update_seq = seq + 2;
     engine
         .execute_text(update_seq, "DELETE FROM epoch_t WHERE a < 200 OR a = 900")
         .unwrap();
     assert!(
-        engine.chunk_class_compactions() > 0,
-        "the interposed write must publish a compacted E2"
+        engine.streaming_cold_stamps() > stamps_before,
+        "the interposed write must publish a tombstone-sidecar E2"
+    );
+    assert_eq!(
+        engine.chunk_class_compactions(),
+        compactions_before,
+        "the pinned old writer must defer physical history reclamation"
     );
     resume.wait();
     let err = delete
@@ -2541,6 +2833,11 @@ fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_compaction() {
         row.rows.iter().collect::<Vec<_>>(),
         vec![&[SqlValue::Int8(0)][..]],
         "the interposed delete remains the sole committed writer"
+    );
+    engine.maybe_compact_chunk_class("epoch_t");
+    assert!(
+        engine.chunk_class_compactions() > compactions_before,
+        "the same tombstones must compact after the old writer retires"
     );
 }
 

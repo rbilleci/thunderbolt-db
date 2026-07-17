@@ -319,8 +319,8 @@ impl Engine {
     /// The eligibility is SHARED by the off-lock skip (`prepare_insert`) and the wave-time
     /// validate (the sequencer), so they can never diverge into a constraint bypass. Requires:
     /// the wave-batch + device-locate flags; the table ELIDED (device-authoritative — the locate
-    /// is the source of truth); every unique index on a strictly-i32 column (the device locate
-    /// probes i32 keys); NO CHECK / outbound-FK / inbound-FK (those aren't device-batch-validated
+    /// is the source of truth); every unique index has a canonical raw/fingerprint device key;
+    /// NO CHECK / outbound-FK / inbound-FK (those aren't device-batch-validated
     /// here — they keep the off-lock path). Same-wave dups are caught by the unique-slot conflict
     /// ledger (#18); the wave-time locate catches ALREADY-COMMITTED dups.
     pub(crate) fn insert_unique_wave_batchable(
@@ -346,9 +346,9 @@ impl Engine {
         }) {
             return false;
         }
-        // At least one unique index, and EVERY unique index's key column(s) are strictly-i32-section.
-        // COMPOUND KEYS: a compound key over i32-section columns folds to a fingerprint surrogate and
-        // rides the same batched device write-locate.
+        // At least one unique index, and EVERY unique index key column has a canonical resident fold.
+        // Raw single i32-section keys and flagged compound/single-wide fingerprints ride the same
+        // batched device write-locate.
         let mut has_unique = false;
         for index in table.indexes.iter().filter(|index| index.unique) {
             has_unique = true;
@@ -440,19 +440,16 @@ impl Engine {
                     | gpu_db_sql::SqlType::Text
             )
         }) && table.indexes.iter().all(|index| {
-            // The A2/A3 device locate probes i32-SECTION keys only: a unique index on an
-            // i64 column could not be validated device-side, so such a table must not
-            // elide (its probes would decline -> rehydrate thrash at best). COMPOUND KEYS
-            // (TYPE-COVERAGE #14 Track 3): EVERY key column must be i32-section — a compound
-            // key over i32-section columns folds to a fingerprint surrogate that rides the
-            // same i32 device index (`compound_key_fingerprint`).
+            // Every unique key column must have a canonical device fold. Raw single i32-section
+            // indexes keep their existing layout; compound and single wider/text keys use the
+            // fingerprint index plus exact typed recheck.
             !index.unique || index_all_key_columns_foldable(table, index)
         }) && unique_ok
             // CHECK constraints DO NOT block elision (ADR-006): CHECK validation is ROW-LOCAL —
             // `validate_check_constraints_for_rows` evaluates the NEW values only (host-held
             // control-plane literals / device-materialized update images), never the tuple store; and
             // ALTER ADD CHECK's existing-row validation scans via the elision-safe-by-construction
-            // DDL row-validator (which rehydrates first). The ledger-#18 re-resolve coverage proof
+            // DDL row-validator (which rehydrates first). The device-history re-resolve proof
             // already treats CHECK as deterministic-on-values.
             //
             // OUTBOUND FKs no longer block (ADR-006 FK elision, child side) when the table is
@@ -471,7 +468,7 @@ impl Engine {
                 .any(|fk| fk.referenced_table == table_name)
             // INBOUND FKs no longer block (ADR-006 FK elision, parent side): a table REFERENCED by
             // other tables may elide when EVERY inbound FK's referenced column (on THIS table) is a
-            // single-column i32-section PK/UNIQUE — exactly the shape `device_visible_row_with_value`
+            // single-column foldable PK/UNIQUE — exactly the shape `device_visible_row_with_value`
             // answers ON THE DEVICE (`locate_resident_pk_via_shard_index_detailed` + the elided
             // materialize), so a child INSERT's parent-exists probe and a parent DELETE's
             // surviving-provider probe stay device-native (a decline rehydrates — the existing
@@ -486,18 +483,7 @@ impl Engine {
                             index.unique
                                 && index.key_columns.len() == 1
                                 && index.column == fk.referenced_column
-                                && table
-                                    .columns
-                                    .iter()
-                                    .find(|c| c.name == fk.referenced_column)
-                                    .is_some_and(|c| {
-                                        matches!(
-                                            c.ty,
-                                            gpu_db_sql::SqlType::Int4
-                                                | gpu_db_sql::SqlType::Date
-                                                | gpu_db_sql::SqlType::Int2
-                                        )
-                                    })
+                                && index_all_key_columns_foldable(table, index)
                         })
                 })
             })
@@ -506,6 +492,9 @@ impl Engine {
     /// RETIREMENT A4e: is `table` device-authoritative (commits skip the host install)?
     /// `pub` for bench/telemetry (read-only; the A/B arms assert steady-state elided-ness).
     pub fn table_install_elided(&self, table: &str) -> bool {
+        if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            return snapshot.elided_tables.contains(table);
+        }
         self.read_state
             .residency
             .elided_tables

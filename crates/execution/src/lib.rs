@@ -50,6 +50,7 @@ pub use resident_memory::{
 };
 mod resident_header;
 use resident_header::launch_cuda_resident_row_count;
+mod resident_index_build;
 mod resident_sort;
 use resident_sort::{
     launch_cuda_bitonic_sort_hetero, launch_cuda_bitonic_sort_i64,
@@ -114,6 +115,8 @@ pub use derived_column::{
 mod predicate_mask;
 use predicate_mask::compact_mask_i32_to_indices;
 pub use predicate_mask::CudaPredicateMaskI32;
+mod version_conflict;
+pub use version_conflict::CudaVersionConflictVerdict;
 mod resident_gather;
 use resident_gather::{
     copy_cuda_resident_bool_rows, copy_cuda_resident_i128_rows, copy_cuda_resident_i32_rows,

@@ -41,6 +41,7 @@ impl Engine {
         let mut resident_bytes = 0u64;
         let mut resident_rows = Vec::new();
         let mut resident_row_ids: Vec<u64> = Vec::new();
+        let mut resident_created_by: Vec<Index> = Vec::new();
         let mut raw_device_tail = Vec::new();
         {
             let table_rows = self.read_state.mvcc.table_rows(table);
@@ -58,6 +59,7 @@ impl Engine {
                 if self.shard_residency_enabled() {
                     resident_row_ids
                         .push(parse_relational_row_id(&tuple.key, &prefix).unwrap_or(u64::MAX));
+                    resident_created_by.push(tuple.created_by);
                 }
                 row_count += 1;
                 resident_bytes = resident_bytes
@@ -245,6 +247,22 @@ impl Engine {
             }
             payload
         });
+        // R3-003 device conflict state: a re-admission normally collapses live rows to an all-
+        // visible generation. While an older transaction exists, preserve creation stamps newer
+        // than its boundary so a commit-time device verdict can still distinguish "same value"
+        // from "written since BEGIN" after a rebuild. No active old boundary (or no newer row)
+        // means no sidecar and zero steady-state sparse-version overhead.
+        let oldest_active = self.active_snapshots_oldest();
+        let created_by_payload = oldest_active
+            .filter(|oldest| resident_created_by.iter().any(|created| created > oldest))
+            .map(|_| {
+                let mut payload =
+                    vec![CREATED_BY_VISIBLE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
+                for (slot, created_by) in resident_created_by.iter().enumerate() {
+                    payload[slot * 8..slot * 8 + 8].copy_from_slice(&created_by.to_le_bytes());
+                }
+                payload
+            });
 
         // S-F/R-1: allocate the complete mandatory replacement set BEFORE selecting or removing
         // an evictee. Allocation failure therefore leaves every published resident generation
@@ -271,10 +289,24 @@ impl Engine {
         } else {
             None
         };
+        let admitted_created_by_region = if device_memory.is_some() {
+            created_by_payload.as_ref().and_then(|payload| {
+                self.relational_residency_device_memory(gpu_id, payload)
+                    .map(Arc::new)
+            })
+        } else {
+            None
+        };
         #[cfg(not(test))]
         if row_id_payload.is_some() && admitted_row_id_region.is_none() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "relation \"{table}\" GPU {gpu_id} mandatory row-identity allocation failed before admission"
+            ))));
+        }
+        #[cfg(not(test))]
+        if created_by_payload.is_some() && admitted_created_by_region.is_none() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{table}\" GPU {gpu_id} transaction conflict-stamp allocation failed before admission"
             ))));
         }
         let allocated_payload_bytes = device_memory
@@ -285,8 +317,12 @@ impl Engine {
         let allocated_row_id_bytes = admitted_row_id_region
             .as_ref()
             .map_or(0, |memory| memory.metadata().allocated_bytes);
-        let admitted_allocated_bytes =
-            allocated_payload_bytes.saturating_add(allocated_row_id_bytes);
+        let allocated_created_by_bytes = admitted_created_by_region
+            .as_ref()
+            .map_or(0, |memory| memory.metadata().allocated_bytes);
+        let admitted_allocated_bytes = allocated_payload_bytes
+            .saturating_add(allocated_row_id_bytes)
+            .saturating_add(allocated_created_by_bytes);
         let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
         let (evicted_tables_on_admission, resident_bytes_after_admission) = self
             .admit_relational_residency_snapshot_inner(
@@ -384,6 +420,13 @@ impl Engine {
                 .residency
                 .shard_created_by_memory
                 .remove_table(table);
+            if let Some(region) = &admitted_created_by_region {
+                read_state.residency.shard_created_by_memory.insert_shard(
+                    table,
+                    0,
+                    Arc::clone(region),
+                );
+            }
             // RETIREMENT A1: replace the row-identity regions with this rebuild's already-allocated
             // capacity-sized region. Allocation happened before budget eviction, so a failure could
             // not strand the resident set in a partially-evicted state.
@@ -401,6 +444,10 @@ impl Engine {
                 shard_id: 0,
                 row_start: 0,
                 row_count,
+                // This dense rebuild materializes only the current live image. Physical versions
+                // removed at/before this boundary cannot affect a writer at or above it; older
+                // writers must decline a history miss.
+                history_floor_index: snapshot.valid_through_index,
                 // S-d2: the OPEN shard carries headroom (capacity > row_count for int4); the recompaction
                 // gather + offset helpers stride by this capacity. (Dead MVCC tail omitted when padded.)
                 capacity,
@@ -413,16 +460,16 @@ impl Engine {
                 // (NOT necessarily in-place). Fixed-width (i32/i64/b128) + bool append IN PLACE into
                 // headroom; TEXT tables are admitted DENSE (capacity == row_count) so they never fit
                 // in place -> every commit ROLLS OVER a fresh dense text shard (the rollover-only model).
-                // NULL-bearing shards stay non-appendable (single dense shard). The text count joins the
-                // others so a text table qualifies and reaches the rollover branch instead of the
-                // O(table) re-admit (which, being unhandled, would never let the table elide).
-                int4_appendable: snapshot.resident_device_null_columns.is_empty()
-                    && snapshot.column_count
-                        == snapshot.resident_device_int4_columns.len()
-                            + snapshot.resident_device_int8_columns.len()
-                            + snapshot.resident_device_numeric_columns.len()
-                            + snapshot.resident_device_bool_columns.len()
-                            + snapshot.resident_device_text_columns.len(),
+                // NULL-bearing shards are DENSE but still participate: the append path observes
+                // their validity layout and rolls a fresh dense bitmap-bearing shard. Marking them
+                // non-appendable here made that safe rollover branch unreachable and forced every
+                // nullable commit through O(table) invalidate/re-admit.
+                int4_appendable: snapshot.column_count
+                    == snapshot.resident_device_int4_columns.len()
+                        + snapshot.resident_device_int8_columns.len()
+                        + snapshot.resident_device_numeric_columns.len()
+                        + snapshot.resident_device_bool_columns.len()
+                        + snapshot.resident_device_text_columns.len(),
                 // S-d3: the zone map (min/max per int4 column) for shard pruning.
                 resident_device_int4_column_stats: snapshot
                     .resident_device_int4_column_stats
@@ -440,8 +487,9 @@ impl Engine {
                 resident_device_bool_columns: snapshot.resident_device_bool_columns.clone(),
                 resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
                 // M3-for-shards: carry the payload's per-column NULL validity bitmaps so the sharded scan's
-                // recompaction can rebuild them into the unified buffer (this re-admit path is the ONLY
-                // shard builder that can see NULLs; rollover/benchmark are NULL-free).
+                // recompaction can rebuild them into the unified buffer. Nullable append rollover
+                // builds the same layouts for its fresh dense shard; synthetic benchmark shards remain
+                // NULL-free.
                 resident_device_null_columns: snapshot.resident_device_null_columns.clone(),
                 gpu_id,
                 schema: snapshot.schema.clone(),
@@ -451,13 +499,14 @@ impl Engine {
                 invalidated_at_index: None,
                 invalidated_by_memory_pressure: memory_pressure_active,
                 memory_pressure_active,
-                // D4 (ADR-013 pre2): resources ride the descriptor. A (re-)admission rebuilds from
-                // VISIBLE rows only -> all-live, no version regions, hwm 0.
+                // D4/R3-003: resources ride the descriptor. Re-admission is normally all-live;
+                // while an older transaction exists, the compact created_by sidecar preserves
+                // newer conflict/visibility stamps across the rebuild.
                 device_memory: Some(Arc::clone(&dm)),
                 deleted_by_region: None,
-                created_by_region: None,
+                created_by_region: admitted_created_by_region,
                 row_id_region: admitted_row_id_region,
-                max_created_by: 0,
+                max_created_by: resident_created_by.iter().copied().max().unwrap_or(0),
             };
             let mut shard_memory = BTreeMap::new();
             shard_memory.insert(0_u32, dm);

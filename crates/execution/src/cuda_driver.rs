@@ -184,6 +184,27 @@ impl CudaDriverRuntime {
         })
     }
 
+    /// Allocate a retained device buffer and initialize every byte with `cuMemsetD8`. This is the
+    /// index/table-construction primitive: allocation initialization stays on-device instead of
+    /// manufacturing an O(bytes) host zero vector merely to upload it.
+    pub fn retain_device_memory_zeroed(
+        &self,
+        gpu_id: u16,
+        allocated_bytes: u64,
+    ) -> Result<CudaResidentDeviceMemory, CudaRuntimeProbeError> {
+        self.retain_device_memory_recompacted(
+            gpu_id,
+            allocated_bytes,
+            &[],
+            &[RecompactFill {
+                byte_offset: 0,
+                len: allocated_bytes,
+                fill_byte: 0,
+            }],
+            &[],
+        )
+    }
+
     /// STRATA S-E.5 (streaming copy/compute overlap): retain a device allocation whose HtoD upload is
     /// enqueued ASYNCHRONOUSLY on a private pooled stream from a pinned staging buffer, so the DMA
     /// overlaps whatever the host (chunk staging) and the SMs (the previous chunk's kernels, on their

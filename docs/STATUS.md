@@ -10,9 +10,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Production relational reads execute through resident, streaming, transient-relation, or CUDA-native MVCC
   GPU paths. A decline or device fault fails loudly; it never executes relational work on the host.
 - Test-only CPU semantic infrastructure remains under `cfg(test)` pending **RETIRE-001**.
-- The host write/commit/MVCC tuple-store path, host DML indexes/probes, generic CUDA-MVCC host result
-  post-processing, and recovery repair operators remain pending **R3-002**, **R3-003**,
-  **R3-004**, **RETIRE-002**, and **RETIRE-003**.
+- The host write/commit/MVCC tuple-store path and bootstrap DML indexes/probes remain pending **R3-004** and
+  **DUR-002**; generic CUDA-MVCC host result post-processing and recovery repair operators remain pending
+  **RETIRE-002** and **RETIRE-003**. R3-002/R3-003 passed independent adversarial acceptance on 2026-07-17.
 
 ## Read path and STRATA
 
@@ -44,122 +44,133 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 ## Write path, durability, and recovery
 
-- The classic serial/replay paths enforce WAL-before-visibility, and strict lane acknowledgements wait behind the
-  durability/apply join. The durable path includes append-only/checkpointed WAL, FUA intent lanes, contiguous
-  exclusive durable-next prefixes, lane recovery/recycle, group commit, and fused device apply for eligible shapes.
-  R3-006 reproduced the live exclusive-next/inclusive-snapshot defect: local `[0,1)` at global base 41 published
-  42 instead of 41. The pump and resize barrier now convert the joined exclusive prefix to the checked inclusive
-  sequence before publication; claims refuse wrap before WAL append, and the cold-checkpoint writer accepts only
-  the same inclusive recovery boundary. Seven CPU boundary tests cover empty/first/normal/exhausted conversion and
-  both durable/apply lag directions. The ordinary engine suite passes 509/509 with 487 GPU tests ignored; focused
-  real-GPU lane recovery, UPDATE, async-drain, and cold-checkpoint mismatch gates pass 4/4.
-- Covered int4-PK INSERT/UPDATE/DELETE intent paths and mixed GPU read/write execution are live. Wider write
-  shapes and implementation of the accepted GPU-native write/MVCC model remain **R3-002** and **R3-003**.
-- **ADR-014 is accepted as of 2026-07-16**, completing **R3-001**. The accepted package is reconciled against source
-  commit `f701d8b6`: it includes explicit
-  identity/STRATA/conveyor/transaction/host-debt traceability, normative row/transaction/isolation/publication/
-  recovery/migration state machines, a snapshot-age capacity model, and fresh focused GPU/CPU correctness results.
-  Separate 2026-07-15 adversarial performance, durability/resilience, transactional ACID, and consistency/accuracy
-  audits all returned **REVISE before acceptance**. Their findings are incorporated as bounded adaptation; an explicit
-  autocommit/predeclared/interactive lifecycle; RC/RR semantics with fail-loud serializable; failed-transaction and
-  transaction-characteristic/DDL-overlay rules; minimum per-token validation floors owned through ticket drop;
-  documented RC `40001` target-recheck deviation; shared/exclusive FK guards; transactional sequence restart versus
-  nontransactional SQL sequence values plus private-CREATE/RESTART versus ordinary stable-ID effects and
-  operation-specific `currval`; transactional session defaults; in-transaction statement versus terminal
-  completion; explicit genesis/exhaustion; the RR stable-catalog deviation; stable-ID object lifecycle ordering;
-  semantic metadata/rewrite classification with typed missing values; PG16 non-MVCC rewrite guards/fences;
-  ordered statement/enclosing outcomes; non-circular typed commit/no-op/abort
-  markers; pre-side-effect claims plus checkpointed/reconciled digest-bound statement/terminal status; lane-local
-  physical/global logical WAL ordering; exclusive conveyor-next versus inclusive MVCC-sequence conversion;
-  placement exposed only through atomic `{visible_next, database_root, publication_epoch}` acquisition; cut-exact
-  checkpoints; immutable
-  artifact/pointer reachability; allocator/format lineage; indeterminate post-log resolution; recovery supervision;
-  bounded non-commit tickets; and explicit local/replicated RPO scope. The live facade/server still commits DML per
-  statement under transaction-state bookkeeping, erases requested isolation modes, lacks ReadyForQuery `E`, and can
-  return current async SQL-like success before visibility; these are R3-003/DUR-002 gaps, not target evidence. The
-  reviewed decision-level ACID/failure trace matrix is complete: 115 compact trace rows cover row/object overlays,
-  transaction/session/isolation, constraints/sequences, conveyor/publication/acknowledgement, WAL/checkpoint/
-  activation/recovery/migration, and service/GC pressure with explicit authority and graduation owners. The current
-  Candidate-A current-implementation measurement has run and remains **FAIL** under the revised W1
-  0.8/1.5/5-ms target: strict 1,000-offered INSERT p50 is 2.88 ms;
-  100,000-offered INSERT p99 is 210.29 ms; the measured mixed path achieves 92,744 TPS with 44.88-ms p99; and the
-  actual narrow insert allocation is 244,897,808 bytes for 300,003 appended versions (816.3 B/version), with
-  433.3 physical FUA WAL bytes/op. The current intent route rejects non-INT4 widths. A same-physics fixed-record
-  harness measures the queue-depth-one durability distribution at 1.662-ms p50/1.723-ms p99; the actual
-  engine-facing `FuaFrameLog` completes 4,000 queue-depth-one fences in 6.169 seconds (1.542 ms/fence average).
-  The fixed-record harness is supporting fence-physics evidence, not the relational lane. A build-only
-  resident-input comparison across 8/32/128-byte rows, 1/3/6 indexes, and batch sizes 1/256/4,096 fences the odd/
-  even seqlock transitions, ends undo at the replacement commit, asserts old/current visibility, and selects compact
-  append/tombstone in every p50 cell; the semantically complete formats are byte-tied. The corrected build-only
-  13-family controller injection model derives W1/T8/T32 only after complete operation/mutation/resource admission,
-  rejects class escalation and every count/resource overflow, derives the wave deadline from that admitted class,
-  and qualifies p50/p99/p99.9 independently with strict equality failure for every class and percentile. It also
-  passes cold/index preclaim, both lag directions, sparse/global skew, wave caps, hard credits, held-snapshot
-  pressure, hysteresis, cold-quota/disabled-maintenance rejection, overlap/yield, starvation override, and global-
-  drain-resize refusal.
-  This selects the physical design without accepting the current 816-B allocation or relabeling its end-to-end SLO
-  failure. The five-minute capacity argument is explicit: the
-  current serial/FUA replay paths measure about 38–40k outcomes/s; a two-attempt profile uses a 19,200/s floor,
-  32-GiB artifact cap, 1,000,000-outcome suffix cap, and future 512-MiB/s canonical restore floor to bound recovery
-  at 292.18 seconds. The current rotated checkpoint still replays O(full history), so DUR-001/002 must implement and
-  qualify the accepted bounded canonical path. Final packet reviews v1/v2/v3 returned **REJECT**; their
-  selection/provenance/task-reference, undo-visibility/seqlock/adaptation-evidence, and pressure-state/wave-trigger
-  blockers are corrected. The controller model now tests soft/high/hard/lower recovery, pre-deadline byte/service
-  shipment, and oversized-item pre-claim rejection. Frozen packet v4 passed fresh independent review with
-  **ACCEPT** and no remaining pre-acceptance blocker under the prior uniform latency target. The accepted target
-  policy now separates R1 reads (0.5/1/5 ms), W1 single keyed synchronous mutations (0.8/1.5/5 ms), T8 bounded
-  predeclared transactions (1.5/3/10 ms), and T32 bounded predeclared transactions (3/6/20 ms); W1 operations and
-  all classes qualify independently. Focused packet v5 returned **REVISE**: the executable did not derive class from
-  the full envelope, treated p99-only compatibility as complete profile qualification, the throughput targets did
-  not select TPS versus operations/s or a reference mix, and an active isolated benchmark retained 0.5/1/5-ms write
-  prose. The corrections bind >100,000 sustained aggregate committed TPS and a 400,000-transaction peak cohort to a
-  deterministic
-  60% R1 / 25% W1 / 10% maximum-shape T8 / 5% maximum-shape T32 mix. Its 3.25 operations/transaction imply
-  >325,000 and 1,300,000 logical operations/s; standalone class sweeps are diagnostic only. Focused packet v6
-  returned **REVISE** because exact route/data/access manifests remained deferred, one-second peak cohort accounting
-  and burst enumeration were ambiguous, and an active read-QPS gate retained a conflicting system-SLO label.
-  Immutable `docs/design/oltp-benchmark-workload-v1.md` now fixes schema/cardinality, seed/skew, exact SQL/order,
-  numeric route envelopes, 30+600-second sustained timing, and named `B01`–`B10` cohorts. Focused packet v7 returned
-  **REVISE** because the sustained arrival timestamps, generated ledger/DELETE ordinals, and T32 pair/amount
-  assignments were not fully executable. Workload v1 now also fixes every warm-up/measurement arrival timestamp,
-  excludes warm-up completions from sustained TPS, and fixes every zero-based generated ordinal, parameter-stream
-  consumption, and debit/credit amount assignment. Peak TPS is committed
-  cohort count divided by the fixed arrival second; wall completion throughput is diagnostic, every cohort must
-  pass, and the active route gate is explicitly local. Replacement packet v8 is frozen at `c9628766`; all 24 hashes
-  and executable gates passed, fresh independent review
-  returned **ACCEPT** with no material blocker, and the user explicitly accepted ADR-014. `DECISIONS.md` and
-  `ARCHITECTURE.md` now carry the binding ledger and stable system contracts. The implemented standalone canonical
-  campaign remains under R3-002/003, DUR-001/002, and RETIRE-002 before production authority or
-  host-store removal;
-  HA-001 is additional only for replicated/node-loss-RPO deployment.
+- WAL-before-visibility is enforced. The durable path includes append-only/checkpointed WAL, FUA intent lanes,
+  contiguous durable cuts, lane recovery/recycle, group commit, and fused device apply for eligible shapes.
+- Covered typed INSERT/UPDATE/DELETE intent paths and mixed GPU read/write execution are live. Typed-index and
+  full transaction/GC acceptance are complete; bootstrap host authority remains deletion debt under **R3-004**.
+- ADR-014 selects append/tombstone MVCC as the single logical write model: stable entity identity, immutable
+  versions, version-aware device indexes, and one visibility rule across temperature-specific resident/cold GPU
+  encodings. The current host-store-first recovery and host index/probe fallbacks are migration debt, not target
+  authority.
+- **R3-002 typed device indexes cover the supported write surface.** Single-column INT2/INT4/INT8/DATE/TIMESTAMP,
+  NUMERIC, UUID, BOOL, and TEXT keys plus compound and nullable keys use raw keys or canonical fingerprints with
+  exact typed collision recheck. Hot-shard and cold-chunk initial index construction now reads resident typed
+  columns, deleted stamps, BOOL bitmaps, and TEXT offsets directly on device, builds a zeroed open-addressed device
+  table, and returns only a bounded verdict; it no longer downloads keys/fingerprints for a host build and uploads
+  the table. Index decline and partial-NULL compound keys use an exact typed device predicate and materialized
+  tuple/entity recheck. Authoritative hot/cold DML fails closed when no device verdict is available rather than
+  rehydrating for `CachedShardPkIndex` or a host probe. Focused duplicate, GC-boundary, wide/text/BOOL, compound,
+  partial-NULL, FK, recovery, and hot/cold controls pass. Independent adversarial audit accepted this boundary;
+  global deletion of bootstrap/test fallback source is **R3-004**.
+- **Production unique conflict history is device-current.** Visible-locate returns, per key, the maximum real
+  `created_by`/`deleted_by` stamp across every matching physical version independently of the requested visibility
+  snapshot. Classic typed hot and cold DML issue exact device predicates for every old released and new claimed
+  unique tuple; explicit transactions do the same against their `BEGIN` boundary. Intent lanes use that stamp plus
+  a bounded same-wave set and an unpublished-apply slot bridge. A transient descriptor/index race retries once
+  behind the lane device-publication boundary; absence of a stable device verdict still fails closed. The production
+  `RecentCommitsLedger` now retains row identities only; its typed and i32 unique maps exist solely under `cfg(test)`
+  as driverless semantic oracles. Hot autocommit TEXT key-away, hot explicit-transaction key-away, and cold-chunk
+  claim/release controls prove that a currently free key still serializes a stale writer from device history.
+- **R3-003 stable entity identity is live end to end.** The GPU visible-locate kernel returns the matched version's
+  resident identity with its `(shard, slot)` verdict; covered intent-lane UPDATE appends the replacement with that
+  same identity, the rare rehydrate fallback resolves key-to-identity without inventing one, and replay migrates
+  existing v1 `new_row_id` records by treating that field only as the legacy allocator reservation. The PTX
+  fail-closed/identity control, lane UPDATE identity gate (three sequential plus two concurrent executions),
+  recovery, and sustained version-aware-index controls pass. The current engine library inventory is 519 ordinary
+  plus 514 GPU-ignored tests, the complete serial inventory passes 1,033/1,033, and workspace
+  all-target/all-feature check plus strict workspace Clippy
+  are clean. The identity-only sub-slice did not change a read-kernel family or residency layout.
+- **R3-003 transaction snapshot ownership now has a real lifetime boundary.** `ActiveSnapshots` folds keyed
+  explicit-transaction holds and statement-local guards into the same ordered commit-sequence registry. Engine
+  `BEGIN` captures one boundary under transaction control; `COMMIT`/`ROLLBACK` release it, `AND CHAIN` transfers to
+  a fresh transaction, and the session façade drives those engine transitions and aborts on close. A focused
+  lifecycle test holds snapshot 1 while commit 2 publishes and proves checkpoint vacuum at 1 is rejected until
+  rollback; registry multiplicity, chain transfer, session commit/rollback, and close-abort controls pass. The
+  lock-free shared façade now exposes a connection-local `SharedSession`; blocking and async pgwire loops
+  create/close it, and transaction-bound async traffic skips
+  cross-session point-read batching. The keyed hold is now a generation-owned bundle: commit boundary, exact catalog,
+  every current table-version handle, single-buffer entries, shard descriptors, and their
+  device/version/identity/index resource pins. Sequential and shared-session SELECT scope the deep GPU read stack to
+  that bundle. Non-vacuous controls prove a table absent at `BEGIN` stays absent after a later first insert through a
+  zero-row transient GPU relation, while old single-buffer and shard allocations remain executable after
+  current-generation UPDATE re-admission; current autocommit reads see the replacement bytes. The two façade
+  connection modes pass the same old-generation control.
+- **R3-003 resident explicit transactions now stage and commit atomically.** Supported FK-free resident
+  INSERT/UPDATE/DELETE prepares under the retained transaction scope, including prior private mutations. Each
+  statement publishes an immutable transaction-private shard map, so SELECT and subsequent DML observe
+  read-your-writes while autocommit readers remain on the global generation. COMMIT remaps provisional INSERT
+  identities from one claimed allocator block; serializes ordered resolved INSERT/UPDATE/DELETE row images in one
+  binary WAL transaction record; fsyncs before apply; and publishes every touched relation at the same single commit
+  index. Replay consumes that record without predicate re-evaluation and reproduces NULLs, final stable identities,
+  allocator high-water, row visibility, and the one-generation boundary.
+- Existing-row first-committer-wins validation is device-native for this slice: COMMIT resolves stable identity,
+  reads the version `created_by` stamp, and verifies complete nullable resident bytes. A same-value external UPDATE
+  after BEGIN therefore conflicts even after current-generation re-admission. When an older transaction requires
+  that evidence, admission retains an on-demand `created_by` sidecar; terminal control advances the shared
+  oldest-active boundary and removes the redundant sidecar/write-owner when safe without invalidating a captured
+  generation. Nullable admitted shards also retain append headroom, so NULL-bearing commits use incremental device
+  maintenance instead of O(table) re-admission. The atomic target passed three sequential plus two simultaneous GPU
+  executions; the post-staging conflict/sidecar-GC, retained-generation release, NULL rollback, recovery, and both
+  sequential/shared facade privacy controls pass.
+- **R3-003 sequence-default state is transaction-owned.** Pure default evaluation seeds each statement from the
+  transaction's prior sequence post-state rather than the published catalog, so multiple private INSERTs allocate
+  one ordered value stream without global mutation. The final per-sequence `(last_value, is_called)` map is encoded
+  deterministically in the same resolved binary transaction record as the rows; live apply and recovery install it
+  under the same catalog/data commit boundary. Rollback discards the private state, so the next autocommit consumes
+  the unspent value. The actual-GPU multi-statement/visibility/recovery/rollback target passed three sequential and
+  two simultaneous executions.
+- **R3-003 cold, cross-table, and reclamation implementation is present.** Transaction-private cold chunks carry
+  stable entity identities and immutable COW tails/sidecars across INSERT/UPDATE/DELETE, publish through the same
+  resolved transaction WAL record, and recover to the same logical state. COMMIT validates current-device unique
+  conflicts plus outbound/inbound FK and cross-table stamps before WAL publication. Oldest-active fencing now
+  reclaims bounded resident tuple versions and relational value-index entries without invalidating retained
+  generations. Four high-risk targets—cold transaction/recovery, unique self-exclusion, cross-table FK, and W0
+  invalidation—each pass three sequential plus two concurrent GPU executions with no CUDA 700/716/717. Device
+  unique-history retirement additionally passes the write-locate, lane DELETE, hot key-away, and cold transaction
+  HAZARD matrices; the durable concurrent-intent recovery target passes its own three sequential plus two
+  simultaneous matrix after stable device-publication retry was added.
+- **R3-002/R3-003 independent acceptance is complete.** The final audit accepted exact device history floors across
+  dense/current-only rebuilds and additive/private shard generations, transaction-private hot/cold COW publication,
+  retained-generation and safe-horizon reclamation, exact nullable/compound/wide unique verdicts, and structural
+  tail-maintenance quiescence. It also required and accepted a definitive class-authoritative parent-DELETE inbound
+  FK recheck under `commit_mutex` immediately before WAL. A deterministic barrier proves the child commits after
+  provisional validation and before that serialized recheck; rejection appends no parent WAL, does not poison the
+  commit path, and survives recovery with low facade transaction IDs. The history/epoch test proves physical
+  compaction is deferred while an old generation is pinned and becomes eligible after retirement. No audit blocker
+  remains; R3-002/R3-003 are completed facts and have been removed from `PLAN.md`.
+- **R3-005 is closed.** The lane DELETE end-to-end control proves two same-key DELETEs produce exactly one winner
+  and never double-count. It also proves that a zero-row DELETE of a never-existing key leaves no stale arbitration
+  slot: a subsequent same-key covered INSERT succeeds with one affected row. The target passes three sequential
+  plus two simultaneous GPU executions, with non-vacuous visible-locate and tombstone counters.
 - Crash-durable replay exists; the broader fault campaign, automatic lane checkpointing, PITR timestamps, and
   multi-node quorum integration are **DUR-001**, **DUR-002**, and **HA-001**.
 
-## ADR-014 acceptance closeout verification — 2026-07-16
+## Verification snapshot — 2026-07-17
 
-- PR-wide whitespace validation from base `f701d8b6`, strict workspace all-target/all-feature Clippy, and the
-  CPU-neutral workspace CI suite pass.
-- The complete serial all-feature engine library gate passes **996/996**, including the GPU intent-lane,
-  residency, recovery, transaction-adjacent, and STRATA paths. This verifies the acceptance/documentation closeout;
-  it does not replace the R3-002/003 and DUR-001/002 production graduation evidence.
-- Post-acceptance documentation compaction retains five active ADR/workload contracts, archives 25 source-crosswalk,
-  audit, candidate, packet, and verdict documents under `docs/archive/reviews/write-path-adr-014-acceptance/`, and
-  removes the two disposable decision models from Cargo example discovery while preserving them in that archive.
-
-## Verification snapshot — 2026-07-14
-
-- Engine library: ordinary mode **505 passed, 0 failed, 487 GPU-ignored**; complete serial mode
-  **992 passed, 0 failed, 0 ignored**.
+- Engine library: **519 ordinary + 514 actual-GPU = 1,033/1,033** passed. Execution library:
+  **56 ordinary + 79 actual-GPU = 135/135** passed. Facade library:
+  **39 ordinary + 8 actual-GPU = 47/47** passed.
+- Nine high-risk device-history, transaction, tail-handoff, lane-probe, sharded-publication, and retained-completion
+  families passed three sequential plus two concurrent HAZARD invocations. The corrected class-FK TOCTOU and
+  pinned-history epoch/compaction tests each passed ten consecutive GPU invocations. A broader facade
+  concurrency-stress run previously passed 9, failed 4, and left 1 ignored; its
+  shape-changing-DDL/read route declines and elided-rehydration race are verification debt under **READ-001**, not
+  acceptance evidence for this transaction slice.
 - Production transient GPU integrations: catalog and bounded-function routes pass.
 - Pgwire: ordinary suite **3 passed** plus the ignored non-vacuous sharded/NULL GPU golden passes.
 - Production mixed gate: **116.2k reads/s**, p50 **246us**, p99 **501us**, p99.9 **671us**; zero host gathers,
-  zero fallback groups, and 160/160 host-install-elided writes. Its read-QPS floor is gate-local non-vacuity
-  evidence, not the charter's aggregate mixed-system TPS gate.
-- Read roofline: in-L2 `count_i32_compare` approximately **0.87x** the same-run `sum_i32` roofline; grouped
-  kernel approximately **1,678 M elements/s**.
-- Canonical report card: 48M-row out-of-L2 batched route **250.2M lookups/s at batch 65,536, p50 132us**;
-  indexed single-flight route **3.23x** the scan.
-- Production release check, engine/facade examples, static host-row-removal guard, and diff whitespace check pass.
+  zero fallback groups, and 160/160 host-install-elided writes.
+- Read roofline repeat: in-L2 ratios are `equal_any` **0.462x**, ordered projection **0.133x**, ordered compaction
+  **0.026x**, arithmetic filter **0.024x**, compare count **0.880x**, and between count **0.442x** the same-run
+  **1,383.1 GB/s** `sum_i32` roofline; out-of-L2 roofline is **1,426.8 GB/s**, gather is **349.5/155.3 GB/s**
+  in/out of L2, constant-mask output is **1,152.6/1,497.1 GB/s**, and grouped kernel is **1,677.0 M elements/s**.
+- The canonical two-layer/two-cache-regime report card completes. Its 48M-row out-of-L2 batched route reaches
+  **276.7M lookups/s, p50 108us** at batch 65,536; indexed single-flight reaches **38.2M lookups/s, p50 1,588us**
+  and **3.22x** the scan route. The corresponding in-L2 batched route reaches **268.4M lookups/s, p50 119us**.
+  The 48M-row build completes in **165.1s**. No material same-run baseline ratio regression is present.
+- Workspace all-target/all-feature check, strict workspace all-target/all-feature Clippy, global formatting,
+  source size, and diff whitespace gates pass. The independent R3-002/R3-003 audit returned **ACCEPT** with no
+  remaining blocker.
 
 ## Structural decomposition
 
@@ -364,7 +375,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   14 concurrent invocations without CUDA 700/716/717. Workspace all-target/all-feature check and execution
   clippy are green. The execution root is 19,020 lines. Independent extraction audit was clean and exposed
   pre-existing raw address/context/extent/geometry and launched-error-drain gaps in the safe APIs, closed by
-  the following **STRUCT-001AB** hardening without changing the broader **R3-001** design.
+  the following **STRUCT-001AB** hardening without pre-empting the then-open write-model decision.
   That write-apply hardening is complete. `CudaWriteDestination`, `CudaWriteIndex`, and
   `CudaCompoundFoldColumn` replace arbitrary device addresses; same-context identity, 4/8-byte alignment,
   allocation extents, staging/u32 arithmetic, exact power-of-two index geometry, append load capacity, and
@@ -2113,8 +2124,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   and generation capture, zone-map/local-slot correctness, W0 liveness, the already-dead filter, exact-one fingerprint
   tuple verification, zero-row handling, partial-failure re-admit, tombstone-before-append ordering, multi-row identity,
   the SV6 `created_by` stamp, and churn accounting are unchanged. Dependencies flow one-way to shard pruning,
-  predicate lowering, and existing resident mutation/read primitives; the then-future R3-001 design boundary is now
-  accepted as ADR-014, while this extracted code remains current implementation rather than target authority.
+  predicate lowering, and existing resident mutation/read primitives. The extraction deliberately did not pre-empt
+  the then-open write-model decision; ADR-014 later closed it.
   Twelve focused GPU transition tests pass, as do both 505/487 engine modes, the complete 992-test GPU suite,
   all-target check, strict clippy, exact-source/consumer/visibility/dependency/scoped-format/diff/docs gates, and
   independent audit. Fifteen GiB of generated residue was removed. Runtime behavior did not change, so HAZARD and
@@ -2856,7 +2867,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   caller/dependency/format/diff checks, 68 GiB generated-residue cleanup, fresh inventory, and independent audit are
   clean. Strict rustdoc remains the pre-existing link-warning baseline recorded at IW. Runtime behavior is unchanged,
   so HAZARD/report card were inapplicable. Final file disposition is complete with a 1,761-line parent and bounded
-  851/660/1,465-line children, no exception, cycle, context bag, API drift, or R3-001 decision. The actionable
+  851/660/1,465-line children, no exception, cycle, context bag, API drift, or write-model decision at extraction
+  time. ADR-014 later closed that decision. The actionable
   inventory is now 20: seven production, nine tests, and four examples/tools. STRUCT-001IZ owns `mvcc_read_exec.rs`.
 
   STRUCT-001IZ then isolated the exact MVCC row projection, size/transfer accounting, filter, ordering, and
@@ -3964,17 +3976,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Boundary | Work ID |
 |---|---|
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
-| Wider-type/compound-key write and read fast-path coverage | **R3-002**, **READ-002** |
-| Deterministic CC, transaction-held snapshots, VACUUM/GC | **R3-003** |
+| Non-int4 O(1) point-lookup breadth | **READ-002** |
 | Host write/store deletion | **R3-004** |
 | Test-only CPU semantic oracle | **RETIRE-001** |
 | Reverse-gather/deauthorization/scan-build DDL and recovery repair | **RETIRE-002** |
 | Generic CUDA-MVCC host compaction, ordering, projection, and result assembly | **RETIRE-003** |
-| Host `CachedShardPkIndex` and DML/constraint probe fallback | **R3-002**, **R3-004** |
+| Host `CachedShardPkIndex` and bootstrap/test DML/constraint probe source | **R3-004** |
 | Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |
 | Two physical GPUs have not executed the scheduler, device-locate, or typed sidecar context gates | **MULTI-001**, **MULTI-002**, **MULTI-003** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |
-| Lane DELETE residuals and empty-aggregate pgwire NULL seam require focused disposition | **R3-005**, **READ-003** |
+| Empty-aggregate pgwire NULL seam requires focused disposition | **READ-003** |
 | Lanes auto-checkpoint/PITR and full crash campaign | **DUR-001**, **DUR-002** |
 | Multi-node Raft/quorum serving is not integrated | **HA-001** |
 | Connection/runtime scale and bounded result streaming | **SCALE-001** |

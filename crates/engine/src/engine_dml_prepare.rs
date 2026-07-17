@@ -7,6 +7,9 @@
 use super::*;
 
 mod contracts;
+pub(crate) use contracts::device_structural_tuple_predicate;
+mod device_tuple;
+mod unique_conflict;
 
 use contracts::device_eq_scan_literal;
 pub(crate) use contracts::{
@@ -145,11 +148,10 @@ impl Engine {
         let has_constraints = table.indexes.iter().any(|index| index.unique)
             || !table.check_constraints.is_empty()
             || !table.foreign_keys.is_empty();
-        // Ledger #18: the under-lock re-resolve skips the redundant unique/CHECK pass on
-        // FK-free tables — the ledger conflict check IS the commit-time guard (see
-        // [`InsertPrepareValidation`] for the coverage proof). Measured: the second validator
-        // probe per commit was the PK'd arm's largest sequencer-side residual.
-        let ledger_covered = validation == InsertPrepareValidation::ReResolveLedgerCovered
+        // The under-lock re-resolve skips the redundant unique/CHECK pass on FK-free tables: exact
+        // device version history plus wave-local arbitration is the commit-time guard (see
+        // [`InsertPrepareValidation`] for the coverage proof).
+        let device_covered = validation == InsertPrepareValidation::ReResolveDeviceCovered
             && table.foreign_keys.is_empty();
         // M1 design B (wave-time batched validation): eligible INSERTs DEFER the PK-unique check
         // to the wave sequencer (one batched device locate for the whole wave). The off-lock
@@ -176,11 +178,14 @@ impl Engine {
         {
             match self.validate_class_insert_uniqueness(table, &new_rows, txn_id, None) {
                 Some(verdict) => verdict?,
-                None => self.deauthoritize_chunk_table(&table.name, false)?,
+                None => {
+                    self.guard_transaction_dml_rebind(&table.name, "cold-chunk uniqueness source")?;
+                    self.deauthoritize_chunk_table(&table.name, false)?;
+                }
             }
         }
-        if ledger_covered || wave_deferred {
-            // fall through to encode: PK not-null ran; unique covered by the ledger (#18) or
+        if device_covered || wave_deferred {
+            // fall through to encode: PK not-null ran; uniqueness is device-history-covered or
             // deferred to the wave batch (B).
         } else if self.dml_value_index_resolve_enabled() && !self_referencing_fk {
             if has_constraints {
@@ -343,7 +348,7 @@ impl Engine {
         let prefix = relational_key_prefix(&delete.table);
         // Resolve (tuple_id, key, row) for each matching version against this table's published
         // generation: tuple_id is what apply tombstones; key/row feed the write-set entries.
-        let mut table_rows = self.read_state.mvcc.table_rows(&delete.table);
+        let mut table_rows = self.read_table_rows_at(&delete.table, txn_id);
         let has_inbound_fks = catalog.relational_catalog.values().any(|candidate| {
             candidate
                 .foreign_keys
@@ -372,8 +377,9 @@ impl Engine {
                     class_resolved = Some(matches);
                 }
                 None => {
+                    self.guard_transaction_dml_rebind(&table.name, "cold-chunk predicate source")?;
                     self.deauthoritize_chunk_table(&table.name, false)?;
-                    table_rows = self.read_state.mvcc.table_rows(&table.name);
+                    table_rows = self.read_table_rows_at(&table.name, txn_id);
                 }
             }
         }
@@ -388,9 +394,10 @@ impl Engine {
                 // GAP-1 TOCTOU: a table eliding between the concurrent guard's check and
                 // this prepare now rehydrates under the commit lock, never a bare
                 // `with_table_mut` race.
+                self.guard_transaction_dml_rebind(&table.name, "resident predicate source")?;
                 self.rehydrate_elided_serialized(&table.name)?;
                 // A5 FLIP SI FIX: the scan below must read the FRESH generation.
-                table_rows = self.read_state.mvcc.table_rows(&table.name);
+                table_rows = self.read_table_rows_at(&table.name, txn_id);
             }
             None
         } else {
@@ -411,7 +418,7 @@ impl Engine {
                     // then stamps an ALREADY-DEAD slot (exact-count 1 passes!) and leaves
                     // the truly-current version live forever; a stale-EMPTY view silently
                     // LOSES the update (0 matches). RE-PIN before every fallback.
-                    table_rows = self.read_state.mvcc.table_rows(&table.name);
+                    table_rows = self.read_table_rows_at(&table.name, txn_id);
                     match Self::resolve_dml_matches_via_value_index(
                         table,
                         &table_rows,
@@ -549,14 +556,12 @@ impl Engine {
     /// shards); every hit must carry a STAMPED identity (sentinel/absent region = unknown lineage).
     /// The locate is PHYSICAL (a tombstoned row still hits): the keyed fetch at `visibility` is the
     /// authoritative filter — a host-invisible row resolves to no match, exactly as the scan would.
-    /// COMPOUND KEYS (operational cases): pick the device PK-index probe key for a DELETE/UPDATE
-    /// resolve over one Eq-predicate `group`. Preference: a COMPOUND unique index whose EVERY key
-    /// column is Eq-covered in the group by an i32-section value -> `(FLAG | ordinal, fingerprint)`
-    /// (folded in key-column order, byte-matching the device-built index); else the FIRST i32-section
-    /// Eq -> `(col_idx, needle)` (the single-column key, byte-identical to the prior behavior). `None`
-    /// when no i32-section Eq exists. The caller's full `filter_groups` recheck restores exactness, so
-    /// a compound fingerprint collision here can never delete/update the wrong row.
-    fn dml_device_probe_key(
+    /// Pick the device index probe key for a DELETE/UPDATE resolve over one Eq-predicate `group`.
+    /// Preference: a fingerprint-backed unique index (compound or single wider/text) whose EVERY key
+    /// column is Eq-covered -> `(FLAG | ordinal, fingerprint)`, byte-matching the device-built index;
+    /// else the FIRST raw i32-section Eq -> `(col_idx, needle)`. The caller's full `filter_groups`
+    /// recheck restores exactness, so a fingerprint collision can never target the wrong row.
+    pub(crate) fn dml_device_probe_key(
         &self,
         table: &RelationalTable,
         group: &[(usize, SelectFilterOp, SqlValue)],
@@ -568,14 +573,11 @@ impl Engine {
                 eqs.push((*idx, value));
             }
         }
-        // Prefer a COMPOUND unique index whose EVERY key column is Eq-covered by a FOLDABLE value
-        // (i32/i64 sections). Fold each column's i32 WORDS (`sql_value_key_words`) in key-column order,
-        // byte-matching the device-built index.
-        for (ord, index) in
-            table.indexes.iter().enumerate().filter(|(_, index)| {
-                index.unique && crate::engine_residency::index_is_compound(index)
-            })
-        {
+        // Prefer a fingerprint-backed unique index whose EVERY key column is Eq-covered by a
+        // foldable typed value. Fold in key-column order, byte-matching the device-built index.
+        for (ord, index) in table.indexes.iter().enumerate().filter(|(_, index)| {
+            index.unique && crate::engine_residency::index_uses_fingerprint(table, index)
+        }) {
             let Some(positions) = crate::engine_residency::index_key_column_positions(table, index)
             else {
                 continue;
@@ -633,6 +635,7 @@ impl Engine {
         table_rows: &crate::resident_storage::TableRowsView,
     ) -> Result<Option<Vec<DmlResolvedMatch>>, EngineError> {
         let elided = self.table_install_elided(&table.name);
+        let transaction_scoped = self.current_transaction_read_snapshot().is_some();
         // A4e: EVERY decline on an elided table must REHYDRATE first (sticky de-elision) — the
         // fallbacks below the ladder read the STALE store (elided commits never installed), so a
         // plain decline hands them wrong-empties or stale matches. This includes the SHAPE
@@ -648,6 +651,7 @@ impl Engine {
                 // VANISHED from the device (k=5 bisect: 202 reconciled, store readable 200,
                 // point500=0). `_serialized` stamps at the ENGINE's committed_seq and is
                 // lock-aware, like every other prepare/probe seam post-audit.
+                engine.guard_transaction_dml_rebind(&table.name, "resident predicate source")?;
                 engine.rehydrate_elided_serialized(&table.name)?;
             }
             Ok(())
@@ -717,10 +721,12 @@ impl Engine {
             }
             let key = relational_row_key(&table.name, row_id);
             debug_assert!(key.starts_with(&prefix));
-            // A4e: an ELIDED table's rows exist ONLY on the device — the host store is a stale
-            // prefix. Materialize row + visibility from the hit (A4a); tuple_id is synthetic
-            // (= row_id; apply skips host tombstoning for elided tables, nothing consumes it).
-            if elided {
+            // A4e: an ELIDED table's rows exist ONLY on the device. R3-003 extends the same
+            // authority rule to an explicit transaction's private generation: even when the
+            // globally published table retains a host reference generation, prior transaction
+            // deltas exist only in the private GPU shards. Re-fetching the retained host tuple
+            // here would erase read-your-writes for the next DML statement.
+            if elided || transaction_scoped {
                 match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
                     Some(Some(row)) => {
                         if filter_groups.iter().any(|filters| {
@@ -1065,7 +1071,7 @@ impl Engine {
     /// old slot) is neutralized by the fetch-at-visibility + structural recheck, exactly like the
     /// stale host-index entry it mirrors. NULL / non-Int4 values decline (host structural
     /// semantics, NULL == NULL, serve them).
-    fn device_visible_row_with_value(
+    pub(crate) fn device_visible_row_with_value(
         &self,
         table: &RelationalTable,
         mut visibility: StorageVisibility,
@@ -1077,7 +1083,9 @@ impl Engine {
             return None;
         }
         if self.table_chunk_authoritative(&table.name).is_some() {
-            visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
+            if self.current_transaction_read_snapshot().is_none() {
+                visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
+            }
             return self.chunk_class_visible_row_with_value(
                 table,
                 visibility.read_txn_id,
@@ -1086,41 +1094,61 @@ impl Engine {
                 exclude_keys,
             );
         }
-        // TYPE-COVERAGE track 2: i32-section needles (Int4/Date/Int2) probe the device hash
-        // index with the exact section encoding; other types have NO device index and go
-        // straight to the elided scan arm below.
+        // Raw i32-section needles use their catalog-column cache key. A single-column wider/text
+        // UNIQUE uses its flagged fingerprint index and the typed row-value recheck below restores
+        // exactness. Non-indexed values go to the device Eq scan arm.
         let column_ty = table.columns.get(column_idx)?.ty;
-        let index_hits =
+        let fingerprint_index = table.indexes.iter().enumerate().find(|(_, index)| {
+            index.unique
+                && index.key_columns.len() == 1
+                && crate::engine_residency::index_key_column_positions(table, index)
+                    .is_some_and(|positions| positions.as_slice() == [column_idx])
+                && crate::engine_residency::index_uses_fingerprint(table, index)
+        });
+        let index_hits = if let Some((ordinal, index)) = fingerprint_index {
+            crate::engine_residency::sql_value_key_words(column_ty, value).and_then(|words| {
+                let needle = crate::engine_residency::compound_key_fingerprint(&words);
+                let key_id = crate::engine_residency::index_probe_key_id(table, index, ordinal)?;
+                self.locate_resident_pk_via_shard_index_detailed(table, key_id, needle)
+            })
+        } else {
             crate::engine_residency::i32_section_needle(column_ty, value).and_then(|needle| {
                 self.locate_resident_pk_via_shard_index_detailed(table, column_idx, needle)
-            });
+            })
+        };
         let hits = match index_hits {
             Some(hits) => hits,
             None => {
-                // ADR-006 (child-side FK elision): the hash-index probe DECLINES on a NON-UNIQUE
-                // column (dup-bearing shards — an FK column is inherently duplicate-heavy) and
-                // never serves a non-i32 column at all. On an ELIDED table, falling to the host
-                // ladder would REHYDRATE (de-elide) on every inbound-FK child check — so
-                // scan-locate the Eq ON THE DEVICE instead (the same W0-guarded,
-                // generation-consistent locate the range-DML resolve uses); the per-hit loop
-                // below applies visibility + the exclude set + the exact-value recheck. Any
-                // locate decline -> `None` -> the host ladder (rehydrate) stays the safety net. A
-                // NON-elided table keeps the host value-index probe (cheap, correct).
-                if !self.table_install_elided(&table.name) {
-                    return None;
-                }
+                // ADR-006 / R3-003: the hash-index probe DECLINES on a NON-UNIQUE column
+                // (dup-bearing shards — an FK column is inherently duplicate-heavy) and never
+                // serves a non-i32 column at all. Scan-locate the Eq ON THE DEVICE for resident
+                // tables, including non-elided bootstrap/reference layouts; the per-hit loop below
+                // applies visibility + the exclude set + the exact-value recheck. Any locate
+                // decline -> `None` -> the host ladder remains the temporary safety net. A
                 // BOUNDARY RAISE (the FINDING-C class, applied preemptively): the host-ladder
                 // fallback this arm replaces REHYDRATES and probes at a boundary raised to
                 // `committed_seq` — and the materialize CONTRACT requires read_txn >= the current
                 // published seq (stamped elided appends carry their commit seq; a facade txn id can
                 // lag it post-recovery). Match the fallback's strength: a lower boundary here would
                 // MISS a committed referencing child row = a wrongly-ALLOWED parent delete (orphan).
-                visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
-                let rhs = device_eq_scan_literal(column_ty, value)?;
-                let predicate = crate::engine_expr::ResidentExpr::Binary {
-                    op: crate::engine_expr::ResidentBinaryOp::Eq,
-                    lhs: Box::new(crate::engine_expr::ResidentExpr::Column(column_idx)),
-                    rhs: Box::new(rhs),
+                if self.current_transaction_read_snapshot().is_none() {
+                    visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
+                }
+                // UNIQUE semantics in this engine are structural: NULL conflicts with NULL. An
+                // un-fingerprintable NULL therefore uses the resident validity bitmap's IS NULL
+                // predicate instead of declining to a host value-index probe.
+                let predicate = if matches!(value, SqlValue::Null) {
+                    crate::engine_expr::ResidentExpr::IsNull {
+                        col: column_idx,
+                        is_not_null: false,
+                    }
+                } else {
+                    let rhs = device_eq_scan_literal(column_ty, value)?;
+                    crate::engine_expr::ResidentExpr::Binary {
+                        op: crate::engine_expr::ResidentBinaryOp::Eq,
+                        lhs: Box::new(crate::engine_expr::ResidentExpr::Column(column_idx)),
+                        rhs: Box::new(rhs),
+                    }
                 };
                 self.locate_resident_delete_slots_detailed(table, &predicate)?
             }
@@ -1141,27 +1169,12 @@ impl Engine {
             if exclude_keys.is_some_and(|excluded| excluded.contains(&key)) {
                 continue; // a row this statement touches: excluded, like the host probe
             }
-            // RETIREMENT A4e: elided tables materialize from the device (the host store is
-            // empty); visibility rides the regions (A4a).
-            let row = if self.table_install_elided(&table.name) {
+            let row =
                 match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
                     Some(Some(row)) => row,
                     Some(None) => continue,
                     None => return None,
-                }
-            } else {
-                // Self-pinned view (the SI-fix discipline): loaded fresh per probe so a
-                // mid-statement rehydration can never leave this fetch on a stale generation.
-                let table_rows = self.read_state.mvcc.table_rows(&table.name);
-                let fetched = table_rows
-                    .store()
-                    .tuple_fetch_by_key(&key, visibility)
-                    .ok()?;
-                let Some(tuple) = fetched else {
-                    continue; // no visible version at this snapshot
                 };
-                decode_relational_row(&tuple.value, &table.columns).ok()?
-            };
             if row[column_idx] == *value {
                 answer = true;
                 break;
@@ -1197,6 +1210,19 @@ impl Engine {
         {
             return Ok(answer);
         }
+        // R3-002 authority boundary: once the relation's rows live exclusively in a published
+        // device generation, a missing device verdict is an availability failure, never license to
+        // resurrect the CPU relational path. Non-authoritative bootstrap/parity tables may still use
+        // the host ladder until R3-004 deletes it globally.
+        if self.dml_device_validate_enabled()
+            && (self.table_install_elided(&table.name)
+                || self.table_chunk_authoritative(&table.name).is_some())
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "device constraint verdict unavailable for relation \"{}\"",
+                table.name
+            )));
+        }
         // A4e + A5 FLIP SI FIX: a device decline on an ELIDED table must rehydrate BEFORE the
         // host probe (the stale value-index would answer from missing/old rows = a constraint
         // hole); the fresh pin below then reads the post-rehydration generation.
@@ -1212,10 +1238,12 @@ impl Engine {
         // store versions with future/foreign seqs -> "tuple not found" for later readers).
         let mut probe_visibility = visibility;
         if self.table_chunk_authoritative(&table.name).is_some() {
+            self.guard_transaction_dml_rebind(&table.name, "cold-chunk constraint source")?;
             self.deauthoritize_chunk_table(&table.name, false)?;
             probe_visibility.read_txn_id = probe_visibility.read_txn_id.max(self.committed_seq());
         }
         if self.table_install_elided(&table.name) {
+            self.guard_transaction_dml_rebind(&table.name, "resident constraint source")?;
             self.rehydrate_elided_serialized(&table.name)?;
             // Audit FINDING C hardening: the reconcile stamps at committed_seq; a caller
             // boundary BELOW it (facade txn ids are decoupled from commit seqs) would read
@@ -1223,7 +1251,7 @@ impl Engine {
             // constraint bypass. Raise the probe boundary to cover the reconcile's stamps.
             probe_visibility.read_txn_id = probe_visibility.read_txn_id.max(self.committed_seq());
         }
-        let fresh = self.read_state.mvcc.table_rows(&table.name);
+        let fresh = self.read_table_rows_at(&table.name, probe_visibility.read_txn_id);
         Self::any_visible_row_with_value(
             table,
             &fresh,
@@ -1288,14 +1316,14 @@ impl Engine {
         table: &RelationalTable,
         visibility: StorageVisibility,
         key_id: usize,
-        // `None` = the tuple has a non-i32-section key value (e.g. NULL), so the device fingerprint
-        // probe can't run — go straight to the host scan (which applies the structural NULL == NULL
-        // semantics the scan validators use).
+        // `None` = the tuple has a non-i32-section key value (e.g. NULL), so the fingerprint probe
+        // cannot run. The device tuple helper then builds an exact typed predicate (including
+        // structural IS NULL leaves); an authoritative relation fails closed if that scan declines.
         fingerprint: Option<i32>,
         key_cols: &[(usize, SqlValue)],
         exclude_keys: Option<&BTreeSet<String>>,
     ) -> Result<bool, EngineError> {
-        if let Some(fingerprint) = fingerprint {
+        if fingerprint.is_some() {
             if let Some(answer) = self.device_visible_row_with_tuple(
                 table,
                 visibility,
@@ -1306,78 +1334,49 @@ impl Engine {
             ) {
                 return Ok(answer);
             }
+        } else if let [(column_idx, value)] = key_cols {
+            // A single nullable fingerprint key has no fingerprint word. Preserve structural
+            // UNIQUE NULL semantics with the resident validity bitmap's IS NULL scan before the
+            // host ladder; compound partial-NULL tuples still require their tuple-aware path.
+            if let Some(answer) = self.device_visible_row_with_value(
+                table,
+                visibility,
+                *column_idx,
+                value,
+                exclude_keys,
+            ) {
+                return Ok(answer);
+            }
+        } else if let Some(answer) = self.device_visible_row_with_tuple(
+            table,
+            visibility,
+            key_id,
+            None,
+            key_cols,
+            exclude_keys,
+        ) {
+            return Ok(answer);
+        }
+        if self.dml_device_validate_enabled()
+            && (self.table_install_elided(&table.name)
+                || self.table_chunk_authoritative(&table.name).is_some())
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "device tuple-constraint verdict unavailable for relation \"{}\"",
+                table.name
+            )));
         }
         // Device decline: rehydrate an elided table BEFORE the host scan (a stale value index would
         // answer from missing/old rows = a constraint hole) — same SI-fix discipline as
         // `visible_row_with_value`.
         let mut probe_visibility = visibility;
         if self.table_install_elided(&table.name) {
+            self.guard_transaction_dml_rebind(&table.name, "resident tuple-constraint source")?;
             self.rehydrate_elided_serialized(&table.name)?;
             probe_visibility.read_txn_id = probe_visibility.read_txn_id.max(self.committed_seq());
         }
-        let fresh = self.read_state.mvcc.table_rows(&table.name);
+        let fresh = self.read_table_rows_at(&table.name, probe_visibility.read_txn_id);
         Self::any_visible_row_with_tuple(table, &fresh, probe_visibility, key_cols, exclude_keys)
-    }
-
-    /// COMPOUND KEYS: the DEVICE arm of [`Self::visible_row_with_tuple`] — probe the fingerprint
-    /// index, materialize each hit on-device, and confirm the FULL key tuple. `None` on any device
-    /// decline (the caller rehydrates + host-scans). Mirrors `device_visible_row_with_value`.
-    fn device_visible_row_with_tuple(
-        &self,
-        table: &RelationalTable,
-        visibility: StorageVisibility,
-        key_id: usize,
-        fingerprint: i32,
-        key_cols: &[(usize, SqlValue)],
-        exclude_keys: Option<&BTreeSet<String>>,
-    ) -> Option<bool> {
-        if !self.dml_device_validate_enabled() {
-            return None;
-        }
-        let hits = self.locate_resident_pk_via_shard_index_detailed(table, key_id, fingerprint)?;
-        let mut answer = false;
-        for hit in &hits {
-            let region = hit.row_id.as_ref()?;
-            let halves = region
-                .read_resident_i32_column(u64::from(hit.slot) * 8, 2)
-                .ok()?;
-            let (lo, hi) = (*halves.first()?, *halves.get(1)?);
-            let row_id = (lo as u32 as u64) | ((hi as u32 as u64) << 32);
-            if row_id == u64::MAX {
-                return None; // unstamped slot: identity unknown -> host ladder
-            }
-            let key = relational_row_key(&table.name, row_id);
-            if exclude_keys.is_some_and(|excluded| excluded.contains(&key)) {
-                continue;
-            }
-            let row = if self.table_install_elided(&table.name) {
-                match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
-                    Some(Some(row)) => row,
-                    Some(None) => continue,
-                    None => return None,
-                }
-            } else {
-                let table_rows = self.read_state.mvcc.table_rows(&table.name);
-                let fetched = table_rows
-                    .store()
-                    .tuple_fetch_by_key(&key, visibility)
-                    .ok()?;
-                let Some(tuple) = fetched else {
-                    continue;
-                };
-                decode_relational_row(&tuple.value, &table.columns).ok()?
-            };
-            // Full-tuple exactness: EVERY key column must match (a fingerprint hit alone is not a dup).
-            if key_cols.iter().all(|(ci, v)| row.get(*ci) == Some(v)) {
-                answer = true;
-                break;
-            }
-        }
-        self.read_state
-            .residency
-            .dml_device_validate_hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(answer)
     }
 
     /// COMPOUND KEYS: the HOST arm of [`Self::visible_row_with_tuple`] — candidates from the FIRST
@@ -1463,17 +1462,14 @@ impl Engine {
             else {
                 continue;
             };
-            let compound = crate::engine_residency::index_is_compound(index);
-            let key_id = if compound {
-                crate::engine_residency::COMPOUND_KEY_ID_FLAG | ord
-            } else {
-                positions[0]
-            };
+            let fingerprint_backed = crate::engine_residency::index_uses_fingerprint(table, index);
+            let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)
+                .unwrap_or(positions[0]);
             let mut seen: BTreeSet<Vec<SqlValue>> = BTreeSet::new();
             for row in new_images {
                 let tuple_key: Vec<SqlValue> = positions.iter().map(|&i| row[i].clone()).collect();
                 let conflict = !seen.insert(tuple_key) || {
-                    if compound {
+                    if fingerprint_backed {
                         let key_cols: Vec<(usize, SqlValue)> =
                             positions.iter().map(|&i| (i, row[i].clone())).collect();
                         let fingerprint = crate::engine_residency::compound_index_row_fingerprint(
@@ -1709,7 +1705,7 @@ impl Engine {
         // UPDATE records the same slot as both released (old) and claimed (new) — harmless (the
         // write-set dedups to one slot), so an idempotent rewrite does not self-conflict.
         let mut released_unique_slots: Vec<UniqueIndexSlotKey> = Vec::new();
-        let mut table_rows = self.read_state.mvcc.table_rows(&update.table);
+        let mut table_rows = self.read_table_rows_at(&update.table, txn_id);
         let constrained = table.indexes.iter().any(|index| index.unique)
             || !table.check_constraints.is_empty()
             || !table.foreign_keys.is_empty()
@@ -1771,8 +1767,9 @@ impl Engine {
                 None => declined = true,
             }
             if declined {
+                self.guard_transaction_dml_rebind(&table.name, "cold-chunk update source")?;
                 self.deauthoritize_chunk_table(&table.name, false)?;
-                table_rows = self.read_state.mvcc.table_rows(&table.name);
+                table_rows = self.read_table_rows_at(&table.name, txn_id);
             }
         }
         let index_resolved: Option<Vec<DmlResolvedMatch>> = if class_resolved.is_some() {
@@ -1786,9 +1783,10 @@ impl Engine {
                 // GAP-1 TOCTOU: a table eliding between the concurrent guard's check and
                 // this prepare now rehydrates under the commit lock, never a bare
                 // `with_table_mut` race.
+                self.guard_transaction_dml_rebind(&table.name, "resident update source")?;
                 self.rehydrate_elided_serialized(&table.name)?;
                 // A5 FLIP SI FIX: the scan below must read the FRESH generation.
-                table_rows = self.read_state.mvcc.table_rows(&table.name);
+                table_rows = self.read_table_rows_at(&table.name, txn_id);
             }
             None
         } else {
@@ -1809,7 +1807,7 @@ impl Engine {
                     // then stamps an ALREADY-DEAD slot (exact-count 1 passes!) and leaves
                     // the truly-current version live forever; a stale-EMPTY view silently
                     // LOSES the update (0 matches). RE-PIN before every fallback.
-                    table_rows = self.read_state.mvcc.table_rows(&table.name);
+                    table_rows = self.read_table_rows_at(&table.name, txn_id);
                     match Self::resolve_dml_matches_via_value_index(
                         table,
                         &table_rows,

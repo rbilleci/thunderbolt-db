@@ -67,7 +67,7 @@ fn wave_batch_validation_matches_host_oracle() {
 
 /// M1 design B — the CONCURRENT dup race through the WAVE-BATCH path: 8 writers contend for
 /// the SAME 200 keys on an elided PK'd table with wave-batch validation ON. Exactly one
-/// writer wins each key: same-wave dups fall to the unique-slot conflict ledger (#18), and
+/// writer wins each key: same-wave dups fall to bounded wave-local slot arbitration, and
 /// already-committed dups fall to the wave-batch device locate. No key double-inserts.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
@@ -153,10 +153,10 @@ fn wave_batch_concurrent_dup_race_single_winner() {
 
 /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
 /// on an elided table, BARRIERED between snapshot+prepare and commit (the instrumented
-/// hook), so BOTH pass the off-lock validation and the UNIQUE-SLOT CONFLICT LEDGER is the
-/// ONLY guard left — the under-lock re-resolve deliberately skips the redundant unique
-/// pass on FK-free tables (`InsertPrepareValidation::ReResolveLedgerCovered`). Exactly one
-/// must win; sabotaging the ledger's unique-slot arm makes BOTH land and this test FAIL
+/// hook), so BOTH pass the off-lock validation and device history plus wave-local arbitration is
+/// the ONLY guard left — the under-lock re-resolve deliberately skips the redundant unique
+/// pass on FK-free tables (`InsertPrepareValidation::ReResolveDeviceCovered`). Exactly one
+/// must win; sabotaging the wave arbitration makes BOTH land and this test FAIL
 /// (verified — the stochastic dup-race test above cannot certify this window).
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]

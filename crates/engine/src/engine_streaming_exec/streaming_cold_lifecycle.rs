@@ -436,6 +436,7 @@ impl Engine {
                     },
                     snapshot: chunk.snapshot.clone(),
                     row_count: chunk.row_count,
+                    entity_ids: Arc::clone(&chunk.entity_ids),
                     tuple_range: chunk.tuple_range,
                     // P2: reuse preserves the payload's OWN boundary (stamps do NOT advance it).
                     payload_copin_s: chunk.payload_copin_s,
@@ -593,19 +594,23 @@ impl Engine {
         chunk_target_bytes: u64,
         copin_s: Index,
     ) -> Option<Arc<ColdTableChunks>> {
-        let cold = self
-            .read_state
-            .residency
-            .streaming_cold_chunks
-            .load()
-            .get(table_name)
-            .cloned()?;
-        let current = self
-            .read_state
-            .mvcc
-            .table_rows(table_name)
-            .generation_payload();
+        let cold = self.read_streaming_cold_chunks().get(table_name).cloned()?;
+        let transaction_scoped = self.current_transaction_read_snapshot().is_some();
+        let current = if transaction_scoped {
+            self.read_table_rows_at(table_name, copin_s)
+                .generation_payload()
+        } else {
+            self.read_state
+                .mvcc
+                .table_rows(table_name)
+                .generation_payload()
+        };
         if !Arc::ptr_eq(&cold.generation, &current) {
+            // A retained transaction may only consume its captured/private generation. Patching
+            // would rebind it to current global state and mutate the global cold cache.
+            if transaction_scoped {
+                return None;
+            }
             // 6c-1: the table was written — PATCH the entry (rebuild only the dirty chunks + tail,
             // O(delta)) instead of discarding it. A patch that cannot apply (ALTER'd shape, install
             // race, IO error) falls through to the evict arm; the next read scans + rebuilds.

@@ -31,7 +31,7 @@ the incumbent.
 
 | Former flag | Verdict | Where it went |
 |---|---|---|
-| `GPU_DB_MEGA_FUSE` | A/B loser (both load ends) | Arm REVERTED to `feature/mega-fuse`; record in HANDOVER. Returns as a replacement with the cross-lane coalescer + WAL-first reorder. |
+| `GPU_DB_MEGA_FUSE` | A/B loser (both load ends) | Rejected by ADR-014 and removed from product direction. The archived branch/handovers are historical evidence, not revival authority. |
 | `GPU_DB_FUSED_APPLY` | A/B winner (+14–17%) | Flag DELETED; fused apply is always-on **eligibility dispatch** (the unfused sequence remains only as the ineligible-shape fallback: i64 sections / no live index / in-pass decline). |
 | `GPU_DB_INTENT_LANE_MIN_WAVE` | 512 won every sweep | Hardcoded (adaptive formation cap). |
 | `GPU_DB_INTENT_LANE_GROUP_US` | 2000 won | Hardcoded (population-scaled deadline cap). |

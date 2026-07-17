@@ -43,8 +43,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
 use gpu_db_facade::{
-    execute_on_shared_engine, execute_on_shared_engine_batched, pg_adapter, BatchedDispatch,
-    DbError, EngineFacade, PointLookupBatcher, QueryOutcome, SharedEngine,
+    execute_on_shared_engine, execute_on_shared_engine_batched, execute_on_shared_engine_session,
+    is_transaction_control, pg_adapter, BatchedDispatch, DbError, EngineFacade, PointLookupBatcher,
+    QueryOutcome, SharedEngine, SharedSession,
 };
 use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
 use gpu_db_protocol::{
@@ -116,20 +117,27 @@ pub fn serve_sequential(listener: TcpListener) -> io::Result<()> {
     Ok(())
 }
 
-/// Handle one connection against the shared engine: startup handshake, then a simple-query
-/// loop dispatched through `execute_on_shared_engine` (an implicit session per connection).
+/// Handle one connection against the shared engine: startup handshake, then a simple-query loop
+/// dispatched through the session-aware shared façade (one transaction owner per connection).
 fn handle_connection_shared(stream: &mut TcpStream, engine: &SharedEngine) -> Result<(), String> {
     if !complete_startup(stream)? {
         return Ok(());
     }
-    run_shared_query_loop(stream, engine)
+    let mut session = engine.open_session();
+    let result = run_shared_query_loop(stream, engine, &mut session);
+    engine.close_session(&mut session);
+    result
 }
 
-fn run_shared_query_loop(stream: &mut TcpStream, engine: &SharedEngine) -> Result<(), String> {
+fn run_shared_query_loop(
+    stream: &mut TcpStream,
+    engine: &SharedEngine,
+    session: &mut SharedSession,
+) -> Result<(), String> {
     while let Some(frame) = read_tagged_frame(stream).map_err(|err| err.to_string())? {
         match parse_frontend_message(&frame).map_err(|err| err.to_string())? {
             FrontendMessage::SimpleQuery(sql) => {
-                let outcome = execute_on_shared_engine(engine, &sql);
+                let outcome = execute_on_shared_engine_session(engine, session, &sql);
                 write_outcome(stream, outcome).map_err(|err| err.to_string())?;
             }
             FrontendMessage::Terminate => break,
@@ -478,7 +486,13 @@ async fn handle_connection_async(
     if !complete_startup_async(&mut stream).await? {
         return Ok(());
     }
-    run_async_query_loop(&mut stream, engine, executor, batcher).await
+    let session = Arc::new(std::sync::Mutex::new(engine.open_session()));
+    let result = run_async_query_loop(&mut stream, engine, executor, batcher, &session).await;
+    let mut session = session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    engine.close_session(&mut session);
+    result
 }
 
 async fn complete_startup_async(stream: &mut TokioTcpStream) -> Result<bool, String> {
@@ -530,32 +544,58 @@ async fn run_async_query_loop(
     engine: &Arc<SharedEngine>,
     executor: &Arc<tokio::sync::Semaphore>,
     batcher: Option<&Arc<PointLookupBatcher>>,
+    session: &Arc<std::sync::Mutex<SharedSession>>,
 ) -> Result<(), String> {
     while let Some(frame) = read_tagged_frame_async(stream).await? {
         match parse_frontend_message(&frame).map_err(|err| err.to_string())? {
             FrontendMessage::SimpleQuery(sql) => {
-                let outcome = match batcher {
-                    // Batching ON: classify-or-fallback. Classification + the unchanged
-                    // per-query path still run under a permit on the blocking pool; a
-                    // batchable point-lookup instead parks on a `oneshot` with NO permit
-                    // held and NO `spawn_blocking` (the coalescer thread does the GPU work),
-                    // so many parked lookups coalesce into one submission.
-                    Some(batcher) => {
-                        execute_batchable_or_fallback(
-                            Arc::clone(engine),
-                            executor,
-                            Arc::clone(batcher),
-                            sql,
-                        )
-                        .await?
-                    }
-                    // Batching OFF (GPU_DB_BATCHING=0 escape hatch): the original path, unchanged.
-                    None => {
-                        let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
-                        let engine = Arc::clone(engine);
-                        tokio::task::spawn_blocking(move || execute_on_shared_engine(&engine, &sql))
+                let session_bound = is_transaction_control(&sql)
+                    || session
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .in_transaction();
+                let outcome = if session_bound {
+                    // Transaction-bound traffic is connection-ordered and bypasses cross-session
+                    // point-read batching until R3-003 has snapshot-aware batch descriptors.
+                    let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
+                    let engine = Arc::clone(engine);
+                    let session = Arc::clone(session);
+                    tokio::task::spawn_blocking(move || {
+                        let mut session = session
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        execute_on_shared_engine_session(&engine, &mut session, &sql)
+                    })
+                    .await
+                    .map_err(|err| err.to_string())?
+                } else {
+                    match batcher {
+                        // Batching ON: classify-or-fallback. Classification + the unchanged
+                        // per-query path still run under a permit on the blocking pool; a
+                        // batchable point-lookup instead parks on a `oneshot` with NO permit
+                        // held and NO `spawn_blocking` (the coalescer thread does the GPU work),
+                        // so many parked lookups coalesce into one submission.
+                        Some(batcher) => {
+                            execute_batchable_or_fallback(
+                                Arc::clone(engine),
+                                executor,
+                                Arc::clone(batcher),
+                                sql,
+                            )
+                            .await?
+                        }
+                        // Batching OFF (GPU_DB_BATCHING=0 escape hatch): the original path,
+                        // unchanged.
+                        None => {
+                            let _permit =
+                                executor.acquire().await.map_err(|err| err.to_string())?;
+                            let engine = Arc::clone(engine);
+                            tokio::task::spawn_blocking(move || {
+                                execute_on_shared_engine(&engine, &sql)
+                            })
                             .await
                             .map_err(|err| err.to_string())?
+                        }
                     }
                 };
                 let buf = encode_outcome(outcome).map_err(|err| err.to_string())?;

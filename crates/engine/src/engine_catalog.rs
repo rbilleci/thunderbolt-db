@@ -16,6 +16,7 @@ impl Engine {
     }
 
     pub fn relational_copy_columns(&self, table: &str) -> Result<Vec<CopyColumn>, EngineError> {
+        self.ensure_commit_path_available()?;
         let cat = self.ddl_catalog();
         let table = cat.relational_catalog.get(table).ok_or_else(|| {
             EngineError::ApplyFailed(format!("relation \"{}\" does not exist", table))
@@ -46,6 +47,8 @@ impl Engine {
         copy: &CopyFromStdin,
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         if rows.is_empty() {
             return Ok((0, RelationalCopyAdmissionProfile::default()));
         }

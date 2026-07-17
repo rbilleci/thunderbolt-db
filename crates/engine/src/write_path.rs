@@ -2,7 +2,7 @@
 //! preserving). The value types a `prepare_*` produces and `apply_delta`
 //! installs: read-boundary snapshot, write-set + conflict keys, prepared
 //! mutations, the recent-commits ledger (SI first-committer-wins), and the
-//! active-snapshot multiset + RAII guard (oldest-active GC boundary). The
+//! active-snapshot registry + RAII guard (oldest-active GC boundary). The
 //! commit/apply LOGIC stays on `impl Engine`; these are its collaborators.
 
 use super::*;
@@ -34,7 +34,7 @@ pub(crate) struct RowWriteKey {
 /// a unique index. Two transactions writing the same unique slot conflict (first-committer-wins),
 /// so this is the second conflict dimension Stage 4 validates. Non-unique value-index appends are
 /// NOT conflict points and are carried in [`PreparedMutation`], not here.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct UniqueIndexSlotKey {
     pub(crate) table: String,
     pub(crate) column: String,
@@ -82,6 +82,19 @@ pub(crate) struct WriteSet {
 }
 
 impl WriteSet {
+    pub(crate) fn extend_deduplicated(&mut self, other: &Self) {
+        self.rows.extend(other.rows.iter().cloned());
+        self.rows.sort();
+        self.rows.dedup();
+        self.unique_slots.extend(other.unique_slots.iter().cloned());
+        self.unique_slots.sort();
+        self.unique_slots.dedup();
+        self.unique_slots_i32
+            .extend(other.unique_slots_i32.iter().copied());
+        self.unique_slots_i32.sort_unstable();
+        self.unique_slots_i32.dedup();
+    }
+
     /// Append the unique-index slots `values` occupies for `table`. Mirrors
     /// `validate_unique_indexes_for_rows`: for each unique index, resolve the column position
     /// (skip if the column is absent, as the validator does) and record `(table, column, value)`.
@@ -226,16 +239,10 @@ pub(crate) enum AppliedRowMutation {
         /// them (A1). `None` for any unparseable key -> the commit arm declines the incremental
         /// path (re-admit, always correct).
         row_ids: Option<Vec<u64>>,
-        /// P4-2b-ii: the class coordinate token — `Some(entry_epoch)` when `row_ids` are PACKED
-        /// (chunk_idx, slot) coordinates from the chunk-native resolve; the commit hook stamps
-        /// the old versions + tail-appends `new_rows` iff the installed entry still carries it.
-        class_epoch: Option<u64>,
-        /// U2: the OLD versions' row-ids to REMOVE on an elided-rehydrate fallback. A classic
-        /// in-place update reuses the old id for the new version (`row_ids == old ids`), so the
-        /// upsert overwrites and no explicit removal is needed (`None`). A U2 lane update installs
-        /// the new version at a FRESH `new_row_id` (a dead twin), so the tombstoned old must be
-        /// removed explicitly or the rehydrate leaves two live rows sharing the pk.
-        old_row_ids: Option<Vec<u64>>,
+        /// P4-2b-ii: the class stamp inputs — packed `(chunk_idx, slot)` coordinates plus the
+        /// entry epoch. Stable logical identities remain in `row_ids`; never overload one as the
+        /// other. The atomic-transaction maintainer uses epoch zero as its dynamic-resolve marker.
+        class_stamp: Option<(Vec<u64>, u64)>,
         write_set: WriteSet,
     },
 }
@@ -280,21 +287,17 @@ impl WriteDelta {
     }
 }
 
-/// The recent-commits ledger: every committed write's `(table, row-key)` and unique-index slot →
-/// the highest `commit_seq` that wrote it (write-half MVCC, Stage 4, conflict-detection §3.3). The
-/// SI write-write check (first-committer-wins) is: a prepared txn with `read_snapshot = S` conflicts
-/// iff ANY key in its write-set has a recorded `commit_seq > S` — i.e. some other transaction wrote
-/// the same key AFTER this one took its snapshot. Pruned below the oldest active read snapshot (no
-/// active transaction can still be reading before that boundary, so older ledger entries can never
-/// be the "winner" of a future conflict) — which is also the safe MVCC GC boundary.
+/// The recent row-identity ledger: every committed `(table, row-key)` carries the highest
+/// `commit_seq` that wrote it. Unique-slot history is device-authoritative in production; the two
+/// unique maps below exist only in `cfg(test)` as the driverless CPU semantic oracle. Row entries
+/// are pruned below the oldest active read snapshot, which is also the safe MVCC GC boundary.
 #[derive(Debug, Default)]
 pub(crate) struct RecentCommitsLedger {
     pub(crate) rows: BTreeMap<RowWriteKey, Index>,
+    #[cfg(test)]
     pub(crate) unique_slots: BTreeMap<UniqueIndexSlotKey, Index>,
-    /// E2.2(a) — the integer-keyed unique-slot map (see [`IntUniqueSlotKey`]). A strict projection
-    /// of the i32 unique slots that BOTH paths maintain, so the intent fast path's allocation-free
-    /// conflict check/record sees classic-path writes and vice versa. `HashMap`, not `BTreeMap`:
-    /// this map is never range-scanned (prune walks it) and the O(1) probe is the hot-path win.
+    /// Driverless parity twin for the allocation-free i32 slot projection.
+    #[cfg(test)]
     pub(crate) unique_slots_i32: std::collections::HashMap<IntUniqueSlotKey, Index>,
 }
 
@@ -303,48 +306,46 @@ impl RecentCommitsLedger {
     /// strictly newer than `read_snapshot`? If so the preparing txn read a now-stale snapshot of
     /// that key and must abort (retryable). Equality on `read_snapshot` does NOT conflict — that is
     /// a commit this txn's snapshot already saw.
+    #[cfg(test)]
     pub(crate) fn conflicts(&self, write_set: &WriteSet, read_snapshot: Index) -> bool {
+        self.conflicts_rows(write_set, read_snapshot)
+            || self.conflicts_unique(write_set, read_snapshot)
+    }
+
+    pub(crate) fn conflicts_rows(&self, write_set: &WriteSet, read_snapshot: Index) -> bool {
         write_set
             .rows
             .iter()
             .any(|key| self.rows.get(key).is_some_and(|&seq| seq > read_snapshot))
-            || write_set.unique_slots.iter().any(|key| {
-                self.unique_slots
-                    .get(key)
-                    .is_some_and(|&seq| seq > read_snapshot)
-            })
-            || write_set.unique_slots_i32.iter().any(|key| {
-                self.unique_slots_i32
-                    .get(key)
-                    .is_some_and(|&seq| seq > read_snapshot)
-            })
     }
 
-    /// Record a committed write-set at `commit_seq` (the highest writer of each key wins — commits
-    /// are assigned monotonically increasing `commit_seq` under the commit_mutex, so a later commit
-    /// always overwrites with a larger value).
-    /// E2.5b-2 — conflict check for ONE integer slot (the lean lane form).
-    pub(crate) fn conflicts_int_slot(&self, slot: IntUniqueSlotKey, read_snapshot: Index) -> bool {
-        self.unique_slots_i32
-            .get(&slot)
-            .is_some_and(|&seq| seq > read_snapshot)
+    #[cfg(test)]
+    pub(crate) fn conflicts_unique(&self, write_set: &WriteSet, read_snapshot: Index) -> bool {
+        write_set.unique_slots.iter().any(|key| {
+            self.unique_slots
+                .get(key)
+                .is_some_and(|&seq| seq > read_snapshot)
+        }) || write_set.unique_slots_i32.iter().any(|key| {
+            self.unique_slots_i32
+                .get(key)
+                .is_some_and(|&seq| seq > read_snapshot)
+        })
     }
 
-    /// E2.5b-2 — record ONE integer unique slot (the lane pump's fused-pass
-    /// form; equivalent to `record` for a write-set holding exactly this slot).
-    pub(crate) fn record_int_slot(&mut self, slot: IntUniqueSlotKey, commit_seq: Index) {
-        self.unique_slots_i32.insert(slot, commit_seq);
-    }
-
+    /// Record committed row identities. Test builds additionally maintain the driverless unique
+    /// parity maps; production unique conflict history is read from resident version stamps.
     pub(crate) fn record(&mut self, write_set: &WriteSet, commit_seq: Index) {
         for key in &write_set.rows {
             self.rows.insert(key.clone(), commit_seq);
         }
-        for key in &write_set.unique_slots {
-            self.unique_slots.insert(key.clone(), commit_seq);
-        }
-        for &key in &write_set.unique_slots_i32 {
-            self.unique_slots_i32.insert(key, commit_seq);
+        #[cfg(test)]
+        {
+            for key in &write_set.unique_slots {
+                self.unique_slots.insert(key.clone(), commit_seq);
+            }
+            for &key in &write_set.unique_slots_i32 {
+                self.unique_slots_i32.insert(key, commit_seq);
+            }
         }
     }
 
@@ -352,8 +353,11 @@ impl RecentCommitsLedger {
     /// never win a future conflict). Keeps the ledger bounded by the active-snapshot window.
     pub(crate) fn prune_below(&mut self, boundary: Index) {
         self.rows.retain(|_, &mut seq| seq > boundary);
-        self.unique_slots.retain(|_, &mut seq| seq > boundary);
-        self.unique_slots_i32.retain(|_, &mut seq| seq > boundary);
+        #[cfg(test)]
+        {
+            self.unique_slots.retain(|_, &mut seq| seq > boundary);
+            self.unique_slots_i32.retain(|_, &mut seq| seq > boundary);
+        }
     }
 
     #[cfg(test)]
@@ -362,15 +366,135 @@ impl RecentCommitsLedger {
     }
 }
 
-/// Tracks the read snapshots of in-flight transactions (write-half MVCC, Stage 4) as an ordered
-/// multiset of `read_snapshot` `commit_seq` values. A transaction registers its snapshot at
-/// prepare-begin (off-lock) and deregisters at commit/abort. The MINIMUM registered snapshot is the
+/// One explicit transaction's generation-owned read world. `boundary` is the visibility stamp, but
+/// correctness does not rely on that scalar alone: the exact catalog, per-table MVCC generations,
+/// single-buffer entries, shard descriptors, and already-built device index allocations are retained
+/// together until terminal transaction control. A later commit may invalidate/re-admit the current
+/// resident set; these owned generations remain alive and cannot be paired with newer descriptors.
+#[derive(Debug)]
+pub(crate) struct TransactionSnapshot {
+    pub(crate) boundary: Index,
+    /// Row-identity allocator boundary captured with the transaction generation. INSERT prepare
+    /// must not derive provisional identities from a newer allocator observation; the private
+    /// transaction delta will apply its own deterministic offset before COMMIT assigns final slots.
+    pub(crate) next_row_id: u64,
+    pub(crate) catalog: Arc<CatalogSnapshot>,
+    pub(crate) table_versions: BTreeMap<String, SnapshotHandle<Arc<TableVersionData>>>,
+    pub(crate) resident_snapshots: Arc<BTreeMap<String, RelationalResidencyEntry>>,
+    pub(crate) resident_shards: Arc<BTreeMap<String, Vec<RelationalResidentShard>>>,
+    /// Representation authority is part of the generation, not current global policy. An elided
+    /// table's captured host generation is intentionally incomplete; a class table's captured cold
+    /// entry is its post-freeze authority. DML prepare must retain and consult these exact maps.
+    pub(crate) elided_tables: Arc<BTreeSet<String>>,
+    pub(crate) chunk_authoritative_tables: Arc<BTreeMap<String, Index>>,
+    /// Transaction-private, device-resident write generation. Every successful DML statement
+    /// replaces this state atomically with a new immutable shard map: retained base shards carry
+    /// private tombstone sidecars and INSERT/UPDATE post-images live in dense private shards.
+    /// SELECT and later DML clone the published map, so no reader can observe half a statement.
+    pub(crate) delta: std::sync::Mutex<TransactionDeltaState>,
+    /// One explicit transaction is a sequential statement stream. Holding this guard for the full
+    /// SELECT/DML/terminal-control operation prevents a DML replacement from retiring the exact
+    /// GPU charge of a superseded private generation while a same-transaction reader still pins
+    /// that generation's device allocations.
+    pub(crate) statement_lock: std::sync::Mutex<()>,
+    /// Engine-wide charge table shared with every transaction snapshot. Sequential statement
+    /// ownership makes the delta state's current-generation charge exact; `Drop` releases that
+    /// final charge when the transaction snapshot's last retained handle disappears.
+    pub(crate) private_gpu_account: Arc<std::sync::Mutex<BTreeMap<u16, u64>>>,
+    /// Lifetime pins for device index allocations that existed at capture. Execution validates an
+    /// index against the retained data-buffer identity before use and may rebuild lazily when absent;
+    /// this vector prevents a captured valid index allocation from being reclaimed underneath the
+    /// transaction merely because the current-generation cache was purged.
+    pub(crate) _resident_index_resources: Vec<Arc<CudaResidentDeviceMemory>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TransactionDeltaState {
+    pub(crate) generation: u64,
+    pub(crate) resident_shards: Arc<BTreeMap<String, Vec<RelationalResidentShard>>>,
+    /// Transaction-private cold authority. Chunk-class INSERTs append device-format tail chunks
+    /// here with a birth boundary visible to this transaction, never to the globally published
+    /// cold map. SELECT and later DML therefore consume the same immutable private generation.
+    pub(crate) streaming_cold_chunks:
+        Arc<BTreeMap<String, Arc<crate::engine_streaming_exec::ColdTableChunks>>>,
+    pub(crate) deltas: Vec<WriteDelta>,
+    pub(crate) write_set: WriteSet,
+    pub(crate) next_row_id: u64,
+    /// Transaction-local post-state for every sequence consumed by a column default. A later
+    /// statement seeds its pure `nextval` scratch here, so values advance across private statements
+    /// without mutating the published catalog before COMMIT.
+    pub(crate) sequence_state: BTreeMap<String, (i64, bool)>,
+    pub(crate) private_gpu_bytes_by_gpu: BTreeMap<u16, u64>,
+}
+
+impl Drop for TransactionSnapshot {
+    fn drop(&mut self) {
+        let charged = self
+            .delta
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .private_gpu_bytes_by_gpu
+            .clone();
+        let mut account = self
+            .private_gpu_account
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (gpu_id, bytes) in charged {
+            let slot = account.entry(gpu_id).or_default();
+            *slot = slot.saturating_sub(bytes);
+            if *slot == 0 {
+                account.remove(&gpu_id);
+            }
+        }
+    }
+}
+
+impl TransactionSnapshot {
+    pub(crate) fn transaction_shards(&self) -> Arc<BTreeMap<String, Vec<RelationalResidentShard>>> {
+        Arc::clone(
+            &self
+                .delta
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .resident_shards,
+        )
+    }
+
+    pub(crate) fn transaction_cold_chunks(
+        &self,
+    ) -> Arc<BTreeMap<String, Arc<crate::engine_streaming_exec::ColdTableChunks>>> {
+        Arc::clone(
+            &self
+                .delta
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .streaming_cold_chunks,
+        )
+    }
+
+    pub(crate) fn transaction_delta_is_empty(&self) -> bool {
+        self.delta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .deltas
+            .is_empty()
+    }
+}
+
+/// Tracks the read snapshots of in-flight statements and explicit transactions (write-half MVCC,
+/// Stage 4) as an ordered multiset of `read_snapshot` `commit_seq` values. An autocommit statement
+/// registers for its prepare/commit window; an explicit transaction registers once at `BEGIN` and
+/// keeps that reference until `COMMIT`/`ROLLBACK`. The MINIMUM registered snapshot is the
 /// oldest-active boundary: ledger entries and MVCC versions older than it can be reclaimed because no
 /// active transaction can still observe (or conflict against) them. This is the concrete
 /// oldest-active-`commit_seq` the Stage-0 GC-boundary debt needed.
 #[derive(Debug, Default)]
 pub(crate) struct ActiveSnapshots {
     pub(crate) counts: BTreeMap<Index, usize>,
+    /// Explicit transaction identity -> its one generation-owned lifetime snapshot. Keeping this
+    /// map beside the ordered multiset makes duplicate registration/removal exact while `counts`
+    /// continues to fold statement-local and transaction-held references into one GC boundary.
+    pub(crate) transactions: BTreeMap<TxnId, Arc<TransactionSnapshot>>,
 }
 
 impl ActiveSnapshots {
@@ -387,16 +511,56 @@ impl ActiveSnapshots {
         }
     }
 
+    pub(crate) fn register_transaction(
+        &mut self,
+        txn_id: TxnId,
+        snapshot: Arc<TransactionSnapshot>,
+    ) {
+        let boundary = snapshot.boundary;
+        let previous = self.transactions.insert(txn_id, snapshot);
+        debug_assert!(
+            previous.is_none(),
+            "transaction {txn_id} registered more than one active snapshot"
+        );
+        if let Some(previous) = previous {
+            self.deregister(previous.boundary);
+        }
+        self.register(boundary);
+    }
+
+    pub(crate) fn deregister_transaction(
+        &mut self,
+        txn_id: TxnId,
+    ) -> Option<Arc<TransactionSnapshot>> {
+        let snapshot = self.transactions.remove(&txn_id)?;
+        self.deregister(snapshot.boundary);
+        Some(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transaction_snapshot(&self, txn_id: TxnId) -> Option<Index> {
+        self.transactions
+            .get(&txn_id)
+            .map(|snapshot| snapshot.boundary)
+    }
+
+    pub(crate) fn transaction_snapshot_handle(
+        &self,
+        txn_id: TxnId,
+    ) -> Option<Arc<TransactionSnapshot>> {
+        self.transactions.get(&txn_id).cloned()
+    }
+
     /// The oldest active read snapshot, or `None` when no transaction is in flight.
     pub(crate) fn oldest(&self) -> Option<Index> {
         self.counts.keys().next().copied()
     }
 }
 
-/// RAII guard that deregisters a transaction's read snapshot from [`ActiveSnapshots`] on drop
-/// (write-half MVCC, Stage 4), so a snapshot is released even if prepare/commit returns early (a
-/// serialization abort, a constraint error) — keeping the oldest-active GC boundary from getting
-/// stuck behind an aborted transaction.
+/// RAII guard that deregisters an autocommit statement's read snapshot from [`ActiveSnapshots`] on
+/// drop (write-half MVCC, Stage 4), so a snapshot is released even if prepare/commit returns early (a
+/// serialization abort, a constraint error). Explicit transactions use the registry's keyed
+/// lifetime entry instead, released by transaction control.
 pub(crate) struct ActiveSnapshotGuard<'a> {
     pub(crate) engine: &'a Engine,
     pub(crate) snapshot: Index,

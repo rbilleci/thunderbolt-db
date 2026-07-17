@@ -107,6 +107,7 @@ fn build_pk_hash(keys: &[i32]) -> (Vec<u64>, u32, u32) {
 }
 
 include!("write_index.rs");
+include!("version_conflict.rs");
 
 #[test]
 fn cuda_driver_runtime_routes_only_detected_devices() {

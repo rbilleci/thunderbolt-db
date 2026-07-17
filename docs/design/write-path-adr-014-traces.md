@@ -6,6 +6,9 @@ source baseline `f701d8b6e9e0a9a1904bc990f23162632f382045` plus the verified R3-
 canonical transaction, WAL, checkpoint, or recovery implementation exists. Those graduation proofs remain with
 the PLAN owners named below; this document owns no work.
 
+R3-002/R3-003 labels below are historical graduation labels; both passed independent acceptance on 2026-07-17.
+The remaining canonical durability and recovery seams are owned by **DUR-002** in `../PLAN.md`.
+
 ## Review method and pass condition
 
 Each family starts from one authoritative publication object

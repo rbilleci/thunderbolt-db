@@ -323,8 +323,8 @@ impl Engine {
         // the planning decision (the shard slice is passed by reference into the sharded-route
         // planner, and the snapshot is read field-by-field below — both must outlive those uses, so the
         // guards are bound here and held to the end of the function).
-        let shards_guard = self.read_state.residency.shards.load();
-        let snapshots_guard = self.read_state.residency.snapshots.load();
+        let shards_guard = self.read_residency_shards();
+        let snapshots_guard = self.read_residency_snapshots();
 
         let query_shape = match resident_route_query_shape(select, &table, &bound) {
             Some(shape) => shape,
@@ -372,11 +372,7 @@ impl Engine {
             && snapshot.invalidated_at_index.is_none()
             && !snapshot.invalidated_by_memory_pressure
             && !memory_pressure_active;
-        let has_retained_device_memory = self
-            .read_state
-            .residency
-            .device_memory
-            .contains_key(&table.name);
+        let has_retained_device_memory = self.read_resident_device_memory(&table.name).is_some();
         let d2h_bytes_estimate = resident_route_d2h_bytes_estimate(select, &query_shape, snapshot);
         let mut decision = RelationalResidentRouteDecisionStatus {
             table: table.name.clone(),

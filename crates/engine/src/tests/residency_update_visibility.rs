@@ -108,6 +108,1183 @@ fn sv4b_sql_delete_tombstones_in_place_and_matches_host_mvcc() {
     );
 }
 
+/// R3-003 generation ownership: BEGIN pins the old shard descriptor plus its exact allocation.
+/// A later UPDATE invalidates and re-admits the current table to a distinct allocation; transaction
+/// SELECT still executes on the retained old GPU generation while an autocommit SELECT sees new data.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_select_retains_old_gpu_generation_across_readmission() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.set_resident_update_tombstone_enabled(false);
+    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+        .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+
+    let captured = e.transaction_snapshot_handle(90).unwrap();
+    let old_memory = captured.resident_shards["accounts"][0]
+        .device_memory
+        .as_ref()
+        .unwrap()
+        .clone();
+    drop(captured);
+    e.execute_text(3, "UPDATE accounts SET balance = 200 WHERE id = 1")
+        .unwrap();
+    let current_memory = e.read_residency_shards()["accounts"][0]
+        .device_memory
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(
+        !Arc::ptr_eq(&old_memory, &current_memory),
+        "the transaction pin must keep the old allocation alive, forcing re-admission to a distinct generation"
+    );
+
+    let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let old = e
+        .execute_relational_select_in_transaction(90, &select)
+        .unwrap();
+    assert_eq!(old.rows.row(0)[0], SqlValue::Int4(100));
+    let current = e.execute_relational_select(&select).unwrap();
+    assert_eq!(current.rows.row(0)[0], SqlValue::Int4(200));
+    let retained_pins = Arc::strong_count(&old_memory);
+    e.execute_text(90, "ROLLBACK").unwrap();
+    assert!(
+        Arc::strong_count(&old_memory) < retained_pins,
+        "terminal transaction release must drop its generation-owned device allocation pin"
+    );
+}
+
+/// R3-003 transaction DML prepare: after current-generation re-admission, the old transaction's
+/// point predicate must resolve from its retained shard allocation. The residual balance predicate
+/// distinguishes the generations; staging succeeds against the retained bytes, then COMMIT rejects
+/// the changed stable identity/row image from the current device generation.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_dml_prepare_uses_retained_gpu_generation_for_conflict_verdict() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.set_resident_update_tombstone_enabled(false);
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, marker INT)",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, balance, marker) VALUES (1, 100, NULL)",
+    )
+    .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+
+    let captured = e.transaction_snapshot_handle(90).unwrap();
+    let old_memory = captured.resident_shards["accounts"][0]
+        .device_memory
+        .as_ref()
+        .unwrap()
+        .clone();
+    e.execute_dml_concurrent(3, "UPDATE accounts SET balance = 200 WHERE id = 1")
+        .unwrap();
+    let current_memory = e.read_residency_shards()["accounts"][0]
+        .device_memory
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(!Arc::ptr_eq(&old_memory, &current_memory));
+
+    let device_hits_before = e.dml_device_resolve_hits();
+    e.execute_dml_concurrent(
+        90,
+        "UPDATE accounts SET balance = 300 WHERE id = 1 AND balance = 100",
+    )
+    .unwrap();
+    assert!(
+        e.dml_device_resolve_hits() > device_hits_before,
+        "non-vacuity: retained-generation predicate resolution must complete on the GPU"
+    );
+
+    let select = match parse_command("SELECT balance, marker FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(
+        e.execute_relational_select_in_transaction(90, &select)
+            .unwrap()
+            .rows
+            .row(0)[0],
+        SqlValue::Int4(300)
+    );
+    assert_eq!(
+        e.execute_relational_select_in_transaction(90, &select)
+            .unwrap()
+            .rows
+            .row(0)[1],
+        SqlValue::Null
+    );
+    let wal_before = e.durable_wal_records().len();
+    let err = e.execute_text(90, "COMMIT").unwrap_err();
+    assert!(
+        matches!(&err, ExecuteError::Serialization(message) if message.contains("device write-write conflict")),
+        "expected current-generation device write conflict, got {err:?}"
+    );
+    assert_eq!(e.durable_wal_records().len(), wal_before);
+    assert_eq!(
+        e.execute_relational_select(&select).unwrap().rows.row(0)[0],
+        SqlValue::Int4(200)
+    );
+    assert_eq!(
+        e.execute_relational_select(&select).unwrap().rows.row(0)[1],
+        SqlValue::Null
+    );
+    e.execute_text(90, "ROLLBACK").unwrap();
+}
+
+/// R3-003 transaction delta: UPDATE/INSERT/DELETE publish only a private device generation.
+/// Transaction SELECT and later DML observe it, autocommit readers do not, and rollback releases it
+/// without ever changing the global generation. NULL proves the private payload/bitmap route.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_private_gpu_delta_provides_read_your_writes_and_rollback() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(true);
+    e.set_shard_residency_enabled(true);
+    e.set_shard_size_target(64);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, marker INT)",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, balance, marker) VALUES (1, 100, NULL)",
+    )
+    .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+
+    e.execute_dml_concurrent(90, "UPDATE accounts SET balance = 200 WHERE id = 1")
+        .unwrap();
+    e.execute_dml_concurrent(
+        90,
+        "INSERT INTO accounts (id, balance, marker) VALUES (2, 300, NULL)",
+    )
+    .unwrap();
+
+    let row = match parse_command("SELECT balance, marker FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let inserted = match parse_command("SELECT balance, marker FROM accounts WHERE id = 2").unwrap()
+    {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let private = e
+        .execute_relational_select_in_transaction(90, &row)
+        .unwrap();
+    assert_eq!(private.rows.row(0), &[SqlValue::Int4(200), SqlValue::Null]);
+    let private_insert = e
+        .execute_relational_select_in_transaction(90, &inserted)
+        .unwrap();
+    assert_eq!(
+        private_insert.rows.row(0),
+        &[SqlValue::Int4(300), SqlValue::Null]
+    );
+    assert_eq!(
+        e.execute_relational_select(&row).unwrap().rows.row(0),
+        &[SqlValue::Int4(100), SqlValue::Null]
+    );
+    assert!(e
+        .execute_relational_select(&inserted)
+        .unwrap()
+        .rows
+        .is_empty());
+
+    e.execute_dml_concurrent(90, "DELETE FROM accounts WHERE id = 1")
+        .unwrap();
+    assert!(e
+        .execute_relational_select_in_transaction(90, &row)
+        .unwrap()
+        .rows
+        .is_empty());
+    e.execute_text(90, "ROLLBACK").unwrap();
+
+    assert_eq!(
+        e.execute_relational_select(&row).unwrap().rows.row(0),
+        &[SqlValue::Int4(100), SqlValue::Null]
+    );
+    assert!(e
+        .execute_relational_select(&inserted)
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+/// Private CUDA allocations reserve the shared residency budget before allocation, release a
+/// failed statement immediately, charge the exact current private Arc graph (not every historical
+/// COW), and release the retained charge at transaction teardown.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_private_gpu_budget_is_preallocated_exact_and_lifetime_scoped() {
+    let mut e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 200)",
+    )
+    .unwrap();
+    let global_bytes = e.relational_resident_bytes_for_gpu(0);
+    assert!(global_bytes > 0, "test requires retained device allocation");
+    let (expected_first_charge, replacement_cow_bytes) = {
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let names = table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let types = table
+            .columns
+            .iter()
+            .map(|column| column.ty)
+            .collect::<Vec<_>>();
+        let rows = vec![vec![SqlValue::Int4(1), SqlValue::Int4(101)]];
+        let (payload, ..) =
+            crate::engine_residency::build_relational_device_payload(&names, &types, &rows)
+                .unwrap();
+        let tombstone_bytes = e
+            .read_residency_shards()
+            .get("accounts")
+            .unwrap()
+            .iter()
+            .map(|shard| shard.capacity as u64 * 8)
+            .max()
+            .unwrap();
+        (
+            tombstone_bytes + payload.len() as u64 + 8, // one private stable-identity cell
+            tombstone_bytes,
+        )
+    };
+    e.set_relational_residency_budget_bytes(0, global_bytes);
+    e.execute_text(90, "BEGIN").unwrap();
+    let error = e
+        .execute_dml_concurrent(90, "UPDATE accounts SET balance = 101 WHERE id = 1")
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds residency budget"));
+    assert!(
+        e.transaction_private_gpu_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "a pre-allocation decline must leave no private charge"
+    );
+
+    e.set_relational_residency_budget_bytes(0, global_bytes + expected_first_charge);
+    e.execute_dml_concurrent(90, "UPDATE accounts SET balance = 101 WHERE id = 1")
+        .unwrap();
+    let snapshot = e.transaction_snapshot_handle(90).unwrap();
+    let first_charge = snapshot
+        .delta
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .private_gpu_bytes_by_gpu[&0];
+    assert_eq!(first_charge, expected_first_charge);
+    assert_eq!(
+        e.transaction_private_gpu_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())[&0],
+        first_charge
+    );
+
+    // Both statements COW the same base-shard tombstone sidecar. The second retains a replacement
+    // sidecar of the same size plus the already-retained UPDATE payload; it must not accumulate the
+    // now-unreachable first sidecar charge. Its preflight must nevertheless admit the temporary
+    // old+new COW peak until the replacement graph is published.
+    e.set_relational_residency_budget_bytes(0, global_bytes + first_charge + replacement_cow_bytes);
+    e.execute_dml_concurrent(90, "DELETE FROM accounts WHERE id = 2")
+        .unwrap();
+    let second_charge = snapshot
+        .delta
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .private_gpu_bytes_by_gpu[&0];
+    assert_eq!(second_charge, first_charge);
+    drop(snapshot);
+    e.execute_text(90, "ROLLBACK").unwrap();
+    assert!(
+        e.transaction_private_gpu_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "terminal transaction release must drop the final private Arc charge"
+    );
+}
+
+/// A transaction SELECT owns its private generation for the whole statement. A later statement
+/// in the same transaction cannot replace that generation (and retire its exact GPU charge) until
+/// the reader releases it, so global admission never observes live private VRAM as uncharged.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_private_reader_pin_serializes_replacement_and_budget_accounting() {
+    let mut engine = Engine::new_local();
+    engine.set_shard_residency_enabled(true);
+    engine.set_auto_admit_on_commit(true);
+    engine
+        .execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
+        .unwrap();
+    engine
+        .execute_text(
+            2,
+            "INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 200)",
+        )
+        .unwrap();
+    // Admission limits are covered by the preceding exact-budget test. This race isolates charge
+    // lifetime/serialization and must allow the temporary old+new replacement peak.
+    engine.set_relational_residency_budget_bytes(0, u64::MAX);
+    engine.execute_text(90, "BEGIN").unwrap();
+    engine
+        .execute_dml_concurrent(90, "UPDATE accounts SET balance = 101 WHERE id = 1")
+        .unwrap();
+    let snapshot = engine.transaction_snapshot_handle(90).unwrap();
+    let first_charge = snapshot
+        .delta
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .private_gpu_bytes_by_gpu[&0];
+    drop(snapshot);
+
+    let Command::Select(select) =
+        parse_command("SELECT id, balance FROM accounts ORDER BY id").unwrap()
+    else {
+        panic!("expected SELECT plan");
+    };
+    let engine = Arc::new(engine);
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let reader = {
+        let engine = Arc::clone(&engine);
+        let reached = Arc::clone(&reached);
+        let resume = Arc::clone(&resume);
+        std::thread::spawn(move || {
+            engine.execute_relational_select_in_transaction_instrumented(90, &select, || {
+                reached.wait();
+                resume.wait();
+            })
+        })
+    };
+    reached.wait();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let replacement = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            let result = engine.execute_dml_concurrent(90, "DELETE FROM accounts WHERE id = 2");
+            done_tx.send(()).unwrap();
+            result
+        })
+    };
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "same-transaction DML replaced a private generation while its reader was pinned"
+    );
+    assert_eq!(
+        engine
+            .transaction_private_gpu_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())[&0],
+        first_charge,
+        "the pinned reader's exact private GPU charge must remain published"
+    );
+
+    resume.wait();
+    assert_eq!(reader.join().unwrap().unwrap().rows.len(), 2);
+    replacement.join().unwrap().unwrap();
+    let snapshot = engine.transaction_snapshot_handle(90).unwrap();
+    let replacement_charge = snapshot
+        .delta
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .private_gpu_bytes_by_gpu[&0];
+    assert_eq!(replacement_charge, first_charge);
+    drop(snapshot);
+    engine.execute_text(90, "ROLLBACK").unwrap();
+    assert!(engine
+        .transaction_private_gpu_bytes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty());
+}
+
+/// The legacy batching entry is transaction-aware: active DML stages into the same private GPU
+/// generation as the canonical path, and terminal control publishes that delta rather than
+/// discarding it through the empty transaction-context helper.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn enqueue_active_transaction_routes_private_dml_and_commit_atomically() {
+    let mut engine = Engine::new_local();
+    engine.set_shard_residency_enabled(true);
+    engine.set_auto_admit_on_commit(true);
+    engine
+        .execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
+        .unwrap();
+    engine
+        .execute_text(2, "INSERT INTO accounts (id, balance) VALUES (0, 0)")
+        .unwrap();
+    let residency = engine
+        .populate_relational_residency_snapshot("accounts")
+        .expect("admit empty transaction base generation");
+    if residency.device_memory_proof.is_none() {
+        return;
+    }
+    let now = Instant::now();
+    engine.enqueue_set_text(90, "BEGIN", now).unwrap();
+    engine
+        .enqueue_set_text(
+            90,
+            "INSERT INTO accounts (id, balance) VALUES (1, 100)",
+            now,
+        )
+        .unwrap();
+    let Command::Select(select) =
+        parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap()
+    else {
+        panic!("expected SELECT plan");
+    };
+    assert!(engine
+        .execute_relational_select(&select)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        engine
+            .execute_relational_select_in_transaction(90, &select)
+            .unwrap()
+            .rows,
+        vec![vec![SqlValue::Int4(1), SqlValue::Int4(100)]]
+    );
+    engine.enqueue_set_text(90, "COMMIT", now).unwrap();
+    assert_eq!(
+        engine.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Int4(1), SqlValue::Int4(100)]]
+    );
+    assert!(engine.transaction_snapshot_handle(90).is_none());
+}
+
+/// Pending GPU submissions retain their originating service token through both Engine completion
+/// forms. A wedge published after the device drain but before return must suppress the result.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn pending_retained_completions_recheck_origin_wedge_after_device_drain() {
+    fn pending_submission() -> (Arc<Engine>, RelationalRetainedReadSubmission) {
+        let engine = Arc::new(Engine::new_local());
+        engine.set_host_install_elision_enabled(false);
+        engine.set_shard_residency_enabled(false);
+        engine.set_auto_admit_on_commit(true);
+        engine
+            .execute_text(1, "CREATE TABLE events (id INT PRIMARY KEY, value INT)")
+            .unwrap();
+        engine
+            .execute_text(2, "INSERT INTO events (id, value) VALUES (1, 10), (2, 20)")
+            .unwrap();
+        let Command::Select(select) = parse_command("SELECT id FROM events WHERE id = 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let job = engine
+            .prepare_relational_retained_read_job(&select)
+            .unwrap();
+        let submission = engine
+            .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[job])
+            .unwrap();
+        assert!(
+            submission.is_pending(),
+            "test requires a deferred GPU result"
+        );
+        (engine, submission)
+    }
+
+    let (engine, submission) = pending_submission();
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    engine.set_retained_completion_post_hook(Arc::clone(&reached), Arc::clone(&resume));
+    let completion = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || engine.complete_relational_retained_read_submission(submission))
+    };
+    reached.wait();
+    engine.wedge_commit_path();
+    resume.wait();
+    let error = completion.join().unwrap().unwrap_err();
+    assert!(error.to_string().contains("restart recovery"), "{error}");
+
+    let (engine, submission) = pending_submission();
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    engine.set_retained_completion_post_hook(Arc::clone(&reached), Arc::clone(&resume));
+    let completion = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            engine.complete_relational_retained_read_submission_batched(submission)
+        })
+    };
+    reached.wait();
+    engine.wedge_commit_path();
+    resume.wait();
+    let error = completion.join().unwrap().unwrap_err();
+    assert!(error.to_string().contains("restart recovery"), "{error}");
+}
+
+/// R3-003 atomic publication: several private GPU statements (including an update of a
+/// transaction-local insert, a delete, and NULL payloads) become visible at one commit index and
+/// one resolved WAL record. Recovery must reproduce the same final identity state.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_private_gpu_delta_commits_one_atomic_recoverable_record() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(true);
+    e.set_shard_residency_enabled(true);
+    e.set_shard_size_target(64);
+    e.set_auto_admit_on_commit(true);
+    e.set_resident_update_tombstone_enabled(true);
+    e.set_resident_delete_tombstone_enabled(true);
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, marker INT)",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, balance, marker) VALUES (1, 100, NULL), (3, 400, 7)",
+    )
+    .unwrap();
+    let base_memory = e.read_residency_shards()["accounts"][0]
+        .device_memory
+        .as_ref()
+        .unwrap()
+        .clone();
+    e.execute_text(90, "BEGIN").unwrap();
+    let wal_before = e.durable_wal_records().len();
+
+    e.execute_dml_concurrent(90, "UPDATE accounts SET balance = 200 WHERE id = 1")
+        .unwrap();
+    e.execute_dml_concurrent(
+        90,
+        "INSERT INTO accounts (id, balance, marker) VALUES (2, 300, NULL)",
+    )
+    .unwrap();
+    e.execute_dml_concurrent(90, "UPDATE accounts SET balance = 350 WHERE id = 2")
+        .unwrap();
+    e.execute_dml_concurrent(90, "DELETE FROM accounts WHERE id = 3")
+        .unwrap();
+
+    let select =
+        match parse_command("SELECT id, balance, marker FROM accounts ORDER BY id").unwrap() {
+            Command::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+    assert_eq!(
+        e.execute_relational_select(&select).unwrap().rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(100), SqlValue::Null],
+            vec![SqlValue::Int4(3), SqlValue::Int4(400), SqlValue::Int4(7)],
+        ],
+        "autocommit visibility remains unchanged before COMMIT"
+    );
+    assert_eq!(
+        e.execute_relational_select_in_transaction(90, &select)
+            .unwrap()
+            .rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(200), SqlValue::Null],
+            vec![SqlValue::Int4(2), SqlValue::Int4(350), SqlValue::Null],
+        ],
+        "transaction generation includes all prior private statements"
+    );
+
+    let before_commit_seq = e.visible_up_to();
+    e.execute_text(90, "COMMIT").unwrap();
+    assert!(e.transaction_snapshot_handle(90).is_none());
+    assert_eq!(e.visible_up_to(), before_commit_seq + 1);
+    assert!(
+        e.read_residency_shards()["accounts"]
+            .iter()
+            .filter_map(|shard| shard.device_memory.as_ref())
+            .any(|memory| Arc::ptr_eq(memory, &base_memory)),
+        "non-vacuity: atomic COMMIT retained the base GPU allocation instead of invalidating and re-admitting the table"
+    );
+    assert!(
+        table_has_any_deleted_by_cell(&e, "accounts"),
+        "non-vacuity: update/delete commit stamps remained on the resident generation"
+    );
+    let durable = e.durable_wal_records();
+    assert_eq!(durable.len(), wal_before + 1);
+    assert!(matches!(
+        decode_binary_record(&durable.last().unwrap().payload).unwrap(),
+        BinaryWalRecord::Transaction(record) if record.mutations.len() == 3
+    ));
+    let expected = vec![
+        vec![SqlValue::Int4(1), SqlValue::Int4(200), SqlValue::Null],
+        vec![SqlValue::Int4(2), SqlValue::Int4(350), SqlValue::Null],
+    ];
+    assert_eq!(e.execute_relational_select(&select).unwrap().rows, expected);
+
+    let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        expected,
+        "replay of the one resolved transaction record is byte-equivalent"
+    );
+}
+
+/// A failure after the one transaction WAL record is durable is not an ordinary abort: the engine
+/// wedges, retains the transaction context, and refuses rollback/service until restart replay.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_post_durable_apply_failure_is_sticky_fail_stop() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(true);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+        .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_dml_concurrent(90, "UPDATE accounts SET balance = 200 WHERE id = 1")
+        .unwrap();
+
+    e.fail_next_transaction_post_durable_apply();
+    let err = e.execute_text(90, "COMMIT").unwrap_err();
+    assert!(
+        err.to_string().contains("restart recovery required"),
+        "{err}"
+    );
+    assert!(e.is_commit_path_poisoned());
+    assert!(e.transaction_snapshot_handle(90).is_some());
+    let rollback = e.execute_text(90, "ROLLBACK").unwrap_err();
+    assert!(
+        rollback.to_string().contains("restart recovery required"),
+        "{rollback}"
+    );
+    let select = match parse_command("SELECT id, balance FROM accounts ORDER BY id").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let read = e.execute_relational_select(&select).unwrap_err();
+    assert!(
+        read.to_string().contains("restart recovery required"),
+        "direct engine reads must fail-stop too: {read}"
+    );
+    let later = e
+        .execute_dml_concurrent(91, "INSERT INTO accounts (id, balance) VALUES (2, 300)")
+        .unwrap_err();
+    assert!(
+        later.to_string().contains("restart recovery required"),
+        "direct concurrent writes must fail-stop too: {later}"
+    );
+
+    let durable = e.durable_wal_records();
+    let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Int4(1), SqlValue::Int4(200)]],
+        "restart applies the durable-but-unacknowledged transaction exactly once"
+    );
+}
+
+/// R3-003 transaction-owned sequence state: default evaluation advances across private statements,
+/// stays invisible on rollback, and is installed/replayed in the same atomic record as its rows.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_sequence_defaults_advance_privately_and_recover_atomically() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE SEQUENCE txn_ids").unwrap();
+    e.execute_text(
+        2,
+        "CREATE TABLE serial_accounts (id INT DEFAULT nextval('txn_ids'::regclass), balance INT)",
+    )
+    .unwrap();
+    // Seed a resident generation without consuming the sequence; first private nextval remains 1.
+    e.execute_text(
+        3,
+        "INSERT INTO serial_accounts (id, balance) VALUES (99, 990)",
+    )
+    .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+    let wal_before = e.durable_wal_records().len();
+    e.execute_dml_concurrent(
+        90,
+        "INSERT INTO serial_accounts (balance) VALUES (10), (20)",
+    )
+    .unwrap();
+    e.execute_dml_concurrent(90, "INSERT INTO serial_accounts (balance) VALUES (30)")
+        .unwrap();
+
+    let select = match parse_command("SELECT id, balance FROM serial_accounts ORDER BY id").unwrap()
+    {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(
+        e.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Int4(99), SqlValue::Int4(990)]],
+        "private nextval rows remain globally invisible"
+    );
+    assert_eq!(
+        e.execute_relational_select_in_transaction(90, &select)
+            .unwrap()
+            .rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(20)],
+            vec![SqlValue::Int4(3), SqlValue::Int4(30)],
+            vec![SqlValue::Int4(99), SqlValue::Int4(990)],
+        ]
+    );
+    let sequence = e.relational_catalog_sequence("txn_ids").unwrap();
+    assert_eq!((sequence.last_value, sequence.is_called), (1, false));
+
+    e.execute_text(90, "COMMIT").unwrap();
+    let sequence = e.relational_catalog_sequence("txn_ids").unwrap();
+    assert_eq!((sequence.last_value, sequence.is_called), (3, true));
+    let durable = e.durable_wal_records();
+    assert_eq!(durable.len(), wal_before + 1);
+    assert!(matches!(
+        decode_binary_record(&durable.last().unwrap().payload).unwrap(),
+        BinaryWalRecord::Transaction(record)
+            if record.sequence_advances.get("txn_ids") == Some(&(3, true))
+                && record.mutations.len() == 3
+    ));
+
+    let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        e.execute_relational_select(&select).unwrap().rows
+    );
+    let sequence = recovered.relational_catalog_sequence("txn_ids").unwrap();
+    assert_eq!((sequence.last_value, sequence.is_called), (3, true));
+
+    e.execute_text(91, "BEGIN").unwrap();
+    e.execute_dml_concurrent(91, "INSERT INTO serial_accounts (balance) VALUES (40)")
+        .unwrap();
+    e.execute_text(91, "ROLLBACK").unwrap();
+    let sequence = e.relational_catalog_sequence("txn_ids").unwrap();
+    assert_eq!((sequence.last_value, sequence.is_called), (3, true));
+    e.execute_text(4, "INSERT INTO serial_accounts (balance) VALUES (40)")
+        .unwrap();
+    let id_four = match parse_command("SELECT balance FROM serial_accounts WHERE id = 4").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(
+        e.execute_relational_select(&id_four).unwrap().rows.row(0)[0],
+        SqlValue::Int4(40),
+        "rollback must not consume the transaction-private sequence value"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_atomic_commit_rechecks_conflicts_after_last_staged_statement() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, marker INT)",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, balance, marker) VALUES (1, 100, NULL)",
+    )
+    .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_dml_concurrent(90, "UPDATE accounts SET balance = 200 WHERE id = 1")
+        .unwrap();
+    let wal_before_winner = e.durable_wal_records().len();
+    e.execute_dml_concurrent(3, "UPDATE accounts SET balance = 100 WHERE id = 1")
+        .unwrap();
+    let wal_after_winner = e.durable_wal_records().len();
+    assert_eq!(wal_after_winner, wal_before_winner + 1);
+    assert!(
+        table_has_any_created_by_cell(&e, "accounts"),
+        "re-admission while the old transaction is active must retain newer device conflict stamps"
+    );
+
+    let err = e.execute_text(90, "COMMIT").unwrap_err();
+    assert!(
+        matches!(&err, ExecuteError::Serialization(message) if message.contains("write-write conflict")),
+        "losing transaction must abort before WAL append: {err:?}"
+    );
+    assert!(
+        matches!(&err, ExecuteError::Serialization(message) if message.contains("device write-write conflict")),
+        "non-vacuity: COMMIT must return the device-side identity/version verdict: {err:?}"
+    );
+    assert_eq!(e.durable_wal_records().len(), wal_after_winner);
+    assert!(e.transaction_snapshot_handle(90).is_some());
+    let select = match parse_command("SELECT balance, marker FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(
+        e.execute_relational_select(&select).unwrap().rows.row(0),
+        &[SqlValue::Int4(100), SqlValue::Null]
+    );
+    assert_eq!(
+        e.execute_relational_select_in_transaction(90, &select)
+            .unwrap()
+            .rows
+            .row(0),
+        &[SqlValue::Int4(200), SqlValue::Null]
+    );
+    e.execute_text(90, "ROLLBACK").unwrap();
+    assert!(
+        !table_has_any_created_by_cell(&e, "accounts"),
+        "terminal transaction release must GC a conflict sidecar whose high-water is now globally visible"
+    );
+}
+
+/// R3-003 cross-table stamps: FK preparation consumes the private device generations, while
+/// COMMIT rechecks untouched providers/children against the current device generations.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_foreign_keys_use_private_and_current_device_generations() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.set_resident_update_tombstone_enabled(true);
+    e.set_resident_delete_tombstone_enabled(true);
+    e.execute_text(1, "CREATE TABLE parents (id INT PRIMARY KEY)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "CREATE TABLE children (id INT PRIMARY KEY, parent_id INT)",
+    )
+    .unwrap();
+    e.execute_text(
+        3,
+        "ALTER TABLE ONLY children ADD CONSTRAINT children_parent_fk FOREIGN KEY (parent_id) REFERENCES parents(id)",
+    )
+    .unwrap();
+    e.execute_text(4, "INSERT INTO parents (id) VALUES (1), (2)")
+        .unwrap();
+    e.execute_text(5, "INSERT INTO children (id, parent_id) VALUES (10, 1)")
+        .unwrap();
+
+    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_dml_concurrent(90, "INSERT INTO parents (id) VALUES (3)")
+        .unwrap();
+    e.execute_dml_concurrent(90, "INSERT INTO children (id, parent_id) VALUES (30, 3)")
+        .unwrap();
+    e.execute_dml_concurrent(90, "DELETE FROM children WHERE id = 10")
+        .unwrap();
+    e.execute_dml_concurrent(90, "DELETE FROM parents WHERE id = 1")
+        .unwrap();
+    e.execute_text(90, "COMMIT").unwrap();
+    let joined = match parse_command("SELECT id, parent_id FROM children ORDER BY id").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(
+        e.execute_relational_select(&joined).unwrap().rows,
+        vec![vec![SqlValue::Int4(30), SqlValue::Int4(3)]]
+    );
+
+    // Provider deleted after BEGIN: the child prepared against the retained generation, but the
+    // current-device provider stamp rejects COMMIT before another WAL record is appended.
+    e.execute_text(91, "BEGIN").unwrap();
+    e.execute_dml_concurrent(91, "INSERT INTO children (id, parent_id) VALUES (40, 2)")
+        .unwrap();
+    e.execute_dml_concurrent(10, "DELETE FROM parents WHERE id = 2")
+        .unwrap();
+    let wal_after_provider_delete = e.durable_wal_records().len();
+    let outbound = e.execute_text(91, "COMMIT").unwrap_err();
+    assert!(
+        matches!(&outbound, ExecuteError::Serialization(message) if message.contains("device foreign-key conflict")),
+        "expected current-device provider conflict, got {outbound:?}"
+    );
+    assert_eq!(e.durable_wal_records().len(), wal_after_provider_delete);
+    e.execute_text(91, "ROLLBACK").unwrap();
+
+    // Child inserted after BEGIN: the parent delete prepared against an empty retained child set,
+    // then the current-device child stamp rejects the orphaning commit.
+    e.execute_dml_concurrent(11, "INSERT INTO parents (id) VALUES (4)")
+        .unwrap();
+    e.execute_text(92, "BEGIN").unwrap();
+    e.execute_dml_concurrent(92, "DELETE FROM parents WHERE id = 4")
+        .unwrap();
+    e.execute_dml_concurrent(12, "INSERT INTO children (id, parent_id) VALUES (50, 4)")
+        .unwrap();
+    let wal_after_child_insert = e.durable_wal_records().len();
+    let inbound = e.execute_text(92, "COMMIT").unwrap_err();
+    assert!(
+        matches!(&inbound, ExecuteError::Serialization(message) if message.contains("device foreign-key conflict")),
+        "expected current-device child conflict, got {inbound:?}"
+    );
+    assert_eq!(e.durable_wal_records().len(), wal_after_child_insert);
+    e.execute_text(92, "ROLLBACK").unwrap();
+}
+
+/// The classic sequencer has applied the parent DELETE but has not yet handed its durability tail
+/// to the deque. An explicit child transaction must treat that interval as unsettled: it waits for
+/// the registered applied tail, then rejects against the published parent deletion.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_fk_commit_waits_across_classic_wave_tail_handoff() {
+    let mut e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.set_resident_delete_tombstone_enabled(true);
+    e.execute_text(1, "CREATE TABLE parents (id INT PRIMARY KEY)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "CREATE TABLE children (id INT PRIMARY KEY, parent_id INT)",
+    )
+    .unwrap();
+    e.execute_text(
+        3,
+        "ALTER TABLE ONLY children ADD CONSTRAINT children_parent_fk FOREIGN KEY (parent_id) REFERENCES parents(id)",
+    )
+    .unwrap();
+    e.execute_text(4, "INSERT INTO parents (id) VALUES (1), (2)")
+        .unwrap();
+    e.execute_text(5, "INSERT INTO children (id, parent_id) VALUES (0, 2)")
+        .unwrap();
+    let parents_residency = e
+        .populate_relational_residency_snapshot("parents")
+        .expect("refresh parent transaction base generation");
+    let children_residency = e
+        .populate_relational_residency_snapshot("children")
+        .expect("admit child transaction base generation");
+    if parents_residency.device_memory_proof.is_none()
+        || children_residency.device_memory_proof.is_none()
+    {
+        return;
+    }
+    let e = Arc::new(e);
+    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_dml_concurrent(90, "INSERT INTO children (id, parent_id) VALUES (10, 1)")
+        .unwrap();
+
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    e.set_wave_tail_handoff_hook(Arc::clone(&reached), Arc::clone(&resume));
+    let delete = {
+        let e = Arc::clone(&e);
+        std::thread::spawn(move || {
+            e.execute_dml_concurrent(100, "DELETE FROM parents WHERE id = 1")
+        })
+    };
+    reached.wait();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let commit = {
+        let e = Arc::clone(&e);
+        std::thread::spawn(move || {
+            let result = e.execute_text(90, "COMMIT");
+            done_tx.send(()).unwrap();
+            result
+        })
+    };
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "explicit COMMIT crossed an applied classic wave before its tail was handed off"
+    );
+    resume.wait();
+    delete.join().unwrap().unwrap();
+    let result = commit.join().unwrap();
+    assert!(
+        matches!(&result, Err(ExecuteError::Serialization(message))
+            if message.contains("device foreign-key conflict")),
+        "the settled parent delete must reject the child commit: {result:?}"
+    );
+    e.execute_text(90, "ROLLBACK").unwrap();
+}
+
+/// A classic tail can fail after an explicit COMMIT's optimistic poison check. The full-drain
+/// result and the under-lock sticky recheck are both load-bearing: the transaction must stop before
+/// claiming final identities or appending its WAL record once that concurrent tail wedges service.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_commit_fails_closed_when_waited_classic_tail_wedges() {
+    let mut engine = Engine::new_local();
+    engine.set_host_install_elision_enabled(false);
+    engine.set_shard_residency_enabled(true);
+    engine.set_auto_admit_on_commit(true);
+    engine
+        .execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
+        .unwrap();
+    engine
+        .execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+        .unwrap();
+    engine.execute_text(90, "BEGIN").unwrap();
+    engine
+        .execute_dml_concurrent(90, "UPDATE accounts SET balance = 101 WHERE id = 1")
+        .unwrap();
+    let durable_before = engine.durable_wal_records().len();
+    let visible_before = engine.committed_seq();
+    engine.simulate_next_wal_flush_failure();
+
+    let engine = Arc::new(engine);
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let failure_published = Arc::new(std::sync::Barrier::new(2));
+    let finish_failure = Arc::new(std::sync::Barrier::new(2));
+    engine.set_wave_tail_handoff_hook(Arc::clone(&reached), Arc::clone(&resume));
+    engine.set_wave_tail_failure_publish_hook(
+        Arc::clone(&failure_published),
+        Arc::clone(&finish_failure),
+    );
+    let classic = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.execute_dml_concurrent(
+                    100,
+                    "INSERT INTO accounts (id, balance) VALUES (2, 200)",
+                )
+            }))
+        })
+    };
+    reached.wait();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let transaction = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            let result = engine.execute_text(90, "COMMIT");
+            done_tx.send(()).unwrap();
+            result
+        })
+    };
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "explicit COMMIT crossed the classic tail before its durability verdict"
+    );
+    resume.wait();
+    failure_published.wait();
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok(),
+        "explicit COMMIT did not fail after the wedge was published and before the tail advertised finished"
+    );
+    finish_failure.wait();
+    assert!(
+        classic.join().unwrap().is_err(),
+        "the injected classic-tail fsync failure must take the wedge path"
+    );
+    let error = transaction.join().unwrap().unwrap_err();
+    assert!(error.to_string().contains("restart recovery"), "{error}");
+    assert!(engine.is_commit_path_poisoned());
+    assert_eq!(engine.committed_seq(), visible_before);
+    assert_eq!(
+        engine.durable_wal_records().len(),
+        durable_before,
+        "neither the failed classic wave nor the explicit transaction may extend the durable prefix"
+    );
+    assert!(
+        engine.transaction_snapshot_handle(90).is_some(),
+        "a pre-WAL fail-stop must leave the explicit transaction uncommitted"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_select_retains_old_single_buffer_generation_across_readmission() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(false);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+        .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+
+    let captured = e.transaction_snapshot_handle(90).unwrap();
+    let old_memory = captured.resident_snapshots["accounts"]
+        .device_memory
+        .as_ref()
+        .unwrap()
+        .clone();
+    e.execute_text(3, "UPDATE accounts SET balance = 200 WHERE id = 1")
+        .unwrap();
+    let current_memory = e.read_residency_snapshots()["accounts"]
+        .device_memory
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(
+        !Arc::ptr_eq(&old_memory, &current_memory),
+        "the captured single-buffer allocation must survive current-generation replacement"
+    );
+
+    let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let old = e
+        .execute_relational_select_in_transaction(90, &select)
+        .unwrap();
+    assert_eq!(old.rows.row(0)[0], SqlValue::Int4(100));
+    let current = e.execute_relational_select(&select).unwrap();
+    assert_eq!(current.rows.row(0)[0], SqlValue::Int4(200));
+    e.execute_text(90, "ROLLBACK").unwrap();
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn transaction_first_touch_of_later_admitted_table_executes_empty_generation_on_gpu() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+        .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+    e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 200)")
+        .unwrap();
+
+    let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let old = e
+        .execute_relational_select_in_transaction(90, &select)
+        .unwrap();
+    assert!(old.rows.is_empty());
+    let current = e.execute_relational_select(&select).unwrap();
+    assert_eq!(current.rows.row(0)[0], SqlValue::Int4(200));
+    e.execute_text(90, "ROLLBACK").unwrap();
+}
+
 /// SV5 (GPU-native incremental UPDATE, commit WIRING): with `resident_update_tombstone_enabled` ON, a
 /// single-row SQL UPDATE on a shard-resident table TOMBSTONES the old version's slot + APPENDS the new
 /// image IN PLACE (no O(table) re-admit) and the GPU read == host MVCC. NON-VACUITY: the deleted_by region

@@ -5,6 +5,7 @@
 use super::*;
 mod constraint_elision;
 mod lane_lifecycle;
+mod wide_unique_index;
 
 /// Route preparation is a SHAPE PROOF: a table that is not yet elided
 /// (device-authoritative), or that has no unique index, must be refused with a

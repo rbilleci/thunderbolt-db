@@ -26,6 +26,10 @@ pub enum CudaCompoundFoldColumn {
         bytes_byte_offset: u64,
         bytes_len: u64,
     },
+    /// One-bit-per-row, LSB-first resident boolean bitmap.
+    Bool {
+        bitmap_byte_offset: u64,
+    },
 }
 
 fn checked_destination(
@@ -409,7 +413,8 @@ DONE:
 // and `blob_offsets[k]` as the byte offset of its blob, reads the row's [start,end) byte span, folds ONE
 // word = the FNV-1a hash of those bytes (h=0x811C9DC5; per BYTE h^=b; h*=0x01000193 — byte-identical to the
 // host `fnv1a_bytes`), then applies the same outer per-word mix. `blob_offsets` is ignored for fixed-width
-// columns (pass 0). One thread per row.
+// columns (pass 0). `widths[k] == UINT32_MAX` is the BOOL SENTINEL: `offsets[k]` addresses the
+// one-bit-per-row LSB-first bitmap and the extracted 0/1 contributes one canonical word. One thread per row.
 const COMPOUND_FOLD_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -460,6 +465,8 @@ FOLDLOOP:
     ld.global.u32 %r9, [%rd9];          // w = widths[k] (words in this column; 0 = TEXT sentinel)
     setp.eq.u32 %p4, %r9, 0;
     @%p4 bra TEXTCOL;                   // w == 0 -> variable-length text column
+    setp.eq.u32 %p4, %r9, 4294967295;
+    @%p4 bra BOOLCOL;                   // w == UINT32_MAX -> one-bit bool bitmap
     mul.lo.u32 %r10, %r6, %r9;          // row * w (word index of this column's row-0-relative start)
     mul.wide.u32 %rd10, %r10, 4;        // row * w * 4 (byte offset)
     add.u64 %rd11, %rd1, %rd7;
@@ -479,6 +486,25 @@ WORDLOOP:
     add.u32 %r11, %r11, 1;
     setp.lt.u32 %p3, %r11, %r9;
     @%p3 bra WORDLOOP;
+    bra NEXTCOL;
+
+BOOLCOL:
+    // Resident bool bitmaps are LSB-first. Loading bytes is equivalent to the u32-word readers on
+    // little-endian CUDA devices and avoids expanding one bit per row into a staging column.
+    shr.u32 %r19, %r6, 3;              // byte index = row / 8
+    and.b32 %r20, %r6, 7;              // bit index = row % 8
+    add.u64 %rd35, %rd1, %rd7;         // bitmap base = base + off
+    cvt.u64.u32 %rd38, %r19;
+    add.u64 %rd35, %rd35, %rd38;
+    ld.global.u8 %r21, [%rd35];
+    shr.u32 %r21, %r21, %r20;
+    and.b32 %r21, %r21, 1;
+    xor.b32 %r7, %r7, %r21;
+    mul.lo.u32 %r7, %r7, 16777619;
+    shl.b32 %r13, %r7, 13;
+    shr.b32 %r14, %r7, 19;
+    or.b32 %r7, %r13, %r14;
+    add.u32 %r7, %r7, 2654435761;
     bra NEXTCOL;
 
 TEXTCOL:
@@ -1079,6 +1105,24 @@ impl CudaResidentDeviceMemory {
                     widths.push(0);
                     blob_offsets.push(bytes_byte_offset);
                     blob_lens.push(bytes_len);
+                }
+                CudaCompoundFoldColumn::Bool { bitmap_byte_offset } => {
+                    let bitmap_len = row_count
+                        .checked_add(7)
+                        .map(|bits| bits / 8)
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                    let end = bitmap_byte_offset
+                        .checked_add(bitmap_len as u64)
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                    if end > self.metadata().allocated_bytes {
+                        return Err(CudaRuntimeProbeError::InvalidInputLength(
+                            usize::try_from(end).unwrap_or(usize::MAX),
+                        ));
+                    }
+                    offsets.push(bitmap_byte_offset);
+                    widths.push(u32::MAX);
+                    blob_offsets.push(0);
+                    blob_lens.push(0);
                 }
             }
         }

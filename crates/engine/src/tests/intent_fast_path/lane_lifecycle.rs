@@ -71,6 +71,24 @@ fn select_rows_unordered_sorted(engine: &Engine) -> Vec<Vec<SqlValue>> {
     }
 }
 
+/// Resolve one covered key through the same GPU visible-locate result the lane apply consumes.
+/// The returned row id is ADR-014's stable entity identity, not a physical version coordinate.
+fn visible_entity_id(engine: &Engine, key: i32) -> u64 {
+    let table = engine.relational_catalog_table("t").unwrap();
+    let snapshot = engine.committed_seq();
+    let located = engine
+        .wave_batch_visible_locate(&table, 0, &[key], &[snapshot])
+        .expect("GPU visible-locate must answer for the covered key");
+    assert_eq!(located.counts, vec![1], "covered key must resolve uniquely");
+    let entity_id = located.row_ids[0];
+    assert_ne!(
+        entity_id,
+        u64::MAX,
+        "covered mutation lineage must carry a stable entity identity"
+    );
+    entity_id
+}
+
 /// The full E2.1 arc on real hardware: warm a PK'd int4 table into elision,
 /// prepare the covered route, drive concurrent intents through the fast path
 /// (wave-batched device PK validation + device open-shard apply + W5a binary
@@ -341,7 +359,289 @@ fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<Covered
     panic!("table never entered elision on a GPU box");
 }
 
-/// E2.2(c) + (a) — the driver-multiplexed submit/poll API and the integer-ledger conflict
+/// First-activation handoff: force a classic writer to pass the optimistic lanes guard and pause
+/// before `commit_state`, activate lanes under that lock, then resume it. The reciprocal under-lock
+/// guard must reject it without consuming a serial sequence or appending WAL. Without that second
+/// check this deterministically creates overlapping serial/lane sequence ownership.
+#[test]
+fn intent_lane_activation_rejects_prechecked_classic_writer_under_commit_lock() {
+    let mut engine = Engine::new_local_cpu_oracle();
+    engine.attach_test_intent_lanes(test_wal_path("lane-activation-handoff"), 4);
+    let engine = std::sync::Arc::new(engine);
+    let lanes = engine
+        .intent_lanes
+        .as_ref()
+        .map(std::sync::Arc::clone)
+        .expect("test lane set must be installed");
+    let before_next = engine.commit_state().repl.peek_next_index();
+    let before_wal = engine.wal_buffered_count();
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    engine.set_intent_lanes_classic_prelock_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let classic = {
+        let engine = std::sync::Arc::clone(&engine);
+        std::thread::spawn(move || {
+            engine.commit_mutation_at(77, std::sync::Arc::from(&b"SET overlap value"[..]), 1)
+        })
+    };
+    reached.wait();
+    engine.ensure_intent_lanes_activated(&lanes).unwrap();
+    resume.wait();
+    let error = classic
+        .join()
+        .unwrap()
+        .expect_err("the prechecked classic writer must lose the activation handoff")
+        .to_string();
+    assert!(error.contains("intent lanes are ACTIVE"), "{error}");
+    assert_eq!(engine.commit_state().repl.peek_next_index(), before_next);
+    assert_eq!(engine.wal_buffered_count(), before_wal);
+    assert_eq!(
+        lanes.seq_oracle.load(Ordering::Acquire),
+        before_next,
+        "activation reserves the next serial index but consumes no lane sequence"
+    );
+}
+
+/// The engine-wide fail-stop drains lane ingress, not only the classic wave queue. This is a pure
+/// host test: no lane validation/apply is driven and therefore no CUDA device is required.
+#[test]
+fn central_commit_wedge_drains_queued_lane_intents() {
+    let path = test_wal_path("central-wedge-lane-drain");
+    let engine = Engine::with_durable_wal_segment(&path);
+    let Some(lanes) = engine.intent_lanes.as_ref().map(std::sync::Arc::clone) else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    let outcome = crate::engine_dml_concurrent::new_pending_outcome();
+    lanes.outstanding.fetch_add(1, Ordering::Relaxed);
+    lanes.queues[0]
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push_back(crate::engine_dml_concurrent::LaneIntent {
+            op: crate::engine_dml_concurrent::LaneOpKind::Insert,
+            txn_id: 7,
+            slot: (0, 7),
+            read_snapshot: 0,
+            prepared_catalog_seq: 0,
+            filter_idx: 0,
+            row_id_offset: 0,
+            table: std::sync::Arc::from("t"),
+            template: std::sync::Arc::from(&b""[..]),
+            values: Vec::new(),
+            outcome: std::sync::Arc::clone(&outcome),
+            outstanding: Some(std::sync::Arc::clone(&lanes.outstanding)),
+            synchronous: true,
+            rows_affected: 1,
+            rows_affected_cell: None,
+        });
+
+    engine.wedge_commit_path();
+    let error = outcome
+        .take_if_done()
+        .expect("queued lane intent must settle on central wedge")
+        .unwrap_err();
+    assert!(error.to_string().contains("restart recovery"));
+    assert_eq!(lanes.outstanding.load(Ordering::Relaxed), 0);
+    assert!(!engine.drive_commit_wave());
+
+    drop(engine);
+    let _ = gpu_db_wal::remove_stale_lane_files(&path);
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// First activation must recheck the sticky wedge under the commit lock. The driver has already
+/// removed this item from ingress when it pauses, so the central drain cannot see it; activation
+/// owns the obligation to fail that local batch without claiming a sequence or appending lane WAL.
+#[test]
+fn lane_activation_fails_locally_drained_batch_if_commit_path_wedges_while_waiting() {
+    let path = test_wal_path("lane-activation-wedge-handoff");
+    let mut engine = Engine::new_local_cpu_oracle();
+    engine.attach_test_intent_lanes(path.clone(), 4);
+    let lanes = engine
+        .intent_lanes
+        .as_ref()
+        .map(std::sync::Arc::clone)
+        .expect("test lane set must be installed");
+    let outcome = crate::engine_dml_concurrent::new_pending_outcome();
+    lanes.outstanding.fetch_add(1, Ordering::Relaxed);
+    lanes.queues[0]
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push_back(crate::engine_dml_concurrent::LaneIntent {
+            op: crate::engine_dml_concurrent::LaneOpKind::Insert,
+            txn_id: 8,
+            slot: (0, 8),
+            read_snapshot: 0,
+            prepared_catalog_seq: 0,
+            filter_idx: 0,
+            row_id_offset: 0,
+            table: std::sync::Arc::from("t"),
+            template: std::sync::Arc::from(&b""[..]),
+            values: Vec::new(),
+            outcome: std::sync::Arc::clone(&outcome),
+            outstanding: Some(std::sync::Arc::clone(&lanes.outstanding)),
+            synchronous: true,
+            rows_affected: 1,
+            rows_affected_cell: None,
+        });
+
+    let before_seq = lanes.seq_oracle.load(Ordering::Acquire);
+    let before_wal = engine.wal_buffered_count();
+    let engine = std::sync::Arc::new(engine);
+    // Force activation to wait after the driver drains ingress. Holding this lock also models the
+    // classic post-durable failure whose apply/publish error installs the wedge before unlocking.
+    let commit = engine.commit_state();
+    let driver = {
+        let engine = std::sync::Arc::clone(&engine);
+        std::thread::spawn(move || engine.drive_intent_lane(0))
+    };
+    let mut drained = false;
+    for _ in 0..1_000_000 {
+        if lanes.queues[0]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            drained = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(drained, "the driver did not drain lane ingress");
+    engine.wedge_commit_path();
+    drop(commit);
+
+    assert!(
+        driver.join().unwrap(),
+        "the drained batch was failed locally"
+    );
+    let error = outcome
+        .take_if_done()
+        .expect("the locally drained intent must settle")
+        .unwrap_err();
+    assert!(error.to_string().contains("restart recovery"), "{error}");
+    assert_eq!(lanes.outstanding.load(Ordering::Relaxed), 0);
+    assert!(!lanes.activated.load(Ordering::Acquire));
+    assert_eq!(lanes.seq_oracle.load(Ordering::Acquire), before_seq);
+    assert_eq!(engine.wal_buffered_count(), before_wal);
+
+    drop(engine);
+    let _ = gpu_db_wal::remove_stale_lane_files(&path);
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Publication-epoch non-vacuity: queue a publisher but hold its device apply, then pause a stale
+/// same-key validator after its old device probe and before bridge arbitration. Apply publishes the
+/// key and removes the publisher bridge in that exact gap. The epoch change must make validation
+/// retry and serialize the stale contender. Removing the epoch comparison admits both inserts.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_lane_probe_retries_across_publication_and_bridge_removal() {
+    let path = test_wal_path("lane-publication-epoch");
+    let mut engine = Engine::new_local_cpu_oracle();
+    engine.attach_test_intent_lanes(path.clone(), 4);
+    let txn_ids = AtomicU64::new(100);
+    let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
+        return;
+    };
+    let lanes = engine
+        .intent_lanes
+        .as_ref()
+        .map(std::sync::Arc::clone)
+        .expect("test lane set must be installed");
+    let engine = std::sync::Arc::new(engine);
+    const KEY: i32 = 765_432;
+    let lane = lanes.lane_for_pk(KEY);
+
+    // Validate/claim the publisher and leave it queued behind the held apply lock. Its in-flight
+    // slot now bridges the still-absent device key.
+    let mut publisher = engine
+        .submit_covered_insert_intent(txn_ids.fetch_add(1, Ordering::Relaxed), &route, &[KEY, 1])
+        .unwrap();
+    let device_guard = lanes
+        .device_apply_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(engine.drive_intent_lane(lane));
+    assert_eq!(
+        lanes
+            .apply_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len(),
+        1,
+        "publisher must be claimed but not device-applied"
+    );
+    drop(device_guard);
+
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    engine.set_lane_probe_publication_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let mut stale = engine
+        .submit_covered_insert_intent(txn_ids.fetch_add(1, Ordering::Relaxed), &route, &[KEY, 2])
+        .unwrap();
+    let epoch_before = lanes.device_publication_epoch.load(Ordering::Acquire);
+    let validator = {
+        let engine = std::sync::Arc::clone(&engine);
+        std::thread::spawn(move || engine.drive_intent_lane(lane))
+    };
+
+    // The stale probe has completed while the publisher is absent. Publish it and remove its
+    // bridge before allowing the validator to acquire `inflight_slots`.
+    reached.wait();
+    assert!(engine.drive_lane_apply_once_for_test(&lanes));
+    assert!(
+        lanes.device_publication_epoch.load(Ordering::Acquire) > epoch_before,
+        "the forced apply must cross the publication epoch"
+    );
+    assert!(
+        lanes.inflight_slots[lane]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "publisher bridge must be removed before stale arbitration resumes"
+    );
+    resume.wait();
+    assert!(validator.join().unwrap());
+
+    let stale_error = engine
+        .poll_intent(&mut stale)
+        .expect("stale contender must resolve during the forced validation")
+        .expect_err("the retried device history verdict must reject the stale contender")
+        .to_string();
+    assert!(
+        stale_error.contains("write-write conflict"),
+        "{stale_error}"
+    );
+
+    let mut publisher_result = None;
+    for _ in 0..10_000_000 {
+        engine.drive_commit_wave();
+        if let Some(result) = engine.poll_intent(&mut publisher) {
+            publisher_result = Some(result);
+            break;
+        }
+    }
+    assert_eq!(
+        publisher_result.expect("publisher never settled").unwrap(),
+        1
+    );
+    drop(lanes);
+    drop(engine);
+    let _ = gpu_db_wal::remove_stale_lane_files(&path);
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(path);
+}
+
+/// E2.2(c) + (a) — the driver-multiplexed submit/poll API and bounded arbitration
 /// semantics. Submits a batch of distinct-PK intents WITHOUT per-commit blocking, drains them via
 /// the single-writer pump, and reaps every ticket. Then proves first-committer-wins on a SAME-WAVE
 /// duplicate PK (the integer conflict slot: exactly one commits, the other is a retryable conflict)
@@ -390,7 +690,7 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
     );
 
     // SAME-WAVE duplicate PK: submit two intents on the same fresh PK before any pump. Exactly one
-    // wins; the other is a first-committer-wins conflict caught by the INTEGER unique-slot ledger.
+    // wins; the other is a first-committer-wins conflict caught by same-wave slot arbitration.
     let mut a = engine
         .submit_covered_insert_intent(
             txn_ids.fetch_add(1, Ordering::Relaxed),
@@ -424,7 +724,7 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
         .count();
     assert_eq!(
         wins, 1,
-        "exactly one of two same-PK intents commits (integer-ledger first-committer-wins): {ra:?} / {rb:?}"
+        "exactly one of two same-PK intents commits (same-wave first-committer-wins): {ra:?} / {rb:?}"
     );
 
     // Committed-dup through the async surface: a fresh intent on the now-committed PK 500000 is
@@ -456,16 +756,25 @@ fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
 /// (>= `SHARD_MIN_WAVE`) containing a duplicate PK takes the sharded sequencer when
 /// `GPU_DB_INTENT_SEQUENCER_SHARDS>1`; the duplicate must still resolve to exactly one winner (the
 /// per-shard private dedup set — same PK hashes to the same worker), and every distinct PK commits.
-/// Robust to either mode: under the default (shards=1, serial) the same invariant holds via the
-/// shared integer ledger. Run the sharded arm with `GPU_DB_INTENT_SEQUENCER_SHARDS=4`.
+/// Robust to either mode: under the default (shards=1, serial) the same invariant holds via
+/// wave-local arbitration. Run the sharded arm with `GPU_DB_INTENT_SEQUENCER_SHARDS=4`.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_intent_sharded_wave_same_pk_single_winner() {
+    let shards = std::env::var("GPU_DB_INTENT_SEQUENCER_SHARDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    if shards < 2 {
+        return;
+    }
     let mut engine = Engine::new_local_cpu_oracle();
     let txn_ids = AtomicU64::new(2);
     let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
         return; // driverless box
     };
+    let write_locates_before = engine.device_write_locate_hits();
+    let history_locates_before = engine.device_visible_locate_hits();
 
     // Build ONE wave (submit everything before pumping): 200 distinct PKs plus a duplicate of the
     // first, all in [600000, 600200). 201 items >= SHARD_MIN_WAVE forces the sharded fan-out.
@@ -532,6 +841,14 @@ fn gpu_intent_sharded_wave_same_pk_single_winner() {
         "duplicate loses as a first-committer-wins conflict: {}",
         errs[0]
     );
+    assert!(
+        engine.device_write_locate_hits() > write_locates_before,
+        "the sharded wave must run committed-duplicate validation on the device"
+    );
+    assert!(
+        engine.device_visible_locate_hits() > history_locates_before,
+        "the sharded wave must run physical-version history validation on the device"
+    );
 
     let count = engine
         .execute_relational_select_text("SELECT COUNT(*) FROM t WHERE id >= 600000 AND id < 700000")
@@ -539,6 +856,125 @@ fn gpu_intent_sharded_wave_same_pk_single_winner() {
     assert!(
         format!("{:?}", count.rows.row(0).first()).contains(&format!("({DISTINCT})")),
         "exactly {DISTINCT} distinct rows visible: {:?}",
+        count.rows.row(0).first()
+    );
+}
+
+/// Validation-to-publication TOCTOU control for the sharded sequencer. The explicit transaction
+/// has already staged the same absent PK. Pause the sharded wave immediately after its device
+/// verdict: because validation is inside the commit publication lock, the explicit COMMIT cannot
+/// publish in that gap. The sharded wave wins first and the transaction then rejects from device
+/// history. Moving validation back outside the lock makes the timeout assertion fail and can admit
+/// both writers.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU plus GPU_DB_INTENT_SEQUENCER_SHARDS>=2"]
+fn gpu_sharded_validation_holds_publication_lock_against_explicit_writer() {
+    let shards = std::env::var("GPU_DB_INTENT_SEQUENCER_SHARDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    if shards < 2 {
+        return;
+    }
+
+    let mut engine = Engine::new_local_cpu_oracle();
+    let txn_ids = AtomicU64::new(2);
+    let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
+        return;
+    };
+    let engine = std::sync::Arc::new(engine);
+    const TXN: u64 = 9_000_000;
+    const BASE: i32 = 710_000;
+    engine.execute_text(TXN, "BEGIN").unwrap();
+    engine
+        .execute_dml_concurrent(TXN, "INSERT INTO t VALUES (710000, -1)")
+        .unwrap();
+
+    let mut tickets = (0..64_i32)
+        .map(|offset| {
+            engine
+                .submit_covered_insert_intent(
+                    txn_ids.fetch_add(1, Ordering::Relaxed),
+                    &route,
+                    &[BASE + offset, offset],
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    engine.set_sharded_post_validation_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let driver = {
+        let engine = std::sync::Arc::clone(&engine);
+        std::thread::spawn(move || engine.drive_commit_wave())
+    };
+    reached.wait();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let committer = {
+        let engine = std::sync::Arc::clone(&engine);
+        std::thread::spawn(move || {
+            let result = engine.execute_text(TXN, "COMMIT");
+            done_tx.send(()).unwrap();
+            result
+        })
+    };
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "the explicit writer crossed the sharded validation/publication gap"
+    );
+    resume.wait();
+    assert!(
+        driver.join().unwrap(),
+        "the sharded driver must sequence the wave"
+    );
+
+    let mut results: Vec<Option<Result<u64, ExecuteError>>> =
+        (0..tickets.len()).map(|_| None).collect();
+    for _ in 0..1_000_000 {
+        engine.drive_commit_wave();
+        for (ticket, result) in tickets.iter_mut().zip(results.iter_mut()) {
+            if result.is_none() {
+                *result = engine.poll_intent(ticket);
+            }
+        }
+        if results.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    assert!(
+        results.iter().all(Option::is_some),
+        "sharded wave outcomes never settled"
+    );
+    assert_eq!(results.len(), 64);
+    assert!(
+        results
+            .iter()
+            .all(|result| result.as_ref().is_some_and(Result::is_ok)),
+        "distinct sharded keys must all win: {results:?}"
+    );
+
+    let error = committer
+        .join()
+        .unwrap()
+        .expect_err("the explicit same-key writer must lose after the sharded publication");
+    assert!(
+        matches!(&error, ExecuteError::Serialization(message)
+            if message.contains("device unique conflict") || message.contains("write history")),
+        "expected a device-history serialization conflict, got {error:?}"
+    );
+    engine.execute_text(TXN, "ROLLBACK").unwrap();
+    let count = engine
+        .execute_relational_select_text("SELECT COUNT(*) FROM t WHERE id >= 710000 AND id < 710064")
+        .unwrap();
+    assert!(
+        format!("{:?}", count.rows.row(0).first()).contains("(64)"),
+        "only the 64 sharded rows may be visible: {:?}",
         count.rows.row(0).first()
     );
 }
@@ -783,7 +1219,6 @@ fn gpu_lane_delete_intents_end_to_end() {
         .residency
         .lane_tombstone_applies
         .load(Ordering::Relaxed);
-
     // 1-row delete, then the SAME key again (dead twin -> 0 rows), then a never-existed key.
     assert_eq!(
         commit_delete_via_submit(&engine, &txn_ids, &delete_route, 50).unwrap(),
@@ -807,6 +1242,11 @@ fn gpu_lane_delete_intents_end_to_end() {
     assert!(
         engine.table_install_elided("t"),
         "0-row deletes must not de-elide"
+    );
+    assert_eq!(
+        commit_intent_via_submit(&engine, &txn_ids, &insert_route, &[987_654, 123]).unwrap(),
+        1,
+        "a zero-row delete must not leave a stale conflict slot that poisons a same-key insert"
     );
 
     // Visibility: id=50 is gone; total row count dropped by exactly one.
@@ -1141,6 +1581,7 @@ fn gpu_lane_update_intents_end_to_end() {
         .residency
         .lane_tombstone_applies
         .load(Ordering::Relaxed);
+    let entity_50 = visible_entity_id(&engine, 50);
 
     // KNOWN CLIFF (U1/U2 exit finding, open board): a read-back over an update/delete-VERSIONED
     // elided shard falls into the rehydrating host arm and DE-ELIDES the table (the plain scan
@@ -1157,6 +1598,11 @@ fn gpu_lane_update_intents_end_to_end() {
     assert!(
         engine.table_install_elided("t"),
         "an in-place lane update must not de-elide the table (fallback fired?)"
+    );
+    assert_eq!(
+        visible_entity_id(&engine, 50),
+        entity_50,
+        "a covered UPDATE must preserve stable entity identity"
     );
     let rows = select_rows_unordered_sorted(&engine); // DE-ELIDES the versioned shard
     let fifty: Vec<_> = rows
@@ -1199,6 +1645,11 @@ fn gpu_lane_update_intents_end_to_end() {
         1,
         "chained update of the same key affects one row"
     );
+    assert_eq!(
+        visible_entity_id(&engine, 50),
+        entity_50,
+        "chained covered UPDATEs must retain the original entity identity"
+    );
     let rows = select_rows_unordered_sorted(&engine); // DE-ELIDES
     let fifty: Vec<_> = rows
         .iter()
@@ -1216,7 +1667,7 @@ fn gpu_lane_update_intents_end_to_end() {
     );
 
     // UPDATE-THEN-DELETE: update key 60, then delete it — the delete must locate the NEW version
-    // through the pk index that the update's dead-twin append dropped then a locate rebuilt.
+    // through the version-aware pk index after the update appended a second physical version.
     update_route = engine.prepare_covered_update_route("t").unwrap(); // re-enter elision
     assert_eq!(
         commit_update_via_submit(&engine, &txn_ids, &update_route, &[60, 4242]).unwrap(),
@@ -1227,7 +1678,7 @@ fn gpu_lane_update_intents_end_to_end() {
     assert_eq!(
         commit_delete_via_submit(&engine, &txn_ids, &delete_route, 60).unwrap(),
         1,
-        "the updated row is locatable + deletable (index survived the dead twin)"
+        "the updated row is locatable + deletable (index survived the version twin)"
     );
     assert!(
         !select_rows_unordered_sorted(&engine)
@@ -1334,7 +1785,7 @@ fn gpu_lane_update_recovery_replays_row_identical() {
             1
         );
     }
-    // Update the evens below 40 to (id, id + 5000) — one row each. Each update's dead-twin append
+    // Update the evens below 40 to (id, id + 5000) — one row each. Each update's version append
     // versions the shard and can de-elide it (the F3/U4 rebuild-decline cliff), so re-prepare
     // (re-enter elision) after each update for the NEXT one. The WAL records this writes are
     // UNCHANGED by the host-side rehydration, so replay parity is unaffected.
@@ -1409,7 +1860,7 @@ fn gpu_lane_update_recovery_replays_row_identical() {
 
 /// F3/U4 (THE VERSION-AWARE-INDEX GATE): many CONSECUTIVE covered updates on distinct keys, with
 /// the update route prepared ONCE and NEVER re-prepared, must all succeed and the table must stay
-/// ELIDED throughout. Before F3/U4 the dead-twin append dropped the pk-index cache, the next
+/// ELIDED throughout. Before F3/U4 the physical version-twin append dropped the pk-index cache, the next
 /// update's locate rebuild declined on the above-boundary twin, the apply rehydrated + de-elided,
 /// and this route DRIFTED (submit returns Err) within a handful of updates. With the dup-tolerant
 /// index the twin is placed at the next probe slot, the visible-locate resolves it, and the index
@@ -1486,7 +1937,7 @@ fn gpu_lane_update_sustained_stays_elided() {
         );
         assert!(
             engine.table_install_elided("t"),
-            "the dup-tolerant index must keep the table elided across update {id} (no dead-twin \
+            "the dup-tolerant index must keep the table elided across update {id} (no version-twin \
              de-elision)"
         );
     }

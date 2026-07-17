@@ -367,18 +367,40 @@ pub(crate) fn compound_key_fingerprint(vals: &[i32]) -> i32 {
     h as i32
 }
 
-/// COMPOUND KEYS: the device-probe "key id" that identifies WHICH unique index a probe/gather targets.
-/// A single-column index keeps its catalog COLUMN INDEX verbatim (byte-compatible with every existing
-/// cache entry and offset computation). A COMPOUND index encodes `FLAG | ordinal` where `ordinal` is the
-/// index's position in `table.indexes` — a small, per-index-UNIQUE, collision-free discriminator (a
-/// probabilistic hash of the column set could alias two compound indexes and silently serve the wrong
-/// index buffer = a MISSED-duplicate correctness bug, so the ordinal is used, not a hash). The flag bit
-/// (the top usize bit) can never collide with a real column index (`< usize::MAX >> 1`).
+/// FINGERPRINT INDEXES: the device-probe "key id" that identifies WHICH unique index a probe/gather
+/// targets. A raw single-column i32-section index keeps its catalog COLUMN INDEX verbatim
+/// (byte-compatible with every existing cache entry and offset computation). A fingerprint-backed index
+/// encodes `FLAG | ordinal` where `ordinal` is the index's position in `table.indexes` — a small,
+/// per-index-UNIQUE, collision-free discriminator. This includes compound indexes and single-column
+/// wider/text indexes. A probabilistic hash of the column set could alias two indexes and silently serve
+/// the wrong index buffer = a MISSED-duplicate correctness bug, so the ordinal is used, not a hash. The
+/// flag bit (the top usize bit) can never collide with a real column index (`< usize::MAX >> 1`).
 pub(crate) const COMPOUND_KEY_ID_FLAG: usize = 1_usize << (usize::BITS - 1);
 
 /// COMPOUND KEYS: `true` when `index` spans more than one key column.
 pub(crate) fn index_is_compound(index: &RelationalIndex) -> bool {
     index.key_columns.len() > 1
+}
+
+/// R3-002: `true` when the device index stores the canonical 32-bit fingerprint rather than one
+/// raw i32-section value. Compound keys always use the fingerprint contract. A single wider/text key
+/// joins that contract only when its resident type has an exact fold encoding; unsupported keys remain
+/// outside device-index eligibility.
+pub(crate) fn index_uses_fingerprint(table: &RelationalTable, index: &RelationalIndex) -> bool {
+    if index_is_compound(index) {
+        return true;
+    }
+    let Some(position) = index_key_column_positions(table, index)
+        .and_then(|positions| positions.first().copied().filter(|_| positions.len() == 1))
+    else {
+        return false;
+    };
+    let ty = table.columns[position].ty;
+    compound_key_type_supported(ty)
+        && !matches!(
+            ty,
+            gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2
+        )
 }
 
 /// COMPOUND KEYS: resolve `index.key_columns` (ordered) to their catalog column positions. `None` if any
@@ -394,45 +416,27 @@ pub(crate) fn index_key_column_positions(
         .collect()
 }
 
-/// COMPOUND KEYS: can `index` be validated by the DEVICE PK-index probe? The answer differs by arity,
-/// because the two paths store different things. A SINGLE-column key: the device index stores the RAW i32
-/// key, so ONLY an i32-section key column (Int4/Date/Int2) is probeable (an i64 raw key does not fit — such
-/// a table must NOT elide). A COMPOUND key: every key column folds its i32-word decomposition into a 32-bit
-/// surrogate FINGERPRINT, so ANY foldable type (i32-section + i64-section today; b128/text are follow-ups)
-/// is probeable (see [`compound_key_type_supported`]). A key column of an unsupported type keeps the index
-/// OFF the elision path (honest partial coverage).
+/// Can `index` be validated by the DEVICE index probe? Every key column must have a canonical resident
+/// word/text fold. Single i32-section keys keep the raw-key layout; compound and single wider/text keys
+/// store the folded fingerprint. A key column of an unsupported type keeps the index OFF the elision path
+/// (honest partial coverage).
 pub(crate) fn index_all_key_columns_foldable(
     table: &RelationalTable,
     index: &RelationalIndex,
 ) -> bool {
-    if index_is_compound(index) {
-        index.key_columns.iter().all(|name| {
+    !index.key_columns.is_empty()
+        && index.key_columns.iter().all(|name| {
             table
                 .columns
                 .iter()
                 .find(|c| &c.name == name)
                 .is_some_and(|c| compound_key_type_supported(c.ty))
         })
-    } else {
-        // Single-column: raw i32 key -> i32-section only (byte-identical to the pre-compound gate).
-        table
-            .columns
-            .iter()
-            .find(|c| c.name == index.column)
-            .is_some_and(|c| {
-                matches!(
-                    c.ty,
-                    gpu_db_sql::SqlType::Int4
-                        | gpu_db_sql::SqlType::Date
-                        | gpu_db_sql::SqlType::Int2
-                )
-            })
-    }
 }
 
-/// COMPOUND KEYS: the device-probe key id for `index` (see [`COMPOUND_KEY_ID_FLAG`]). `ordinal` is the
-/// index's position in `table.indexes`. Single-column -> the key column's catalog index; compound ->
-/// `FLAG | ordinal`. Returns `None` if the single key column can't be resolved.
+/// The device-probe key id for `index` (see [`COMPOUND_KEY_ID_FLAG`]). `ordinal` is the index's
+/// position in `table.indexes`. Raw single-i32 -> the key column's catalog index; fingerprint-backed ->
+/// `FLAG | ordinal`. Returns `None` if the raw single key column can't be resolved.
 ///
 /// CACHE SAFETY (audit): the ordinal is also the discriminator for the per-shard PK device-index
 /// cache `(table, shard_id, key_id)`, and DROP CONSTRAINT / DROP INDEX SHIFT ordinals. This is sound
@@ -447,16 +451,16 @@ pub(crate) fn index_probe_key_id(
     index: &RelationalIndex,
     ordinal: usize,
 ) -> Option<usize> {
-    if index_is_compound(index) {
+    if index_uses_fingerprint(table, index) {
         Some(COMPOUND_KEY_ID_FLAG | ordinal)
     } else {
         table.columns.iter().position(|c| c.name == index.column)
     }
 }
 
-/// COMPOUND KEYS: decode a device-probe `key_id` (see [`index_probe_key_id`]) back to the ordered
-/// catalog positions of its key column(s). A single-column key id IS the column index (`[key_id]`); a
-/// compound key id (`COMPOUND_KEY_ID_FLAG | ordinal`) resolves `table.indexes[ordinal].key_columns`.
+/// Decode a device-probe `key_id` (see [`index_probe_key_id`]) back to the ordered catalog positions
+/// of its key column(s). A raw single-i32 key id IS the column index (`[key_id]`); a fingerprint key id
+/// (`COMPOUND_KEY_ID_FLAG | ordinal`) resolves `table.indexes[ordinal].key_columns`.
 /// `None` if the ordinal / a named key column is out of range (a torn catalog -> the caller declines).
 pub(crate) fn probe_key_id_positions(table: &RelationalTable, key_id: usize) -> Option<Vec<usize>> {
     if key_id & COMPOUND_KEY_ID_FLAG != 0 {
@@ -528,6 +532,7 @@ pub(crate) fn sql_value_key_words(ty: gpu_db_sql::SqlType, value: &SqlValue) -> 
         // hash of its UTF-8 bytes (`fnv1a_bytes`), which the device fold kernel computes over the resident
         // text blob byte-for-byte identically. A 32-bit collision is separated by the full-tuple recheck.
         (gpu_db_sql::SqlType::Text, SqlValue::Text(s)) => Some(vec![fnv1a_bytes(s.as_bytes())]),
+        (gpu_db_sql::SqlType::Bool, SqlValue::Bool(v)) => Some(vec![if *v { 1 } else { 0 }]),
         _ => None,
     }
 }
@@ -546,9 +551,8 @@ pub(crate) fn fnv1a_bytes(bytes: &[u8]) -> i32 {
 
 /// COMPOUND KEYS (wider types): the device fold kernel's per-column WIDTH — the number of fixed-width i32
 /// WORDS (Int4/Date/Int2 -> 1 in the i32 section; Int8/Timestamp -> 2 in the i64 section; Numeric/Uuid ->
-/// 4 in the b128 section), or the TEXT SENTINEL 0 (Text -> variable-length: the kernel's width==0 branch
-/// reads the row's offsets+blob and hashes them instead of reading fixed words). `None` for a type not
-/// supported as a compound key column. A type is a valid compound key column IFF this returns `Some`.
+/// 4 in the b128 section), the TEXT SENTINEL 0, or the BOOL bitmap sentinel `u32::MAX`. `None` for
+/// a type not supported as a fingerprint key column. A type is valid IFF this returns `Some`.
 pub(crate) fn key_column_width_words(ty: gpu_db_sql::SqlType) -> Option<u32> {
     match ty {
         gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2 => {
@@ -557,7 +561,7 @@ pub(crate) fn key_column_width_words(ty: gpu_db_sql::SqlType) -> Option<u32> {
         gpu_db_sql::SqlType::Int8 | gpu_db_sql::SqlType::Timestamp => Some(2),
         gpu_db_sql::SqlType::Numeric { .. } | gpu_db_sql::SqlType::Uuid => Some(4),
         gpu_db_sql::SqlType::Text => Some(0), // text sentinel (variable-length, hashed on-device)
-        _ => None,
+        gpu_db_sql::SqlType::Bool => Some(u32::MAX), // one-bit bitmap sentinel
     }
 }
 

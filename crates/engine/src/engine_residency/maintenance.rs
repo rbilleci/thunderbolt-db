@@ -3,6 +3,52 @@
 use super::*;
 
 impl Engine {
+    /// R3-003 bounded device-version GC. A created_by sidecar is redundant once the oldest active
+    /// read boundary is at or beyond that shard's stamp high-water: every possible reader sees all
+    /// its versions as born-visible, and new transactions begin no earlier. Republish current
+    /// descriptors without the sidecar and release the write-side owner; captured generations keep
+    /// their own Arc until their transaction deregisters. Deleted_by cannot be dropped in place
+    /// (that would resurrect dead slots) and remains owned by thresholded dense VACUUM.
+    pub(crate) fn gc_transaction_created_by_regions(&self) -> usize {
+        let safe_boundary = self
+            .active_snapshots_oldest()
+            .unwrap_or_else(|| self.committed_seq());
+        let removable = self
+            .read_state
+            .residency
+            .shards
+            .load()
+            .iter()
+            .flat_map(|(table, shards)| {
+                shards.iter().filter_map(|shard| {
+                    (shard.created_by_region.is_some() && shard.max_created_by <= safe_boundary)
+                        .then_some((table.clone(), shard.shard_id))
+                })
+            })
+            .collect::<Vec<_>>();
+        if removable.is_empty() {
+            return 0;
+        }
+        let removable_set = removable.iter().cloned().collect::<BTreeSet<_>>();
+        self.read_state.residency.with_shards_mut(|shards| {
+            for (table, table_shards) in shards {
+                for shard in table_shards {
+                    if removable_set.contains(&(table.clone(), shard.shard_id)) {
+                        shard.created_by_region = None;
+                        shard.max_created_by = 0;
+                    }
+                }
+            }
+        });
+        for (table, shard_id) in &removable {
+            self.read_state
+                .residency
+                .shard_created_by_memory
+                .invalidate_shard(table, *shard_id);
+        }
+        removable.len()
+    }
+
     /// RETIREMENT A4e (audit B3): rehydrate an elided table FROM AN OFF-COMMIT-LOCK context
     /// (the CPU-shape read seam, the execute_text DDL entry). `rehydrate_elided_table` mutates the
     /// host store via COW `with_table_mut` — safe ONLY under the commit lock (writers + other
@@ -41,20 +87,29 @@ impl Engine {
             let Some(table) = engine.relational_catalog_table(table_name) else {
                 return Ok(()); // no such table: vacuum is a no-op, not an error
             };
+            let current = engine.committed_seq();
+            // Dense VACUUM reconstructs only the current live image. An older retained writer
+            // still needs post-BEGIN claim/release versions for commit-time conflict detection,
+            // so it fences the rebuild exactly like an old reader fences MVCC reclamation. Equal
+            // boundaries are safe: no history newer than that snapshot exists under this lock.
+            if engine
+                .active_snapshots_oldest()
+                .is_some_and(|oldest| oldest < current)
+            {
+                return Ok(());
+            }
             if engine.table_install_elided(table_name) {
-                let seq = engine.committed_seq();
                 engine.rehydrate_elided_table(
                     &table,
-                    seq,
+                    current,
                     &Default::default(),
                     &Default::default(),
-                    seq,
+                    current,
                 )?;
             }
-            let seq = engine.committed_seq();
             let tables: std::collections::BTreeSet<String> =
                 std::iter::once(table_name.to_string()).collect();
-            engine.invalidate_relational_residency_tables_concurrent(&tables, seq, seq);
+            engine.invalidate_relational_residency_tables_concurrent(&tables, current, current);
             if engine.auto_admit_on_commit_enabled() {
                 engine.auto_admit_resident_tables(&tables);
             }
@@ -190,9 +245,10 @@ impl Engine {
     /// generation-independent). `keys` are `(column_index, value)`; a key with no visible match
     /// at `read_txn` resolves to nothing (its delete was against a row this gather cannot see —
     /// impossible for a wave-located 1-row target, but the resolve is total rather than lossy).
-    /// Returns `(row-id removals for the rehydrate, the KEY VALUES that matched a visible row)`
-    /// — the matched-key set lets the WAL-first delete fallback set each delete's rows-affected
-    /// (1 if its key matched, else 0).
+    /// Returns `(row-id removals for the rehydrate, matched KEY -> stable entity id)`. The map
+    /// lets DELETE report rows affected and lets UPDATE preserve the old version's identity for
+    /// its appended replacement. A duplicate key mapping to different identities is an invariant
+    /// failure, never an arbitrary host-side choice.
     pub(crate) fn resolve_elided_row_ids_by_int4_key(
         &self,
         table: &RelationalTable,
@@ -201,7 +257,7 @@ impl Engine {
     ) -> Result<
         (
             std::collections::BTreeSet<u64>,
-            std::collections::HashSet<i32>,
+            std::collections::HashMap<i32, u64>,
         ),
         EngineError,
     > {
@@ -217,16 +273,25 @@ impl Engine {
                 ))
             })?;
         let mut removals = std::collections::BTreeSet::new();
-        let mut matched_keys = std::collections::HashSet::new();
+        let mut matched = std::collections::HashMap::new();
         for (row_id, values) in &gathered {
             for &(column, key) in keys {
                 if values.get(column) == Some(&SqlValue::Int4(key)) {
                     removals.insert(*row_id);
-                    matched_keys.insert(key);
+                    if matched
+                        .insert(key, *row_id)
+                        .is_some_and(|prior| prior != *row_id)
+                    {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "unique key {key} resolved to multiple entity identities while \
+                             rehydrating table \"{}\"",
+                            table.name
+                        )));
+                    }
                 }
             }
         }
-        Ok((removals, matched_keys))
+        Ok((removals, matched))
     }
 
     pub(crate) fn rehydrate_elided_table(

@@ -320,7 +320,8 @@ fn int8_section_appends_roll_over_and_recompact_to_parity() {
 /// catalog; a decline REHYDRATES through the A4c i64 gather (store + value_index rebuilt
 /// with Int8/Timestamp variants — a mistype would corrupt the index representations).
 /// Outcomes + reads must match the install twin. Sabotage: mistyping the i64 decode fails
-/// the read parity; an i64-UNIQUE table must NEVER elide (the locate cannot probe it).
+/// the read parity. R3-002 additionally proves a single-column i64 UNIQUE table now elides through
+/// its fingerprint index and exact typed device recheck.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn int8_payload_elision_matches_install_twin() {
@@ -400,8 +401,12 @@ fn int8_payload_elision_matches_install_twin() {
     );
     assert_eq!(off.host_install_elisions(), 0);
 
-    // The i64-UNIQUE guard: a unique index on a BIGINT column must keep the table OFF
-    // elision (the i32 locate cannot probe it; eligibility must reject it).
+    // R3-002 single-wide index: BIGINT UNIQUE now rides the flagged fingerprint index.
+    on.set_binary_wal_records_enabled(true);
+    on.set_device_write_locate_enabled(true);
+    on.set_device_write_locate_wave_batch_enabled(true);
+    on.set_constrained_elision_enabled(true);
+    on.set_dml_device_resolve_enabled(true);
     on.execute_text(700, "CREATE TABLE u8 (v BIGINT UNIQUE, x INT)")
         .unwrap();
     for i in 0..30_u64 {
@@ -414,13 +419,16 @@ fn int8_payload_elision_matches_install_twin() {
         )
         .unwrap();
     }
+    assert!(on.table_install_elided("u8"), "BIGINT UNIQUE must elide");
+    let locate_before = on.device_write_locate_hits();
     assert!(
-        !on.table_install_elided("u8"),
-        "an i64-UNIQUE table must never elide (no device probe for i64 keys)"
-    );
-    assert!(
-        on.execute_text(750, "INSERT INTO u8 (v, x) VALUES (8100000005, 9)")
+        on.execute_dml_concurrent(750, "INSERT INTO u8 (v, x) VALUES (8100000005, 9)")
             .is_err(),
-        "the i64 unique constraint still fires (host-validated)"
+        "the BIGINT unique constraint still fires"
     );
+    assert!(
+        on.device_write_locate_hits() > locate_before,
+        "BIGINT duplicate validation must probe the device index"
+    );
+    assert!(on.table_install_elided("u8"));
 }

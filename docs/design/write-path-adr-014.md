@@ -7,6 +7,10 @@ packet reviews v1–v3 returned **REJECT**; packet v4 accepted the prior target;
 **ACCEPT**. The user then explicitly reviewed and accepted the ADR. Acceptance selects this target design; it does
 not claim the current implementation passes its performance, fault, coverage, or host-retirement gates.
 
+**Post-acceptance update, 2026-07-17:** R3-002/R3-003 subsequently passed independent adversarial acceptance.
+References to those IDs below are historical graduation labels, not open work. The canonical durable envelope and
+destructive recovery campaign remain **DUR-002**; current sequencing is owned only by `../PLAN.md`.
+
 **Decision scope:** relational row/version identity, transaction/isolation semantics, mutation representation,
 index visibility, deterministic conflict control, latency/throughput adaptation, publication, GC,
 checkpoint/recovery, and transition from the current write representations.

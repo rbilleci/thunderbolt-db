@@ -59,7 +59,56 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        if self.is_commit_path_poisoned() {
+            return Err(ExecuteError::Engine(EngineError::Durability(
+                "commit path is wedged; restart recovery required".to_string(),
+            )));
+        }
         self.execute_relational_select_instrumented(select, || {})
+    }
+
+    /// Execute a SELECT against the generation bundle retained by explicit `txn_id`. The scoped
+    /// context is connection-neutral and panic-safe: deep catalog, MVCC, and resident GPU lookups
+    /// resolve through the retained bundle for this call, then the previous thread context is
+    /// restored. Transaction control remains the sole owner of the bundle's lifetime.
+    pub fn execute_relational_select_in_transaction(
+        &self,
+        txn_id: TxnId,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_select_in_transaction_with_hook(txn_id, select, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_relational_select_in_transaction_instrumented(
+        &self,
+        txn_id: TxnId,
+        select: &Select,
+        on_statement_locked: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_select_in_transaction_with_hook(txn_id, select, on_statement_locked)
+    }
+
+    fn execute_relational_select_in_transaction_with_hook(
+        &self,
+        txn_id: TxnId,
+        select: &Select,
+        on_statement_locked: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        let snapshot = self
+            .transaction_snapshot_handle(txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+        let _statement = snapshot
+            .statement_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        on_statement_locked();
+        let _scope = self.enter_transaction_read(Arc::clone(&snapshot));
+        self.execute_relational_select(select)
     }
 
     /// Parse and execute a relational SELECT from text, accepting native
@@ -82,6 +131,11 @@ impl Engine {
         &self,
         text: &str,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        if self.is_commit_path_poisoned() {
+            return Err(ExecuteError::Engine(EngineError::Durability(
+                "commit path is wedged; restart recovery required".to_string(),
+            )));
+        }
         match parse_command_allowing_catalog(text) {
             Ok(Command::Select(select)) => {
                 // A non-grouped ORDER BY over an i64-sortable int key is a charter-native GPU sort: run
@@ -131,10 +185,7 @@ impl Engine {
                                     | SqlType::Bool
                             )
                         }) && self
-                            .read_state
-                            .residency
-                            .shards
-                            .load()
+                            .read_residency_shards()
                             .get(&table.name)
                             .is_some_and(|shards| !shards.is_empty())
                     };
@@ -171,6 +222,8 @@ impl Engine {
         select: &Select,
         on_pinned: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         // Multi-key ORDER BY (`ORDER BY a, b, ...`) is GPU-only: it runs on the general Expr executor's
         // bitonic-sort path, routed in `execute_relational_select_text` when every key is an i64-sortable
         // base column on a GPU-resident table. This enumerated/CPU path has no multi-key sort and must
@@ -206,8 +259,8 @@ impl Engine {
         // the catalog ring's COUNT floor (`MIN_RETAINED_CATALOG_GENERATIONS`) guarantees this read's
         // generation is still present even if a flurry of concurrent DDLs commit while the statement
         // runs, so `catalog_as_of(s)` never falls back to a too-new generation.
-        let s = self.committed_seq();
-        let catalog = self.read_state.catalog_as_of(s);
+        let s = self.read_snapshot_boundary();
+        let catalog = self.read_catalog_as_of(s);
         if let Some(view) = catalog.relational_views.get(&select.table).cloned() {
             if !select_is_plain_view_scan(select) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -254,6 +307,32 @@ impl Engine {
                     catalog_rows,
                     s,
                 );
+            }
+        }
+        // A table that existed but had never published a data or residency generation at BEGIN is
+        // exactly empty in the transaction snapshot. If a later first INSERT admits it, using the
+        // current GPU buffer would pair old visibility with new bytes. Execute the empty generation
+        // as a zero-row transient GPU relation instead: fail-free, device-native, and independent of
+        // the later allocation. Non-empty captured tables continue through their retained resident
+        // source below (or fail loud if that old generation had no GPU representation).
+        if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            let captured_empty_without_residency = snapshot.boundary == s
+                && !snapshot.table_versions.contains_key(&select.table)
+                && !snapshot.resident_snapshots.contains_key(&select.table)
+                && snapshot
+                    .resident_shards
+                    .get(&select.table)
+                    .is_none_or(|shards| shards.is_empty());
+            if captured_empty_without_residency {
+                if let Some(table) = snapshot
+                    .catalog
+                    .relational_catalog
+                    .get(&select.table)
+                    .cloned()
+                {
+                    on_pinned();
+                    return self.execute_transient_rows_via_general(select, table, Vec::new(), s);
+                }
             }
         }
         let resident_route = self.plan_relational_resident_route(select);
@@ -328,7 +407,7 @@ impl Engine {
         select: &Select,
         copin_s: Index,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let catalog = self.read_state.catalog_as_of(copin_s);
+        let catalog = self.read_catalog_as_of(copin_s);
         if let Some(view) = catalog.relational_views.get(&select.table).cloned() {
             if !select_is_plain_view_scan(select) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -358,10 +437,7 @@ impl Engine {
     pub(crate) fn table_is_gpu_resident(&self, table: &str) -> bool {
         self.relational_residency_snapshot(table).is_some()
             || self
-                .read_state
-                .residency
-                .shards
-                .load()
+                .read_residency_shards()
                 .get(table)
                 .is_some_and(|shards| !shards.is_empty())
     }
@@ -426,7 +502,7 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.execute_relational_select_cpu_pinned_at(
             select,
-            self.committed_seq(),
+            self.read_snapshot_boundary(),
             on_bound_before_pin,
         )
     }
@@ -500,6 +576,8 @@ impl Engine {
         &self,
         call: &SelectFunction,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         // Lock-free read path (Stage 2 — blocker #1): pin the catalog snapshot for the function lookup.
         let catalog = self.catalog_snapshot();
         let Some(function) = catalog.relational_functions.get(&call.name) else {
@@ -558,6 +636,11 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        if self.is_commit_path_poisoned() {
+            return Err(ExecuteError::Engine(EngineError::Durability(
+                "commit path is wedged; restart recovery required".to_string(),
+            )));
+        }
         #[cfg(not(test))]
         {
             if self.table_is_gpu_resident(&select.table) {
@@ -587,6 +670,11 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        if self.is_commit_path_poisoned() {
+            return Err(ExecuteError::Engine(EngineError::Durability(
+                "commit path is wedged; restart recovery required".to_string(),
+            )));
+        }
         let decision = self.plan_relational_resident_route(select);
         if !decision.accepted {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -596,21 +684,21 @@ impl Engine {
         }
 
         let before_metrics = self.metrics.snapshot();
-        if let Some(device_memory) = self.read_state.residency.device_memory.get(&decision.table) {
+        if let Some(device_memory) = self.read_resident_device_memory(&decision.table) {
             // Make this allocation's CUDA context current on the calling thread so a
             // concurrent reader (not the context's creator) can launch — without it the
             // kernel fails with INVALID_CONTEXT (P1-M3 step 3c / gate 2).
             let _ = device_memory.set_current_context();
             device_memory.clear_last_kernel_event_elapsed_us();
         }
-        for device_memory in self
-            .read_state
-            .residency
-            .shard_device_memory
-            .published_owners_for_table(&decision.table)
-        {
-            let _ = device_memory.set_current_context();
-            device_memory.clear_last_kernel_event_elapsed_us();
+        if let Some(shards) = self.read_residency_shards().get(&decision.table) {
+            for device_memory in shards
+                .iter()
+                .filter_map(|shard| shard.device_memory.as_ref())
+            {
+                let _ = device_memory.set_current_context();
+                device_memory.clear_last_kernel_event_elapsed_us();
+            }
         }
         let route_started = Instant::now();
         let result = match decision.query_shape.as_str() {

@@ -224,10 +224,7 @@ impl Engine {
         rtx: Index,
     ) -> Option<Vec<(usize, Vec<u32>)>> {
         let entry = self
-            .read_state
-            .residency
-            .streaming_cold_chunks
-            .load()
+            .read_streaming_cold_chunks()
             .get(&table.name)
             .cloned()?;
         self.locate_streaming_cold_slots_in_entry(table, predicate, rtx, &entry, None)
@@ -307,10 +304,7 @@ impl Engine {
         exclude_keys: Option<&std::collections::BTreeSet<String>>,
     ) -> Option<bool> {
         let entry = self
-            .read_state
-            .residency
-            .streaming_cold_chunks
-            .load()
+            .read_streaming_cold_chunks()
             .get(&table.name)
             .cloned()?;
         let predicate = if matches!(value, SqlValue::Null) {
@@ -328,8 +322,8 @@ impl Engine {
             self.locate_streaming_cold_slots_in_entry(table, &predicate, rtx, &entry, None)?;
         for (chunk_idx, slots) in located {
             for slot in slots {
-                let pseudo_id = ((chunk_idx as u64) << 32) | u64::from(slot);
-                let key = relational_row_key(&table.name, pseudo_id);
+                let entity_id = *entry.chunks.get(chunk_idx)?.entity_ids.get(slot as usize)?;
+                let key = relational_row_key(&table.name, entity_id);
                 if exclude_keys.is_none_or(|excluded| !excluded.contains(&key)) {
                     self.read_state
                         .residency
@@ -337,6 +331,114 @@ impl Engine {
                         .fetch_add(1, Ordering::Relaxed);
                     return Some(true);
                 }
+            }
+        }
+        self.read_state
+            .residency
+            .chunk_class_device_exact_rechecks
+            .fetch_add(1, Ordering::Relaxed);
+        Some(false)
+    }
+
+    /// Compound twin of `chunk_class_visible_row_with_value`: exact typed/NULL tuple equality and
+    /// sidecar visibility execute over the authoritative cold generation; the host only applies the
+    /// statement's entity-id exclusion set to approved coordinates.
+    pub(crate) fn chunk_class_visible_row_with_tuple(
+        &self,
+        table: &RelationalTable,
+        rtx: Index,
+        key_cols: &[(usize, SqlValue)],
+        exclude_keys: Option<&std::collections::BTreeSet<String>>,
+    ) -> Option<bool> {
+        let entry = self
+            .read_streaming_cold_chunks()
+            .get(&table.name)
+            .cloned()?;
+        let mut row = vec![SqlValue::Null; table.columns.len()];
+        let mut positions = Vec::with_capacity(key_cols.len());
+        for (position, value) in key_cols {
+            *row.get_mut(*position)? = value.clone();
+            positions.push(*position);
+        }
+        let predicate = Self::class_exact_key_predicate(table, &positions, &row)?;
+        let located =
+            self.locate_streaming_cold_slots_in_entry(table, &predicate, rtx, &entry, None)?;
+        for (chunk_idx, slots) in located {
+            for slot in slots {
+                let entity_id = *entry.chunks.get(chunk_idx)?.entity_ids.get(slot as usize)?;
+                let key = relational_row_key(&table.name, entity_id);
+                if exclude_keys.is_none_or(|excluded| !excluded.contains(&key)) {
+                    self.read_state
+                        .residency
+                        .chunk_class_device_exact_rechecks
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(true);
+                }
+            }
+        }
+        self.read_state
+            .residency
+            .chunk_class_device_exact_rechecks
+            .fetch_add(1, Ordering::Relaxed);
+        Some(false)
+    }
+
+    /// Return whether any physical cold version matching an exact unique-key tuple was claimed or
+    /// released after `read_snapshot`. Exact typed/NULL matching and create/delete stamp checks
+    /// stay on-device; each chunk returns one fixed four-byte verdict rather than coordinates or
+    /// stamps. The safe-horizon compaction fence below preserves histories a live writer needs.
+    pub(crate) fn chunk_exact_key_write_conflict(
+        &self,
+        table: &RelationalTable,
+        positions: &[usize],
+        row: &[SqlValue],
+        read_snapshot: Index,
+    ) -> Option<bool> {
+        let entry = self
+            .read_streaming_cold_chunks()
+            .get(&table.name)
+            .cloned()?;
+        let current = self.committed_seq();
+        let live = u64::from_le_bytes([COLD_DELETED_BY_LIVE_FILL_BYTE; 8]);
+        for chunk in &entry.chunks {
+            if chunk.row_count == 0 {
+                continue;
+            }
+            let staged = self.stage_cold_chunk(chunk, current).ok()?;
+            let (source, visibility) = staged.ready().ok()?;
+            let row_count = u32::try_from(chunk.row_count).ok()?;
+            let mask = self.exact_key_device_mask(
+                table,
+                &source.descriptor,
+                &source.device_memory,
+                row_count,
+                positions,
+                row,
+            )?;
+            let deleted_by = visibility
+                .and_then(|visibility| visibility.deleted_by_offset)
+                .map(|offset| (source.device_memory.as_ref(), offset));
+            let verdict = source
+                .device_memory
+                .predicate_mask_version_conflict(
+                    &mask,
+                    None,
+                    chunk.payload_copin_s,
+                    deleted_by,
+                    live,
+                    live,
+                    read_snapshot,
+                )
+                .ok()?;
+            if verdict.readback_bytes != std::mem::size_of::<u32>() {
+                return None;
+            }
+            if verdict.conflict {
+                self.read_state
+                    .residency
+                    .chunk_class_device_exact_rechecks
+                    .fetch_add(1, Ordering::Relaxed);
+                return Some(true);
             }
         }
         self.read_state
@@ -358,13 +460,13 @@ impl Engine {
     /// token / single-critical-section rule, and the store-divergence rebuild hazard) apply to
     /// this pair as a unit.
     // Production caller = P4-2b; the isolation gate exercises it now.
-    /// P4 COMPACTION (fence-free, the deletion directive): rebuild ONE heavily-stamped chunk
+    /// P4 COMPACTION (safe-horizon fenced): rebuild ONE heavily-stamped chunk
     /// from its SURVIVORS — a device projection gather (predicate=None + the sidecar mask over
     /// the staged chunk), re-encoded as a fresh sidecar-free payload born at the compacting
-    /// boundary. SOUND without a fence by the reclamation argument: in-flight folds hold the OLD
-    /// entry Arc; every later bind pins >= the current boundary >= `boundary`, so nobody can
-    /// observe the re-slotting (the born gate would hide the chunk from a sub-boundary reader,
-    /// but no such reader can bind). DELETES: the dead slots' payload bytes + the whole sidecar.
+    /// boundary. In-flight folds keep the OLD entry Arc, while the driver additionally requires
+    /// every removed tombstone to be at-or-behind the oldest active snapshot. Thus retained
+    /// transactions keep both old-read visibility and key claim/release history. DELETES: the dead
+    /// slots' payload bytes + the whole sidecar.
     /// `None` = the gather declined (device error) — the caller keeps the stamped, uncompacted
     /// chunk (compaction is an optimization, never load-bearing).
     fn compact_streaming_cold_chunk(
@@ -405,6 +507,25 @@ impl Engine {
             )
             .ok()?;
         let survivors: Vec<Vec<SqlValue>> = result.rows.iter().map(|r| r.to_vec()).collect();
+        if chunk.entity_ids.len() != chunk.row_count as usize {
+            return None;
+        }
+        let survivor_ids = chunk
+            .entity_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entity_id)| {
+                let visible = chunk.deleted_by.as_ref().is_none_or(|sidecar| {
+                    i64::from_le_bytes(
+                        sidecar[slot * 8..slot * 8 + 8]
+                            .try_into()
+                            .expect("cold sidecar slot width"),
+                    ) > boundary as i64
+                });
+                visible.then_some(*entity_id)
+            })
+            .collect::<Vec<_>>();
+        debug_assert_eq!(survivor_ids.len(), survivors.len());
         let (snapshot, payload) = self
             .build_transient_relation_payload_only(table, &survivors)
             .ok()?;
@@ -421,6 +542,7 @@ impl Engine {
             payload: ColdPayload::Ram(Arc::new(payload)),
             snapshot,
             row_count: survivors.len() as u64,
+            entity_ids: Arc::new(survivor_ids),
             tuple_range: (1, 0), // class chunks carry no store ids (the sentinel)
             payload_copin_s: boundary,
             deleted_by: None,
@@ -489,6 +611,7 @@ impl Engine {
                 },
                 snapshot: chunk.snapshot.clone(),
                 row_count: chunk.row_count,
+                entity_ids: Arc::clone(&chunk.entity_ids),
                 tuple_range: chunk.tuple_range,
                 payload_copin_s: chunk.payload_copin_s,
                 deleted_by,
@@ -538,6 +661,9 @@ impl Engine {
 
     /// The class check: `Some(freeze boundary)` when `table` is chunk-authoritative.
     pub(crate) fn table_chunk_authoritative(&self, table: &str) -> Option<Index> {
+        if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            return snapshot.chunk_authoritative_tables.get(table).copied();
+        }
         self.read_state
             .residency
             .chunk_authoritative_tables
@@ -703,6 +829,39 @@ impl Engine {
             }
         }
         let boundary = entry.build_copin_s;
+        // Resolve the canonical logical ids while the store generation that built these chunks is
+        // still present. Tuple ids are physical versions and may differ after UPDATE; row keys are
+        // the stable identity the transaction WAL and conflict path carry across generations.
+        let store_view = self.read_state.mvcc.table_rows(table_name);
+        let visibility = StorageVisibility {
+            read_txn_id: boundary,
+        };
+        let prefix = relational_key_prefix(table_name);
+        let mut class_entity_ids = Vec::with_capacity(entry.chunks.len());
+        for chunk in &entry.chunks {
+            if chunk.row_count == 0 {
+                class_entity_ids.push(Arc::new(Vec::new()));
+                continue;
+            }
+            let Ok(versions) = store_view.store().visible_versions_in_range(
+                visibility,
+                chunk.tuple_range.0,
+                chunk.tuple_range.1,
+            ) else {
+                return;
+            };
+            let ids = versions
+                .into_iter()
+                .filter(|version| version.key.starts_with(&prefix))
+                .map(|version| {
+                    crate::engine_residency::parse_relational_row_id(&version.key, &prefix)
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(ids) = ids.filter(|ids| ids.len() == chunk.row_count as usize) else {
+                return;
+            };
+            class_entity_ids.push(Arc::new(ids));
+        }
         let mut map =
             std::collections::BTreeMap::clone(&residency.chunk_authoritative_tables.load());
         map.insert(table_name.to_string(), boundary);
@@ -754,7 +913,8 @@ impl Engine {
             chunks: entry
                 .chunks
                 .iter()
-                .map(|chunk| ColdChunk {
+                .zip(class_entity_ids)
+                .map(|(chunk, entity_ids)| ColdChunk {
                     chunk_id: chunk.chunk_id,
                     payload: match &chunk.payload {
                         ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
@@ -766,6 +926,7 @@ impl Engine {
                     },
                     snapshot: chunk.snapshot.clone(),
                     row_count: chunk.row_count,
+                    entity_ids,
                     tuple_range: chunk.tuple_range,
                     payload_copin_s: chunk.payload_copin_s,
                     deleted_by: chunk.deleted_by.as_ref().map(Arc::clone),
@@ -786,6 +947,164 @@ impl Engine {
             .fetch_add(reclaimed, Ordering::Relaxed);
     }
 
+    /// Build a transaction-private class tail without publishing it. The appended chunks are born
+    /// at the transaction's retained boundary, so its ordinary visibility predicate sees them;
+    /// only the private entry contains those birth stamps. COMMIT later replays the resolved WAL
+    /// record and appends equivalent chunks at the real commit boundary.
+    pub(crate) fn append_transaction_cold_tail(
+        &self,
+        table: &RelationalTable,
+        entry: &Arc<ColdTableChunks>,
+        rows: &[Vec<SqlValue>],
+        row_ids: &[u64],
+        transaction_boundary: Index,
+    ) -> Option<Arc<ColdTableChunks>> {
+        if rows.len() != row_ids.len() {
+            return None;
+        }
+        if rows.is_empty() {
+            return Some(Arc::clone(entry));
+        }
+        let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
+        let mut chunks = entry
+            .chunks
+            .iter()
+            .map(|chunk| ColdChunk {
+                chunk_id: chunk.chunk_id,
+                payload: match &chunk.payload {
+                    ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
+                    ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
+                        file: Arc::clone(file),
+                        offset: *offset,
+                        len: *len,
+                    },
+                },
+                snapshot: chunk.snapshot.clone(),
+                row_count: chunk.row_count,
+                entity_ids: Arc::clone(&chunk.entity_ids),
+                tuple_range: chunk.tuple_range,
+                payload_copin_s: chunk.payload_copin_s,
+                deleted_by: chunk.deleted_by.as_ref().map(Arc::clone),
+            })
+            .collect::<Vec<_>>();
+        let mut total_payload_bytes = entry.total_payload_bytes;
+        let mut start = 0usize;
+        while start < rows.len() {
+            let mut bytes = 0u64;
+            let mut end = start;
+            while end < rows.len() {
+                bytes = bytes.saturating_add(chunk_row_device_bytes(&rows[end], &column_types));
+                end += 1;
+                if bytes >= entry.chunk_target_bytes {
+                    break;
+                }
+            }
+            let (snapshot, payload) = self
+                .build_transient_relation_payload_only(table, &rows[start..end])
+                .ok()?;
+            total_payload_bytes = total_payload_bytes.saturating_add(payload.len() as u64);
+            chunks.push(ColdChunk {
+                chunk_id: COLD_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
+                payload: ColdPayload::Ram(Arc::new(payload)),
+                snapshot,
+                row_count: (end - start) as u64,
+                entity_ids: Arc::new(row_ids[start..end].to_vec()),
+                tuple_range: (1, 0),
+                payload_copin_s: transaction_boundary,
+                deleted_by: None,
+            });
+            start = end;
+        }
+        Some(Arc::new(ColdTableChunks {
+            generation: Arc::clone(&entry.generation),
+            column_signature: entry.column_signature.clone(),
+            build_copin_s: transaction_boundary,
+            chunk_target_bytes: entry.chunk_target_bytes,
+            total_payload_bytes,
+            spilled: entry.spilled,
+            entry_epoch: COLD_ENTRY_EPOCH.fetch_add(1, Ordering::Relaxed),
+            chunks,
+        }))
+    }
+
+    /// COW-stamp epoch-bound coordinates inside a transaction-private entry. The global cold map
+    /// and its key caches are untouched; later private reads compose this sidecar on-device.
+    pub(crate) fn stamp_transaction_cold_coordinates(
+        &self,
+        entry: &Arc<ColdTableChunks>,
+        packed: &[u64],
+        expected_epoch: u64,
+        transaction_boundary: Index,
+    ) -> Option<Arc<ColdTableChunks>> {
+        if entry.entry_epoch != expected_epoch {
+            return None;
+        }
+        if packed.is_empty() {
+            return Some(Arc::clone(entry));
+        }
+        let mut by_chunk = BTreeMap::<usize, Vec<usize>>::new();
+        for coordinate in packed {
+            by_chunk
+                .entry((coordinate >> 32) as usize)
+                .or_default()
+                .push((coordinate & 0xFFFF_FFFF) as usize);
+        }
+        let mut sidecar_growth = 0u64;
+        let mut chunks = Vec::with_capacity(entry.chunks.len());
+        for (chunk_idx, chunk) in entry.chunks.iter().enumerate() {
+            let slots = by_chunk.remove(&chunk_idx).unwrap_or_default();
+            let deleted_by = if slots.is_empty() {
+                chunk.deleted_by.as_ref().map(Arc::clone)
+            } else {
+                let mut sidecar = chunk.deleted_by.as_ref().map_or_else(
+                    || {
+                        sidecar_growth = sidecar_growth.saturating_add(chunk.row_count * 8);
+                        vec![COLD_DELETED_BY_LIVE_FILL_BYTE; chunk.row_count as usize * 8]
+                    },
+                    |bytes| bytes.as_ref().clone(),
+                );
+                for slot in slots {
+                    if slot >= chunk.row_count as usize {
+                        return None;
+                    }
+                    sidecar[slot * 8..slot * 8 + 8]
+                        .copy_from_slice(&transaction_boundary.to_le_bytes());
+                }
+                Some(Arc::new(sidecar))
+            };
+            chunks.push(ColdChunk {
+                chunk_id: chunk.chunk_id,
+                payload: match &chunk.payload {
+                    ColdPayload::Ram(bytes) => ColdPayload::Ram(Arc::clone(bytes)),
+                    ColdPayload::Spilled { file, offset, len } => ColdPayload::Spilled {
+                        file: Arc::clone(file),
+                        offset: *offset,
+                        len: *len,
+                    },
+                },
+                snapshot: chunk.snapshot.clone(),
+                row_count: chunk.row_count,
+                entity_ids: Arc::clone(&chunk.entity_ids),
+                tuple_range: chunk.tuple_range,
+                payload_copin_s: chunk.payload_copin_s,
+                deleted_by,
+            });
+        }
+        if !by_chunk.is_empty() {
+            return None;
+        }
+        Some(Arc::new(ColdTableChunks {
+            generation: Arc::clone(&entry.generation),
+            column_signature: entry.column_signature.clone(),
+            build_copin_s: transaction_boundary,
+            chunk_target_bytes: entry.chunk_target_bytes,
+            total_payload_bytes: entry.total_payload_bytes.saturating_add(sidecar_growth),
+            spilled: entry.spilled,
+            entry_epoch: COLD_ENTRY_EPOCH.fetch_add(1, Ordering::Relaxed),
+            chunks,
+        }))
+    }
+
     /// THE CLASS INSERT MATERIALIZATION — called from the applied-commit hook UNDER THE COMMIT
     /// LOCK (obligation 1: one critical section, no intervening patch — the class entry's
     /// generation never changes so no patch can interpose). Appends the statement's OWN rows as
@@ -796,8 +1115,12 @@ impl Engine {
         &self,
         table: &RelationalTable,
         rows: &[Vec<SqlValue>],
+        row_ids: &[u64],
         commit_seq: Index,
     ) -> bool {
+        if rows.len() != row_ids.len() {
+            return false;
+        }
         if rows.is_empty() {
             return true;
         }
@@ -832,6 +1155,7 @@ impl Engine {
                     },
                     snapshot: chunk.snapshot.clone(),
                     row_count: chunk.row_count,
+                    entity_ids: Arc::clone(&chunk.entity_ids),
                     tuple_range: chunk.tuple_range,
                     payload_copin_s: chunk.payload_copin_s,
                     deleted_by: chunk.deleted_by.as_ref().map(Arc::clone),
@@ -869,6 +1193,7 @@ impl Engine {
                 payload: ColdPayload::Ram(Arc::new(payload)),
                 snapshot,
                 row_count: (end - start) as u64,
+                entity_ids: Arc::new(row_ids[start..end].to_vec()),
                 tuple_range: (1, 0),
                 payload_copin_s: commit_seq,
                 deleted_by: None,
@@ -991,17 +1316,15 @@ impl Engine {
                     } else {
                         chunk.payload_copin_s
                     };
-                    // Fresh row ids (the class INSERT advanced the allocator without assigning;
-                    // ids are internal-only for a keyless FK-free table — divergence from the
-                    // prepare-time ids is unobservable, and WAL replay derives its own).
+                    if chunk.entity_ids.len() != rows.len() {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "chunk-authoritative table \"{table_name}\" lost stable entity metadata"
+                        )));
+                    }
                     let keyed: Vec<(String, Vec<SqlValue>)> = rows
                         .into_iter()
-                        .map(|row| {
-                            let row_id = engine
-                                .read_state
-                                .mvcc
-                                .next_row_id
-                                .fetch_add(1, Ordering::Relaxed);
+                        .zip(chunk.entity_ids.iter().copied())
+                        .map(|(row, row_id)| {
                             (
                                 crate::rel_exec_helpers::relational_row_key(table_name, row_id),
                                 row,
@@ -1098,10 +1421,7 @@ impl Engine {
         visibility: StorageVisibility,
     ) -> Option<(ClassDmlMatches, u64)> {
         let entry = self
-            .read_state
-            .residency
-            .streaming_cold_chunks
-            .load()
+            .read_streaming_cold_chunks()
             .get(&table.name)
             .cloned()?;
         #[cfg(test)]
@@ -1157,7 +1477,8 @@ impl Engine {
                 // back only the approved row image; never decode the host cold payload here.
                 let image = self.read_cold_chunk_slot_values(table, chunk, &src, *slot as usize)?;
                 let pseudo_id = ((*chunk_idx as u64) << 32) | u64::from(*slot);
-                let key = crate::rel_exec_helpers::relational_row_key(&table.name, pseudo_id);
+                let entity_id = *chunk.entity_ids.get(*slot as usize)?;
+                let key = crate::rel_exec_helpers::relational_row_key(&table.name, entity_id);
                 matches.push((pseudo_id, key, image));
             }
         }
@@ -1248,7 +1569,8 @@ impl Engine {
                 // predicate. This is the one final value readback needed to stage the DML image.
                 let row = self.read_cold_chunk_slot_values(table, chunk, &src, slot as usize)?;
                 let pseudo_id = ((position as u64) << 32) | u64::from(slot);
-                let key = crate::rel_exec_helpers::relational_row_key(&table.name, pseudo_id);
+                let entity_id = *chunk.entity_ids.get(slot as usize)?;
+                let key = crate::rel_exec_helpers::relational_row_key(&table.name, entity_id);
                 matches.push((pseudo_id, key, row));
             }
         }
@@ -1291,6 +1613,54 @@ impl Engine {
         self.stamp_streaming_cold_slots(table_name, &located, stamp, true)
     }
 
+    /// Materialize one currently visible class version by stable identity. Identity narrows only
+    /// placement metadata; visibility and the complete nullable row image still come from the
+    /// cold generation/device payload, which is the relational authority.
+    pub(crate) fn class_row_by_entity_identity(
+        &self,
+        table: &RelationalTable,
+        entity_id: u64,
+        boundary: Index,
+    ) -> Option<(Vec<SqlValue>, Index, u64, u64)> {
+        let entry = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(&table.name)
+            .cloned()?;
+        let mut found = None;
+        for (chunk_idx, chunk) in entry.chunks.iter().enumerate() {
+            if chunk.payload_copin_s > boundary {
+                continue;
+            }
+            for (slot, candidate) in chunk.entity_ids.iter().enumerate() {
+                if *candidate != entity_id {
+                    continue;
+                }
+                let visible = chunk.deleted_by.as_ref().is_none_or(|sidecar| {
+                    i64::from_le_bytes(
+                        sidecar[slot * 8..slot * 8 + 8]
+                            .try_into()
+                            .expect("cold sidecar slot width"),
+                    ) > boundary as i64
+                });
+                if !visible {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                let staged = self.stage_cold_chunk(chunk, boundary).ok()?;
+                let (source, _) = staged.ready().ok()?;
+                let row = self.read_cold_chunk_slot_values(table, chunk, &source, slot)?;
+                let coordinate = ((chunk_idx as u64) << 32) | slot as u64;
+                found = Some((row, chunk.payload_copin_s, coordinate, entry.entry_epoch));
+            }
+        }
+        found
+    }
+
     /// P4 COMPACTION driver — runs at the commit hook AFTER `publish_committed_seq` (the timing
     /// is load-bearing: the compacted chunk is born at the CURRENT PUBLISHED boundary, so every
     /// later bind pins at-or-above it and sees it; a PRE-publish install would let a concurrent
@@ -1312,6 +1682,13 @@ impl Engine {
             return;
         };
         let live = i64::from_le_bytes([COLD_DELETED_BY_LIVE_FILL_BYTE; 8]);
+        // A current-only survivor rebuild may discard a tombstoned key version only when every
+        // still-servable snapshot is at-or-after that deletion. With no active transaction the
+        // current published boundary is the safe horizon; otherwise the oldest retained boundary
+        // is authoritative. A newer tombstone keeps its entire chunk unchanged.
+        let safe_horizon = self
+            .active_snapshots_oldest()
+            .unwrap_or_else(|| self.committed_seq());
         let needs: Vec<usize> = entry
             .chunks
             .iter()
@@ -1329,7 +1706,12 @@ impl Engine {
                             != live
                     })
                     .count() as u64;
-                dead * 4 >= chunk.row_count
+                let all_dead_reclaimable = (0..chunk.row_count as usize).all(|slot| {
+                    let deleted =
+                        i64::from_le_bytes(sidecar[slot * 8..slot * 8 + 8].try_into().expect("8"));
+                    deleted == live || (deleted >= 0 && deleted as u64 <= safe_horizon)
+                });
+                dead * 4 >= chunk.row_count && all_dead_reclaimable
             })
             .map(|(idx, _)| idx)
             .collect();
@@ -1380,6 +1762,7 @@ impl Engine {
                 },
                 snapshot: chunk.snapshot.clone(),
                 row_count: chunk.row_count,
+                entity_ids: Arc::clone(&chunk.entity_ids),
                 tuple_range: chunk.tuple_range,
                 payload_copin_s: chunk.payload_copin_s,
                 deleted_by: chunk.deleted_by.as_ref().map(Arc::clone),

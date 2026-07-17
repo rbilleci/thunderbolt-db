@@ -144,8 +144,8 @@ impl ResidentDeviceMemoryMap {
     /// first residency); an in-flight reader keeps the generation it already loaded.
     /// `&self`: if the cell exists we publish on it directly (no map change); only a
     /// first-time residency COW-installs a new cell into the map.
-    pub(crate) fn insert(&self, table: String, owner: CudaResidentDeviceMemory) {
-        let owner = Some(Arc::new(owner));
+    pub(crate) fn insert(&self, table: String, owner: Arc<CudaResidentDeviceMemory>) {
+        let owner = Some(owner);
         if let Some(cell) = self.cells.load().get(&table) {
             cell.publish(owner);
             return;
@@ -203,19 +203,6 @@ impl ShardResidentDeviceMemoryMap {
             .load()
             .get(key)
             .and_then(|cell| cell.load().get().clone())
-    }
-
-    /// Published owners for every shard of `table` (tombstones excluded), owned `Arc`s.
-    pub(crate) fn published_owners_for_table(
-        &self,
-        table: &str,
-    ) -> Vec<Arc<CudaResidentDeviceMemory>> {
-        self.cells
-            .load()
-            .iter()
-            .filter(|((cell_table, _), _)| cell_table == table)
-            .filter_map(|(_, cell)| cell.load().get().clone())
-            .collect()
     }
 
     /// Replace a table's shards: publish each new shard as a new generation
@@ -286,6 +273,15 @@ impl ShardResidentDeviceMemoryMap {
             if cell_table == table {
                 cell.publish(None);
             }
+        }
+    }
+
+    /// Release one shard-sidecar owner while retaining its reusable cell. Captured descriptors
+    /// keep their own `Arc`; new generations observe no owner. Used by transaction-bound version
+    /// GC once every active read boundary is newer than the sidecar's high-water.
+    pub(crate) fn invalidate_shard(&self, table: &str, shard_id: u32) {
+        if let Some(cell) = self.cells.load().get(&(table.to_string(), shard_id)) {
+            cell.publish(None);
         }
     }
 
@@ -423,6 +419,14 @@ impl MvccData {
         self.next_row_id.fetch_add(n, AtomicOrdering::Relaxed);
     }
 
+    /// Advance the relational row-id allocator to at least `high_water`. Explicit transactions
+    /// claim their final identity block before WAL encoding; replay has not. A monotonic max makes
+    /// applying the same resolved transaction record correct in both worlds.
+    pub(crate) fn advance_row_id_to_at_least(&self, high_water: u64) {
+        self.next_row_id
+            .fetch_max(high_water, AtomicOrdering::Relaxed);
+    }
+
     /// E2.5b-2 — atomically CLAIM a block of `n` row ids, returning the first. Unlike
     /// `advance_row_id` (single-writer read-then-advance), this is safe under concurrent
     /// lane pumps: the fetch_add is the claim.
@@ -476,6 +480,19 @@ impl MvccData {
         }
     }
 
+    /// Capture every currently-published relational table generation. The caller holds the commit
+    /// serializer while opening an explicit transaction, so these per-table handles all belong to
+    /// the same visible boundary. Tables without a data cell are deliberately absent; a later first
+    /// insert must remain invisible to this snapshot and resolves through the shared empty sentinel.
+    pub(crate) fn capture_table_versions(
+        &self,
+    ) -> BTreeMap<String, SnapshotHandle<Arc<TableVersionData>>> {
+        self.tables_read()
+            .iter()
+            .map(|(table, cell)| (table.clone(), cell.load()))
+            .collect()
+    }
+
     /// Mutate a table's payload via copy-on-write and publish the new generation: clone the current
     /// `TableVersionData` (or start empty), run `mutate`, then `publish` a fresh `Arc`. In-flight
     /// readers keep the generation they already loaded (epoch reclamation).
@@ -516,6 +533,48 @@ impl MvccData {
             }
         }
         result
+    }
+
+    /// Clone a transaction record's complete table working set without publishing any member.
+    /// The caller mutates these COW roots and publishes only after every decode/target/store
+    /// operation succeeds, so a malformed durable record cannot strand a partial table prefix.
+    pub(crate) fn clone_transaction_tables(
+        &self,
+        tables: &BTreeSet<String>,
+    ) -> BTreeMap<String, TableVersionData> {
+        let current = self.tables_read();
+        tables
+            .iter()
+            .map(|table| {
+                let data = current
+                    .get(table)
+                    .map(|cell| TableVersionData::clone(cell.load().get()))
+                    .unwrap_or_default();
+                (table.clone(), data)
+            })
+            .collect()
+    }
+
+    /// Publish a fully staged explicit-transaction table set. Each row version is stamped with the
+    /// not-yet-published commit index, so readers pinned at the old `committed_seq` keep old-row
+    /// visibility even while these per-table roots are installed sequentially under commit lock.
+    pub(crate) fn publish_transaction_tables(&self, staged: BTreeMap<String, TableVersionData>) {
+        for (table, data) in staged {
+            let data = Arc::new(data);
+            if let Some(cell) = self.tables_read().get(&table) {
+                cell.publish(data);
+                continue;
+            }
+            let mut map = self.tables_write();
+            match map.get(&table) {
+                Some(cell) => {
+                    cell.publish(data);
+                }
+                None => {
+                    map.insert(table, SnapshotCell::new(data));
+                }
+            }
+        }
     }
 
     /// Mutate the KV partition via copy-on-write and publish the new generation. `&self` (the cell
@@ -614,6 +673,14 @@ pub(crate) static EMPTY_TABLE_VERSION_DATA: std::sync::LazyLock<Arc<TableVersion
     std::sync::LazyLock::new(|| Arc::new(TableVersionData::default()));
 
 thread_local! {
+    /// Explicit transaction read context for the current statement. The façade supplies the
+    /// transaction id at its execution boundary; this scoped handle lets the deep GPU read stack
+    /// resolve catalog/data/residency through one owned generation without storing connection state
+    /// globally. The RAII scope restores any prior value.
+    pub(crate) static TRANSACTION_READ_SNAPSHOT: std::cell::RefCell<Option<Arc<TransactionSnapshot>>> = const {
+        std::cell::RefCell::new(None)
+    };
+
     /// Set (RAII-scoped) while this thread runs an internal relational read from INSIDE the commit
     /// critical section (materialized-view create/refresh applying a committed entry). The deep read
     /// executor reads this to skip its leader re-check, which would otherwise re-lock the already-held
@@ -627,6 +694,114 @@ thread_local! {
     /// self-deadlocks. The leader's exclusivity already gives the rebuild the exclusion the
     /// guard provides. False for every off-lock prober.
     pub(crate) static LANE_APPLY_LEADER_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct TransactionReadScope {
+    previous: Option<Arc<TransactionSnapshot>>,
+}
+
+impl Drop for TransactionReadScope {
+    fn drop(&mut self) {
+        TRANSACTION_READ_SNAPSHOT.with(|current| {
+            current.replace(self.previous.take());
+        });
+    }
+}
+
+impl Engine {
+    pub(crate) fn enter_transaction_read(
+        &self,
+        snapshot: Arc<TransactionSnapshot>,
+    ) -> TransactionReadScope {
+        let previous = TRANSACTION_READ_SNAPSHOT.with(|current| current.replace(Some(snapshot)));
+        TransactionReadScope { previous }
+    }
+
+    pub(crate) fn transaction_snapshot_handle(
+        &self,
+        txn_id: TxnId,
+    ) -> Option<Arc<TransactionSnapshot>> {
+        self.active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .transaction_snapshot_handle(txn_id)
+    }
+
+    pub(crate) fn current_transaction_read_snapshot(&self) -> Option<Arc<TransactionSnapshot>> {
+        TRANSACTION_READ_SNAPSHOT.with(|current| current.borrow().clone())
+    }
+
+    /// The boundary selected by the current statement owner: an explicit transaction's retained
+    /// generation when scoped, otherwise the latest published autocommit boundary.
+    pub(crate) fn read_snapshot_boundary(&self) -> Index {
+        self.current_transaction_read_snapshot()
+            .map_or_else(|| self.committed_seq(), |snapshot| snapshot.boundary)
+    }
+
+    pub(crate) fn read_catalog_as_of(&self, boundary: Index) -> Arc<CatalogSnapshot> {
+        if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            debug_assert_eq!(
+                boundary, snapshot.boundary,
+                "transaction-scoped catalog read attempted to rebind its boundary"
+            );
+            return Arc::clone(&snapshot.catalog);
+        }
+        self.read_state.catalog_as_of(boundary)
+    }
+
+    pub(crate) fn read_residency_snapshots(
+        &self,
+    ) -> Arc<BTreeMap<String, RelationalResidencyEntry>> {
+        self.current_transaction_read_snapshot().map_or_else(
+            || self.read_state.residency.snapshots.load_full(),
+            |snapshot| Arc::clone(&snapshot.resident_snapshots),
+        )
+    }
+
+    pub(crate) fn read_residency_shards(
+        &self,
+    ) -> Arc<BTreeMap<String, Vec<RelationalResidentShard>>> {
+        self.current_transaction_read_snapshot().map_or_else(
+            || self.read_state.residency.shards.load_full(),
+            |snapshot| snapshot.transaction_shards(),
+        )
+    }
+
+    pub(crate) fn read_streaming_cold_chunks(
+        &self,
+    ) -> Arc<BTreeMap<String, Arc<crate::engine_streaming_exec::ColdTableChunks>>> {
+        self.current_transaction_read_snapshot().map_or_else(
+            || self.read_state.residency.streaming_cold_chunks.load_full(),
+            |snapshot| snapshot.transaction_cold_chunks(),
+        )
+    }
+
+    pub(crate) fn read_resident_device_memory(
+        &self,
+        table: &str,
+    ) -> Option<Arc<CudaResidentDeviceMemory>> {
+        if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            return snapshot
+                .resident_snapshots
+                .get(table)
+                .and_then(|entry| entry.device_memory.as_ref().cloned());
+        }
+        self.read_state.residency.device_memory.get(table)
+    }
+
+    pub(crate) fn read_table_rows_at(&self, table: &str, boundary: Index) -> TableRowsView {
+        if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            debug_assert_eq!(
+                boundary, snapshot.boundary,
+                "transaction-scoped table read attempted to rebind its boundary"
+            );
+            return snapshot.table_versions.get(table).map_or_else(
+                || TableRowsView::Empty(Arc::clone(&EMPTY_TABLE_VERSION_DATA)),
+                |handle| TableRowsView::Resident(handle.clone()),
+            );
+        }
+        self.read_state.mvcc.table_rows(table)
+    }
 }
 
 /// A loaded, immutable view of one table's rows for the read path: either the pinned published
@@ -739,6 +914,11 @@ pub(crate) struct RelationalResidentShard {
     pub(crate) shard_id: u32,
     pub(crate) row_start: usize,
     pub(crate) row_count: usize,
+    /// Lowest read snapshot for which a conflict-history MISS is authoritative. A dense rebuild
+    /// keeps only the current live image and therefore sets this to its rebuild boundary; an
+    /// additive rollover shard drops no older physical versions and uses zero. Exact conflict
+    /// probes may return true below this floor, but must decline rather than return false.
+    pub(crate) history_floor_index: Index,
     /// Capacity-padded column stride (S-d2): the OPEN shard carries headroom (`capacity > row_count`) for
     /// in-place appends; sealed/benchmark shards are dense (`capacity == row_count`). The sharded read's
     /// recompaction gather reads each column slice at this stride (a column's live rows sit at its
@@ -833,6 +1013,7 @@ impl PartialEq for RelationalResidentShard {
         self.shard_id == other.shard_id
             && self.row_start == other.row_start
             && self.row_count == other.row_count
+            && self.history_floor_index == other.history_floor_index
             && self.capacity == other.capacity
             && self.int4_appendable == other.int4_appendable
             && self.resident_device_int4_column_stats == other.resident_device_int4_column_stats
@@ -921,14 +1102,18 @@ impl RelationalResidentCache {
         device_memory: Option<CudaResidentDeviceMemory>,
         residency: &ResidencyReadState,
     ) {
-        if let Some(device_memory) = device_memory {
-            residency.device_memory.insert(table.clone(), device_memory);
+        let device_memory = device_memory.map(Arc::new);
+        if let Some(device_memory) = &device_memory {
+            residency
+                .device_memory
+                .insert(table.clone(), Arc::clone(device_memory));
         } else {
             // Refreshed without device memory (e.g. no GPU): publish a tombstone so any
             // in-flight reader of a prior resident generation keeps it.
             residency.device_memory.invalidate(&table);
         }
-        let entry = RelationalResidencyEntry::new(Arc::new(descriptor));
+        let entry =
+            RelationalResidencyEntry::with_device_memory(Arc::new(descriptor), device_memory);
         residency.with_snapshots_mut(|snapshots| snapshots.insert(table, entry));
     }
 

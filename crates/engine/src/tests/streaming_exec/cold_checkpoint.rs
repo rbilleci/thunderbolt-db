@@ -372,12 +372,13 @@ fn gpu_cold_checkpoint_boundary_mismatch_is_skipped() {
     assert!(e.streaming_cold_builds() >= 1);
 }
 
-/// R3-006 regression: an EXCLUSIVE lane next-slot frontier is not an inclusive `committed_seq`.
-/// If a caller artificially advances the live watermark one slot above the checkpoint's last
-/// durable/applied record, the cold artifact must be refused rather than blessing the mismatch.
+/// A one-high live watermark is a genuinely newer commit under the inclusive lane convention. A
+/// checkpoint captured for the prior cut must reject it rather than encode future-state bytes at
+/// the older recovery seam. This deterministically emulates the commit-wins race after the cut was
+/// captured and before cold-entry qualification.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_cold_checkpoint_rejects_exclusive_next_watermark() {
+fn gpu_cold_checkpoint_rejects_next_commit_watermark() {
     let Some((base, expected, _next_row)) = p1_lanes_streaming_fixture("frontier", 300) else {
         return;
     };
@@ -387,28 +388,26 @@ fn gpu_cold_checkpoint_rejects_exclusive_next_watermark() {
         p1_force_streaming(&mut e, budget);
         assert_eq!(p1_count(&e), expected);
         assert!(e.streaming_cold_builds() >= 1);
-        // Inject the pre-R3-006 bug: publish the EXCLUSIVE frontier one above the inclusive last
-        // record. Production lane settlement must never do this after the correction.
+        // Emulate the next commit publishing after checkpoint cut capture but before the cold
+        // writer's watermark check.
         let lanes = e.intent_lanes.as_ref().expect("lanes installed");
         let frontier = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire) + 24;
         e.publish_committed_seq(frontier);
         assert_eq!(
             e.committed_seq(),
             frontier,
-            "premise: injected one-high watermark"
+            "premise: next-commit watermark"
         );
         let cut = e.checkpoint_intent_lanes().expect("lanes checkpoint");
         assert_eq!(cut, 24);
-        assert!(
-            e.streaming_cold_checkpointed() == 0,
-            "an exclusive-next watermark must not qualify an inclusive-boundary artifact"
+        assert_eq!(
+            e.streaming_cold_checkpointed(),
+            0,
+            "a next-commit watermark must reject the older-cut artifact"
         );
     }
-    let mut e = Engine::open_durable_wal_segment(&base).expect("reopen after frontier checkpoint");
-    assert!(
-        e.streaming_cold_restored() == 0,
-        "the mismatched artifact must not exist or restore"
-    );
+    let mut e = Engine::open_durable_wal_segment(&base).expect("reopen after rejected checkpoint");
+    assert_eq!(e.streaming_cold_restored(), 0);
     p1_force_streaming(&mut e, budget);
     assert_eq!(p1_count(&e), expected);
     assert!(e.streaming_cold_builds() >= 1);

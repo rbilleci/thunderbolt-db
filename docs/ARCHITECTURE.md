@@ -145,8 +145,9 @@ ADR-014 makes the user-transaction envelope and isolation boundary explicit:
   savepoints, cascades, deferrable constraints, or temporary-relation semantics reject rather than approximate.
 
 The full accepted lifecycle, SQL-sequence, retry-identity, and compatibility contract is ADR-014's detailed design
-[`design/write-path-adr-014.md`](design/write-path-adr-014.md). Implementation ownership remains in
-**R3-002/003** and **DUR-002**; this architecture contract does not claim those paths are built.
+[`design/write-path-adr-014.md`](design/write-path-adr-014.md). R3-002/R3-003 device-index, transaction,
+conflict-history, and reclamation graduation is complete; the canonical durable envelope and destructive fault
+qualification remain **DUR-002**.
 
 The binding latency classes are defined in `CHARTER.md`: R1 bounded reads target 0.5/1/5-ms p50/p99/p99.9; W1
 single keyed synchronous mutations target 0.8/1.5/5 ms; T8 transactions contain 2–8 predeclared operations with at
@@ -213,9 +214,9 @@ ADR-014 selects compact append/tombstone MVCC:
   scratch, WAL, and status bytes are independently bounded; pressure rejects before WAL rather than reclaiming live
   authority.
 
-Dense latest-image plus undo and the retired per-wave blocking mega-fuse are rejected by ADR-014. **R3-002/003**
-implement coverage and concurrency; **R3-004** removes host store/index/probe authority only after the accepted
-graduation dependencies pass.
+Dense latest-image plus undo and the retired per-wave blocking mega-fuse are rejected by ADR-014. R3-002/R3-003
+coverage and concurrency graduation is complete; **R3-004** removes host store/index/probe authority only after
+**DUR-002** passes.
 
 ## 8. Durability and recovery
 

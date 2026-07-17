@@ -346,6 +346,8 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let plan = compile_resident_plan(&table, &bound, select)?;
 
@@ -840,6 +842,8 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
@@ -966,6 +970,8 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
@@ -1108,6 +1114,8 @@ impl Engine {
         &self,
         selects: &[Select],
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         self.execute_relational_equality_multi_column_projection_batch_inner(selects, None, true)
     }
 
@@ -1286,7 +1294,7 @@ impl Engine {
             .map(|(_bound, _access_path, needle)| *needle)
             .collect::<Vec<_>>();
 
-        if let Some(device_memory) = self.read_state.residency.device_memory.get(&table.name) {
+        if let Some(device_memory) = self.read_resident_device_memory(&table.name) {
             device_memory.clear_last_kernel_event_elapsed_us();
         }
         let text_projection_indexes = selected_indexes
@@ -1310,10 +1318,7 @@ impl Engine {
         let batch_started = Instant::now();
         let compact_text_rows = if let Some(text_idx) = compact_text_projection_idx {
             let device_memory = self
-                .read_state
-                .residency
-                .device_memory
-                .get(&table.name)
+                .read_resident_device_memory(&table.name)
                 .ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(format!(
                         "relation \"{}\" has no retained resident device memory",
@@ -1345,10 +1350,7 @@ impl Engine {
         };
         let projected_rows = if compact_text_rows.is_none() {
             let device_memory = self
-                .read_state
-                .residency
-                .device_memory
-                .get(&table.name)
+                .read_resident_device_memory(&table.name)
                 .ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(format!(
                         "relation \"{}\" has no retained resident device memory",

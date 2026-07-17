@@ -468,7 +468,7 @@ impl CatalogHistory {
 /// the generation as-of its pinned `committed_seq` so a shape-changing DDL can never split a reader's
 /// (catalog, data) pair. The field names mirror the `Engine`/`DdlCatalogState` working maps so the
 /// publish is a straight clone-and-store.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CatalogSnapshot {
     /// The commit `Index` this catalog generation was published at (PART B). `0` for the initial
     /// empty generation. A reader pinned at `committed_seq = s` selects the generation with the

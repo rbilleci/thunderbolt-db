@@ -1,6 +1,6 @@
 use super::{
-    build_int4_pk_bloom_host, build_int4_pk_hash_table_host, build_int4_pk_hash_table_host_visible,
-    extend_int4_pk_bloom_host, extend_int4_pk_hash_table_host, probe_cached_shard_pk,
+    build_int4_pk_bloom_host, build_int4_pk_hash_table_host, extend_int4_pk_bloom_host,
+    extend_int4_pk_hash_table_host, probe_cached_shard_pk, resident_device_bool_column_offset,
     resident_device_int4_column_offset, resident_device_int8_column_offset,
     resident_device_numeric_column_offset, resident_device_text_column_layout,
     shard_fixed_width_key_offset, shard_key_column_blob_len, shard_key_column_blob_offset, Arc,
@@ -31,7 +31,7 @@ impl Engine {
     ) -> Option<Vec<ShardPkHit>> {
         const MAX_HITS: u32 = 4;
         let positions = crate::engine_residency::probe_key_id_positions(table, key_id)?;
-        let shards = self.read_state.residency.shards.load();
+        let shards = self.read_residency_shards();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
             return None;
@@ -81,6 +81,9 @@ impl Engine {
                         resident_device_text_column_layout(&descriptor, table, p)
                             .ok()
                             .map(|layout| layout.offsets_byte_offset)
+                    }
+                    Some(SqlType::Bool) => {
+                        resident_device_bool_column_offset(&descriptor, table, p).ok()
                     }
                     _ => resident_device_int4_column_offset(&descriptor, table, p).ok(),
                 })
@@ -653,7 +656,7 @@ impl Engine {
         filter_idx: usize,
         needles: &[i32],
     ) -> Option<Vec<BatchShardGroup>> {
-        let shards = self.read_state.residency.shards.load();
+        let shards = self.read_residency_shards();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
             return None;
@@ -874,12 +877,10 @@ impl Engine {
 
     /// Sub-slice 8 (GPU-native probe): ensure the shard's PK hash index is resident ON THE DEVICE (uploaded
     /// once per shard generation), returning `(device_index, table_mask, hash_shift)` for the dense-emit
-    /// probe kernel. Mirrors R1's `build_wave_resident_int4_index` per shard: DtoH the key column -> build the
-    /// host hash table (`(key<<32)|(row+1)`) -> HtoD upload via `retain_device_memory_copy` -> cache keyed
-    /// `(table, shard_id, col_idx)` validated by `(ptr, row_count)` + the ABA `_resident_guard` pin. `None`
-    /// (caller falls back to the host path) when the shard is empty / oversize, the DtoH fails, the upload
-    /// fails, or the key column has DUPLICATES (the hash declines — cached as `device_index: None` so it is
-    /// not rebuilt every batch).
+    /// probe kernel. R3-002 builds the open-addressing table directly from the resident typed columns:
+    /// raw/fingerprint derivation, GC-bound tombstone skipping, and hash insertion all execute on-device;
+    /// only compact descriptors and a four-byte decline verdict cross the host. The cache remains keyed by
+    /// `(table, shard_id, key_id)` and validated by `(ptr, row_count)` plus the ABA resident guard.
     pub(super) fn ensure_shard_pk_device_index(
         &self,
         table: &RelationalTable,
@@ -987,7 +988,7 @@ impl Engine {
                     }
                 }
             }
-            let shards = self.read_state.residency.shards.load();
+            let shards = self.read_residency_shards();
             let live = shards
                 .get(table_name)?
                 .iter()
@@ -1049,64 +1050,41 @@ impl Engine {
         if row_count == 0 || row_count_u64 >= u32::MAX as u64 {
             return None;
         }
-        // COMPOUND KEYS: obtain the per-row keys the index stores. A single-column key reads its one
-        // resident column verbatim (raw keys), byte-identical to the prior path. A COMPOUND key folds
-        // its columns into the surrogate fingerprint ON THE DEVICE (`submit_compound_fold_fingerprints`,
-        // byte-matching the host `compound_key_fingerprint`) — the raw key columns are NEVER read back
-        // to the host to be hashed (the charter close); the host reads only the derived fingerprint
-        // column, exactly as the single-column build reads its one key column.
-        let keys: Vec<i32> = if build_offsets.len() == 1 {
-            let keys = build_memory
-                .read_resident_i32_column(build_offsets[0], row_count)
-                .ok()?;
-            if keys.len() != row_count {
-                return None;
-            }
-            keys
-        } else {
-            // Per-column WORD widths (i32-section -> 1, i64 section -> 2), parallel to `build_offsets`
-            // in `positions` order; the device fold reads `widths[k]` words per column.
-            let widths = positions
-                .iter()
-                .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
-                .collect::<Option<Vec<u32>>>()?;
-            let fold_columns = widths
-                .iter()
-                .enumerate()
-                .map(|(idx, &width_words)| {
-                    if width_words == 0 {
-                        CudaCompoundFoldColumn::Text {
-                            offsets_byte_offset: build_offsets[idx],
-                            bytes_byte_offset: build_blob_offsets[idx],
-                            bytes_len: build_blob_lens[idx],
-                        }
-                    } else {
-                        CudaCompoundFoldColumn::Fixed {
-                            byte_offset: build_offsets[idx],
-                            width_words,
-                        }
+        // Every key shape is described uniformly. One fixed one-word column is the raw ABI; wider,
+        // BOOL, TEXT, and multi-column descriptors select the canonical device fingerprint fold.
+        let widths = positions
+            .iter()
+            .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
+            .collect::<Option<Vec<u32>>>()?;
+        let fold_columns = widths
+            .iter()
+            .enumerate()
+            .map(|(idx, &width_words)| {
+                if width_words == u32::MAX {
+                    CudaCompoundFoldColumn::Bool {
+                        bitmap_byte_offset: build_offsets[idx],
                     }
-                })
-                .collect::<Vec<_>>();
-            let fps = build_memory
-                .submit_compound_fold_fingerprints(&fold_columns, row_count)
-                .ok()?;
-            if fps.len() != row_count {
-                return None;
-            }
-            fps
-        };
-        // U1 (visibility-aware rebuild): read the shard's deleted_by stamps (absent region =
-        // all-live) and skip rows dead at or below the GC boundary — see
-        // `build_int4_pk_hash_table_host_visible`. Boundary = the oldest registered snapshot
-        // (or committed_seq if none): a row dead at or below it is invisible to every current
-        // AND future reader (future snapshots bind at >= committed_seq >= any published stamp).
-        let deleted_stamps: Option<Vec<u64>> = self
+                } else if width_words == 0 {
+                    CudaCompoundFoldColumn::Text {
+                        offsets_byte_offset: build_offsets[idx],
+                        bytes_byte_offset: build_blob_offsets[idx],
+                        bytes_len: build_blob_lens[idx],
+                    }
+                } else {
+                    CudaCompoundFoldColumn::Fixed {
+                        byte_offset: build_offsets[idx],
+                        width_words,
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        // U1: keep deleted stamps resident too. The build kernel skips only rows dead at/below the
+        // oldest active boundary; no O(rows) stamp DtoH is needed.
+        let deleted_by = self
             .read_state
             .residency
             .shard_deleted_by_memory
-            .get(&(table_name.to_string(), shard_id))
-            .and_then(|region| region.read_resident_u64_column(0, row_count).ok());
+            .get(&(table_name.to_string(), shard_id));
         let gc_boundary = self
             .active_snapshots
             .lock()
@@ -1131,64 +1109,49 @@ impl Engine {
         } else {
             row_count_u64.saturating_mul(2)
         };
-        // The host hash build is outside the allocation lock. Only its retained GPU result affects
-        // the residency cap, so serialize from this point through cache publication.
+        let table_size = sizing_rows.checked_mul(2)?.checked_next_power_of_two()?;
+        if table_size > (1_u64 << 30) {
+            return None;
+        }
+        let table_mask = (table_size - 1) as u32;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let index_bytes = table_size.checked_mul(std::mem::size_of::<u64>() as u64)?;
+        // Only the retained zeroed table affects the residency cap, so serialize allocation, build,
+        // and publication. `cuMemsetD8` initializes it without an O(table) host zero vector/H2D.
         let _budget_allocation = self
             .read_state
             .residency
             .budget_allocation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (device_index, table_mask, hash_shift) = match build_int4_pk_hash_table_host_visible(
-            &keys,
-            sizing_rows,
-            deleted_stamps.as_deref(),
-            gc_boundary,
-            // F3/U4: place MVCC version twins (dead-old + live-new sharing a pk) rather than
-            // declining — BUT only on a VERSIONED shard (one that carries a `deleted_by` region).
-            // A version twin can only exist where a delete/update tombstoned the old, so a versioned
-            // shard's same-key duplicates are twins the dup-tolerant visible/write-locate AND dense-read
-            // probes resolve by advancing past invisible hits. A DELETE-FREE shard has no versions, so a
-            // same-key duplicate is a genuine
-            // DATA duplicate (a non-unique-key table) that MUST still decline the whole shard — the
-            // first-match probe cannot resolve it. `deleted_stamps.is_some()` is exactly that gate.
-            deleted_stamps.is_some(),
-        ) {
-            Some((index, table_mask, hash_shift)) => {
-                let index_bytes: Vec<u8> =
-                    index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
-                let runtime = self.cuda_driver_probe_runtime();
-                let gpu_id = build_memory.metadata().gpu_id;
-                if self
-                    .relational_residency_budget_bytes(gpu_id)
-                    .is_some_and(|budget| {
-                        self.relational_resident_bytes_for_gpu(gpu_id)
-                            .saturating_add(index_bytes.len() as u64)
-                            > budget
-                    })
-                {
-                    return None;
-                }
-                // An upload failure (e.g. OOM) is TRANSIENT -> return None WITHOUT caching (retry next
-                // batch); the caller falls back to the host path meanwhile.
-                let Ok(mem) = runtime.retain_device_memory_copy(gpu_id, &index_bytes) else {
-                    return None;
-                };
-                if self
-                    .relational_residency_budget_bytes(gpu_id)
-                    .is_some_and(|budget| {
-                        self.relational_resident_bytes_for_gpu(gpu_id)
-                            .saturating_add(mem.metadata().allocated_bytes)
-                            > budget
-                    })
-                {
-                    return None;
-                }
-                (Some(Arc::new(mem)), table_mask, hash_shift)
-            }
-            // Duplicate / oversize key column -> declined; CACHE `None` so it is not rebuilt every batch.
-            None => (None, 0, 0),
+        let runtime = self.cuda_driver_probe_runtime();
+        let gpu_id = build_memory.metadata().gpu_id;
+        if self
+            .relational_residency_budget_bytes(gpu_id)
+            .is_some_and(|budget| {
+                self.relational_resident_bytes_for_gpu(gpu_id)
+                    .saturating_add(index_bytes)
+                    > budget
+            })
+        {
+            return None;
+        }
+        let Ok(mem) = runtime.retain_device_memory_zeroed(gpu_id, index_bytes) else {
+            return None;
         };
+        let declined = build_memory
+            .submit_resident_typed_index_build(
+                &mem,
+                table_mask,
+                hash_shift,
+                &fold_columns,
+                row_count,
+                deleted_by.as_deref(),
+                gc_boundary,
+                deleted_by.is_some() || key_id & crate::engine_residency::COMPOUND_KEY_ID_FLAG != 0,
+            )
+            .ok()?;
+        let device_index = (!declined).then(|| Arc::new(mem));
         let result = device_index
             .clone()
             .map(|di| (di, table_mask, hash_shift, row_count));
@@ -1245,7 +1208,7 @@ impl Engine {
         if ncols == 0 || ncols > 4 {
             return None;
         }
-        let shards = self.read_state.residency.shards.load();
+        let shards = self.read_residency_shards();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
             return None;

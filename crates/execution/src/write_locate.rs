@@ -44,6 +44,9 @@ pub struct VisibleLocateShard {
     pub created_by: Option<Arc<CudaResidentDeviceMemory>>,
     /// `deleted_by[row]` u64 region owner; absent means every row remains live.
     pub deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
+    /// Stable logical entity identity for each physical version slot. An absent region makes the
+    /// identity result `u64::MAX`; mutation callers must decline rather than invent an identity.
+    pub row_id: Option<Arc<CudaResidentDeviceMemory>>,
 }
 
 fn validate_index_geometry(
@@ -110,6 +113,14 @@ pub struct VisibleLocateResult {
     pub shard_idx: Vec<u32>,
     pub slot: Vec<u32>,
     pub count: Vec<u32>,
+    /// Stable entity identity of the first visible match, or `u64::MAX` when no identity region
+    /// was supplied. Parallel to `count`.
+    pub row_id: Vec<u64>,
+    /// Highest real `created_by` or `deleted_by` stamp among every physical version matching the
+    /// needle. The all-live deleted sentinel is ignored. This is independent of the requested
+    /// visibility snapshot and lets writers detect a claim/release history newer than their read
+    /// snapshot, including a key that was inserted and deleted again before validation.
+    pub latest_write: Vec<u64>,
 }
 
 /// The VISIBLE-LOCATE kernel (U1): write-locate's probe loop + ON-DEVICE MVCC visibility. Each
@@ -131,12 +142,14 @@ const VISIBLE_LOCATE_PTX: &[u8] = br#"
     .param .u64 snapshots_ptr,
     .param .u64 out_shard_ptr,
     .param .u64 out_slot_ptr,
-    .param .u64 out_count_ptr
+    .param .u64 out_count_ptr,
+    .param .u64 out_row_id_ptr,
+    .param .u64 out_latest_write_ptr
 )
 {
-    .reg .pred %p<9>;
+    .reg .pred %p<12>;
     .reg .b32 %r<21>;
-    .reg .b64 %rd<33>;
+    .reg .b64 %rd<44>;
 
     ld.param.u64 %rd1, [desc_array_ptr];
     ld.param.u32 %r1, [shard_count];
@@ -146,6 +159,8 @@ const VISIBLE_LOCATE_PTX: &[u8] = br#"
     ld.param.u64 %rd4, [out_shard_ptr];
     ld.param.u64 %rd5, [out_slot_ptr];
     ld.param.u64 %rd6, [out_count_ptr];
+    ld.param.u64 %rd7, [out_row_id_ptr];
+    ld.param.u64 %rd39, [out_latest_write_ptr];
 
     mov.u32 %r3, %tid.x;
     mov.u32 %r4, %ctaid.x;
@@ -154,31 +169,34 @@ const VISIBLE_LOCATE_PTX: &[u8] = br#"
     setp.ge.u32 %p1, %r6, %r2;
     @%p1 bra DONE;
 
-    mul.wide.u32 %rd7, %r6, 4;
-    add.u64 %rd8, %rd2, %rd7;
-    ld.global.s32 %r7, [%rd8];
-    mul.wide.u32 %rd9, %r6, 8;
-    add.u64 %rd10, %rd3, %rd9;
-    ld.global.u64 %rd11, [%rd10];
+    mul.wide.u32 %rd8, %r6, 4;
+    add.u64 %rd9, %rd2, %rd8;
+    ld.global.s32 %r7, [%rd9];
+    mul.wide.u32 %rd10, %r6, 8;
+    add.u64 %rd11, %rd3, %rd10;
+    ld.global.u64 %rd12, [%rd11];
 
     mov.u32 %r8, 0;
     mov.u32 %r9, 0;
     mov.u32 %r10, 0;
     mov.u32 %r11, 0;
+    mov.u64 %rd30, 18446744073709551615;
+    mov.u64 %rd40, 0;
 
 SHARD:
     setp.ge.u32 %p1, %r11, %r1;
     @%p1 bra WRITEOUT;
-    mul.wide.u32 %rd12, %r11, 40;
-    add.u64 %rd13, %rd1, %rd12;
-    ld.global.u64 %rd14, [%rd13];
-    ld.global.u64 %rd15, [%rd13+8];
-    cvt.u32.u64 %r12, %rd15;
-    shr.u64 %rd16, %rd15, 32;
-    cvt.u32.u64 %r13, %rd16;
-    ld.global.u64 %rd17, [%rd13+16];
-    ld.global.u64 %rd18, [%rd13+24];
-    ld.global.u32 %r19, [%rd13+32];
+    mul.wide.u32 %rd13, %r11, 48;
+    add.u64 %rd14, %rd1, %rd13;
+    ld.global.u64 %rd15, [%rd14];
+    ld.global.u64 %rd16, [%rd14+8];
+    cvt.u32.u64 %r12, %rd16;
+    shr.u64 %rd17, %rd16, 32;
+    cvt.u32.u64 %r13, %rd17;
+    ld.global.u64 %rd18, [%rd14+16];
+    ld.global.u64 %rd19, [%rd14+24];
+    ld.global.u64 %rd20, [%rd14+32];
+    ld.global.u32 %r19, [%rd14+40];
 
     mul.lo.u32 %r14, %r7, 2654435761;
     shr.u32 %r15, %r14, %r13;
@@ -186,39 +204,57 @@ SHARD:
     mov.u32 %r16, 0;
 
 PROBE:
-    mul.wide.u32 %rd19, %r15, 8;
-    add.u64 %rd20, %rd14, %rd19;
-    ld.global.u64 %rd21, [%rd20];
-    setp.eq.u64 %p2, %rd21, 0;
+    mul.wide.u32 %rd21, %r15, 8;
+    add.u64 %rd22, %rd15, %rd21;
+    ld.global.u64 %rd23, [%rd22];
+    setp.eq.u64 %p2, %rd23, 0;
     @%p2 bra NEXTSHARD;
-    shr.u64 %rd22, %rd21, 32;
-    cvt.u32.u64 %r17, %rd22;
+    shr.u64 %rd24, %rd23, 32;
+    cvt.u32.u64 %r17, %rd24;
     setp.ne.s32 %p2, %r17, %r7;
     @%p2 bra ADVANCE;
-    cvt.u32.u64 %r18, %rd21;
+    cvt.u32.u64 %r18, %rd23;
     sub.u32 %r18, %r18, 1;
     setp.ge.u32 %p8, %r18, %r19;
     @%p8 bra BADINDEX;
-    setp.eq.u64 %p3, %rd17, 0;
-    @%p3 bra CBOK;
-    mul.wide.u32 %rd23, %r18, 8;
-    add.u64 %rd24, %rd17, %rd23;
-    ld.global.u64 %rd25, [%rd24];
-    setp.gt.u64 %p4, %rd25, %rd11;
+
+    mov.u64 %rd27, 0;
+    setp.eq.u64 %p3, %rd18, 0;
+    @%p3 bra CBLOADED;
+    mul.wide.u32 %rd25, %r18, 8;
+    add.u64 %rd26, %rd18, %rd25;
+    ld.global.u64 %rd27, [%rd26];
+CBLOADED:
+    setp.gt.u64 %p10, %rd27, %rd40;
+    @%p10 mov.u64 %rd40, %rd27;
+
+    mov.u64 %rd29, 9187201950435737471;
+    setp.eq.u64 %p5, %rd19, 0;
+    @%p5 bra DBLOADED;
+    mul.wide.u32 %rd25, %r18, 8;
+    add.u64 %rd28, %rd19, %rd25;
+    ld.global.u64 %rd29, [%rd28];
+DBLOADED:
+    setp.eq.u64 %p10, %rd29, 9187201950435737471;
+    @%p10 bra HISTORYDONE;
+    setp.gt.u64 %p11, %rd29, %rd40;
+    @%p11 mov.u64 %rd40, %rd29;
+HISTORYDONE:
+
+    setp.gt.u64 %p4, %rd27, %rd12;
     @%p4 bra ADVANCE;
-CBOK:
-    setp.eq.u64 %p5, %rd18, 0;
-    @%p5 bra VISHIT;
-    mul.wide.u32 %rd26, %r18, 8;
-    add.u64 %rd27, %rd18, %rd26;
-    ld.global.u64 %rd28, [%rd27];
-    setp.le.u64 %p6, %rd28, %rd11;
+    setp.le.u64 %p6, %rd29, %rd12;
     @%p6 bra ADVANCE;
 VISHIT:
     setp.ne.u32 %p7, %r8, 0;
     @%p7 bra VCOUNT;
     mov.u32 %r9, %r11;
     mov.u32 %r10, %r18;
+    setp.eq.u64 %p9, %rd20, 0;
+    @%p9 bra VCOUNT;
+    mul.wide.u32 %rd31, %r18, 8;
+    add.u64 %rd32, %rd20, %rd31;
+    ld.global.u64 %rd30, [%rd32];
 VCOUNT:
     add.u32 %r8, %r8, 1;
     bra ADVANCE;
@@ -238,13 +274,18 @@ NEXTSHARD:
     bra SHARD;
 
 WRITEOUT:
-    mul.wide.u32 %rd29, %r6, 4;
-    add.u64 %rd30, %rd4, %rd29;
-    st.global.u32 [%rd30], %r9;
-    add.u64 %rd31, %rd5, %rd29;
-    st.global.u32 [%rd31], %r10;
-    add.u64 %rd7, %rd6, %rd29;
-    st.global.u32 [%rd7], %r8;
+    mul.wide.u32 %rd33, %r6, 4;
+    add.u64 %rd34, %rd4, %rd33;
+    st.global.u32 [%rd34], %r9;
+    add.u64 %rd35, %rd5, %rd33;
+    st.global.u32 [%rd35], %r10;
+    add.u64 %rd36, %rd6, %rd33;
+    st.global.u32 [%rd36], %r8;
+    mul.wide.u32 %rd37, %r6, 8;
+    add.u64 %rd38, %rd7, %rd37;
+    st.global.u64 [%rd38], %rd30;
+    add.u64 %rd41, %rd39, %rd37;
+    st.global.u64 [%rd41], %rd40;
 
 DONE:
     ret;
@@ -673,7 +714,7 @@ impl CudaResidentDeviceMemory {
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(shards.len()))?;
         let needle_count_u32 = u32::try_from(needles.len())
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
-        const DESC_U64_PER_SHARD: usize = 5; // index, geometry, created, deleted, row_count
+        const DESC_U64_PER_SHARD: usize = 6; // index, geometry, created, deleted, identity, row_count
         let desc_capacity = shards
             .len()
             .checked_mul(DESC_U64_PER_SHARD)
@@ -693,9 +734,13 @@ impl CudaResidentDeviceMemory {
                 shard.table_mask,
                 shard.hash_shift,
             )?;
-            for region in [shard.created_by.as_ref(), shard.deleted_by.as_ref()]
-                .into_iter()
-                .flatten()
+            for region in [
+                shard.created_by.as_ref(),
+                shard.deleted_by.as_ref(),
+                shard.row_id.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
             {
                 if !Arc::ptr_eq(&primary, &region.primary_arc()) {
                     return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
@@ -716,12 +761,22 @@ impl CudaResidentDeviceMemory {
                     .as_ref()
                     .map_or(0, |region| region.device_ptr()),
             );
+            desc.push(
+                shard
+                    .row_id
+                    .as_ref()
+                    .map_or(0, |region| region.device_ptr()),
+            );
             desc.push(u64::from(shard.row_count));
             index_guards.push(Arc::clone(&shard.index));
         }
         let out_bytes = needles
             .len()
             .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let row_id_out_bytes = needles
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let needle_bytes = std::mem::size_of_val(needles);
         let snapshot_bytes = std::mem::size_of_val(snapshots);
@@ -761,6 +816,8 @@ impl CudaResidentDeviceMemory {
         let shard_out_guard = primary.lease_device_buffer_owned(out_bytes)?;
         let slot_out_guard = primary.lease_device_buffer_owned(out_bytes)?;
         let count_guard = primary.lease_device_buffer_owned(out_bytes)?;
+        let row_id_out_guard = primary.lease_device_buffer_owned(row_id_out_bytes)?;
+        let latest_write_out_guard = primary.lease_device_buffer_owned(row_id_out_bytes)?;
 
         let mut ptx = Vec::with_capacity(VISIBLE_LOCATE_PTX.len() + 1);
         ptx.extend_from_slice(VISIBLE_LOCATE_PTX);
@@ -794,6 +851,8 @@ impl CudaResidentDeviceMemory {
         let mut shard_out_arg = shard_out_guard.ptr;
         let mut slot_out_arg = slot_out_guard.ptr;
         let mut count_arg = count_guard.ptr;
+        let mut row_id_out_arg = row_id_out_guard.ptr;
+        let mut latest_write_out_arg = latest_write_out_guard.ptr;
         let mut args = [
             (&mut desc_arg as *mut u64).cast::<c_void>(),
             (&mut shard_count_arg as *mut u32).cast::<c_void>(),
@@ -803,6 +862,8 @@ impl CudaResidentDeviceMemory {
             (&mut shard_out_arg as *mut u64).cast::<c_void>(),
             (&mut slot_out_arg as *mut u64).cast::<c_void>(),
             (&mut count_arg as *mut u64).cast::<c_void>(),
+            (&mut row_id_out_arg as *mut u64).cast::<c_void>(),
+            (&mut latest_write_out_arg as *mut u64).cast::<c_void>(),
         ];
         let threads_per_block: u32 = 128;
         let blocks = needle_count_u32.div_ceil(threads_per_block);
@@ -828,6 +889,8 @@ impl CudaResidentDeviceMemory {
         let mut shard_idx = vec![0u32; needles.len()];
         let mut slot = vec![0u32; needles.len()];
         let mut count = vec![0u32; needles.len()];
+        let mut row_id = vec![u64::MAX; needles.len()];
+        let mut latest_write = vec![0u64; needles.len()];
         check_cuda(unsafe {
             cu_memcpy_dtoh(
                 shard_idx.as_mut_ptr().cast::<c_void>(),
@@ -849,6 +912,20 @@ impl CudaResidentDeviceMemory {
                 out_bytes,
             )
         })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                row_id.as_mut_ptr().cast::<c_void>(),
+                row_id_out_guard.ptr,
+                row_id_out_bytes,
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                latest_write.as_mut_ptr().cast::<c_void>(),
+                latest_write_out_guard.ptr,
+                row_id_out_bytes,
+            )
+        })?;
         if count.contains(&INVALID_COUNT) {
             return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
         }
@@ -858,6 +935,8 @@ impl CudaResidentDeviceMemory {
             shard_idx,
             slot,
             count,
+            row_id,
+            latest_write,
         })
     }
 }

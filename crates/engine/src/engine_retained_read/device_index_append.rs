@@ -7,7 +7,7 @@ impl Engine {
     /// every wave (the measured 305us/wave bottleneck). Device analog of the host
     /// `extend_shard_pk_index_cache_on_append`. Called at the append chokepoint with the appended
     /// values in hand (no DtoH). Per entry: a different ptr (re-admit) or a basis != `base_row_count`
-    /// (a prober rebuilt) is skipped; a DECLINED entry stays declined (monotone); a dup/overflow ->
+    /// (a prober rebuilt) is skipped; a DECLINED entry stays declined (monotone); probe overflow ->
     /// DECLINED; past the load rule (`2*new_count > table_size`) the entry is DROPPED (the next probe
     /// rebuilds at the grown size).
     pub(crate) fn extend_shard_pk_device_index_on_append(
@@ -17,11 +17,13 @@ impl Engine {
         device_ptr: u64,
         base_row_count: usize,
         column_values: &[Vec<i32>],
-        // COMPOUND KEYS (wider types): the appended rows' full SqlValues, so a compound index's tail
-        // fingerprint can fold WIDER key columns (i64) whose values are not in the i32 `column_values`.
+        // The appended rows' full SqlValues, so a fingerprint tail can fold wider/text key columns
+        // whose values are absent from the i32 `column_values`.
         new_rows: &[Vec<SqlValue>],
     ) {
-        let appended = column_values.first().map_or(0, Vec::len);
+        // A table may contain no i32-section column at all (for example `k TEXT PRIMARY KEY`), so
+        // `column_values` is not an authoritative row-count source for fingerprint maintenance.
+        let appended = new_rows.len();
         if appended == 0 {
             return;
         }
@@ -37,14 +39,13 @@ impl Engine {
                 tail,
             );
         }
-        // COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): each compound unique index's cache entry is keyed
-        // by `FLAG | ordinal`, and its appended tail is the per-row FINGERPRINT folded from the key
-        // columns' appended values. Only compound indexes need this second pass (single-column keys
-        // rode the loop above); resolved from the catalog (rare relative to the append itself).
+        // Fingerprint-backed unique indexes (compound plus single wider/text) are keyed by
+        // `FLAG | ordinal`; their appended tails fold the typed key values into per-row fingerprints.
+        // Raw single-i32 indexes rode the loop above; catalog resolution is rare relative to append.
         let catalog = self.catalog_snapshot();
         if let Some(table) = catalog.relational_catalog.get(table_name) {
             for (ord, index) in table.indexes.iter().enumerate() {
-                if !index.unique || !crate::engine_residency::index_is_compound(index) {
+                if !index.unique || !crate::engine_residency::index_uses_fingerprint(table, index) {
                     continue;
                 }
                 // Fold each appended row's key TUPLE into its fingerprint from the full SqlValues
@@ -66,7 +67,10 @@ impl Engine {
                 if !foldable {
                     continue;
                 }
-                let key_id = crate::engine_residency::COMPOUND_KEY_ID_FLAG | ord;
+                let Some(key_id) = crate::engine_residency::index_probe_key_id(table, index, ord)
+                else {
+                    continue;
+                };
                 self.extend_shard_pk_device_index_entry(
                     (table_name.to_string(), shard_id, key_id),
                     device_ptr,
@@ -80,8 +84,8 @@ impl Engine {
 
     /// M1 (ledger #24): maintain ONE cached device PK-index entry over an append — insert the k
     /// appended keys/fingerprints (`tail`) via the `index_insert` kernel. Shared by the single-column
-    /// and compound passes of `extend_shard_pk_device_index_on_append` (`tail` is a column's raw
-    /// values or the folded compound fingerprints; the device index treats both as opaque keys).
+    /// and fingerprint passes of `extend_shard_pk_device_index_on_append` (`tail` is a column's raw
+    /// values or folded typed fingerprints; the device index treats both as opaque keys).
     fn extend_shard_pk_device_index_entry(
         &self,
         key: (String, u32, usize),

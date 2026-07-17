@@ -1282,12 +1282,310 @@ fn commit_and_rollback_require_active_transaction_context() {
 }
 
 #[test]
+fn active_engine_transaction_rejects_unsupported_autocommit_commands() {
+    let e = Engine::new_local();
+    e.execute_text(41, "BEGIN").unwrap();
+
+    let err = e
+        .execute_text(41, "CREATE TABLE escaped_commit (id INT)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not supported inside an active transaction"),
+        "{err}"
+    );
+    assert!(
+        e.relational_catalog_table("escaped_commit").is_none(),
+        "unsupported transaction commands must not autocommit"
+    );
+    e.execute_text(41, "ROLLBACK").unwrap();
+}
+
+#[test]
+fn enqueue_active_transaction_rejects_unsupported_autocommit_commands() {
+    let mut e = Engine::new_local_cpu_oracle();
+    let now = Instant::now();
+    e.enqueue_set_text(41, "BEGIN", now).unwrap();
+
+    let err = e
+        .enqueue_set_text(41, "CREATE TABLE escaped_enqueue (id INT)", now)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not supported inside an active transaction"),
+        "{err}"
+    );
+    assert!(e.relational_catalog_table("escaped_enqueue").is_none());
+    assert!(e.transaction_snapshot_handle(41).is_some());
+    e.enqueue_set_text(41, "ROLLBACK", now).unwrap();
+    assert!(e.transaction_snapshot_handle(41).is_none());
+}
+
+#[test]
+fn explicit_transaction_snapshot_lives_from_begin_through_terminal_control() {
+    let e = Engine::new_local_cpu_oracle();
+
+    e.execute_text(1, "SET acct:1=open").unwrap();
+    assert_eq!(e.committed_seq(), 1);
+    e.execute_text(90, "BEGIN").unwrap();
+    {
+        let active = e
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(active.transaction_snapshot(90), Some(1));
+        assert_eq!(active.oldest(), Some(1));
+    }
+
+    // A later autocommit advances the visible boundary, but the transaction keeps exactly the
+    // snapshot captured by BEGIN and therefore keeps the GC/ledger floor at commit sequence 1.
+    e.execute_text(2, "SET acct:1=closed").unwrap();
+    assert_eq!(e.committed_seq(), 2);
+    {
+        let active = e
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(active.transaction_snapshot(90), Some(1));
+        assert_eq!(active.oldest(), Some(1));
+    }
+    let vacuum_err = e.checkpoint_vacuum_mvcc_versions(1).unwrap_err();
+    assert!(
+        vacuum_err
+            .to_string()
+            .contains("crosses active read snapshot 1"),
+        "got: {vacuum_err}"
+    );
+
+    e.execute_text(90, "ROLLBACK").unwrap();
+    let active = e
+        .active_snapshots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(active.transaction_snapshot(90), None);
+    assert_eq!(active.oldest(), None);
+}
+
+#[test]
+fn explicit_transaction_select_reads_captured_catalog_and_table_generation() {
+    let e = Engine::new_local_cpu_oracle();
+    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+        .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+
+    // The table had no data cell at BEGIN. A later first write publishes one, but the transaction's
+    // generation bundle deliberately records the table as empty rather than loading that newer cell
+    // on first touch.
+    e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 200)")
+        .unwrap();
+    let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let old = e
+        .execute_relational_select_in_transaction(90, &select)
+        .unwrap();
+    assert!(
+        old.rows.is_empty(),
+        "a first touch must not load a post-BEGIN table generation"
+    );
+
+    let current = e.execute_relational_select(&select).unwrap();
+    assert_eq!(current.rows.row(0)[0], SqlValue::Int4(200));
+    e.execute_text(90, "ROLLBACK").unwrap();
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn explicit_transaction_dml_prepare_and_conflict_check_use_begin_generation() {
+    let e = Engine::new_local();
+    e.set_host_install_elision_enabled(false);
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+        .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+
+    // A later writer replaces the row after BEGIN and publishes a newer device identity/version
+    // stamp.
+    e.execute_dml_concurrent(3, "UPDATE accounts SET balance = 200 WHERE id = 1")
+        .unwrap();
+
+    // The retained generation still contains balance=100. Resolving this predicate against current
+    // rows would find zero targets. Successful staging and private read-your-writes therefore prove
+    // predicate preparation used BEGIN's generation; COMMIT must reject the stale device stamp.
+    e.execute_dml_concurrent(
+        90,
+        "UPDATE accounts SET balance = 300 WHERE id = 1 AND balance = 100",
+    )
+    .unwrap();
+
+    let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(select) => select,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let old = e
+        .execute_relational_select_in_transaction(90, &select)
+        .unwrap();
+    assert_eq!(old.rows.row(0)[0], SqlValue::Int4(300));
+    let current = e.execute_relational_select(&select).unwrap();
+    assert_eq!(current.rows.row(0)[0], SqlValue::Int4(200));
+
+    let err = e.execute_text(90, "COMMIT").unwrap_err();
+    assert!(
+        matches!(&err, ExecuteError::Serialization(message) if message.contains("device write-write conflict")),
+        "expected current-generation device write conflict, got {err:?}"
+    );
+    e.execute_text(90, "ROLLBACK").unwrap();
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn explicit_transaction_unique_validation_uses_current_device_generation() {
+    let e = Engine::new_local();
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (id INT PRIMARY KEY, tenant_key INT UNIQUE)",
+    )
+    .unwrap();
+    e.execute_text(2, "INSERT INTO accounts (id, tenant_key) VALUES (1, 10)")
+        .unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+
+    e.execute_dml_concurrent(3, "INSERT INTO accounts (id, tenant_key) VALUES (2, 20)")
+        .unwrap();
+    e.execute_dml_concurrent(90, "INSERT INTO accounts (id, tenant_key) VALUES (3, 20)")
+        .unwrap();
+    let err = e.execute_text(90, "COMMIT").unwrap_err();
+    assert!(
+        matches!(&err, ExecuteError::Serialization(message) if message.contains("device unique conflict")),
+        "BEGIN-generation validation must not see the later row, while COMMIT must arbitrate the \
+         final unique value against the current device generation; got {err:?}"
+    );
+
+    let old = match parse_command("SELECT id FROM accounts WHERE tenant_key = 20").unwrap() {
+        Command::Select(select) => e
+            .execute_relational_select_in_transaction(90, &select)
+            .unwrap(),
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(old.rows.row(0)[0], SqlValue::Int4(3));
+    e.execute_text(90, "ROLLBACK").unwrap();
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn explicit_transaction_unique_key_away_history_uses_device_stamps() {
+    let e = Engine::new_local();
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.set_host_install_elision_enabled(true);
+    e.set_constrained_elision_enabled(true);
+    e.set_dml_device_resolve_enabled(true);
+    e.set_device_write_locate_enabled(true);
+    e.set_device_write_locate_wave_batch_enabled(true);
+    e.set_resident_delete_tombstone_enabled(true);
+    e.set_resident_update_tombstone_enabled(true);
+    e.execute_text(
+        1,
+        "CREATE TABLE history_accounts (id INT PRIMARY KEY, tenant_key INT UNIQUE)",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO history_accounts (id, tenant_key) VALUES (1, 10)",
+    )
+    .unwrap();
+    for i in 0..512_i32 {
+        e.execute_dml_concurrent(
+            10_000 + i as u64,
+            &format!(
+                "INSERT INTO history_accounts (id, tenant_key) VALUES ({}, {})",
+                1000 + i,
+                1000 + i
+            ),
+        )
+        .unwrap();
+        if e.table_install_elided("history_accounts") {
+            break;
+        }
+    }
+    assert!(e.table_install_elided("history_accounts"));
+    e.execute_text(190, "BEGIN").unwrap();
+    e.execute_dml_concurrent(
+        190,
+        "INSERT INTO history_accounts (id, tenant_key) VALUES (3, 30)",
+    )
+    .unwrap();
+
+    e.execute_dml_concurrent(
+        191,
+        "INSERT INTO history_accounts (id, tenant_key) VALUES (4, 30)",
+    )
+    .unwrap();
+    e.execute_dml_concurrent(192, "DELETE FROM history_accounts WHERE id = 4")
+        .unwrap();
+
+    // Force the dense-rebuild path while the stale writer is still registered. VACUUM must keep
+    // the churn/history generation intact; resetting the counter proves a rebuild actually ran.
+    // Sabotage control: removing the oldest-active fence resets this to zero and the stale COMMIT
+    // below loses the key-away stamp.
+    let churn_before_vacuum = e.tombstone_churn("history_accounts");
+    assert!(churn_before_vacuum > 0, "external DELETE created history");
+    e.vacuum_table("history_accounts").unwrap();
+    assert_eq!(
+        e.tombstone_churn("history_accounts"),
+        churn_before_vacuum,
+        "an older active writer must defer current-only dense VACUUM"
+    );
+
+    // Ordinary admission is allowed to rebuild the current live image while an old writer is
+    // active, but that rebuilt generation must carry a history floor. Force the exact
+    // claim+release-loss counterexample: the rebuild drops row 4's deleted physical version, so
+    // COMMIT must decline the now-incomplete device miss rather than interpret it as no conflict.
+    let tables = std::iter::once("history_accounts".to_string()).collect();
+    e.auto_admit_resident_tables(&tables);
+    assert_eq!(
+        e.tombstone_churn("history_accounts"),
+        0,
+        "non-vacuity: ordinary admission performed the current-only rebuild"
+    );
+
+    let err = e.execute_text(190, "COMMIT").unwrap_err();
+    assert!(
+        matches!(&err, ExecuteError::Serialization(message)
+            if message.contains("device unique-history verdict unavailable")),
+        "a current-only rebuild newer than BEGIN must make a history miss fail closed, got {err:?}"
+    );
+    e.execute_text(190, "ROLLBACK").unwrap();
+    let rows = e
+        .execute_relational_select_text(
+            "SELECT id, tenant_key FROM history_accounts WHERE id >= 3 AND id <= 4 ORDER BY id",
+        )
+        .unwrap()
+        .rows;
+    assert!(rows.is_empty());
+}
+
+#[test]
 fn and_chain_forms_reopen_transaction_context() {
     let e = Engine::new_local_cpu_oracle();
 
     e.execute_text(21, "BEGIN").unwrap();
     e.execute_text(21, "COMMIT AND CHAIN").unwrap();
     assert_eq!(e.active_txn_count(), 1);
+    {
+        let active = e
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(active.transaction_snapshot(21), None);
+        assert_eq!(active.transaction_snapshot(22), Some(0));
+    }
     e.execute_text(22, "COMMIT").unwrap();
     assert_eq!(e.active_txn_count(), 0);
 

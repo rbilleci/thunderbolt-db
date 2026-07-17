@@ -19,7 +19,7 @@ type AppliedUpdate = (
     Vec<Vec<SqlValue>>,
     Option<Vec<u64>>,
     WriteSet,
-    Option<u64>,
+    Option<(Vec<u64>, u64)>,
 );
 
 mod preflight;
@@ -460,7 +460,15 @@ impl Engine {
                         .collect(),
                     row_ids,
                     delta.write_set.clone(),
-                    *class_epoch,
+                    class_epoch.map(|epoch| {
+                        (
+                            installs
+                                .iter()
+                                .map(|(coordinate, _, _)| *coordinate)
+                                .collect(),
+                            epoch,
+                        )
+                    }),
                 ))
             }
             _ => None,
@@ -524,7 +532,33 @@ impl Engine {
         text: &str,
         now: Instant,
     ) -> Result<(), ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         let cmd = parse_command(text)?;
+        if self.transaction_snapshot_handle(txn_id).is_some() {
+            match &cmd {
+                Command::Insert(_) | Command::Update(_) | Command::Delete(_) => {
+                    return self.execute_dml_in_transaction(txn_id, text);
+                }
+                Command::Commit { chain } => {
+                    self.commit_explicit_transaction(txn_id, *chain)?;
+                    self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+                    return Ok(());
+                }
+                Command::Rollback { chain } => {
+                    self.rollback_explicit_transaction(txn_id, *chain)?;
+                    self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+                    return Ok(());
+                }
+                Command::Begin => {}
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "command is not supported inside an active transaction; it was not executed"
+                            .to_string(),
+                    )));
+                }
+            }
+        }
         match cmd {
             Command::SetKv { .. }
             | Command::DeleteKv { .. }
@@ -656,21 +690,15 @@ impl Engine {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Begin => {
-                self.commit_state_mut().txn_manager.begin_with_id(txn_id)?;
+                self.begin_transaction_context(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Commit { chain } => {
-                self.commit_state_mut().txn_manager.commit(txn_id)?;
-                if chain {
-                    self.commit_state_mut().txn_manager.begin()?;
-                }
+                self.finish_transaction_context(txn_id, true, chain)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Rollback { chain } => {
-                self.commit_state_mut().txn_manager.rollback(txn_id)?;
-                if chain {
-                    self.commit_state_mut().txn_manager.begin()?;
-                }
+                self.finish_transaction_context(txn_id, false, chain)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::GetKv { key } => {

@@ -145,9 +145,17 @@ impl Engine {
             return Some(Vec::new());
         }
         let shards = self.read_state.residency.shards.load();
-        let table_shards = shards.get(&table.name)?;
+        let Some(table_shards) = shards.get(&table.name) else {
+            return self
+                .zero_row_resident_generation_boundary(table)
+                .is_some()
+                .then(|| vec![0u32; needles.len()]);
+        };
         if table_shards.is_empty() {
-            return None;
+            return self
+                .zero_row_resident_generation_boundary(table)
+                .is_some()
+                .then(|| vec![0u32; needles.len()]);
         }
         let runtime_snapshot = self.router.runtime().snapshot();
         let mut descs: Vec<WriteLocateShard> = Vec::new();
@@ -309,30 +317,33 @@ impl Engine {
                     },
                     shard.row_count,
                 )?;
-            let (bound_memory, created_by, deleted_by) = if index_row_count == shard.row_count {
-                (
-                    Arc::clone(&device_memory),
-                    shard.created_by_region.clone(),
-                    shard.deleted_by_region.clone(),
-                )
-            } else {
-                // The index cache intentionally accepts a newer in-place extension. Rebind the
-                // visibility owners to that exact published row extent before device dereference.
-                let current = self.read_state.residency.shards.load();
-                let live = current.get(&table.name)?.iter().find(|candidate| {
-                    candidate.shard_id == shard.shard_id
-                        && candidate.row_count == index_row_count
-                        && candidate
-                            .device_memory
-                            .as_ref()
-                            .is_some_and(|memory| Arc::ptr_eq(memory, &device_memory))
-                })?;
-                (
-                    live.device_memory.clone()?,
-                    live.created_by_region.clone(),
-                    live.deleted_by_region.clone(),
-                )
-            };
+            let (bound_memory, created_by, deleted_by, row_id) =
+                if index_row_count == shard.row_count {
+                    (
+                        Arc::clone(&device_memory),
+                        shard.created_by_region.clone(),
+                        shard.deleted_by_region.clone(),
+                        shard.row_id_region.clone(),
+                    )
+                } else {
+                    // The index cache intentionally accepts a newer in-place extension. Rebind the
+                    // visibility owners to that exact published row extent before device dereference.
+                    let current = self.read_state.residency.shards.load();
+                    let live = current.get(&table.name)?.iter().find(|candidate| {
+                        candidate.shard_id == shard.shard_id
+                            && candidate.row_count == index_row_count
+                            && candidate
+                                .device_memory
+                                .as_ref()
+                                .is_some_and(|memory| Arc::ptr_eq(memory, &device_memory))
+                    })?;
+                    (
+                        live.device_memory.clone()?,
+                        live.created_by_region.clone(),
+                        live.deleted_by_region.clone(),
+                        live.row_id_region.clone(),
+                    )
+                };
             descs.push(VisibleLocateShard {
                 index: device_index,
                 table_mask,
@@ -340,6 +351,7 @@ impl Engine {
                 row_count: u32::try_from(index_row_count).ok()?,
                 created_by,
                 deleted_by,
+                row_id,
             });
             probed.push((shard.shard_id, bound_memory));
         }
@@ -349,6 +361,8 @@ impl Engine {
                 counts: vec![0u32; needles.len()],
                 shard_ids: vec![0u32; needles.len()],
                 slots: vec![0u32; needles.len()],
+                row_ids: vec![u64::MAX; needles.len()],
+                latest_write: vec![0u64; needles.len()],
                 probed: Vec::new(),
             });
         }
@@ -356,7 +370,12 @@ impl Engine {
         let result = ctx
             .submit_multi_shard_i32_visible_locate(&descs, needles, snapshots)
             .ok()?;
-        if result.count.len() != needles.len() {
+        if result.count.len() != needles.len()
+            || result.shard_idx.len() != needles.len()
+            || result.slot.len() != needles.len()
+            || result.row_id.len() != needles.len()
+            || result.latest_write.len() != needles.len()
+        {
             return None;
         }
         self.read_state
@@ -377,6 +396,8 @@ impl Engine {
             counts: result.count,
             shard_ids,
             slots: result.slot,
+            row_ids: result.row_id,
+            latest_write: result.latest_write,
             probed,
         })
     }

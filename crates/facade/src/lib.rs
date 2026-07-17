@@ -23,8 +23,10 @@
 //!   across the boundary (roadmap §9.2).
 //! - `rows_affected` is `None` for DML: the engine's `execute_text` does not yet
 //!   return an affected-row count. Surfacing that is a tracked follow-up.
-//! - Transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) updates session state but
-//!   does not yet drive real MVCC isolation — that is Phase 1 (P1-M3).
+//! - Transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) owns one engine transaction identity and one
+//!   generation-owned read snapshot for the session lifetime. SELECT consumes that retained catalog,
+//!   MVCC, and GPU-residency generation. DML stages into a transaction-private GPU generation;
+//!   COMMIT publishes its resolved row mutations through one durable record and one commit index.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -148,7 +150,7 @@ pub struct DbError {
 pub struct SessionId(pub u64);
 
 struct SessionState {
-    in_transaction: bool,
+    active_txn_id: Option<u64>,
 }
 
 /// The protocol-neutral entry point to the engine.
@@ -177,7 +179,7 @@ impl EngineFacade {
         self.sessions.insert(
             id,
             SessionState {
-                in_transaction: false,
+                active_txn_id: None,
             },
         );
         SessionId(id)
@@ -185,21 +187,25 @@ impl EngineFacade {
 
     /// Close a session. Unknown ids are ignored.
     pub fn close_session(&mut self, session: SessionId) {
-        self.sessions.remove(&session.0);
+        if let Some(state) = self.sessions.remove(&session.0) {
+            if let Some(txn_id) = state.active_txn_id {
+                // Connection/session teardown is an abort boundary. The transaction-control path
+                // releases both TxnManager state and the transaction-held active snapshot.
+                let _ = self.engine.execute_text(txn_id, "ROLLBACK");
+            }
+        }
     }
 
     /// Whether the session currently believes it is inside a transaction.
     pub fn session_in_transaction(&self, session: SessionId) -> bool {
         self.sessions
             .get(&session.0)
-            .map(|state| state.in_transaction)
-            .unwrap_or(false)
+            .is_some_and(|state| state.active_txn_id.is_some())
     }
 
-    // A per-statement monotonic id handed to the engine's `execute_text`. It is a
-    // placeholder, NOT a transaction handle: `BEGIN/INSERT/INSERT/COMMIT` get
-    // several unrelated ids today (real MVCC transaction identity arrives in
-    // P1-M3). Allocated per `execute` call; only the write path actually uses it.
+    // A monotonic durable identity. Explicit transaction control keeps one id from BEGIN through
+    // COMMIT/ROLLBACK; its SELECT and DML use that held identity, while autocommit statements each
+    // receive a fresh identity.
     fn take_txn_id(&mut self) -> u64 {
         let id = self.next_txn_id;
         self.next_txn_id += 1;
@@ -217,23 +223,68 @@ impl EngineFacade {
             });
         }
 
-        let txn_id = self.take_txn_id();
-        let outcome = execute_on_engine(&mut self.engine, txn_id, sql)?;
-        if let QueryOutcome::Command { tag, .. } = &outcome {
-            match tag {
-                CommandTag::Begin => self.set_in_transaction(session, true),
-                CommandTag::Commit | CommandTag::Rollback => {
-                    self.set_in_transaction(session, false)
+        let active_txn_id = self
+            .sessions
+            .get(&session.0)
+            .and_then(|state| state.active_txn_id);
+        match parse_command(sql) {
+            Ok(Command::Begin) => {
+                // Preserve the façade's existing idempotent BEGIN-in-BEGIN behavior (the neutral
+                // result type has no warning channel), while avoiding a duplicate registry entry.
+                if active_txn_id.is_none() {
+                    let txn_id = self.take_txn_id();
+                    self.engine
+                        .execute_text(txn_id, sql)
+                        .map_err(map_execute_error)?;
+                    self.set_active_txn_id(session, Some(txn_id));
                 }
-                _ => {}
+                return Ok(QueryOutcome::Command {
+                    tag: CommandTag::Begin,
+                    rows_affected: None,
+                });
             }
+            Ok(Command::Commit { chain }) => {
+                if let Some(txn_id) = active_txn_id {
+                    let successor = self
+                        .engine
+                        .commit_explicit_transaction(txn_id, chain)
+                        .map_err(map_execute_error)?;
+                    if let Some(next_txn_id) = successor {
+                        self.next_txn_id = self.next_txn_id.max(next_txn_id.saturating_add(1));
+                    }
+                    self.set_active_txn_id(session, successor);
+                }
+                return Ok(QueryOutcome::Command {
+                    tag: CommandTag::Commit,
+                    rows_affected: None,
+                });
+            }
+            Ok(Command::Rollback { chain }) => {
+                if let Some(txn_id) = active_txn_id {
+                    let successor = self
+                        .engine
+                        .rollback_explicit_transaction(txn_id, chain)
+                        .map_err(map_execute_error)?;
+                    if let Some(next_txn_id) = successor {
+                        self.next_txn_id = self.next_txn_id.max(next_txn_id.saturating_add(1));
+                    }
+                    self.set_active_txn_id(session, successor);
+                }
+                return Ok(QueryOutcome::Command {
+                    tag: CommandTag::Rollback,
+                    rows_affected: None,
+                });
+            }
+            _ => {}
         }
-        Ok(outcome)
+
+        let statement_txn_id = self.take_txn_id();
+        execute_on_engine_with_transaction(&mut self.engine, statement_txn_id, active_txn_id, sql)
     }
 
-    fn set_in_transaction(&mut self, session: SessionId, value: bool) {
+    fn set_active_txn_id(&mut self, session: SessionId, txn_id: Option<u64>) {
         if let Some(state) = self.sessions.get_mut(&session.0) {
-            state.in_transaction = value;
+            state.active_txn_id = txn_id;
         }
     }
 }
@@ -258,6 +309,15 @@ pub fn execute_on_engine(
     txn_id: u64,
     sql: &str,
 ) -> Result<QueryOutcome, DbError> {
+    execute_on_engine_with_transaction(engine, txn_id, None, sql)
+}
+
+fn execute_on_engine_with_transaction(
+    engine: &mut Engine,
+    statement_txn_id: u64,
+    read_txn_id: Option<u64>,
+    sql: &str,
+) -> Result<QueryOutcome, DbError> {
     let command = match parse_command(sql) {
         Ok(command) => command,
         // An empty statement is not an error in the wire protocol — surface it as
@@ -267,9 +327,11 @@ pub fn execute_on_engine(
     };
     match command {
         Command::Select(select) => {
-            let result = engine
-                .execute_relational_select(&select)
-                .map_err(map_execute_error)?;
+            let result = match read_txn_id {
+                Some(txn_id) => engine.execute_relational_select_in_transaction(txn_id, &select),
+                None => engine.execute_relational_select(&select),
+            }
+            .map_err(map_execute_error)?;
             let columns = result.columns.iter().map(map_column).collect();
             let rows = result
                 .rows
@@ -292,9 +354,26 @@ pub fn execute_on_engine(
         }),
         other => {
             let tag = command_tag(&other);
-            engine
-                .execute_text(txn_id, sql)
-                .map_err(map_execute_error)?;
+            if let Some(txn_id) = read_txn_id {
+                if matches!(
+                    other,
+                    Command::Insert(_) | Command::Update(_) | Command::Delete(_)
+                ) {
+                    engine
+                        .execute_dml_in_transaction(txn_id, sql)
+                        .map_err(map_execute_error)?;
+                } else {
+                    return Err(DbError {
+                        category: ErrorCategory::Unsupported,
+                        message: "command is not supported inside an active transaction; it was not executed"
+                            .to_string(),
+                    });
+                }
+            } else {
+                engine
+                    .execute_text(statement_txn_id, sql)
+                    .map_err(map_execute_error)?;
+            }
             Ok(QueryOutcome::Command {
                 tag,
                 rows_affected: None,
@@ -314,6 +393,20 @@ pub fn execute_on_engine(
 pub struct SharedEngine {
     engine: Arc<Engine>,
     next_txn_id: AtomicU64,
+}
+
+/// Per-client transaction ownership for the lock-free shared-engine façade. The value is cheap,
+/// connection-local, and `Send`; the engine keeps the authoritative transaction state and the
+/// keyed snapshot hold. It deliberately contains no relational data or CPU execution state.
+#[derive(Debug, Default)]
+pub struct SharedSession {
+    active_txn_id: Option<u64>,
+}
+
+impl SharedSession {
+    pub fn in_transaction(&self) -> bool {
+        self.active_txn_id.is_some()
+    }
 }
 
 /// Protocol-neutral non-vacuity counters for mixed GPU-native workloads. These are monotonic
@@ -347,6 +440,24 @@ impl SharedEngine {
             engine: Arc::new(engine),
             next_txn_id: AtomicU64::new(1),
         }
+    }
+
+    /// Open a connection/request session for transaction ownership. Session identity is local to
+    /// the façade; an engine transaction identity is allocated only when the client sends BEGIN.
+    pub fn open_session(&self) -> SharedSession {
+        SharedSession::default()
+    }
+
+    /// Close a shared session, rolling back any still-active transaction so its engine state and
+    /// transaction-held snapshot cannot outlive a disconnected client.
+    pub fn close_session(&self, session: &mut SharedSession) {
+        if let Some(txn_id) = session.active_txn_id.take() {
+            let _ = self.engine.execute_text(txn_id, "ROLLBACK");
+        }
+    }
+
+    fn take_txn_id(&self) -> u64 {
+        self.next_txn_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// A shared façade over a **crash-durable** engine: opens (recovering) or creates the WAL
@@ -489,7 +600,7 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
         }),
         other => {
             let tag = command_tag(&other);
-            let txn_id = shared.next_txn_id.fetch_add(1, Ordering::Relaxed);
+            let txn_id = shared.take_txn_id();
             // Probe whether this statement is concurrent-eligible DML; if so, the engine's `&self`
             // concurrent-DML path (off-lock prepare + short commit_mutex) overlaps other writers and
             // never blocks readers.
@@ -519,6 +630,133 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
                 rows_affected: None,
             })
         }
+    }
+}
+
+/// Whether a SQL statement is transaction control and therefore must run through a connection's
+/// [`SharedSession`] even while that session is currently idle. Servers use this to keep BEGIN off
+/// the stateless/batched dispatch path without duplicating SQL prefix heuristics.
+pub fn is_transaction_control(sql: &str) -> bool {
+    matches!(
+        parse_command(sql),
+        Ok(Command::Begin | Command::Commit { .. } | Command::Rollback { .. })
+    )
+}
+
+/// Execute through the concurrent shared engine while preserving one transaction owner per client
+/// session. Transaction control drives the engine's keyed snapshot lifecycle; SELECT executes on
+/// that retained generation, while DML stages into a transaction-private GPU generation and COMMIT
+/// publishes the resolved mutations atomically.
+pub fn execute_on_shared_engine_session(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    sql: &str,
+) -> Result<QueryOutcome, DbError> {
+    match parse_command(sql) {
+        Ok(Command::Begin) => {
+            if session.active_txn_id.is_none() {
+                if shared.engine.is_commit_path_poisoned() {
+                    return Err(poisoned_engine_error());
+                }
+                let txn_id = shared.take_txn_id();
+                shared
+                    .engine
+                    .execute_text(txn_id, sql)
+                    .map_err(map_execute_error)?;
+                session.active_txn_id = Some(txn_id);
+            }
+            Ok(QueryOutcome::Command {
+                tag: CommandTag::Begin,
+                rows_affected: None,
+            })
+        }
+        Ok(Command::Commit { chain }) => {
+            if let Some(txn_id) = session.active_txn_id {
+                if shared.engine.is_commit_path_poisoned() {
+                    return Err(poisoned_engine_error());
+                }
+                let successor = shared
+                    .engine
+                    .commit_explicit_transaction(txn_id, chain)
+                    .map_err(map_execute_error)?;
+                if let Some(next_txn_id) = successor {
+                    shared
+                        .next_txn_id
+                        .fetch_max(next_txn_id.saturating_add(1), Ordering::Relaxed);
+                }
+                session.active_txn_id = successor;
+            }
+            Ok(QueryOutcome::Command {
+                tag: CommandTag::Commit,
+                rows_affected: None,
+            })
+        }
+        Ok(Command::Rollback { chain }) => {
+            if let Some(txn_id) = session.active_txn_id {
+                if shared.engine.is_commit_path_poisoned() {
+                    return Err(poisoned_engine_error());
+                }
+                let successor = shared
+                    .engine
+                    .rollback_explicit_transaction(txn_id, chain)
+                    .map_err(map_execute_error)?;
+                if let Some(next_txn_id) = successor {
+                    shared
+                        .next_txn_id
+                        .fetch_max(next_txn_id.saturating_add(1), Ordering::Relaxed);
+                }
+                session.active_txn_id = successor;
+            }
+            Ok(QueryOutcome::Command {
+                tag: CommandTag::Rollback,
+                rows_affected: None,
+            })
+        }
+        Ok(Command::Select(select)) if session.active_txn_id.is_some() => {
+            if shared.engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
+            let txn_id = session
+                .active_txn_id
+                .expect("guarded by transaction-active match arm");
+            let result = shared
+                .engine
+                .execute_relational_select_in_transaction(txn_id, &select)
+                .map_err(map_execute_error)?;
+            let columns = result.columns.iter().map(map_column).collect();
+            let rows = result
+                .rows
+                .iter()
+                .map(|row| row.iter().cloned().map(map_value).collect())
+                .collect();
+            Ok(QueryOutcome::Rows { columns, rows })
+        }
+        Ok(Command::Insert(_) | Command::Update(_) | Command::Delete(_))
+            if session.active_txn_id.is_some() =>
+        {
+            if shared.engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
+            let txn_id = session
+                .active_txn_id
+                .expect("guarded by transaction-active match arm");
+            let command = parse_command(sql).expect("matched parsed DML");
+            let tag = command_tag(&command);
+            shared
+                .engine
+                .execute_dml_in_transaction(txn_id, sql)
+                .map_err(map_execute_error)?;
+            Ok(QueryOutcome::Command {
+                tag,
+                rows_affected: None,
+            })
+        }
+        Ok(_) if session.active_txn_id.is_some() => Err(DbError {
+            category: ErrorCategory::Unsupported,
+            message: "command is not supported inside an active transaction; it was not executed"
+                .to_string(),
+        }),
+        _ => execute_on_shared_engine(shared, sql),
     }
 }
 
@@ -957,8 +1195,259 @@ mod tests {
         assert!(!facade.session_in_transaction(session));
         facade.execute(session, "BEGIN").unwrap();
         assert!(facade.session_in_transaction(session));
+        assert_eq!(facade.engine.active_txn_count(), 1);
         facade.execute(session, "COMMIT").unwrap();
         assert!(!facade.session_in_transaction(session));
+        assert_eq!(facade.engine.active_txn_count(), 0);
+    }
+
+    #[test]
+    fn session_close_rolls_back_engine_transaction_context() {
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        facade.execute(session, "BEGIN").unwrap();
+        assert_eq!(facade.engine.active_txn_count(), 1);
+
+        facade.close_session(session);
+
+        assert!(!facade.session_in_transaction(session));
+        assert_eq!(facade.engine.active_txn_count(), 0);
+    }
+
+    #[test]
+    fn session_and_chain_transfers_to_a_known_engine_transaction() {
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        facade.execute(session, "BEGIN").unwrap();
+
+        facade.execute(session, "COMMIT AND CHAIN").unwrap();
+        assert!(facade.session_in_transaction(session));
+        assert_eq!(facade.engine.active_txn_count(), 1);
+
+        facade.execute(session, "ROLLBACK").unwrap();
+        assert!(!facade.session_in_transaction(session));
+        assert_eq!(facade.engine.active_txn_count(), 0);
+    }
+
+    #[test]
+    fn active_transaction_rejects_commands_it_cannot_stage() {
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        facade.execute(session, "BEGIN").unwrap();
+
+        let error = facade
+            .execute(session, "CREATE TABLE must_not_autocommit (id INT)")
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::Unsupported);
+        assert!(facade.session_in_transaction(session));
+
+        facade.execute(session, "ROLLBACK").unwrap();
+        facade
+            .execute(session, "CREATE TABLE must_not_autocommit (id INT)")
+            .unwrap();
+    }
+
+    #[test]
+    fn shared_active_transaction_rejects_commands_it_cannot_stage() {
+        let shared = SharedEngine::new();
+        let mut session = shared.open_session();
+        execute_on_shared_engine_session(&shared, &mut session, "BEGIN").unwrap();
+
+        let error = execute_on_shared_engine_session(
+            &shared,
+            &mut session,
+            "CREATE TABLE must_not_autocommit (id INT)",
+        )
+        .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::Unsupported);
+        assert!(session.in_transaction());
+
+        execute_on_shared_engine_session(&shared, &mut session, "ROLLBACK").unwrap();
+        execute_on_shared_engine(&shared, "CREATE TABLE must_not_autocommit (id INT)").unwrap();
+    }
+
+    #[test]
+    fn shared_session_owns_engine_transaction_and_aborts_on_close() {
+        let shared = SharedEngine::new();
+        let mut session = shared.open_session();
+        assert!(!session.in_transaction());
+
+        execute_on_shared_engine_session(&shared, &mut session, "BEGIN").unwrap();
+        assert!(session.in_transaction());
+        assert_eq!(shared.read_engine().unwrap().active_txn_count(), 1);
+
+        execute_on_shared_engine_session(&shared, &mut session, "COMMIT AND CHAIN").unwrap();
+        assert!(session.in_transaction());
+        assert_eq!(shared.read_engine().unwrap().active_txn_count(), 1);
+
+        shared.close_session(&mut session);
+        assert!(!session.in_transaction());
+        assert_eq!(shared.read_engine().unwrap().active_txn_count(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sequential_session_select_uses_its_retained_gpu_generation() {
+        let mut facade = EngineFacade::new();
+        facade.engine.set_host_install_elision_enabled(false);
+        facade.engine.set_shard_residency_enabled(true);
+        facade.engine.set_auto_admit_on_commit(true);
+        facade.engine.set_resident_update_tombstone_enabled(false);
+        let reader = facade.open_session();
+        let writer = facade.open_session();
+        facade
+            .execute(reader, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        facade
+            .execute(reader, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+            .unwrap();
+        facade.execute(reader, "BEGIN").unwrap();
+        facade
+            .execute(writer, "UPDATE accounts SET balance = 200 WHERE id = 1")
+            .unwrap();
+
+        let outcome = facade
+            .execute(reader, "SELECT balance FROM accounts WHERE id = 1")
+            .unwrap();
+        let QueryOutcome::Rows { rows, .. } = outcome else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows, vec![vec![DbValue::Int4(100)]]);
+        facade.execute(reader, "ROLLBACK").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shared_session_select_uses_its_retained_gpu_generation() {
+        let engine = Engine::new_local();
+        engine.set_host_install_elision_enabled(false);
+        engine.set_shard_residency_enabled(true);
+        engine.set_auto_admit_on_commit(true);
+        engine.set_resident_update_tombstone_enabled(false);
+        engine
+            .execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        engine
+            .execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+            .unwrap();
+        let shared = SharedEngine::from_engine(engine);
+        let mut reader = shared.open_session();
+        execute_on_shared_engine_session(&shared, &mut reader, "BEGIN").unwrap();
+        execute_on_shared_engine(&shared, "UPDATE accounts SET balance = 200 WHERE id = 1")
+            .unwrap();
+
+        let outcome = execute_on_shared_engine_session(
+            &shared,
+            &mut reader,
+            "SELECT balance FROM accounts WHERE id = 1",
+        )
+        .unwrap();
+        let QueryOutcome::Rows { rows, .. } = outcome else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows, vec![vec![DbValue::Int4(100)]]);
+        execute_on_shared_engine_session(&shared, &mut reader, "ROLLBACK").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sequential_session_dml_is_private_until_atomic_commit() {
+        let mut facade = EngineFacade::new();
+        facade.engine.set_host_install_elision_enabled(false);
+        facade.engine.set_shard_residency_enabled(true);
+        facade.engine.set_auto_admit_on_commit(true);
+        facade.engine.set_resident_update_tombstone_enabled(true);
+        let writer = facade.open_session();
+        let observer = facade.open_session();
+        facade
+            .execute(
+                writer,
+                "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)",
+            )
+            .unwrap();
+        facade
+            .execute(writer, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+            .unwrap();
+        facade.execute(writer, "BEGIN").unwrap();
+        let wal_before = facade.engine.durable_wal_records().len();
+        facade
+            .execute(writer, "UPDATE accounts SET balance = 200 WHERE id = 1")
+            .unwrap();
+
+        let QueryOutcome::Rows { rows, .. } = facade
+            .execute(writer, "SELECT balance FROM accounts WHERE id = 1")
+            .unwrap()
+        else {
+            panic!("expected writer rows")
+        };
+        assert_eq!(rows, vec![vec![DbValue::Int4(200)]]);
+        let QueryOutcome::Rows { rows, .. } = facade
+            .execute(observer, "SELECT balance FROM accounts WHERE id = 1")
+            .unwrap()
+        else {
+            panic!("expected observer rows")
+        };
+        assert_eq!(rows, vec![vec![DbValue::Int4(100)]]);
+        assert_eq!(facade.engine.durable_wal_records().len(), wal_before);
+
+        facade.execute(writer, "COMMIT").unwrap();
+        assert_eq!(facade.engine.durable_wal_records().len(), wal_before + 1);
+        let QueryOutcome::Rows { rows, .. } = facade
+            .execute(observer, "SELECT balance FROM accounts WHERE id = 1")
+            .unwrap()
+        else {
+            panic!("expected committed rows")
+        };
+        assert_eq!(rows, vec![vec![DbValue::Int4(200)]]);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shared_session_dml_is_private_until_atomic_commit() {
+        let engine = Engine::new_local();
+        engine.set_host_install_elision_enabled(false);
+        engine.set_shard_residency_enabled(true);
+        engine.set_auto_admit_on_commit(true);
+        engine.set_resident_update_tombstone_enabled(true);
+        engine
+            .execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
+            .unwrap();
+        engine
+            .execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+            .unwrap();
+        let shared = SharedEngine::from_engine(engine);
+        let mut writer = shared.open_session();
+        execute_on_shared_engine_session(&shared, &mut writer, "BEGIN").unwrap();
+        execute_on_shared_engine_session(
+            &shared,
+            &mut writer,
+            "UPDATE accounts SET balance = 200 WHERE id = 1",
+        )
+        .unwrap();
+
+        let QueryOutcome::Rows { rows, .. } = execute_on_shared_engine_session(
+            &shared,
+            &mut writer,
+            "SELECT balance FROM accounts WHERE id = 1",
+        )
+        .unwrap() else {
+            panic!("expected writer rows")
+        };
+        assert_eq!(rows, vec![vec![DbValue::Int4(200)]]);
+        let QueryOutcome::Rows { rows, .. } =
+            execute_on_shared_engine(&shared, "SELECT balance FROM accounts WHERE id = 1").unwrap()
+        else {
+            panic!("expected observer rows")
+        };
+        assert_eq!(rows, vec![vec![DbValue::Int4(100)]]);
+
+        execute_on_shared_engine_session(&shared, &mut writer, "COMMIT").unwrap();
+        let QueryOutcome::Rows { rows, .. } =
+            execute_on_shared_engine(&shared, "SELECT balance FROM accounts WHERE id = 1").unwrap()
+        else {
+            panic!("expected committed rows")
+        };
+        assert_eq!(rows, vec![vec![DbValue::Int4(200)]]);
     }
 
     #[test]
@@ -1177,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn bigint_and_bool_round_trip_with_filters() {
+    fn bigint_and_bool_round_trip_on_gpu_native_facade() {
         let mut facade = EngineFacade::new();
         let session = facade.open_session();
         facade
@@ -1195,20 +1684,17 @@ mod tests {
                 "INSERT INTO flags (n, ok) VALUES (20000000000, FALSE)",
             )
             .unwrap();
-        // BIGINT range filter on the CPU path.
-        let big = select_rows(
-            &mut facade,
-            session,
-            "SELECT n FROM flags WHERE n > 15000000000",
+        // The production facade requires a supported GPU route. Predicate-family coverage lives
+        // in the engine's actual-GPU expression suite; this facade test owns neutral type mapping
+        // and the false wire representation without depending on the removed CPU query fallback.
+        let rows = select_rows(&mut facade, session, "SELECT n, ok FROM flags");
+        assert_eq!(
+            rows,
+            vec![
+                vec![DbValue::Int8(10_000_000_000), DbValue::Bool(true)],
+                vec![DbValue::Int8(20_000_000_000), DbValue::Bool(false)],
+            ]
         );
-        assert_eq!(big, vec![vec![DbValue::Int8(20_000_000_000)]]);
-        // BOOL equality filter, and the `f` text wire form.
-        let off = select_rows(
-            &mut facade,
-            session,
-            "SELECT ok FROM flags WHERE ok = FALSE",
-        );
-        assert_eq!(off, vec![vec![DbValue::Bool(false)]]);
-        assert_eq!(pg_adapter::db_value_text(&off[0][0]), "f");
+        assert_eq!(pg_adapter::db_value_text(&rows[1][1]), "f");
     }
 }

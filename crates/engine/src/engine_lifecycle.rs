@@ -24,6 +24,27 @@ impl Engine {
         engine
     }
 
+    /// Install a small lazy-backed lane set without constructing a durable production engine.
+    /// Race regressions use this to make lane activation non-vacuous while keeping their WAL
+    /// footprint bounded; the lane files are still real and exercise the production pipeline.
+    #[cfg(test)]
+    pub(crate) fn attach_test_intent_lanes(
+        &mut self,
+        lane_base: std::path::PathBuf,
+        lane_count: usize,
+    ) {
+        assert!(lane_count >= 2, "tests need at least two intent lanes");
+        assert!(self.intent_lanes.is_none(), "test lanes already attached");
+        self.intent_lanes = Some(std::sync::Arc::new(
+            crate::engine_intent_lanes::IntentLaneState::fresh(
+                lane_count,
+                2,
+                lane_base,
+                4 * 1024 * 1024,
+            ),
+        ));
+    }
+
     fn begin_recovery_replay(&self) {
         self.set_auto_admit_on_commit(false);
         self.set_host_install_elision_enabled(false);
@@ -187,7 +208,9 @@ impl Engine {
                 sm: KvStateMachine::default(),
                 txn_manager: TxnManager::default(),
             }),
+            commit_path_wedged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_snapshots: std::sync::Arc::new(Mutex::new(ActiveSnapshots::default())),
+            transaction_private_gpu_bytes: Arc::new(Mutex::new(BTreeMap::new())),
             group_flush: GroupFlushState::default(),
             intent_lanes: None,
             // Mirrors LocalReplicator::leader() below.
@@ -344,6 +367,32 @@ impl Engine {
     /// checks this to re-home its poison-on-panic policy onto the commit path (write-half Stage 4).
     pub fn is_commit_path_poisoned(&self) -> bool {
         self.commit.is_poisoned()
+            || self
+                .commit_path_wedged
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn commit_path_unavailable_error(&self) -> EngineError {
+        EngineError::Durability(
+            "commit path is wedged; restart recovery is required before reads or writes resume"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn ensure_commit_path_available(&self) -> Result<(), EngineError> {
+        if self.is_commit_path_poisoned() {
+            Err(self.commit_path_unavailable_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn wedge_commit_path(&self) {
+        self.commit_path_wedged
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.fail_all_pending_commit_work(
+            "a durable commit could not be applied or published; restart recovery is required",
+        );
     }
 
     /// A value-`Arc` clone of the lock-free read-path state. The concurrent-dispatch façade pins this
@@ -1117,10 +1166,18 @@ impl Engine {
             .filter(|memory| memory.metadata().gpu_id == gpu_id)
             .map(|memory| memory.metadata().allocated_bytes)
             .sum::<u64>();
+        let private_bytes = self
+            .transaction_private_gpu_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&gpu_id)
+            .copied()
+            .unwrap_or(0);
         snapshot_bytes
             .saturating_add(shard_bytes)
             .saturating_add(single_indexes)
             .saturating_add(shard_indexes)
+            .saturating_add(private_bytes)
     }
 
     pub fn set_gpu_runtime_saturated(&mut self, saturated: bool) {

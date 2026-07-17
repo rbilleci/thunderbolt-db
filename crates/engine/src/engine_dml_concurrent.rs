@@ -9,11 +9,27 @@ use super::*;
 
 mod lane;
 mod lane_apply;
+mod state;
 mod wave;
+
+pub(crate) use state::{
+    new_pending_outcome, CommitWaveItem, CommitWaveOutcome, CommitWaveState, LaneIntent, LaneOpKind,
+};
+#[cfg(test)]
+use state::{wave_tail_failure_publish_hook, wave_tail_handoff_hook};
+use state::{CommitWaveDone, CommitWaveQueue, CommitWaveTail, TailMaintenanceCompletion};
 
 /// Upper bound on items per wave drain (keeps a single wave's worst-case commit latency bounded;
 /// under saturation the NEXT wave picks the rest up immediately).
 const COMMIT_WAVE_MAX_DEFAULT: usize = 1024;
+
+/// Parallel vectors returned by one device launch form a single verdict. Every component must
+/// cover exactly the submitted positions: accepting a short vector makes `zip` fail open, while
+/// accepting a long vector hides an ABI/launch mismatch that can misassociate later results.
+#[inline]
+fn exact_device_verdict_cardinality(expected: usize, component_lengths: &[usize]) -> bool {
+    component_lengths.iter().all(|length| *length == expected)
+}
 
 /// E2.2(d) — the wave-size / pipeline-depth knobs are env-overridable for the latency-knee sweep
 /// (`GPU_DB_COMMIT_WAVE_MAX`, `GPU_DB_WAVE_TAIL_PIPELINE_DEPTH`), read once. The defaults are the
@@ -101,249 +117,137 @@ pub(crate) fn wave_host_phase_timing_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("GPU_DB_BENCH_HOSTPHASE").is_ok_and(|v| v == "1"))
 }
 
-/// One enqueued concurrent commit: everything the sequencer needs to conflict-check, re-resolve,
-/// append, apply, and publish it — plus the shared slot its owner blocks on.
-pub(crate) struct CommitWaveItem {
-    txn_id: u64,
-    cmd: Command,
-    payload: std::sync::Arc<[u8]>,
-    write_set: WriteSet,
-    read_snapshot: Index,
-    residency_tables: BTreeSet<String>,
-    /// Ledger #18 audit fix: the catalog generation the OFF-LOCK prepare validated against.
-    /// The sequencer grants the ledger-covered re-resolve skip ONLY while the live catalog
-    /// still carries this stamp — a constraint-adding DDL (ADD UNIQUE/CHECK) committing
-    /// between the snapshot and the wave records NOTHING in the conflict ledger, so the skip
-    /// would silently bypass the new constraint; any DDL bumps the stamp and forces the
-    /// always-correct Full re-validation instead.
-    prepared_catalog_seq: Index,
-    /// DELTA-REUSE (B): the OFF-LOCK-prepared insert delta, carried forward for reuse-eligible
-    /// items (elided, FK-free, no nextval). The under-lock re-resolve then only RE-KEYS it at the
-    /// wave's `next_row_id` (`rekey_offlock_insert_delta`) instead of re-running the full
-    /// coerce+validate+write-set rebuild — the coerced values / write-set are input-deterministic,
-    /// so they are identical to a fresh re-prepare while the catalog generation still matches
-    /// (`prepared_catalog_seq`; a DDL bump forces the Full path, dropping the reuse). `None` = the
-    /// item takes the normal `prepare_dml` re-resolve.
-    offlock_delta: Option<crate::write_path::WriteDelta>,
-    /// E2.2(b) — the PRE-ENCODED W5a binary WAL record, built OFF the sequencer at intent-build
-    /// time as a pure function of `(route, params)` with a PLACEHOLDER row id, plus the fixed byte
-    /// offset of that row id. Present only for single-row covered-INSERT intents. The sequencer
-    /// patches the 8-byte row id at `offset` with the wave-assigned id (no String row-key parse, no
-    /// per-item `encode_relational_row` + `try_encode_binary_insert`) and uses the result verbatim
-    /// as the reuse-eligible delta's WAL payload. `None` = the classic per-item encode path.
-    binary_wal_template: Option<(std::sync::Arc<[u8]>, u32)>,
-    outcome: CommitWaveOutcome,
-}
+impl Engine {
+    /// Central fail-stop drain. The sticky engine flag is stored before this method runs, so any
+    /// racing submit/pump observes the gate even if its item is between local pipeline stages.
+    pub(crate) fn fail_all_pending_commit_work(&self, reason: &str) {
+        let error = || {
+            ExecuteError::Engine(EngineError::Durability(format!(
+                "commit path is wedged pending restart recovery: {reason}"
+            )))
+        };
 
-pub(crate) type CommitWaveOutcome = Arc<CommitWaveDone>;
-
-/// A wave item's completion slot: the payload behind a mutex, the `done` flag an ATOMIC so
-/// waiters can SPIN on completion (a few µs) instead of paying a futex sleep+wake round-trip
-/// per commit — the wakeup latency, not the mutex, dominated the first wave measurement.
-///
-/// U1: the Ok payload is ROWS AFFECTED (INSERT intents = 1; classic wave items = the applied
-/// delta's exact row count; 0-row lane DELETEs complete with Ok(0) at the pre-claim filter) —
-/// the engine's first rows-affected surface, introduced with the lane DELETE intents.
-#[derive(Default)]
-pub(crate) struct CommitWaveDone {
-    done: std::sync::atomic::AtomicBool,
-    result: Mutex<Option<Result<u64, ExecuteError>>>,
-}
-
-impl CommitWaveDone {
-    pub(crate) fn take_if_done(&self) -> Option<Result<u64, ExecuteError>> {
-        if !self.done.load(AtomicOrdering::Acquire) {
-            return None;
+        let stranded = {
+            let mut queue = self.lock_commit_wave_queue();
+            queue.wedged.get_or_insert_with(|| reason.to_string());
+            queue.sequencer_active = false;
+            queue.items.drain(..).collect::<Vec<_>>()
+        };
+        for item in stranded {
+            item.set_outcome(Err(error()));
         }
-        self.result
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-    }
-}
-
-/// U1/U2: the lane-op kind. INSERT is the E2 flagship; DELETE + UPDATE are the Tier-1 mutation
-/// ops — covered by-PK, target resolved by the coalesced device VISIBLE-LOCATE at APPLY (WAL-first:
-/// the locate moved off the pump critical path). An UPDATE rides the delete's tombstone plus an
-/// insert's append: tombstone-OLD + append-NEW at a fresh `new_row_id` claimed at the pump (a dead
-/// twin sharing the pk), the append CONDITIONAL on the old-version locate (a 0-row update appends
-/// nothing but still burns the claimed row id, keeping replay's allocator in lock-step).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LaneOpKind {
-    Insert,
-    Delete,
-    Update,
-}
-
-/// E2.5b-2 LEAN LANE ITEM: everything the lane pump needs, ~112B + the value
-/// row — vs the ~500B CommitWaveItem plus its AST/delta/text attachments. The
-/// pump's host passes were the measured final wall (~6.5ms/lane cycle of cold
-/// cache traffic at ~925-item waves); this struct is the fix.
-pub(crate) struct LaneIntent {
-    /// U1/U2: which op this intent performs (Insert rides every existing path
-    /// unchanged; Delete adds the visible-locate + tombstone arms; Update adds a
-    /// conditional new-version append on top of the delete's locate + tombstone).
-    pub(crate) op: LaneOpKind,
-    pub(crate) txn_id: u64,
-    pub(crate) slot: crate::write_path::IntUniqueSlotKey,
-    pub(crate) read_snapshot: Index,
-    pub(crate) prepared_catalog_seq: Index,
-    pub(crate) filter_idx: u32,
-    pub(crate) row_id_offset: u32,
-    pub(crate) table: std::sync::Arc<str>,
-    pub(crate) template: std::sync::Arc<[u8]>,
-    pub(crate) values: Vec<SqlValue>,
-    pub(crate) outcome: CommitWaveOutcome,
-    /// Live-population decrement handle (see `IntentLaneState::outstanding`);
-    /// None outside lanes mode.
-    pub(crate) outstanding: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    /// PostgreSQL `synchronous_commit` model: true (default) acks at the
-    /// STRICT gate (durable AND applied); false acks at the APPLIED cut
-    /// (async commit — bounded loss on power failure, consistency preserved).
-    pub(crate) synchronous: bool,
-    /// U1: the rows-affected count a settled Ok reports for INSERT intents (always 1).
-    pub(crate) rows_affected: u64,
-    /// U1/U2 WAL-first: a DELETE's (and UPDATE's) rows-affected is resolved at APPLY (the locate
-    /// moved off the pump critical path), so the outcome comes from this shared cell the apply
-    /// writes (0 or 1). `None` for inserts — they use `rows_affected`. Shared with the delete's
-    /// `LaneTombstone.rows_affected` / the update's `LaneUpdate.rows_affected`; the settle reads it
-    /// after the applied cut covers the wave.
-    pub(crate) rows_affected_cell: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-}
-
-impl LaneIntent {
-    /// The rows-affected an Ok outcome reports: a delete reads its apply-resolved cell; an
-    /// insert (no cell) uses the fixed `rows_affected` (1). Read at settle, after apply.
-    pub(crate) fn resolved_rows_affected(&self) -> u64 {
-        match &self.rows_affected_cell {
-            Some(cell) => cell.load(AtomicOrdering::Acquire),
-            None => self.rows_affected,
+        let pending_tails = {
+            let mut tails = self
+                .commit_wave
+                .pending_tails
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tails.drain(..).collect::<Vec<_>>()
+        };
+        let pending_tail_count = pending_tails.len() as u64;
+        drop(pending_tails); // armed Drop fails every tail member
+        if pending_tail_count != 0 {
+            self.commit_wave
+                .tails_finished
+                .fetch_add(pending_tail_count, AtomicOrdering::Release);
         }
-    }
 
-    pub(crate) fn set_outcome(&self, result: Result<u64, ExecuteError>) {
-        *self
-            .outcome
-            .result
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
-        self.outcome.done.store(true, AtomicOrdering::Release);
-        // Population bookkeeping: set_outcome is the single completion choke
-        // point, so submit/settle pairing is exact by construction.
-        if let Some(outstanding) = &self.outstanding {
-            outstanding.fetch_sub(1, AtomicOrdering::Relaxed);
-        }
-    }
-}
-
-/// A fresh, pending completion slot (shared by the lean lane path).
-pub(crate) fn new_pending_outcome() -> CommitWaveOutcome {
-    Arc::new(CommitWaveDone {
-        done: std::sync::atomic::AtomicBool::new(false),
-        result: Mutex::new(None),
-    })
-}
-
-impl CommitWaveItem {
-    fn set_outcome(&self, result: Result<u64, ExecuteError>) {
-        *self
-            .outcome
-            .result
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
-        self.outcome.done.store(true, AtomicOrdering::Release);
-    }
-}
-
-/// The deterministic commit-wave state (ledger #6): the arrival-ordered item queue, the
-/// single-sequencer election flag, and the sticky wedge. The condvar doubles as the completion
-/// signal for waiters, the promotion signal for the next sequencer, and (W2) the tail-finished
-/// signal for the depth-1 durability pipeline.
-pub(crate) struct CommitWaveState {
-    pub(crate) queue: Mutex<CommitWaveQueue>,
-    pub(crate) cv: std::sync::Condvar,
-    /// W2/W2b — the DURABILITY PIPELINE (depth [`WAVE_TAIL_PIPELINE_DEPTH`]): sequenced waves
-    /// whose group-fsync wait, `committed_seq` publish, and outcome acks have NOT yet run. The
-    /// sequencer pushes tails here and immediately drains/sequences the NEXT wave under the
-    /// commit_mutex; tails are FINISHED (fsync-wait → publish → acks) by whichever threads claim
-    /// them — the waves' own blocked waiters (they are spinning on their outcomes anyway) or the
-    /// sequencer as the fallback claimer at the capacity gate. Finish order is UNCONSTRAINED:
-    /// a tail's durability wait covers all earlier WAL positions (prefix frontier) and the
-    /// publish is a CAS-max, so concurrent out-of-order finishing is safe. This is what lets
-    /// wave N+1's serial sequencing overlap wave N's fdatasync, and lets consecutive waves'
-    /// records coalesce into SHARED fsyncs via the WAL's group-flush protocol.
-    /// Liveness: a pending tail always has ≥1 live claimer — its members' outcomes are unset
-    /// until it finishes, so they are by definition still in the waiter loops (which probe this
-    /// deque), and the sequencer try-claims before ever blocking on the capacity gate.
-    pub(crate) pending_tails: Mutex<std::collections::VecDeque<CommitWaveTail>>,
-    /// Tails handed to the pipeline slot / tails fully finished. `handed == finished` ⇔ the
-    /// pipeline is empty (the depth-1 gate the sequencer enforces before handing a new tail).
-    pub(crate) tails_handed: AtomicU64,
-    pub(crate) tails_finished: AtomicU64,
-}
-
-impl Default for CommitWaveState {
-    fn default() -> Self {
-        Self {
-            queue: Mutex::new(CommitWaveQueue::default()),
-            cv: std::sync::Condvar::new(),
-            pending_tails: Mutex::new(std::collections::VecDeque::new()),
-            tails_handed: AtomicU64::new(0),
-            tails_finished: AtomicU64::new(0),
-        }
-    }
-}
-
-/// W2 — one sequenced-but-not-yet-durable wave: everything needed to finish it OFF the
-/// sequencer's critical path. The deltas are applied and the WAL records appended (that is what
-/// lets the next wave's re-resolves see them); nothing is client-visible until `finish` runs the
-/// group-durability wait and publishes `committed_seq` (WAL-before-visibility per tail; the
-/// CAS-max publish makes out-of-order tail completion safe). `armed` keeps the wedge-don't-strand policy:
-/// a tail dropped unfinished (claimer panic, pipeline abandonment) fails every still-unset
-/// outcome and wedges the queue, exactly like `CommitWaveBatchGuard` does for the in-section
-/// half of the wave.
-pub(crate) struct CommitWaveTail {
-    batch: Vec<CommitWaveItem>,
-    /// `(batch position, commit_seq, appended, rows_affected)` for every item that reached the
-    /// durable-commit point, in wave order (aborted items' outcomes were already set in-section).
-    /// `rows_affected` is the applied delta's exact row count — the Ok payload of the ack (U1).
-    committed: Vec<(usize, Index, bool, u64)>,
-    last_seq: Index,
-    last_position: usize,
-    armed: bool,
-}
-
-impl Drop for CommitWaveTail {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // The durability half of the wave died before acking (the group-fsync-failure panic
-        // path, or claimer death): fail every still-unset member outcome. Queue wedging + the
-        // finished-counter bump need `&Engine` and are handled by `finish_wave_tail`'s
-        // unwind-safe completion guard.
-        for item in &self.batch {
-            if !item.outcome.done.load(AtomicOrdering::Acquire) {
-                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
-                    "the concurrent commit path is wedged pending restart recovery: the \
-                     commit-wave durability tail died before completing"
-                        .to_string(),
-                ))));
+        if let Some(lanes) = &self.intent_lanes {
+            lanes.apply_poisoned.store(true, AtomicOrdering::Release);
+            let mut intents = Vec::new();
+            for queue in &lanes.queues {
+                intents.extend(
+                    queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .drain(..),
+                );
+            }
+            intents.extend(
+                lanes
+                    .resize_hold
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .drain(..),
+            );
+            // Lane publishers install an ApplyRequest and its LaneSettle while holding these in
+            // this same order. Holding both sets across the drain prevents an active pump from
+            // publishing one half after the other half was already swept.
+            let mut apply_queue = lanes
+                .apply_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut settle_queues = lanes
+                .settle
+                .iter()
+                .map(|queue| {
+                    queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                })
+                .collect::<Vec<_>>();
+            for queue in &mut settle_queues {
+                for entry in queue.drain(..) {
+                    intents.extend(entry.winners);
+                    intents.extend(entry.async_winners);
+                }
+            }
+            for request in apply_queue.drain(..) {
+                request.slot.failed.store(true, AtomicOrdering::Release);
+                request.slot.done.store(true, AtomicOrdering::Release);
+                let mut inflight = lanes.inflight_slots[request.lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for slot in request.unique_slots {
+                    inflight.remove(&slot);
+                }
+            }
+            drop(settle_queues);
+            drop(apply_queue);
+            for request in lanes
+                .validate_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drain(..)
+            {
+                *request
+                    .slot
+                    .result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(None);
+                request.slot.done.store(true, AtomicOrdering::Release);
+            }
+            for item in intents {
+                item.set_outcome(Err(error()));
             }
         }
+        self.commit_wave.cv.notify_all();
     }
-}
 
-#[derive(Default)]
-pub(crate) struct CommitWaveQueue {
-    items: std::collections::VecDeque<CommitWaveItem>,
-    sequencer_active: bool,
-    /// Sticky: a wave failed after its deltas were applied (durability failure mid-wave). No
-    /// further concurrent commits may run until restart recovery.
-    wedged: Option<String>,
-}
+    #[cfg(test)]
+    pub(crate) fn set_wave_tail_handoff_hook(
+        &self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *wave_tail_handoff_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((self as *const Self as usize, reached, resume));
+    }
 
-impl Engine {
+    #[cfg(test)]
+    pub(crate) fn set_wave_tail_failure_publish_hook(
+        &self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *wave_tail_failure_publish_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((self as *const Self as usize, reached, resume));
+    }
+
     /// Whether `text` is a DML statement (`INSERT`/`UPDATE`/`DELETE` on an existing base table whose
     /// columns carry no `nextval` sequence default) that the **concurrent** commit path can execute
     /// via off-lock prepare + the short commit critical section (write-half MVCC, Stage 4). Anything
@@ -381,10 +285,9 @@ impl Engine {
         true
     }
 
-    /// Register a transaction's read snapshot (its `read_snapshot` `commit_seq`) for the
-    /// oldest-active GC/ledger-prune boundary, returning a guard that deregisters on drop (write-half
-    /// MVCC, Stage 4). Done off-lock at prepare-begin so taking a snapshot never serializes on the
-    /// commit_mutex.
+    /// Register an autocommit statement's scalar read boundary for the oldest-active
+    /// GC/ledger-prune boundary, returning a guard that deregisters on drop (write-half MVCC,
+    /// Stage 4). Explicit transactions use the generation-owned keyed registration below.
     pub(crate) fn register_active_snapshot(&self, snapshot: Index) -> ActiveSnapshotGuard<'_> {
         self.active_snapshots
             .lock()
@@ -403,6 +306,158 @@ impl Engine {
             .deregister(snapshot);
     }
 
+    /// Capture the exact catalog, MVCC table generations, and resident GPU resource descriptors at
+    /// `boundary`. The caller holds `commit`, so no DML/DDL publisher can advance the logical state
+    /// while the bundle is assembled. The descriptor publisher lock makes the single-buffer and
+    /// shard map loads one residency publication observation; both descriptor kinds own the device
+    /// allocations they describe. Cached device indexes are lifetime-pinned as optional accelerators
+    /// and remain subject to their existing buffer-identity validation before execution.
+    pub(crate) fn capture_transaction_snapshot(&self, boundary: Index) -> Arc<TransactionSnapshot> {
+        let catalog = self.read_state.catalog_as_of(boundary);
+        let table_versions = self.read_state.mvcc.capture_table_versions();
+        let (
+            resident_snapshots,
+            resident_shards,
+            elided_tables,
+            chunk_authoritative_tables,
+            streaming_cold_chunks,
+        ) = {
+            let _publish = self
+                .read_state
+                .residency
+                .descriptor_publish_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                self.read_state.residency.snapshots.load_full(),
+                self.read_state.residency.shards.load_full(),
+                self.read_state.residency.elided_tables.load_full(),
+                self.read_state
+                    .residency
+                    .chunk_authoritative_tables
+                    .load_full(),
+                self.read_state.residency.streaming_cold_chunks.load_full(),
+            )
+        };
+        let mut resident_index_resources = self
+            .read_state
+            .residency
+            .wave_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter_map(|index| index.index_memory.as_ref().cloned())
+            .collect::<Vec<_>>();
+        resident_index_resources.extend(
+            self.read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .filter_map(|index| index.device_index.as_ref().cloned()),
+        );
+        resident_index_resources.extend(
+            self.read_state
+                .residency
+                .chunk_key_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .map(|index| Arc::clone(&index.device)),
+        );
+        resident_index_resources.extend(
+            self.read_state
+                .residency
+                .chunk_key_bloom
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .map(|bloom| Arc::clone(&bloom.device)),
+        );
+        Arc::new(TransactionSnapshot {
+            boundary,
+            next_row_id: self.read_state.mvcc.current_row_id(),
+            catalog,
+            table_versions,
+            resident_snapshots,
+            resident_shards: Arc::clone(&resident_shards),
+            elided_tables,
+            chunk_authoritative_tables,
+            delta: std::sync::Mutex::new(TransactionDeltaState {
+                generation: 0,
+                resident_shards: Arc::clone(&resident_shards),
+                streaming_cold_chunks: Arc::clone(&streaming_cold_chunks),
+                deltas: Vec::new(),
+                write_set: WriteSet::default(),
+                next_row_id: self.read_state.mvcc.current_row_id(),
+                sequence_state: BTreeMap::new(),
+                private_gpu_bytes_by_gpu: BTreeMap::new(),
+            }),
+            statement_lock: std::sync::Mutex::new(()),
+            private_gpu_account: Arc::clone(&self.transaction_private_gpu_bytes),
+            _resident_index_resources: resident_index_resources,
+        })
+    }
+
+    /// Open an explicit transaction and pin its one lifetime generation bundle: visibility boundary,
+    /// catalog, table versions, and resident GPU resource descriptors. Its scalar boundary remains
+    /// in the same space used by conflict-ledger pruning and MVCC GC. Lock order is `commit` ->
+    /// residency publishers/caches -> `active_snapshots`.
+    pub(crate) fn begin_transaction_context(&self, txn_id: TxnId) -> Result<(), TxnError> {
+        let mut commit = self.commit_state();
+        let snapshot = self.capture_transaction_snapshot(self.committed_seq());
+        let txn = commit.txn_manager.begin_with_id(txn_id)?;
+        self.active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .register_transaction(txn.id, snapshot);
+        Ok(())
+    }
+
+    /// Finish an explicit transaction, releasing its lifetime snapshot. `AND CHAIN` creates the
+    /// successor while the same locks are held and registers a fresh boundary for that new identity,
+    /// so there is no un-fenced gap between the two transaction contexts.
+    pub(crate) fn finish_transaction_context(
+        &self,
+        txn_id: TxnId,
+        committed: bool,
+        chain: bool,
+    ) -> Result<Option<TxnId>, TxnError> {
+        let mut commit = self.commit_state();
+        if committed {
+            commit.txn_manager.commit(txn_id)?;
+        } else {
+            commit.txn_manager.rollback(txn_id)?;
+        }
+
+        let successor = if chain {
+            let next = commit.txn_manager.begin()?;
+            Some((
+                next.id,
+                self.capture_transaction_snapshot(self.committed_seq()),
+            ))
+        } else {
+            None
+        };
+        let mut active = self
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = active.deregister_transaction(txn_id);
+        debug_assert!(
+            removed.is_some(),
+            "active transaction {txn_id} had no lifetime snapshot"
+        );
+        let successor_id = successor.as_ref().map(|(next_id, _)| *next_id);
+        if let Some((next_id, next_snapshot)) = successor {
+            active.register_transaction(next_id, next_snapshot);
+        }
+        drop(active);
+        self.gc_transaction_created_by_regions();
+        Ok(successor_id)
+    }
+
     /// Execute one autocommit DML statement (`INSERT`/`UPDATE`/`DELETE`) on the CONCURRENT commit
     /// path under Snapshot Isolation (write-half MVCC, Stage 4 — the concurrency flip):
     ///
@@ -410,11 +465,12 @@ impl Engine {
     /// 2. **Prepare (off-lock, no commit_mutex):** parse, constraint-preflight against `S`, and
     ///    compute the conflict write-set (`prepare_*` at `S`). Many writers run this concurrently,
     ///    and concurrently with lock-free readers.
-    /// 3. **Commit (short critical section under the commit_mutex):** validate the write-set against
-    ///    the recent-commits ledger (overlap since `S` ⇒ retryable [`ExecuteError::Serialization`],
+    /// 3. **Commit (short critical section under the commit_mutex):** validate row identities
+    ///    against the recent-commits map and unique keys against device version history plus
+    ///    wave-local arbitration (overlap since `S` ⇒ retryable [`ExecuteError::Serialization`],
     ///    first-committer-wins) → assign `commit_seq` (the commit `Index`) → WAL append + group-commit
     ///    fsync → install the delta RE-RESOLVED at `commit_seq` (so the live apply is byte-identical
-    ///    to a WAL replay) + publish the table generation → record the write-set in the ledger → bump
+    ///    to a WAL replay) + publish the table generation → record row identities → bump
     ///    `committed_seq` LAST (release-store: the publish point).
     /// 4. **Abort/retry:** a conflict (or any prepare error) publishes nothing and is returned; a
     ///    serialization conflict is retryable with a fresh snapshot.
@@ -424,6 +480,9 @@ impl Engine {
     pub fn execute_dml_concurrent(&self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
         self.intent_lanes_write_guard()
             .map_err(ExecuteError::Engine)?;
+        if self.transaction_snapshot_handle(txn_id).is_some() {
+            return self.execute_dml_in_transaction(txn_id, text);
+        }
         self.execute_dml_concurrent_instrumented(txn_id, text, || {})
     }
 
@@ -439,13 +498,36 @@ impl Engine {
         text: &str,
         on_prepared: impl FnOnce(),
     ) -> Result<(), ExecuteError> {
+        if self.is_commit_path_poisoned() {
+            return Err(ExecuteError::Engine(EngineError::Durability(
+                "commit path is wedged; restart recovery required".to_string(),
+            )));
+        }
+        if self.transaction_snapshot_handle(txn_id).is_some() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "instrumented concurrent DML is autocommit-only; an active transaction must use the serialized private-generation entry"
+                    .to_string(),
+            )));
+        }
         let cmd = parse_command(text)?;
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
-        // (1) Begin: pin + register the read snapshot for the off-lock prepare.
-        let read_snapshot = self.committed_seq();
-        let _snapshot_guard = self.register_active_snapshot(read_snapshot);
+        // A constrained table's very first write may precede any data-triggered admission. Build
+        // its empty/current device history generation under the same publication cut before the
+        // off-lock prepare; thereafter every authoritative verdict remains device-current.
+        self.ensure_unique_history_generation(&cmd)?;
+        // (1) Begin: an explicit transaction reuses its lifetime generation and registry hold;
+        // an autocommit statement captures and temporarily registers the newest scalar boundary.
+        // The retained scope is entered ONLY around prepare below. Letting it leak into the wave
+        // sequencer's commit-time re-resolve would make a publisher mutate against old resources.
+        let transaction_snapshot = self.transaction_snapshot_handle(txn_id);
+        let read_snapshot = transaction_snapshot
+            .as_ref()
+            .map_or_else(|| self.committed_seq(), |snapshot| snapshot.boundary);
+        let _snapshot_guard = transaction_snapshot
+            .is_none()
+            .then(|| self.register_active_snapshot(read_snapshot));
 
         // (2) Prepare OFF-LOCK at the read snapshot: validate constraints + compute the conflict
         // write-set. (The delta itself is recomputed at commit_seq under the lock so the live apply
@@ -462,7 +544,8 @@ impl Engine {
         // unhandled). The concurrent arm has none yet: an unhandled concurrent commit would
         // invalidate + re-admit from the EMPTY host store. Concurrent-native elision hooks are
         // the ledgered follow-up (they are what the SLO target ultimately needs).
-        if self.host_install_elision_enabled()
+        if transaction_snapshot.is_none()
+            && self.host_install_elision_enabled()
             && !matches!(cmd, Command::Insert(_))
             && Self::dml_mutated_tables(&cmd)
                 .iter()
@@ -475,20 +558,34 @@ impl Engine {
         // prepare's own catalog bind is at least this fresh, so a stamp match at re-resolve
         // proves no constraint-adding DDL landed since the off-lock validation (a capture
         // AFTER prepare could miss a DDL slipping between the bind and the capture).
-        let prepared_catalog_seq = self.catalog_snapshot().commit_seq;
-        let snapshot = self.dml_read_snapshot(read_snapshot);
-        let prepared = self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)?;
+        let prepared_catalog_seq = transaction_snapshot.as_ref().map_or_else(
+            || self.catalog_snapshot().commit_seq,
+            |snapshot| snapshot.catalog.commit_seq,
+        );
+        let snapshot = transaction_snapshot.as_ref().map_or_else(
+            || self.dml_read_snapshot(read_snapshot),
+            |generation| DmlReadSnapshot {
+                commit_seq: generation.boundary,
+                next_row_id: generation.next_row_id,
+            },
+        );
+        let prepared = if let Some(generation) = transaction_snapshot.as_ref() {
+            let _scope = self.enter_transaction_read(Arc::clone(generation));
+            self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)?
+        } else {
+            self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)?
+        };
         let residency_tables = Self::dml_mutated_tables(&cmd);
 
         // The snapshot is now pinned and prepare is done; the commit critical section has not started.
         // (Tests barrier here to align two writers' snapshots before their commits race.)
         on_prepared();
 
-        // DELTA-REUSE (B): carry the whole delta forward for reuse-eligible (elided, no-nextval)
-        // inserts so the under-lock re-resolve only re-keys it; every other item keeps just its
-        // write-set (the conflict path reads it BEFORE the re-resolve, so it is always needed).
+        // Carry the off-lock delta forward for device unique-history validation. Reuse-eligible
+        // inserts may additionally re-key this delta under the catalog-generation gate; every
+        // other shape still takes the normal authoritative re-prepare after conflict validation.
         let write_set = prepared.write_set.clone();
-        let offlock_delta = Self::reresolve_reuse_eligible(&prepared).then_some(prepared);
+        let offlock_delta = Some(prepared);
 
         // (3) Commit: enqueue into the deterministic commit WAVE (ledger #6) and wait for the
         // sequencer to durably commit + publish it (or abort it with a retryable conflict).
@@ -506,9 +603,10 @@ impl Engine {
 
     /// Off-lock prepare dispatch: run the pure `prepare_*` for a DML command against `snapshot`.
     /// `insert_validation` = `Full` off-lock (the authoritative validation);
-    /// `ReResolveLedgerCovered` only from the sequencer's under-lock re-resolve (ledger #18 —
+    /// `ReResolveDeviceCovered` only from the sequencer's under-lock re-resolve (device history +
+    /// wave-local arbitration —
     /// the coverage proof lives on [`InsertPrepareValidation`]).
-    fn prepare_dml(
+    pub(crate) fn prepare_dml(
         &self,
         cmd: &Command,
         snapshot: DmlReadSnapshot,
@@ -535,7 +633,8 @@ impl Engine {
     /// ground truth that `prepare_insert` skipped it because the table was ELIDED at prepare (a
     /// non-elided insert of >=1 row into a >=1-column table always yields >=1 entry) — and an elided
     /// table is FK-free + CHECK-free by `table_elision_eligible`, so the re-resolve owes no
-    /// constraint re-validation beyond the ledger. The generation gate (ReResolveLedgerCovered) is
+    /// constraint re-validation beyond that device verdict. The generation gate
+    /// (`ReResolveDeviceCovered`) is
     /// enforced at reuse time, so a post-prepare DDL (e.g. ADD FK) still forces the Full path.
     fn reresolve_reuse_eligible(delta: &crate::write_path::WriteDelta) -> bool {
         matches!(
@@ -734,8 +833,12 @@ impl Engine {
         &self,
         item: CommitWaveItem,
     ) -> Result<CommitWaveOutcome, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         let outcome = Arc::clone(&item.outcome);
         let mut queue = self.lock_commit_wave_queue();
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         if let Some(reason) = &queue.wedged {
             return Err(ExecuteError::Engine(EngineError::Durability(format!(
                 "the concurrent commit path is wedged pending restart recovery: {reason}"
@@ -752,6 +855,9 @@ impl Engine {
     /// share a few OS threads with no per-commit park/wake — the disruptor ingress the mandate
     /// calls for. `take_if_done` on a submitted ticket observes the result.
     pub fn drive_commit_wave(&self) -> bool {
+        if self.ensure_commit_path_available().is_err() {
+            return false;
+        }
         // E2.5b-2: in lanes mode a pump call advances one lane's pipeline (round-robin);
         // the classic wave machinery below still services pre-activation traffic.
         if let Some(lanes) = &self.intent_lanes {
@@ -927,9 +1033,35 @@ impl Engine {
                 }
                 queue.items.drain(..n).collect()
             };
+            if let Err(error) = self.ensure_commit_path_available() {
+                let message = error.to_string();
+                for item in batch {
+                    item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                        message.clone(),
+                    ))));
+                }
+                let mut queue = self.lock_commit_wave_queue();
+                queue.sequencer_active = false;
+                drop(queue);
+                self.commit_wave.cv.notify_all();
+                return;
+            }
             let wave_started = std::time::Instant::now();
             let wave_len = batch.len() as u64;
             let tail = self.sequence_commit_wave(batch);
+            #[cfg(test)]
+            if tail.is_some() {
+                let hook = wave_tail_handoff_hook()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some((engine, reached, resume)) = hook {
+                    if engine == self as *const Self as usize {
+                        reached.wait();
+                        resume.wait();
+                    }
+                }
+            }
             let waves = WAVE_STATS[0].fetch_add(1, AtomicOrdering::Relaxed);
             // W1b: periodic auto-checkpoint probe OFF the critical section (the rotation takes
             // the commit_mutex itself). Every 256 waves keeps the under-bound check (one mutex
@@ -950,13 +1082,35 @@ impl Engine {
                 // (under load the shared fsync already covered them and the finishes are
                 // instant).
                 self.wait_wave_tail_capacity(wave_tail_pipeline_depth() - 1);
-                {
+                // Publish the maintenance obligation before the tail can be claimed and finished.
+                // A transaction observing the finished count must therefore also observe either
+                // the completed re-admission or this pending count.
+                let maintenance =
+                    (!admit_tables.is_empty()).then(|| TailMaintenanceCompletion::new(self));
+                let mut tail = Some(tail);
+                let handed = {
                     let mut tails = self
                         .commit_wave
                         .pending_tails
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    tails.push_back(tail);
+                    if self.is_commit_path_poisoned() {
+                        false
+                    } else {
+                        tails.push_back(tail.take().expect("tail is handed once"));
+                        true
+                    }
+                };
+                if !handed {
+                    drop(tail); // armed Drop fails every member outcome
+                    self.commit_wave
+                        .tails_finished
+                        .fetch_add(1, AtomicOrdering::Release);
+                    let mut queue = self.lock_commit_wave_queue();
+                    queue.sequencer_active = false;
+                    drop(queue);
+                    self.commit_wave.cv.notify_all();
+                    return;
                 }
                 self.commit_wave
                     .tails_handed
@@ -981,6 +1135,7 @@ impl Engine {
                         self.auto_admit_resident_tables(&admit_tables);
                     }
                 }
+                drop(maintenance);
             } else {
                 let _queue = self.lock_commit_wave_queue();
                 self.commit_wave.cv.notify_all();
@@ -1007,7 +1162,7 @@ impl Engine {
     /// tails may still complete (and even publish, via the durable-frontier fast path) after
     /// this returns — callers needing a REAL barrier (the admit arm) must treat `false` as
     /// "barrier not established".
-    fn wait_wave_tail_capacity(&self, max_outstanding: u64) -> bool {
+    pub(crate) fn wait_wave_tail_capacity(&self, max_outstanding: u64) -> bool {
         loop {
             let handed = self.commit_wave.tails_handed.load(AtomicOrdering::Acquire);
             let finished = self
@@ -1070,6 +1225,7 @@ impl Engine {
         }
         impl Drop for TailCompletion<'_> {
             fn drop(&mut self) {
+                let wedge = !self.clean;
                 if !self.clean {
                     let mut queue = self.engine.lock_commit_wave_queue();
                     let reason = queue.wedged.clone().unwrap_or_else(|| {
@@ -1090,12 +1246,33 @@ impl Engine {
                         }
                     }
                 }
+                if wedge {
+                    // Publish the sticky engine-wide fail-stop BEFORE the release-store that tells
+                    // barrier waiters this tail is finished. A COMMIT that observes the finished
+                    // counter through Acquire must therefore also observe the wedge before it can
+                    // claim identities or append WAL.
+                    self.engine.wedge_commit_path();
+                }
+                #[cfg(test)]
+                if wedge {
+                    let hook = wave_tail_failure_publish_hook()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some((engine, reached, resume)) = hook {
+                        if engine == self.engine as *const Engine as usize {
+                            reached.wait();
+                            resume.wait();
+                        }
+                    }
+                }
                 self.engine
                     .commit_wave
                     .tails_finished
                     .fetch_add(1, AtomicOrdering::Release);
-                let _queue = self.engine.lock_commit_wave_queue();
+                let queue = self.engine.lock_commit_wave_queue();
                 self.engine.commit_wave.cv.notify_all();
+                drop(queue);
             }
         }
         let mut completion = TailCompletion {
@@ -1113,6 +1290,10 @@ impl Engine {
             drop(tail); // armed: fails every still-unset member outcome with the wedge error
             return; // completion guard (clean=false) wedges idempotently + counts + notifies
         }
+        if self.is_commit_path_poisoned() {
+            drop(tail); // armed: fail outcomes; a wedged service publishes no later visibility
+            return;
+        }
         self.publish_committed_seq(tail.last_seq);
         for (position, _seq, _appended, rows) in &tail.committed {
             self.metrics.inc_commit();
@@ -1127,6 +1308,9 @@ impl Engine {
     /// outcomes) and by the sequencer as the fallback claimer at the depth gate. Returns whether
     /// a tail was finished.
     pub(crate) fn try_finish_pending_wave_tail(&self) -> bool {
+        if self.is_commit_path_poisoned() {
+            return false;
+        }
         // AUDIT d6d10f8e F: every waiter probes this every 64 spin iterations — pre-check the
         // counters (two atomic loads) so the common nothing-pending case never touches the
         // shared mutex.
@@ -1451,18 +1635,45 @@ impl Engine {
         text: &str,
         timestamp_micros: u64,
     ) -> Result<(), ExecuteError> {
+        if self.is_commit_path_poisoned() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "commit path is wedged; restart recovery required".to_string(),
+            )));
+        }
         let cmd = parse_command(text)?;
+        if self.transaction_snapshot_handle(txn_id).is_some() {
+            if matches!(
+                &cmd,
+                Command::Insert(_) | Command::Update(_) | Command::Delete(_)
+            ) {
+                return self.execute_dml_in_transaction(txn_id, text);
+            }
+            if !matches!(
+                &cmd,
+                Command::Begin | Command::Commit { .. } | Command::Rollback { .. }
+            ) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "command is not supported inside an active transaction; it was not executed"
+                        .to_string(),
+                )));
+            }
+        }
         // RETIREMENT A4e (audit B1-DDL/B2): any NON-DML command rehydrates every elided table
         // FIRST (under the commit lock via the serialized helper) — DDL preflights/validators
         // (ADD UNIQUE/PK/FK, CREATE INDEX) read the host store via visible_relational_rows, and a
         // stale prefix would validate a constraint over data that violates it. DDL is rare and
         // the elided set is tiny; the blunt sweep is the safe shape.
-        if self.host_install_elision_enabled()
-            && !matches!(
-                cmd,
-                Command::Insert(_) | Command::Update(_) | Command::Delete(_) | Command::Select(_)
-            )
-        {
+        let representation_neutral = matches!(
+            &cmd,
+            Command::Insert(_)
+                | Command::Update(_)
+                | Command::Delete(_)
+                | Command::Select(_)
+                | Command::Begin
+                | Command::Commit { .. }
+                | Command::Rollback { .. }
+        );
+        if self.host_install_elision_enabled() && !representation_neutral {
             let elided: Vec<String> = self
                 .read_state
                 .residency
@@ -1479,10 +1690,7 @@ impl Engine {
         // P4-2b (S-E.P4, design review H2): the SAME sweep for CHUNK-AUTHORITATIVE tables — a
         // DDL preflight (ADD PK/UNIQUE/CHECK/FK) reading visible_relational_rows against a
         // FROZEN store would validate vacuously; de-authoritize every class table first.
-        if !matches!(
-            cmd,
-            Command::Insert(_) | Command::Update(_) | Command::Delete(_) | Command::Select(_)
-        ) {
+        if !representation_neutral {
             let class_tables: Vec<String> = self
                 .read_state
                 .residency
@@ -1600,21 +1808,37 @@ impl Engine {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Begin => {
-                self.commit_state().txn_manager.begin_with_id(txn_id)?;
+                self.begin_transaction_context(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Commit { chain } => {
-                self.commit_state().txn_manager.commit(txn_id)?;
-                if chain {
-                    self.commit_state().txn_manager.begin()?;
+                let snapshot = self
+                    .transaction_snapshot_handle(txn_id)
+                    .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+                let _statement = snapshot
+                    .statement_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.ensure_commit_path_available()
+                    .map_err(ExecuteError::Engine)?;
+                if snapshot.transaction_delta_is_empty() {
+                    self.finish_transaction_context(txn_id, true, chain)?;
+                } else {
+                    self.commit_transaction_delta(txn_id, chain, timestamp_micros)?;
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Rollback { chain } => {
-                self.commit_state().txn_manager.rollback(txn_id)?;
-                if chain {
-                    self.commit_state().txn_manager.begin()?;
-                }
+                let snapshot = self
+                    .transaction_snapshot_handle(txn_id)
+                    .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+                let _statement = snapshot
+                    .statement_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.ensure_commit_path_available()
+                    .map_err(ExecuteError::Engine)?;
+                self.finish_transaction_context(txn_id, false, chain)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::GetKv { key } => {
@@ -1635,6 +1859,8 @@ impl Engine {
     }
 
     pub fn execute_read_text(&mut self, text: &str) -> Result<Option<String>, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         let cmd = parse_command(text)?;
 
         match cmd {
@@ -1755,7 +1981,19 @@ impl Engine {
     pub(crate) fn pin_relational_read_at(&self, table: &str, s: Index) -> RelationalReadPin {
         RelationalReadPin {
             visibility: StorageVisibility { read_txn_id: s },
-            table_rows: self.read_state.mvcc.table_rows(table),
+            table_rows: self.read_table_rows_at(table, s),
         }
+    }
+}
+
+#[cfg(test)]
+mod device_verdict_cardinality_tests {
+    use super::exact_device_verdict_cardinality;
+
+    #[test]
+    fn exact_cardinality_rejects_short_and_long_device_components() {
+        assert!(exact_device_verdict_cardinality(3, &[3, 3, 3]));
+        assert!(!exact_device_verdict_cardinality(3, &[2, 3, 3]));
+        assert!(!exact_device_verdict_cardinality(3, &[3, 4, 3]));
     }
 }

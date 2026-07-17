@@ -49,7 +49,7 @@ use gpu_db_storage::{
     InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleId, TupleStore, TupleVersion,
     Visibility as StorageVisibility,
 };
-use gpu_db_txn::{TxnError, TxnManager};
+use gpu_db_txn::{TxnError, TxnManager, TxnState};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
 use gpu_db_wal::{
     append_wal_archive_segment_with_timestamps, apply_wal_archive_retention_from_txn,
@@ -116,6 +116,8 @@ mod engine_select_bind;
 mod engine_select_exec;
 mod engine_sql_pg;
 mod engine_streaming_exec;
+mod engine_transaction_commit;
+mod engine_transaction_delta;
 mod engine_wal_archive;
 mod engine_write_apply;
 
@@ -356,10 +358,18 @@ pub struct Engine {
     /// already holds `&mut self` (serialized DDL apply, recovery, checkpoint/snapshot admin) reaches
     /// it via `commit_state_mut()` (a zero-cost `Mutex::get_mut`, no actual locking).
     commit: Mutex<CommitState>,
-    /// In-flight transactions' read snapshots (write-half MVCC, Stage 4), for the oldest-active GC
-    /// boundary. Separate from `commit` so a transaction can register its snapshot at prepare-begin
-    /// WITHOUT serializing on the commit_mutex (prepare is off-lock).
+    /// Sticky fail-stop independent of mutex poisoning. A transaction whose WAL record crossed
+    /// the durable/replicated boundary but could not be fully installed must never return to
+    /// ordinary service: restart recovery is the only safe continuation.
+    commit_path_wedged: Arc<AtomicBool>,
+    /// In-flight statements' and explicit transactions' read snapshots (write-half MVCC, Stage 4),
+    /// for the oldest-active GC boundary. Autocommit prepare registers a scalar guard; explicit
+    /// BEGIN registers one keyed, generation-owned catalog/MVCC/GPU-resource bundle.
     active_snapshots: std::sync::Arc<Mutex<ActiveSnapshots>>,
+    /// GPU bytes owned only by explicit-transaction private generations, by device. These
+    /// allocations are not present in the globally published residency maps, so they must be
+    /// charged separately against the same admission budget until the transaction snapshot drops.
+    transaction_private_gpu_bytes: Arc<Mutex<BTreeMap<u16, u64>>>,
     /// Lock-free mirror of the replicator role (0=Leader, 1=Follower, 2=Candidate), updated only
     /// by the rare `become_*` transitions. The per-statement leader check (`repl_role`) used to
     /// lock the commit_mutex for this one field read — measured to CONVOY every "off-lock"

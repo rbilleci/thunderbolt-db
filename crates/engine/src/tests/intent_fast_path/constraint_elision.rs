@@ -437,13 +437,13 @@ fn gpu_fk_child_date_fk_stays_elided() {
 }
 
 /// CPU-ENGINE RETIREMENT (ADR-006, FK child side — NON-i32 fk columns): UUID / BIGINT / TEXT fk
-/// children now ELIDE. These types have NO device hash index, so the inbound child-reference
-/// check rides `device_eq_scan_literal` → the Eq scan-locate — three DISTINCT kernel paths (uuid
+/// children now ELIDE. Duplicate-heavy child columns are not unique indexes, so the inbound
+/// child-reference check rides `device_eq_scan_literal` → the Eq scan-locate — distinct paths (uuid
 /// = b128 byte compare via the canonical `format_uuid` round-trip; int8 = CompareScalarI64; text
 /// = byte-exact blob compare). Per pair: elided-era referencing rows (duplicated fk values),
 /// a rejected referenced-parent delete with the child STAYING elided, and an allowed
-/// unreferenced delete. The parents (uuid/int8/text PK, not foldable) stay NON-elided — their
-/// parent-exists probes take the host value index; only the CHILD side is device-native here.
+/// unreferenced delete. R3-002 also permits the foldable wide-key parents to elide; their
+/// parent-exists probes use the fingerprint index plus exact typed device recheck.
 /// GPU-gated.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
@@ -482,10 +482,8 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
              REFERENCES slots(at)",
         ),
     ] {
-        // One monotone txn-id stream with headroom over every commit seq this test produces:
-        // the NON-elided parent probes run at the RAW facade boundary (no committed_seq raise),
-        // so a txn id BELOW the row's commit seq would hide the parent row (the known
-        // facade-id/commit-seq decoupling seam — a harness artifact here, not the subject).
+        // One monotone facade txn-id stream keeps this older cross-type fixture independent of
+        // commit-sequence allocation details.
         engine.execute_text(TXN0 + 1, parent_ddl).unwrap();
         engine.execute_text(TXN0 + 2, child_ddl).unwrap();
         engine.execute_text(TXN0 + 3, fk_ddl).unwrap();
@@ -542,7 +540,16 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         }
         sql!(format!("INSERT INTO {parent} VALUES ({kept}, 'keep')")).unwrap();
         sql!(format!("INSERT INTO {parent} VALUES ({departing}, 'ref')")).unwrap();
+        assert!(
+            engine.table_install_elided(parent),
+            "{parent}: a foldable single-wide parent key must elide"
+        );
+        let parent_validate_before = engine.dml_device_validate_hits();
         sql!(format!("INSERT INTO {child} VALUES (1, {kept})")).unwrap();
+        assert!(
+            engine.dml_device_validate_hits() > parent_validate_before,
+            "{parent}: child provider validation must use the exact device fingerprint recheck"
+        );
         if !gpu_checked {
             let snap = engine.populate_relational_residency_snapshot(child);
             if snap
@@ -627,9 +634,18 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
     engine
         .execute_text(txn(), "INSERT INTO toggles VALUES (false, 'off')")
         .unwrap();
+    assert!(
+        engine.table_install_elided("toggles"),
+        "a BOOL-PK parent must elide through the bitmap fingerprint index"
+    );
+    let bool_parent_validate_before = engine.dml_device_validate_hits();
     engine
         .execute_text(txn(), "INSERT INTO states VALUES (1, false)")
         .unwrap();
+    assert!(
+        engine.dml_device_validate_hits() > bool_parent_validate_before,
+        "the BOOL parent provider probe must exact-recheck on device"
+    );
     engine
         .execute_text(txn(), "INSERT INTO states VALUES (2, false)")
         .unwrap();

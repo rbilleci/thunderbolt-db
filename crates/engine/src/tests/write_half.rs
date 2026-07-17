@@ -126,14 +126,49 @@ fn recent_commits_ledger_integer_slot_conflict_and_cross_path() {
 
 #[test]
 fn active_snapshots_track_oldest_boundary() {
-    // The oldest-active read-snapshot boundary (the GC/ledger-prune floor) under registration +
-    // deregistration (write-half MVCC, Stage 4).
+    // The oldest-active read-snapshot boundary (the GC/ledger-prune floor) folds statement-local
+    // guards and keyed transaction-lifetime holds into the same commit-sequence multiset.
     let mut active = ActiveSnapshots::default();
     assert_eq!(active.oldest(), None);
     active.register(10);
     active.register(7);
     active.register(7);
     active.register(12);
+    active.register_transaction(
+        41,
+        Arc::new(TransactionSnapshot {
+            boundary: 6,
+            next_row_id: 1,
+            catalog: Arc::new(CatalogSnapshot::default()),
+            table_versions: BTreeMap::new(),
+            resident_snapshots: Arc::new(BTreeMap::new()),
+            resident_shards: Arc::new(BTreeMap::new()),
+            elided_tables: Arc::new(BTreeSet::new()),
+            chunk_authoritative_tables: Arc::new(BTreeMap::new()),
+            delta: std::sync::Mutex::new(TransactionDeltaState {
+                generation: 0,
+                resident_shards: Arc::new(BTreeMap::new()),
+                streaming_cold_chunks: Arc::new(BTreeMap::new()),
+                deltas: Vec::new(),
+                write_set: WriteSet::default(),
+                next_row_id: 1,
+                sequence_state: BTreeMap::new(),
+                private_gpu_bytes_by_gpu: BTreeMap::new(),
+            }),
+            statement_lock: std::sync::Mutex::new(()),
+            private_gpu_account: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            _resident_index_resources: Vec::new(),
+        }),
+    );
+    assert_eq!(active.transaction_snapshot(41), Some(6));
+    assert_eq!(active.oldest(), Some(6));
+    assert_eq!(
+        active
+            .deregister_transaction(41)
+            .map(|snapshot| snapshot.boundary),
+        Some(6)
+    );
+    assert_eq!(active.transaction_snapshot(41), None);
     assert_eq!(active.oldest(), Some(7));
     active.deregister(7); // one of the two at 7 remains
     assert_eq!(active.oldest(), Some(7));
@@ -558,16 +593,18 @@ fn group_fsync_failure_wedges_the_concurrent_commit_path_without_exposing_the_de
         "the wedge poisons the commit_mutex so the façade refuses further service"
     );
 
-    // The applied-but-unpublished delta is invisible (committed_seq never advanced past it).
+    // The engine-wide fail-stop refuses reads after the applied-but-unpublished delta wedges the
+    // commit path. Visibility is proved from the durable prefix after restart below; serving a
+    // live snapshot here would risk exposing torn state.
     let Command::Select(select) = parse_command("SELECT id FROM t").unwrap() else {
         panic!("expected SELECT plan");
     };
     assert!(
-        e.execute_relational_select(&select)
-            .unwrap()
-            .rows
-            .is_empty(),
-        "a commit whose group fsync failed must never become visible"
+        matches!(
+            e.execute_relational_select(&select),
+            Err(ExecuteError::Engine(EngineError::Durability(_)))
+        ),
+        "a wedged engine must fail reads closed until restart recovery"
     );
 
     // The sticky group failure turns later concurrent commits into errors, not panics.
@@ -1009,4 +1046,241 @@ fn wave_insert_prepared_before_add_check_is_revalidated() {
         .unwrap()
         .rows;
     assert_eq!(rows.len(), 1, "only the seed row survives");
+}
+
+/// One sticky engine gate owns every public service surface and releases classic work already
+/// queued when a post-durable invariant failure wedges the process.
+#[test]
+fn central_commit_wedge_drains_classic_queue_and_rejects_reads_writes_and_drivers() {
+    let mut e = Engine::new_local_cpu_oracle();
+    e.execute_text(1, "SET live=value").unwrap();
+    e.execute_text(2, "CREATE TABLE surface_gate (id INT)")
+        .unwrap();
+    let Command::Select(surface_select) = parse_command("SELECT id FROM surface_gate").unwrap()
+    else {
+        panic!("expected SELECT plan");
+    };
+    let ready_submission = e
+        .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
+        .unwrap();
+    let ready_batched_submission = e
+        .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
+        .unwrap();
+    let ready_detached_submission = e
+        .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
+        .unwrap();
+    let text = "INSERT INTO t VALUES (1)";
+    let item = e.make_covered_insert_wave_item(
+        2,
+        parse_command(text).unwrap(),
+        text,
+        WriteSet::default(),
+        e.committed_seq(),
+        BTreeSet::new(),
+        e.catalog_snapshot().commit_seq,
+        None,
+        None,
+    );
+    let outcome = e.submit_commit_wave_item(item).unwrap();
+
+    e.wedge_commit_path();
+    let queued = outcome
+        .take_if_done()
+        .expect("wedging must settle every queued classic outcome")
+        .unwrap_err();
+    assert!(queued.to_string().contains("restart recovery"));
+    assert!(
+        !e.drive_commit_wave(),
+        "a wedged driver must perform no work"
+    );
+    assert!(e
+        .commit_mutation(3, Arc::from(&b"SET later=value"[..]))
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(e
+        .execute_read_text("GET live")
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert_eq!(e.get("live"), None, "the public KV read fail-stops too");
+
+    let hook_called = std::sync::atomic::AtomicBool::new(false);
+    let select_error = e
+        .execute_relational_select_instrumented(&surface_select, || {
+            hook_called.store(true, AtomicOrdering::Release);
+        })
+        .unwrap_err();
+    assert!(select_error.to_string().contains("restart recovery"));
+    assert!(
+        !hook_called.load(AtomicOrdering::Acquire),
+        "the instrumented read must fail before binding or execution"
+    );
+    assert!(e
+        .execute_relational_function(&SelectFunction {
+            name: "missing".to_string(),
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    let mvcc_query = MvccReadQuery {
+        source: MvccReadSource::FullScan,
+        visibility: StorageVisibility { read_txn_id: 2 },
+        filter: None,
+        order: None,
+        projection: MvccProjection::KeyValue,
+        limit: None,
+    };
+    assert!(e
+        .execute_mvcc_query(&mvcc_query)
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(e
+        .execute_mvcc_query_with_cuda_driver_probe(&mvcc_query)
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(e
+        .prepare_relational_retained_read_job(&surface_select)
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    let submit_error =
+        match e.submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[]) {
+            Err(error) => error,
+            Ok(_) => panic!("a wedged engine accepted a retained-read submission"),
+        };
+    assert!(submit_error.to_string().contains("restart recovery"));
+    assert!(e
+        .complete_relational_retained_read_submission(ready_submission)
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(e
+        .complete_relational_retained_read_submission_batched(ready_batched_submission)
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(ready_detached_submission
+        .complete_detached()
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(e
+        .submit_sharded_point_lookups_batched(&surface_select, &[1])
+        .is_none());
+    assert!(e
+        .relational_retained_snapshot_handle("surface_gate")
+        .is_none());
+    assert!(e
+        .execute_resident_plan(&surface_select)
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(e
+        .execute_resident_expr_select_sql("SELECT id FROM surface_gate")
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(e
+        .execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
+            &[]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(e
+        .relational_copy_columns("surface_gate")
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+    assert!(e
+        .execute_relational_copy_rows(
+            4,
+            &CopyFromStdin {
+                table: "surface_gate".to_string(),
+                columns: Some(vec!["id".to_string()]),
+                options: gpu_db_sql::CopyOptions::TEXT,
+            },
+            Vec::new(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
+}
+
+#[test]
+fn instrumented_autocommit_dml_rejects_an_active_transaction_identity() {
+    let e = Engine::new_local_cpu_oracle();
+    e.execute_text(1, "CREATE TABLE accounts (id INT)").unwrap();
+    e.execute_text(90, "BEGIN").unwrap();
+    let wal_before = e.durable_wal_records().len();
+    let hook_called = std::sync::atomic::AtomicBool::new(false);
+    let error = e
+        .execute_dml_concurrent_instrumented(90, "INSERT INTO accounts (id) VALUES (1)", || {
+            hook_called.store(true, AtomicOrdering::Release)
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("autocommit-only"), "{error}");
+    assert!(!hook_called.load(AtomicOrdering::Acquire));
+    assert_eq!(e.durable_wal_records().len(), wal_before);
+    assert!(e.transaction_snapshot_handle(90).is_some());
+    e.execute_text(90, "ROLLBACK").unwrap();
+}
+
+#[test]
+fn retained_completion_rejects_cross_engine_and_mid_completion_wedges() {
+    let origin = Engine::new_local_cpu_oracle();
+    let other = Engine::new_local_cpu_oracle();
+    let foreign = origin
+        .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
+        .unwrap();
+    let error = other
+        .complete_relational_retained_read_submission(foreign)
+        .unwrap_err();
+    assert!(error.to_string().contains("different engine"), "{error}");
+    let foreign_batched = origin
+        .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
+        .unwrap();
+    let error = other
+        .complete_relational_retained_read_submission_batched(foreign_batched)
+        .unwrap_err();
+    assert!(error.to_string().contains("different engine"), "{error}");
+
+    let engine = Arc::new(Engine::new_local_cpu_oracle());
+    let submission = engine
+        .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
+        .unwrap();
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    engine.set_retained_completion_post_hook(Arc::clone(&reached), Arc::clone(&resume));
+    let completion = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || engine.complete_relational_retained_read_submission(submission))
+    };
+    reached.wait();
+    engine.wedge_commit_path();
+    resume.wait();
+    let error = completion.join().unwrap().unwrap_err();
+    assert!(error.to_string().contains("restart recovery"), "{error}");
+
+    let engine = Arc::new(Engine::new_local_cpu_oracle());
+    let submission = engine
+        .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
+        .unwrap();
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    engine.set_retained_completion_post_hook(Arc::clone(&reached), Arc::clone(&resume));
+    let completion = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            engine.complete_relational_retained_read_submission_batched(submission)
+        })
+    };
+    reached.wait();
+    engine.wedge_commit_path();
+    resume.wait();
+    let error = completion.join().unwrap().unwrap_err();
+    assert!(error.to_string().contains("restart recovery"), "{error}");
 }

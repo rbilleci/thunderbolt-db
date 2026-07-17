@@ -77,6 +77,8 @@ impl Engine {
         &self,
         sql: &str,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         let stmt = parse_single_select(sql)?;
         if select_has_inline_window(&stmt)? {
             return self.execute_gpu_rank_window_select(&stmt);

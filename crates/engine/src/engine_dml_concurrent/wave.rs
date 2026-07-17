@@ -1,18 +1,33 @@
 use super::{
-    coerce_filter_literal, current_timestamp_micros, relational_key_prefix,
-    try_encode_binary_insert, wave_device_phase_timing_enabled, wave_host_phase_timing_enabled,
-    Command, CommitState, CommitWaveItem, CommitWaveTail, DmlReadSnapshot, Engine, EngineError,
-    ExecuteError, Index, Insert, InsertPrepareValidation, LogReplicator, RelationalIndex,
-    RelationalTable, SqlValue, WalRecord, WriteDelta, WAVE_DEVICE_STATS, WAVE_HOST_STATS,
+    coerce_filter_literal, current_timestamp_micros, exact_device_verdict_cardinality,
+    relational_key_prefix, try_encode_binary_insert, wave_device_phase_timing_enabled,
+    wave_host_phase_timing_enabled, Command, CommitState, CommitWaveItem, CommitWaveTail,
+    DmlReadSnapshot, Engine, EngineError, ExecuteError, Index, Insert, InsertPrepareValidation,
+    LogReplicator, RelationalIndex, RelationalTable, SqlValue, WalRecord, WriteDelta,
+    WAVE_DEVICE_STATS, WAVE_HOST_STATS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+type ShardedPostValidationHook = (
+    usize,
+    std::sync::Arc<std::sync::Barrier>,
+    std::sync::Arc<std::sync::Barrier>,
+);
+
+#[cfg(test)]
+fn sharded_post_validation_hook() -> &'static std::sync::Mutex<Option<ShardedPostValidationHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ShardedPostValidationHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 /// E2.4a — VARIANT 1 (shared-WAL sharded sequencing): the number of PARALLEL shard workers the
 /// sequencer fans a homogeneous covered-INSERT-intent wave out to. `1` (default) = the E2.3 serial
-/// sequencer, byte-identical. `N>1` moves the per-item conflict check/record (per-shard private
-/// integer ledger for intent-only slots; same-PK → same shard → single-winner 23505 preserved),
+/// sequencer. `N>1` moves per-item conflict arbitration (device history plus per-shard private
+/// same-wave sets; same-PK → same shard → single-winner 23505 preserved),
 /// the value clone, and the WAL-record clone OFF the ordered critical section into N workers hashing
 /// on the row's unique-slot key; the ordered WAL append + global commit-seq claim + device-append
 /// buffer stay under ONE thin serial cut (the ~0.3-0.4us/item floor).
@@ -54,7 +69,8 @@ type CommitWaveWinner = (usize, String, Vec<SqlValue>, Vec<u8>, usize);
 /// E2.4a — one shard worker's verdict for a wave position: either a retryable/duplicate abort
 /// (outcome set verbatim in the serial cut) or a Commit carrying the cloned row image and the
 /// cloned W5a WAL record (row id still the encode-time placeholder; the serial cut patches it with
-/// the wave-assigned id). Built entirely off the commit lock by [`Engine::shard_prepare_intents`].
+/// the wave-assigned id). Built by parallel workers while the coordinator retains the serialized
+/// publication boundary; the workers do not touch the guarded commit state.
 enum ShardVerdict {
     Commit {
         table: String,
@@ -63,6 +79,16 @@ enum ShardVerdict {
         wal_offset: usize,
     },
     Abort(ExecuteError),
+}
+
+/// Exact outcome of the wave-batched device uniqueness pass. `violations` are authoritative
+/// duplicate-key verdicts. `declined` contains positions for which the device could not return a
+/// complete verdict; those positions must abort retryably before WAL rather than being interpreted
+/// as misses or delegated to a production host relational source.
+#[derive(Default)]
+struct WaveUniqueVerdicts {
+    violations: BTreeMap<usize, String>,
+    declined: BTreeSet<usize>,
 }
 
 /// E2.4a — the deterministic shard of a unique slot: a fibonacci-hash mix of the packed slot id and
@@ -102,10 +128,23 @@ impl Drop for CommitWaveBatchGuard<'_> {
             }
         }
         self.engine.commit_wave.cv.notify_all();
+        self.engine.wedge_commit_path();
     }
 }
 
 impl Engine {
+    #[cfg(test)]
+    pub(crate) fn set_sharded_post_validation_hook(
+        &self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *sharded_post_validation_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((self as *const Self as usize, reached, resume));
+    }
+
     /// Commit one WAVE: the per-item (3a)-(3e) steps of the old per-commit critical section, run
     /// back-to-back under ONE commit_mutex hold in wave order. W2: the durability tail (group
     /// fsync wait + `committed_seq` publish + acks) is RETURNED as a [`CommitWaveTail`] (plus the
@@ -142,16 +181,13 @@ impl Engine {
     /// CATALOG DRIFT (a constraint-adding DDL committed since the item's prepare, gen mismatch):
     /// the item MIGHT have been deferred but its eligibility can't be re-derived, so full-validate
     /// it now (redundant if it wasn't deferred, safe either way — DDL mid-wave is rare). SAME-wave
-    /// dups are caught by the unique-slot conflict ledger (#18), NOT here; this catches
-    /// ALREADY-COMMITTED dups. A locate DECLINE / non-batchable item -> per-item full validation.
-    fn wave_batch_validate_unique(
-        &self,
-        batch: &[CommitWaveItem],
-    ) -> std::collections::BTreeMap<usize, String> {
-        let mut violations: std::collections::BTreeMap<usize, String> =
-            std::collections::BTreeMap::new();
+    /// dups are caught by wave-local slot arbitration, NOT here; this catches
+    /// ALREADY-COMMITTED dups. A device locate/recheck decline aborts retryably; an unbindable item
+    /// takes the typed per-item full validator.
+    fn wave_batch_validate_unique(&self, batch: &[CommitWaveItem]) -> WaveUniqueVerdicts {
+        let mut verdicts = WaveUniqueVerdicts::default();
         if !self.device_write_locate_wave_batch_enabled() {
-            return violations;
+            return verdicts;
         }
         let catalog = self.catalog_snapshot();
         // PERF (this fn runs SERIALLY on the sequencer, so per-item host work must be tiny — the
@@ -250,7 +286,7 @@ impl Engine {
         for (gi, &(tctx_idx, key_id, ord)) in group_keys.iter().enumerate() {
             let table = tables[tctx_idx].table;
             let index = &table.indexes[ord];
-            let compound = crate::engine_residency::index_is_compound(index);
+            let fingerprint_backed = crate::engine_residency::index_uses_fingerprint(table, index);
             let locate_started = wave_device_phase_timing_enabled().then(Instant::now);
             let locate = self.wave_batch_locate_hit_counts(table, key_id, &group_needles[gi]);
             if let Some(started) = locate_started {
@@ -259,6 +295,16 @@ impl Engine {
             }
             match locate {
                 Some(counts) => {
+                    let expected = group_positions[gi].len();
+                    if !exact_device_verdict_cardinality(
+                        expected,
+                        &[group_needles[gi].len(), counts.len()],
+                    ) {
+                        verdicts
+                            .declined
+                            .extend(group_positions[gi].iter().copied());
+                        continue;
+                    }
                     for ((&pos, &needle), &count) in group_positions[gi]
                         .iter()
                         .zip(group_needles[gi].iter())
@@ -273,40 +319,52 @@ impl Engine {
                         let visibility = crate::StorageVisibility {
                             read_txn_id: batch[pos].read_snapshot,
                         };
-                        let is_dup = if compound {
+                        let is_dup = if fingerprint_backed {
                             let Command::Insert(insert) = &batch[pos].cmd else {
                                 continue;
                             };
                             match insert_index_key_tuple(insert, table, index) {
-                                Some(tuple) => self
-                                    .visible_row_with_tuple(
-                                        table,
-                                        visibility,
-                                        key_id,
-                                        Some(needle),
-                                        &tuple,
-                                        None,
-                                    )
-                                    .unwrap_or(false),
+                                Some(tuple) => match self.visible_row_with_tuple(
+                                    table,
+                                    visibility,
+                                    key_id,
+                                    Some(needle),
+                                    &tuple,
+                                    None,
+                                ) {
+                                    Ok(is_dup) => is_dup,
+                                    Err(_) => {
+                                        verdicts.declined.insert(pos);
+                                        continue;
+                                    }
+                                },
                                 None => {
-                                    // Unbindable tuple (e.g. NULL key column) -> full host validate.
+                                    // An unbindable tuple (for example a NULL key column) takes the
+                                    // full typed validator. On a device-authoritative relation that
+                                    // validator remains device-native; an actual device decline is
+                                    // represented separately above and never becomes `false`.
                                     full_validate.push(pos);
                                     continue;
                                 }
                             }
                         } else {
-                            self.visible_row_with_value(
+                            match self.visible_row_with_value(
                                 table,
                                 visibility,
                                 key_id,
                                 &SqlValue::Int4(needle),
                                 None,
-                            )
-                            .unwrap_or(false)
+                            ) {
+                                Ok(is_dup) => is_dup,
+                                Err(_) => {
+                                    verdicts.declined.insert(pos);
+                                    continue;
+                                }
+                            }
                         };
                         if is_dup {
                             let index_name = index.name.as_str();
-                            violations.entry(pos).or_insert_with(|| {
+                            verdicts.violations.entry(pos).or_insert_with(|| {
                                 format!(
                                     "duplicate key value violates unique index \"{index_name}\""
                                 )
@@ -314,12 +372,14 @@ impl Engine {
                         }
                     }
                 }
-                None => full_validate.extend(group_positions[gi].iter().copied()),
+                None => verdicts
+                    .declined
+                    .extend(group_positions[gi].iter().copied()),
             }
         }
         // Full validation for drifted / declined / unbindable inserts (rare).
         for pos in full_validate {
-            if violations.contains_key(&pos) {
+            if verdicts.violations.contains_key(&pos) || verdicts.declined.contains(&pos) {
                 continue;
             }
             let Command::Insert(insert) = &batch[pos].cmd else {
@@ -329,13 +389,16 @@ impl Engine {
                 continue;
             }
             let snapshot = self.dml_read_snapshot(batch[pos].read_snapshot);
-            if let Err(err) =
-                self.prepare_insert(insert, snapshot, None, InsertPrepareValidation::Full)
-            {
-                violations.insert(pos, err.to_string());
+            if let Err(err) = self.prepare_insert(
+                insert,
+                snapshot,
+                None,
+                InsertPrepareValidation::WaveFallbackFull,
+            ) {
+                verdicts.violations.insert(pos, err.to_string());
             }
         }
-        violations
+        verdicts
     }
 
     fn sequence_commit_wave_inner(
@@ -347,10 +410,9 @@ impl Engine {
         // (conflict check/record, value + WAL-record clones) out to N parallel shard workers and
         // keep only the ordered WAL append + global commit-seq claim + device-append buffer under a
         // thin serial cut. A mixed wave (any non-intent / classic item) keeps the fully-serial path
-        // below, byte-identical: the sharded conflict verdict is computed from a shared-ledger
-        // SNAPSHOT + a per-shard private dedup set, which is only equivalent to the serial
-        // record-as-you-go ledger when no in-wave classic write can slip a same-slot record between
-        // the snapshot and the serial cut (a homogeneous-intent wave has none).
+        // below. The sharded conflict verdict combines device history with a per-shard private
+        // dedup set; a homogeneous-intent wave guarantees no classic item can interleave between
+        // that verdict and the ordered cut.
         let shards = intent_sequencer_shards();
         if shards > 1 && batch.len() >= SHARD_MIN_WAVE && self.auto_admit_on_commit_enabled() {
             let wave_catalog_seq = self.catalog_snapshot().commit_seq;
@@ -382,6 +444,26 @@ impl Engine {
         let mut next_row_id = self.read_state.mvcc.current_row_id();
 
         let mut commit = self.commit_state();
+        if let Err(error) = self.ensure_commit_path_available() {
+            let message = error.to_string();
+            for item in &batch {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                    message.clone(),
+                ))));
+            }
+            std::mem::forget(guard);
+            return None;
+        }
+        if let Err(error) = self.intent_lanes_write_guard() {
+            let message = error.to_string();
+            for item in &batch {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                    message.clone(),
+                ))));
+            }
+            std::mem::forget(guard);
+            return None;
+        }
         let flush_fast_run =
             |commit: &mut CommitState,
              fast_run: &mut Vec<(usize, Index, String, WriteDelta)>,
@@ -439,7 +521,7 @@ impl Engine {
         // are unique violations -> aborted in the loop below with the byte-identical 23505.
         let hostphase = wave_host_phase_timing_enabled();
         let wave_validate_started = hostphase.then(Instant::now);
-        let wave_unique_violations = self.wave_batch_validate_unique(&batch);
+        let wave_unique_verdicts = self.wave_batch_validate_unique(&batch);
         if let Some(started) = wave_validate_started {
             WAVE_HOST_STATS[0]
                 .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -449,9 +531,18 @@ impl Engine {
         // interleave a wave's items. Load the snapshot ONCE here instead of per item (the old
         // per-item `catalog_snapshot()` was an ArcSwap load + Arc clone on every commit — the
         // generation gate at re-resolve, the fast-run eligibility probe, and the intent fast-lane
-        // gate all read it). `wave_catalog_seq` is the ledger-#18 stamp every item compares against.
+        // gate all read it). `wave_catalog_seq` is the schema stamp every item compares against.
         let wave_catalog = self.catalog_snapshot();
         let wave_catalog_seq = wave_catalog.commit_seq;
+        // Unique keys of successful earlier members whose device append/tombstone may still be
+        // buffered until this wave's flush. This set is wave-bounded; committed history lives in
+        // the resident version stamps queried below, not in the CPU commit ledger.
+        let mut wave_unique_slots: std::collections::HashSet<
+            crate::write_path::UniqueIndexSlotKey,
+        > = std::collections::HashSet::new();
+        let mut wave_unique_slots_i32: std::collections::HashSet<
+            crate::write_path::IntUniqueSlotKey,
+        > = std::collections::HashSet::new();
         // HOST-phase probe: `_hp` timestamps the running phase boundary; `hp!(k)` charges the elapsed
         // time since the last boundary to WAVE_HOST_STATS[k] and resets. Reset at each item's top.
         let mut _hp = hostphase.then(Instant::now);
@@ -477,10 +568,16 @@ impl Engine {
             }
             // M1 design B: a deferred INSERT whose PK value already exists (wave-batch verdict)
             // aborts here — the same 23505 the off-lock validation would have raised.
-            if let Some(err) = wave_unique_violations.get(&position) {
+            if let Some(err) = wave_unique_verdicts.violations.get(&position) {
                 batch[position].set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     err.clone(),
                 ))));
+                continue;
+            }
+            if wave_unique_verdicts.declined.contains(&position) {
+                batch[position].set_outcome(Err(ExecuteError::Serialization(
+                    "device uniqueness validation declined before commit (retryable)".to_string(),
+                )));
                 continue;
             }
             // Batched-append ORDER: a non-INSERT item's re-resolve (device locate) and its
@@ -488,13 +585,63 @@ impl Engine {
             if !matches!(batch[position].cmd, Command::Insert(_)) {
                 flush_appends(&mut pending_appends, &mut committed);
             }
-            // (3a) SI first-committer-wins: any key in the write-set committed after this item's
-            // read snapshot aborts it (retryable). Earlier items in THIS wave recorded into the
-            // ledger below, so intra-wave conflicts are caught here exactly like cross-wave ones.
-            if commit
+            // (3a) SI first-committer-wins. Row identity conflicts retain the bounded
+            // oldest-active CPU map. Unique conflicts come from exact device version history,
+            // plus the wave-local bridge for earlier buffered members not yet published.
+            let item = &batch[position];
+            let row_conflict = commit
                 .ledger
-                .conflicts(&batch[position].write_set, batch[position].read_snapshot)
-            {
+                .conflicts_rows(&item.write_set, item.read_snapshot);
+            let has_unique = !item.write_set.unique_slots.is_empty()
+                || !item.write_set.unique_slots_i32.is_empty();
+            let wave_unique_conflict = item
+                .write_set
+                .unique_slots
+                .iter()
+                .any(|slot| wave_unique_slots.contains(slot))
+                || item
+                    .write_set
+                    .unique_slots_i32
+                    .iter()
+                    .any(|slot| wave_unique_slots_i32.contains(slot));
+            let device_unique_conflict =
+                if !has_unique || wave_unique_conflict {
+                    false
+                } else {
+                    match item.offlock_delta.as_ref().and_then(|delta| {
+                        self.device_unique_write_conflicts(delta, item.read_snapshot)
+                    }) {
+                        Some(conflict) => conflict,
+                        None => {
+                            // Ordinary CPU-oracle unit tests keep their parity ledger. Production has
+                            // no host authority: a missing device history verdict fails closed. Test
+                            // builds follow that same law once a table is device-authoritative, so an
+                            // actual-GPU acceptance target cannot pass via the cfg(test) parity map.
+                            #[cfg(test)]
+                            {
+                                let device_authoritative = match &item.cmd {
+                                    Command::Insert(insert) => Some(insert.table.as_str()),
+                                    Command::Update(update) => Some(update.table.as_str()),
+                                    Command::Delete(delete) => Some(delete.table.as_str()),
+                                    _ => None,
+                                }
+                                .is_some_and(|table| {
+                                    self.table_install_elided(table)
+                                        || self.table_chunk_authoritative(table).is_some()
+                                });
+                                device_authoritative
+                                    || commit
+                                        .ledger
+                                        .conflicts_unique(&item.write_set, item.read_snapshot)
+                            }
+                            #[cfg(not(test))]
+                            {
+                                true
+                            }
+                        }
+                    }
+                };
+            if row_conflict || wave_unique_conflict || device_unique_conflict {
                 let read_snapshot = batch[position].read_snapshot;
                 batch[position].set_outcome(Err(ExecuteError::Serialization(format!(
                     "write-write conflict on a key committed after read snapshot {read_snapshot}"
@@ -580,6 +727,9 @@ impl Engine {
                 commit.record_commit_timestamp(batch[position].txn_id, timestamp_micros);
                 hp!(3);
                 commit.ledger.record(&batch[position].write_set, commit_seq);
+                wave_unique_slots.extend(batch[position].write_set.unique_slots.iter().cloned());
+                wave_unique_slots_i32
+                    .extend(batch[position].write_set.unique_slots_i32.iter().copied());
                 hp!(4);
                 // Elided apply == advance the row-id allocator (host store skipped) + the elision
                 // counter, exactly `apply_delta`'s elided-insert branch for one row. Clone the row
@@ -646,21 +796,22 @@ impl Engine {
             // the conflicts() check above IS the commit-time guard (coverage proof on
             // InsertPrepareValidation) — but ONLY while the catalog generation still matches
             // the off-lock prepare's (audit fix): a constraint-adding DDL committed since S
-            // records nothing in the ledger and the item's write_set lacks slots for the new
+            // is absent from the prepared key projection and the item's write_set lacks slots for the new
             // index, so the skip would silently bypass it. Any DDL bumps the stamp -> Full
             // (always correct; DDL is rare so the hot path keeps the skip).
             let insert_validation = if wave_catalog_seq == item.prepared_catalog_seq {
-                InsertPrepareValidation::ReResolveLedgerCovered
+                InsertPrepareValidation::ReResolveDeviceCovered
             } else {
                 InsertPrepareValidation::Full
             };
             // DELTA-REUSE (B): a reuse-eligible elided insert whose catalog generation still
-            // matches (ReResolveLedgerCovered) owes no re-validation — RE-KEY the off-lock delta
+            // matches (`ReResolveDeviceCovered`) owes no re-validation — RE-KEY the off-lock delta
             // at the wave's `next_row_id` instead of re-coercing + rebuilding it. A generation
             // drift (Full) or a non-eligible item falls through to the authoritative re-prepare.
             let prepared = match &item.offlock_delta {
                 Some(delta)
-                    if insert_validation == InsertPrepareValidation::ReResolveLedgerCovered =>
+                    if insert_validation == InsertPrepareValidation::ReResolveDeviceCovered
+                        && Self::reresolve_reuse_eligible(delta) =>
                 {
                     Ok(Self::rekey_offlock_insert_delta(delta, install_snapshot))
                 }
@@ -724,7 +875,7 @@ impl Engine {
             // (3c) Assign the seq for real: WAL append + propose (the sequencer is the single
             // proposer under the commit_mutex). The fsync is deferred to the wave tail.
             // W5a: covered inserts (the delta-reuse class — elided, FK/CHECK-free, no sequence
-            // defaults, ledger-covered uniqueness) log the RESOLVED BINARY record instead of the
+            // defaults, device-history-covered uniqueness) log the RESOLVED BINARY record instead of the
             // SQL text: replay becomes decode+install (no parse, no re-resolve), the record
             // carries the ORIGINAL row ids, and checkpoints shrink. Everything else keeps the
             // SQL-text payload unchanged.
@@ -814,6 +965,8 @@ impl Engine {
             // (3e) Record the write-set for future conflict detection (also read by LATER items
             // in this same wave — the intra-wave conflict path above).
             commit.ledger.record(&item.write_set, commit_seq);
+            wave_unique_slots.extend(item.write_set.unique_slots.iter().cloned());
+            wave_unique_slots_i32.extend(item.write_set.unique_slots_i32.iter().copied());
             hp!(4);
 
             // Fast-run eligibility: a plain INSERT into a table with no unique index, no CHECK,
@@ -927,6 +1080,14 @@ impl Engine {
                 .map(|oldest| oldest.saturating_sub(1))
                 .unwrap_or(last_seq);
             commit.ledger.prune_below(prune_boundary);
+        }
+        // Register the applied-but-unpublished tail while the commit lock still excludes explicit
+        // transaction validation. The sequencer publishes it into the deque after returning; the
+        // applied counter closes that handoff gap for the explicit-transaction settle proof.
+        if wave_tail.is_some() {
+            self.commit_wave
+                .tails_applied
+                .fetch_add(1, AtomicOrdering::Release);
         }
         // === leave the commit critical section BEFORE the fsync (D3b group commit) ===
         drop(commit);
@@ -1064,18 +1225,97 @@ impl Engine {
             }
     }
 
+    /// Batched device-history verdict for the homogeneous single-i32-key sharded intent shape.
+    /// The visible-locate kernel returns the latest physical version stamp independently of each
+    /// item's visibility snapshot, so a claim followed by a delete/key-away still conflicts.
+    fn sharded_intent_history_conflicts(
+        &self,
+        batch: &[CommitWaveItem],
+    ) -> std::collections::BTreeSet<usize> {
+        type Group = (Vec<i32>, Vec<u64>, Vec<usize>);
+        let catalog = self.catalog_snapshot();
+        let mut conflicts = std::collections::BTreeSet::new();
+        let mut groups = BTreeMap::<(String, usize), Group>::new();
+        for (position, item) in batch.iter().enumerate() {
+            let Command::Insert(insert) = &item.cmd else {
+                conflicts.insert(position);
+                continue;
+            };
+            let Some(table) = catalog.relational_catalog.get(&insert.table) else {
+                conflicts.insert(position);
+                continue;
+            };
+            let slot_id = item.write_set.unique_slots_i32[0].0;
+            let column_id = slot_id as u32;
+            let Some(column_idx) = table
+                .columns
+                .iter()
+                .position(|column| column.id == column_id)
+            else {
+                conflicts.insert(position);
+                continue;
+            };
+            let group = groups
+                .entry((insert.table.clone(), column_idx))
+                .or_default();
+            group.0.push(item.write_set.unique_slots_i32[0].1);
+            group.1.push(item.read_snapshot);
+            group.2.push(position);
+        }
+        for ((table_name, column_idx), (needles, snapshots, positions)) in groups {
+            let Some(table) = catalog.relational_catalog.get(&table_name) else {
+                conflicts.extend(positions);
+                continue;
+            };
+            let Some(locate) =
+                self.wave_batch_visible_locate(table, column_idx, &needles, &snapshots)
+            else {
+                conflicts.extend(positions);
+                continue;
+            };
+            let expected = positions.len();
+            if !exact_device_verdict_cardinality(
+                expected,
+                &[
+                    needles.len(),
+                    snapshots.len(),
+                    locate.counts.len(),
+                    locate.shard_ids.len(),
+                    locate.slots.len(),
+                    locate.row_ids.len(),
+                    locate.latest_write.len(),
+                ],
+            ) {
+                conflicts.extend(positions);
+                continue;
+            }
+            for ((position, latest), snapshot) in positions
+                .iter()
+                .copied()
+                .zip(locate.latest_write.iter().copied())
+                .zip(snapshots.iter().copied())
+            {
+                if latest > snapshot {
+                    conflicts.insert(position);
+                }
+            }
+        }
+        conflicts
+    }
+
     /// E2.4a VARIANT 1 — sequence a HOMOGENEOUS covered-INSERT-intent wave with N parallel shard
     /// workers over ONE ordered WAL + ONE global commit-seq.
     ///
     /// Stage 1 (device, coordinator): the wave-batched PK-unique locate — one device call, the
-    /// committed-dup 23505 verdicts. Stage 2 (N parallel workers, NO commit lock): each worker
-    /// owns the wave positions whose unique slot hashes to its shard and, in wave-position order,
-    /// runs the SI conflict check against a shared-ledger SNAPSHOT + a per-shard PRIVATE dedup set
+    /// committed-dup 23505 verdicts. Stage 2 (N parallel workers under the coordinator's retained
+    /// publication boundary): each worker owns the wave positions whose unique slot hashes to its
+    /// shard and, in wave-position order, consumes the batched device-history verdict plus a
+    /// per-shard PRIVATE dedup set
     /// (same-slot → same shard, so the lowest-position writer wins — byte-identical to the serial
     /// record-as-you-go single-winner), then clones the row image + WAL record. Stage 3 (thin
     /// serial cut, commit lock): walk the wave in order, and for each committing item claim the
     /// next commit-seq + integer row id, patch the WAL record's row id, append + propose, record the
-    /// commit timestamp + the write-set into the SHARED ledger (classic-path interop), advance the
+    /// commit timestamp + row-identity write-set record, advance the
     /// elided row-id allocator, and buffer the row into the per-table device append. The device
     /// append flushes ONCE per table at the tail (one HtoD/wave); the durability tail is returned
     /// for the W2 pipeline exactly as the serial path.
@@ -1091,23 +1331,76 @@ impl Engine {
         let wall_clock = current_timestamp_micros();
         let n = batch.len();
 
-        // Stage 1 — the wave-batched device PK-unique locate (committed-dup 23505 verdicts). One
-        // device call, off the commit lock, identical to the serial path.
+        // Acquire the publication boundary BEFORE validation. Serialized/classic writers and DDL
+        // publish under this same lock, so neither a row/version nor a catalog generation can change
+        // between the device verdict and this wave's ordered WAL cut.
+        let mut commit = self.commit_state();
+        if let Err(error) = self.ensure_commit_path_available() {
+            let message = error.to_string();
+            for item in &batch {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                    message.clone(),
+                ))));
+            }
+            std::mem::forget(guard);
+            return None;
+        }
+        if let Err(error) = self.intent_lanes_write_guard() {
+            let message = error.to_string();
+            for item in &batch {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                    message.clone(),
+                ))));
+            }
+            std::mem::forget(guard);
+            return None;
+        }
+
+        // Stage 1 — the wave-batched device PK-unique locate (committed-dup 23505 verdicts), now
+        // inside the serialized publication boundary. Holding the lock through worker preparation
+        // is intentionally conservative: the verdict cannot become stale before Stage 3.
         let hostphase = wave_host_phase_timing_enabled();
         let wave_validate_started = hostphase.then(Instant::now);
-        let wave_unique_violations = self.wave_batch_validate_unique(&batch);
+        let wave_unique_verdicts = self.wave_batch_validate_unique(&batch);
+        let mut wave_history_conflicts = self.sharded_intent_history_conflicts(&batch);
+        wave_history_conflicts.extend(wave_unique_verdicts.declined.iter().copied());
+        let serialized_catalog_seq = self.catalog_snapshot().commit_seq;
+        wave_history_conflicts.extend(
+            batch
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.prepared_catalog_seq != serialized_catalog_seq)
+                .map(|(position, _)| position),
+        );
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut hook = sharded_post_validation_hook()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                hook.as_ref()
+                    .is_some_and(|(owner, _, _)| *owner == self as *const Self as usize)
+                    .then(|| hook.take())
+                    .flatten()
+            };
+            if let Some((_, reached, resume)) = hook {
+                reached.wait();
+                resume.wait();
+            }
+        }
         if let Some(started) = wave_validate_started {
             WAVE_HOST_STATS[0]
                 .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
         }
-
-        let mut commit = self.commit_state();
-
-        // Stage 2 — parallel shard prep against the shared-ledger snapshot (`&commit.ledger` is
-        // borrowed immutably by the scoped workers; the coordinator resumes mutable use after join).
+        // Stage 2 — parallel shard prep against the device-history verdict plus per-shard private
+        // same-wave dedup. The coordinator resumes the ordered commit cut after join.
         let shard_started = hostphase.then(Instant::now);
-        let mut verdicts =
-            self.shard_prepare_intents(&batch, &commit.ledger, &wave_unique_violations, shards);
+        let mut verdicts = self.shard_prepare_intents(
+            &batch,
+            &wave_unique_verdicts.violations,
+            &wave_history_conflicts,
+            shards,
+        );
         if let Some(started) = shard_started {
             // Charge the parallel prep to the conflict bucket (it subsumes conflict + reresolve).
             WAVE_HOST_STATS[1]
@@ -1116,7 +1409,7 @@ impl Engine {
 
         // Stage 3 — the thin serial cut, E2.5b BATCHED: one commit-seq block claim, one
         // repl propose_batch, one row-id block, one applied mark, one timestamp for the whole
-        // wave. The per-item body is reduced to the WAL push, the shared-ledger record, and the
+        // wave. The per-item body is reduced to the WAL push, row-identity record, and the
         // device-buffer push — the E2.4a measurement showed the per-item repl round-trips,
         // BTreeMap timestamp insert, and allocator atomics WERE the ordered cut (~1.3us/item).
         // Aborts never consume a commit seq (same as the serial path's peek-before-propose), and
@@ -1185,9 +1478,8 @@ impl Engine {
                             batch[position].txn_id,
                             base_timestamp_micros + offset as u64,
                         );
-                        // Classic-path interop: record the write-set into the SHARED ledger (in
-                        // wave order). Same-slot dups were already resolved by the workers
-                        // (single-winner), so recording every winner is conflict-free.
+                        // Record row identities in wave order. Unique-slot history is already
+                        // resolved by device history + worker-local single-winner arbitration.
                         commit.ledger.record(&batch[position].write_set, commit_seq);
                         let entry = pending_appends.entry(table).or_default();
                         entry.3.push(commit_seq);
@@ -1220,7 +1512,7 @@ impl Engine {
         }
         self.flush_wave_pending_appends(&mut pending_appends, &mut committed, &batch);
         if let Some(started) = cut_started {
-            // Charge the ordered serial cut (WAL append + commit-seq + shared-ledger record +
+            // Charge the ordered serial cut (WAL append + commit-seq + row record +
             // device buffer) to the `sequence` bucket — raw nanos; the bench divides by items.
             WAVE_HOST_STATS[3]
                 .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -1235,6 +1527,13 @@ impl Engine {
                 .map(|oldest| oldest.saturating_sub(1))
                 .unwrap_or(last_seq);
             commit.ledger.prune_below(prune_boundary);
+        }
+        // Register under the commit lock for the same apply-to-deque handoff proof as the serial
+        // sequencer. `tails_finished` catches up only after durability and visibility publication.
+        if wave_tail.is_some() {
+            self.commit_wave
+                .tails_applied
+                .fetch_add(1, AtomicOrdering::Release);
         }
         // === leave the commit critical section BEFORE the fsync (D3b group commit) ===
         drop(commit);
@@ -1271,16 +1570,14 @@ impl Engine {
     /// Partitions the wave's positions across `shards` workers by hashing each row's single unique
     /// slot (so same-slot rows land in the same worker) and, per worker, computes a per-position
     /// [`ShardVerdict`] in wave-position order: 23505 for a committed-dup (device-locate verdict),
-    /// a retryable serialization abort for a shared-ledger conflict OR an intra-wave same-slot
+    /// a retryable serialization abort for a device-history conflict OR an intra-wave same-slot
     /// duplicate (the per-shard private dedup set — lowest position wins), else a Commit carrying
-    /// the cloned row image + the cloned (still-placeholder-row-id) WAL record. `shared_ledger` is
-    /// read-only for the whole pass (the coordinator holds the commit lock and does not mutate it
-    /// until after join), so the workers see a consistent snapshot of all pre-wave commits.
+    /// the cloned row image + the cloned (still-placeholder-row-id) WAL record.
     fn shard_prepare_intents(
         &self,
         batch: &[CommitWaveItem],
-        shared_ledger: &crate::write_path::RecentCommitsLedger,
         unique_violations: &std::collections::BTreeMap<usize, String>,
+        history_conflicts: &std::collections::BTreeSet<usize>,
         shards: usize,
     ) -> Vec<Option<ShardVerdict>> {
         let n = batch.len();
@@ -1310,9 +1607,7 @@ impl Engine {
                                 ShardVerdict::Abort(ExecuteError::Engine(EngineError::ApplyFailed(
                                     msg.clone(),
                                 )))
-                            } else if shared_ledger
-                                .conflicts(&item.write_set, item.read_snapshot)
-                            {
+                            } else if history_conflicts.contains(&pos) {
                                 let rs = item.read_snapshot;
                                 ShardVerdict::Abort(ExecuteError::Serialization(format!(
                                     "write-write conflict on a key committed after read snapshot {rs}"
@@ -1321,7 +1616,7 @@ impl Engine {
                                 let slot = item.write_set.unique_slots_i32[0];
                                 if !private.insert(slot) {
                                     // Intra-wave same-slot duplicate: the later position loses,
-                                    // exactly the serial integer-ledger first-committer-wins verdict.
+                                    // exactly the serial wave-local first-committer-wins verdict.
                                     let rs = item.read_snapshot;
                                     ShardVerdict::Abort(ExecuteError::Serialization(format!(
                                         "write-write conflict on a key committed after read snapshot {rs}"
@@ -1416,17 +1711,16 @@ fn insert_key_column_bind(
     Some((filter_idx, coerced))
 }
 
-/// COMPOUND KEYS: bind the DEVICE-PROBE `(key_id, needle)` for `index` against this insert's row.
-/// Single-column -> `(col_idx, raw i32)`; compound -> `(FLAG | ord, fingerprint)` folded over every key
-/// column's i32 WORDS (`sql_value_key_words` — i64 keys contribute 2 words). `None` if any key column
-/// can't bind / is an unsupported key value (the caller falls to full host validation).
+/// Bind the DEVICE-PROBE `(key_id, needle)` for `index` against this insert's row. Raw single-i32
+/// indexes use `(col_idx, value)`; compound and single wider/text indexes use `(FLAG | ord,
+/// fingerprint)` over the canonical typed words. `None` declines to full validation.
 fn insert_index_probe_needle(
     insert: &Insert,
     table: &RelationalTable,
     index: &RelationalIndex,
     ord: usize,
 ) -> Option<(usize, i32)> {
-    if crate::engine_residency::index_is_compound(index) {
+    if crate::engine_residency::index_uses_fingerprint(table, index) {
         let mut words: Vec<i32> = Vec::with_capacity(index.key_columns.len());
         for name in &index.key_columns {
             let (col_idx, value) = insert_key_column_bind(insert, table, name)?;

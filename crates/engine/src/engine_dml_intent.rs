@@ -148,7 +148,7 @@ impl CoveredDeleteRoute {
 /// arm: an eligibility-drifted submit returns a retryable error (honest refusal over a fabricated
 /// count). Unlike the delete route, the WAL record cannot be pre-encoded — the new image is
 /// runtime data — so a submit encodes the full `OP_UPDATE_BY_KEY` record and the pump patches the
-/// claimed `new_row_id` into it.
+/// claimed v1 allocator reservation into it. ADR-014 UPDATE identity comes from the GPU locate.
 #[derive(Debug, Clone)]
 pub struct CoveredUpdateRoute {
     table: String,
@@ -597,6 +597,8 @@ impl Engine {
         pk: i32,
         mode: SynchronousCommit,
     ) -> Result<IntentTicket, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
@@ -755,6 +757,8 @@ impl Engine {
         new_values: &[i32],
         mode: SynchronousCommit,
     ) -> Result<IntentTicket, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
@@ -798,9 +802,9 @@ impl Engine {
 
     /// Build the LEAN lane item for a covered UPDATE: the new post-image (all columns) rides
     /// `values` (moved into the apply's new-version append), and the `OP_UPDATE_BY_KEY` record is
-    /// encoded here with a PLACEHOLDER `new_row_id` (0) — the pump patches the real claimed id at
-    /// `row_id_offset` (exactly like an INSERT's row id). The tombstone target + new-version
-    /// append are resolved at APPLY by the coalesced device visible-locate.
+    /// encoded here with a PLACEHOLDER `new_row_id` (0) — the pump patches a legacy allocator
+    /// reservation at `row_id_offset`. The tombstone target and stable entity identity are resolved
+    /// at APPLY by the coalesced GPU visible-locate; the reservation is not the new version's identity.
     fn build_lane_update_intent(
         &self,
         txn_id: u64,
@@ -820,8 +824,8 @@ impl Engine {
         }
         let pk = *new_values.get(route.pk_column_index)?;
         let values: Vec<SqlValue> = new_values.iter().map(|&v| SqlValue::Int4(v)).collect();
-        // PLACEHOLDER new_row_id (0): the pump stamps the id it claims at wave formation into
-        // these 8 bytes at `row_id_offset`. `None` (name-width) declines to the retryable drift.
+        // PLACEHOLDER new_row_id (0): the pump stamps the v1 allocator reservation into these
+        // bytes. `None` (name-width) declines to the retryable drift.
         let record = crate::wal_binary::encode_binary_update_by_key(
             &route.table,
             &route.pk_column_name,
@@ -866,6 +870,13 @@ impl Engine {
             return Some(resolved);
         }
         let outcome = ticket.outcome.as_ref()?;
+        if self.is_commit_path_poisoned() && !outcome.is_done() {
+            ticket.outcome = None;
+            ticket.release_snapshot();
+            return Some(Err(ExecuteError::Engine(
+                self.commit_path_unavailable_error(),
+            )));
+        }
         let result = outcome.take_if_done()?;
         ticket.outcome = None;
         ticket.release_snapshot();
@@ -877,6 +888,8 @@ impl Engine {
         route: &CoveredInsertRoute,
         params: &[i32],
     ) -> Result<(), ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         if params.len() != route.column_count {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "covered-INSERT intent expects {} params for table \"{}\", got {}",

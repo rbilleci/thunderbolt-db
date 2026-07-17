@@ -35,10 +35,11 @@ chronology or future sequencing. The full pre-unification record is archived at
   physical comparison, controller models, source crosswalk, packet manifests, and reviews are historical evidence
   in the acceptance archive. Candidate A's current implementation measurements still fail W1 and production
   graduation; acceptance selects the target, not the live implementation.
-- **Consequence:** **R3-002/003** implement device-native coverage, transactions, conflict control, adaptation, and
-  maintenance; **DUR-001/002** implement and fault-qualify checkpoint/WAL/recovery; **RETIRE-002** removes host repair;
-  **R3-004** removes the host write/store path only after those standalone gates. **HA-001** is additionally required
-  for replicated/node-loss-RPO deployment. **BENCH-001** remains the immutable performance evidence gate.
+- **Consequence:** R3-002/R3-003 device-native coverage, transactions, conflict history, and bounded reclamation are
+  accepted implementation facts. **DUR-001/002** implement and fault-qualify checkpoint/WAL/recovery;
+  **RETIRE-002** removes host repair; **R3-004** removes the host write/store path after **DUR-002**. **HA-001** is
+  additionally required for replicated/node-loss-RPO deployment. **BENCH-001** remains the immutable performance
+  evidence gate.
 
 ## ADR-013 — Universal birth stamps and generation-atomic shard publication
 
@@ -83,8 +84,9 @@ chronology or future sequencing. The full pre-unification record is archived at
   transactions remain supported as a slower class.
 - **Reason:** GPU throughput comes from many transactions at once, while deterministic ordering simplifies
   conflicts, replication, and recovery.
-- **Consequence:** ADR-014 selects the write/MVCC/transaction/recovery model; **R3-002/003** implement its write and
-  concurrency surface, and **BENCH-001** remains the evidence gate.
+- **Consequence:** ADR-014 selects the write/MVCC/transaction/recovery model; R3-002/R3-003 completed its accepted
+  write and concurrency graduation, **DUR-002** owns the durable envelope, and **BENCH-001** remains the evidence
+  gate.
 
 ## ADR-008 — Product workload bet is GPU-native OLTP
 

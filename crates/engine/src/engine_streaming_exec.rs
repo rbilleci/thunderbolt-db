@@ -61,6 +61,7 @@ mod streaming_ordered_fold;
 mod streaming_projection_fold;
 mod streaming_reduction_fold;
 mod streaming_select_route;
+mod streaming_transaction_cow;
 
 /// The DEVICE payload bytes one row contributes to a transient chunk. Unlike the logical
 /// `relational_resident_value_bytes` (which is 0 for `NULL` and 0 for empty text), this counts the FIXED
@@ -302,6 +303,11 @@ pub(crate) struct ColdChunk {
     payload: ColdPayload,
     pub(crate) snapshot: RelationalResidencySnapshot,
     pub(crate) row_count: u64,
+    /// Stable logical entity identity, parallel to payload slots once a table becomes
+    /// chunk-authoritative. Ordinary cache entries leave this empty; class entry resolves the
+    /// canonical row keys from the still-pinned store before reclaiming it, and every tail/update
+    /// carries the same identities forward. Placement remains `(entry_epoch, chunk, slot)`.
+    pub(crate) entity_ids: Arc<Vec<u64>>,
     /// P5-1 — CONTENT IDENTITY (design review H3): a process-monotonic id allocated ONLY where
     /// the payload bytes are GENUINELY NEW (the builder's push, the tail constructor, the
     /// compaction survivor build) and PRESERVED by every verbatim clone. The chunk-index cache
@@ -452,6 +458,7 @@ impl ColdCacheBuilder {
             payload: cold_payload,
             snapshot,
             row_count,
+            entity_ids: Arc::new(Vec::new()),
             tuple_range,
             // A freshly built payload reflects the builder's boundary and has no tombstones.
             payload_copin_s: self.build_copin_s,
@@ -793,9 +800,9 @@ impl Engine {
 
     /// Write the cold-tier checkpoint artifact beside the lanes checkpoint. `boundary_index` is
     /// the RECOVERY-SEAM value stamped into the artifact — the INCLUSIVE index of the
-    /// checkpoint's last record, which is what both recovery replay and the corrected R3-006 lane
-    /// publication reach. The lane/WAL cut is an EXCLUSIVE next-slot frontier but is never a
-    /// `committed_seq`; only the converted inclusive boundary qualifies the artifact. A table
+    /// checkpoint's last record, which is what the seam's `committed_seq()` reaches (replay
+    /// publishes each record's own index). The live watermark must equal `boundary_index`; a
+    /// one-high watermark represents a genuinely newer commit and must abort the artifact. A table
     /// qualifies when its entry's pinned generation is ptr-equal current
     /// (untouched since its settled install), or the 6c-1 patcher brings it current at the
     /// observed watermark (the patch install re-proves settledness; a concurrent commit fails

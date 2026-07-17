@@ -211,10 +211,7 @@ impl Engine {
         let sharded_unified: Option<ShardedUnifiedExecSource> = if src.is_none()
             && self.relational_residency_entry(&table.name).is_none()
             && self
-                .read_state
-                .residency
-                .shards
-                .load()
+                .read_residency_shards()
                 .get(&table.name)
                 .is_some_and(|shards| !shards.is_empty())
         {
@@ -268,17 +265,17 @@ impl Engine {
                         table.name
                     ))));
                 }
-                let device_memory = self
-                    .read_state
-                    .residency
-                    .device_memory
-                    .get(&table.name)
-                    .ok_or_else(|| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "relation \"{}\" has no retained resident device memory",
-                            table.name
-                        )))
-                    })?;
+                let device_memory =
+                    residency_entry
+                        .device_memory
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "relation \"{}\" has no retained resident device memory",
+                                table.name
+                            )))
+                        })?;
                 let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
                     ExecuteError::Engine(EngineError::ApplyFailed(
                         "resident snapshot row count exceeds retained device-memory proof range"

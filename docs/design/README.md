@@ -12,7 +12,7 @@ are **not plans** and do not own priority, status, or sequencing. The only execu
   recovery capacity profile and refusal rules.
 - [`oltp-benchmark-workload-v1.md`](oltp-benchmark-workload-v1.md) — immutable BENCH-001 workload and acceptance
   accounting.
-- [`non-int4-index-design-inputs.md`](non-int4-index-design-inputs.md) — index constraints for **READ-002** and
-  **R3-002**.
+- [`non-int4-index-design-inputs.md`](non-int4-index-design-inputs.md) — accepted index constraints and remaining
+  point-lookup breadth under **READ-002**.
 
 Dated proposals, superseded inputs, probes, packet manifests, and detailed reviews live under `../archive/`.

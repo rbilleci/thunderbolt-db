@@ -2,15 +2,85 @@ use super::{Engine, EngineError, ExecuteError, LaneIntent, LaneOpKind};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
+#[cfg(test)]
+type LaneProbePublicationHook = (
+    usize,
+    std::sync::Arc<std::sync::Barrier>,
+    std::sync::Arc<std::sync::Barrier>,
+);
+
+#[cfg(test)]
+fn lane_probe_publication_hook() -> &'static std::sync::Mutex<Option<LaneProbePublicationHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LaneProbePublicationHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 impl Engine {
+    /// Transfer exclusive sequence ownership from the serial WAL/replicator to intent lanes. The
+    /// activation store is published only while holding `commit_state`; every classic publication
+    /// path rechecks it after acquiring that same lock. Thus a classic writer that passed its
+    /// optimistic pre-lock guard either publishes entirely before this handoff or observes ACTIVE
+    /// under-lock and aborts. The lane validates only after this fence, so its device verdict cannot
+    /// be invalidated by a later classic/DDL/transaction commit.
+    pub(crate) fn ensure_intent_lanes_activated(
+        &self,
+        lanes: &crate::engine_intent_lanes::IntentLaneState,
+    ) -> Result<(), EngineError> {
+        if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
+            return self.ensure_commit_path_available();
+        }
+        let commit = self.commit_state();
+        // Close the outer availability-check → local-drain → activation gap against a classic
+        // post-durable failure. Such a failure wedges while owning this same commit lock; a lane
+        // that waited behind it must fail its already-drained batch, never activate and claim/WAL.
+        self.ensure_commit_path_available()?;
+        if !lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
+            let first = commit.repl.peek_next_index();
+            lanes
+                .base_seq
+                .store(first, std::sync::atomic::Ordering::Release);
+            lanes
+                .seq_oracle
+                .store(first, std::sync::atomic::Ordering::Release);
+            lanes
+                .activated
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lane_probe_publication_hook(
+        &self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *lane_probe_publication_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((self as *const Self as usize, reached, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drive_lane_apply_once_for_test(
+        &self,
+        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
+    ) -> bool {
+        self.drive_apply_queue_once(lanes)
+    }
+
     /// E2.5b-2 stage 3b — one pump iteration for intent lane `lane`: the N-lane
     /// parallel ordered cut. Single-writer per lane (try_lock guard); the ONLY
     /// shared-state touch is one brief commit lock per wave (global seq-block
-    /// claim + timestamp merge). Everything else — device validate, private
-    /// ledger, lane WAL append, device apply — runs lane-parallel. Outcomes
+    /// claim + timestamp merge). Everything else — device validate, bounded
+    /// same-wave/unpublished arbitration, lane WAL append, device apply — runs lane-parallel. Outcomes
     /// settle exclusively behind the visible cut (durable AND applied AND
     /// published), so an ack can never precede any lower seq's durability.
     pub(crate) fn drive_intent_lane(&self, lane: usize) -> bool {
+        if self.ensure_commit_path_available().is_err() {
+            return false;
+        }
         let Some(lanes) = self.intent_lanes.as_ref().map(std::sync::Arc::clone) else {
             return false;
         };
@@ -83,76 +153,127 @@ impl Engine {
             }
             return progressed || applied;
         }
+        // First non-empty lane wave takes sequence ownership BEFORE its device validation. The
+        // reciprocal under-lock classic guards make this a closed handoff, not a check-then-act.
+        if self.ensure_intent_lanes_activated(&lanes).is_err() {
+            for item in batch {
+                item.set_outcome(Err(ExecuteError::Engine(
+                    self.commit_path_unavailable_error(),
+                )));
+            }
+            return true;
+        }
         lanes.stat_drain_ns.fetch_add(
             drain_started.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
         );
 
-        // INSERT dup-validation only (count-only device locate; committed-dup 23505 verdicts;
-        // needles come straight from the intents' integer slots — no AST walk). U1 WAL-FIRST:
-        // a DELETE does NO pump-time device work — its by-key W5b record is claimed + fenced on
-        // this path, and the visible target is LOCATED at APPLY (off this critical path,
-        // overlapping the durability fence), so a single delete's ack is fence-bound, not
-        // locate+fence-bound.
-        let stat_start = Instant::now();
-        let violations = self.lane_validate_unique(&batch);
-        lanes.stat_validate_ns.fetch_add(
-            stat_start.elapsed().as_nanos() as u64,
-            AtomicOrdering::Relaxed,
-        );
         lanes.stat_waves.fetch_add(1, AtomicOrdering::Relaxed);
         lanes
             .stat_items
             .fetch_add(batch.len() as u64, AtomicOrdering::Relaxed);
 
-        // private-ledger conflicts + intra-wave same-slot dedup (lowest position wins).
-        // PASS-FUSION: integer slots are extracted here once (winner_slots) so the
-        // post-claim ledger record never re-walks the fat items.
-        let conflict_started = Instant::now();
-        let mut winners: Vec<LaneIntent> = Vec::with_capacity(batch.len());
-        let mut winner_slots: Vec<crate::write_path::IntUniqueSlotKey> =
-            Vec::with_capacity(batch.len());
-        {
-            let ledger = lanes.ledgers[lane]
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut wave_slots: std::collections::HashSet<crate::write_path::IntUniqueSlotKey> =
-                std::collections::HashSet::with_capacity(batch.len());
-            for (position, item) in batch.into_iter().enumerate() {
-                if let Some(err) = violations.get(&position) {
-                    item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        err.clone(),
-                    ))));
+        // DEVICE-PUBLICATION SEQLOCK: validation stays GPU-concurrent with apply. It samples the
+        // publication epoch, probes, then locks this lane's bridge and rechecks the epoch. Apply
+        // increments the epoch after device publication and before bridge removal. A changed epoch
+        // retries the complete probe; a stable epoch lets this pass arbitrate and install its own
+        // provisional bridge atomically with respect to removal.
+        let (winner_positions, winner_slots) = {
+            loop {
+                let epoch_before = lanes
+                    .device_publication_epoch
+                    .load(std::sync::atomic::Ordering::Acquire);
+                // INSERT duplicate validation and physical-version history validation use one
+                // device visible-locate verdict per key. DELETE/UPDATE target resolution remains
+                // at apply.
+                let stat_start = Instant::now();
+                let (violations, device_conflicts) = self.lane_validate_unique(&batch);
+                lanes.stat_validate_ns.fetch_add(
+                    stat_start.elapsed().as_nanos() as u64,
+                    AtomicOrdering::Relaxed,
+                );
+                #[cfg(test)]
+                {
+                    let probe_hook = {
+                        let mut hook = lane_probe_publication_hook()
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        hook.as_ref()
+                            .is_some_and(|(owner, _, _)| *owner == self as *const Self as usize)
+                            .then(|| hook.take())
+                            .flatten()
+                    };
+                    if let Some((_, reached, resume)) = probe_hook {
+                        reached.wait();
+                        resume.wait();
+                    }
+                }
+
+                let conflict_started = Instant::now();
+                let mut inflight = lanes.inflight_slots[lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let epoch_after = lanes
+                    .device_publication_epoch
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if epoch_before != epoch_after {
+                    drop(inflight);
+                    lanes.stat_conflict_ns.fetch_add(
+                        conflict_started.elapsed().as_nanos() as u64,
+                        AtomicOrdering::Relaxed,
+                    );
                     continue;
                 }
-                // SI write-write (first-committer/updater-wins) — the SAME check for INSERT and
-                // DELETE (a delete of a key written after its snapshot is a serialization abort).
-                // U1 WAL-FIRST: a DELETE has NO pre-claim locate/0-row filter here; it becomes a
-                // winner and the apply resolves its 0-or-1 rows-affected. A 0-row delete writes a
-                // durable no-op W5b record (replay re-resolves the same 0 rows) — the price of
-                // taking the locate off this critical path.
-                if ledger.conflicts_int_slot(item.slot, item.read_snapshot) {
-                    let read_snapshot = item.read_snapshot;
-                    item.set_outcome(Err(ExecuteError::Serialization(format!(
-                        "write-write conflict on a key committed after read snapshot {read_snapshot}"
-                    ))));
-                    continue;
+
+                let mut winner_positions = vec![false; batch.len()];
+                let mut winner_slots: Vec<crate::write_path::IntUniqueSlotKey> =
+                    Vec::with_capacity(batch.len());
+                let mut wave_slots: std::collections::HashSet<crate::write_path::IntUniqueSlotKey> =
+                    std::collections::HashSet::with_capacity(batch.len());
+                for (position, item) in batch.iter().enumerate() {
+                    if let Some(err) = violations.get(&position) {
+                        item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            err.clone(),
+                        ))));
+                        continue;
+                    }
+                    if device_conflicts.contains(&position) || inflight.contains(&item.slot) {
+                        let read_snapshot = item.read_snapshot;
+                        item.set_outcome(Err(ExecuteError::Serialization(format!(
+                            "write-write conflict on a key committed after read snapshot {read_snapshot}"
+                        ))));
+                        continue;
+                    }
+                    // SI write-write (first-committer/updater-wins) — the SAME check for INSERT and
+                    // DELETE (a delete of a key written after its snapshot is a serialization abort).
+                    if !wave_slots.insert(item.slot) {
+                        item.set_outcome(Err(ExecuteError::Serialization(
+                            "intra-wave duplicate key: an earlier same-wave op holds this unique slot"
+                                .to_string(),
+                        )));
+                        continue;
+                    }
+                    winner_slots.push(item.slot);
+                    winner_positions[position] = true;
                 }
-                if !wave_slots.insert(item.slot) {
-                    item.set_outcome(Err(ExecuteError::Serialization(
-                        "intra-wave duplicate key: an earlier same-wave op holds this unique slot"
-                            .to_string(),
-                    )));
-                    continue;
+                // Install the bounded bridge inside the same stable-epoch arbitration section. It
+                // is provisional until WAL append succeeds; clean pre-durable failures remove it.
+                for slot in &winner_slots {
+                    let inserted = inflight.insert(*slot);
+                    debug_assert!(inserted, "winner slot passed in-flight arbitration");
                 }
-                winner_slots.push(item.slot);
-                winners.push(item);
+                lanes.stat_conflict_ns.fetch_add(
+                    conflict_started.elapsed().as_nanos() as u64,
+                    AtomicOrdering::Relaxed,
+                );
+                break (winner_positions, winner_slots);
             }
-        }
-        lanes.stat_conflict_ns.fetch_add(
-            conflict_started.elapsed().as_nanos() as u64,
-            AtomicOrdering::Relaxed,
-        );
+        };
+        let mut winners: Vec<LaneIntent> = batch
+            .into_iter()
+            .zip(winner_positions)
+            .filter_map(|(item, winner)| winner.then_some(item))
+            .collect();
         let k = winners.len() as u64;
         if k == 0 {
             return true;
@@ -166,6 +287,14 @@ impl Engine {
             Ok(wal) => wal,
             Err(err) => {
                 let message = format!("intent lane WAL unavailable: {err}");
+                let mut inflight = lanes.inflight_slots[lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for slot in &winner_slots {
+                    let removed = inflight.remove(slot);
+                    debug_assert!(removed, "provisional lane slot must be released");
+                }
+                drop(inflight);
                 for item in winners {
                     item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
                         message.clone(),
@@ -181,7 +310,8 @@ impl Engine {
         // record (the new version, incl. the 0-row case). DELETES consume none. Ids are assigned in
         // WINNERS ORDER (== seq order), so a single running offset feeds both the insert row-id
         // patch and the update `new_row_id` patch below, and replay re-derives the identical
-        // assignment record-by-record. A delete claiming an id would skew every later identity.
+        // assignment record-by-record. For UPDATE this is now a legacy reservation rather than
+        // entity identity; a delete claiming one would still skew replay's allocator high-water.
         let patch_started = Instant::now();
         let row_consuming_count = winners
             .iter()
@@ -204,10 +334,9 @@ impl Engine {
         for item in winners.iter() {
             match item.op {
                 LaneOpKind::Insert | LaneOpKind::Update => {
-                    // INSERT patches its row id; UPDATE patches its new version's `new_row_id` —
-                    // both at `row_id_offset` (8 LE bytes) in the pre-encoded template, drawing the
-                    // next id from the shared block in winners order (a delete in between draws
-                    // none, so its record slides by unpatched).
+                    // INSERT patches its entity/row id; UPDATE patches the v1 record's legacy
+                    // allocator reservation. Both occupy `row_id_offset` (8 LE bytes) and draw the
+                    // next id from the shared block in winners order; a delete draws none.
                     let off = item.row_id_offset as usize;
                     let row_id = row_id_base + row_alloc_offset;
                     row_alloc_offset += 1;
@@ -238,63 +367,26 @@ impl Engine {
             AtomicOrdering::Relaxed,
         );
 
-        // THE CLAIM, LOCK-FREE: after activation, a seq block is one fetch_add
-        // on the lanes oracle (the per-wave commit-lock claim measured 77%
-        // lock-wait at 8 lanes). The FIRST wave seeds the oracle + timestamp
-        // reservation under the commit lock, then flips the activation latch;
-        // v1 contract: classic writes are refused after activation and the
-        // repl log intentionally does not carry lane payloads (single-node;
-        // recovery reads the lane logs' explicit seqs — Raft integration is
-        // an E2.5c+ concern).
+        // THE CLAIM, LOCK-FREE: activation already transferred sequence ownership under the commit
+        // lock before validation, so every wave claims from the lane oracle with one fetch_add.
+        // The serial repl log intentionally carries no later lane payloads; recovery merges the
+        // pre-activation serial prefix with lane logs over disjoint ranges.
         let stat_start = Instant::now();
-        let first_seq = if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
-            lanes.seq_oracle.fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |next| next.checked_add(k),
-            )
-        } else {
-            // AUDIT F1 (CRITICAL): double-checked activation UNDER the commit
-            // lock. peek_next_index does not advance, so two lanes' first
-            // waves racing the old check-then-act would both seed the oracle
-            // at the same base and claim DUPLICATE global seqs — acked
-            // commits then fail recovery (overlapping lane claims). Exactly
-            // one seeder exists now (latch set LAST, under the lock); the
-            // race loser re-reads the seeded oracle.
-            let commit = self.commit_state();
-            if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
-                drop(commit);
-                lanes.seq_oracle.fetch_update(
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                    |next| next.checked_add(k),
-                )
-            } else {
-                let first = commit.repl.peek_next_index();
-                let Some(next) = first.checked_add(k) else {
-                    drop(commit);
-                    for item in winners {
-                        item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
-                            "intent-lane commit sequence exhausted before WAL append".to_string(),
-                        ))));
-                    }
-                    return true;
-                };
-                lanes
-                    .seq_oracle
-                    .store(next, std::sync::atomic::Ordering::Release);
-                lanes
-                    .base_seq
-                    .store(first, std::sync::atomic::Ordering::Release);
-                lanes
-                    .activated
-                    .store(true, std::sync::atomic::Ordering::Release);
-                Ok(first)
-            }
-        };
-        let first_seq = match first_seq {
+        let first_seq = match lanes.seq_oracle.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |next| next.checked_add(k),
+        ) {
             Ok(first) => first,
             Err(_) => {
+                let mut inflight = lanes.inflight_slots[lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for slot in &winner_slots {
+                    let removed = inflight.remove(slot);
+                    debug_assert!(removed, "provisional lane slot must be released");
+                }
+                drop(inflight);
                 for item in winners {
                     item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
                         "intent-lane commit sequence exhausted before WAL append".to_string(),
@@ -309,17 +401,6 @@ impl Engine {
         );
         let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
         let local_first = first_seq - base;
-
-        // record winners into the lane's private ledger at their global seqs —
-        // from the slots extracted in the conflict pass (no fat-item re-walk)
-        {
-            let mut ledger = lanes.ledgers[lane]
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (offset, slot) in winner_slots.iter().enumerate() {
-                ledger.record_int_slot(*slot, first_seq + offset as u64);
-            }
-        }
 
         // OFF-LOCK: durable lane append (envelope already fused into the patch
         // pass above; stat_encode retired into the claim-adjacent patch time).
@@ -386,6 +467,14 @@ impl Engine {
             }
         }
         if let Some(message) = append_error {
+            let mut inflight = lanes.inflight_slots[lane]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for slot in &winner_slots {
+                let removed = inflight.remove(slot);
+                debug_assert!(removed, "failed lane WAL must release provisional slot");
+            }
+            drop(inflight);
             for item in winners {
                 item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
                     message.clone(),
@@ -407,7 +496,7 @@ impl Engine {
             done: std::sync::atomic::AtomicBool::new(false),
             failed: std::sync::atomic::AtomicBool::new(false),
         });
-        {
+        let apply_request = {
             let mut rows = Vec::with_capacity(winners.len());
             let mut stamps = Vec::with_capacity(winners.len());
             let mut txn_ids = Vec::with_capacity(winners.len());
@@ -421,8 +510,10 @@ impl Engine {
             // U1/U2: split the wave — INSERT winners feed the merged append (rows/stamps/
             // row_ids parallel, insert-dense); DELETE winners feed the tombstone pass; UPDATE
             // winners feed the locate-tombstone-then-conditional-append pass. Inserts and updates
-            // draw contiguous ids from `row_id_base` in winners order via the SAME running offset
-            // the patch loop used, so an update's applied `new_row_id` == its WAL-patched one.
+            // draw contiguous allocator reservations from `row_id_base` in winners order via the
+            // SAME running offset the patch loop used. R3 stable identity means an update does not
+            // use that reservation for its replacement; it remains in v1 WAL solely so old logs
+            // and replay high-water reconstruction stay compatible.
             // The request's seq range covers the WHOLE claimed block regardless of mix (the applied
             // cut must advance over every claimed seq or acks hang).
             let mut row_alloc_offset = 0u64;
@@ -454,10 +545,10 @@ impl Engine {
                     }
                     LaneOpKind::Update => {
                         // WAL-FIRST: an UNRESOLVED by-key update — the apply locates the visible
-                        // old version, tombstones it, and CONDITIONALLY appends the new image at
-                        // this claimed `new_row_id` (only if the old located to one row). The
-                        // new_row_id is the SAME id the patch loop stamped into the WAL record.
-                        let new_row_id = row_id_base + row_alloc_offset;
+                        // old version, tombstones it, and CONDITIONALLY appends the new image with
+                        // the old version's GPU-returned stable identity. The allocator reservation
+                        // is still consumed and WAL-patched for v1 recovery compatibility.
+                        let _reserved_row_id = row_id_base + row_alloc_offset;
                         row_alloc_offset += 1;
                         let cell = item
                             .rows_affected_cell
@@ -468,55 +559,79 @@ impl Engine {
                             filter_idx: item.filter_idx,
                             pk: item.slot.1,
                             read_snapshot: item.read_snapshot,
-                            new_row_id,
                             new_values: std::mem::take(&mut item.values),
                             rows_affected: cell,
                         });
                     }
                 }
             }
-            lanes
-                .apply_queue
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(crate::engine_intent_lanes::ApplyRequest {
-                    table: table_name,
-                    rows,
-                    row_ids,
-                    stamps,
-                    txn_ids,
-                    tombstones,
-                    updates,
-                    seq_first: first_seq,
-                    seq_len: k,
-                    slot: std::sync::Arc::clone(&apply_slot),
-                });
-        }
+            crate::engine_intent_lanes::ApplyRequest {
+                lane,
+                table: table_name,
+                rows,
+                row_ids,
+                stamps,
+                txn_ids,
+                tombstones,
+                updates,
+                seq_first: first_seq,
+                seq_len: k,
+                unique_slots: winner_slots,
+                slot: std::sync::Arc::clone(&apply_slot),
+            }
+        };
         // NO-REAP PIPELINE (disruptor staging): the wave's apply request is
         // queued and its settlement entry goes straight into the settle queue
         // — the pump NEVER waits on device apply. Settlement is gated on the
         // visible cut, which only the apply LEADER advances (at completion),
         // so a settled-Ok still implies durable AND applied; the failed flag
         // covers the failure path. Same-slot safety holds without the device
-        // index seeing this wave: the lane ledger recorded the winners at
-        // claim and PK-hash routing pins a PK to one lane.
+        // index seeing this wave: the bounded in-flight set owns the gap from validation selection
+        // through device publication, and clean pre-durable failures explicitly release it.
         // Partition by commit mode (pg `synchronous_commit`): async winners
         // ack at the APPLIED cut, strict winners at the visible (durable AND
         // applied) cut. Same wave, same WAL frames, same apply — only the
         // ack gate differs.
         let (async_winners, winners): (Vec<LaneIntent>, Vec<LaneIntent>) =
             winners.into_iter().partition(|item| !item.synchronous);
-        lanes.settle[lane]
+        // Publish the apply request and its owning outcomes atomically with respect to the central
+        // wedge drain. The drain takes these locks in the same order; either it observes both, or
+        // this under-lock gate observes the sticky flag and fails the local wave itself.
+        let mut apply_queue = lanes
+            .apply_queue
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_back(crate::engine_intent_lanes::LaneSettle {
-                end_seq: local_first + k,
-                winners,
-                async_winners,
-                async_settled: false,
-                apply_slot,
-                published_at: std::time::Instant::now(),
-            });
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut settle = lanes.settle[lane]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(error) = self.ensure_commit_path_available() {
+            drop(settle);
+            drop(apply_queue);
+            let mut inflight = lanes.inflight_slots[apply_request.lane]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for slot in &apply_request.unique_slots {
+                inflight.remove(slot);
+            }
+            drop(inflight);
+            for item in winners.into_iter().chain(async_winners) {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                    error.to_string(),
+                ))));
+            }
+            return true;
+        }
+        apply_queue.push(apply_request);
+        settle.push_back(crate::engine_intent_lanes::LaneSettle {
+            end_seq: local_first + k,
+            winners,
+            async_winners,
+            async_settled: false,
+            apply_slot,
+            published_at: std::time::Instant::now(),
+        });
+        drop(settle);
+        drop(apply_queue);
         // Opportunistic non-blocking leader pass keeps the apply queue moving
         // (nobody blocks on it anymore).
         self.drive_apply_queue_once(&lanes);
@@ -529,10 +644,11 @@ impl Engine {
     /// DRAIN BARRIER — divert new submits to the hold queue, pump every lane
     /// until nothing is in flight, flip `active_lanes`, then re-route the held
     /// intents through the new epoch. Safety: at the barrier every prior
-    /// commit precedes every post-flip snapshot, so the device validate alone
-    /// catches old duplicates (lane-ledger continuity across epochs is not
-    /// required). Fail-open: a drain that cannot complete (wedge) aborts the
-    /// resize and keeps the old epoch.
+    /// commit publishes device version history before every post-flip
+    /// snapshot, so validation in the next epoch observes the old claims and
+    /// releases without carrying the unpublished-slot bridge across epochs.
+    /// Fail-open: a drain that cannot complete (wedge) aborts the resize and
+    /// keeps the old epoch.
     pub(super) fn maybe_resize_lanes(
         &self,
         lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
@@ -680,13 +796,11 @@ impl Engine {
         // Re-route the held intents through the (possibly new) epoch, with a
         // POST-BARRIER read snapshot. AUDIT (CRITICAL): a held intent carries
         // the snapshot it captured at submit — PRE-flip. The barrier's safety
-        // argument ("every prior commit precedes every post-flip snapshot, so
-        // the device validate alone catches old duplicates") holds only for
-        // post-flip snapshots: with the stale one, a same-PK commit that
-        // settled during the drain is invisible to the authoritative recheck
-        // (committed after the stale snapshot) AND unknown to the new lane's
-        // ledger (it was recorded in the old lane) — a silent duplicate-key
-        // admission. `committed_seq()` here covers every drained commit by
+        // argument ("every prior commit precedes every post-flip snapshot")
+        // holds only for post-flip snapshots: with the stale one, a same-PK
+        // claim/release that settled during the drain is newer than the
+        // request boundary, while the old epoch's unpublished-slot bridge has
+        // correctly retired. `committed_seq()` here covers every drained commit by
         // construction (the drain waited for settle, which publishes before
         // outcomes). The ticket's registered snapshot hold keeps the OLD
         // value — a conservative GC boundary, harmless. For covered INSERTs a
@@ -708,6 +822,10 @@ impl Engine {
         lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
         mut intent: LaneIntent,
     ) {
+        if let Err(error) = self.ensure_commit_path_available() {
+            intent.set_outcome(Err(ExecuteError::Engine(error)));
+            return;
+        }
         lanes
             .outstanding
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -718,11 +836,17 @@ impl Engine {
             lanes
                 .outstanding
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            lanes
+            let mut hold = lanes
                 .resize_hold
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(intent);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(error) = self.ensure_commit_path_available() {
+                drop(hold);
+                intent.set_outcome(Err(ExecuteError::Engine(error)));
+                return;
+            }
+            hold.push(intent);
+            drop(hold);
             // STRAND GUARD: if the barrier released between our check and the
             // push, the leader's hold-queue take may already be done and
             // nothing would ever route this intent (until the next resize).
@@ -743,10 +867,15 @@ impl Engine {
         }
         intent.outstanding = Some(std::sync::Arc::clone(&lanes.outstanding));
         let lane = lanes.lane_for_pk(intent.slot.1);
-        lanes.queues[lane]
+        let mut queue = lanes.queues[lane]
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_back(intent);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(error) = self.ensure_commit_path_available() {
+            drop(queue);
+            intent.set_outcome(Err(ExecuteError::Engine(error)));
+            return;
+        }
+        queue.push_back(intent);
     }
 
     /// Drain the resize hold queue outside an active barrier and route the
@@ -831,6 +960,12 @@ impl Engine {
                 AtomicOrdering::Relaxed,
             );
             let failed = outcome.is_err();
+            // Publish the seqlock witness after every apply attempt that may have touched resident
+            // state and before removing any request bridge. A validator whose device probe
+            // overlapped this attempt must retry, including after a partial-apply panic.
+            lanes
+                .device_publication_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if failed {
                 // A failed merged apply permanently HOLES the applied cut (its
                 // seqs never apply), so later waves would wait forever behind
@@ -838,6 +973,7 @@ impl Engine {
                 lanes
                     .apply_poisoned
                     .store(true, std::sync::atomic::Ordering::Release);
+                self.wedge_commit_path();
             }
             let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
             let mut applied_rows = 0u64;
@@ -848,6 +984,17 @@ impl Engine {
                         .failed
                         .store(true, std::sync::atomic::Ordering::Release);
                 } else if request.seq_len > 0 {
+                    // The merged apply completed, so the resident version stamps now own future
+                    // conflict detection. Release this request's bounded in-flight bridge before
+                    // advancing the applied cut.
+                    let mut inflight = lanes.inflight_slots[request.lane]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for slot in &request.unique_slots {
+                        let removed = inflight.remove(slot);
+                        debug_assert!(removed, "applied lane slot was not marked in flight");
+                    }
+                    drop(inflight);
                     // Advance the applied cut HERE, at apply completion — the
                     // cut is GLOBAL-gating (every lane's acks wait on it);
                     // deferring it to the owning pump measurably inflated

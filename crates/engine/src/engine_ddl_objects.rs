@@ -535,6 +535,20 @@ impl Engine {
             ColumnDefault::SequenceNextVal { sequence, .. } => {
                 self.preflight_sequence_target(sequence)?;
                 let entry = seq_state.entry(sequence.clone()).or_insert_with(|| {
+                    if let Some(state) =
+                        self.current_transaction_read_snapshot()
+                            .and_then(|snapshot| {
+                                snapshot
+                                    .delta
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .sequence_state
+                                    .get(sequence)
+                                    .copied()
+                            })
+                    {
+                        return state;
+                    }
                     let catalog = self.catalog_snapshot();
                     let seq = catalog
                         .relational_sequences

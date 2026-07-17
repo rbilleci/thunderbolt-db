@@ -13,6 +13,19 @@ mod template;
 mod wave_index;
 mod wave_locate;
 
+#[cfg(test)]
+type RetainedCompletionPostHook = (
+    usize,
+    std::sync::Arc<std::sync::Barrier>,
+    std::sync::Arc<std::sync::Barrier>,
+);
+
+#[cfg(test)]
+fn retained_completion_post_hook() -> &'static Mutex<Option<RetainedCompletionPostHook>> {
+    static HOOK: OnceLock<Mutex<Option<RetainedCompletionPostHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
 /// One generation-validated host PK-cache source. The cache key, resident owner, exact column
 /// offset, and live row extent travel together so probe helpers cannot mix shard generations.
 struct ShardPkCacheSource<'a> {
@@ -34,6 +47,49 @@ struct ShardDeviceIndexKey<'a> {
 }
 
 impl Engine {
+    fn ensure_retained_submission_available(
+        &self,
+        origin_wedge: &Arc<AtomicBool>,
+    ) -> Result<(), ExecuteError> {
+        if !Arc::ptr_eq(origin_wedge, &self.commit_path_wedged) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "retained read submission belongs to a different engine".to_string(),
+            )));
+        }
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        if origin_wedge.load(AtomicOrdering::Acquire) {
+            return Err(ExecuteError::Engine(self.commit_path_unavailable_error()));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_retained_completion_post_hook(
+        &self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *retained_completion_post_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((self as *const Self as usize, reached, resume));
+    }
+
+    #[cfg(test)]
+    fn run_retained_completion_post_hook(&self) {
+        let hook = retained_completion_post_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((engine, reached, resume)) = hook {
+            if engine == self as *const Self as usize {
+                reached.wait();
+                resume.wait();
+            }
+        }
+    }
+
     // Stage-0 (Thread-3 batched/async submission): this takes `&self`, not `&mut self`.
     // Its body only calls `plan_relational_resident_route`, `bind_relational_select_for_execution`,
     // and `relational_retained_snapshot_handle` — all `&self` — so job preparation needs no
@@ -44,6 +100,8 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalRetainedReadJob, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         let decision = self.plan_relational_resident_route(select);
         if !decision.accepted {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -148,6 +206,8 @@ impl Engine {
         &self,
         jobs: &[RelationalRetainedReadJob],
     ) -> Result<RelationalRetainedReadSubmission, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         for job in jobs {
             let handle = self
                 .relational_retained_snapshot_handle(&job.table)
@@ -206,6 +266,7 @@ impl Engine {
                 .as_micros()
                 .try_into()
                 .unwrap_or(u64::MAX),
+            commit_path_wedged: Arc::clone(&self.commit_path_wedged),
             inner: RelationalRetainedReadSubmissionInner::Ready(results),
         })
     }
@@ -214,12 +275,18 @@ impl Engine {
         &self,
         submission: RelationalRetainedReadSubmission,
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
-        match submission.inner {
-            RelationalRetainedReadSubmissionInner::Ready(results) => Ok(results),
+        let origin_wedge = Arc::clone(&submission.commit_path_wedged);
+        self.ensure_retained_submission_available(&origin_wedge)?;
+        let results = match submission.inner {
+            RelationalRetainedReadSubmissionInner::Ready(results) => results,
             RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
-                self.complete_relational_retained_int4_projection_submission(*pending)
+                self.complete_relational_retained_int4_projection_submission(*pending)?
             }
-        }
+        };
+        #[cfg(test)]
+        self.run_retained_completion_post_hook();
+        self.ensure_retained_submission_available(&origin_wedge)?;
+        Ok(results)
     }
 
     fn try_submit_relational_retained_int4_projection_jobs(
@@ -238,6 +305,7 @@ impl Engine {
                     .as_micros()
                     .try_into()
                     .unwrap_or(u64::MAX),
+                commit_path_wedged: Arc::clone(&self.commit_path_wedged),
                 inner: RelationalRetainedReadSubmissionInner::Ready(Vec::new()),
             }));
         }
@@ -357,6 +425,7 @@ impl Engine {
                 .as_micros()
                 .try_into()
                 .unwrap_or(u64::MAX),
+            commit_path_wedged: Arc::clone(&self.commit_path_wedged),
             inner: RelationalRetainedReadSubmissionInner::PendingInt4Projection(Box::new(
                 RelationalRetainedInt4ProjectionSubmission {
                     table,
@@ -396,9 +465,11 @@ impl Engine {
     /// — the `shards` descriptor flags are owned by the SERIALIZED path (they are not interior-
     /// mutable via `&self`), so `is_valid()` alone cannot prove a shard's bytes are current. Any
     /// WRITE-locate that trusts the descriptor's riding buffer must ALSO require the authoritative
-    /// cell to still publish EXACTLY that Arc (ptr-identical). A tombstoned (`None`) or re-admitted
-    /// (different-ptr) cell declines the locate, sending the caller to the always-correct host
-    /// ladder. Without this gate, a concurrent host-installed write purges the PK cache but leaves
+    /// generation to own EXACTLY that Arc (ptr-identical). Transaction-scoped reads validate against
+    /// their captured shard generation; other callers validate against the current device-memory
+    /// cell. A tombstoned (`None`) or re-admitted (different-ptr) current cell declines the locate,
+    /// sending the caller to the always-correct host ladder. Without this gate, a concurrent
+    /// host-installed write purges the PK cache but leaves
     /// the descriptor valid-looking, and the next probe REBUILDS the cache from STALE device bytes
     /// — where a physical miss is load-bearing ("no visible duplicate" / "0 matches"): a duplicate
     /// key FALSE-PASSES or an Eq-resolved UPDATE/DELETE loses its row. Repro + regression:
@@ -409,6 +480,14 @@ impl Engine {
         shard_id: u32,
         descriptor_memory: &Arc<CudaResidentDeviceMemory>,
     ) -> bool {
+        if let Some(snapshot) = self.current_transaction_read_snapshot() {
+            return snapshot
+                .transaction_shards()
+                .get(table_name)
+                .and_then(|shards| shards.iter().find(|shard| shard.shard_id == shard_id))
+                .and_then(|shard| shard.device_memory.as_ref())
+                .is_some_and(|memory| Arc::ptr_eq(memory, descriptor_memory));
+        }
         self.read_state
             .residency
             .shard_device_memory
@@ -450,7 +529,7 @@ impl Engine {
             return None;
         }
         let filter_idx = key_id;
-        let shards = self.read_state.residency.shards.load();
+        let shards = self.read_residency_shards();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
             return None;
@@ -542,6 +621,9 @@ impl Engine {
         proj_cols: &[String],
         needles: &[i32],
     ) -> Option<usize> {
+        if self.ensure_commit_path_available().is_err() {
+            return None;
+        }
         let table = self.relational_catalog_table(table_name)?;
         let filter_idx =
             crate::rel_exec_helpers::relational_column_index(&table, filter_col).ok()?;
@@ -575,6 +657,9 @@ impl Engine {
         select: &Select,
         needles: &[i32],
     ) -> Option<RelationalRetainedBatchResult> {
+        if self.ensure_commit_path_available().is_err() {
+            return None;
+        }
         if !self.shard_batched_point_read_enabled() {
             return None;
         }
@@ -593,10 +678,7 @@ impl Engine {
             needles,
         )?;
         let gpu_id = self
-            .read_state
-            .residency
-            .shards
-            .load()
+            .read_residency_shards()
             .get(&table.name)
             .and_then(|s| s.first())
             .map(|s| s.gpu_id)
@@ -792,14 +874,20 @@ impl Engine {
         &self,
         submission: RelationalRetainedReadSubmission,
     ) -> Result<RelationalRetainedBatchResult, ExecuteError> {
-        match submission.inner {
+        let origin_wedge = Arc::clone(&submission.commit_path_wedged);
+        self.ensure_retained_submission_available(&origin_wedge)?;
+        let result = match submission.inner {
             RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
-                Self::complete_int4_projection_batched_detached(*pending)
+                Self::complete_int4_projection_batched_detached(*pending)?
             }
             RelationalRetainedReadSubmissionInner::Ready(results) => {
-                Ok(Self::fold_ready_results_batched(results))
+                Self::fold_ready_results_batched(results)
             }
-        }
+        };
+        #[cfg(test)]
+        self.run_retained_completion_post_hook();
+        self.ensure_retained_submission_available(&origin_wedge)?;
+        Ok(result)
     }
 
     /// Build the batched result from a drained int4 point-read submission: ONE sort by
@@ -1312,7 +1400,11 @@ fn shard_fixed_width_key_offset(
                 .find(|layout| layout.name == column.name)
                 .map(|layout| layout.offsets_byte_offset)
         }
-        _ => None,
+        SqlType::Bool => shard
+            .resident_device_bool_columns
+            .iter()
+            .find(|layout| layout.name == column.name)
+            .map(|layout| layout.bitmap_byte_offset),
     }
 }
 
@@ -1407,7 +1499,8 @@ pub(crate) fn bloom_maybe_contains(
 
 /// U1: the batched visible-locate verdicts for one wave's delete needles. Parallel per-needle
 /// vectors (`counts[i]` visible matches at needle i's snapshot; `shard_ids[i]`/`slots[i]` = the
-/// first visible target, meaningful iff `counts[i] >= 1`) + `probed`, the (shard_id, MAIN device
+/// first visible target and `row_ids[i]` = its stable entity identity, meaningful iff
+/// `counts[i] >= 1`) + `probed`, the (shard_id, MAIN device
 /// region) identity handles of every probed shard captured from the SAME `shards.load()`
 /// snapshot — the apply-time tombstone MUST recheck cell liveness against these exact regions
 /// (a VACUUM/re-admit between locate and apply re-clusters slots; stamping a stale slot would
@@ -1417,6 +1510,8 @@ pub(crate) struct WaveVisibleLocate {
     pub(crate) counts: Vec<u32>,
     pub(crate) shard_ids: Vec<u32>,
     pub(crate) slots: Vec<u32>,
+    pub(crate) row_ids: Vec<u64>,
+    pub(crate) latest_write: Vec<u64>,
     pub(crate) probed: Vec<(u32, Arc<CudaResidentDeviceMemory>)>,
 }
 

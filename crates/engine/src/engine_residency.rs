@@ -27,10 +27,11 @@ pub(crate) use payload::{
     compound_index_row_fingerprint, compound_key_fingerprint, compound_key_type_supported,
     compound_unique_slot_id, compute_open_shard_int4_append_chunks, i32_section_needle,
     index_all_key_columns_foldable, index_is_compound, index_key_column_positions,
-    index_probe_key_id, key_column_width_words, parse_relational_row_id, probe_key_id_positions,
-    sql_value_as_int4, sql_value_from_i32_section, sql_value_from_i64_section, sql_value_key_words,
-    AppendCreatedBy, UnifiedResidentSnapshotParts, COMPOUND_KEY_ID_FLAG,
-    CREATED_BY_VISIBLE_FILL_BYTE, DELETED_BY_LIVE_FILL_BYTE, ROW_ID_UNSTAMPED_FILL_BYTE,
+    index_probe_key_id, index_uses_fingerprint, key_column_width_words, parse_relational_row_id,
+    probe_key_id_positions, sql_value_as_int4, sql_value_from_i32_section,
+    sql_value_from_i64_section, sql_value_key_words, AppendCreatedBy, UnifiedResidentSnapshotParts,
+    COMPOUND_KEY_ID_FLAG, CREATED_BY_VISIBLE_FILL_BYTE, DELETED_BY_LIVE_FILL_BYTE,
+    ROW_ID_UNSTAMPED_FILL_BYTE,
 };
 
 #[cfg(test)]
@@ -219,7 +220,7 @@ impl Engine {
             // M3-for-shards: carry the shard's own per-column NULL bitmaps (offsets are relative to the
             // shard's buffer, which this descriptor addresses). Empty for the NULL-free majority.
             resident_device_null_columns: shard.resident_device_null_columns.clone(),
-            valid_through_index: self.committed_seq(),
+            valid_through_index: self.read_snapshot_boundary(),
             invalidated_by_txn_id: shard.invalidated_by_txn_id,
             invalidated_at_index: shard.invalidated_at_index,
             invalidated_by_memory_pressure: shard.invalidated_by_memory_pressure,
@@ -424,10 +425,20 @@ impl Engine {
             .filter(|memory| memory.metadata().gpu_id == gpu_id)
             .map(|memory| memory.metadata().allocated_bytes)
             .sum::<u64>();
+        // Transaction-private device generations are not attributable to an evictable global
+        // table. Keep their retained charge in every "excluding table" admission projection.
+        let private_bytes = self
+            .transaction_private_gpu_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&gpu_id)
+            .copied()
+            .unwrap_or(0);
         snapshot_bytes
             .saturating_add(shard_bytes)
             .saturating_add(single_indexes)
             .saturating_add(shard_indexes)
+            .saturating_add(private_bytes)
     }
 
     /// Actual retained allocation bytes attributable to one table on one GPU. This is the exact
@@ -520,63 +531,52 @@ impl Engine {
         &self,
         table: &str,
     ) -> Option<RelationalResidencySnapshot> {
-        self.read_state
-            .residency
-            .snapshots
-            .load()
-            .get(table)
-            .map(|entry| {
-                let mut snapshot = (*entry.descriptor).clone();
-                snapshot.memory_pressure_active = self
-                    .router
-                    .runtime()
-                    .snapshot()
-                    .memory_pressured_gpu_ids
-                    .contains(&snapshot.gpu_id);
-                snapshot
-            })
+        self.read_residency_snapshots().get(table).map(|entry| {
+            let mut snapshot = (*entry.descriptor).clone();
+            snapshot.memory_pressure_active = self
+                .router
+                .runtime()
+                .snapshot()
+                .memory_pressured_gpu_ids
+                .contains(&snapshot.gpu_id);
+            snapshot
+        })
     }
 
     pub fn relational_retained_snapshot_handle(
         &self,
         table: &str,
     ) -> Option<RelationalRetainedSnapshotHandle> {
-        self.read_state
-            .residency
-            .snapshots
-            .load()
-            .get(table)
-            .map(|entry| {
-                let snapshot = &entry.descriptor;
-                let memory_pressure_active = self
-                    .router
-                    .runtime()
-                    .snapshot()
-                    .memory_pressured_gpu_ids
-                    .contains(&snapshot.gpu_id);
-                RelationalRetainedSnapshotHandle {
-                    schema: snapshot.schema.clone(),
-                    table: snapshot.table.clone(),
-                    gpu_id: snapshot.gpu_id,
-                    generation: snapshot.generation,
-                    row_count: snapshot.row_count,
-                    column_count: snapshot.column_count,
-                    resident_bytes: snapshot.resident_bytes,
-                    valid_through_index: snapshot.valid_through_index,
-                    valid: snapshot.invalidated_by_txn_id.is_none()
-                        && snapshot.invalidated_at_index.is_none()
-                        && !snapshot.invalidated_by_memory_pressure
-                        && !memory_pressure_active,
-                    has_retained_device_memory: self
-                        .read_state
-                        .residency
-                        .device_memory
-                        .contains_key(table),
-                    resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
-                    resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
-                    resident_device_null_columns: snapshot.resident_device_null_columns.clone(),
-                }
-            })
+        if self.ensure_commit_path_available().is_err() {
+            return None;
+        }
+        self.read_residency_snapshots().get(table).map(|entry| {
+            let snapshot = &entry.descriptor;
+            let memory_pressure_active = self
+                .router
+                .runtime()
+                .snapshot()
+                .memory_pressured_gpu_ids
+                .contains(&snapshot.gpu_id);
+            RelationalRetainedSnapshotHandle {
+                schema: snapshot.schema.clone(),
+                table: snapshot.table.clone(),
+                gpu_id: snapshot.gpu_id,
+                generation: snapshot.generation,
+                row_count: snapshot.row_count,
+                column_count: snapshot.column_count,
+                resident_bytes: snapshot.resident_bytes,
+                valid_through_index: snapshot.valid_through_index,
+                valid: snapshot.invalidated_by_txn_id.is_none()
+                    && snapshot.invalidated_at_index.is_none()
+                    && !snapshot.invalidated_by_memory_pressure
+                    && !memory_pressure_active,
+                has_retained_device_memory: self.read_resident_device_memory(table).is_some(),
+                resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
+                resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
+                resident_device_null_columns: snapshot.resident_device_null_columns.clone(),
+            }
+        })
     }
 
     pub fn relational_retained_device_read_view(
@@ -587,10 +587,7 @@ impl Engine {
         if !handle.valid || !handle.has_retained_device_memory {
             return None;
         }
-        self.read_state
-            .residency
-            .device_memory
-            .get(table)
+        self.read_resident_device_memory(table)
             .map(|device_memory| device_memory.read_view())
     }
 
@@ -607,10 +604,7 @@ impl Engine {
         &self,
         table: &str,
     ) -> Option<Arc<RelationalResidencySnapshot>> {
-        self.read_state
-            .residency
-            .snapshots
-            .load()
+        self.read_residency_snapshots()
             .get(table)
             .map(|entry| entry.descriptor.clone())
     }
@@ -620,11 +614,6 @@ impl Engine {
         &self,
         table: &str,
     ) -> Option<RelationalResidencyEntry> {
-        self.read_state
-            .residency
-            .snapshots
-            .load()
-            .get(table)
-            .cloned()
+        self.read_residency_snapshots().get(table).cloned()
     }
 }

@@ -7,7 +7,7 @@ use gpu_db_types::{EngineError, TxnId};
 use crate::{
     add_column_default_supported, bind_delete_filter_groups, bind_update_assignments,
     coerce_column_default, coerce_insert_value, decode_relational_row, relational_key_prefix,
-    select_filter_matches, sequence_defaults, Engine, PUBLIC_SCHEMA_NAME,
+    select_filter_matches, sequence_defaults, DmlReadSnapshot, Engine, PUBLIC_SCHEMA_NAME,
 };
 
 impl Engine {
@@ -1390,6 +1390,24 @@ impl Engine {
                 }) {
                     return Ok(());
                 }
+                // P4/R3: a class-authoritative table's host rows were reclaimed at class entry.
+                // The generic serialized preflight ladder below can therefore resolve an empty
+                // removal set from the host/resident bootstrap representation and let a parent
+                // DELETE reach durable apply, where the chunk-aware validator then rejects it
+                // and necessarily wedges the post-durable path. Reuse the canonical prepared
+                // DELETE for this representation: it resolves the removed provider from the
+                // pinned cold entry, validates inbound FKs on-device, and rejects before WAL.
+                if self.table_chunk_authoritative(&table.name).is_some() {
+                    let boundary = self.committed_seq();
+                    let _ = self.prepare_delete(
+                        delete,
+                        DmlReadSnapshot {
+                            commit_seq: boundary,
+                            next_row_id: self.read_state.mvcc.current_row_id(),
+                        },
+                    )?;
+                    return Ok(());
+                }
                 let filter_groups = bind_delete_filter_groups(table, delete)
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 let mut visibility = StorageVisibility {
@@ -1482,5 +1500,42 @@ impl Engine {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Definitive serialized-DML constraint check. The ordinary preflight intentionally runs
+    /// before `commit_mutex`, so it cannot close a child-insert/parent-delete race by itself.
+    /// Re-resolve a class-authoritative parent DELETE at the current MVCC boundary while the
+    /// caller holds that mutex, immediately before WAL append. Other DML keeps its existing
+    /// sequencer/serialized path; binary recovery payloads are already durable records.
+    pub(crate) fn preflight_serialized_dml_under_commit_lock(
+        &self,
+        payload: &[u8],
+    ) -> Result<(), EngineError> {
+        let Some(Command::Delete(delete)) = std::str::from_utf8(payload)
+            .ok()
+            .and_then(|text| gpu_db_sql::parse_command(text).ok())
+        else {
+            return Ok(());
+        };
+        let catalog = self.catalog_snapshot();
+        let Some(table) = catalog.relational_catalog.get(&delete.table) else {
+            return Ok(());
+        };
+        let has_inbound_fk = catalog.relational_catalog.values().any(|candidate| {
+            candidate
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.referenced_table == table.name)
+        });
+        if !has_inbound_fk || self.table_chunk_authoritative(&table.name).is_none() {
+            return Ok(());
+        }
+        let snapshot = DmlReadSnapshot {
+            commit_seq: self.committed_seq(),
+            next_row_id: self.read_state.mvcc.current_row_id(),
+        };
+        self.skip_leader_check_during_internal_read(|engine| {
+            engine.prepare_delete(&delete, snapshot).map(|_| ())
+        })
     }
 }

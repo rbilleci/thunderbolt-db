@@ -795,6 +795,11 @@ mod tests {
     /// GPU. The success-slicing path is GPU-gated (`#[ignore]`) below.
     fn cpu_engine_with_table() -> Arc<SharedEngine> {
         let shared = Arc::new(SharedEngine::new());
+        // `SharedEngine::new()` follows the production auto-admission policy, so a GPU-equipped
+        // test host would otherwise turn these deliberately error-path tests into success-path
+        // tests. Disable admission before the first mutation to make the fixture deterministic.
+        shared.engine.set_auto_admit_on_commit(false);
+        shared.engine.set_host_install_elision_enabled(false);
         execute_on_shared_engine(&shared, "CREATE TABLE t (id INT)").unwrap();
         execute_on_shared_engine(&shared, "INSERT INTO t (id) VALUES (1)").unwrap();
         shared

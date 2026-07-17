@@ -15,6 +15,8 @@ impl Engine {
         &self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         #[cfg(not(test))]
         return self.execute_mvcc_query_with_cuda_driver_probe(query);
         #[cfg(test)]
@@ -54,6 +56,8 @@ impl Engine {
         &self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
         let kv = self.read_state.mvcc.load_kv();
         self.execute_mvcc_query_with_cuda_driver_probe_on_store(kv.get(), query)
     }

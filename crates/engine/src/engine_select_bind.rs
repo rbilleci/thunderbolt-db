@@ -21,7 +21,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<(RelationalTable, BoundRelationalSelect, Index), ExecuteError> {
-        let s = self.committed_seq();
+        let s = self.read_snapshot_boundary();
         self.bind_relational_select_at(select, s)
     }
 
@@ -33,8 +33,7 @@ impl Engine {
         s: Index,
     ) -> Result<(RelationalTable, BoundRelationalSelect, Index), ExecuteError> {
         let table = self
-            .read_state
-            .catalog_as_of(s)
+            .read_catalog_as_of(s)
             .relational_catalog
             .get(&select.table)
             .ok_or_else(|| {

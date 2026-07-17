@@ -561,6 +561,13 @@ impl Engine {
         // the caller: this fn is elision-safe by construction, not by caller discipline.
         let mut visibility = visibility;
         if self.table_install_elided(&table.name) {
+            if self.current_transaction_read_snapshot().is_some() {
+                return Err(EngineError::ApplyFailed(format!(
+                    "transaction-generation DML validation for \"{}\" declined its retained \
+                     device source; refusing to rehydrate or read a newer host generation",
+                    table.name
+                )));
+            }
             self.rehydrate_elided_serialized(&table.name)?;
             // Re-audit SHOULD-FIX (the FINDING-C class, scan-arm side): the reconcile stamps
             // every elided-era row at committed_seq; callers reading at a FACADE txn id below
@@ -573,7 +580,7 @@ impl Engine {
         // Load this table's published MVCC generation; the cursor reads its immutable rows
         // lock-free (the prefix filter is redundant now each partition is single-table, but kept
         // so the read stays correct regardless of partition contents — write-half Stage 3).
-        let table_rows = self.read_state.mvcc.table_rows(&table.name);
+        let table_rows = self.read_table_rows_at(&table.name, visibility.read_txn_id);
         let mut cursor = table_rows
             .store()
             .seq_scan_open(visibility)

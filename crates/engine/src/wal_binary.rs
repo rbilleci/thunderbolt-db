@@ -14,9 +14,9 @@
 //! (`apply_mvcc_entry`, `residency_invalidation_scope`) dispatch on the tag explicitly BEFORE
 //! their UTF-8 checks. SQL text can never collide (it starts with printable ASCII).
 //!
-//! v1 (W5a) scope: the COVERED single-table INSERT class (the delta-reuse class: FK/CHECK-free,
-//! no sequence defaults, unique-slots claimed via the ledger) — exactly the records whose apply
-//! is a pure install. Everything else stays SQL text. UPDATE/DELETE follow in W5b.
+//! v1 (W5a) began with the covered single-table INSERT class; W5b added UPDATE/DELETE, and R3-003
+//! added one resolved explicit-transaction operation carrying ordered row mutations plus atomic
+//! sequence post-state. Unsupported autocommit shapes remain SQL text.
 
 use super::*;
 
@@ -33,9 +33,16 @@ const OP_INSERT: u8 = 1;
 const OP_DELETE_BY_KEY: u8 = 2;
 /// U2 (W5b): a covered lane UPDATE, logged BY KEY + the new row image + the new version's row id.
 /// Replay re-resolves the key: a visible old version → tombstone it + append the new image at
-/// `new_row_id`; no visible version → a 0-row no-op (the row id is still consumed, keeping the
-/// allocator in lock-step with the live path that claimed it before the apply-time locate).
+/// the old version's stable entity id. The legacy `new_row_id` field remains a consumed allocator
+/// reservation so v1 logs and allocator high-water replay stay compatible; it is not replacement identity.
 const OP_UPDATE_BY_KEY: u8 = 3;
+/// R3-003: one explicit transaction's ordered, resolved row mutations. Every operation carries
+/// stable entity identity plus the row image(s), so replay never re-evaluates SQL predicates.
+const OP_TRANSACTION: u8 = 4;
+
+const TXN_INSERT: u8 = 1;
+const TXN_UPDATE: u8 = 2;
+const TXN_DELETE: u8 = 3;
 
 /// The decoded form of a v1 binary INSERT record.
 pub(crate) struct BinaryInsertRecord {
@@ -59,10 +66,43 @@ pub(crate) struct BinaryUpdateByKeyRecord {
     pub(crate) table: String,
     pub(crate) pk_column: String,
     pub(crate) pk_value: i32,
-    /// The new version's reserved row id (claimed live before the apply-time locate).
+    /// Legacy v1 allocator reservation. ADR-014 replay derives replacement identity from the
+    /// visible old version; this value is retained for framing and allocator high-water parity.
     pub(crate) new_row_id: u64,
     /// The new row image in `encode_relational_row`'s cell encoding (all columns, new values).
     pub(crate) new_row_encoded: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BinaryTransactionMutation {
+    Insert {
+        table: String,
+        row_id: u64,
+        row_encoded: String,
+    },
+    Update {
+        table: String,
+        row_id: u64,
+        old_row_encoded: String,
+        new_row_encoded: String,
+    },
+    Delete {
+        table: String,
+        row_id: u64,
+        old_row_encoded: String,
+    },
+}
+
+/// One durable explicit-transaction record. `allocator_high_water` is the row-id allocator value
+/// after the transaction's insert identities were claimed. Apply uses an idempotent max operation,
+/// so the live process (which preclaimed the ids before WAL encoding) and recovery converge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinaryTransactionRecord {
+    pub(crate) allocator_high_water: u64,
+    /// Final catalog post-state for each sequence consumed by a transaction-private default.
+    /// Entries are sorted by name (`BTreeMap`) for deterministic WAL bytes.
+    pub(crate) sequence_advances: BTreeMap<String, (i64, bool)>,
+    pub(crate) mutations: Vec<BinaryTransactionMutation>,
 }
 
 /// A decoded binary WAL record of any op (the tag dispatch for apply/replay consumers).
@@ -70,6 +110,72 @@ pub(crate) enum BinaryWalRecord {
     Insert(BinaryInsertRecord),
     DeleteByKey(BinaryDeleteByKeyRecord),
     UpdateByKey(BinaryUpdateByKeyRecord),
+    Transaction(BinaryTransactionRecord),
+}
+
+/// Encode one resolved explicit transaction as ONE WAL payload. Width overflow is reported as
+/// `None`; callers must fail the transaction rather than fall back to statement SQL records, which
+/// would lose atomicity and predicate-resolution identity.
+pub(crate) fn try_encode_binary_transaction(record: &BinaryTransactionRecord) -> Option<Vec<u8>> {
+    if record.sequence_advances.len() > u32::MAX as usize
+        || record.mutations.len() > u32::MAX as usize
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(32 + record.mutations.len() * 96);
+    out.push(WAL_BINARY_TAG);
+    out.push(WAL_BINARY_VERSION);
+    out.push(OP_TRANSACTION);
+    out.extend_from_slice(&record.allocator_high_water.to_le_bytes());
+    out.extend_from_slice(&(record.sequence_advances.len() as u32).to_le_bytes());
+    for (sequence, (last_value, is_called)) in &record.sequence_advances {
+        if sequence.len() > u16::MAX as usize {
+            return None;
+        }
+        out.extend_from_slice(&(sequence.len() as u16).to_le_bytes());
+        out.extend_from_slice(sequence.as_bytes());
+        out.extend_from_slice(&last_value.to_le_bytes());
+        out.push(u8::from(*is_called));
+    }
+    out.extend_from_slice(&(record.mutations.len() as u32).to_le_bytes());
+    for mutation in &record.mutations {
+        let (kind, table, row_id) = match mutation {
+            BinaryTransactionMutation::Insert { table, row_id, .. } => (TXN_INSERT, table, *row_id),
+            BinaryTransactionMutation::Update { table, row_id, .. } => (TXN_UPDATE, table, *row_id),
+            BinaryTransactionMutation::Delete { table, row_id, .. } => (TXN_DELETE, table, *row_id),
+        };
+        if table.len() > u16::MAX as usize {
+            return None;
+        }
+        out.push(kind);
+        out.extend_from_slice(&(table.len() as u16).to_le_bytes());
+        out.extend_from_slice(table.as_bytes());
+        out.extend_from_slice(&row_id.to_le_bytes());
+        let mut push_row = |encoded: &str| -> Option<()> {
+            if encoded.len() > u32::MAX as usize {
+                return None;
+            }
+            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            out.extend_from_slice(encoded.as_bytes());
+            Some(())
+        };
+        match mutation {
+            BinaryTransactionMutation::Insert { row_encoded, .. } => push_row(row_encoded)?,
+            BinaryTransactionMutation::Update {
+                old_row_encoded,
+                new_row_encoded,
+                ..
+            } => {
+                push_row(old_row_encoded)?;
+                push_row(new_row_encoded)?;
+            }
+            BinaryTransactionMutation::Delete {
+                old_row_encoded, ..
+            } => push_row(old_row_encoded)?,
+        }
+    }
+    out.shrink_to_fit();
+    Some(out)
 }
 
 /// Encode a W5b by-key DELETE record. `None` on width-exceeding names (caller falls back to the
@@ -144,6 +250,9 @@ pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, En
     let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
     match payload.get(2) {
         Some(&OP_INSERT) => decode_binary_insert(payload).map(BinaryWalRecord::Insert),
+        Some(&OP_TRANSACTION) => {
+            decode_binary_transaction(payload).map(BinaryWalRecord::Transaction)
+        }
         Some(&OP_UPDATE_BY_KEY) => {
             let mut at = 0usize;
             let mut take = |n: usize| -> Result<&[u8], EngineError> {
@@ -225,6 +334,91 @@ pub(crate) fn decode_binary_record(payload: &[u8]) -> Result<BinaryWalRecord, En
         Some(op) => Err(fail(&format!("unsupported op {op}"))),
         None => Err(fail("truncated header")),
     }
+}
+
+fn decode_binary_transaction(payload: &[u8]) -> Result<BinaryTransactionRecord, EngineError> {
+    let fail = |what: &str| EngineError::Durability(format!("malformed binary WAL record: {what}"));
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Result<&[u8], EngineError> {
+        let end = at.checked_add(n).ok_or_else(|| fail("length overflow"))?;
+        let slice = payload.get(at..end).ok_or_else(|| fail("truncated"))?;
+        at = end;
+        Ok(slice)
+    };
+    if take(1)?[0] != WAL_BINARY_TAG {
+        return Err(fail("missing tag"));
+    }
+    if take(1)?[0] != WAL_BINARY_VERSION {
+        return Err(fail("unsupported version"));
+    }
+    if take(1)?[0] != OP_TRANSACTION {
+        return Err(fail("op dispatch mismatch"));
+    }
+    let allocator_high_water = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
+    let sequence_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+    let mut sequence_advances = BTreeMap::new();
+    for _ in 0..sequence_count {
+        let name_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+        let name = std::str::from_utf8(take(name_len)?)
+            .map_err(|_| fail("non-utf8 sequence name"))?
+            .to_string();
+        let last_value = i64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
+        let is_called = match take(1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(fail("invalid sequence called flag")),
+        };
+        if sequence_advances
+            .insert(name, (last_value, is_called))
+            .is_some()
+        {
+            return Err(fail("duplicate sequence advancement"));
+        }
+    }
+    let mutation_count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+    let mut mutations = Vec::with_capacity(mutation_count.min(64 * 1024));
+    for _ in 0..mutation_count {
+        let kind = take(1)?[0];
+        let table_len = u16::from_le_bytes(take(2)?.try_into().expect("2 bytes")) as usize;
+        let table = std::str::from_utf8(take(table_len)?)
+            .map_err(|_| fail("non-utf8 table name"))?
+            .to_string();
+        let row_id = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
+        let mut take_row = || -> Result<String, EngineError> {
+            let len = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+            std::str::from_utf8(take(len)?)
+                .map(str::to_string)
+                .map_err(|_| fail("non-utf8 row encoding"))
+        };
+        let mutation = match kind {
+            TXN_INSERT => BinaryTransactionMutation::Insert {
+                table,
+                row_id,
+                row_encoded: take_row()?,
+            },
+            TXN_UPDATE => BinaryTransactionMutation::Update {
+                table,
+                row_id,
+                old_row_encoded: take_row()?,
+                new_row_encoded: take_row()?,
+            },
+            TXN_DELETE => BinaryTransactionMutation::Delete {
+                table,
+                row_id,
+                old_row_encoded: take_row()?,
+            },
+            other => return Err(fail(&format!("unsupported transaction mutation {other}"))),
+        };
+        mutations.push(mutation);
+    }
+    if at != payload.len() {
+        return Err(fail("trailing bytes"));
+    }
+    Ok(BinaryTransactionRecord {
+        allocator_high_water,
+        sequence_advances,
+        mutations,
+    })
 }
 
 /// Encode a covered INSERT delta as a v1 binary record. `rows` are `(row_id, values)`.

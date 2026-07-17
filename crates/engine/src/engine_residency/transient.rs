@@ -38,7 +38,7 @@ impl Engine {
         }
     }
 
-    pub(super) fn relational_residency_device_memory(
+    pub(crate) fn relational_residency_device_memory(
         &self,
         gpu_id: u16,
         payload: &[u8],
@@ -715,6 +715,7 @@ impl Engine {
                 shard_id: shard.shard_id,
                 row_start: shard.row_start,
                 row_count: shard.row_count,
+                history_floor_index: self.committed_seq(),
                 // Benchmark shards are read DENSE (explicit chunk layouts sized by row_count) and are not
                 // append targets.
                 capacity: shard.row_count,

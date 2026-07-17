@@ -25,7 +25,7 @@ impl Engine {
         table: &RelationalTable,
         predicate: &ResidentExpr,
     ) -> Option<Vec<(u32, Vec<u32>)>> {
-        let shards = self.read_state.residency.shards.load();
+        let shards = self.read_residency_shards();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
             return None;
@@ -101,7 +101,7 @@ impl Engine {
         table: &RelationalTable,
         predicate: &ResidentExpr,
     ) -> Option<Vec<crate::engine_retained_read::ShardPkHit>> {
-        let shards = self.read_state.residency.shards.load();
+        let shards = self.read_residency_shards();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
             return None;
@@ -112,20 +112,6 @@ impl Engine {
         let runtime_snapshot = self.router.runtime().snapshot();
         let mut out: Vec<crate::engine_retained_read::ShardPkHit> = Vec::new();
         for shard in table_shards.iter() {
-            // S-d3 zone-map prune (same soundness as the slot-only variant: prune ONLY a stat-carrying shard
-            // that provably excludes every mandatory needle; a no-stat shard is always kept).
-            if !constraints.is_empty()
-                && constraints.iter().any(|(col, needle)| {
-                    shard_zone_map_excludes(
-                        &column_names,
-                        &shard.resident_device_int4_column_stats,
-                        *col,
-                        *needle,
-                    )
-                })
-            {
-                continue;
-            }
             if shard.schema != table.schema || shard.table != table.name {
                 return None;
             }
@@ -140,6 +126,21 @@ impl Engine {
             // still publish THIS buffer, else decline (the located slot would address a superseded generation).
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
+            }
+            // S-d3 zone-map prune only AFTER the W0 liveness proof. A stale generation's zone map
+            // may exclude a value inserted after invalidation; pruning first would skip the
+            // liveness check and turn an invalid generation into an authoritative empty result.
+            if !constraints.is_empty()
+                && constraints.iter().any(|(col, needle)| {
+                    shard_zone_map_excludes(
+                        &column_names,
+                        &shard.resident_device_int4_column_stats,
+                        *col,
+                        *needle,
+                    )
+                })
+            {
+                continue;
             }
             let descriptor = self.resident_snapshot_for_shard(shard, table);
             let slots = self
@@ -232,15 +233,12 @@ impl Engine {
         Some(total)
     }
 
-    /// COMPOUND KEYS (wider types, Stage 2b): locate + tombstone the deleted `row`'s resident slot via the
-    /// compound FINGERPRINT index, for tables the int4-column predicate can't uniquely locate (an i64 key
-    /// column is not in the predicate). Folds the row's key tuple to its fingerprint, probes the compound
-    /// index, and — because the probe is fingerprint-based (a collision could point at a DIFFERENT tuple) —
-    /// TUPLE-VERIFIES each hit by materializing the slot on-device and comparing the full key columns. Only
-    /// the verified, snapshot-LIVE slot is tombstoned. Returns `Some(1)` on the unique match, else `None`
-    /// (ambiguous / device decline / can't-materialize) -> the caller re-admits (always correct). `ord` is
-    /// `index`'s position in `table.indexes`.
-    fn try_tombstone_resident_delete_via_fingerprint(
+    /// Locate + tombstone the deleted row through one device-supported unique index. Raw single-i32
+    /// indexes use their literal needle; compound/wider indexes use their fingerprint. A NULL member
+    /// or index decline falls through to the canonical typed/`IS NULL` structural scan. Every hit is
+    /// materialized and tuple-rechecked before the exact-one stamp, so fingerprint collisions and
+    /// visibility drift fail closed.
+    fn try_tombstone_resident_delete_via_unique_index(
         &self,
         table: &RelationalTable,
         index: &crate::relational_model::RelationalIndex,
@@ -248,11 +246,34 @@ impl Engine {
         row: &[SqlValue],
         commit_seq: Index,
     ) -> Option<usize> {
-        let fingerprint =
-            crate::engine_residency::compound_index_row_fingerprint(table, index, row)?;
         let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)?;
         let key_positions = crate::engine_residency::index_key_column_positions(table, index)?;
-        let hits = self.locate_resident_pk_via_shard_index_detailed(table, key_id, fingerprint)?;
+        let key_cols = key_positions
+            .iter()
+            .map(|&column_idx| Some((column_idx, row.get(column_idx)?.clone())))
+            .collect::<Option<Vec<_>>>()?;
+        let needle = if crate::engine_residency::index_uses_fingerprint(table, index) {
+            crate::engine_residency::compound_index_row_fingerprint(table, index, row)
+        } else {
+            let column_idx = *key_positions.first().filter(|_| key_positions.len() == 1)?;
+            crate::engine_residency::i32_section_needle(
+                table.columns.get(column_idx)?.ty,
+                row.get(column_idx)?,
+            )
+        };
+        let hits = needle
+            .and_then(|needle| {
+                self.locate_resident_pk_via_shard_index_detailed(table, key_id, needle)
+            })
+            .or_else(|| {
+                // Partial-NULL compound keys have no complete fingerprint, and a device-index
+                // decline is not permission to rehydrate a GPU-authoritative table. Use the same
+                // exact typed/IS-NULL predicate as constraint validation, then tuple-materialize
+                // below before stamping.
+                let predicate =
+                    crate::engine_dml_prepare::device_structural_tuple_predicate(table, &key_cols)?;
+                self.locate_resident_delete_slots_detailed(table, &predicate)
+            })?;
         // TUPLE-VERIFY every fingerprint hit: materialize the slot at the commit boundary (created_by <=
         // seq && deleted_by > seq = snapshot-live, so an already-tombstoned slot yields None and is
         // dropped — the SI-fix already-dead discipline), then confirm the full key tuple matches. A device
@@ -282,26 +303,34 @@ impl Engine {
         Some(1)
     }
 
-    /// COMPOUND KEYS (wider types): the first compound unique index whose slot the int4-column predicate
-    /// CANNOT uniquely locate — i.e. it has a key column outside the i32 section (an i64 key). Such a
-    /// table's DELETE/UPDATE must locate via the fingerprint index (`try_tombstone_resident_delete_via_
-    /// fingerprint`); an all-i32-section table keeps the proven int4-predicate locate. Returns `(ord, index)`.
-    fn compound_index_needing_fingerprint_locate(
-        table: &RelationalTable,
-    ) -> Option<(usize, &crate::relational_model::RelationalIndex)> {
-        table.indexes.iter().enumerate().find(|(_, index)| {
-            index.unique
-                && crate::engine_residency::index_is_compound(index)
-                && index.key_columns.iter().any(|name| {
-                    table
-                        .columns
-                        .iter()
-                        .find(|c| &c.name == name)
-                        .is_some_and(|c| {
-                            !matches!(c.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2)
+    /// Pick a unique index requiring tuple-aware locate for this row. NULL-bearing indexes take
+    /// priority even when raw/all-i32 because their key has no probe needle. Otherwise a
+    /// fingerprint-backed compound/wider index covers columns the legacy int4 image cannot.
+    fn index_needing_tuple_locate<'a>(
+        table: &'a RelationalTable,
+        row: &[SqlValue],
+    ) -> Option<(usize, &'a crate::relational_model::RelationalIndex)> {
+        let eligible = |index: &crate::relational_model::RelationalIndex| {
+            index.unique && crate::engine_residency::index_all_key_columns_foldable(table, index)
+        };
+        table
+            .indexes
+            .iter()
+            .enumerate()
+            .find(|(_, index)| {
+                eligible(index)
+                    && crate::engine_residency::index_key_column_positions(table, index)
+                        .is_some_and(|positions| {
+                            positions
+                                .iter()
+                                .any(|&position| matches!(row.get(position), Some(SqlValue::Null)))
                         })
+            })
+            .or_else(|| {
+                table.indexes.iter().enumerate().find(|(_, index)| {
+                    eligible(index) && crate::engine_residency::index_uses_fingerprint(table, index)
                 })
-        })
+            })
     }
 
     /// SV4b (commit path): for a single-entry DELETE commit, LOCATE + tombstone the deleted rows' resident
@@ -343,17 +372,13 @@ impl Engine {
         let Some(table) = cat.relational_catalog.get(table_name) else {
             return false;
         };
-        // COMPOUND KEYS (wider types): a compound key with an i64 column can't be located by the
-        // int4-column predicate -> use the fingerprint index + tuple-verify. All-i32-section tables keep
-        // the proven int4-predicate locate.
-        let fp_index = Self::compound_index_needing_fingerprint_locate(table);
         for row in deleted_rows {
             if row.len() != table.columns.len() {
                 return false;
             }
-            if let Some((ord, index)) = fp_index {
+            if let Some((ord, index)) = Self::index_needing_tuple_locate(table, row) {
                 if !matches!(
-                    self.try_tombstone_resident_delete_via_fingerprint(
+                    self.try_tombstone_resident_delete_via_unique_index(
                         table, index, ord, row, commit_seq
                     ),
                     Some(1)

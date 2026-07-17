@@ -646,6 +646,8 @@ impl Engine {
             shard_id: new_shard_id,
             row_start: row_start.saturating_add(row_count),
             row_count: k,
+            // A rollover is additive: it does not replace or compact any older shard history.
+            history_floor_index: 0,
             capacity: new_capacity,
             int4_appendable: true,
             resident_device_int4_column_stats: int4_stats,

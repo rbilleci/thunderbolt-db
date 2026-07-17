@@ -401,11 +401,29 @@ pub struct RelationalResidencySnapshot {
 #[derive(Debug, Clone)]
 pub struct RelationalResidencyEntry {
     pub descriptor: std::sync::Arc<RelationalResidencySnapshot>,
+    /// The exact single-buffer allocation described by `descriptor`. Keeping the resource in the
+    /// same immutable published entry gives readers one generation-atomic load of metadata plus
+    /// device ownership, matching the shard descriptor contract. The side map remains write-side
+    /// lifecycle bookkeeping during the migration, but read execution must use this field.
+    pub(crate) device_memory: Option<std::sync::Arc<CudaResidentDeviceMemory>>,
 }
 
 impl RelationalResidencyEntry {
     pub fn new(descriptor: std::sync::Arc<RelationalResidencySnapshot>) -> Self {
-        Self { descriptor }
+        Self {
+            descriptor,
+            device_memory: None,
+        }
+    }
+
+    pub(crate) fn with_device_memory(
+        descriptor: std::sync::Arc<RelationalResidencySnapshot>,
+        device_memory: Option<std::sync::Arc<CudaResidentDeviceMemory>>,
+    ) -> Self {
+        Self {
+            descriptor,
+            device_memory,
+        }
     }
 }
 
@@ -480,6 +498,7 @@ pub struct RelationalRetainedReadSubmission {
     pub snapshot_generation: u64,
     pub job_count: usize,
     pub submit_wall_micros: u64,
+    pub(crate) commit_path_wedged: Arc<AtomicBool>,
     pub(crate) inner: RelationalRetainedReadSubmissionInner,
 }
 
@@ -492,13 +511,26 @@ impl RelationalRetainedReadSubmission {
     }
 
     pub fn complete_detached(self) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
-        match self.inner {
-            RelationalRetainedReadSubmissionInner::Ready(results) => Ok(results),
-            RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => Ok(
-                Engine::complete_relational_retained_int4_projection_submission_detached(*pending)?
-                    .results,
-            ),
+        if self.commit_path_wedged.load(AtomicOrdering::Acquire) {
+            return Err(ExecuteError::Engine(EngineError::Durability(
+                "commit path is wedged; restart recovery is required before retained reads resume"
+                    .to_string(),
+            )));
         }
+        let results = match self.inner {
+            RelationalRetainedReadSubmissionInner::Ready(results) => results,
+            RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
+                Engine::complete_relational_retained_int4_projection_submission_detached(*pending)?
+                    .results
+            }
+        };
+        if self.commit_path_wedged.load(AtomicOrdering::Acquire) {
+            return Err(ExecuteError::Engine(EngineError::Durability(
+                "commit path wedged while a retained read was completing; restart recovery is required before results are returned"
+                    .to_string(),
+            )));
+        }
+        Ok(results)
     }
 }
 

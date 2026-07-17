@@ -60,17 +60,14 @@ impl Engine {
         // (The null check runs on its own lightweight shards load; the route re-validates internally against
         // its own generation-consistent capture, and the unified gather below is NULL-aware regardless.)
         if let Some((filter_idx, needle)) = point_lookup_eq {
-            let any_shard_has_nulls = self
-                .read_state
-                .residency
-                .shards
-                .load()
-                .get(&table.name)
-                .is_some_and(|shards| {
-                    shards
-                        .iter()
-                        .any(|s| !s.resident_device_null_columns.is_empty())
-                });
+            let any_shard_has_nulls =
+                self.read_residency_shards()
+                    .get(&table.name)
+                    .is_some_and(|shards| {
+                        shards
+                            .iter()
+                            .any(|s| !s.resident_device_null_columns.is_empty())
+                    });
             if !any_shard_has_nulls {
                 if let Some(result) = self.try_shard_index_point_route(
                     select, &table, &bound, filter_idx, needle, copin_s,
@@ -86,7 +83,7 @@ impl Engine {
         // version region (a tombstone could hide rows / a stamp could hide appended versions) or any
         // predicate falls through to the device path unchanged.
         if matches!(select.projection, SelectProjection::CountAll) && predicate.is_none() {
-            let shards_guard = self.read_state.residency.shards.load();
+            let shards_guard = self.read_residency_shards();
             if let Some(shards) = shards_guard.get(&table.name) {
                 // D4: read the version-freeness from the SAME loaded descriptors being summed —
                 // the metadata COUNT can no longer pair an old shard list with freshly-purged maps.
@@ -322,10 +319,7 @@ impl Engine {
         // — the DATA read below uses the generation-consistent handles captured inside the hit, which is what
         // closes the concurrent TOCTOU (a stale gpu_id label on the same single GPU is harmless).
         let gpu_id = self
-            .read_state
-            .residency
-            .shards
-            .load()
+            .read_residency_shards()
             .get(&table.name)?
             .first()?
             .gpu_id;

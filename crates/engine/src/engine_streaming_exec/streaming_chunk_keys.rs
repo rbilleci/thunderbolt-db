@@ -5,13 +5,10 @@ use super::*;
 impl Engine {
     // ================= P5-1: THE PER-CHUNK DEVICE KEY-INDEX CACHE =================
 
-    /// Build ONE chunk's key index: stage the payload, derive per-row KEY FINGERPRINTS (a single
-    /// int4 key reads its column verbatim; every other shape folds ON-DEVICE via
-    /// `submit_compound_fold_fingerprints` — raw key bytes never reach the host), build the
-    /// hash table host-side from the fingerprints (ALL-VISIBLE: the sidecar applies at the
-    /// probe's recheck), and RETAIN it as a persistent device buffer. `None` = decline (an
-    /// in-chunk duplicate fingerprint under the non-dup-tolerant build, a stage/read failure) —
-    /// the caller treats the table as probe-unservable (P5-2 de-auths).
+    /// Build ONE chunk's key index directly from its staged resident payload. Raw/fingerprint key
+    /// derivation and hash insertion stay on-device; only typed descriptors and the decline verdict
+    /// cross the host. Cold-chunk keys are duplicate-tolerant because a 32-bit fingerprint collision
+    /// is resolved by the exact typed recheck. `None` makes P5-2 de-authorize the class.
     #[allow(dead_code)] // P5-2 wires the production caller.
     fn build_chunk_key_index(
         &self,
@@ -20,8 +17,9 @@ impl Engine {
         key_positions: &[usize],
     ) -> Option<ChunkKeyIndex> {
         use crate::relational_model::{
-            resident_device_int4_column_offset, resident_device_int8_column_offset,
-            resident_device_numeric_column_offset, resident_device_text_column_layout,
+            resident_device_bool_column_offset, resident_device_int4_column_offset,
+            resident_device_int8_column_offset, resident_device_numeric_column_offset,
+            resident_device_text_column_layout,
         };
         if chunk.row_count == 0 {
             return None;
@@ -61,70 +59,75 @@ impl Engine {
                     blob_offsets.push(layout.bytes_byte_offset);
                     blob_lens.push(layout.bytes_len);
                 }
-                SqlType::Bool => return None, // a bool key is not a real-world unique key
+                SqlType::Bool => {
+                    offsets.push(resident_device_bool_column_offset(d, table, pos).ok()?);
+                    blob_offsets.push(0);
+                    blob_lens.push(0);
+                }
             }
         }
-        let keys: Vec<i32> = if key_positions.len() == 1
-            && matches!(
-                table.columns[key_positions[0]].ty,
-                SqlType::Int4 | SqlType::Date | SqlType::Int2
-            ) {
-            src.device_memory
-                .read_resident_i32_column(offsets[0], row_count)
-                .ok()?
-        } else {
-            let widths = key_positions
-                .iter()
-                .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
-                .collect::<Option<Vec<u32>>>()?;
-            let fold_columns = widths
-                .iter()
-                .enumerate()
-                .map(|(idx, &width_words)| {
-                    if width_words == 0 {
-                        CudaCompoundFoldColumn::Text {
-                            offsets_byte_offset: offsets[idx],
-                            bytes_byte_offset: blob_offsets[idx],
-                            bytes_len: blob_lens[idx],
-                        }
-                    } else {
-                        CudaCompoundFoldColumn::Fixed {
-                            byte_offset: offsets[idx],
-                            width_words,
-                        }
+        let widths = key_positions
+            .iter()
+            .map(|&p| crate::engine_residency::key_column_width_words(table.columns[p].ty))
+            .collect::<Option<Vec<u32>>>()?;
+        let fold_columns = widths
+            .iter()
+            .enumerate()
+            .map(|(idx, &width_words)| {
+                if width_words == u32::MAX {
+                    CudaCompoundFoldColumn::Bool {
+                        bitmap_byte_offset: offsets[idx],
                     }
-                })
-                .collect::<Vec<_>>();
-            src.device_memory
-                .submit_compound_fold_fingerprints(&fold_columns, row_count)
-                .ok()?
-        };
-        if keys.len() != row_count {
+                } else if width_words == 0 {
+                    CudaCompoundFoldColumn::Text {
+                        offsets_byte_offset: offsets[idx],
+                        bytes_byte_offset: blob_offsets[idx],
+                        bytes_len: blob_lens[idx],
+                    }
+                } else {
+                    CudaCompoundFoldColumn::Fixed {
+                        byte_offset: offsets[idx],
+                        width_words,
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        let table_size = chunk
+            .row_count
+            .checked_mul(2)?
+            .checked_next_power_of_two()?;
+        if table_size > (1_u64 << 30) {
             return None;
         }
-        // All-visible, non-dup-tolerant: a keyed class chunk's fingerprints are unique unless a
-        // genuine fingerprint COLLISION exists in-chunk — decline then (probe-unservable).
-        let (hash_table, table_mask, hash_shift) =
-            crate::engine_retained_read::build_int4_pk_hash_table_host_visible(
-                &keys,
-                chunk.row_count,
+        let table_mask = (table_size - 1) as u32;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let index_bytes = table_size.checked_mul(std::mem::size_of::<u64>() as u64)?;
+        let runtime = self.cuda_driver_probe_runtime();
+        let device = runtime
+            .retain_device_memory_zeroed(d.gpu_id, index_bytes)
+            .ok()?;
+        if src
+            .device_memory
+            .submit_resident_typed_index_build(
+                &device,
+                table_mask,
+                hash_shift,
+                &fold_columns,
+                row_count,
                 None,
                 0,
-                // DUP-TOLERANT (audit availability finding): a 32-bit fingerprint birthday
-                // collision between DISTINCT keys must not decline the chunk (at 50k+ rows the
-                // decline rate is material) — colliding entries chain to the next probe slot,
-                // the write-locate walks ALL matches, and the full-tuple recheck resolves.
                 true,
-            )?;
-        let bytes: Vec<u8> = hash_table.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let runtime = self.cuda_driver_probe_runtime();
-        let device = runtime.retain_device_memory_copy(d.gpu_id, &bytes).ok()?;
+            )
+            .ok()?
+        {
+            return None;
+        }
         Some(ChunkKeyIndex {
             device: Arc::new(device),
             table_mask,
             hash_shift,
             row_count: u32::try_from(row_count).ok()?,
-            bytes: bytes.len() as u64,
+            bytes: index_bytes,
             last_used: 0,
         })
     }
@@ -139,8 +142,9 @@ impl Engine {
         key_positions: &[usize],
     ) -> Option<ChunkKeyBloom> {
         use crate::relational_model::{
-            resident_device_int4_column_offset, resident_device_int8_column_offset,
-            resident_device_numeric_column_offset, resident_device_text_column_layout,
+            resident_device_bool_column_offset, resident_device_int4_column_offset,
+            resident_device_int8_column_offset, resident_device_numeric_column_offset,
+            resident_device_text_column_layout,
         };
         let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
         let (src, _vis) = staged.ready().ok()?;
@@ -177,7 +181,13 @@ impl Engine {
                     blob_offsets.push(layout.bytes_byte_offset);
                     blob_lens.push(layout.bytes_len);
                 }
-                SqlType::Bool => return None,
+                SqlType::Bool => {
+                    offsets.push(
+                        resident_device_bool_column_offset(&chunk.snapshot, table, pos).ok()?,
+                    );
+                    blob_offsets.push(0);
+                    blob_lens.push(0);
+                }
             }
         }
         let keys = if key_positions.len() == 1
@@ -197,7 +207,11 @@ impl Engine {
                 .iter()
                 .enumerate()
                 .map(|(idx, &width_words)| {
-                    if width_words == 0 {
+                    if width_words == u32::MAX {
+                        CudaCompoundFoldColumn::Bool {
+                            bitmap_byte_offset: offsets[idx],
+                        }
+                    } else if width_words == 0 {
                         CudaCompoundFoldColumn::Text {
                             offsets_byte_offset: offsets[idx],
                             bytes_byte_offset: blob_offsets[idx],
@@ -874,7 +888,7 @@ impl Engine {
     /// already type-coerced by bind. This engine's current unique semantics are structural
     /// (`NULL == NULL`), so NULL key components lower to the device validity-mask `IS NULL`
     /// leaf rather than SQL `=` (which would be UNKNOWN).
-    fn class_exact_key_predicate(
+    pub(crate) fn class_exact_key_predicate(
         table: &RelationalTable,
         positions: &[usize],
         row: &[SqlValue],
@@ -1017,10 +1031,7 @@ impl Engine {
             return Some(Err(err));
         }
         let entry = self
-            .read_state
-            .residency
-            .streaming_cold_chunks
-            .load()
+            .read_streaming_cold_chunks()
             .get(&table.name)
             .cloned()?;
         if let Some((_, epoch)) = exclude {

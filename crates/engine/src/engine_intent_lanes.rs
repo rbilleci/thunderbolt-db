@@ -3,7 +3,7 @@
 //! The measured wall since E2.3 is the single serial ordered cut (~1.7us/item ≈
 //! 625k TPS). This module parallelizes the CUT ITSELF: covered-INSERT intents
 //! hash by PK to one of N lanes; each lane is a SINGLE-WRITER pipeline (own
-//! ingress queue, own private integer conflict ledger, own `FuaWalLaneSet`
+//! ingress queue, bounded same-wave/unpublished-slot arbitration, own `FuaWalLaneSet`
 //! WAL lane with its own fence pool), and the only shared-state touch is ONE
 //! brief `CommitState` lock per WAVE (global commit-seq block claim via
 //! `propose_batch` + timestamp merge). Visibility publishes exclusively at the
@@ -15,7 +15,7 @@
 //! the engine.
 //!
 //! V1 scoping (honest, enforced): lanes mode is INTENT-ONLY once the first
-//! lane seq is claimed. Classic/DDL writes before lane activation (schema DDL,
+//! nonempty lane wave activates. Classic/DDL writes before lane activation (schema DDL,
 //! elision warm-up) run on the classic path and land in the serial WAL;
 //! recovery replays the serial log first, then the lane merge (disjoint,
 //! contiguous seq ranges). A classic write AFTER activation fails loudly with
@@ -31,6 +31,24 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+
+fn inclusive_global_boundary(base: u64, exclusive_local_cut: u64) -> u64 {
+    base.saturating_add(exclusive_local_cut).saturating_sub(1)
+}
+
+#[cfg(test)]
+type ClassicPrelockHook = (
+    usize,
+    std::sync::Arc<std::sync::Barrier>,
+    std::sync::Arc<std::sync::Barrier>,
+);
+
+#[cfg(test)]
+fn classic_prelock_hook() -> &'static Mutex<Option<ClassicPrelockHook>> {
+    static HOOK: std::sync::OnceLock<Mutex<Option<ClassicPrelockHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
 
 /// Cross-lane APPLIED cut: lanes report disjoint contiguous global-seq blocks
 /// `[start, end)` as their waves finish device apply; `advance` returns the
@@ -115,9 +133,10 @@ pub(crate) struct IntentLaneState {
     /// same-PK-same-lane invariant only holds within a routing epoch, so a
     /// resize passes through a DRAIN BARRIER — new submits divert to
     /// `resize_hold` while pumps drain every in-flight intent to settlement
-    /// (`outstanding` -> 0); at the barrier every prior commit is covered by
-    /// any post-flip snapshot, so the device validate alone catches old
-    /// duplicates and lane-ledger continuity across the flip is not needed.
+    /// (`outstanding` -> 0); at the barrier every prior commit has published
+    /// its device version history before any post-flip snapshot is admitted.
+    /// The next epoch therefore validates that history directly and does not
+    /// need an unpublished-slot bridge carried across the flip.
     pub(crate) active_lanes: std::sync::atomic::AtomicUsize,
     /// True while a resize leader holds the barrier: submits divert to
     /// `resize_hold` (one Relaxed load on the submit fast path).
@@ -175,9 +194,11 @@ pub(crate) struct IntentLaneState {
     /// submitters). Items route by PK hash, so same-PK contention stays in-lane.
     pub(crate) queues:
         Vec<Mutex<std::collections::VecDeque<crate::engine_dml_concurrent::LaneIntent>>>,
-    /// Per-lane PRIVATE conflict ledgers (integer slots only in lanes mode; the
-    /// intent-only contract means no classic write can race them).
-    pub(crate) ledgers: Vec<Mutex<crate::write_path::RecentCommitsLedger>>,
+    /// Keys whose WAL block is claimed but whose device apply has not completed. This is bounded
+    /// by the apply pipeline, not retained commit history: same-PK routing makes it the exact
+    /// arbitration bridge until the resident version stamps become authoritative.
+    pub(crate) inflight_slots:
+        Vec<Mutex<std::collections::HashSet<crate::write_path::IntUniqueSlotKey>>>,
     /// Per-lane settlement queues: waves whose outcomes are set once the
     /// visible cut covers their end seq (ack = durable ∧ applied ∧ published).
     pub(crate) settle: Vec<Mutex<std::collections::VecDeque<LaneSettle>>>,
@@ -185,6 +206,12 @@ pub(crate) struct IntentLaneState {
     /// (shared per-table device offsets): v1 serializes the apply stage.
     /// ~20-30us per wave, so contention stays low at wave granularity.
     pub(crate) device_apply_lock: Mutex<()>,
+    /// Seqlock-style witness for lane device publication. The apply leader increments this after a
+    /// merged apply has completed (or unwound after touching device state) and before removing any
+    /// in-flight slot. A validator samples it before its device probe and again while holding the
+    /// target lane's `inflight_slots` lock; a changed value makes the whole verdict retry. This
+    /// closes probe-vs-bridge-removal TOCTOU without serializing GPU validation behind apply.
+    pub(crate) device_publication_epoch: AtomicU64,
     /// Round-robin pump cursor: each `drive_commit_wave` call in lanes mode
     /// advances one lane's pipeline.
     pub(crate) pump_cursor: AtomicU64,
@@ -204,8 +231,8 @@ pub(crate) struct IntentLaneState {
     /// attribution of the pump pipeline.
     pub(crate) stat_waves: AtomicU64,
     pub(crate) stat_items: AtomicU64,
-    /// Host-pass attribution (E2.5b-2 round 2): batch formation drain, ledger
-    /// conflict/dedup, fused patch+envelope, and settle-pass time — the
+    /// Host-pass attribution (E2.5b-2 round 2): batch formation drain,
+    /// conflict/dedup arbitration, fused patch+envelope, and settle-pass time — the
     /// previously invisible ~3.5ms/lane-cycle between the measured stages.
     pub(crate) stat_drain_ns: AtomicU64,
     pub(crate) stat_conflict_ns: AtomicU64,
@@ -251,11 +278,10 @@ pub(crate) struct IntentLaneState {
     /// the apply coalescer, queues its settlement entry immediately, and never
     /// waits — the device apply runs under opportunistic non-blocking leader
     /// passes (`drive_apply_queue_once`) and the applied cut (advanced BY the
-    /// leader at completion) gates settlement. Same-slot safety does not
-    /// depend on apply completion: the lane LEDGER records winners at claim
-    /// time and PK-hash routing pins a PK to one lane, so the next wave's
-    /// conflict pass sees the previous wave's slots regardless of device-index
-    /// freshness.
+    /// leader at completion) gates settlement. Same-slot safety does not depend on apply
+    /// completion: the bounded in-flight bridge records selected winners before WAL claim, and the
+    /// publication epoch makes bridge removal atomic with the next device verdict. PK-hash routing
+    /// pins a PK to one lane.
     ///
     /// Fail-closed: an apply-leader failure PERMANENTLY holes the applied cut
     /// (its seqs never apply), so it must poison the lanes — later waves would
@@ -295,6 +321,8 @@ pub(crate) struct ValidateSlot {
 /// leader pattern as validate). Everything the merged append needs travels in
 /// the request — no `CommitWaveItem` re-walk on the apply path.
 pub(crate) struct ApplyRequest {
+    /// Owning lane for removal from its bounded in-flight arbitration set after device apply.
+    pub(crate) lane: usize,
     pub(crate) table: String,
     /// INSERT winners only (parallel with `row_ids`/`stamps`/`txn_ids`): the merged
     /// open-shard append inputs. A delete-only wave ships these empty (U1).
@@ -314,6 +342,9 @@ pub(crate) struct ApplyRequest {
     /// insert-only and can no longer stand in for the block).
     pub(crate) seq_first: u64,
     pub(crate) seq_len: u64,
+    /// Every winner's unique slot. These remain in `inflight_slots[lane]` only until this request
+    /// completes its merged device apply.
+    pub(crate) unique_slots: Vec<crate::write_path::IntUniqueSlotKey>,
     pub(crate) slot: std::sync::Arc<ApplySlot>,
 }
 
@@ -337,10 +368,11 @@ pub(crate) struct LaneTombstone {
 
 /// U2 WAL-first: an UNRESOLVED by-key UPDATE — the apply locates the visible old version itself
 /// (device visible-locate at `read_snapshot`), tombstones it, and CONDITIONALLY appends the new
-/// version at `new_row_id` (only when the locate found exactly one visible row). The record is
-/// already by-key durable (W5b: pk + `new_row_id` + new image), so `seq` and `new_row_id` are
-/// claimed and fenced before this resolves; a 0-row outcome is a durable no-op that appends
-/// nothing — but the `new_row_id` is still consumed, keeping replay's allocator in lock-step.
+/// version with the located old version's stable entity identity (only when the locate found
+/// exactly one visible row). The v1 record still carries a reserved legacy row id so existing WAL
+/// framing and allocator replay stay compatible during the ADR-014 migration; that reservation is
+/// not the replacement version's identity. A 0-row outcome appends nothing but still consumes the
+/// reservation, keeping replay's allocator in lock-step.
 pub(crate) struct LaneUpdate {
     /// The commit seq — the `deleted_by` stamp on the located old version AND the `created_by`
     /// stamp on the appended new version.
@@ -351,8 +383,6 @@ pub(crate) struct LaneUpdate {
     pub(crate) pk: i32,
     /// The update's read snapshot — the visibility the apply-time locate evaluates at.
     pub(crate) read_snapshot: u64,
-    /// The new version's reserved row id (claimed live at the pump before the apply-time locate).
-    pub(crate) new_row_id: u64,
     /// The new row image (all columns, catalog order) — appended iff the old located to one row.
     pub(crate) new_values: Vec<crate::SqlValue>,
     /// The shared cell the apply writes the resolved rows-affected (0 or 1) into; the settle reads
@@ -475,9 +505,10 @@ impl IntentLaneState {
             activated: AtomicBool::new(false),
             base_seq: AtomicU64::new(0),
             queues: (0..lane_count).map(|_| Default::default()).collect(),
-            ledgers: (0..lane_count).map(|_| Default::default()).collect(),
+            inflight_slots: (0..lane_count).map(|_| Default::default()).collect(),
             settle: (0..lane_count).map(|_| Default::default()).collect(),
             device_apply_lock: Mutex::new(()),
+            device_publication_epoch: AtomicU64::new(0),
             pump_cursor: AtomicU64::new(0),
             pump_guards: (0..lane_count).map(|_| Default::default()).collect(),
             pending_since: (0..lane_count).map(|_| Default::default()).collect(),
@@ -612,9 +643,31 @@ impl IntentLaneState {
     }
 }
 
+#[cfg(test)]
+mod boundary_tests {
+    #[test]
+    fn exclusive_lane_cut_maps_to_inclusive_commit_boundary() {
+        assert_eq!(super::inclusive_global_boundary(4, 0), 3);
+        assert_eq!(super::inclusive_global_boundary(4, 1), 4);
+        assert_eq!(super::inclusive_global_boundary(4, 7), 10);
+    }
+}
+
 /// `GPU_DB_INTENT_LANES` (default 1 = lanes mode OFF; >= 2 enables). Read once
 /// at engine construction, like the other write-path knobs.
 impl crate::Engine {
+    #[cfg(test)]
+    pub(crate) fn set_intent_lanes_classic_prelock_hook(
+        &self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *classic_prelock_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((self as *const Self as usize, reached, resume));
+    }
+
     /// Lane diagnostics for benches: (waves, items, validate_ns, claim_ns,
     /// append_ns, apply_ns, durable_cut, applied_cut). None when lanes are off.
     #[allow(clippy::type_complexity)]
@@ -638,7 +691,7 @@ impl crate::Engine {
     }
 
     /// Pump host-pass diagnostics: (drain_ns, conflict_ns, patch_ns, settle_ns)
-    /// — the formation/ledger/patch+envelope/settle passes between the staged
+    /// — the formation/arbitration/patch+envelope/settle passes between the staged
     /// stats above. None when lanes are off.
     pub fn intent_lane_hostpass_stats(&self) -> Option<(u64, u64, u64, u64)> {
         let lanes = self.intent_lanes.as_ref()?;
@@ -702,7 +755,7 @@ impl crate::Engine {
             .load(Ordering::Relaxed)
     }
 
-    /// V1 intent-only contract: once the first lane seq block is claimed, classic
+    /// V1 intent-only contract: once the first nonempty lane wave activates, classic
     /// DML/DDL writes are refused fail-loud — a classic record appended to the
     /// serial WAL AFTER lane activation would interleave two ordered logs with
     /// no merge rule (full serial+lanes merge replay is the E2.5c slice).
@@ -715,6 +768,22 @@ impl crate::Engine {
                      classic DML/DDL writes are refused after the first lane commit"
                         .to_string(),
                 ));
+            }
+        }
+        #[cfg(test)]
+        {
+            let prelock_hook = {
+                let mut hook = classic_prelock_hook()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                hook.as_ref()
+                    .is_some_and(|(owner, _, _)| *owner == self as *const Self as usize)
+                    .then(|| hook.take())
+                    .flatten()
+            };
+            if let Some((_, reached, resume)) = prelock_hook {
+                reached.wait();
+                resume.wait();
             }
         }
         Ok(())

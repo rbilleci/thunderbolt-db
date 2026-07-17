@@ -25,7 +25,10 @@ impl Engine {
     /// boundary instead (PART B), but the off-latch DML preflight and a handful of admin reads that are
     /// not boundary-pinned use this. A statement that does pin loads its boundary once and threads it.
     pub(crate) fn catalog_snapshot(&self) -> Arc<CatalogSnapshot> {
-        self.read_state.latest_catalog()
+        self.current_transaction_read_snapshot().map_or_else(
+            || self.read_state.latest_catalog(),
+            |snapshot| Arc::clone(&snapshot.catalog),
+        )
     }
 
     /// Build a fresh immutable catalog generation from `cat` (the DDL working maps, held under the
@@ -143,15 +146,58 @@ impl Engine {
                 "checkpoint vacuum safe commit_seq {safe_commit_seq} is newer than the durable commit boundary {durable_boundary}"
             )));
         }
-        Ok(self
+        let stats = self
             .read_state
             .mvcc
-            .prune_versions_deleted_at_or_before(safe_commit_seq))
+            .prune_versions_deleted_at_or_before(safe_commit_seq);
+        self.prune_relational_value_indexes_to_retained_versions()?;
+        Ok(stats)
+    }
+
+    /// Rebuild each append-only relational value index from the versions that survived the same
+    /// checkpoint GC fence. A row key remains in every slot needed by any retained snapshot; stale
+    /// update values and fully deleted identities disappear together with their versions.
+    fn prune_relational_value_indexes_to_retained_versions(&self) -> Result<usize, EngineError> {
+        let catalog = self.catalog_snapshot();
+        let mut removed = 0usize;
+        for table in catalog.relational_catalog.values() {
+            removed += self.read_state.mvcc.with_table_mut(&table.name, |data| {
+                let before = data.value_index.values().map(imbl::Vector::len).sum::<usize>();
+                let mut retained = BTreeMap::<ColumnValueKey, BTreeSet<String>>::new();
+                for version in data.rows.all_versions() {
+                    let row = decode_relational_row(&version.value, &table.columns).map_err(
+                        |err| {
+                            EngineError::Durability(format!(
+                                "value-index GC could not decode retained row in relation \"{}\": {err}",
+                                table.name
+                            ))
+                        },
+                    )?;
+                    for (column, value) in table.columns.iter().zip(row.iter()) {
+                        retained
+                            .entry(ColumnValueKey {
+                                column: column.name.clone(),
+                                value: relational_index_value(value),
+                            })
+                            .or_default()
+                            .insert(version.key.clone());
+                    }
+                }
+                let mut rebuilt = imbl::OrdMap::new();
+                for (slot, row_keys) in retained {
+                    rebuilt.insert(slot, row_keys.into_iter().collect());
+                }
+                let after = rebuilt.values().map(imbl::Vector::len).sum::<usize>();
+                data.value_index = rebuilt;
+                Ok::<usize, EngineError>(before.saturating_sub(after))
+            })?;
+        }
+        Ok(removed)
     }
 
     /// The oldest active read snapshot (`commit_seq`), or `None` when no transaction is in flight —
     /// the safe MVCC GC / ledger-prune boundary (write-half Stage 4).
-    fn active_snapshots_oldest(&self) -> Option<Index> {
+    pub(crate) fn active_snapshots_oldest(&self) -> Option<Index> {
         self.active_snapshots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -159,6 +205,9 @@ impl Engine {
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
+        if self.ensure_commit_path_available().is_err() {
+            return None;
+        }
         // KV now lives under the commit_mutex (A.2): a `MutexGuard` cannot lend a borrow that
         // outlives it, so this returns an owned `String` (the historical `Option<&str>`). The KV read
         // path is not perf-critical; the relational read path is the lock-free one.

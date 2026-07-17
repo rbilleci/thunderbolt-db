@@ -2740,14 +2740,18 @@ fn compound_primary_key_over_i32_section_columns_enforces_tuple_uniqueness() {
         "duplicate compound tuple raises 23505, got {err:?}"
     );
 
-    // (4) A compound key touching a NON-FOLDABLE type (BOOL — no i32-word decomposition) stays
-    // rejected — cleanly, in preflight. (i32/i64/b128/text are all supported now; bool is not.)
+    // (4) BOOL has a canonical one-bit resident fold too. Distinct boolean members remain
+    // distinct tuples and an exact repeat is rejected by the CPU parity oracle.
+    e.execute_text(7, "CREATE TABLE w (a INT, f BOOL, PRIMARY KEY (a, f))")
+        .unwrap();
+    e.execute_text(8, "INSERT INTO w (a, f) VALUES (1, TRUE), (1, FALSE)")
+        .unwrap();
     let err = e
-        .execute_text(7, "CREATE TABLE w (a INT, f BOOL, PRIMARY KEY (a, f))")
+        .execute_text(9, "INSERT INTO w (a, f) VALUES (1, TRUE)")
         .unwrap_err();
     assert!(
-        format!("{err:?}").contains("compound"),
-        "non-foldable-typed compound PK is rejected, got {err:?}"
+        format!("{err:?}").contains("duplicate key value"),
+        "duplicate compound BOOL tuple raises 23505, got {err:?}"
     );
 
     // (5) The other compound entry points also work for i32-section keys (ADD PK / ADD UNIQUE /
@@ -2785,12 +2789,12 @@ fn compound_primary_key_over_i32_section_columns_enforces_tuple_uniqueness() {
         .is_err());
 
     // (7) A single-column PRIMARY KEY still works end-to-end (no regression).
-    e.execute_text(8, "CREATE TABLE s (id INT PRIMARY KEY, v INT)")
+    e.execute_text(10, "CREATE TABLE s (id INT PRIMARY KEY, v INT)")
         .unwrap();
-    e.execute_text(9, "INSERT INTO s (id, v) VALUES (1, 10), (2, 20)")
+    e.execute_text(11, "INSERT INTO s (id, v) VALUES (1, 10), (2, 20)")
         .unwrap();
     assert!(e
-        .execute_text(10, "INSERT INTO s (id, v) VALUES (1, 99)")
+        .execute_text(12, "INSERT INTO s (id, v) VALUES (1, 99)")
         .is_err());
     let table = e.relational_catalog_table("s").unwrap();
     let pk = table.indexes.iter().find(|i| i.primary_key).unwrap();

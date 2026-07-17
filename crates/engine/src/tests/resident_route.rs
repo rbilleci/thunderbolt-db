@@ -2868,6 +2868,18 @@ fn w0_concurrent_invalidation_must_not_leave_write_locate_trusting_stale_shards(
     // The shard DESCRIPTORS stay valid-looking — the bug's precondition.
     e.execute_dml_concurrent(10, "INSERT INTO t (id) VALUES (42)")
         .unwrap();
+    let table = e.relational_catalog_table("t").unwrap();
+    assert_eq!(
+        e.device_visible_row_with_value(
+            &table,
+            StorageVisibility { read_txn_id: 10 },
+            0,
+            &SqlValue::Int4(42),
+            None,
+        ),
+        None,
+        "an invalidated device generation must decline constraint validation"
+    );
 
     // The SAME key again: uniqueness validation must see the committed id=42. On the buggy build
     // the device probe rebuilds the PK cache from the STALE shard bytes (42 was never appended),

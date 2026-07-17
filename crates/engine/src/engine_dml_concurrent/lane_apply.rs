@@ -1,27 +1,68 @@
 use super::{
-    Engine, EngineError, ExecuteError, Index, LaneIntent, LaneOpKind, RelationalTable, SqlValue,
+    exact_device_verdict_cardinality, Engine, EngineError, ExecuteError, Index, LaneIntent,
+    LaneOpKind, RelationalTable, SqlValue,
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 impl Engine {
+    /// Probe optimistically against immutable published descriptors. If an append races that
+    /// observation, repeat once behind the lane device-publication boundary instead of turning a
+    /// transient torn descriptor/index pair into a spurious serialization abort.
+    fn lane_visible_locate_stable(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        needles: &[i32],
+        snapshots: &[u64],
+    ) -> Option<crate::engine_retained_read::WaveVisibleLocate> {
+        if let Some(result) = self.wave_batch_visible_locate(table, filter_idx, needles, snapshots)
+        {
+            return Some(result);
+        }
+        let apply_leader =
+            crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(|flag| flag.get());
+        if apply_leader {
+            return self.wave_batch_visible_locate(table, filter_idx, needles, snapshots);
+        }
+        let lanes = self.intent_lanes.as_ref()?;
+        let _device_guard = lanes
+            .device_apply_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        struct DeviceGuardFlag;
+        impl Drop for DeviceGuardFlag {
+            fn drop(&mut self) {
+                crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(|flag| flag.set(false));
+            }
+        }
+        crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(|flag| flag.set(true));
+        let _device_guard_flag = DeviceGuardFlag;
+        self.wave_batch_visible_locate(table, filter_idx, needles, snapshots)
+    }
+
     /// LEAN device validate for lane intents: needles straight from the
-    /// integer slots, locate through the cross-lane coalescer, count>0 hits
-    /// re-checked authoritatively at the item's read snapshot (same semantics
-    /// as wave_batch_validate_unique's covered-insert arm). Returns 23505
-    /// messages by batch position. Catalog drift (DDL between build and pump,
-    /// pre-activation-window only) aborts the item retryably.
+    /// integer slots, returning both visibility at each item's read snapshot and the highest
+    /// physical-version write stamp for that key. A stamp newer than the snapshot is a retryable
+    /// first-committer-wins conflict even when the key has since been deleted or moved away;
+    /// otherwise an INSERT-visible match is the normal 23505 duplicate. Catalog drift (DDL between
+    /// build and pump, pre-activation-window only) aborts the item retryably.
     pub(super) fn lane_validate_unique(
         &self,
         batch: &[LaneIntent],
-    ) -> std::collections::BTreeMap<usize, String> {
+    ) -> (
+        std::collections::BTreeMap<usize, String>,
+        std::collections::BTreeSet<usize>,
+    ) {
         let mut violations = std::collections::BTreeMap::new();
+        let mut conflicts = std::collections::BTreeSet::new();
         if batch.is_empty() {
-            return violations;
+            return (violations, conflicts);
         }
         let catalog = self.catalog_snapshot();
         // group needles per (table, filter_idx); usually exactly one group
         let mut group_keys: Vec<(&str, u32)> = Vec::new();
         let mut group_needles: Vec<Vec<i32>> = Vec::new();
+        let mut group_snapshots: Vec<Vec<u64>> = Vec::new();
         let mut group_positions: Vec<Vec<usize>> = Vec::new();
         for (position, item) in batch.iter().enumerate() {
             if catalog.commit_seq != item.prepared_catalog_seq {
@@ -31,23 +72,19 @@ impl Engine {
                 );
                 continue;
             }
-            // U1/U2: DELETE and UPDATE items resolve via the apply-time visible-locate; the
-            // insert-dup validate has nothing to check for them (their pk is EXPECTED to exist —
-            // a dup verdict would wrongly reject the very row they mutate).
-            if item.op != LaneOpKind::Insert {
-                continue;
-            }
             let key = (&*item.table, item.filter_idx);
             let group = match group_keys.iter().position(|k| *k == key) {
                 Some(index) => index,
                 None => {
                     group_keys.push(key);
                     group_needles.push(Vec::new());
+                    group_snapshots.push(Vec::new());
                     group_positions.push(Vec::new());
                     group_keys.len() - 1
                 }
             };
             group_needles[group].push(item.slot.1);
+            group_snapshots[group].push(item.read_snapshot);
             group_positions[group].push(position);
         }
         for (group, &(table_name, filter_idx)) in group_keys.iter().enumerate() {
@@ -57,79 +94,62 @@ impl Engine {
                 }
                 continue;
             };
-            let locate = self.wave_batch_locate_hit_counts(
+            let locate = self.lane_visible_locate_stable(
                 table,
                 filter_idx as usize,
                 &group_needles[group],
+                &group_snapshots[group],
             );
-            let Some(counts) = locate else {
-                // decline -> authoritative per-needle recheck (rare)
-                for (&position, &needle) in group_positions[group]
-                    .iter()
-                    .zip(group_needles[group].iter())
-                {
-                    self.lane_authoritative_dup_check(
-                        table,
-                        filter_idx as usize,
-                        needle,
-                        batch[position].read_snapshot,
-                        position,
-                        &mut violations,
-                    );
+            let Some(locate) = locate else {
+                // A host probe cannot prove that an after-snapshot claim was subsequently
+                // released. No device history verdict therefore fails retryably before WAL.
+                for &position in &group_positions[group] {
+                    conflicts.insert(position);
                 }
                 continue;
             };
-            for ((&position, &needle), &count) in group_positions[group]
+            let expected = group_positions[group].len();
+            if !exact_device_verdict_cardinality(
+                expected,
+                &[
+                    group_needles[group].len(),
+                    group_snapshots[group].len(),
+                    locate.counts.len(),
+                    locate.shard_ids.len(),
+                    locate.slots.len(),
+                    locate.row_ids.len(),
+                    locate.latest_write.len(),
+                ],
+            ) {
+                // Parallel device-result vectors are one exact verdict. A short OR long component
+                // must not let `zip` silently ignore a requested key.
+                conflicts.extend(group_positions[group].iter().copied());
+                continue;
+            }
+            for (((&position, &count), &latest_write), &snapshot) in group_positions[group]
                 .iter()
-                .zip(group_needles[group].iter())
-                .zip(counts.iter())
+                .zip(locate.counts.iter())
+                .zip(locate.latest_write.iter())
+                .zip(group_snapshots[group].iter())
             {
-                if count == 0 {
+                if latest_write > snapshot {
+                    conflicts.insert(position);
                     continue;
                 }
-                self.lane_authoritative_dup_check(
-                    table,
-                    filter_idx as usize,
-                    needle,
-                    batch[position].read_snapshot,
-                    position,
-                    &mut violations,
-                );
+                if batch[position].op == LaneOpKind::Insert && count > 0 {
+                    let index_name = table
+                        .columns
+                        .get(filter_idx as usize)
+                        .map(|column| format!("{}_{}_key", table.name, column.name))
+                        .unwrap_or_else(|| format!("{}_key", table.name));
+                    violations.insert(
+                        position,
+                        format!("duplicate key value violates unique index \"{index_name}\""),
+                    );
+                }
             }
         }
-        violations
-    }
-
-    fn lane_authoritative_dup_check(
-        &self,
-        table: &RelationalTable,
-        filter_idx: usize,
-        needle: i32,
-        read_snapshot: Index,
-        position: usize,
-        violations: &mut std::collections::BTreeMap<usize, String>,
-    ) {
-        let visibility = crate::StorageVisibility {
-            read_txn_id: read_snapshot,
-        };
-        let value = SqlValue::Int4(needle);
-        match self.visible_row_with_value(table, visibility, filter_idx, &value, None) {
-            Ok(true) => {
-                let index_name = table
-                    .columns
-                    .get(filter_idx)
-                    .map(|column| format!("{}_{}_key", table.name, column.name))
-                    .unwrap_or_else(|| format!("{}_key", table.name));
-                violations.insert(
-                    position,
-                    format!("duplicate key value violates unique index \"{index_name}\""),
-                );
-            }
-            Ok(false) => {}
-            Err(err) => {
-                violations.insert(position, format!("unique validation failed: {err}"));
-            }
-        }
+        (violations, conflicts)
     }
 
     /// APPLY LEADER body: merge every pending lane request per table and run
@@ -258,7 +278,7 @@ impl Engine {
                 let catalog_table = self
                     .relational_catalog_table(table)
                     .expect("an elided table is in the catalog");
-                let (mut removals, matched_keys) = self
+                let (removals, matched_keys) = self
                     .resolve_elided_row_ids_by_int4_key(
                         &catalog_table,
                         gather_snapshot,
@@ -278,16 +298,16 @@ impl Engine {
                 // one visible row = the rehydrate removes it = rows-affected 1; else 0.
                 for tombstone in &tombstones {
                     tombstone.rows_affected.store(
-                        u64::from(matched_keys.contains(&tombstone.pk)),
+                        u64::from(matched_keys.contains_key(&tombstone.pk)),
                         std::sync::atomic::Ordering::Release,
                     );
                 }
-                // U2 WAL-FIRST fallback: resolve the update-olds BY KEY too. A matched old =
-                // remove it (its resolved row id joins `removals`) + upsert the new version at its
-                // claimed `new_row_id` (the CONDITIONAL append, done here by hand); an unmatched
-                // (0-row) update removes nothing and appends nothing. Rows-affected = matched.
+                // U2/R3 WAL-FIRST fallback: resolve the update-olds BY KEY too. A matched old
+                // supplies the stable entity id reused by the replacement upsert; the old image
+                // is overwritten by identity, not removed under one id and reinserted under a
+                // fresh one. An unmatched update appends nothing. Rows-affected = matched.
                 if !updates.is_empty() {
-                    let (update_removals, update_matched) = self
+                    let (_update_removals, update_entities) = self
                         .resolve_elided_row_ids_by_int4_key(
                             &catalog_table,
                             gather_snapshot,
@@ -302,15 +322,15 @@ impl Engine {
                                  the merged lane fallback on {table} failed: {err}"
                             )
                         });
-                    removals.extend(update_removals);
                     for update in &updates {
-                        let matched = update_matched.contains(&update.pk);
-                        if matched {
-                            upserts.insert(update.new_row_id, update.new_values.clone());
+                        let entity_id = update_entities.get(&update.pk).copied();
+                        if let Some(entity_id) = entity_id {
+                            upserts.insert(entity_id, update.new_values.clone());
                         }
-                        update
-                            .rows_affected
-                            .store(u64::from(matched), std::sync::atomic::Ordering::Release);
+                        update.rows_affected.store(
+                            u64::from(entity_id.is_some()),
+                            std::sync::atomic::Ordering::Release,
+                        );
                     }
                 }
                 self.rehydrate_elided_table(
@@ -373,6 +393,17 @@ impl Engine {
         else {
             return false; // device decline -> rehydrate fallback resolves by key
         };
+        let expected = tombstones.len();
+        if needles.len() != expected
+            || snapshots.len() != expected
+            || locate.counts.len() != expected
+            || locate.shard_ids.len() != expected
+            || locate.slots.len() != expected
+            || locate.row_ids.len() != expected
+            || locate.latest_write.len() != expected
+        {
+            return false;
+        }
         // Resolve each delete to 0 or 1 rows; collect the 1-row targets grouped by (shard,
         // locate-region identity) for the batched scatter + cell-liveness recheck. The group
         // value = (the region Arc, the (slot, stamp) pairs for that shard).
@@ -438,11 +469,10 @@ impl Engine {
     /// versions on the DEVICE, at apply time (off the pump critical path). ONE visible-locate over
     /// all keys at their read snapshots resolves each to zero or one visible row. A 1-row update
     /// tombstones the located old (scatter, grouped by shard with the cell-liveness recheck, EXACTLY
-    /// the delete pass) AND appends its new image at the claimed `new_row_id` — a dead twin sharing
-    /// the pk, so the append's index CAS collides with the still-indexed old and DROPS the pk-index
-    /// cache (the next locate rebuilds it visibility-aware, skipping dead-below-GC twins; this is the
-    /// F3/U4 dead-twin cost). A 0-row update appends NOTHING (the CONDITIONAL append) but its
-    /// `new_row_id` was already claimed + WAL-durable, so replay stays in allocator lock-step. Every
+    /// the delete pass) AND appends its new image with the GPU-returned stable entity identity. The
+    /// physical version twin still shares the pk, so the append's index CAS follows the existing
+    /// duplicate/version-aware path. A 0-row update appends NOTHING; its legacy v1 WAL allocator
+    /// reservation was already claimed and remains replayed for format/high-water compatibility. Every
     /// update's rows-affected cell is set only on FULL success. Returns `false` on ANY decline
     /// (declined locate, ambiguous multiplicity, stale cell, stamp/append failure) WITHOUT setting
     /// cells — the caller's rehydrate fallback then resolves by key. Runs under the apply leader lock.
@@ -471,9 +501,20 @@ impl Engine {
         else {
             return false; // device decline -> rehydrate fallback resolves by key
         };
+        let expected = updates.len();
+        if needles.len() != expected
+            || snapshots.len() != expected
+            || locate.counts.len() != expected
+            || locate.shard_ids.len() != expected
+            || locate.slots.len() != expected
+            || locate.row_ids.len() != expected
+            || locate.latest_write.len() != expected
+        {
+            return false;
+        }
         // Resolve each update to 0 or 1 rows; collect the 1-row olds grouped by (shard, region) for
         // the batched tombstone scatter (identical to the delete pass) AND, in the SAME order, the
-        // 1-row updates' new-version append inputs (new image, birth seq = its own seq, new row id).
+        // 1-row updates' new-version append inputs (new image, birth seq, stable entity id).
         type TombstoneGroup = (
             std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>,
             Vec<(u32, Index)>,
@@ -503,9 +544,15 @@ impl Engine {
                         .or_insert_with(|| (std::sync::Arc::clone(region), Vec::new()))
                         .1
                         .push((slot, update.seq));
+                    let Some(&entity_id) = locate.row_ids.get(i) else {
+                        return false;
+                    };
+                    if entity_id == u64::MAX {
+                        return false; // identity-unknown lineage: never invent a replacement identity
+                    }
                     append_rows.push(update.new_values.clone());
                     append_stamps.push(update.seq);
-                    append_row_ids.push(update.new_row_id);
+                    append_row_ids.push(entity_id);
                     counts.push(1);
                 }
                 _ => return false, // ambiguous multiplicity / missing -> fallback
@@ -591,6 +638,7 @@ impl Engine {
             } else {
                 "intent lane apply leader failed; cut permanently holed".to_string()
             };
+            self.wedge_commit_path();
             let mut queue = lanes.settle[lane]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());

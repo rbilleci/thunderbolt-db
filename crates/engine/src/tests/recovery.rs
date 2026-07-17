@@ -58,6 +58,109 @@ fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
     assert_eq!(result.rows, vec![vec![SqlValue::Int4(3)]]);
 }
 
+#[test]
+fn explicit_transaction_binary_record_is_one_atomic_recoverable_generation() {
+    let e = Engine::new_local_cpu_oracle();
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, marker INT)",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, balance, marker) VALUES (1, 100, NULL)",
+    )
+    .unwrap();
+    let existing_row_id = e.read_state.mvcc.current_row_id() - 1;
+    let inserted_row_id = e.read_state.mvcc.current_row_id();
+    let record = BinaryTransactionRecord {
+        allocator_high_water: inserted_row_id + 1,
+        sequence_advances: BTreeMap::new(),
+        mutations: vec![
+            BinaryTransactionMutation::Insert {
+                table: "accounts".to_string(),
+                row_id: inserted_row_id,
+                row_encoded: encode_relational_row(&[
+                    SqlValue::Int4(2),
+                    SqlValue::Int4(300),
+                    SqlValue::Null,
+                ]),
+            },
+            BinaryTransactionMutation::Update {
+                table: "accounts".to_string(),
+                row_id: inserted_row_id,
+                old_row_encoded: encode_relational_row(&[
+                    SqlValue::Int4(2),
+                    SqlValue::Int4(300),
+                    SqlValue::Null,
+                ]),
+                new_row_encoded: encode_relational_row(&[
+                    SqlValue::Int4(2),
+                    SqlValue::Int4(350),
+                    SqlValue::Null,
+                ]),
+            },
+            BinaryTransactionMutation::Update {
+                table: "accounts".to_string(),
+                row_id: existing_row_id,
+                old_row_encoded: encode_relational_row(&[
+                    SqlValue::Int4(1),
+                    SqlValue::Int4(100),
+                    SqlValue::Null,
+                ]),
+                new_row_encoded: encode_relational_row(&[
+                    SqlValue::Int4(1),
+                    SqlValue::Int4(200),
+                    SqlValue::Null,
+                ]),
+            },
+            BinaryTransactionMutation::Delete {
+                table: "accounts".to_string(),
+                row_id: existing_row_id,
+                old_row_encoded: encode_relational_row(&[
+                    SqlValue::Int4(1),
+                    SqlValue::Int4(200),
+                    SqlValue::Null,
+                ]),
+            },
+        ],
+    };
+    let payload = try_encode_binary_transaction(&record).unwrap();
+    let wal_before = e.durable_wal_records().len();
+    let token = e.commit_mutation(90, Arc::from(payload)).unwrap();
+    let durable = e.durable_wal_records();
+    assert_eq!(durable.len(), wal_before + 1, "one transaction WAL record");
+    assert!(matches!(
+        decode_binary_record(&durable.last().unwrap().payload).unwrap(),
+        BinaryWalRecord::Transaction(decoded) if decoded == record
+    ));
+    assert_eq!(e.visible_up_to(), token.index, "one published commit index");
+
+    let select =
+        match parse_command("SELECT id, balance, marker FROM accounts ORDER BY id").unwrap() {
+            Command::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+    let live = e.execute_relational_select(&select).unwrap();
+    assert_eq!(
+        live.rows.row(0),
+        &[SqlValue::Int4(2), SqlValue::Int4(350), SqlValue::Null]
+    );
+    assert_eq!(live.rows.len(), 1);
+
+    let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+    let replayed = recovered.execute_relational_select(&select).unwrap();
+    assert_eq!(
+        replayed.rows, live.rows,
+        "live apply and replay are identical"
+    );
+    assert_eq!(
+        recovered.read_state.mvcc.current_row_id(),
+        record.allocator_high_water,
+        "replay restores the transaction's claimed allocator high-water"
+    );
+}
+
 // Query the `id` values from `people`, sorted, for crash-recovery assertions.
 fn select_people_ids(engine: &mut Engine) -> Vec<i32> {
     let Command::Select(select) = parse_command("SELECT id FROM people ORDER BY id").unwrap()
@@ -1900,6 +2003,47 @@ fn checkpoint_vacuum_prunes_mvcc_versions_only_at_durable_safe_boundary() {
             .map(|version| version.value),
         Some("open".to_string())
     );
+}
+
+#[test]
+fn checkpoint_vacuum_reclaims_relational_value_index_update_churn() {
+    let e = Engine::new_local_cpu_oracle();
+    e.execute_text(1, "CREATE TABLE churn (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO churn (id, v) VALUES (1, 0)")
+        .unwrap();
+    for value in 1..=128 {
+        e.execute_text(
+            value as u64 + 2,
+            &format!("UPDATE churn SET v = {value} WHERE id = 1"),
+        )
+        .unwrap();
+    }
+    let before = e.read_state.mvcc.value_index_snapshot();
+    assert_eq!(
+        before
+            .keys()
+            .filter(|slot| slot.table == "churn" && slot.column == "v")
+            .count(),
+        129,
+        "every historical update value is indexed before the GC fence"
+    );
+
+    let safe = e.committed_seq();
+    let stats = e.checkpoint_vacuum_mvcc_versions(safe).unwrap();
+    assert_eq!(stats.removed_versions, 128);
+    let after = e.read_state.mvcc.value_index_snapshot();
+    let values = after
+        .keys()
+        .filter(|slot| slot.table == "churn" && slot.column == "v")
+        .map(|slot| slot.value.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec!["i:128".to_string()]);
+    let row = match parse_command("SELECT v FROM churn WHERE id = 1").unwrap() {
+        Command::Select(select) => e.execute_relational_select(&select).unwrap(),
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    assert_eq!(row.rows.row(0)[0], SqlValue::Int4(128));
 }
 
 #[test]
