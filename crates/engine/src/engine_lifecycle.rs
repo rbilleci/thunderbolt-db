@@ -357,14 +357,6 @@ impl Engine {
             resident_update_tombstone_enabled: std::sync::atomic::AtomicBool::new(true),
             shard_index_probe_enabled: std::sync::atomic::AtomicBool::new(true),
             shard_batched_point_read_enabled: std::sync::atomic::AtomicBool::new(true),
-            // PHASE C slice 1 (ledger #1): DELETE/UPDATE resolve matches via the per-table equality
-            // VALUE INDEX (O(matches)) instead of the O(table) prepare seq_scan. DEFAULT ON; the
-            // kill switch reverts to the scan (the oracle path) — the A/B lever the differentials use.
-            dml_value_index_resolve_enabled: std::sync::atomic::AtomicBool::new(true),
-            // RETIREMENT A2: the device resolve is DEFAULT ON (measured: see the A2 bench line);
-            // the fallback chain (value-index resolve -> scan) remains complete behind it.
-            dml_device_resolve_enabled: std::sync::atomic::AtomicBool::new(true),
-            dml_device_validate_enabled: std::sync::atomic::AtomicBool::new(true),
             // A5 THE FLIP (user-authorized 2026-07-03): device-authoritative commits are the
             // DEFAULT wherever auto-admit runs; the paired auto-vacuum reclaims elided-write
             // churn. The burn-in SI bug this was once held on (stale fallback view after a
@@ -387,9 +379,6 @@ impl Engine {
             // at the 4-mod-8 case; tombstone weak-predicate soundness; i64-unique never elides).
             // Kill switch retained; default-ON makes the suite the continuing burn-in.
             shard_int8_section_enabled: std::sync::atomic::AtomicBool::new(true),
-            // M1 (charter-pure device locate): default OFF (the A/B lever vs the host-probe
-            // oracle); flip after the SLO gate (wave-prefetch batching) + audit.
-            device_write_locate_enabled: std::sync::atomic::AtomicBool::new(false),
             // Default ON (measured: best-of-3 sustained 1.65M vs 1.41M unfused, p50 21.6ms
             // vs 26.3ms on the champion shape; full GPU parity incl. the reopen/checkpoint
             // arcs). ALWAYS ON (flag folded per the no-flag-proliferation
@@ -1267,11 +1256,8 @@ impl Engine {
     }
 
     pub fn relational_resident_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
-        let snapshot_bytes: u64 = self
-            .read_state
-            .residency
-            .snapshots
-            .load()
+        let snapshots = self.read_state.residency.snapshots.load();
+        let snapshot_bytes: u64 = snapshots
             .values()
             .filter(|entry| entry.descriptor.gpu_id == gpu_id)
             .map(|entry| {
@@ -1282,6 +1268,20 @@ impl Engine {
                     .map_or(0, |proof| proof.allocated_bytes)
             })
             .sum();
+        let snapshot_sidecar_bytes = [
+            &self.read_state.residency.shard_deleted_by_memory,
+            &self.read_state.residency.shard_created_by_memory,
+            &self.read_state.residency.shard_row_id_memory,
+        ]
+        .into_iter()
+        .map(|sidecars| {
+            sidecars.retained_bytes_matching(gpu_id, |table| {
+                snapshots
+                    .get(table)
+                    .is_some_and(|entry| entry.descriptor.gpu_id == gpu_id)
+            })
+        })
+        .sum::<u64>();
         let shard_bytes: u64 = self
             .read_state
             .residency
@@ -1333,6 +1333,7 @@ impl Engine {
             .copied()
             .unwrap_or(0);
         snapshot_bytes
+            .saturating_add(snapshot_sidecar_bytes)
             .saturating_add(shard_bytes)
             .saturating_add(single_indexes)
             .saturating_add(shard_indexes)

@@ -70,24 +70,6 @@ impl Engine {
         }
     }
 
-    /// A transaction-generation prepare may use only the resources captured at `BEGIN`. The
-    /// autocommit compatibility ladders are allowed to rehydrate/de-authoritize and then rebind to
-    /// current state; doing that while a retained scope is active would silently destroy snapshot
-    /// isolation. Device/source declines therefore fail before any current-generation mutation.
-    pub(crate) fn guard_transaction_dml_rebind(
-        &self,
-        table: &str,
-        declined_source: &str,
-    ) -> Result<(), EngineError> {
-        if self.current_transaction_read_snapshot().is_some() {
-            return Err(EngineError::ApplyFailed(format!(
-                "transaction-generation DML validation for \"{table}\" declined its retained \
-                 {declined_source}; refusing to rebind to current state"
-            )));
-        }
-        Ok(())
-    }
-
     /// Stage one DML statement in an explicit transaction. Preparation and every constraint/read
     /// bind to the retained generation plus prior private deltas. A successful statement publishes
     /// a new transaction-private shard map atomically; global WAL, MVCC, residency, and committed

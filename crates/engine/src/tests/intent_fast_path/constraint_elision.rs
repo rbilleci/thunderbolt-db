@@ -23,10 +23,8 @@ fn gpu_check_constrained_table_elides() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -142,10 +140,8 @@ fn gpu_fk_referenced_parent_elides() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -263,10 +259,8 @@ fn gpu_fk_child_table_elides() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -365,10 +359,8 @@ fn gpu_fk_child_date_fk_stays_elided() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -491,10 +483,8 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -694,10 +684,8 @@ fn gpu_mixed_width_dml_resolves_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -881,10 +869,8 @@ fn gpu_check_elided_preflight_rehydrate_no_bypass() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 

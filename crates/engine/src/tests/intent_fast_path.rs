@@ -28,7 +28,6 @@ fn covered_insert_route_requires_covered_shape() {
     // Flags on, but the table is not elided (no GPU warm-up ran), so the
     // wave-batched device validation is unavailable.
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     let err = engine.prepare_covered_insert_route("t").unwrap_err();
     assert!(
@@ -69,7 +68,6 @@ fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
 
@@ -185,10 +183,8 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
 
     let txn_ids = AtomicU64::new(2);
@@ -293,10 +289,8 @@ fn gpu_compound_text_key_elides_and_validates_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
 
     let txn_ids = AtomicU64::new(2);
     macro_rules! sql {
@@ -398,10 +392,8 @@ fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
 
     let mut txn = 2u64;
     // A fixed, KNOWN dataset (id 1..=12; b=id*10; g=id%3; s="v{id}"). Insert the first row, then guard on
@@ -547,10 +539,8 @@ fn gpu_zero_match_dml_keeps_table_elided() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -643,10 +633,8 @@ fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
 
     let mut txn = 2u64;
@@ -746,10 +734,8 @@ fn gpu_range_dml_resolves_on_device_without_deelide() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -878,10 +864,8 @@ fn gpu_int8_range_dml_resolves_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -996,10 +980,8 @@ fn gpu_timestamp_range_delete_resolves_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
 
     // ids 1..=6 at ts = 2020-01..06-01. Purge everything strictly before 2020-04-01 -> ids 1,2,3.
@@ -1080,10 +1062,8 @@ fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -1169,10 +1149,8 @@ fn gpu_nullable_column_dml_resolves_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -1273,10 +1251,8 @@ fn gpu_numeric_range_dml_resolves_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -1394,10 +1370,8 @@ fn gpu_text_predicate_dml_resolves_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -1510,10 +1484,8 @@ fn gpu_like_prefix_dml_resolves_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
 
     engine
@@ -1592,10 +1564,8 @@ fn gpu_elided_pk_table_with_column(col_ddl: &str, seed: &[(i64, &str)]) -> Optio
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -2378,7 +2348,6 @@ fn zero_row_dml_must_not_enter_elision_on_nonelided_table() {
     engine.set_host_install_elision_enabled(true);
     engine.set_auto_admit_on_commit(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -2450,10 +2419,8 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
     engine.set_resident_delete_tombstone_enabled(true);
     engine.set_resident_update_tombstone_enabled(true);
 
@@ -2603,10 +2570,8 @@ fn gpu_compound_delete_update_by_key_stays_device_native() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
-    engine.set_dml_device_resolve_enabled(true);
 
     let txn_ids = AtomicU64::new(2);
     macro_rules! sql {
@@ -2713,7 +2678,6 @@ fn gpu_compound_drop_constraint_shifts_ordinal_without_aliasing_the_device_index
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
 

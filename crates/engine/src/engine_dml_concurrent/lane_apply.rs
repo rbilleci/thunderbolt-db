@@ -210,13 +210,12 @@ impl Engine {
             // (Audit note: "a same-batch insert is never a target" is NOT the invariant — the
             // visibility filter is what makes every case semantically correct, not append order.)
             let appended = rows.is_empty()
-                || (self.auto_admit_on_commit_enabled()
-                    && self.try_append_resident_int4_open_shard(
-                        table,
-                        &rows,
-                        crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
-                        Some(&row_ids),
-                    ));
+                || self.try_append_resident_int4_open_shard(
+                    table,
+                    &rows,
+                    crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
+                    Some(&row_ids),
+                );
             if appended
                 && !rows.is_empty()
                 && self.host_install_elision_enabled()

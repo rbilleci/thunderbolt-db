@@ -556,8 +556,7 @@ impl Engine {
                     .collect::<BTreeSet<_>>();
                 maintained == touched
             } else {
-                self.auto_admit_on_commit_enabled()
-                    && to_apply.len() == 1
+                to_apply.len() == 1
                     && match applied.last() {
                         Some(AppliedRowMutation::Insert {
                             table,
@@ -865,16 +864,38 @@ impl Engine {
             (handled, maintained)
         };
         self.publish_committed_seq(publish_index);
-        // STRATA S-B: best-effort GPU-residency admission for the committed mutation's tables (flag-gated,
-        // after the publish so it snapshots the new generation; never fails the already-durable commit).
-        // Skipped when we maintained residency in place above — that table is already resident + current.
-        if self.auto_admit_on_commit_enabled() && !handled {
-            if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
-                // A maintained table stays elided + current — re-admitting would rebuild it from the
-                // stale host store (de-eliding it). `maintained` is empty for the single-entry path.
-                let admit: BTreeSet<String> = tables.difference(&maintained).cloned().collect();
-                self.auto_admit_resident_tables(&admit);
-            }
+        // STRATA read-cache policy remains independently configurable. R3-004 establishes mandatory
+        // device write generations in DML preflight; this post-publish refresh is only the broader
+        // read-residency policy for unhandled DDL/global invalidation.
+        if !handled {
+            let precise_scope = Self::residency_invalidation_scope(&to_apply);
+            let mandatory_refresh = precise_scope.clone().unwrap_or_else(|| {
+                let mut resident: BTreeSet<String> = self
+                    .read_state
+                    .residency
+                    .snapshots
+                    .load()
+                    .keys()
+                    .cloned()
+                    .collect();
+                resident.extend(self.read_state.residency.shards.load().keys().cloned());
+                resident
+            });
+            let tables = if self.auto_admit_on_commit_enabled() {
+                precise_scope.unwrap_or_else(|| {
+                    self.catalog_snapshot()
+                        .relational_catalog
+                        .keys()
+                        .cloned()
+                        .collect()
+                })
+            } else {
+                mandatory_refresh
+            };
+            // A maintained table stays elided + current — re-admitting would rebuild it from the
+            // stale host store. `maintained` is empty for the single-entry path.
+            let admit: BTreeSet<String> = tables.difference(&maintained).cloned().collect();
+            self.auto_admit_resident_tables(&admit);
         }
         // 6c-3: EAGER streaming cold-tier maintenance — unconditional (self-gating on entry
         // existence), best-effort, O(delta) per touched table with a cold entry. The commit mutex
@@ -1104,12 +1125,31 @@ impl Engine {
             self.publish_catalog_snapshot(cat, token.index, prune_below);
         }
         self.publish_committed_seq(token.index);
-        // STRATA S-B: best-effort GPU-residency admission for the committed mutation's tables (flag-gated,
-        // after the publish so it snapshots the new generation; never fails the already-durable commit).
-        if self.auto_admit_on_commit_enabled() {
-            if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
-                self.auto_admit_resident_tables(&tables);
-            }
+        {
+            let precise_scope = Self::residency_invalidation_scope(&to_apply);
+            let tables = if self.auto_admit_on_commit_enabled() {
+                precise_scope.unwrap_or_else(|| {
+                    self.catalog_snapshot()
+                        .relational_catalog
+                        .keys()
+                        .cloned()
+                        .collect()
+                })
+            } else {
+                precise_scope.unwrap_or_else(|| {
+                    let mut resident: BTreeSet<String> = self
+                        .read_state
+                        .residency
+                        .snapshots
+                        .load()
+                        .keys()
+                        .cloned()
+                        .collect();
+                    resident.extend(self.read_state.residency.shards.load().keys().cloned());
+                    resident
+                })
+            };
+            self.auto_admit_resident_tables(&tables);
         }
         // 6c-3: EAGER streaming cold-tier maintenance (see apply_and_publish_committed_inner's
         // twin). The commit guard acquired at this fn's top is still held.
@@ -1755,6 +1795,10 @@ impl Engine {
         let Some(cmd) = Self::decode_engine_command(&entry.payload)? else {
             return Ok(Vec::new());
         };
+        // Recovery and direct committed-entry apply bypass the user-facing preflight. Establish
+        // the exact target/related device generations while the caller's commit+catalog locks are
+        // already held, before any DML resolver or constraint probe runs.
+        self.ensure_dml_device_generation_with_catalog(&cmd, cat)?;
 
         // Stage 0 (write-half MVCC): the version stamp is the commit sequence, which is the
         // replicator-assigned commit `Index` (== WAL append order == read boundary `visible_up_to`).

@@ -1,3 +1,4 @@
+use crate::tests::assert_recovered_relational_access_path;
 use crate::{
     Engine, RelationalAccessPath, RelationalCheckConstraint, RelationalColumn, RelationalIndex,
     FIRST_USER_COLUMN_ID, FIRST_USER_RELATION_OID, PUBLIC_SCHEMA_NAME,
@@ -822,13 +823,13 @@ fn relational_catalog_renames_index_and_replays_from_wal() {
         panic!("expected SELECT plan");
     };
     let result = e.execute_relational_select(&select).unwrap();
-    assert_eq!(
-        *result.access_path,
+    assert_recovered_relational_access_path(
+        &result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
 

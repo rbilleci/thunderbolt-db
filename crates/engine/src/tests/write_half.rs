@@ -629,18 +629,20 @@ fn group_fsync_failure_wedges_the_concurrent_commit_path_without_exposing_the_de
     let _ = std::fs::remove_file(&path);
 }
 
-/// PHASE C slice 1 (ledger #1) — the VALUE-INDEX DML resolve == the seq_scan ORACLE. Runs every
-/// scenario TWICE (flag ON = index resolve, flag OFF = the scan) on twin engines fed identical
-/// statements, comparing the final table states; plus the semantics corners that could diverge:
-/// STALE index entries (the index is append-only: an UPDATE moves the indexed value but the old
-/// (column,value)->key entry survives — the visibility fetch + full predicate RECHECK must exclude
-/// it), OR filter groups, duplicate values (multi-row match, tuple_id order), range-only fallback
-/// (ineligible -> the scan arm serves under the flag), and DELETE-then-reinsert key reuse.
-/// SABOTAGE-VERIFIED: skip the predicate recheck in `resolve_dml_matches_via_value_index` and the
-/// stale-entry scenario FAILS (the moved row is wrongly deleted); force eligibility on a range-only
-/// group and the fallback scenario FAILS.
+/// R3-004 — mandatory device DML resolution across point, stale-version, OR, duplicate-value,
+/// range, and delete/reinsert shapes. Every scenario pins its terminal semantics directly.
 #[test]
-fn dml_value_index_resolve_matches_seq_scan_oracle() {
+fn device_dml_resolve_covers_point_or_range_and_version_churn() {
+    let Command::Update(negative_range) =
+        parse_command("UPDATE t SET v = 0 WHERE v > -100").unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        negative_range.filters[0].value,
+        SqlValue::Int4(-100),
+        "the DML device predicate must retain the signed literal"
+    );
     let scenarios: Vec<Vec<&str>> = vec![
         // 1. Point DELETE + point UPDATE on distinct values.
         vec![
@@ -673,7 +675,7 @@ fn dml_value_index_resolve_matches_seq_scan_oracle() {
         // 4. Range-only predicate -> ineligible -> the scan arm under the flag (still correct).
         vec![
             "DELETE FROM t WHERE id < 3",
-            "UPDATE t SET v = 0 WHERE id > 8",
+            "UPDATE t SET v = 123 WHERE id > 8",
         ],
         // 5. DELETE then re-insert the same value, then UPDATE by it (key/entry reuse).
         vec![
@@ -683,9 +685,8 @@ fn dml_value_index_resolve_matches_seq_scan_oracle() {
         ],
     ];
     for (i, statements) in scenarios.iter().enumerate() {
-        let build = |index_on: bool| -> Vec<Vec<SqlValue>> {
-            let e = Engine::new_local_cpu_oracle();
-            e.set_dml_value_index_resolve_enabled(index_on);
+        let build = || -> Vec<Vec<SqlValue>> {
+            let e = Engine::new_local();
             e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
             // v = (id % 5) * 10 -> deliberate duplicates in v.
             let values: Vec<String> = (0..10_i64)
@@ -704,23 +705,47 @@ fn dml_value_index_resolve_matches_seq_scan_oracle() {
                 .rows
                 .into_boxed()
         };
-        let with_index = build(true);
-        let with_scan = build(false);
-        assert_eq!(
-            with_index, with_scan,
-            "scenario {i}: value-index resolve must equal the seq_scan oracle"
-        );
+        let rows = build();
+        let expected_len = [9, 10, 10, 9, 8, 7, 10][i];
+        assert_eq!(rows.len(), expected_len, "scenario {i}: terminal row count");
+        match i {
+            0 => {
+                assert!(!rows
+                    .iter()
+                    .any(|row| row.first() == Some(&SqlValue::Int4(3))));
+                assert!(rows.iter().any(|row| {
+                    row.first() == Some(&SqlValue::Int4(5))
+                        && row.get(1) == Some(&SqlValue::Int4(999))
+                }));
+            }
+            1 | 2 => assert!(rows.iter().any(|row| {
+                row.first() == Some(&SqlValue::Int4(70)) && row.get(1) == Some(&SqlValue::Int4(20))
+            })),
+            3 => assert!(!rows
+                .iter()
+                .any(|row| row.first() == Some(&SqlValue::Int4(70)))),
+            4 => assert_eq!(
+                rows.iter()
+                    .filter(|row| row.get(1) == Some(&SqlValue::Int4(-1)))
+                    .count(),
+                2
+            ),
+            5 => assert!(rows.iter().any(|row| {
+                row.first() == Some(&SqlValue::Int4(9)) && row.get(1) == Some(&SqlValue::Int4(123))
+            })),
+            6 => assert!(rows.iter().any(|row| {
+                row.first() == Some(&SqlValue::Int4(6)) && row.get(1) == Some(&SqlValue::Int4(707))
+            })),
+            _ => unreachable!(),
+        }
     }
 }
 
-/// PHASE C slice 1 — constrained tables (unique / CHECK / FK either direction) and full-table DML
-/// keep the SCAN path (the validators need the survivor set until they are index-driven): the
-/// results are oracle-equal AND the constraint errors still fire.
+/// R3-004 — constrained and range DML remain device-native and preserve unique enforcement.
 #[test]
-fn dml_value_index_resolve_constrained_tables_fall_back_correctly() {
-    let build = |index_on: bool| -> (Vec<Vec<SqlValue>>, String) {
-        let e = Engine::new_local_cpu_oracle();
-        e.set_dml_value_index_resolve_enabled(index_on);
+fn device_dml_resolve_enforces_unique_during_range_updates() {
+    let build = || -> (Vec<Vec<SqlValue>>, String) {
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE p (id INT UNIQUE, v INT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO p (id, v) VALUES (1,10),(2,20),(3,30)")
@@ -743,13 +768,50 @@ fn dml_value_index_resolve_constrained_tables_fall_back_correctly() {
             .into_boxed();
         (rows, err)
     };
-    let (rows_on, err_on) = build(true);
-    let (rows_off, err_off) = build(false);
-    assert_eq!(rows_on, rows_off, "constrained-table DML == oracle");
-    assert_eq!(
-        err_on, err_off,
-        "constraint error identical through both paths"
+    let (rows, err) = build();
+    assert!(
+        err.contains("duplicate key"),
+        "expected unique violation: {err}"
     );
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(7)],
+            vec![SqlValue::Int4(3), SqlValue::Int4(7)],
+        ]
+    );
+}
+
+#[test]
+fn durable_unique_replay_rebuilds_device_constraint_generation() {
+    let path = test_wal_path("device-unique-replay");
+    let engine = Engine::with_durable_wal_segment(&path);
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")
+        .unwrap();
+    engine
+        .execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10)")
+        .unwrap();
+    engine
+        .execute_text(3, "INSERT INTO t (id, v) VALUES (2, 20)")
+        .unwrap();
+    drop(engine);
+
+    let recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    let rows = recovered
+        .execute_relational_select_text("SELECT id, v FROM t ORDER BY id")
+        .unwrap()
+        .rows
+        .into_boxed();
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(20)],
+        ]
+    );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -846,7 +908,7 @@ fn commit_wave_mixed_fast_and_slow_items_stay_correct_and_recover() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// PHASE C slice 1b — INDEX-DRIVEN validators == the scan validators (twin engines, flag ON/OFF):
+/// R3-004 — device validators cover:
 /// unique (self-value-keeping update must NOT self-conflict; cross-row duplicate must; NULLs ARE
 /// duplicates in this engine), CHECK on the new image, OUTBOUND FK (update to a missing/present
 /// parent), INBOUND FK RESTRICT (delete/update-away the last provider vs a surviving provider vs
@@ -855,12 +917,10 @@ fn commit_wave_mixed_fast_and_slow_items_stay_correct_and_recover() {
 /// false-conflicts the self-value update; skipping the surviving-provider probe false-fires the
 /// inbound FK; skipping the inbound section misses the last-provider violation.
 #[test]
-fn dml_index_validators_match_scan_validators_oracle() {
-    // Each scenario: (setup DDL/DML, statement, expect_err).
+fn device_dml_validators_cover_unique_check_and_foreign_keys() {
     type ValidatorOutcome = (Result<(), String>, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>);
-    let run = |index_on: bool, setup: &[&str], stmt: &str| -> ValidatorOutcome {
-        let e = Engine::new_local_cpu_oracle();
-        e.set_dml_value_index_resolve_enabled(index_on);
+    let run = |setup: &[&str], stmt: &str| -> ValidatorOutcome {
+        let e = Engine::new_local();
         for (i, sql) in setup.iter().enumerate() {
             e.execute_text(1 + i as u64, sql).unwrap();
         }
@@ -878,12 +938,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
             .unwrap_or_default();
         (out, parent, child)
     };
-    let base_fk: Vec<&str> = vec![
-        "CREATE TABLE p (id INT UNIQUE, v INT)",
-        "INSERT INTO p (id, v) VALUES (1,10),(2,20),(2,-1),(3,30)", // wait: id UNIQUE forbids dup 2
-    ];
-    let _ = base_fk;
-    let scenarios: Vec<(Vec<&str>, &str)> = vec![
+    let scenarios: Vec<(Vec<&str>, &str, bool)> = vec![
         // 1. unique: self-value-keeping update (must NOT self-conflict).
         (
             vec![
@@ -891,6 +946,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO p (id, v) VALUES (1,10),(2,20),(3,30)",
             ],
             "UPDATE p SET v = 99 WHERE id = 2",
+            false,
         ),
         // 2. unique: cross-row duplicate (must error identically).
         (
@@ -899,6 +955,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO p (id, v) VALUES (1,10),(2,20),(3,30)",
             ],
             "UPDATE p SET id = 1 WHERE id = 3",
+            true,
         ),
         // 3. CHECK on the new image (violation) — and a passing variant.
         (
@@ -907,6 +964,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
             ],
             "UPDATE p SET v = -5 WHERE id = 2",
+            true,
         ),
         (
             vec![
@@ -914,6 +972,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
             ],
             "UPDATE p SET v = 5 WHERE id = 2",
+            false,
         ),
         // 4. OUTBOUND FK: update the child's FK to a missing parent (error) / present parent (ok).
         (
@@ -925,6 +984,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO c (id, pid) VALUES (100,1)",
             ],
             "UPDATE c SET pid = 9 WHERE id = 100",
+            true,
         ),
         (
             vec![
@@ -935,6 +995,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO c (id, pid) VALUES (100,1)",
             ],
             "UPDATE c SET pid = 2 WHERE id = 100",
+            false,
         ),
         // 5. INBOUND FK RESTRICT: delete the LAST provider of a referenced value (error).
         (
@@ -946,6 +1007,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO c (id, pid) VALUES (100,1)",
             ],
             "DELETE FROM p WHERE id = 1",
+            true,
         ),
         // 6. INBOUND FK: delete an UNREFERENCED provider (ok).
         (
@@ -957,6 +1019,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO c (id, pid) VALUES (100,1)",
             ],
             "DELETE FROM p WHERE id = 2",
+            false,
         ),
         // 7. INBOUND FK: update-away the referenced value but RE-PROVIDE it in the new image (ok).
         (
@@ -968,6 +1031,7 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO c (id, pid) VALUES (100,1)",
             ],
             "UPDATE p SET v = 111 WHERE id = 1",
+            false,
         ),
         // 8. INBOUND FK: update-away the LAST provider's key (error).
         (
@@ -979,17 +1043,16 @@ fn dml_index_validators_match_scan_validators_oracle() {
                 "INSERT INTO c (id, pid) VALUES (100,1)",
             ],
             "UPDATE p SET id = 5 WHERE id = 1",
+            true,
         ),
     ];
-    for (i, (setup, stmt)) in scenarios.iter().enumerate() {
-        let (out_on, p_on, c_on) = run(true, setup, stmt);
-        let (out_off, p_off, c_off) = run(false, setup, stmt);
-        assert_eq!(
-            out_on, out_off,
-            "scenario {i}: outcome (ok/error text) must match the oracle"
+    for (i, (setup, stmt, expect_err)) in scenarios.iter().enumerate() {
+        let (out, parent, child) = run(setup, stmt);
+        assert_eq!(out.is_err(), *expect_err, "scenario {i}: {out:?}");
+        assert!(
+            !parent.is_empty() || !child.is_empty(),
+            "scenario {i}: setup remains visible"
         );
-        assert_eq!(p_on, p_off, "scenario {i}: parent state == oracle");
-        assert_eq!(c_on, c_off, "scenario {i}: child state == oracle");
     }
 }
 

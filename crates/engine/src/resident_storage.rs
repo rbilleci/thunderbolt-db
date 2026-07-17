@@ -164,6 +164,24 @@ impl ShardResidentDeviceMemoryMap {
             .and_then(|cell| cell.load().get().clone())
     }
 
+    /// Sum live allocations whose table name satisfies `include`. Single-buffer relations use
+    /// this shard-keyed map for write metadata sidecars even though they have no shard descriptor,
+    /// so residency budget accounting cannot derive these bytes from `RelationalResidentShard`.
+    pub(crate) fn retained_bytes_matching(
+        &self,
+        gpu_id: u16,
+        include: impl Fn(&str) -> bool,
+    ) -> u64 {
+        self.cells
+            .load()
+            .iter()
+            .filter(|((table, _), _)| include(table))
+            .filter_map(|(_, cell)| cell.load().get().clone())
+            .filter(|memory| memory.metadata().gpu_id == gpu_id)
+            .map(|memory| memory.metadata().allocated_bytes)
+            .sum()
+    }
+
     /// Replace a table's shards: publish each new shard as a new generation
     /// (creating the cell on first residency) and publish a `None` tombstone for any prior
     /// shard of this table not in the new set. In-flight readers keep the generation

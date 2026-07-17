@@ -45,22 +45,8 @@ fn relational_sql_create_insert_select_uses_mvcc_execution_path() {
         vec![vec![SqlValue::Text("Linus".to_string()), SqlValue::Int4(2)]]
     );
     assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Cpu);
-    assert_eq!(
-        result.fallback_reason,
-        Some(FallbackReason::GpuMvccReadParityGap)
-    );
-    assert_eq!(
-        *result.access_path,
-        RelationalAccessPath::OrderedKeyBatch {
-            table: "people".to_string(),
-            predicate_column: Some("id".to_string()),
-            predicate_op: Some(SelectFilterOp::Eq),
-            order_column: "name".to_string(),
-            descending: false,
-            matched_keys: 1,
-        }
-    );
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.fallback_reason, None);
 }
 
 #[test]
@@ -143,13 +129,13 @@ fn relational_copy_rows_commit_through_engine_wal_mvcc() {
             SqlValue::Text("O'Brien".to_string())
         ]]
     );
-    assert_eq!(
-        *indexed_result.access_path,
+    assert_recovered_relational_access_path(
+        &indexed_result,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "id".to_string(),
             matched_keys: 1,
-        }
+        },
     );
 
     let err = e
@@ -832,13 +818,13 @@ fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
             SqlValue::Int4(7),
         ]]
     );
-    assert_eq!(
-        *result.access_path,
+    assert_recovered_relational_access_path(
+        &result,
         RelationalAccessPath::EqualityIndex {
             table: "renamed_table_people".to_string(),
             column: "id".to_string(),
             matched_keys: 1,
-        }
+        },
     );
 
     let old_select = parse_command("SELECT id FROM rename_table_people WHERE id = 1").unwrap();
@@ -933,13 +919,13 @@ fn relational_rename_column_updates_catalog_indexes_and_replays() {
         result.rows,
         vec![vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())]]
     );
-    assert_eq!(
-        *result.access_path,
+    assert_recovered_relational_access_path(
+        &result,
         RelationalAccessPath::EqualityIndex {
             table: "rename_column_people".to_string(),
             column: "person_id".to_string(),
             matched_keys: 1,
-        }
+        },
     );
     let table = e.relational_catalog_table("rename_column_people").unwrap();
     assert_eq!(
@@ -2520,7 +2506,6 @@ fn primary_key_rejects_null_on_insert_and_update() {
         .unwrap();
     let mut txn = 5;
     for index_arm in [true, false] {
-        e.set_dml_value_index_resolve_enabled(index_arm);
         let err = e
             .execute_text(txn, "UPDATE pk_nn SET id = NULL WHERE v = 1")
             .unwrap_err()
@@ -2533,7 +2518,6 @@ fn primary_key_rejects_null_on_insert_and_update() {
         );
         txn += 1;
     }
-    e.set_dml_value_index_resolve_enabled(true);
     assert_eq!(
         e.execute_relational_select(&count).unwrap().rows,
         vec![vec![SqlValue::Int8(2)]],

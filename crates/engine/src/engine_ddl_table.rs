@@ -676,23 +676,6 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn validate_unique_indexes_for_rows(
-        table: &RelationalTable,
-        rows: &[Vec<SqlValue>],
-    ) -> Result<(), EngineError> {
-        for index in table.indexes.iter().filter(|index| index.unique) {
-            // COMPOUND KEYS: validate the ORDERED TUPLE of every key column (single-column keys
-            // resolve `[column_idx]` — byte-identical to the prior behavior).
-            let Some(column_idxs) =
-                crate::engine_residency::index_key_column_positions(table, index)
-            else {
-                continue;
-            };
-            Self::validate_unique_values_tuple(rows, &column_idxs, &index.name)?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn validate_check_constraints_for_rows(
         table: &RelationalTable,
         rows: &[Vec<SqlValue>],

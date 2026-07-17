@@ -1,15 +1,11 @@
-/// RETIREMENT A2 — the THREE-WAY resolve differential: the DEVICE resolve (locate -> row_id ->
-/// derived key -> keyed fetch -> recheck) == the VALUE-INDEX resolve == the SCAN, over identical
-/// statement sequences on triple engines. Covers: point DELETE/UPDATE (the locate's unique-key
+/// RETIREMENT A2 — the mandatory device resolve ladder. Covers: point DELETE/UPDATE (the locate's unique-key
 /// shape), DML after an SV5 UPDATE (the appended version's A1 identity must resolve the SAME
 /// key), delete-by-tombstoned-value (the PHYSICAL locate hits the tombstoned slot; the keyed
-/// fetch at visibility must yield no match), duplicate-key decline (locate refuses ->
-/// value-index serves), OR-group + range fallbacks, and post-rollover appends. NON-VACUITY:
-/// `dml_device_resolve_hits` must ADVANCE on the device engine for the point shapes (output
-/// equality alone cannot prove which resolver served).
+/// fetch at visibility must yield no match), duplicate values, OR-group and range predicates,
+/// and post-rollover appends. NON-VACUITY: `dml_device_resolve_hits` must ADVANCE for point shapes.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn a2_device_resolve_matches_value_index_and_scan() {
+fn a2_device_resolve_serves_point_or_and_range_ladder() {
     let scenarios: Vec<Vec<String>> = vec![
         vec![
             "DELETE FROM t WHERE id = 40".into(),
@@ -27,16 +23,10 @@ fn a2_device_resolve_matches_value_index_and_scan() {
         vec!["UPDATE t SET v = -1 WHERE id = 70 OR id = 71".into()], // OR-group -> fallback
         vec!["DELETE FROM t WHERE id < 5".into()],  // range -> fallback
     ];
-    let build = |scenario: usize,
-                 device: bool,
-                 value_index: bool,
-                 statements: &[String]|
-     -> Vec<Vec<SqlValue>> {
+    let build = |scenario: usize, statements: &[String]| -> Vec<Vec<SqlValue>> {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_dml_device_resolve_enabled(device);
-        e.set_dml_value_index_resolve_enabled(value_index);
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
         let mut seq = 2u64;
         for chunk in 0..2_i64 {
@@ -57,7 +47,7 @@ fn a2_device_resolve_matches_value_index_and_scan() {
         }
         // Non-vacuity only for the SINGLE-Eq point scenarios (0-2); the dup/OR/range
         // scenarios (3-5) are DESIGNED to decline to the fallback chain.
-        if device && scenario <= 2 {
+        if scenario <= 2 {
             assert!(
                 e.dml_device_resolve_hits() > hits_before,
                 "scenario {scenario}: non-vacuity — the device resolve must have served a point statement"
@@ -71,11 +61,34 @@ fn a2_device_resolve_matches_value_index_and_scan() {
             .into_boxed()
     };
     for (i, statements) in scenarios.iter().enumerate() {
-        let via_device = build(i, true, true, statements);
-        let via_index = build(i, false, true, statements);
-        let via_scan = build(i, false, false, statements);
-        assert_eq!(via_device, via_index, "scenario {i}: device == value-index");
-        assert_eq!(via_index, via_scan, "scenario {i}: value-index == scan");
+        let rows = build(i, statements);
+        let expected_len = [199, 199, 199, 194, 200, 195][i];
+        assert_eq!(rows.len(), expected_len, "scenario {i}: terminal row count");
+        match i {
+            0 => assert!(!rows
+                .iter()
+                .any(|row| row.first() == Some(&SqlValue::Int4(40)))),
+            1 => assert!(!rows
+                .iter()
+                .any(|row| row.first() == Some(&SqlValue::Int4(50)))),
+            2 => assert!(!rows
+                .iter()
+                .any(|row| row.first() == Some(&SqlValue::Int4(60)))),
+            3 => assert!(!rows
+                .iter()
+                .any(|row| row.get(1) == Some(&SqlValue::Int4(100)))),
+            4 => assert_eq!(
+                rows.iter()
+                    .filter(|row| row.get(1) == Some(&SqlValue::Int4(-1)))
+                    .count(),
+                2
+            ),
+            5 => assert!(!rows.iter().any(|row| {
+                row.first()
+                    .is_some_and(|value| matches!(value, SqlValue::Int4(id) if *id < 5))
+            })),
+            _ => unreachable!(),
+        }
     }
 }
 

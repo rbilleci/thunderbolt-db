@@ -115,7 +115,6 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
 
@@ -290,7 +289,6 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         recovered.set_auto_admit_on_commit(true);
         recovered.set_host_install_elision_enabled(true);
         recovered.set_binary_wal_records_enabled(true);
-        recovered.set_device_write_locate_enabled(true);
         recovered.set_device_write_locate_wave_batch_enabled(true);
         recovered.set_constrained_elision_enabled(true);
         let route = recovered
@@ -384,7 +382,6 @@ fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<Covered
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
     engine
@@ -1057,7 +1054,6 @@ fn gpu_synchronous_commit_off_remains_durable_and_recovers() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
 
@@ -1210,7 +1206,6 @@ fn gpu_lane_delete_intents_end_to_end() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
 
@@ -1430,7 +1425,6 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
     let txn_ids = AtomicU64::new(10);
@@ -1497,7 +1491,6 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
     recovered.set_auto_admit_on_commit(true);
     recovered.set_host_install_elision_enabled(true);
     recovered.set_binary_wal_records_enabled(true);
-    recovered.set_device_write_locate_enabled(true);
     recovered.set_device_write_locate_wave_batch_enabled(true);
     recovered.set_constrained_elision_enabled(true);
     let after = select_rows_unordered_sorted(&recovered);
@@ -1568,7 +1561,6 @@ fn gpu_lane_update_intents_end_to_end() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
 
@@ -1797,7 +1789,6 @@ fn gpu_lane_update_recovery_replays_row_identical() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
     let txn_ids = AtomicU64::new(10);
@@ -1883,7 +1874,6 @@ fn gpu_lane_update_recovery_replays_row_identical() {
     recovered.set_auto_admit_on_commit(true);
     recovered.set_host_install_elision_enabled(true);
     recovered.set_binary_wal_records_enabled(true);
-    recovered.set_device_write_locate_enabled(true);
     recovered.set_device_write_locate_wave_batch_enabled(true);
     recovered.set_constrained_elision_enabled(true);
     let after = select_rows_unordered_sorted(&recovered);
@@ -1937,7 +1927,6 @@ fn gpu_lane_update_sustained_stays_elided() {
     engine.set_auto_admit_on_commit(true);
     engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
-    engine.set_device_write_locate_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
     engine.set_constrained_elision_enabled(true);
     let txn_ids = AtomicU64::new(10);

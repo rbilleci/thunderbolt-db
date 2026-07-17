@@ -1,21 +1,18 @@
-/// RETIREMENT A3 — the VALIDATOR-LADDER differential: constraint outcomes (success AND the
-/// exact violation error) with the DEVICE-INDEX probes == the value-index probes, over the same
-/// statement sequence on twin engines. Covers unique violation + PASS (the FALSE answer is the
+/// RETIREMENT A3 — the mandatory device validator ladder. Covers unique violation + PASS (the FALSE answer is the
 /// load-bearing one — a device miss would wrongly ADMIT a duplicate), unique-through-SV5-churn
 /// (the version-split physical hit must be neutralized by fetch-at-visibility), unique
 /// key-move, outbound-FK present/absent, inbound-FK blocked/allowed DELETE, and NULL-on-unique
-/// (declines to host structural NULL==NULL semantics). NON-VACUITY: `dml_device_validate_hits`
-/// must ADVANCE on the device engine and stay ZERO on the flag-OFF twin. Sabotage: make the
+/// with structural NULL==NULL semantics. NON-VACUITY: `dml_device_validate_hits`
+/// must ADVANCE. Sabotage: make the
 /// device probe skip `answer = true` and the violation statements wrongly SUCCEED -> outcome
 /// vectors diverge -> FAIL.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn a3_device_validate_matches_value_index_ladder() {
-    let run = |device: bool| {
+fn a3_device_validator_serves_constraint_ladder() {
+    let run = || {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_dml_device_validate_enabled(device);
         e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")
             .unwrap();
         e.execute_text(2, "CREATE TABLE c (id INT, tid INT)")
@@ -79,26 +76,13 @@ fn a3_device_validate_matches_value_index_ladder() {
             .into_boxed();
         (outcomes, hits, t_rows, c_rows)
     };
-    let (dev_out, dev_hits, dev_t, dev_c) = run(true);
-    let (idx_out, idx_hits, idx_t, idx_c) = run(false);
-    assert_eq!(
-        dev_out, idx_out,
-        "outcome ladder: device == value-index (incl violation text)"
-    );
-    assert_eq!(dev_t, idx_t, "end-state t: device == value-index");
-    assert_eq!(dev_c, idx_c, "end-state c: device == value-index");
+    let (dev_out, dev_hits, dev_t, dev_c) = run();
     // Audit A3 finding 1: a FLOOR, not just >0 — the 12-statement sequence carries ~14
-    // device-servable Int4 probes (unique per new image, FK survivor/child pairs); if a
-    // coverage regression silently declined most of them to the host ladder, outcomes would
-    // stay equal (declines are safe) and >0 would stay green. The floor trips on
-    // mostly-declined.
+    // device-servable Int4 probes (unique per new image, FK survivor/child pairs). The floor
+    // catches a coverage regression before a decline becomes the expected loud error.
     assert!(
         dev_hits >= 10,
         "non-vacuity floor: the device index must have ANSWERED most probes (got {dev_hits})"
-    );
-    assert_eq!(
-        idx_hits, 0,
-        "flag OFF must never consult the device validator"
     );
     // Spot-pin the shape (guards both-engines-wrong drift).
     assert!(
@@ -129,6 +113,23 @@ fn a3_device_validate_matches_value_index_ladder() {
             .is_err_and(|err| err.contains("foreign key")),
         "referenced-provider delete must violate the FK: {:?}",
         dev_out[8]
+    );
+    assert!(
+        dev_t
+            .iter()
+            .any(|row| row.first() == Some(&SqlValue::Int4(500))),
+        "the fresh unique key is present"
+    );
+    assert!(
+        !dev_t
+            .iter()
+            .any(|row| row.first() == Some(&SqlValue::Int4(43))),
+        "the unreferenced provider is deleted"
+    );
+    assert_eq!(
+        dev_c.len(),
+        2,
+        "only the provider-backed child insert succeeds"
     );
 }
 

@@ -364,11 +364,8 @@ impl Engine {
     }
 
     fn relational_resident_bytes_for_gpu_excluding(&self, gpu_id: u16, table: &str) -> u64 {
-        let snapshot_bytes: u64 = self
-            .read_state
-            .residency
-            .snapshots
-            .load()
+        let snapshots = self.read_state.residency.snapshots.load();
+        let snapshot_bytes: u64 = snapshots
             .iter()
             .filter(|(name, entry)| name.as_str() != table && entry.descriptor.gpu_id == gpu_id)
             .map(|(_name, entry)| {
@@ -379,6 +376,21 @@ impl Engine {
                     .map_or(0, |proof| proof.allocated_bytes)
             })
             .sum();
+        let snapshot_sidecar_bytes = [
+            &self.read_state.residency.shard_deleted_by_memory,
+            &self.read_state.residency.shard_created_by_memory,
+            &self.read_state.residency.shard_row_id_memory,
+        ]
+        .into_iter()
+        .map(|sidecars| {
+            sidecars.retained_bytes_matching(gpu_id, |name| {
+                name != table
+                    && snapshots
+                        .get(name)
+                        .is_some_and(|entry| entry.descriptor.gpu_id == gpu_id)
+            })
+        })
+        .sum::<u64>();
         let shard_bytes: u64 = self
             .read_state
             .residency
@@ -435,6 +447,7 @@ impl Engine {
             .copied()
             .unwrap_or(0);
         snapshot_bytes
+            .saturating_add(snapshot_sidecar_bytes)
             .saturating_add(shard_bytes)
             .saturating_add(single_indexes)
             .saturating_add(shard_indexes)
@@ -465,6 +478,18 @@ impl Engine {
             .filter(|entry| entry.descriptor.gpu_id == gpu_id)
             .and_then(|entry| entry.descriptor.device_memory_proof.as_ref())
             .map_or(0, |proof| proof.allocated_bytes);
+        let snapshot_sidecar_bytes = if snapshot_bytes == 0 {
+            0
+        } else {
+            [
+                &self.read_state.residency.shard_deleted_by_memory,
+                &self.read_state.residency.shard_created_by_memory,
+                &self.read_state.residency.shard_row_id_memory,
+            ]
+            .into_iter()
+            .map(|sidecars| sidecars.retained_bytes_matching(gpu_id, |name| name == table))
+            .sum::<u64>()
+        };
         let shard_bytes = self
             .read_state
             .residency
@@ -510,7 +535,9 @@ impl Engine {
             .map(|memory| memory.metadata().allocated_bytes)
             .sum::<u64>();
         (
-            snapshot_bytes.saturating_add(shard_bytes),
+            snapshot_bytes
+                .saturating_add(snapshot_sidecar_bytes)
+                .saturating_add(shard_bytes),
             single_index_bytes.saturating_add(shard_index_bytes),
         )
     }

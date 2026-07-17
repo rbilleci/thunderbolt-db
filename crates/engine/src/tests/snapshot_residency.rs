@@ -74,7 +74,7 @@ fn relational_residency_snapshot_accounts_bytes_and_invalidates_on_later_wal_app
     assert_eq!(snapshot.valid_through_index, e.visible_up_to());
     assert!(snapshot.is_valid());
     assert!(!snapshot.memory_pressure_active);
-    assert_eq!(snapshot.last_refresh_cost, None);
+    assert!(snapshot.last_refresh_cost.is_some());
 
     e.mark_gpu_memory_pressured(0);
     let pressured = e.relational_residency_snapshot("events").unwrap();
@@ -83,16 +83,14 @@ fn relational_residency_snapshot_accounts_bytes_and_invalidates_on_later_wal_app
     assert!(!pressured.is_valid());
 
     let valid_through = pressured.valid_through_index;
+    let error = e
+        .execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+        .unwrap_err();
+    assert!(error.to_string().contains("device DML generation"));
+    e.clear_gpu_memory_pressured(0);
     e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
         .unwrap();
-    let invalidated = e.relational_residency_snapshot("events").unwrap();
-    assert_eq!(invalidated.valid_through_index, valid_through);
-    assert_eq!(invalidated.invalidated_by_txn_id, Some(3));
-    assert!(invalidated.invalidated_at_index.unwrap() > valid_through);
-    assert!(!invalidated.is_valid());
-
-    e.clear_gpu_memory_pressured(0);
-    let refreshed = e.populate_relational_residency_snapshot("events").unwrap();
+    let refreshed = e.relational_residency_snapshot("events").unwrap();
     assert_eq!(refreshed.row_count, 3);
     assert!(refreshed.resident_bytes > snapshot.resident_bytes);
     assert_eq!(refreshed.valid_through_index, e.visible_up_to());
@@ -118,17 +116,12 @@ fn relational_residency_snapshot_accounts_bytes_and_invalidates_on_later_wal_app
         refreshed.valid_through_index
     );
     assert_eq!(refresh_cost.invalidated_by_txn_id, Some(3));
-    assert_eq!(
-        refresh_cost.invalidated_at_index,
-        invalidated.invalidated_at_index
-    );
-    assert!(refresh_cost.invalidated_by_memory_pressure);
+    assert!(!refresh_cost.invalidated_by_memory_pressure);
 }
 
 #[test]
-fn mutation_invalidates_only_the_mutated_table_residency() {
-    // P1-M3 step 2: per-table residency invalidation. A write to one table must no
-    // longer evict every other table's residency (the former stop-the-world bug).
+fn mutation_maintains_only_the_mutated_device_generation() {
+    // R3-004: a write maintains its target generation without disturbing another table.
     let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
@@ -145,12 +138,9 @@ fn mutation_invalidates_only_the_mutated_table_residency() {
     e.execute_text(5, "INSERT INTO a (id) VALUES (2)").unwrap();
 
     let a = e.relational_residency_snapshot("a").unwrap();
-    assert_eq!(
-        a.invalidated_by_txn_id,
-        Some(5),
-        "the mutated table is invalidated"
-    );
-    assert!(!a.is_valid());
+    assert_eq!(a.invalidated_by_txn_id, None);
+    assert!(a.is_valid());
+    assert_eq!(a.valid_through_index, 5);
     let b = e.relational_residency_snapshot("b").unwrap();
     assert_eq!(
         b.invalidated_by_txn_id, None,
@@ -180,12 +170,9 @@ fn create_table_does_not_invalidate_existing_residency() {
 }
 
 #[test]
-fn unscoped_ddl_conservatively_invalidates_unrelated_residency() {
-    // A schema change is not (yet) scoped to a single table, so it conservatively
-    // invalidates UNRELATED residency too rather than risk a stale snapshot.
-    // Over-invalidation is safe; under-invalidation would serve wrong rows. (The
-    // mutated table `a` has its snapshot rebuilt by the schema change itself, so we
-    // observe the conservative fallback on the untouched table `b`.)
+fn unscoped_ddl_refreshes_previously_authoritative_unrelated_residency() {
+    // A schema change still invalidates globally at publication, then refreshes every previously
+    // authoritative device generation before service resumes.
     let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
@@ -202,11 +189,9 @@ fn unscoped_ddl_conservatively_invalidates_unrelated_residency() {
         .unwrap();
 
     let b = e.relational_residency_snapshot("b").unwrap();
-    assert!(
-        !b.is_valid(),
-        "an unscoped DDL on table a must conservatively invalidate unrelated table b"
-    );
-    assert_eq!(b.invalidated_by_txn_id, Some(5));
+    assert!(b.is_valid());
+    assert_eq!(b.invalidated_by_txn_id, None);
+    assert_eq!(b.valid_through_index, 5);
 }
 
 #[test]

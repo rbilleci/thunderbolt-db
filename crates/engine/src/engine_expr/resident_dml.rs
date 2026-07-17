@@ -9,6 +9,12 @@ use crate::{DdlCatalogState, Engine};
 use gpu_db_sql::{SqlType, SqlValue};
 use gpu_db_types::Index;
 
+enum DetailedLocateAttempt {
+    Complete(Vec<crate::engine_retained_read::ShardPkHit>),
+    Declined,
+    Superseded,
+}
+
 impl Engine {
     /// SV4 (GPU-native DELETE -- LOCATE phase): find the resident `(shard_id, LOCAL slot)` positions of
     /// every row matching `predicate` (an int4-equality point-lookup shape), via zone-map-pruned per-shard
@@ -101,31 +107,90 @@ impl Engine {
         table: &RelationalTable,
         predicate: &ResidentExpr,
     ) -> Option<Vec<crate::engine_retained_read::ShardPkHit>> {
-        let shards = self.read_residency_shards();
-        let table_shards = shards.get(&table.name)?;
-        if table_shards.is_empty() {
-            return None;
+        self.locate_resident_slots_detailed(table, Some(predicate), None)
+    }
+
+    /// Compound-key counterpart: evaluate every independently typed equality/IS-NULL leaf to a
+    /// retained device mask, AND the masks on-device, then compact once to local slots. Keeping the
+    /// leaves independent lets mixed i32/i64/i128/text/uuid/bool keys share one exact device verdict
+    /// without forcing unlike value buffers through a mono-typed expression VM.
+    pub(crate) fn locate_resident_conjunct_slots_detailed(
+        &self,
+        table: &RelationalTable,
+        conjuncts: &[ResidentExpr],
+    ) -> Option<Vec<crate::engine_retained_read::ShardPkHit>> {
+        self.locate_resident_slots_detailed(table, None, Some(conjuncts))
+    }
+
+    /// Predicate-free counterpart used by full-table DML. The identity range is generated and
+    /// compacted on the device for each shard; the host receives only the approved local slots.
+    pub(crate) fn locate_resident_all_slots_detailed(
+        &self,
+        table: &RelationalTable,
+    ) -> Option<Vec<crate::engine_retained_read::ShardPkHit>> {
+        self.locate_resident_slots_detailed(table, None, None)
+    }
+
+    fn locate_resident_slots_detailed(
+        &self,
+        table: &RelationalTable,
+        predicate: Option<&ResidentExpr>,
+        conjuncts: Option<&[ResidentExpr]>,
+    ) -> Option<Vec<crate::engine_retained_read::ShardPkHit>> {
+        // Off-lock prepare can race a generation publication after loading the shard map but
+        // before the W0 liveness check. Retry only that benign supersession; unsupported shapes,
+        // pressure, missing resources, and kernel failures remain authoritative declines.
+        const GENERATION_RETRIES: usize = 64;
+        for _ in 0..GENERATION_RETRIES {
+            match self.locate_resident_slots_detailed_once(table, predicate, conjuncts) {
+                DetailedLocateAttempt::Complete(hits) => return Some(hits),
+                DetailedLocateAttempt::Declined => return None,
+                DetailedLocateAttempt::Superseded => std::thread::yield_now(),
+            }
         }
+        None
+    }
+
+    fn locate_resident_slots_detailed_once(
+        &self,
+        table: &RelationalTable,
+        predicate: Option<&ResidentExpr>,
+        conjuncts: Option<&[ResidentExpr]>,
+    ) -> DetailedLocateAttempt {
+        debug_assert!(predicate.is_none() || conjuncts.is_none());
+        let shards = self.read_residency_shards();
+        let Some(table_shards) = shards.get(&table.name).filter(|shards| !shards.is_empty()) else {
+            return self.locate_resident_single_slots_detailed_once(table, predicate, conjuncts);
+        };
         let mut constraints: Vec<(usize, i32)> = Vec::new();
-        mandatory_int4_equalities(predicate, &mut constraints);
+        if let Some(predicate) = predicate {
+            mandatory_int4_equalities(predicate, &mut constraints);
+        }
+        if let Some(conjuncts) = conjuncts {
+            for predicate in conjuncts {
+                mandatory_int4_equalities(predicate, &mut constraints);
+            }
+        }
         let column_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
         let runtime_snapshot = self.router.runtime().snapshot();
         let mut out: Vec<crate::engine_retained_read::ShardPkHit> = Vec::new();
         for shard in table_shards.iter() {
             if shard.schema != table.schema || shard.table != table.name {
-                return None;
+                return DetailedLocateAttempt::Declined;
             }
             let memory_pressure_active = runtime_snapshot
                 .memory_pressured_gpu_ids
                 .contains(&shard.gpu_id);
             if !shard.is_valid(memory_pressure_active) {
-                return None;
+                return DetailedLocateAttempt::Declined;
             }
-            let device_memory = shard.device_memory.clone()?;
+            let Some(device_memory) = shard.device_memory.clone() else {
+                return DetailedLocateAttempt::Declined;
+            };
             // W0: the descriptor flags don't see concurrent invalidations — require the authoritative cell to
             // still publish THIS buffer, else decline (the located slot would address a superseded generation).
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
-                return None;
+                return DetailedLocateAttempt::Superseded;
             }
             // S-d3 zone-map prune only AFTER the W0 liveness proof. A stale generation's zone map
             // may exclude a value inserted after invalidation; pruning first would skip the
@@ -143,16 +208,16 @@ impl Engine {
                 continue;
             }
             let descriptor = self.resident_snapshot_for_shard(shard, table);
-            let slots = self
-                .lower_resident_predicate(
-                    predicate,
-                    table,
-                    &descriptor,
-                    &device_memory,
-                    shard.row_count as u64,
-                    None,
-                )
-                .ok()?;
+            let Some(slots) = self.resident_dml_slots(
+                table,
+                &descriptor,
+                &device_memory,
+                shard.row_count,
+                predicate,
+                conjuncts,
+            ) else {
+                return DetailedLocateAttempt::Declined;
+            };
             // Every hit captures the SAME generation's buffer + regions + descriptor as its slot.
             for slot in slots {
                 out.push(crate::engine_retained_read::ShardPkHit {
@@ -166,7 +231,132 @@ impl Engine {
                 });
             }
         }
-        Some(out)
+        DetailedLocateAttempt::Complete(out)
+    }
+
+    fn locate_resident_single_slots_detailed_once(
+        &self,
+        table: &RelationalTable,
+        predicate: Option<&ResidentExpr>,
+        conjuncts: Option<&[ResidentExpr]>,
+    ) -> DetailedLocateAttempt {
+        let Some(entry) = self.relational_residency_entry(&table.name) else {
+            return DetailedLocateAttempt::Declined;
+        };
+        let descriptor = entry.descriptor;
+        if descriptor.schema != table.schema || descriptor.table != table.name {
+            return DetailedLocateAttempt::Declined;
+        }
+        let pressured = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .contains(&descriptor.gpu_id);
+        if !descriptor.is_valid() || pressured {
+            return DetailedLocateAttempt::Declined;
+        }
+        let Some(device_memory) = self.read_resident_device_memory(&table.name) else {
+            return DetailedLocateAttempt::Declined;
+        };
+        let row_id = self
+            .read_state
+            .residency
+            .shard_row_id_memory
+            .get(&(table.name.clone(), 0));
+        if descriptor.row_count != 0 && row_id.is_none() {
+            return DetailedLocateAttempt::Declined;
+        }
+        let Some(slots) = self.resident_dml_slots(
+            table,
+            &descriptor,
+            &device_memory,
+            descriptor.row_count,
+            predicate,
+            conjuncts,
+        ) else {
+            return DetailedLocateAttempt::Declined;
+        };
+        let deleted_by = self
+            .read_state
+            .residency
+            .shard_deleted_by_memory
+            .get(&(table.name.clone(), 0));
+        let created_by = self
+            .read_state
+            .residency
+            .shard_created_by_memory
+            .get(&(table.name.clone(), 0));
+        DetailedLocateAttempt::Complete(
+            slots
+                .into_iter()
+                .map(|slot| crate::engine_retained_read::ShardPkHit {
+                    shard_id: 0,
+                    slot,
+                    descriptor: descriptor.as_ref().clone(),
+                    device_memory: device_memory.clone(),
+                    deleted_by: deleted_by.clone(),
+                    created_by: created_by.clone(),
+                    row_id: row_id.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    fn resident_dml_slots(
+        &self,
+        table: &RelationalTable,
+        descriptor: &crate::relational_model::RelationalResidencySnapshot,
+        device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
+        row_count: usize,
+        predicate: Option<&ResidentExpr>,
+        conjuncts: Option<&[ResidentExpr]>,
+    ) -> Option<Vec<u32>> {
+        let row_count_u32 = u32::try_from(row_count).ok()?;
+        match (predicate, conjuncts) {
+            (Some(predicate), None) => self
+                .lower_resident_predicate(
+                    predicate,
+                    table,
+                    descriptor,
+                    device_memory,
+                    row_count as u64,
+                    None,
+                )
+                .ok(),
+            (None, Some(_)) if row_count == 0 => Some(Vec::new()),
+            (None, Some(conjuncts)) => {
+                let mut combined = None;
+                for predicate in conjuncts {
+                    let next = self
+                        .resident_predicate_device_mask(
+                            Some(predicate),
+                            table,
+                            descriptor,
+                            device_memory,
+                            row_count_u32,
+                            None,
+                        )
+                        .ok()??;
+                    combined = Some(match combined {
+                        None => next,
+                        Some(previous) => {
+                            device_memory.and_predicate_masks(&previous, &next).ok()?
+                        }
+                    });
+                }
+                match combined {
+                    Some(mask) => device_memory.predicate_mask_indices_u32(&mask).ok(),
+                    None => device_memory
+                        .row_range_indices_u32(row_count_u32, 0, row_count_u32)
+                        .ok(),
+                }
+            }
+            (None, None) => device_memory
+                .row_range_indices_u32(row_count_u32, 0, row_count_u32)
+                .ok(),
+            (Some(_), Some(_)) => None,
+        }
     }
 
     /// SV4 (GPU-native DELETE): LOCATE the resident slots matching `predicate` + stamp `deleted_by =
@@ -352,6 +542,21 @@ impl Engine {
         deleted_rows: &[Vec<SqlValue>],
         commit_seq: Index,
     ) -> bool {
+        let Some(table) = cat.relational_catalog.get(table_name) else {
+            return false;
+        };
+        self.try_tombstone_resident_delete_table(table, deleted_rows, commit_seq)
+    }
+
+    /// Concurrent-wave counterpart to [`Self::try_tombstone_resident_delete_commit`]. The wave
+    /// pins the published catalog generation before sequencing and cannot take the DDL latch while
+    /// holding the commit mutex, so it passes the table from that pinned generation directly.
+    pub(crate) fn try_tombstone_resident_delete_table(
+        &self,
+        table: &RelationalTable,
+        deleted_rows: &[Vec<SqlValue>],
+        commit_seq: Index,
+    ) -> bool {
         // RETIREMENT A4b: MULTI-ROW — per-row locate + tombstone, each gated EXACT count == 1. Any
         // ambiguity on ANY row (dup int4 values across the statement's rows, a locate miss, an
         // int4-identical already-tombstoned slot, NULL/non-int4) returns false -> the caller
@@ -369,9 +574,6 @@ impl Engine {
             // set in the caller, so this no-op never drives a table INTO elision.
             return true;
         }
-        let Some(table) = cat.relational_catalog.get(table_name) else {
-            return false;
-        };
         for row in deleted_rows {
             if row.len() != table.columns.len() {
                 return false;
@@ -403,7 +605,7 @@ impl Engine {
         }
         // VACUUM #5: every stamped tombstone is a DEAD SLOT until a rebuild — feed the churn
         // signal the auto-trigger reads (serialized path; the counter resets on any re-admit).
-        self.add_tombstone_churn(table_name, deleted_rows.len() as u64);
+        self.add_tombstone_churn(&table.name, deleted_rows.len() as u64);
         true
     }
 
@@ -473,6 +675,22 @@ impl Engine {
         commit_seq: Index,
         row_ids: Option<&[u64]>,
     ) -> bool {
+        let Some(table) = cat.relational_catalog.get(table_name) else {
+            return false;
+        };
+        self.try_update_resident_table(table, old_rows, new_rows, commit_seq, row_ids)
+    }
+
+    /// Concurrent-wave counterpart to [`Self::try_update_resident_commit`], using the table from
+    /// the wave's pinned catalog generation rather than re-entering the DDL latch.
+    pub(crate) fn try_update_resident_table(
+        &self,
+        table: &RelationalTable,
+        old_rows: &[Vec<SqlValue>],
+        new_rows: &[Vec<SqlValue>],
+        commit_seq: Index,
+        row_ids: Option<&[u64]>,
+    ) -> bool {
         // ADR-006: a ZERO-ROW UPDATE (WHERE matched nothing) is a data NO-OP — `old_rows`/`new_rows` are
         // both empty (parallel), nothing to tombstone or append, the elided table is byte-unchanged.
         // Report it HANDLED (`true`) so the commit path keeps the table ELIDED instead of REHYDRATING it
@@ -488,7 +706,7 @@ impl Engine {
             return false;
         }
         // 1. Tombstone every OLD version's slot (locates run on the buffer BEFORE the appends).
-        if !self.try_tombstone_resident_delete_commit(cat, table_name, old_rows, commit_seq) {
+        if !self.try_tombstone_resident_delete_table(table, old_rows, commit_seq) {
             return false;
         }
         // 2. Append the NEW image to the open shard, stamped `created_by = commit_seq` (SV6 — the P2
@@ -499,7 +717,7 @@ impl Engine {
         //    tombstone, the caller's re-admit rebuilds all-live from the host store (which already applied
         //    the version rewrite), superseding.
         if !self.try_append_resident_int4_open_shard(
-            table_name,
+            &table.name,
             new_rows,
             crate::engine_residency::AppendCreatedBy::UpdateNewVersion(commit_seq),
             row_ids,

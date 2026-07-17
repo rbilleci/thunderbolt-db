@@ -6,29 +6,142 @@ use super::*;
 const DELETED_BY_LIVE: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 
 impl Engine {
-    /// Ensure every autocommit DML target has a device generation before it captures its read
-    /// snapshot. This is the GPU-native bootstrap for empty/new tables: admission runs under the
-    /// commit/publication lock after all earlier classic tails and their maintenance settle. A real
-    /// admission failure remains fail-closed; no host DML or constraint probe becomes authoritative.
-    pub(crate) fn ensure_dml_device_generation(&self, command: &Command) -> Result<(), ExecuteError> {
+    fn table_has_live_dml_generation(&self, table: &str) -> bool {
+        if self.table_chunk_authoritative(table).is_some() {
+            return true;
+        }
+        let pressured = self.router.runtime().snapshot().memory_pressured_gpu_ids;
+        if let Some(shards) = self.read_residency_shards().get(table) {
+            if !shards.is_empty()
+                && shards.iter().all(|shard| {
+                    shard.device_memory.as_ref().is_some_and(|memory| {
+                        shard.is_valid(pressured.contains(&shard.gpu_id))
+                            && self.shard_write_locate_cell_live(table, shard.shard_id, memory)
+                    })
+                })
+            {
+                return true;
+            }
+        }
+        self.relational_residency_entry(table).is_some_and(|entry| {
+            entry.descriptor.is_valid()
+                && !pressured.contains(&entry.descriptor.gpu_id)
+                && entry.device_memory.is_some()
+                && (entry.descriptor.row_count == 0
+                    || self
+                        .read_state
+                        .residency
+                        .shard_row_id_memory
+                        .get(&(table.to_string(), 0))
+                        .is_some())
+        })
+    }
+
+    pub(crate) fn ensure_dml_device_generation_with_catalog(
+        &self,
+        command: &Command,
+        catalog: &mut DdlCatalogState,
+    ) -> Result<(), EngineError> {
         let table_name = match command {
             Command::Insert(insert) => insert.table.as_str(),
             Command::Update(update) => update.table.as_str(),
             Command::Delete(delete) => delete.table.as_str(),
             _ => return Ok(()),
         };
+        let Some(target) = catalog.relational_catalog.get(table_name) else {
+            return Ok(());
+        };
+        let mut tables: BTreeSet<String> = std::iter::once(table_name.to_string()).collect();
+        tables.extend(
+            target
+                .foreign_keys
+                .iter()
+                .map(|foreign_key| foreign_key.referenced_table.clone()),
+        );
+        tables.extend(
+            catalog
+                .relational_catalog
+                .values()
+                .filter(|candidate| {
+                    candidate
+                        .foreign_keys
+                        .iter()
+                        .any(|foreign_key| foreign_key.referenced_table == table_name)
+                })
+                .map(|candidate| candidate.name.clone()),
+        );
+        let gpu_id = self.planner.default_gpu_id();
+        for table in &tables {
+            if self.table_has_live_dml_generation(table) {
+                continue;
+            }
+            self.reset_tombstone_churn(table);
+            self.populate_relational_residency_snapshot_inner(catalog, table, gpu_id)
+                .map_err(|error| match error {
+                    ExecuteError::Engine(error) => error,
+                    other => EngineError::ApplyFailed(other.to_string()),
+                })?;
+        }
+        if tables
+            .iter()
+            .any(|table| !self.table_has_live_dml_generation(table))
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "device DML generation set for relation \"{table_name}\" is unavailable after admission"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Ensure every autocommit DML target has a device generation before it captures its read
+    /// snapshot. This is the GPU-native bootstrap for empty/new tables: admission runs under the
+    /// commit/publication lock after all earlier classic tails and their maintenance settle. A real
+    /// admission failure remains fail-closed; no host DML or constraint probe becomes authoritative.
+    pub(crate) fn ensure_dml_device_generation(
+        &self,
+        command: &Command,
+    ) -> Result<(), EngineError> {
+        let table_name = match command {
+            Command::Insert(insert) => insert.table.as_str(),
+            Command::Update(update) => update.table.as_str(),
+            Command::Delete(delete) => delete.table.as_str(),
+            _ => return Ok(()),
+        };
+        let catalog = self.catalog_snapshot();
+        let Some(target) = catalog.relational_catalog.get(table_name) else {
+            return Ok(());
+        };
+        let mut tables: BTreeSet<String> = std::iter::once(table_name.to_string()).collect();
+        tables.extend(
+            target
+                .foreign_keys
+                .iter()
+                .map(|foreign_key| foreign_key.referenced_table.clone()),
+        );
+        tables.extend(
+            catalog
+                .relational_catalog
+                .values()
+                .filter(|candidate| {
+                    candidate
+                        .foreign_keys
+                        .iter()
+                        .any(|foreign_key| foreign_key.referenced_table == table_name)
+                })
+                .map(|candidate| candidate.name.clone()),
+        );
         let needs_admission = || {
-            !self.table_is_gpu_resident(table_name)
-                && self.table_chunk_authoritative(table_name).is_none()
+            tables
+                .iter()
+                .any(|table| !self.table_has_live_dml_generation(table))
         };
         if !needs_admission() {
             return Ok(());
         }
 
-        let tables: BTreeSet<String> = std::iter::once(table_name.to_string()).collect();
         loop {
             if !self.wait_wave_tail_quiescence() {
-                return Err(ExecuteError::Engine(self.commit_path_unavailable_error()));
+                return Err(self.commit_path_unavailable_error());
             }
             let commit = self.commit_state();
             let settled = self.commit_wave.tails_applied.load(AtomicOrdering::Acquire)
@@ -45,21 +158,12 @@ impl Engine {
                 drop(commit);
                 continue;
             }
-            self.ensure_commit_path_available()
-                .map_err(ExecuteError::Engine)?;
-            self.intent_lanes_write_guard()
-                .map_err(ExecuteError::Engine)?;
-            if needs_admission() {
-                self.auto_admit_resident_tables(&tables);
-            }
+            self.ensure_commit_path_available()?;
+            self.intent_lanes_write_guard()?;
+            let mut catalog = self.ddl_catalog();
+            self.ensure_dml_device_generation_with_catalog(command, &mut catalog)?;
             drop(commit);
             break;
-        }
-
-        if needs_admission() {
-            return Err(ExecuteError::Serialization(format!(
-                "device DML generation for relation \"{table_name}\" is unavailable after admission"
-            )));
         }
         Ok(())
     }

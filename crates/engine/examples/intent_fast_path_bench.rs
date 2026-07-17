@@ -73,7 +73,6 @@ fn build_engine(segment: &std::path::Path) -> Result<Engine, Box<dyn Error>> {
     e.set_auto_admit_on_commit(true);
     e.set_host_install_elision_enabled(true);
     e.set_binary_wal_records_enabled(true);
-    e.set_device_write_locate_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
     e.set_constrained_elision_enabled(true);
     // GPU_DB_BENCH_SHARD_TARGET: pre-size the open shard (rows) to control

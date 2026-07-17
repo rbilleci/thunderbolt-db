@@ -177,48 +177,12 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// PHASE C slice 1: enable/disable the VALUE-INDEX resolve for DELETE/UPDATE prepare (default
-    /// ON). OFF = the O(table) seq_scan (the oracle path) — the A/B lever the differentials use.
-    pub fn set_dml_value_index_resolve_enabled(&self, on: bool) {
-        self.dml_value_index_resolve_enabled
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn dml_value_index_resolve_enabled(&self) -> bool {
-        self.dml_value_index_resolve_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// RETIREMENT A2: enable/disable the DEVICE DML resolve (default ON). OFF -> the value-index
-    /// resolve (slice 1), then the scan — the differential ladder.
-    pub fn set_dml_device_resolve_enabled(&self, on: bool) {
-        self.dml_device_resolve_enabled
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn dml_device_resolve_enabled(&self) -> bool {
-        self.dml_device_resolve_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// RETIREMENT A3: count of constraint probes ANSWERED by the device index (non-vacuity signal;
     /// both true and false answers count — the FALSE answer is the load-bearing one).
     pub fn dml_device_validate_hits(&self) -> u64 {
         self.read_state
             .residency
             .dml_device_validate_hits
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// RETIREMENT A3: enable/disable the DEVICE constraint-probe validators (default ON). OFF ->
-    /// the value-index probes (slice 1b), then the scan validators — the differential ladder.
-    pub fn set_dml_device_validate_enabled(&self, on: bool) {
-        self.dml_device_validate_enabled
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn dml_device_validate_enabled(&self) -> bool {
-        self.dml_device_validate_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -273,17 +237,6 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// M1 (charter-pure): enable/disable the DEVICE write-locate (host PK-hash probe replacement).
-    pub fn set_device_write_locate_enabled(&self, on: bool) {
-        self.device_write_locate_enabled
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn device_write_locate_enabled(&self) -> bool {
-        self.device_write_locate_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// E2.5c 2M+ push (b): enable/disable the FUSED merged-apply device pass.
     pub fn set_fused_apply_enabled(&self, on: bool) {
         self.fused_apply_enabled
@@ -318,7 +271,7 @@ impl Engine {
     /// M1 design B: is this INSERT's PK-unique check DEFERRABLE to the wave-time batched locate?
     /// The eligibility is SHARED by the off-lock skip (`prepare_insert`) and the wave-time
     /// validate (the sequencer), so they can never diverge into a constraint bypass. Requires:
-    /// the wave-batch + device-locate flags; the table ELIDED (device-authoritative — the locate
+    /// the wave-batch flag; the table ELIDED (device-authoritative — the locate
     /// is the source of truth); every unique index has a canonical raw/fingerprint device key;
     /// NO CHECK / outbound-FK / inbound-FK (those aren't device-batch-validated
     /// here — they keep the off-lock path). Same-wave dups are caught by the unique-slot conflict
@@ -328,7 +281,7 @@ impl Engine {
         catalog: &CatalogSnapshot,
         table: &RelationalTable,
     ) -> bool {
-        if !self.device_write_locate_wave_batch_enabled() || !self.device_write_locate_enabled() {
+        if !self.device_write_locate_wave_batch_enabled() {
             return false;
         }
         if !self.table_install_elided(&table.name) {
@@ -389,7 +342,7 @@ impl Engine {
     /// `constrained_elision_enabled` with BOTH validator-ladder flags live. The original B1
     /// hazard (constraint validation reading the elided host store's stale prefix = silent
     /// bypass) is closed at both ends: every hot-path validator probe now runs through the
-    /// index-driven ladder (`validate_dml_constraints_via_index` -> `visible_row_with_value`,
+    /// device-native ladder (`validate_dml_constraints_via_device` -> `visible_row_with_value`,
     /// device-first, rehydrate-on-decline, self-pinned views — including `prepare_insert`,
     /// this slice) and the residual scan arm's source (`visible_relational_rows`) rehydrates
     /// elided tables itself. CHECK/FK exclusions stay: CHECKs ride the scan arm when the
@@ -402,10 +355,8 @@ impl Engine {
         let Some(table) = catalog.relational_catalog.get(table_name) else {
             return false;
         };
-        let unique_ok = !table.indexes.iter().any(|index| index.unique)
-            || (self.constrained_elision_enabled()
-                && self.dml_value_index_resolve_enabled()
-                && self.dml_device_validate_enabled());
+        let unique_ok =
+            !table.indexes.iter().any(|index| index.unique) || self.constrained_elision_enabled();
         table.columns.iter().all(|column| {
             // TYPE-COVERAGE track 2 (stages 1 + iii): every FIXED-WIDTH-section type is
             // device-authoritative-capable (A4a/A4c type from the catalog; appends ride the

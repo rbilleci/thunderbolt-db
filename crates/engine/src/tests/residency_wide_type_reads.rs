@@ -12,7 +12,6 @@ fn text_column_elides_appends_and_reads_multishard() {
         e.set_auto_admit_on_commit(device);
         e.set_host_install_elision_enabled(device);
         e.set_constrained_elision_enabled(device);
-        e.set_device_write_locate_enabled(device);
         e.set_device_write_locate_wave_batch_enabled(device);
         e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the text gather
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
@@ -101,7 +100,6 @@ fn numeric_column_elides_appends_and_reads_multishard() {
         e.set_auto_admit_on_commit(device);
         e.set_host_install_elision_enabled(device);
         e.set_constrained_elision_enabled(device);
-        e.set_device_write_locate_enabled(device);
         e.set_device_write_locate_wave_batch_enabled(device);
         e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the gather
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, amt NUMERIC(20,4))")
@@ -170,7 +168,6 @@ fn bool_column_elides_appends_and_reads_multishard() {
         e.set_auto_admit_on_commit(device);
         e.set_host_install_elision_enabled(device);
         e.set_constrained_elision_enabled(device);
-        e.set_device_write_locate_enabled(device);
         e.set_device_write_locate_wave_batch_enabled(device);
         e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the bitmap gather
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, flag BOOLEAN)")
@@ -291,7 +288,6 @@ fn b128_and_bigint_filtered_rehydration_reads_from_device() {
             e.set_auto_admit_on_commit(device);
             e.set_host_install_elision_enabled(device);
             e.set_constrained_elision_enabled(device);
-            e.set_device_write_locate_enabled(device);
             e.set_device_write_locate_wave_batch_enabled(device);
             e.set_shard_size_target(64); // multi-shard -> the gather spans shards
             e.execute_text(1, &format!("CREATE TABLE t (id INT PRIMARY KEY, val {ty})"))
@@ -350,7 +346,6 @@ fn grouped_ordered_distinct_over_versioned_elided_hides_tombstones() {
     e.set_auto_admit_on_commit(true);
     e.set_host_install_elision_enabled(true);
     e.set_constrained_elision_enabled(true);
-    e.set_device_write_locate_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, g INT)")

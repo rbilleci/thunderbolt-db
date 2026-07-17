@@ -71,6 +71,12 @@ impl Engine {
         if matches!(created_by, AppendCreatedBy::UpdateNewVersion(_)) {
             return false;
         }
+        let Some(valid_through_index) = created_by
+            .stamps_for(new_rows.len())
+            .and_then(|stamps| stamps.into_iter().max())
+        else {
+            return false;
+        };
         let (capacity, row_start, column_count) = {
             let snapshots = self.read_state.residency.snapshots.load();
             let Some(entry) = snapshots.get(table) else {
@@ -121,6 +127,7 @@ impl Engine {
                 desc.generation = desc.generation.saturating_add(1);
                 desc.row_count += k;
                 desc.resident_bytes = desc.resident_bytes.saturating_add(appended_bytes);
+                desc.valid_through_index = desc.valid_through_index.max(valid_through_index);
             }
         });
         // Slice 1b-ii (audit Finding A): the wave/lpb GPU index cache (engine_retained_read.rs) validates a
@@ -440,8 +447,8 @@ impl Engine {
                 .collect();
             // M1 (ledger #24): incrementally maintain the DEVICE PK index too (the index_insert
             // kernel), so the wave-batched device locate never triggers the O(rows) rebuild.
-            // Only fires when a device index is cached (device_write_locate on); no-op otherwise.
-            if !fused && self.device_write_locate_enabled() {
+            // Only fires when a device index is cached; no-op otherwise.
+            if !fused {
                 let idx_started = crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
                     .then(std::time::Instant::now);
                 self.extend_shard_pk_device_index_on_append(
@@ -1012,7 +1019,7 @@ impl Engine {
         // More than one live entry -> not eligible (the fused kernel inserts into one index).
         let mut index_arg: Option<gpu_db_execution::CudaWriteIndex> = None;
         let mut index_col: Option<usize> = None;
-        if self.device_write_locate_enabled() {
+        {
             let new_count = row_count + k;
             let device_ptr = shard_device_memory.device_ptr();
             let mut live: Vec<(usize, Arc<CudaResidentDeviceMemory>, u32, u32)> = Vec::new();

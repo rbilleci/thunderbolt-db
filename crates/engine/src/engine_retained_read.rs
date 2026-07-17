@@ -504,12 +504,9 @@ impl Engine {
         key_id: usize,
         key: i32,
     ) -> Option<Vec<ShardPkHit>> {
-        // R3-004: the device locate is the only indexed route. The temporary A/B-off arm declines
-        // to the GPU scan; it never probes a host index or reconstructs a host relational view.
-        if self.device_write_locate_enabled() {
-            return self.locate_resident_pk_via_device(table, key_id, key);
-        }
-        None
+        // R3-004: key-to-slot addressing is unconditionally device work. A device-index decline
+        // returns `None` to the GPU scan; there is no host index or host relational probe route.
+        self.locate_resident_pk_via_device(table, key_id, key)
     }
 
     /// Step 1 (lpb-for-shards) benchmark + telemetry entry: resolve the table + columns, run the BATCHED
@@ -1438,5 +1435,4 @@ mod cross_shard_pk_index_tests {
             "both twins (packed row+1 = 1 and 3) are indexed"
         );
     }
-
 }

@@ -2031,6 +2031,13 @@
             range(500, 600),
             "mask a >= 500"
         );
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter(&[load, csm(3, -100, false)], N, ResidentElemType::I32)
+                .unwrap(),
+            range(0, 600),
+            "mask a > -100 preserves the signed scalar ABI"
+        );
         // scalar_on_left: `5 < a` <=> a > 5 <=> [6, 600).
         assert_eq!(
             resident
@@ -2161,6 +2168,13 @@
                 .expect("valid launch after preflight failures"),
             vec![1],
             "preflight failures must leave the CUDA context reusable"
+        );
+        assert_eq!(
+            resident
+                .compare_indices_ordered_from_payload(0, 2, -100, 3)
+                .expect("signed negative needle"),
+            vec![0, 1],
+            "ordered i32 comparison must preserve the signed scalar ABI"
         );
     }
 

@@ -464,14 +464,6 @@ pub struct Engine {
     /// grows as bounded shards to billions of rows. Caps the admit headroom + sizes a rollover shard.
     /// Default 4M (seals in ~3ms, ~250 shards/1B per the admit-scaling measurement); settable small in
     /// tests. Interior-mutable.
-    /// PHASE C slice 1: DELETE/UPDATE prepare resolves matches via the per-table equality value
-    /// index (O(matches)). Kill switch -> the O(table) seq_scan (the differential oracle).
-    dml_value_index_resolve_enabled: std::sync::atomic::AtomicBool,
-    /// RETIREMENT A2: single-Eq DML resolves via the DEVICE (locate -> row-identity region ->
-    /// derived key), not the host value index — the dependency A4 deletes. Kill switch -> the
-    /// value-index resolve (slice 1), then the scan.
-    dml_device_resolve_enabled: std::sync::atomic::AtomicBool,
-    dml_device_validate_enabled: std::sync::atomic::AtomicBool,
     host_install_elision_enabled: std::sync::atomic::AtomicBool,
     /// W5a: covered inserts log RESOLVED BINARY WAL records (decode+install replay) instead of
     /// SQL text. Default OFF until the replay-differential burn-in flips it.
@@ -486,11 +478,6 @@ pub struct Engine {
     /// DEFAULT ON (the 2026-07-03 flip). Kill switch -> int8-bearing tables admit
     /// single-buffer (the pre-slice layout).
     shard_int8_section_enabled: std::sync::atomic::AtomicBool,
-    /// M1 (charter ruling 2026-07-03): the write path's PK locate (A2 resolve, A3 validators)
-    /// probes the per-shard DEVICE hash index via a kernel instead of the host `shard_pk_index`
-    /// hash cache — key->slot ADDRESSING is device work. Default OFF until the SLO gate + audit;
-    /// the host cache stays as the flag-off oracle until M3 deletes it. Kill switch -> host probe.
-    device_write_locate_enabled: std::sync::atomic::AtomicBool,
     /// E2.5c 2M+ push (b): FUSED merged-apply device pass (one staging HtoD + one launch for
     /// column scatter + created_by/row-id stamps + PK index insert). Default ON (measured
     /// best-of-3 sustained 1.65M vs 1.41M unfused); always on (the unfused arm is the ineligible-shape fallback),
@@ -499,7 +486,7 @@ pub struct Engine {
     /// M1 design B (wave-time batched validation): eligible INSERTs' PK-unique check is DEFERRED
     /// from the off-lock prepare to the wave sequencer, which batches the whole wave's PK needles
     /// into ONE device locate (the amortization win: launch cost is flat vs batch size). Default
-    /// OFF; requires device_write_locate_enabled. Kill switch -> per-item off-lock validation.
+    /// OFF. Kill switch -> per-item off-lock validation.
     device_write_locate_wave_batch_enabled: std::sync::atomic::AtomicBool,
     auto_vacuum_enabled: std::sync::atomic::AtomicBool,
     tombstone_churn_threshold_override: std::sync::atomic::AtomicU64,

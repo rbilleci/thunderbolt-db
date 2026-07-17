@@ -1,3 +1,4 @@
+use crate::tests::invalidate_test_relational_residency;
 use crate::{
     BenchmarkRelationalResidencyOwnedShard, BenchmarkRelationalResidencyOwnedShardInstall, Engine,
 };
@@ -132,11 +133,7 @@ fn p8_sharded_resident_sum_reduces_matches_and_rejects_missing_layout() {
     // `last_execution_result_materialization_micros` are no longer populated; the generic rows check covers it.
     assert_eq!(decision.last_execution_rows, Some(1));
 
-    e.execute_text(
-            2,
-            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (42, 1, 1, 1, 'x')",
-        )
-        .unwrap();
+    invalidate_test_relational_residency(&e, "order_line");
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
     assert_eq!(invalidated.query_shape, "sharded_int4_equality_sum");
@@ -320,11 +317,7 @@ fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() 
     // AVG over zero matched rows is SQL NULL (PG), not the legacy canonical-zero numeric sentinel.
     assert_eq!(no_match.rows, vec![vec![SqlValue::Null]]);
 
-    e.execute_text(
-            2,
-            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (25, 1, 1, 1, 'x')",
-        )
-        .unwrap();
+    invalidate_test_relational_residency(&e, "order_line");
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
     assert_eq!(invalidated.query_shape, "sharded_int4_between_avg");
@@ -501,11 +494,7 @@ fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout()
     // MAX over zero matched rows is SQL NULL (PG), not the legacy empty-text sentinel.
     assert_eq!(no_match.rows, vec![vec![SqlValue::Null]]);
 
-    e.execute_text(
-            2,
-            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (25, 1, 1, 99, 'x')",
-        )
-        .unwrap();
+    invalidate_test_relational_residency(&e, "order_line");
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
     assert_eq!(invalidated.query_shape, "sharded_int4_filtered_max");
@@ -682,11 +671,7 @@ fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout()
     // MIN over zero matched rows is SQL NULL (PG), not the legacy empty-text sentinel.
     assert_eq!(no_match.rows, vec![vec![SqlValue::Null]]);
 
-    e.execute_text(
-            2,
-            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (25, 1, 1, 5, 'x')",
-        )
-        .unwrap();
+    invalidate_test_relational_residency(&e, "order_line");
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
     assert_eq!(invalidated.query_shape, "sharded_int4_filtered_min");
@@ -868,11 +853,7 @@ fn p8_sharded_resident_filtered_avg_reduces_matches_and_rejects_missing_layout()
     // AVG over zero matched rows is SQL NULL (PG), not the legacy canonical-zero numeric sentinel.
     assert_eq!(no_match.rows, vec![vec![SqlValue::Null]]);
 
-    e.execute_text(
-            2,
-            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (25, 1, 1, 5, 'x')",
-        )
-        .unwrap();
+    invalidate_test_relational_residency(&e, "order_line");
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
     assert_eq!(invalidated.query_shape, "sharded_int4_filtered_avg");

@@ -41,9 +41,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     for &rows in &sizes {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
-        if env::var("GPU_DB_BENCH_INDEX_OFF").ok().as_deref() == Some("1") {
-            e.set_dml_value_index_resolve_enabled(false); // the scan-oracle configuration
-        }
         if env::var("GPU_DB_BENCH_TOMBSTONE_OFF").ok().as_deref() == Some("1") {
             // The pre-A4b oracle: every DELETE/UPDATE commit invalidates + re-admits (O(table)).
             e.set_resident_delete_tombstone_enabled(false);

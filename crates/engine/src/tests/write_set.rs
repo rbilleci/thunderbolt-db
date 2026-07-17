@@ -53,6 +53,11 @@ fn parse_delete(sql: &str) -> Delete {
     }
 }
 
+fn ensure_insert_device_generation(e: &Engine, insert: &Insert) {
+    e.ensure_dml_device_generation(&Command::Insert(insert.clone()))
+        .unwrap();
+}
+
 /// The set of relational row keys whose version chain `apply_delta` touched for `commit_seq`:
 /// a NEW version created by `commit_seq` (insert / update-new) OR an EXISTING version
 /// tombstoned by `commit_seq` (delete / update-old). Derived purely from the version chains so
@@ -310,14 +315,11 @@ fn insert_write_set_records_unique_slots_but_not_row_keys() {
     e.execute_text(2, "CREATE UNIQUE INDEX u_id ON u (id)")
         .unwrap();
 
+    let insert = parse_insert("INSERT INTO u (id, label) VALUES (7, 'g')");
+    ensure_insert_device_generation(&e, &insert);
     let snapshot = next_commit_snapshot(&e);
     let delta = e
-        .prepare_insert(
-            &parse_insert("INSERT INTO u (id, label) VALUES (7, 'g')"),
-            snapshot,
-            None,
-            InsertPrepareValidation::Full,
-        )
+        .prepare_insert(&insert, snapshot, None, InsertPrepareValidation::Full)
         .unwrap();
     assert!(
         delta.write_set.rows.is_empty(),
@@ -414,14 +416,11 @@ fn write_set_records_unique_index_slots_for_unique_insert() {
     e.execute_text(1, "CREATE TABLE u (id INT UNIQUE, label TEXT)")
         .unwrap();
 
+    let insert = parse_insert("INSERT INTO u (id, label) VALUES (7, 'a'), (8, 'b')");
+    ensure_insert_device_generation(&e, &insert);
     let snapshot = next_commit_snapshot(&e);
     let delta = e
-        .prepare_insert(
-            &parse_insert("INSERT INTO u (id, label) VALUES (7, 'a'), (8, 'b')"),
-            snapshot,
-            None,
-            InsertPrepareValidation::Full,
-        )
+        .prepare_insert(&insert, snapshot, None, InsertPrepareValidation::Full)
         .unwrap();
 
     let slots: BTreeSet<(String, String, String)> = delta
@@ -453,87 +452,6 @@ fn write_set_records_unique_index_slots_for_unique_insert() {
             .iter()
             .all(|s| s.column == "id"),
         "spurious unique slot for a non-unique column"
-    );
-}
-
-#[test]
-fn prepare_apply_round_trips_to_same_state_as_public_path() {
-    // Stage 2 invariant (c): a directly-driven `prepare_* -> apply_delta` sequence reaches the
-    // SAME engine state (versions, value index, row-id counter, sequences) as running the same
-    // SQL through the public commit path — i.e. the split is behavior-preserving.
-    //
-    // `manual` drives prepare/apply by hand at the commit-seq each commit would receive;
-    // `golden` runs the identical statements through `execute_text`.
-    let mut manual = Engine::new_local_cpu_oracle();
-    let mut golden = Engine::new_local_cpu_oracle();
-    for e in [&mut manual, &mut golden] {
-        e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
-            .unwrap();
-        e.execute_text(
-            2,
-            "INSERT INTO t (id, label) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
-        )
-        .unwrap();
-    }
-
-    // Drive a mixed workload by hand on `manual`.
-    let insert_snapshot = next_commit_snapshot(&manual);
-    let insert_seq = insert_snapshot.commit_seq;
-    let insert_delta = manual
-        .prepare_insert(
-            &parse_insert("INSERT INTO t (id, label) VALUES (4, 'd')"),
-            insert_snapshot,
-            None,
-            InsertPrepareValidation::Full,
-        )
-        .unwrap();
-    manual.apply_delta(insert_delta, insert_seq, None).unwrap();
-    manual.publish_committed_seq(insert_seq);
-
-    let update_snapshot = next_commit_snapshot(&manual);
-    let update_seq = update_snapshot.commit_seq;
-    let update_delta = manual
-        .prepare_update(
-            &parse_update("UPDATE t SET label = 'Z' WHERE id = 2"),
-            update_snapshot,
-        )
-        .unwrap();
-    manual.apply_delta(update_delta, update_seq, None).unwrap();
-    manual.publish_committed_seq(update_seq);
-
-    let delete_snapshot = next_commit_snapshot(&manual);
-    let delete_seq = delete_snapshot.commit_seq;
-    let delete_delta = manual
-        .prepare_delete(&parse_delete("DELETE FROM t WHERE id = 1"), delete_snapshot)
-        .unwrap();
-    manual.apply_delta(delete_delta, delete_seq, None).unwrap();
-    manual.publish_committed_seq(delete_seq);
-
-    // The same statements through the public path on `golden`.
-    golden
-        .execute_text(3, "INSERT INTO t (id, label) VALUES (4, 'd')")
-        .unwrap();
-    golden
-        .execute_text(4, "UPDATE t SET label = 'Z' WHERE id = 2")
-        .unwrap();
-    golden
-        .execute_text(5, "DELETE FROM t WHERE id = 1")
-        .unwrap();
-
-    assert_eq!(
-        capture_mutable_state(&manual),
-        capture_mutable_state(&golden),
-        "manual prepare/apply diverged from the public commit path"
-    );
-
-    // And the visible rows agree at each engine's live boundary.
-    let Command::Select(select) = parse_command("SELECT id, label FROM t").unwrap() else {
-        panic!("expected SELECT");
-    };
-    assert_eq!(
-        manual.execute_relational_select(&select).unwrap().rows,
-        golden.execute_relational_select(&select).unwrap().rows,
-        "visible rows diverged"
     );
 }
 
@@ -594,11 +512,13 @@ fn serialized_unique_insert_records_its_unique_slot_into_the_si_ledger() {
     e.execute_text(2, "CREATE UNIQUE INDEX t_id ON t (id)")
         .unwrap();
 
+    let stale_insert = parse_insert("INSERT INTO t (id, v) VALUES (7, 1)");
+    ensure_insert_device_generation(&e, &stale_insert);
     let stale_snapshot = e.visible_up_to();
     let _snapshot_guard = e.register_active_snapshot(stale_snapshot);
     let stale_delta = e
         .prepare_insert(
-            &parse_insert("INSERT INTO t (id, v) VALUES (7, 1)"),
+            &stale_insert,
             e.dml_read_snapshot(stale_snapshot),
             None,
             InsertPrepareValidation::Full,

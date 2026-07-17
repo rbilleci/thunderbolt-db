@@ -1,3 +1,4 @@
+use crate::tests::invalidate_test_relational_residency;
 use crate::{
     BenchmarkRelationalResidencyOwnedShard, BenchmarkRelationalResidencyOwnedShardInstall, Engine,
 };
@@ -98,11 +99,7 @@ fn p8_sharded_resident_count_reduces_valid_shards_and_rejects_invalidated() {
     // is no longer populated; assert the generic `last_execution_rows == Some(1)` (one COUNT(*) row).
     assert_eq!(decision.last_execution_rows, Some(1));
 
-    e.execute_text(
-            2,
-            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (1, 1, 1, 1, 'x')",
-        )
-        .unwrap();
+    invalidate_test_relational_residency(&e, "order_line");
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
     assert_eq!(invalidated.query_shape, "sharded_count_all");
@@ -215,11 +212,7 @@ fn p8_sharded_resident_key_lookup_merges_matches_and_rejects_invalidated() {
     // so assert the generic `last_execution_rows == Some(4)` (the 4 concatenated projected rows) instead.
     assert_eq!(decision.last_execution_rows, Some(4));
 
-    e.execute_text(
-            2,
-            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (42, 1, 1, 1, 'x')",
-        )
-        .unwrap();
+    invalidate_test_relational_residency(&e, "order_line");
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
     assert_eq!(invalidated.query_shape, "sharded_int4_equality_projection");
@@ -385,11 +378,7 @@ fn p8_sharded_resident_multi_column_lookup_merges_projected_rows_and_rejects_mis
     // `last_execution_rows == Some(4)` (the 4 concatenated projected rows) instead.
     assert_eq!(decision.last_execution_rows, Some(4));
 
-    e.execute_text(
-            2,
-            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (42, 1, 1, 1, 'x')",
-        )
-        .unwrap();
+    invalidate_test_relational_residency(&e, "order_line");
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
     assert_eq!(

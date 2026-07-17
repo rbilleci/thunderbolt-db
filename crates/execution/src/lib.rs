@@ -85,7 +85,7 @@ use resident_compare_ordered::{
     validate_ordered_i32_index_domain, validate_ordered_i32_input_window, COMPARE_ORDERED_PTX,
 };
 use resident_compare_ordered::{
-    launch_cuda_buffer_i32_compare_indices_ordered,
+    launch_cuda_buffer_i32_compare_indices_ordered, launch_cuda_owned_i32_compare_indices_ordered,
     launch_cuda_resident_i32_compare_indices_ordered, launch_cuda_resident_i32_compare_project,
 };
 mod resident_scalar;

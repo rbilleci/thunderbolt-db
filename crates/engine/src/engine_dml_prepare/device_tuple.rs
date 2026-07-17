@@ -1,24 +1,20 @@
-//! Exact device tuple-constraint probes: fingerprint-index candidates with a typed resident-scan
-//! fallback, plus full materialized-value and entity-exclusion rechecks.
+//! Exact typed device tuple-constraint probes with visibility and entity-exclusion checks.
 
-use super::contracts::device_structural_tuple_predicate;
+use super::contracts::device_structural_tuple_predicates;
 use super::*;
 
 impl Engine {
-    /// COMPOUND KEYS: probe the fingerprint index, materialize each hit on-device, and confirm the
-    /// full key tuple. Index decline stays device-native through an exact typed predicate scan.
+    /// Probe compound keys through an exact typed resident predicate. Fingerprints remain addressing
+    /// hints elsewhere; they are never constraint authority.
     pub(crate) fn device_visible_row_with_tuple(
         &self,
         table: &RelationalTable,
         mut visibility: StorageVisibility,
-        key_id: usize,
-        fingerprint: Option<i32>,
+        _key_id: usize,
+        _fingerprint: Option<i32>,
         key_cols: &[(usize, SqlValue)],
         exclude_keys: Option<&BTreeSet<String>>,
     ) -> Option<bool> {
-        if !self.dml_device_validate_enabled() {
-            return None;
-        }
         if self.table_chunk_authoritative(&table.name).is_some() {
             if self.current_transaction_read_snapshot().is_none() {
                 visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
@@ -30,22 +26,13 @@ impl Engine {
                 exclude_keys,
             );
         }
-        let index_hits = fingerprint.and_then(|fingerprint| {
-            self.locate_resident_pk_via_shard_index_detailed(table, key_id, fingerprint)
-        });
-        let hits = match index_hits {
-            Some(hits) => hits,
-            None => {
-                // An index build/probe decline is not permission to consult the host value index.
-                // Scan the exact typed tuple predicate on the same resident generation. This also
-                // covers compound partial-NULL keys, which have no complete fingerprint.
-                if self.current_transaction_read_snapshot().is_none() {
-                    visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
-                }
-                let predicate = device_structural_tuple_predicate(table, key_cols)?;
-                self.locate_resident_delete_slots_detailed(table, &predicate)?
-            }
-        };
+        // A fingerprint is only an addressing accelerator and can collide. Constraint authority
+        // therefore comes from the exact typed device predicate for every tuple shape.
+        if self.current_transaction_read_snapshot().is_none() {
+            visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
+        }
+        let predicates = device_structural_tuple_predicates(table, key_cols)?;
+        let hits = self.locate_resident_conjunct_slots_detailed(table, &predicates)?;
         let mut answer = false;
         for hit in &hits {
             let region = hit.row_id.as_ref()?;
@@ -61,15 +48,13 @@ impl Engine {
             if exclude_keys.is_some_and(|excluded| excluded.contains(&key)) {
                 continue;
             }
-            let row =
-                match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
-                    Some(Some(row)) => row,
-                    Some(None) => continue,
-                    None => return None,
-                };
-            if key_cols.iter().all(|(ci, v)| row.get(*ci) == Some(v)) {
-                answer = true;
-                break;
+            match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
+                Some(Some(_)) => {
+                    answer = true;
+                    break;
+                }
+                Some(None) => continue,
+                None => return None,
             }
         }
         self.read_state

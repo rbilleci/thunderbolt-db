@@ -910,8 +910,6 @@ fn relational_sql_cuda_probe_reuses_cached_runtime_snapshot() {
         .set(CudaDriverRuntime::unavailable());
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
-    e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
-        .unwrap();
 
     let Command::Select(select) = parse_command("SELECT * FROM people").unwrap() else {
         panic!("expected SELECT plan");

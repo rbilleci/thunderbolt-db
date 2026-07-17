@@ -96,10 +96,9 @@ fn execute_relational_select_cpu_pinned_matches_the_public_select() {
     // BUG 3 seam (fallback-target half). When a resident route's residency is invalidated
     // mid-statement, `execute_relational_select` re-serves the statement from
     // `execute_relational_select_cpu_pinned`. That fallback target must produce exactly the
-    // result the public CPU path does (a full deterministic resident-route→fallback repro needs a
-    // GPU; this asserts the seam the fallback lands on is correct CPU-only). The two are wired to
-    // the same bind + pinned MVCC read, so for a non-resident table they must agree on rows,
-    // columns, and access path.
+    // result the public device path does. R3-004 makes the DML generation mandatory, so the public
+    // route may legitimately report a different access-path implementation; rows and columns are
+    // the semantic seam the parity oracle owns.
     let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     for id in 1..=5 {
@@ -126,10 +125,6 @@ fn execute_relational_select_cpu_pinned_matches_the_public_select() {
         assert_eq!(
             *via_fallback.columns, *via_public.columns,
             "{sql}: CPU-fallback columns must equal the public select"
-        );
-        assert_eq!(
-            *via_fallback.access_path, *via_public.access_path,
-            "{sql}: CPU-fallback access path must equal the public select"
         );
     }
 }
@@ -310,13 +305,10 @@ fn stage3_old_table_generation_retired_only_after_last_reader_drains() {
     );
 }
 
-/// Stage 3 read-perf sanity: the equality fast-path still reads the versioned value-index (a
-/// per-table map lookup), NOT a version-chain scan. On a many-row table where only a handful
-/// match, the chosen access path is `EqualityIndex` with `matched_keys` ≪ the row count, and a
-/// direct value-index lookup on the loaded generation returns exactly those keys — i.e. the
-/// per-table refactor kept the fast-path index-targeted (the whole reason for per-table cells).
+/// The mandatory device generation returns an exact low-selectivity equality result without
+/// dispatching production execution to the host value index.
 #[test]
-fn stage3_resident_equality_read_still_uses_value_index_fast_path() {
+fn stage3_resident_equality_read_uses_device_generation() {
     let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -339,19 +331,8 @@ fn stage3_resident_equality_read_still_uses_value_index_fast_path() {
         unreachable!()
     };
     let result = e.execute_relational_select(&select).unwrap();
-    // The equality predicate resolved through the per-table versioned value-index, touching
-    // only the 2 matching keys (index-targeted, not a 200-row scan).
-    assert!(
-        matches!(
-            *result.access_path,
-            RelationalAccessPath::EqualityIndex {
-                matched_keys: 2,
-                ..
-            }
-        ),
-        "equality fast-path regressed off the value-index: {:?}",
-        result.access_path
-    );
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.fallback_reason, None);
     assert_eq!(
         result.rows.len(),
         2,

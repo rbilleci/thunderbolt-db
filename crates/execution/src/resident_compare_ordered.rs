@@ -4,7 +4,7 @@ use super::resident_window;
 use super::{
     check_cuda, copy_pinned_into, launch_on_pooled_stream, stage_result_dtoh_async,
     CudaI32Comparison, CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError,
-    GpuPrimaryContext, PooledBufferLease, PooledStream,
+    GpuPrimaryContext, PooledBufferLease, PooledDeviceBufferOwned, PooledStream,
 };
 
 /// Ordered parallel-compaction PTX shared by the VALUE-emit launch
@@ -66,6 +66,14 @@ impl OrderedI32InputWindow {
     }
 
     fn pooled(input: &PooledBufferLease<'_>) -> Self {
+        Self {
+            device_base: input.ptr,
+            allocated_bytes: input.capacity as u64,
+            byte_offset: 0,
+        }
+    }
+
+    fn pooled_owned(input: &PooledDeviceBufferOwned) -> Self {
         Self {
             device_base: input.ptr,
             allocated_bytes: input.capacity as u64,
@@ -176,6 +184,31 @@ pub(super) fn launch_cuda_buffer_i32_compare_indices_ordered(
     Ok(i32_bits_into_u32(slots))
 }
 
+pub(super) fn launch_cuda_owned_i32_compare_indices_ordered(
+    resident: &CudaResidentDeviceMemory,
+    input: &PooledDeviceBufferOwned,
+    row_count: u64,
+    needle: i32,
+    comparison: u32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    validate_ordered_i32_comparison(comparison, 5)?;
+    validate_ordered_i32_index_domain(row_count)?;
+    validate_ordered_i32_context_identity(
+        std::ptr::from_ref(resident.primary()).addr(),
+        std::sync::Arc::as_ptr(&input.primary).addr(),
+        input.capacity,
+    )?;
+    let slots = launch_cuda_resident_i32_compare_ordered_core(
+        resident,
+        OrderedI32InputWindow::pooled_owned(input),
+        row_count,
+        needle,
+        comparison,
+        1,
+    )?;
+    Ok(i32_bits_into_u32(slots))
+}
+
 /// TWO-INPUT (col-vs-col / expr-vs-expr) ordered compare-compaction: compare `lhs[i] <cmp> rhs[i]`
 /// elementwise and return the surviving ROW INDICES (`Vec<u32>`) in ASCENDING ORDER, with NO host
 /// sort. Mirrors `launch_cuda_resident_i32_compare_indices_ordered` (and shares the orchestration of
@@ -226,6 +259,9 @@ pub(super) fn launch_cuda_resident_i32_compare_buffers_indices_ordered(
     if n == 0 {
         return Ok(Vec::new());
     }
+    // CUDA current context is thread-local. Bind before module-cache lookup, buffer leasing, or
+    // any launch so off-lock DML predicates are safe on arbitrary writer threads.
+    resident.primary().set_current()?;
     let lhs_base = lhs.ptr;
     let rhs_base = rhs.ptr;
 
@@ -662,6 +698,9 @@ fn launch_cuda_resident_i32_compare_ordered_core<R: CudaResidentReadSource>(
     if row_count == 0 {
         return Ok(Vec::new());
     }
+    // CUDA current context is thread-local. Bind before module-cache lookup, buffer leasing, or
+    // any launch so off-lock DML predicates are safe on arbitrary writer threads.
+    resident.primary().set_current()?;
     let input_base = input.device_base;
     let byte_offset = input.byte_offset;
 

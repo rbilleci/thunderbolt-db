@@ -1,18 +1,15 @@
-/// M1 (charter-pure device locate) — the DEVICE-vs-HOST-PROBE differential: an elided PK'd
-/// table runs the constraint + DML gauntlet with the DEVICE write-locate ON vs OFF (the host
-/// PK-hash-probe oracle). Every outcome (incl violation text) + final read must match — the
-/// locate feeds BOTH the A2 resolve (point DML) and the A3 validators (dup checks). Includes
+/// M1 (charter-pure device locate) — an elided PK'd table runs the constraint + DML gauntlet
+/// through the mandatory device write-locate path. The locate feeds BOTH the A2 resolve (point
+/// DML) and the A3 validators (dup checks). Includes
 /// an UPDATE that appends a new version (SV5) so a key lands in TWO shards — the kernel's
-/// multi-hit emission is exercised (the host path returns both hits too). NON-VACUITY: the
-/// device arm's `device_write_locate_hits` advances (the kernel really fired).
+/// multi-hit emission is exercised. NON-VACUITY: both device DML resolution and validation advance.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn device_write_locate_matches_host_probe_twin() {
-    let run = |device: bool| {
+fn device_write_locate_serves_constraint_and_dml_gauntlet() {
+    let run = || {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_device_write_locate_enabled(device);
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
             .unwrap();
         let mut seq = 2u64;
@@ -53,25 +50,32 @@ fn device_write_locate_matches_host_probe_twin() {
         rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         (e, outcomes, rows)
     };
-    let (on, on_out, on_rows) = run(true);
-    let (off, off_out, off_rows) = run(false);
-    assert_eq!(
-        on_out, off_out,
-        "device locate outcome ladder == host-probe oracle"
-    );
-    assert_eq!(
-        on_rows, off_rows,
-        "device locate reads == host-probe oracle"
+    let (engine, outcomes, rows) = run();
+    assert!(outcomes[0].is_ok(), "fresh insert succeeds: {outcomes:?}");
+    assert!(
+        outcomes[1]
+            .as_ref()
+            .is_err_and(|err| err.contains("duplicate key")),
+        "duplicate PK is rejected: {outcomes:?}"
     );
     assert!(
-        on.device_write_locate_hits() > 0,
-        "non-vacuity: the DEVICE write-locate kernel must have FIRED (got {})",
-        on.device_write_locate_hits()
+        outcomes[2..].iter().all(Result::is_ok),
+        "DML ladder succeeds: {outcomes:?}"
     );
-    assert_eq!(
-        off.device_write_locate_hits(),
-        0,
-        "flag OFF never touches the device locate"
+    assert_eq!(rows.len(), 201, "net row count after delete/reinsert");
+    assert!(
+        rows.iter().any(|row| {
+            row.first() == Some(&SqlValue::Int4(130)) && row.get(1) == Some(&SqlValue::Int4(7))
+        }),
+        "the cross-shard update chain publishes its terminal image"
+    );
+    assert!(
+        engine.dml_device_resolve_hits() > 0,
+        "non-vacuity: the device DML resolver must have fired"
+    );
+    assert!(
+        engine.dml_device_validate_hits() > 0,
+        "non-vacuity: the device constraint validator must have fired"
     );
 }
 
@@ -81,16 +85,15 @@ fn device_write_locate_matches_host_probe_twin() {
 /// advance-past-every-match, it emitted only the FIRST match per shard = the dead OLD twin, so:
 /// (1) a point read `WHERE pk = k` returned EMPTY for a live updated key, and (2) an INSERT of k
 /// bypassed uniqueness (saw only the dead twin -> "no dup"). Both must now resolve correctly
-/// (device ON == host oracle). Sabotage: reverting the write-locate FOUND->advance flip fails
+/// through the mandatory device path. Sabotage: reverting the write-locate FOUND->advance flip fails
 /// this (the point read goes empty / the reinsert is wrongly accepted).
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn device_locate_same_shard_twin_point_read_and_reinsert() {
-    let run = |device: bool| {
+    let run = || {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(256); // a handful of rows stays in ONE open shard
-        e.set_device_write_locate_enabled(device);
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO t (id, v) VALUES (1,10),(2,20),(3,30)")
@@ -113,30 +116,26 @@ fn device_locate_same_shard_twin_point_read_and_reinsert() {
         let hits = e.device_write_locate_hits();
         (point, reinsert, hits)
     };
-    let (on_point, on_reinsert, on_hits) = run(true);
-    let (off_point, off_reinsert, _off_hits) = run(false);
-    assert_eq!(on_point, off_point, "point read device == host oracle");
-    assert_eq!(
-        on_reinsert, off_reinsert,
-        "reinsert outcome device == host oracle"
-    );
+    let (point, reinsert, hits) = run();
     // The live updated key resolves to its NEW value (not empty).
     assert_eq!(
-        on_point.len(),
+        point.len(),
         1,
-        "point read returns the live updated row (not empty): {on_point:?}"
+        "point read returns the live updated row (not empty): {point:?}"
     );
     assert_eq!(
-        on_point[0].get(1),
+        point[0].get(1),
         Some(&SqlValue::Int4(999)),
         "point read sees the UPDATED value"
     );
     // Reinsert of a live key is a duplicate-PK violation on both arms.
     assert!(
-        on_reinsert.is_err(),
-        "reinserting a live key must be rejected as a duplicate: {on_reinsert:?}"
+        reinsert
+            .as_ref()
+            .is_err_and(|err| err.contains("duplicate key")),
+        "reinserting a live key must be rejected as a duplicate: {reinsert:?}"
     );
-    assert!(on_hits > 0, "non-vacuity: the device locate fired");
+    assert!(hits > 0, "non-vacuity: the device locate fired");
 }
 
 /// R-ver (read version resolution): a plain unfiltered `SELECT <cols> FROM t` over a VERSIONED
@@ -152,7 +151,6 @@ fn plain_scan_over_versioned_elided_table_stays_elided() {
     e.set_auto_admit_on_commit(true);
     e.set_host_install_elision_enabled(true);
     e.set_constrained_elision_enabled(true);
-    e.set_device_write_locate_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")

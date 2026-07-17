@@ -1,10 +1,9 @@
 use super::{
     coerce_filter_literal, current_timestamp_micros, exact_device_verdict_cardinality,
     relational_key_prefix, try_encode_binary_insert, wave_device_phase_timing_enabled,
-    wave_host_phase_timing_enabled, Command, CommitState, CommitWaveItem, CommitWaveTail,
-    DmlReadSnapshot, Engine, EngineError, ExecuteError, Index, Insert, InsertPrepareValidation,
-    LogReplicator, RelationalIndex, RelationalTable, SqlValue, WriteDelta, WAVE_DEVICE_STATS,
-    WAVE_HOST_STATS,
+    wave_host_phase_timing_enabled, Command, CommitWaveItem, CommitWaveTail, DmlReadSnapshot,
+    Engine, EngineError, ExecuteError, Index, Insert, InsertPrepareValidation, LogReplicator,
+    RelationalIndex, RelationalTable, SqlValue, WAVE_DEVICE_STATS, WAVE_HOST_STATS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -414,7 +413,7 @@ impl Engine {
         // dedup set; a homogeneous-intent wave guarantees no classic item can interleave between
         // that verdict and the ordered cut.
         let shards = intent_sequencer_shards();
-        if shards > 1 && batch.len() >= SHARD_MIN_WAVE && self.auto_admit_on_commit_enabled() {
+        if shards > 1 && batch.len() >= SHARD_MIN_WAVE {
             let wave_catalog_seq = self.catalog_snapshot().commit_seq;
             if self.device_write_locate_wave_batch_enabled()
                 && batch
@@ -431,16 +430,7 @@ impl Engine {
         let wall_clock = current_timestamp_micros();
         let mut wave_tail: Option<(Index, usize)> = None;
         let mut committed: Vec<(usize, Index, bool, u64)> = Vec::with_capacity(batch.len());
-        // Homogeneous fast-INSERT run accumulator (ADR-009's homogeneous-wave shape): consecutive
-        // constraint-free INSERTs are installed together by ONE `with_table_mut` per table at run
-        // flush. Their re-resolves never read table rows (constraint-free) and their row keys come
-        // from the VIRTUAL row-id cursor below, so deferring the install is invisible; any
-        // non-fast item flushes the run first so its re-resolve sees every prior wave write.
-        let mut fast_run: Vec<(usize, Index, String, WriteDelta)> = Vec::new();
-        let auto_admit = self.auto_admit_on_commit_enabled();
-        let mut fast_table_cache: BTreeMap<String, bool> = BTreeMap::new();
-        // The virtual row-id cursor: fast-run deltas are prepared against this cursor (their
-        // installs — which advance the real allocator — are deferred to the run flush).
+        // The virtual row-id cursor assigns device-native INSERT identities in wave order.
         let mut next_row_id = self.read_state.mvcc.current_row_id();
 
         let mut commit = self.commit_state();
@@ -464,40 +454,6 @@ impl Engine {
             std::mem::forget(guard);
             return None;
         }
-        let flush_fast_run =
-            |commit: &mut CommitState,
-             fast_run: &mut Vec<(usize, Index, String, WriteDelta)>,
-             committed: &mut Vec<(usize, Index, bool, u64)>| {
-                if fast_run.is_empty() {
-                    return;
-                }
-                let _ = commit; // the commit_mutex guard is held by the caller for the whole wave
-                let mut by_table: BTreeMap<String, Vec<(WriteDelta, Index)>> = BTreeMap::new();
-                let mut run_meta: Vec<(usize, Index, String, u64)> =
-                    Vec::with_capacity(fast_run.len());
-                for (position, seq, table, delta) in fast_run.drain(..) {
-                    run_meta.push((position, seq, table.clone(), delta.rows_affected()));
-                    by_table.entry(table).or_default().push((delta, seq));
-                }
-                for (table, deltas) in by_table {
-                    self.apply_insert_deltas_batched(&table, deltas)
-                        .unwrap_or_else(|err| {
-                            panic!(
-                                "commit-path invariant violation: batched wave apply on {table} \
-                             failed after re-validation succeeded: {err}"
-                            )
-                        });
-                }
-                for (position, seq, _table, rows) in run_meta {
-                    commit.repl.mark_applied(seq);
-                    self.invalidate_relational_residency_tables_concurrent(
-                        &batch[position].residency_tables,
-                        batch[position].txn_id,
-                        seq,
-                    );
-                    committed.push((position, seq, false, rows));
-                }
-            };
         // A4e OPTIMIZATION: wave-BATCHED residency appends. The measured elision residual was
         // the PER-ITEM device append (~27us/item = several small HtoD copies + bookkeeping per
         // single-row INSERT). Consecutive INSERT items buffer here per table and flush as ONE
@@ -660,8 +616,7 @@ impl Engine {
             // apply) for the flagship shape — into one value clone + one WAL patch. Any drift (gen
             // bump, de-elision, auto-admit off, non-intent item) falls through to the always-correct
             // general path below, byte-identical to before.
-            let intent_fast = auto_admit
-                && wave_catalog_seq == batch[position].prepared_catalog_seq
+            let intent_fast = wave_catalog_seq == batch[position].prepared_catalog_seq
                 && batch[position].binary_wal_template.is_some()
                 && matches!(&batch[position].offlock_delta, Some(d)
                     if Self::reresolve_reuse_eligible(d)
@@ -673,10 +628,6 @@ impl Engine {
                     _ => false,
                 };
             if intent_fast {
-                // Land any earlier deferred fast-run installs first so seq order == apply order
-                // (intents are never themselves fast-run — they hold a unique slot — but a mixed
-                // wave may have buffered plain inserts ahead of this one).
-                flush_fast_run(&mut commit, &mut fast_run, &mut committed);
                 let commit_seq = commit.repl.peek_next_index();
                 // The row id is the wave's integer cursor — IDENTICAL to what the general path's
                 // `rekey` would `format!` into `rel/{table}/{row_id:020}` and then parse back out.
@@ -1008,69 +959,67 @@ impl Engine {
             wave_unique_slots_i32.extend(item.write_set.unique_slots_i32.iter().copied());
             hp!(4);
 
-            // Fast-run eligibility: a plain INSERT into a table with no unique index, no CHECK,
-            // and no FK (its re-resolve read no rows and claimed no unique slots), with auto-admit
-            // off (the in-place resident append is a per-item protocol). Everything else is a
-            // SLOW item: flush the pending run first so this item's apply-order matches seq order
-            // and later re-resolves see it.
-            let fast_table = matches!(item.cmd, Command::Insert(_))
-                && !auto_admit
-                && delta.write_set.unique_slots.is_empty()
-                && delta.write_set.unique_slots_i32.is_empty()
-                && match &delta.mutation {
-                    crate::write_path::PreparedMutation::Insert { table, .. } => {
-                        *fast_table_cache.entry(table.clone()).or_insert_with(|| {
-                            wave_catalog.relational_catalog.get(table).is_some_and(|t| {
-                                !t.indexes.iter().any(|index| index.unique)
-                                    && t.check_constraints.is_empty()
-                                    && t.foreign_keys.is_empty()
-                            })
-                        })
-                    }
-                    _ => false,
-                };
-            if fast_table {
-                let crate::write_path::PreparedMutation::Insert { table, .. } = &delta.mutation
-                else {
-                    unreachable!("fast_table guarantees an insert delta");
-                };
-                next_row_id += delta.rows_consumed;
-                fast_run.push((position, commit_seq, table.clone(), delta));
-                wave_tail = Some((commit_seq, wal_position));
-                continue;
-            }
-            flush_fast_run(&mut commit, &mut fast_run, &mut committed);
-
-            // (3d) SLOW item: install the re-validated delta now (apply-before-durable, D3b). A
+            // (3d) Install the re-validated delta now (apply-before-durable, D3b). A
             // failure here is a true invariant violation — PANIC, poisoning the commit_mutex; the
             // batch guard fails the wave's remaining outcomes and wedges the queue.
             // RETIREMENT A1: carry the inserted rows' host identities (parsed from their keys) so
             // the residency append can stamp the row-identity region.
-            let insert_append: Option<(String, Vec<Vec<SqlValue>>, Vec<u64>)> =
-                match &delta.mutation {
-                    crate::write_path::PreparedMutation::Insert {
-                        table,
-                        inserted_rows,
-                        ..
-                    } => {
-                        let prefix = relational_key_prefix(table);
-                        Some((
-                            table.clone(),
-                            inserted_rows
-                                .iter()
-                                .map(|(_key, values)| values.clone())
-                                .collect(),
-                            inserted_rows
-                                .iter()
-                                .map(|(key, _)| {
-                                    crate::engine_residency::parse_relational_row_id(key, &prefix)
-                                        .unwrap_or(u64::MAX)
-                                })
-                                .collect(),
-                        ))
-                    }
-                    _ => None,
-                };
+            enum DeviceMaintenance {
+                Insert(String, Vec<Vec<SqlValue>>, Vec<u64>),
+                Delete(String, Vec<Vec<SqlValue>>),
+                Update(String, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>, Vec<u64>),
+            }
+            let device_maintenance = match &delta.mutation {
+                crate::write_path::PreparedMutation::Insert {
+                    table,
+                    inserted_rows,
+                    ..
+                } => {
+                    let prefix = relational_key_prefix(table);
+                    DeviceMaintenance::Insert(
+                        table.clone(),
+                        inserted_rows
+                            .iter()
+                            .map(|(_key, values)| values.clone())
+                            .collect(),
+                        inserted_rows
+                            .iter()
+                            .map(|(key, _)| {
+                                crate::engine_residency::parse_relational_row_id(key, &prefix)
+                                    .unwrap_or(u64::MAX)
+                            })
+                            .collect(),
+                    )
+                }
+                crate::write_path::PreparedMutation::Delete {
+                    table,
+                    deleted_rows,
+                    ..
+                } => DeviceMaintenance::Delete(table.clone(), deleted_rows.clone()),
+                crate::write_path::PreparedMutation::Update {
+                    table,
+                    installs,
+                    updated_old_rows,
+                    ..
+                } => {
+                    let prefix = relational_key_prefix(table);
+                    DeviceMaintenance::Update(
+                        table.clone(),
+                        updated_old_rows.clone(),
+                        installs
+                            .iter()
+                            .map(|(_, _, values)| values.clone())
+                            .collect(),
+                        installs
+                            .iter()
+                            .map(|(_, key, _)| {
+                                crate::engine_residency::parse_relational_row_id(key, &prefix)
+                                    .unwrap_or(u64::MAX)
+                            })
+                            .collect(),
+                    )
+                }
+            };
             self.apply_delta(delta, commit_seq, None)
                 .unwrap_or_else(|err| {
                     panic!(
@@ -1082,12 +1031,12 @@ impl Engine {
             next_row_id = self.read_state.mvcc.current_row_id();
             hp!(5);
 
-            // Residency, before publish: INSERT rows BUFFER into the wave-batched append (the
-            // flush handles elide-entry / rehydrate / invalidate per table); everything else
-            // invalidates conservatively as before.
+            // Residency, before publish: INSERT rows buffer into the wave-batched append; UPDATE
+            // and DELETE maintain the same authoritative generation in place. A device decline
+            // invalidates and schedules an exact re-admission before the next wave.
             wave_tail = Some((commit_seq, wal_position));
-            match insert_append {
-                Some((table, rows, row_ids)) if self.auto_admit_on_commit_enabled() => {
+            match device_maintenance {
+                DeviceMaintenance::Insert(table, rows, row_ids) => {
                     let entry = pending_appends.entry(table).or_default();
                     // D3: one birth stamp per row of THIS item (the flush spans commit seqs).
                     entry.3.extend(std::iter::repeat_n(commit_seq, rows.len()));
@@ -1095,19 +1044,50 @@ impl Engine {
                     entry.1.extend(row_ids);
                     entry.2.push((position, commit_seq, item_rows));
                 }
-                _ => {
-                    self.invalidate_relational_residency_tables_concurrent(
-                        &item.residency_tables,
-                        item.txn_id,
-                        commit_seq,
-                    );
-                    committed.push((position, commit_seq, false, item_rows));
+                DeviceMaintenance::Delete(table, rows) => {
+                    let handled =
+                        wave_catalog
+                            .relational_catalog
+                            .get(&table)
+                            .is_some_and(|table| {
+                                self.try_tombstone_resident_delete_table(table, &rows, commit_seq)
+                            });
+                    if !handled {
+                        self.invalidate_relational_residency_tables_concurrent(
+                            &item.residency_tables,
+                            item.txn_id,
+                            commit_seq,
+                        );
+                    }
+                    committed.push((position, commit_seq, handled, item_rows));
+                }
+                DeviceMaintenance::Update(table, old_rows, new_rows, row_ids) => {
+                    let handled =
+                        wave_catalog
+                            .relational_catalog
+                            .get(&table)
+                            .is_some_and(|table| {
+                                self.try_update_resident_table(
+                                    table,
+                                    &old_rows,
+                                    &new_rows,
+                                    commit_seq,
+                                    Some(&row_ids),
+                                )
+                            });
+                    if !handled {
+                        self.invalidate_relational_residency_tables_concurrent(
+                            &item.residency_tables,
+                            item.txn_id,
+                            commit_seq,
+                        );
+                    }
+                    committed.push((position, commit_seq, handled, item_rows));
                 }
             }
             hp!(6);
         }
         flush_appends(&mut pending_appends, &mut committed);
-        flush_fast_run(&mut commit, &mut fast_run, &mut committed);
         // Prune the ledger once per wave (was per commit) below the oldest active snapshot.
         if let Some((last_seq, _)) = wave_tail {
             let prune_boundary = self
@@ -1146,11 +1126,9 @@ impl Engine {
         // for this tail and runs them before draining the next wave (rare — only !appended
         // committed items with auto_admit ON).
         let mut admit_tables: BTreeSet<String> = BTreeSet::new();
-        if self.auto_admit_on_commit_enabled() {
-            for (position, _seq, appended, _rows) in &committed {
-                if !appended {
-                    admit_tables.extend(batch[*position].residency_tables.iter().cloned());
-                }
+        for (position, _seq, appended, _rows) in &committed {
+            if !appended {
+                admit_tables.extend(batch[*position].residency_tables.iter().cloned());
             }
         }
         std::mem::forget(guard);
@@ -1183,13 +1161,12 @@ impl Engine {
         for (table, (rows, row_ids, items, stamps)) in std::mem::take(pending) {
             // D3 (ADR-013 pre1): the batched flush spans MULTIPLE commit seqs — each row
             // carries its own birth stamp (the per-row slice the D3-COMPOSE note called for).
-            let appended = self.auto_admit_on_commit_enabled()
-                && self.try_append_resident_int4_open_shard(
-                    &table,
-                    &rows,
-                    crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
-                    Some(&row_ids),
-                );
+            let appended = self.try_append_resident_int4_open_shard(
+                &table,
+                &rows,
+                crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
+                Some(&row_ids),
+            );
             if appended {
                 // A4e elide-entry (audit B1 eligibility), once per flushed table.
                 if self.host_install_elision_enabled() && !self.table_install_elided(&table) {
@@ -1607,11 +1584,9 @@ impl Engine {
 
         // Post-publish auto_admit re-admissions stay a SEQUENCER duty (identical to serial).
         let mut admit_tables: BTreeSet<String> = BTreeSet::new();
-        if self.auto_admit_on_commit_enabled() {
-            for (position, _seq, appended, _rows) in &committed {
-                if !appended {
-                    admit_tables.extend(batch[*position].residency_tables.iter().cloned());
-                }
+        for (position, _seq, appended, _rows) in &committed {
+            if !appended {
+                admit_tables.extend(batch[*position].residency_tables.iter().cloned());
             }
         }
         std::mem::forget(guard);

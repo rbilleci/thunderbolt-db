@@ -2,8 +2,7 @@ use gpu_db_sql::{SelectFilterOp, SqlType, SqlValue};
 
 use crate::{RelationalTable, WriteSet};
 
-/// PHASE C slice 1: one resolved DML match — `(tuple_id, row_key, decoded_row)`, exactly the triple
-/// the seq_scan produced. `None` from the resolver = index-ineligible -> the caller scans.
+/// One device-resolved DML match: stable entity id, derived entity key, and bounded row image.
 pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
 
 /// Applied INSERT data surfaced to residency publication: table, stored row images, conflict
@@ -15,7 +14,7 @@ pub(crate) type AppliedInsert = (String, Vec<Vec<SqlValue>>, WriteSet, Vec<u64>)
 /// mirroring `dml_filter_groups_to_device_predicate`'s Eq lowering EXACTLY (Date/Uuid round-trip
 /// their canonical strings — a raw-days/raw-bytes literal is a hard error in the lowering; Int2
 /// compares as its i32 section image; Timestamp as raw micros via the type-discriminating
-/// Int8Literal). A mismatched `(ty, value)` pair (incl. NULL) declines to the host ladder.
+/// Int8Literal). A mismatched `(ty, value)` pair declines and the caller fails loud.
 pub(crate) fn device_eq_scan_literal(
     ty: gpu_db_sql::SqlType,
     value: &SqlValue,
@@ -51,20 +50,7 @@ pub(crate) fn device_structural_tuple_predicate(
     use crate::engine_expr::{ResidentBinaryOp, ResidentExpr};
 
     let mut predicate = None;
-    for (column_idx, value) in key_cols {
-        let leaf = if matches!(value, SqlValue::Null) {
-            ResidentExpr::IsNull {
-                col: *column_idx,
-                is_not_null: false,
-            }
-        } else {
-            let ty = table.columns.get(*column_idx)?.ty;
-            ResidentExpr::Binary {
-                op: ResidentBinaryOp::Eq,
-                lhs: Box::new(ResidentExpr::Column(*column_idx)),
-                rhs: Box::new(device_eq_scan_literal(ty, value)?),
-            }
-        };
+    for leaf in device_structural_tuple_predicates(table, key_cols)? {
         predicate = Some(match predicate {
             None => leaf,
             Some(previous) => ResidentExpr::Binary {
@@ -77,12 +63,39 @@ pub(crate) fn device_structural_tuple_predicate(
     predicate
 }
 
-/// CPU-ENGINE RETIREMENT (ADR-006): lower a DELETE/UPDATE's `filter_groups` (OR of AND-groups) into an
+/// Independently typed leaves for structural tuple equality. Consumers that must combine unlike
+/// physical widths retain each leaf as a device mask and AND those masks on-device.
+pub(crate) fn device_structural_tuple_predicates(
+    table: &RelationalTable,
+    key_cols: &[(usize, SqlValue)],
+) -> Option<Vec<crate::engine_expr::ResidentExpr>> {
+    use crate::engine_expr::{ResidentBinaryOp, ResidentExpr};
+
+    key_cols
+        .iter()
+        .map(|(column_idx, value)| {
+            if matches!(value, SqlValue::Null) {
+                Some(ResidentExpr::IsNull {
+                    col: *column_idx,
+                    is_not_null: false,
+                })
+            } else {
+                let ty = table.columns.get(*column_idx)?.ty;
+                Some(ResidentExpr::Binary {
+                    op: ResidentBinaryOp::Eq,
+                    lhs: Box::new(ResidentExpr::Column(*column_idx)),
+                    rhs: Box::new(device_eq_scan_literal(ty, value)?),
+                })
+            }
+        })
+        .collect()
+}
+
+/// Lower a DELETE/UPDATE's `filter_groups` (OR of AND-groups) into an
 /// `ResidentExpr` DNF (`Column(catalog_idx) <op> literal`, AND within a group, OR across groups) for the
 /// device predicate scan-locate. Supports INT4/INT8/TIMESTAMP (I32/I64 VM), NUMERIC (I128 VM), and TEXT
-/// EQUALITY (`= 'lit'` only, via the device byte-wise text kernel — text has no device ordering, so text
-/// `<`/`>`/LIKE decline). ANY other leaf (a NULL, a LIKE-prefix, a text inequality, or an empty group)
-/// returns `None` so the caller declines to the host rehydrate. `Column`
+/// equality/ordering/LIKE, UUID, DATE, BOOL, and NULL-aware typed predicates. Any unsupported or
+/// empty group returns `None`; production callers fail loud rather than dispatch to a host scan. `Column`
 /// carries the FULL-CATALOG index, which `lower_resident_predicate` translates to the shard's section
 /// offset (int4 or int8 by the column's catalog type). MIXED-WIDTH groups (int8/timestamp scalar
 /// leaves beside int4/text/bool/date/uuid — e.g. `big > 5 AND name = 'x'`) lower at I32 via the

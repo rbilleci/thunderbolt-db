@@ -1,16 +1,14 @@
 use super::{gpu_available, select};
-use crate::{Engine, StorageVisibility};
+use crate::Engine;
 use gpu_db_sql::{SelectFilterOp, SqlValue};
 
 // ========== P4-2a (chunk-authoritative tables): chunk-native locate + locate-driven stamp ==========
 
-/// THE LOCATE DIFFERENTIAL: the chunk-native locate (device predicate over the chunks themselves,
-/// slots back) must select EXACTLY the rows the store-driven P3 locate selects for the same
-/// predicate — compared by ROW VALUES (slots translate to rows through the P4-1 decoder: on an
-/// unstamped entry, decoded[slot] IS the slot's row).
+/// The chunk-native locate (device predicate over the chunks themselves, slots back) selects the
+/// exact known range/OR set. Slots translate to values through the chunk decoder.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_chunk_native_locate_matches_store_locate() {
+fn gpu_chunk_native_locate_matches_known_rows() {
     let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
@@ -73,22 +71,14 @@ fn gpu_chunk_native_locate_matches_store_locate() {
                 .map(|slot| entry_rows[*chunk_idx][*slot as usize].clone())
         })
         .collect();
-    // The store-driven P3 locate on the SAME pinned view.
-    let visibility = StorageVisibility { read_txn_id: rtx };
-    let table_rows = e.read_state.mvcc.table_rows("big");
-    let mut want: Vec<Vec<SqlValue>> = e
-        .try_streaming_dml_locate(&table, &filter_groups, visibility, &table_rows)
-        .expect("store locate serves")
-        .into_iter()
-        .map(|(_, _, row)| row)
+    let mut want: Vec<Vec<SqlValue>> = (0..N)
+        .filter(|i| *i > 1200 || *i * 2 < 100)
+        .map(|i| vec![SqlValue::Int4(i), SqlValue::Int4(i * 2)])
         .collect();
     got.sort();
     want.sort();
     assert_eq!(got.len(), 349, "1201..=1499 (299) + b<100 => a<50 (50)");
-    assert_eq!(
-        got, want,
-        "chunk-native locate == store-driven locate (row values)"
-    );
+    assert_eq!(got, want, "chunk-native locate == known predicate result");
 }
 
 /// THE STAMP ISOLATION GATE: locate coordinates on the chunks, stamp them at the current

@@ -3,9 +3,8 @@ use super::{
     resident_device_int8_column_offset, resident_device_numeric_column_offset,
     resident_device_text_column_layout, shard_fixed_width_key_offset, shard_key_column_blob_len,
     shard_key_column_blob_offset, Arc, BatchedShardProjection, CachedShardPkDeviceIndex,
-    CudaCompoundFoldColumn, CudaResidentDeviceMemory, Engine, Index,
-    RelationalResidencySnapshot, RelationalTable, ShardDeviceIndexKey, ShardPkHit, SqlType,
-    WriteLocateShard,
+    CudaCompoundFoldColumn, CudaResidentDeviceMemory, Engine, Index, RelationalResidencySnapshot,
+    RelationalTable, ShardDeviceIndexKey, ShardPkHit, SqlType, WriteLocateShard,
 };
 
 impl Engine {

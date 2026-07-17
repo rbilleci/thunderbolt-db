@@ -1,7 +1,8 @@
 use std::os::raw::c_void;
 
 use super::{
-    check_cuda, launch_cuda_buffer_i32_compare_indices_ordered, run_resident_arith_program,
+    check_cuda, launch_cuda_buffer_i32_compare_indices_ordered,
+    launch_cuda_owned_i32_compare_indices_ordered, run_resident_arith_program,
     CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError, ExprStep,
     ExprTerminal, PooledBufferLease, PooledDeviceBufferOwned, Probe, ResidentElemType,
 };
@@ -55,12 +56,41 @@ impl CudaResidentDeviceMemory {
         launch_cuda_row_range_mask_u32(self, row_count, start, end)
     }
 
+    /// Materialize an ascending device-generated row range as indices. This is the all-slots
+    /// terminal for predicate-free DML: the host receives only the compacted result, never builds
+    /// or uploads an O(rows) identity vector.
+    pub fn row_range_indices_u32(
+        &self,
+        row_count: u32,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        let mask = launch_cuda_row_range_mask_u32(self, row_count, start, end)?;
+        launch_cuda_owned_i32_compare_indices_ordered(self, &mask.mask, u64::from(row_count), 0, 5)
+    }
+
     pub fn and_predicate_masks(
         &self,
         left: &CudaPredicateMaskI32,
         right: &CudaPredicateMaskI32,
     ) -> Result<CudaPredicateMaskI32, CudaRuntimeProbeError> {
         launch_cuda_and_predicate_masks(self, left, right)
+    }
+
+    /// Compact a retained predicate mask to ascending row indices. This is the device terminal used
+    /// after independently typed predicate leaves have been combined on-device; the host receives
+    /// only the approved coordinates, never the component masks or a relational verdict.
+    pub fn predicate_mask_indices_u32(
+        &self,
+        mask: &CudaPredicateMaskI32,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_owned_i32_compare_indices_ordered(
+            self,
+            &mask.mask,
+            u64::from(mask.row_count),
+            0,
+            5,
+        )
     }
 }
 

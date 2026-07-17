@@ -2670,25 +2670,26 @@ fn grouped_order_by_expression_is_rejected() {
 }
 
 #[test]
-fn select_text_multikey_order_by_non_resident_rejects() {
-    // Multi-key ORDER BY is GPU-only: it sorts on the general Expr executor's bitonic-sort path, routed
-    // ONLY when every key is an i64-sortable base column on a GPU-RESIDENT table. On a non-resident
-    // table the routing gate falls through to the enumerated/CPU path, which has NO multi-key sort and
-    // must reject it cleanly (never silently sort by the first key). No GPU needed -- the rejection is
-    // on the CPU choke point. Charter: no CPU relational multi-key sort.
+fn select_text_multikey_order_by_uses_mandatory_resident_generation() {
+    // Multi-key ORDER BY is GPU-only. R3-004 makes the post-DML device generation mandatory, so this
+    // shape must execute there rather than exercising the retired non-resident CPU choke point.
     let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a, b) VALUES (1, 9), (1, 3), (2, 5)")
         .unwrap();
-    // Deliberately NOT resident -> the multi-key sort cannot take the GPU path.
-    match e.execute_relational_select_text("SELECT a, b FROM t ORDER BY a ASC, b DESC") {
-        Ok(_) => panic!("multi-key ORDER BY on a non-resident table must error, not return rows"),
-        Err(err) => assert!(
-            err.to_string().contains("multi-key ORDER BY"),
-            "expected a clean multi-key rejection, got: {err}"
-        ),
-    }
-    // A SINGLE-key ORDER BY on the same non-resident table still works (unchanged) via the CPU path.
+    let multi = e
+        .execute_relational_select_text("SELECT a, b FROM t ORDER BY a ASC, b DESC")
+        .expect("mandatory resident generation serves multi-key ORDER BY");
+    assert_eq!(
+        multi.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(9)],
+            vec![SqlValue::Int4(1), SqlValue::Int4(3)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(5)],
+        ]
+    );
+    assert_eq!(multi.executed_target, DeviceTarget::Gpu(0));
+    // A SINGLE-key ORDER BY on the same resident table remains unchanged.
     let single = e
         .execute_relational_select_text("SELECT a FROM t ORDER BY a DESC")
         .expect("single-key ORDER BY still sorts via the existing path");

@@ -1665,8 +1665,6 @@ fn explicit_transaction_unique_key_away_history_uses_device_stamps() {
     e.set_auto_admit_on_commit(true);
     e.set_host_install_elision_enabled(true);
     e.set_constrained_elision_enabled(true);
-    e.set_dml_device_resolve_enabled(true);
-    e.set_device_write_locate_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
     e.set_resident_delete_tombstone_enabled(true);
     e.set_resident_update_tombstone_enabled(true);

@@ -12,6 +12,7 @@ fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
         "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
     )
     .unwrap();
+    forget_test_relational_residency(&e, "events");
 
     let Command::Select(count_select) = parse_command("SELECT COUNT(*) FROM events").unwrap()
     else {
@@ -97,6 +98,7 @@ fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
 
     e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
         .unwrap();
+    invalidate_test_relational_residency(&e, "events");
     let invalidated = e.plan_relational_resident_route(&count_select);
     assert!(!invalidated.accepted);
     assert_eq!(invalidated.cache_state, "Invalidated");
@@ -615,7 +617,10 @@ fn p8_resident_route_batches_int4_equality_projection_literals() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(read_jobs.len(), 2);
-    assert_eq!(read_jobs[0].snapshot_generation, 1);
+    assert_eq!(
+        read_jobs[0].snapshot_generation,
+        read_jobs[1].snapshot_generation
+    );
     assert!(
         read_jobs[0]
             .route_id
@@ -930,6 +935,7 @@ fn p8_opt_in_resident_route_rejects_before_execution() {
         "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
     )
     .unwrap();
+    forget_test_relational_residency(&e, "events");
 
     let Command::Select(absent) = parse_command("SELECT COUNT(*) FROM events").unwrap() else {
         unreachable!()
@@ -954,6 +960,7 @@ fn p8_opt_in_resident_route_rejects_before_execution() {
 
     e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
         .unwrap();
+    invalidate_test_relational_residency(&e, "events");
     let err = e
         .execute_relational_select_with_resident_route(&absent)
         .unwrap_err();
@@ -988,13 +995,15 @@ fn p8_resident_route_decisions_reject_evicted_and_memory_pressured_snapshots() {
     .unwrap();
     e.execute_text(4, "INSERT INTO aux (id, label) VALUES (1, 'aux')")
         .unwrap();
+    forget_test_relational_residency(&e, "events");
+    forget_test_relational_residency(&e, "aux");
 
     let aux = e.populate_relational_residency_snapshot("aux").unwrap();
-    let events = e.populate_relational_residency_snapshot("events").unwrap();
-    let events_allocated = events
-        .device_memory_proof
-        .as_ref()
-        .map_or(events.resident_bytes, |proof| proof.allocated_bytes);
+    let aux_allocated = e.relational_resident_bytes_for_gpu(0);
+    e.populate_relational_residency_snapshot("events").unwrap();
+    let events_allocated = e
+        .relational_resident_bytes_for_gpu(0)
+        .saturating_sub(aux_allocated);
     e.set_relational_residency_budget_bytes(0, events_allocated);
     let admitted = e.populate_relational_residency_snapshot("events").unwrap();
     assert_eq!(admitted.evicted_tables_on_admission, vec!["aux"]);
@@ -1041,6 +1050,7 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
         "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
     )
     .unwrap();
+    forget_test_relational_residency(&e, "events");
 
     let report = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
         tables: vec!["events".to_string()],
@@ -1082,6 +1092,7 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
 
     e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
         .unwrap();
+    invalidate_test_relational_residency(&e, "events");
     assert_eq!(
         e.relational_residency_snapshot("events")
             .unwrap()
@@ -1094,7 +1105,7 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
         first_handle.has_retained_device_memory,
         route.has_retained_device_memory
     );
-    assert_eq!(invalidated_handle.generation, first_handle.generation);
+    assert!(invalidated_handle.generation > first_handle.generation);
     assert!(!invalidated_handle.valid);
     assert!(!invalidated_handle.has_retained_device_memory);
     let refreshed = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
@@ -1113,7 +1124,10 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
         None
     );
     let refreshed_handle = e.relational_retained_snapshot_handle("events").unwrap();
-    assert_eq!(refreshed_handle.generation, 2);
+    assert_eq!(
+        refreshed_handle.generation,
+        invalidated_handle.generation + 1
+    );
     assert_eq!(refreshed_handle.row_count, 3);
     assert!(refreshed_handle.valid);
     assert_eq!(
@@ -1164,13 +1178,13 @@ fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
         "INSERT INTO oversized (id, label) VALUES (1, 'this-row-is-too-large-for-the-test-budget')",
     )
     .unwrap();
+    forget_test_relational_residency(&e, "events");
+    forget_test_relational_residency(&e, "aux");
+    forget_test_relational_residency(&e, "oversized");
 
-    let events_size = e.populate_relational_residency_snapshot("events").unwrap();
+    e.populate_relational_residency_snapshot("events").unwrap();
+    let events_budget = e.relational_resident_bytes_for_gpu(0);
     let aux_size = e.populate_relational_residency_snapshot("aux").unwrap();
-    let events_budget = events_size
-        .device_memory_proof
-        .as_ref()
-        .map_or(events_size.resident_bytes, |proof| proof.allocated_bytes);
     e.clear_relational_residency_budget_bytes(0);
     let report = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
         tables: vec![
@@ -1249,6 +1263,8 @@ fn p8_resident_maintenance_tick_summarizes_refresh_and_route_readiness() {
     .unwrap();
     e.execute_text(4, "INSERT INTO aux (id, label) VALUES (1, 'aux')")
         .unwrap();
+    forget_test_relational_residency(&e, "events");
+    forget_test_relational_residency(&e, "aux");
 
     e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
         tables: vec!["events".to_string()],
@@ -1257,6 +1273,7 @@ fn p8_resident_maintenance_tick_summarizes_refresh_and_route_readiness() {
     });
     e.execute_text(5, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
         .unwrap();
+    invalidate_test_relational_residency(&e, "events");
     assert_eq!(
         e.relational_residency_snapshot("events")
             .unwrap()
@@ -1314,6 +1331,7 @@ fn p8_resident_maintenance_tick_reports_pressure_and_budget_blockers() {
     pressured
         .execute_text(2, "INSERT INTO events (id, label) VALUES (1, 'alpha')")
         .unwrap();
+    forget_test_relational_residency(&pressured, "events");
     pressured.mark_gpu_memory_pressured(0);
     let pressure_report = pressured
         .maintain_relational_residency_with_policy(RelationalResidencyMaintenancePolicy::default());
@@ -1338,6 +1356,7 @@ fn p8_resident_maintenance_tick_reports_pressure_and_budget_blockers() {
             "INSERT INTO oversized (id, label) VALUES (1, 'this-row-is-too-large')",
         )
         .unwrap();
+    forget_test_relational_residency(&oversized, "oversized");
     let budget_report =
         oversized.maintain_relational_residency_with_policy(RelationalResidencyMaintenancePolicy {
             budget_bytes: Some(1),
@@ -1922,8 +1941,9 @@ fn s10c_2b_sharded_ordered_projection_matches_oracle() {
 
 /// STRATA S-B acceptance: with `auto_admit_on_commit` ON, a freshly CREATE+INSERTed table becomes
 /// GPU-resident WITHOUT any explicit warm/populate call, so reads take the GPU-native resident route
-/// and return correct results — including a NULL-bearing int4 column. A flag-OFF engine over identical
-/// data stays non-resident (host path) and returns byte-identical rows. Self-guards on a non-GPU box
+/// and return correct results — including a NULL-bearing int4 column. R3-004 also requires a flag-OFF
+/// engine to retain its device write generation; the flag now controls optional broader read-cache
+/// admission, not whether committed relational data has device authority. Self-guards on a non-GPU box
 /// (the resident route is not accepted when the device-memory upload cannot run).
 #[test]
 fn s_b_auto_admit_on_commit_makes_committed_table_gpu_resident() {
@@ -1977,22 +1997,20 @@ fn s_b_auto_admit_on_commit_makes_committed_table_gpu_resident() {
         "auto-admitted GPU read must be correct, incl. NULL"
     );
 
-    // Flag OFF (default): identical data is NOT auto-admitted -> host path -> byte-identical rows.
-    let host = Engine::new_local_cpu_oracle();
-    host.execute_text(1, "CREATE TABLE t (id INT, v INT)")
+    // Flag OFF (default): DML still establishes the mandatory device generation.
+    let mandatory = Engine::new_local_cpu_oracle();
+    mandatory
+        .execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
-    host.execute_text(
-        2,
-        "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)",
-    )
-    .unwrap();
-    assert!(
-        !host.plan_relational_resident_route(&proj).accepted,
-        "flag-off table must NOT be auto-admitted"
-    );
-    let host_res = host.execute_relational_select(&proj).unwrap();
-    assert_eq!(host_res.executed_target, DeviceTarget::Cpu);
-    assert_eq!(host_res.rows, expected, "host rows must equal the GPU rows");
+    mandatory
+        .execute_text(
+            2,
+            "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)",
+        )
+        .unwrap();
+    let mandatory_res = mandatory.execute_relational_select(&proj).unwrap();
+    assert_eq!(mandatory_res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(mandatory_res.rows, expected);
 }
 
 /// STRATA S-B (production commit path): in production a plain INSERT is routed through the CONCURRENT

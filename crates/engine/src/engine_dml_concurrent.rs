@@ -31,6 +31,16 @@ fn exact_device_verdict_cardinality(expected: usize, component_lengths: &[usize]
     component_lengths.iter().all(|length| *length == expected)
 }
 
+fn is_device_prepare_verdict_unavailable(error: &ExecuteError) -> bool {
+    matches!(
+        error,
+        ExecuteError::Engine(EngineError::ApplyFailed(message))
+            if message.starts_with("device DML verdict unavailable")
+                || message.starts_with("device constraint verdict unavailable")
+                || message.starts_with("device tuple-constraint verdict unavailable")
+    )
+}
+
 /// E2.2(d) — the wave-size / pipeline-depth knobs are env-overridable for the latency-knee sweep
 /// (`GPU_DB_COMMIT_WAVE_MAX`, `GPU_DB_WAVE_TAIL_PIPELINE_DEPTH`), read once. The defaults are the
 /// production values; the sweep finds the throughput/latency knee once (a)-(c) reshape the loop.
@@ -569,11 +579,33 @@ impl Engine {
                 next_row_id: generation.next_row_id,
             },
         );
-        let prepared = if let Some(generation) = transaction_snapshot.as_ref() {
-            let _scope = self.enter_transaction_read(Arc::clone(generation));
-            self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)?
-        } else {
-            self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)?
+        let prepared = {
+            const GENERATION_RETRIES: usize = 64;
+            let mut attempts = 0;
+            loop {
+                let result = if let Some(generation) = transaction_snapshot.as_ref() {
+                    let _scope = self.enter_transaction_read(Arc::clone(generation));
+                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)
+                } else {
+                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)
+                };
+                match result {
+                    Ok(prepared) => break prepared,
+                    Err(error)
+                        if attempts < GENERATION_RETRIES
+                            && is_device_prepare_verdict_unavailable(&error) =>
+                    {
+                        attempts += 1;
+                        // A classic commit can replace/invalidate a generation between the
+                        // pre-prepare admission and this off-lock probe. Re-enter the same
+                        // device-only admission barrier and retry at the already-pinned snapshot;
+                        // unsupported predicates still exhaust the bound and fail loud.
+                        self.ensure_dml_device_generation(&cmd)?;
+                        std::thread::yield_now();
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         };
         let residency_tables = Self::dml_mutated_tables(&cmd);
 

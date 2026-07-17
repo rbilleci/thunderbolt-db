@@ -75,3 +75,27 @@ pub(crate) fn test_wal_path(name: &str) -> std::path::PathBuf {
         NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
     ))
 }
+
+/// Remove a mandatory DML generation when a residency-control test needs to construct a synthetic
+/// cold/absent starting state. This is test-state setup only; no relational statement executes
+/// against the absent generation.
+pub(crate) fn forget_test_relational_residency(engine: &Engine, table: &str) {
+    let catalog = engine.ddl_catalog();
+    catalog.relational_resident_cache.remove_table(
+        table,
+        &engine.read_state.residency,
+        &engine.read_state.route_telemetry,
+    );
+}
+
+/// Publish an explicit invalid descriptor for route-planning tests. Production DML now maintains
+/// its device generation, so invalidation scenarios must be injected rather than inferred from a
+/// successful mutation.
+pub(crate) fn invalidate_test_relational_residency(engine: &Engine, table: &str) {
+    let current = engine.committed_seq();
+    engine.invalidate_relational_residency_tables_concurrent(
+        &BTreeSet::from([table.to_string()]),
+        current,
+        current,
+    );
+}

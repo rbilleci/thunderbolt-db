@@ -11,7 +11,6 @@ fn wave_batch_validation_matches_host_oracle() {
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
         if wave_batch {
-            e.set_device_write_locate_enabled(true);
             e.set_device_write_locate_wave_batch_enabled(true);
         }
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
@@ -75,7 +74,6 @@ fn wave_batch_concurrent_dup_race_single_winner() {
     let e = std::sync::Arc::new(Engine::new_local());
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
-    e.set_device_write_locate_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();

@@ -11,7 +11,7 @@ impl Engine {
         self.populate_relational_residency_snapshot_on_gpu(table, gpu_id)
     }
 
-    pub(super) fn populate_relational_residency_snapshot_inner(
+    pub(crate) fn populate_relational_residency_snapshot_inner(
         &self,
         cat: &mut DdlCatalogState,
         table: &str,
@@ -33,8 +33,15 @@ impl Engine {
                 )))
             })?
             .clone();
+        // During a grouped committed-entry apply, `with_apply_catalog` exposes the evolving working
+        // catalog at `entry.index - 1` while the public `committed_seq` intentionally remains at the
+        // pre-batch boundary. Build the device generation at that working boundary so an earlier
+        // entry in the same durable batch is visible to the next DML entry. Storage rejects boundary
+        // zero even for an empty relation, so use one only for the physical empty scan while retaining
+        // the exact catalog boundary in the published descriptor below.
+        let residency_boundary = self.catalog_snapshot().commit_seq;
         let visibility = StorageVisibility {
-            read_txn_id: self.committed_seq(),
+            read_txn_id: residency_boundary.max(1),
         };
         let prefix = relational_key_prefix(table);
         let mut row_count = 0usize;
@@ -56,11 +63,9 @@ impl Engine {
                 // RETIREMENT A1: the row's host identity, parsed from its key (sentinel on any
                 // malformed key — identity unknown is safe, wrong identity is not). Collected only
                 // when the sharded branch (the sole consumer) is reachable (audit finding 3).
-                if self.shard_residency_enabled() {
-                    resident_row_ids
-                        .push(parse_relational_row_id(&tuple.key, &prefix).unwrap_or(u64::MAX));
-                    resident_created_by.push(tuple.created_by);
-                }
+                resident_row_ids
+                    .push(parse_relational_row_id(&tuple.key, &prefix).unwrap_or(u64::MAX));
+                resident_created_by.push(tuple.created_by);
                 row_count += 1;
                 resident_bytes = resident_bytes
                     .saturating_add(tuple.key.len() as u64)
@@ -148,20 +153,17 @@ impl Engine {
                         | SqlType::Bool
                 )
             });
-        // TYPE-COVERAGE #14 (text): a table with a TEXT column (+ any other elision-compatible types)
+        // TYPE-COVERAGE #14 (text): a keyed table with a TEXT column (+ supported companion types)
         // shard-admits as a DENSE shard (capacity == row_count — text has no capacity-strided headroom).
-        // It is not `fixed_width_sections` (variable-length), so it takes the dense capacity path below
-        // and the rollover-only append (each commit seals a fresh dense text shard). Reads span the
-        // shards via the blob-concat + offset-rebase gather.
+        // Unkeyed text relations retain the established single-buffer read layout; R3-004 attaches a
+        // row-identity sidecar to that generation so DML can still resolve on-device without diverting
+        // its mature read routes through incomplete sharded operators.
         let text_sectioned = !purely_int4
             && !fixed_width_sections
             && self.shard_int8_section_enabled()
             && row_count < (1usize << 29)
             && !column_types.is_empty()
             && column_types.iter().any(|ty| matches!(ty, SqlType::Text))
-            // Text SHARD-admission is for the elided WRITE path (device-authoritative INSERTs), which
-            // needs the PK write-locate. A text table with NO primary key stays SINGLE-BUFFER (the
-            // legacy resident read path — text prefix LIKE, probes, routes — is unchanged for it).
             && catalog_table.indexes.iter().any(|index| index.unique)
             && column_types.iter().all(|ty| {
                 matches!(
@@ -236,9 +238,7 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .contains(&gpu_id);
-        let use_sharded_layout = self.shard_residency_enabled()
-            && (purely_int4 || fixed_width_sections || text_sectioned);
-        let row_id_payload = use_sharded_layout.then(|| {
+        let row_id_payload = Some({
             let mut payload =
                 vec![ROW_ID_UNSTAMPED_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
             for (slot, row_id) in resident_row_ids.iter().enumerate() {
@@ -297,7 +297,9 @@ impl Engine {
             None
         };
         #[cfg(not(test))]
-        if row_id_payload.as_ref().is_some_and(|payload| !payload.is_empty())
+        if row_id_payload
+            .as_ref()
+            .is_some_and(|payload| !payload.is_empty())
             && admitted_row_id_region.is_none()
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -352,7 +354,7 @@ impl Engine {
             resident_device_bool_columns,
             resident_device_text_columns,
             resident_device_null_columns,
-            valid_through_index: self.committed_seq(),
+            valid_through_index: residency_boundary,
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
             invalidated_by_memory_pressure: memory_pressure_active,
@@ -366,7 +368,7 @@ impl Engine {
                     refreshed_resident_bytes: resident_bytes,
                     resident_byte_delta: resident_bytes as i128 - previous.resident_bytes as i128,
                     refreshed_from_index: previous.valid_through_index,
-                    refreshed_through_index: self.committed_seq(),
+                    refreshed_through_index: residency_boundary,
                     invalidated_by_txn_id: previous.invalidated_by_txn_id,
                     invalidated_at_index: previous.invalidated_at_index,
                     invalidated_by_memory_pressure: previous.invalidated_by_memory_pressure,
@@ -538,8 +540,21 @@ impl Engine {
             .residency
             .shard_created_by_memory
             .remove_table(table);
-        // RETIREMENT A1: the row-identity regions follow the shards they annotate.
+        if let Some(region) = &admitted_created_by_region {
+            read_state
+                .residency
+                .shard_created_by_memory
+                .insert_shard(table, 0, Arc::clone(region));
+        }
+        // R3-004: a single-buffer relation keeps the same device row-identity sidecar contract as
+        // shard 0. This is write metadata only; the established single-buffer read facade is unchanged.
         read_state.residency.shard_row_id_memory.remove_table(table);
+        if let Some(region) = &admitted_row_id_region {
+            read_state
+                .residency
+                .shard_row_id_memory
+                .insert_shard(table, 0, Arc::clone(region));
+        }
         // Sub-slice 3b: the single-buffer path replaces the table's shards -> purge stale cached indexes.
         read_state.residency.purge_shard_pk_index_for_table(table);
         cat.relational_resident_cache.install_snapshot(
