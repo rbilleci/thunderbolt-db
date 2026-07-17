@@ -112,9 +112,10 @@ impl Engine {
             .collect();
         // Slice 1b-ii: a PURELY-int4 table is laid down as an OPEN shard with capacity headroom (~2x
         // rows, power-of-two) so committed INSERTs append in place (amortized O(1)/row) instead of
-        // re-uploading the whole table every commit. Other shapes (and huge / empty tables) stay dense.
-        let purely_int4 = row_count > 0
-            && row_count < (1usize << 29)
+        // re-uploading the whole table every commit. R3-004 deliberately includes an EMPTY table:
+        // its first write must append to an already-authoritative device generation, not bootstrap a
+        // host tuple store and re-admit from it after the commit.
+        let purely_int4 = row_count < (1usize << 29)
             && !column_types.is_empty()
             && column_types
                 .iter()
@@ -128,7 +129,6 @@ impl Engine {
         // re-admit until then).
         let fixed_width_sections = !purely_int4
             && self.shard_int8_section_enabled()
-            && row_count > 0
             && row_count < (1usize << 29)
             && !column_types.is_empty()
             && column_types.iter().all(|ty| {
@@ -156,7 +156,6 @@ impl Engine {
         let text_sectioned = !purely_int4
             && !fixed_width_sections
             && self.shard_int8_section_enabled()
-            && row_count > 0
             && row_count < (1usize << 29)
             && !column_types.is_empty()
             && column_types.iter().any(|ty| matches!(ty, SqlType::Text))
@@ -298,7 +297,9 @@ impl Engine {
             None
         };
         #[cfg(not(test))]
-        if row_id_payload.is_some() && admitted_row_id_region.is_none() {
+        if row_id_payload.as_ref().is_some_and(|payload| !payload.is_empty())
+            && admitted_row_id_region.is_none()
+        {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "relation \"{table}\" GPU {gpu_id} mandatory row-identity allocation failed before admission"
             ))));

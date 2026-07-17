@@ -308,8 +308,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 engine.table_install_elided("t"),
                 engine.dml_device_validate_hits(),
             );
-            let (wx, px, rb) = engine.pk_index_maintenance_stats();
-            eprintln!("    [pk-index: writer-extends {wx}  prober-extends {px}  rebuilds {rb}  devlocate {}]", engine.device_write_locate_hits());
+            eprintln!(
+                "    [device-pk-locate hits: {}]",
+                engine.device_write_locate_hits()
+            );
         }
         let stats = engine.wal_group_commit_stats();
         let fsyncs = stats.flush_groups;

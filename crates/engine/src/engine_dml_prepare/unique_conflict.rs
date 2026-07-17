@@ -6,15 +6,11 @@ use super::*;
 const DELETED_BY_LIVE: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 
 impl Engine {
-    /// Ensure an autocommit DML touching a unique-constrained table has a device generation before
-    /// it captures its read snapshot. This is the GPU-native bootstrap for an empty/newly indexed
-    /// table: admission runs under the commit/publication lock after all earlier classic tails and
-    /// their maintenance settle. A real admission failure remains a fail-closed error; no host
-    /// unique probe becomes authoritative.
-    pub(crate) fn ensure_unique_history_generation(
-        &self,
-        command: &Command,
-    ) -> Result<(), ExecuteError> {
+    /// Ensure every autocommit DML target has a device generation before it captures its read
+    /// snapshot. This is the GPU-native bootstrap for empty/new tables: admission runs under the
+    /// commit/publication lock after all earlier classic tails and their maintenance settle. A real
+    /// admission failure remains fail-closed; no host DML or constraint probe becomes authoritative.
+    pub(crate) fn ensure_dml_device_generation(&self, command: &Command) -> Result<(), ExecuteError> {
         let table_name = match command {
             Command::Insert(insert) => insert.table.as_str(),
             Command::Update(update) => update.table.as_str(),
@@ -22,11 +18,7 @@ impl Engine {
             _ => return Ok(()),
         };
         let needs_admission = || {
-            self.catalog_snapshot()
-                .relational_catalog
-                .get(table_name)
-                .is_some_and(|table| table.indexes.iter().any(|index| index.unique))
-                && !self.table_is_gpu_resident(table_name)
+            !self.table_is_gpu_resident(table_name)
                 && self.table_chunk_authoritative(table_name).is_none()
         };
         if !needs_admission() {
@@ -66,7 +58,7 @@ impl Engine {
 
         if needs_admission() {
             return Err(ExecuteError::Serialization(format!(
-                "device unique-history generation for relation \"{table_name}\" is unavailable after admission"
+                "device DML generation for relation \"{table_name}\" is unavailable after admission"
             )));
         }
         Ok(())

@@ -513,10 +513,10 @@ impl Engine {
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
-        // A constrained table's very first write may precede any data-triggered admission. Build
-        // its empty/current device history generation under the same publication cut before the
-        // off-lock prepare; thereafter every authoritative verdict remains device-current.
-        self.ensure_unique_history_generation(&cmd)?;
+        // A table's very first write may precede any data-triggered admission. Build its
+        // empty/current device generation under the same publication cut before the off-lock
+        // prepare; thereafter every authoritative DML and constraint verdict remains device-current.
+        self.ensure_dml_device_generation(&cmd)?;
         // (1) Begin: an explicit transaction reuses its lifetime generation and registry hold;
         // an autocommit statement captures and temporarily registers the newest scalar boundary.
         // The retained scope is entered ONLY around prepare below. Letting it leak into the wave
