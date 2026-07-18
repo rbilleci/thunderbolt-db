@@ -13,9 +13,14 @@ This file records only the current boundary and where the next agent resumes. `P
   specification objects; actual CUDA metadata is separately typed execution evidence.
 - Explicit DDL/recovery/import/VACUUM reverse-gather and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**. Generic CUDA-MVCC host result post-processing remains **RETIRE-003**.
-- **PERF-001 is the sole NOW task.** Recover the R3-004 descriptor/shard-count-scaled point-read loss without
-  restoring host authority, late conversion, or weaker fail-stop publication. **RETIRE-003** is NEXT after
-  PERF-001 acceptance.
+- **PERF-001 is complete.** The accepted tree removes shard-count-scaled descriptor preparation with exact-generation
+  prepared device plans and lock-free route reuse, while preserving fail-stop publication, hard-budget accounting,
+  immutable snapshot semantics, async CUDA ownership, and public result contracts. Three independent final lanes
+  accepted publication/accounting, CUDA ownership/contracts, and benchmark/evidence with no severity finding. The
+  canonical card completed both layers and cache regimes: production compact is **232.641M/s at p50 156us** in-L2
+  and **198.933M/s at p50 203us** out-of-L2. The archive owns the full remediation/audit chronology.
+- **RETIRE-003 is the sole NOW task.** Remove generic CUDA-MVCC host compaction, ordering, projection, and result
+  assembly while preserving the accepted PERF-001 prepared-route/result-path baseline.
 - Physical multi-GPU work remains user-parked under **MULTI-001/002/003**.
 
 ## Integrated baseline — preserve it
@@ -30,37 +35,39 @@ This file records only the current boundary and where the next agent resumes. `P
   post-processing.
 - The pre-R3-004 late-converted unified snapshot reached **264.2M/s in-L2 and 275.7M/s out-of-L2** at batch 65,536.
   Insert-published authoritative shards reached **89.6M/s and 3.29M/s**; RETIRE-001 reproduced **87.3M/s and
-  3.20M/s**. The latter is a stable attribution baseline, not an accepted performance target. Preserve the new
-  device-authoritative representation while removing its descriptor/shard-count-scaled submission cost.
+  3.20M/s**. Accepted PERF-001 production-compact evidence is **232.641M/s at p50 156us** in-L2 and **198.933M/s
+  at p50 203us** out-of-L2. Required transfers are common to both representations and do not explain the remaining
+  **11.9%/27.8%** gaps; fragmentation is an inference, not proof.
 - `PLAN.md` is reconciled to one active path and `STATUS.md` owns completed evidence. Preserve that ownership split.
 
 ## Resume here
 
-1. Read the required project documents, then begin **PERF-001** with permanent `probe-timing` attribution. Hold row
-   count and query shape fixed while sweeping shard/descriptor count; separate descriptor enumeration, route
-   preparation, submission, launch/synchronization, kernel, and final readback time.
-2. Make one narrow recovery change only after the causal scaling term is demonstrated. Preserve insert-published
-   device authority, byte-identical GPU results, fail-stop publication, and a nonzero production-route counter; do
-   not restore the retired late-conversion or any host relational cache/index/probe.
-3. Run focused correctness/performance gates and commission an independent slice audit after every change. Apply
-   the canonical report card to both layers and cache regimes and account for every residual gap against the
-   pre-R3-004 evidence.
-4. Accept and publish PERF-001 before starting **RETIRE-003**. Keep **RETIRE-002** repair outside the slice unless
-   PLAN explicitly promotes it.
+1. Pick up **RETIRE-003** from PLAN. Inventory the generic CUDA-MVCC host compaction/order/projection/result-assembly
+   seams and define the first bounded device-resident deletion slice.
+2. Preserve PERF-001's exact-generation prepared plans, allocation/stream ownership, duplicate-decline contract,
+   route accounting, and accepted report-card baseline. Run the standard card after any result-path change.
+3. Keep **RETIRE-002** repair outside the slice unless PLAN explicitly promotes it.
 
 ## Last green evidence — 2026-07-18
 
-- Engine library: **486/486** ordinary and **1,017/1,017** including ignored actual-GPU tests.
-- Execution library: **47/47** ordinary and **126/126** including ignored GPU tests. Facade library: **47/47**;
-  serialized concurrency integration: **14/14**.
-- The final relational bridge family passed three sequential and two concurrent **23/23** HAZARD waves with no
-  CUDA 700/716/717/719 or context-loss signature; all six RETIRE-001 slice audits/re-audits are clean.
-- The canonical report card completed both layers/cache regimes: raw rooflines were **1,478.8/1,450.6 GB/s** and
-  production batched point reads reached **87.3M/s at p50 622us** in-L2 and **3.20M/s at p50 20.324ms** out-of-L2,
-  within roughly 3% of the accepted R3-004 card. This proves RETIRE-001 added no further loss; PERF-001 owns the
-  roughly 3x in-L2 and 84–86x out-of-L2 gap from the pre-R3-004 late-converted evidence.
-- Workspace all-target/all-feature check, strict Clippy, formatting, diff whitespace, source-size, reference, and
-  documentation ownership gates pass.
+- Engine library: **1,026/1,026** including ignored GPU tests on the exact candidate (397.69s).
+- Execution library: **129/129** including ignored GPU tests on the exact candidate (18.30s). Facade ordinary
+  all-target tests pass **39 with 8
+  GPU-ignored**; serialized concurrency passes **13 with 1 GPU-ignored**.
+- The PERF-001 nine-test point-read family passed three sequential and two simultaneous HAZARD invocations with no
+  device fault. It includes deterministic old-DELETE-boundary, invalidation-republish, NULL-generation, and
+  budget-publication interleavings in addition to byte/visibility and failure-phase coverage. The DELETE test runs
+  the failing current-route-first/old-reader-second order; the execution gate injects panics after H2D and D2H and
+  proves exact pool reuse. It also pauses a losing preparer and proves route retirement releases the replaced index
+  and the stale plan cannot displace the accounted semantic-superset route. A paused index build cannot republish
+  after DROP, and a separate fused/unfused append gate replaces the index after launch and proves Arc-identity
+  publication plus exact rebuild.
+- The final canonical card completed with exit 0. Production compact reached **232.641M/s at p50 156us** in-L2 and
+  **198.933M/s at p50 203us** out-of-L2; the 48M-row fixture built in **1,633.7s** with zero late residency work.
+  Layer-1 in/out-of-L2 rooflines were **1,313.7/1,433.8 GB/s**, isolated gather **349.5/155.3 GB/s**, and GROUP BY
+  **1,673.5M elements/s at p50 5.012ms**. All ratio/algorithmic regression signals are green.
+- Workspace all-target/all-feature check, strict Clippy, formatting, diff whitespace, and changed-source-size gates
+  pass. The latest proof-focused exact execution sweep is **129/129** in 18.20s; all three final audit lanes accept.
 
 ## Required operations
 

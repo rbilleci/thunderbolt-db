@@ -1728,6 +1728,7 @@ fn sv6_created_by_gate_on_index_routes_hides_moved_key_from_older_snapshot() {
             &[0, 1],
             &[999, 130],
         )
+        .expect("batched GPU route completed")
         .expect("the batched sharded gather must serve the visibility-gated device path");
     assert_eq!(batch.ncols, 2);
     assert_eq!(
@@ -1763,6 +1764,7 @@ fn sv6_created_by_gate_on_index_routes_hides_moved_key_from_older_snapshot() {
             &[0, 1],
             &[999, 130],
         )
+        .expect("batched GPU route completed")
         .expect("batched gather post-publish");
     assert_eq!(
         batch.needle_ranges[0].1, 1,

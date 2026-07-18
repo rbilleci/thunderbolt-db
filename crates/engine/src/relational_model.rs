@@ -242,13 +242,15 @@ impl RowBlock {
 }
 
 /// A BATCHED retained-read result: ONE shared schema + ONE flat i32 buffer over ALL needles' rows (in needle
-/// order) + per-needle row ranges. Replaces the N-per-needle `RelationalSelectResult` structs + by-needle
+/// order) + one compact row range per needle.
+/// Replaces the N-per-needle `RelationalSelectResult` structs + by-needle
 /// grouping + 2N `Arc` clones + N column re-maps — the residual that capped end-to-end point reads below the
 /// GPU drain (DECISIONS "Result-path optimization"). This ABI is deliberately non-null i32-only;
 /// structural NULL projections take the per-query GPU route. Stored `values` are raw `i32` rather
 /// than a fat `Vec<SqlValue>` (~24-32B/entry, ~3MB/65536-
 /// batch) — the batcher maps `i32 -> DbValue::Int4` directly, skipping the SqlValue intermediate entirely.
-/// The batcher slices `values` by `needle_ranges[i]` to answer needle `i`'s request, mapping the schema ONCE.
+/// The batcher slices `values` by the logical needle range to answer needle `i`'s request, mapping the schema
+/// ONCE.
 #[derive(Debug, Clone)]
 pub struct RelationalRetainedBatchResult {
     pub columns: Arc<Vec<RelationalColumn>>,
@@ -273,6 +275,92 @@ impl RelationalRetainedBatchResult {
     }
     pub fn ncols(&self) -> usize {
         self.ncols
+    }
+}
+
+/// Compact production point-batcher result. Unlike the compatibility result above, an all-present dense
+/// batch records its identity mapping as one bit rather than allocating one `(start,count)` pair per needle.
+/// Fields are private so this representation can evolve without changing the public range contract.
+#[derive(Debug)]
+pub struct RelationalPointBatchResult {
+    columns: Arc<Vec<RelationalColumn>>,
+    access_path: Arc<RelationalAccessPath>,
+    gpu_id: u16,
+    values: Vec<i32>,
+    ncols: usize,
+    needle_ranges: Vec<(u32, u32)>,
+    dense_all_present: bool,
+}
+
+impl RelationalPointBatchResult {
+    pub(crate) fn new(
+        columns: Arc<Vec<RelationalColumn>>,
+        access_path: Arc<RelationalAccessPath>,
+        gpu_id: u16,
+        values: Vec<i32>,
+        ncols: usize,
+        needle_ranges: Vec<(u32, u32)>,
+    ) -> Self {
+        let dense_all_present = needle_ranges.is_empty() && !values.is_empty();
+        Self {
+            columns,
+            access_path,
+            gpu_id,
+            values,
+            ncols,
+            needle_ranges,
+            dense_all_present,
+        }
+    }
+
+    pub fn columns(&self) -> &[RelationalColumn] {
+        &self.columns
+    }
+
+    pub fn needle_count(&self) -> usize {
+        if self.dense_all_present {
+            debug_assert!(self.ncols > 0 && self.values.len().is_multiple_of(self.ncols));
+            self.values.len() / self.ncols
+        } else {
+            self.needle_ranges.len()
+        }
+    }
+
+    pub fn needle_values(&self, needle: usize) -> &[i32] {
+        let (start, count) = if self.dense_all_present {
+            debug_assert!(needle < self.needle_count());
+            (needle, 1)
+        } else {
+            let (start, count) = self.needle_ranges[needle];
+            (start as usize, count as usize)
+        };
+        &self.values[start * self.ncols..(start + count) * self.ncols]
+    }
+
+    pub fn ncols(&self) -> usize {
+        self.ncols
+    }
+
+    pub fn into_compat(self) -> RelationalRetainedBatchResult {
+        let needle_ranges = if self.dense_all_present {
+            (0..self.needle_count())
+                .map(|needle| {
+                    u32::try_from(needle).map(|needle| (needle, 1)).expect(
+                        "point-batch needle count already bounded by CUDA u32 launch geometry",
+                    )
+                })
+                .collect()
+        } else {
+            self.needle_ranges
+        };
+        RelationalRetainedBatchResult {
+            columns: self.columns,
+            access_path: self.access_path,
+            gpu_id: self.gpu_id,
+            values: self.values,
+            ncols: self.ncols,
+            needle_ranges,
+        }
     }
 }
 

@@ -2564,6 +2564,80 @@ fn r2_batched_assembly_unique_fastpath_scatters_by_needle() {
     assert_eq!(batched.needle_values(3), &[33, 303]);
 }
 
+#[test]
+fn r2_dense_all_present_preserves_public_range_contract_and_expansion() {
+    let columns = std::sync::Arc::new(vec![RelationalColumn {
+        id: 0,
+        table_oid: 0,
+        attnum: 1,
+        name: "id".to_string(),
+        ty: SqlType::Int4,
+        domain: None,
+        default: None,
+        type_oid: 23,
+        type_size: 4,
+    }]);
+    let access = std::sync::Arc::new(RelationalAccessPath::EqualityIndex {
+        table: "t".to_string(),
+        column: "id".to_string(),
+        matched_keys: 3,
+    });
+    let projected = CudaI32BatchProjectionColumns {
+        values: vec![10, 20, 30],
+        needle_indices: Vec::new(),
+        row_indices: Vec::new(),
+        projection_count: 1,
+        status: vec![1, 1, 1],
+    };
+    let _: &[u32] = &projected.status;
+    let batched = Engine::assemble_batched_rows(&projected, 3, 1, columns, access, 0);
+    assert_eq!(batched.needle_ranges, vec![(0, 1), (1, 1), (2, 1)]);
+    assert_eq!(batched.needle_count(), 3);
+    assert_eq!(batched.needle_values(0), &[10]);
+    assert_eq!(batched.needle_values(1), &[20]);
+    assert_eq!(batched.needle_values(2), &[30]);
+    let expanded = Engine::expand_ready_batched_result(batched);
+    assert_eq!(expanded.len(), 3);
+    let rows = expanded
+        .into_iter()
+        .map(|result| result.rows.into_boxed())
+        .collect::<Vec<_>>();
+    assert_eq!(rows[0], vec![vec![SqlValue::Int4(10)]]);
+    assert_eq!(rows[1], vec![vec![SqlValue::Int4(20)]]);
+    assert_eq!(rows[2], vec![vec![SqlValue::Int4(30)]]);
+
+    // The production batcher may carry the identity mapping compactly, but conversion at the established
+    // public boundary must recreate the same one-range-per-needle ABI.
+    let compact_columns = std::sync::Arc::new(vec![RelationalColumn {
+        id: 0,
+        table_oid: 0,
+        attnum: 1,
+        name: "id".to_string(),
+        ty: SqlType::Int4,
+        domain: None,
+        default: None,
+        type_oid: 23,
+        type_size: 4,
+    }]);
+    let compact_access = std::sync::Arc::new(RelationalAccessPath::EqualityIndex {
+        table: "t".to_string(),
+        column: "id".to_string(),
+        matched_keys: 3,
+    });
+    let compact = RelationalPointBatchResult::new(
+        compact_columns,
+        compact_access,
+        0,
+        vec![10, 20, 30],
+        1,
+        Vec::new(),
+    );
+    assert_eq!(compact.needle_count(), 3);
+    assert_eq!(compact.needle_values(1), &[20]);
+    let compat = compact.into_compat();
+    assert_eq!(compat.needle_ranges, vec![(0, 1), (1, 1), (2, 1)]);
+}
+
 // DECISIONS "lpb read levers" #1: the DENSE-emit unique index probe must be BYTE-IDENTICAL to the atomic
 // index kernel, across the edge cases the kernel must get right: all-match, none-match, absent needles (the
 // GAP case — validates that absent slots are never read as present), and NULL-as-0. The same index route is

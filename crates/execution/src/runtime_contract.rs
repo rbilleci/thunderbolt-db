@@ -39,6 +39,10 @@ pub enum CudaRuntimeProbeError {
         limit: u64,
     },
     KernelLaunchFailed(i32),
+    /// A supposedly unique point-read route found the same needle in more than one resident shard. The
+    /// compact production result uses status 3 to decline/re-resolve; compatibility APIs surface it as an
+    /// error rather than silently translating the duplicate into a not-found row.
+    DuplicatePointReadMatch(usize),
     /// A comparison code outside the range the called primitive supports (the fused
     /// scalar/buffer compact kernels handle 0=eq..4=ge; `5=ne` is mask-path only).
     UnsupportedComparison(u32),
@@ -76,6 +80,10 @@ impl fmt::Display for CudaRuntimeProbeError {
                 "CUDA allocation budget exceeded: {live} live + {requested} requested > {limit} bytes"
             ),
             Self::KernelLaunchFailed(code) => write!(f, "CUDA kernel launch failed: {code}"),
+            Self::DuplicatePointReadMatch(needle_index) => write!(
+                f,
+                "duplicate CUDA point-read match for needle index {needle_index}"
+            ),
             Self::UnsupportedComparison(code) => {
                 write!(f, "unsupported comparison code for this primitive: {code}")
             }
@@ -112,6 +120,10 @@ mod tests {
         assert_eq!(
             CudaRuntimeProbeError::IntegerOutOfRange.to_string(),
             "integer out of range"
+        );
+        assert_eq!(
+            CudaRuntimeProbeError::DuplicatePointReadMatch(7).to_string(),
+            "duplicate CUDA point-read match for needle index 7"
         );
         assert_eq!(
             CudaRuntimeProbeError::BigintOutOfRange.to_string(),

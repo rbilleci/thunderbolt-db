@@ -14,6 +14,9 @@ pub struct CudaResidentDeviceMemory {
     /// context of its own; it holds a refcount so the context outlives the allocation, and
     /// reaches the device pointer, library, module cache, and stream pool through it.
     pub(super) primary: Arc<GpuPrimaryContext>,
+    /// Shared allocation lifetime. Read views clone this guard, so every safe owner or view that can
+    /// submit a kernel keeps the exact device pointer allocated until its last clone is dropped.
+    allocation: Arc<CudaResidentDeviceAllocation>,
     pub(super) last_kernel_event_elapsed_us: Mutex<Option<u64>>,
 }
 
@@ -22,6 +25,36 @@ pub struct CudaResidentDeviceMemoryReadView {
     metadata: CudaDeviceMemoryProof,
     device_ptr: u64,
     primary: Arc<GpuPrimaryContext>,
+    allocation: Arc<CudaResidentDeviceAllocation>,
+}
+
+pub(super) struct CudaResidentDeviceAllocation {
+    device_ptr: u64,
+    primary: Arc<GpuPrimaryContext>,
+}
+
+/// Test-only non-owning witness for the exact resident allocation. This lets lifetime regressions
+/// prove that a read view and a deferred submission retain the allocation itself, independently of
+/// CUDA's synchronizing `cuMemFree` behavior.
+#[cfg(test)]
+pub(crate) struct CudaResidentAllocationWeak(std::sync::Weak<CudaResidentDeviceAllocation>);
+
+#[cfg(test)]
+impl CudaResidentAllocationWeak {
+    pub(crate) fn is_alive(&self) -> bool {
+        self.0.upgrade().is_some()
+    }
+}
+
+impl Drop for CudaResidentDeviceAllocation {
+    fn drop(&mut self) {
+        // The allocation is freed only after the last owner/read-view guard drops. Bind the shared
+        // primary context first because that last guard may be released on an otherwise unbound thread.
+        let _ = self.primary.set_current();
+        unsafe {
+            (self.primary.cu_mem_free)(self.device_ptr);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,10 +117,10 @@ impl fmt::Debug for CudaResidentDeviceMemoryReadView {
 }
 
 // Both `CudaResidentDeviceMemory` and its read view are now **auto** `Send`/`Sync`: every
-// field is thread-safe — `metadata` is plain data, `device_ptr` is a `u64`, the telemetry
-// slot is a `Mutex`, and the context/library/module-cache/stream-pool all live behind
-// `Arc<GpuPrimaryContext>` (whose own `unsafe impl Send + Sync` carries the load-bearing
-// argument). This is the §9.3 payoff over the P1-M3 per-allocation model: residency owns
+// field is thread-safe — `metadata` is plain data, `device_ptr` is a `u64`, allocation lifetime
+// and context/library/module-cache/stream-pool all live behind `Arc` (with `GpuPrimaryContext`'s
+// `unsafe impl Send + Sync` carrying the load-bearing argument), and telemetry uses a `Mutex`.
+// This is the §9.3 payoff over the P1-M3 per-allocation model: residency owns
 // no raw context, so the previously hand-written `unsafe impl`s here are gone — concurrent
 // reads over a published generation are safe by construction, witnessed by the
 // `published_resident_generation_*` and `concurrent_readers_*` GPU probes.
@@ -117,6 +150,9 @@ pub(super) trait CudaResidentReadSource {
     /// (split `submit`/`complete`) that must carry pool re-entry across the boundary in a `Send`
     /// submission, where a borrow won't outlive the `submit` frame.
     fn primary_arc(&self) -> Arc<GpuPrimaryContext>;
+    /// A strong guard for the exact resident allocation addressed by a deferred submission. Safe split
+    /// submit/complete APIs return independently of the source borrow, so the submission must retain it.
+    fn allocation_arc(&self) -> Arc<CudaResidentDeviceAllocation>;
     fn record_kernel_event_elapsed_us(&self, _elapsed_us: Option<u64>) {}
 }
 
@@ -139,6 +175,10 @@ impl CudaResidentReadSource for CudaResidentDeviceMemory {
 
     fn primary_arc(&self) -> Arc<GpuPrimaryContext> {
         Arc::clone(&self.primary)
+    }
+
+    fn allocation_arc(&self) -> Arc<CudaResidentDeviceAllocation> {
+        Arc::clone(&self.allocation)
     }
 
     fn record_kernel_event_elapsed_us(&self, elapsed_us: Option<u64>) {
@@ -166,9 +206,34 @@ impl CudaResidentReadSource for CudaResidentDeviceMemoryReadView {
     fn primary_arc(&self) -> Arc<GpuPrimaryContext> {
         Arc::clone(&self.primary)
     }
+
+    fn allocation_arc(&self) -> Arc<CudaResidentDeviceAllocation> {
+        Arc::clone(&self.allocation)
+    }
 }
 
 impl CudaResidentDeviceMemory {
+    /// Transfer one freshly allocated raw device pointer into the shared owner/read-view lifetime.
+    /// Every construction path funnels through this helper so a safe read view can never outlive the
+    /// allocation it addresses.
+    pub(super) fn from_raw_parts(
+        metadata: CudaDeviceMemoryProof,
+        device_ptr: u64,
+        primary: Arc<GpuPrimaryContext>,
+    ) -> Self {
+        let allocation = Arc::new(CudaResidentDeviceAllocation {
+            device_ptr,
+            primary: Arc::clone(&primary),
+        });
+        Self {
+            metadata,
+            device_ptr,
+            primary,
+            allocation,
+            last_kernel_event_elapsed_us: Mutex::new(None),
+        }
+    }
+
     pub fn metadata(&self) -> &CudaDeviceMemoryProof {
         &self.metadata
     }
@@ -365,7 +430,13 @@ impl CudaResidentDeviceMemory {
             metadata: self.metadata.clone(),
             device_ptr: self.device_ptr,
             primary: Arc::clone(&self.primary),
+            allocation: Arc::clone(&self.allocation),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocation_weak_for_test(&self) -> CudaResidentAllocationWeak {
+        CudaResidentAllocationWeak(Arc::downgrade(&self.allocation))
     }
 
     pub fn last_kernel_event_elapsed_us(&self) -> Option<u64> {
@@ -387,19 +458,5 @@ impl CudaResidentDeviceMemory {
 
     pub fn count_rows_from_header(&self) -> Result<u64, CudaRuntimeProbeError> {
         launch_cuda_resident_row_count(self)
-    }
-}
-
-impl Drop for CudaResidentDeviceMemory {
-    fn drop(&mut self) {
-        // §9.3: residency frees only its own device memory. The shared primary context is
-        // owned by `GpuPrimaryContext` (released when the last `Arc` — registry + every
-        // allocation — drops), not destroyed per allocation. Bind the context first so the
-        // free lands in the right context even when the last reader drops this owner on a
-        // thread that never bound it (otherwise cuMemFree would no-op + leak).
-        let _ = self.primary.set_current();
-        unsafe {
-            (self.primary.cu_mem_free)(self.device_ptr);
-        }
     }
 }

@@ -590,77 +590,103 @@ impl Engine {
         filter_col: &str,
         proj_cols: &[String],
         needles: &[i32],
-    ) -> Option<usize> {
-        if self.ensure_commit_path_available().is_err() {
-            return None;
-        }
-        let table = self.relational_catalog_table(table_name)?;
-        let filter_idx =
-            crate::rel_exec_helpers::relational_column_index(&table, filter_col).ok()?;
+    ) -> Result<Option<usize>, ExecuteError> {
+        self.ensure_commit_path_available()?;
+        let Some(table) = self.relational_catalog_table(table_name) else {
+            return Ok(None);
+        };
+        let Ok(filter_idx) = crate::rel_exec_helpers::relational_column_index(&table, filter_col)
+        else {
+            return Ok(None);
+        };
         let mut selected_indexes = Vec::with_capacity(proj_cols.len());
         for c in proj_cols {
-            selected_indexes
-                .push(crate::rel_exec_helpers::relational_column_index(&table, c).ok()?);
+            let Ok(index) = crate::rel_exec_helpers::relational_column_index(&table, c) else {
+                return Ok(None);
+            };
+            selected_indexes.push(index);
         }
-        let proj = self.gather_sharded_int4_point_lookups_batched(
+        let Some(proj) = self.gather_sharded_int4_point_lookups_batched(
             self.committed_seq(),
             &table,
             filter_idx,
             &selected_indexes,
             needles,
-        )?;
-        Some(proj.needle_ranges.iter().filter(|&&(_, c)| c > 0).count())
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(proj.matched_needle_count()))
     }
 
     /// lpb-for-shards WIRING: serve a shard-resident int4 point-lookup BATCH as ONE dispatchable
-    /// `RelationalRetainedBatchResult` — the SAME type the single-buffer lpb coalescer produces, so the facade
-    /// batcher's `distribute_results_batched` handles it UNCHANGED (columns mapped once, sliced per needle).
+    /// Compatibility wrapper for callers that require the established public one-range-per-needle result.
     /// Binds `select`, verifies it is a shard-resident single int4-`Eq` point lookup, runs
     /// `gather_sharded_int4_point_lookups_batched` over `needles`, and wraps the projection with the shared
     /// schema. Returns `None` (the batcher keeps its existing behavior — byte-identical) when the flag is OFF,
     /// the table is not shard-resident, the shape is not a single int4 equality, or the gather declines
-    /// (dup / non-int4 / error). `needles` must be DISTINCT (the caller dedups), per the gather's contract.
+    /// (dup / non-int4). Runtime failures are returned as typed errors and never become eligibility declines.
+    /// `needles` must be DISTINCT (the caller dedups), per the gather's contract.
     /// `access_path` is a label (`FullTableScan`) — the batcher's dispatch consumes only `columns` +
     /// `needle_values`, never `access_path`.
     pub fn submit_sharded_point_lookups_batched(
         &self,
         select: &Select,
         needles: &[i32],
-    ) -> Option<RelationalRetainedBatchResult> {
-        if self.ensure_commit_path_available().is_err() {
-            return None;
-        }
+    ) -> Result<Option<RelationalRetainedBatchResult>, ExecuteError> {
+        Ok(self
+            .submit_sharded_point_lookups_batched_compact(select, needles)?
+            .map(RelationalPointBatchResult::into_compat))
+    }
+
+    /// Production point-batcher entry. Dense all-present results keep an internal identity mapping and avoid
+    /// the 8-byte-per-needle compatibility range allocation; runtime failures remain typed errors.
+    pub fn submit_sharded_point_lookups_batched_compact(
+        &self,
+        select: &Select,
+        needles: &[i32],
+    ) -> Result<Option<RelationalPointBatchResult>, ExecuteError> {
+        self.ensure_commit_path_available()?;
         if !self.shard_batched_point_read_enabled() {
-            return None;
+            return Ok(None);
         }
-        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select).ok()?;
+        let Ok((table, bound, copin_s)) = self.bind_relational_select_for_execution(select) else {
+            return Ok(None);
+        };
         if self.resident_shard_count(&table.name) == 0 {
-            return None; // not shard-resident -> the batcher's single-buffer / per-query path
+            return Ok(None); // not shard-resident -> the batcher's single-buffer / per-query path
         }
-        let (filter_idx, _needle) = crate::engine_expr::shard_point_lookup_int4_eq(&bound, &table)?;
+        let Some((filter_idx, _needle)) =
+            crate::engine_expr::shard_point_lookup_int4_eq(&bound, &table)
+        else {
+            return Ok(None);
+        };
         // SC5 rider: the gather reads at the STATEMENT'S pinned boundary (was: an internal
         // committed_seq re-read that broke catalog<->data co-pinning).
-        let proj = self.gather_sharded_int4_point_lookups_batched(
+        let Some(proj) = self.gather_sharded_int4_point_lookups_batched(
             copin_s,
             &table,
             filter_idx,
             &bound.selected_indexes,
             needles,
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         let gpu_id = self
             .read_residency_shards()
             .get(&table.name)
             .and_then(|s| s.first())
             .map(|s| s.gpu_id)
             .unwrap_or(0);
-        Some(RelationalRetainedBatchResult {
-            columns: Arc::new(bound.selected_columns),
-            access_path: Arc::new(RelationalAccessPath::FullTableScan),
+        Ok(Some(RelationalPointBatchResult::new(
+            Arc::new(bound.selected_columns),
+            Arc::new(RelationalAccessPath::FullTableScan),
             gpu_id,
-            values: proj.values,
-            ncols: proj.ncols,
-            needle_ranges: proj.needle_ranges,
-        })
+            proj.values,
+            proj.ncols,
+            proj.needle_ranges,
+        )))
     }
 
     fn complete_relational_retained_int4_projection_submission(
@@ -1409,14 +1435,48 @@ pub(crate) struct ShardPkHit {
 }
 
 /// Step 1 (lpb-for-shards): the batched point-lookup projection. `values` is row-major int4, `ncols` wide, in
-/// NEEDLE ORDER; `needle_ranges[i] = (start_row, row_count)` slices needle i's rows (unique-PK -> count 0 or
-/// 1). The schema (columns / access_path) is shape metadata the caller wraps around this raw projection.
+/// NEEDLE ORDER. Mixed/absent batches use `needle_ranges[i] = (start_row, row_count)`; an empty range vector
+/// with non-empty values is the private all-present identity mapping. The schema
+/// (columns / access_path) is shape metadata the caller wraps around this raw projection.
 /// Consumed by the production batch-result wiring (`submit_sharded_point_lookups_batched`), the
 /// differential tests, and the benches.
+#[derive(Debug)]
 pub(crate) struct BatchedShardProjection {
     pub(crate) ncols: usize,
     pub(crate) values: Vec<i32>,
     pub(crate) needle_ranges: Vec<(u32, u32)>,
+}
+
+impl BatchedShardProjection {
+    fn matched_needle_count(&self) -> usize {
+        if self.needle_ranges.is_empty() && !self.values.is_empty() {
+            debug_assert!(self.ncols > 0 && self.values.len().is_multiple_of(self.ncols));
+            self.values.len() / self.ncols
+        } else {
+            self.needle_ranges
+                .iter()
+                .filter(|&&(_, count)| count > 0)
+                .count()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn needle_count(&self) -> usize {
+        if self.needle_ranges.is_empty() && !self.values.is_empty() {
+            self.values.len() / self.ncols
+        } else {
+            self.needle_ranges.len()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn needle_range(&self, needle: usize) -> (u32, u32) {
+        if self.needle_ranges.is_empty() && !self.values.is_empty() {
+            (needle as u32, 1)
+        } else {
+            self.needle_ranges[needle]
+        }
+    }
 }
 
 #[cfg(test)]

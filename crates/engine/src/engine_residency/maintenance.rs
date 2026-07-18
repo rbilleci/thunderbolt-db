@@ -66,9 +66,11 @@ impl Engine {
         self.read_state.residency.with_snapshots_mut(|snapshots| {
             snapshots.remove(table_name);
         });
-        self.read_state.residency.with_shards_mut(|shards| {
-            shards.remove(table_name);
-        });
+        self.read_state
+            .residency
+            .with_shards_mut_for_table(table_name, |shards| {
+                shards.remove(table_name);
+            });
         Ok(true)
     }
 

@@ -5,7 +5,8 @@ use crate::cuda_context::{check_cuda, GpuPrimaryContext, PooledStream, PooledStr
 use crate::resident_memory::{CudaResidentDeviceMemory, CudaResidentReadSource};
 use crate::{
     copy_pinned_into, launch_on_pooled_stream, stage_result_dtoh_async,
-    CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError,
+    validate_i32_index_geometry, CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError,
+    I32NeedlesHostGuard,
 };
 
 pub(super) fn launch_cuda_resident_i32_equal_project(
@@ -687,6 +688,11 @@ DONE:
     if row_count == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
+    if !filter_offset.is_multiple_of(std::mem::align_of::<i32>() as u64) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(filter_offset).unwrap_or(usize::MAX),
+        ));
+    }
     let filter_bytes = row_count
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| filter_offset.checked_add(bytes))
@@ -697,6 +703,11 @@ DONE:
         ));
     }
     for byte_offset in projection_offsets {
+        if byte_offset % std::mem::align_of::<i32>() as u64 != 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                usize::try_from(*byte_offset).unwrap_or(usize::MAX),
+            ));
+        }
         let bytes = row_count
             .checked_mul(std::mem::size_of::<i32>() as u64)
             .and_then(|bytes| byte_offset.checked_add(bytes))
@@ -774,6 +785,7 @@ DONE:
 
     let primary = resident.primary_arc();
     primary.set_current()?;
+    let needles_host_guard = I32NeedlesHostGuard::stage(&primary, needles);
 
     // Pooled device buffers (owned guards — returned to the pool when the submission drops, after
     // `complete` reads them). Reused buffers are NOT zeroed; only the count is memset, the needles
@@ -826,17 +838,38 @@ DONE:
     let threads_per_block = 128;
     let blocks = row_count_u32.div_ceil(threads_per_block);
 
-    // Lease the pooled private stream (owned — held by the submission until `complete`).
-    let stream_owned = PooledStreamOwned {
+    // Establish the complete draining owner before the first asynchronous enqueue. In particular, it owns an
+    // exact host copy of `needles`: this safe deferred API may return while H2D is still consuming that source.
+    let mut submission = CudaI32EqualAnyProjectSubmission {
+        projection_count: projection_offsets.len(),
+        needles_len: needles.len(),
+        row_count,
         primary: Arc::clone(&primary),
-        pooled: Some(primary.acquire_pooled_stream()?),
+        _resident_allocation_guard: resident.allocation_arc(),
+        values_guard,
+        indices_guard,
+        row_indices_guard,
+        count_guard,
+        _needles_guard: needles_guard,
+        _needles_host_guard: needles_host_guard,
+        stream: Some(PooledStreamOwned {
+            primary: Arc::clone(&primary),
+            pooled: Some(primary.acquire_pooled_stream()?),
+        }),
+        timed: false,
+        _wave_index_guard: None,
     };
-    let pooled = stream_owned
+    let pooled = submission
+        .stream
+        .as_ref()
+        .expect("submission owns stream")
         .pooled
         .as_ref()
         .expect("pooled stream just leased");
     let stream = pooled.stream;
     let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+    submission.timed = timed;
+    let needles_host_ptr = submission._needles_host_guard.as_ptr();
 
     // Error-path stream drain (same contract as the text route): every op below ENQUEUES async
     // work on `stream`; an early `?` would unwind the owned buffer/stream guards (returning them
@@ -861,30 +894,17 @@ DONE:
     };
 
     if let Some((htod_async, memset_async)) = async_ops {
-        check_cuda(unsafe {
-            htod_async(
-                needles_guard.ptr,
-                needles.as_ptr().cast::<c_void>(),
-                needle_bytes,
-                stream,
-            )
-        })
-        .map_err(drain_err)?;
-        check_cuda(unsafe { memset_async(count_guard.ptr, 0, std::mem::size_of::<u32>(), stream) })
+        check_cuda(unsafe { htod_async(needles_arg, needles_host_ptr, needle_bytes, stream) })
+            .map_err(drain_err)?;
+        check_cuda(unsafe { memset_async(count_arg, 0, std::mem::size_of::<u32>(), stream) })
             .map_err(drain_err)?;
     } else {
         // Blocking fallback: these default-stream ops complete (host-blocking) before the kernel
         // is enqueued on the pooled stream below, so the kernel still observes the uploaded needles
         // and the zeroed counter.
-        check_cuda(unsafe {
-            cu_memcpy_htod(
-                needles_guard.ptr,
-                needles.as_ptr().cast::<c_void>(),
-                needle_bytes,
-            )
-        })
-        .map_err(drain_err)?;
-        check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })
+        check_cuda(unsafe { cu_memcpy_htod(needles_arg, needles_host_ptr, needle_bytes) })
+            .map_err(drain_err)?;
+        check_cuda(unsafe { cu_memset_d8(count_arg, 0, std::mem::size_of::<u32>()) })
             .map_err(drain_err)?;
     }
 
@@ -915,20 +935,7 @@ DONE:
     // NB: deliberately NOT synced here — `complete` does the single covering sync, so the kernel
     // overlaps the caller's host work between `submit` and `complete`.
 
-    Ok(CudaI32EqualAnyProjectSubmission {
-        projection_count: projection_offsets.len(),
-        needles_len: needles.len(),
-        row_count,
-        primary,
-        values_guard,
-        indices_guard,
-        row_indices_guard,
-        count_guard,
-        _needles_guard: needles_guard,
-        stream: Some(stream_owned),
-        timed,
-        _wave_index_guard: None,
-    })
+    Ok(submission)
 }
 
 /// R1a — the GPU-INDEX point-lookup analogue of `submit_cuda_resident_i32_equal_any_project`. Instead of
@@ -978,6 +985,7 @@ pub(super) fn submit_cuda_resident_i32_index_probe<R: CudaResidentReadSource>(
     .param .u64 index_ptr,
     .param .u32 table_mask,
     .param .u32 hash_shift,
+    .param .u32 row_count,
     .param .u32 needle_count,
     .param .u32 projection_count,
     .param .u64 projection_offset0,
@@ -999,6 +1007,7 @@ pub(super) fn submit_cuda_resident_i32_index_probe<R: CudaResidentReadSource>(
     ld.param.u64 %rd2, [index_ptr];
     ld.param.u32 %r1, [table_mask];
     ld.param.u32 %r2, [hash_shift];
+    ld.param.u32 %r18, [row_count];
     ld.param.u32 %r3, [needle_count];
     ld.param.u32 %r4, [projection_count];
     ld.param.u64 %rd3, [projection_offset0];
@@ -1047,6 +1056,8 @@ PROBE:
 FOUND:
     cvt.u32.u64 %r14, %rd16;
     sub.u32 %r14, %r14, 1;
+    setp.ge.u32 %p2, %r14, %r18;
+    @%p2 bra DONE;
     cvt.u64.u32 %rd18, %r14;
 
     mov.u32 %r15, 1;
@@ -1112,10 +1123,23 @@ DONE:
             projection_offsets.len(),
         ));
     }
-    if row_count == 0 || index_ptr == 0 {
+    if row_count == 0 || row_count >= u32::MAX as u64 || index_ptr == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
+    if !Arc::ptr_eq(&resident.primary_arc(), &index.primary_arc()) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    validate_i32_index_geometry(
+        index.metadata().allocated_bytes,
+        index_table_mask,
+        index_hash_shift,
+    )?;
     for byte_offset in projection_offsets {
+        if byte_offset % std::mem::align_of::<i32>() as u64 != 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                usize::try_from(*byte_offset).unwrap_or(usize::MAX),
+            ));
+        }
         let bytes = row_count
             .checked_mul(std::mem::size_of::<i32>() as u64)
             .and_then(|bytes| byte_offset.checked_add(bytes))
@@ -1171,6 +1195,7 @@ DONE:
 
     let primary = resident.primary_arc();
     primary.set_current()?;
+    let needles_host_guard = I32NeedlesHostGuard::stage(&primary, needles);
 
     let needles_guard = primary.lease_device_buffer_owned(needle_bytes)?;
     let values_guard = primary.lease_device_buffer_owned(output_bytes)?;
@@ -1187,6 +1212,7 @@ DONE:
     let mut index_arg = index_ptr;
     let mut table_mask_arg = index_table_mask;
     let mut hash_shift_arg = index_hash_shift;
+    let mut row_count_arg = row_count as u32;
     let mut needle_count_arg = needle_count_u32;
     let mut projection_count_arg = u32::try_from(projection_offsets.len())
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(projection_offsets.len()))?;
@@ -1204,6 +1230,7 @@ DONE:
         (&mut index_arg as *mut u64).cast::<c_void>(),
         (&mut table_mask_arg as *mut u32).cast::<c_void>(),
         (&mut hash_shift_arg as *mut u32).cast::<c_void>(),
+        (&mut row_count_arg as *mut u32).cast::<c_void>(),
         (&mut needle_count_arg as *mut u32).cast::<c_void>(),
         (&mut projection_count_arg as *mut u32).cast::<c_void>(),
         (&mut projected_offsets[0] as *mut u64).cast::<c_void>(),
@@ -1219,16 +1246,36 @@ DONE:
     let threads_per_block = 128;
     let blocks = needle_count_u32.div_ceil(threads_per_block);
 
-    let stream_owned = PooledStreamOwned {
+    let mut submission = CudaI32EqualAnyProjectSubmission {
+        projection_count: projection_offsets.len(),
+        needles_len: needles.len(),
+        row_count,
         primary: Arc::clone(&primary),
-        pooled: Some(primary.acquire_pooled_stream()?),
+        _resident_allocation_guard: resident.allocation_arc(),
+        values_guard,
+        indices_guard,
+        row_indices_guard,
+        count_guard,
+        _needles_guard: needles_guard,
+        _needles_host_guard: needles_host_guard,
+        stream: Some(PooledStreamOwned {
+            primary: Arc::clone(&primary),
+            pooled: Some(primary.acquire_pooled_stream()?),
+        }),
+        timed: false,
+        _wave_index_guard: Some(Arc::clone(index)),
     };
-    let pooled = stream_owned
+    let pooled = submission
+        .stream
+        .as_ref()
+        .expect("submission owns stream")
         .pooled
         .as_ref()
         .expect("pooled stream just leased");
     let stream = pooled.stream;
     let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+    submission.timed = timed;
+    let needles_host_ptr = submission._needles_host_guard.as_ptr();
 
     let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
         unsafe {
@@ -1242,27 +1289,14 @@ DONE:
         _ => None,
     };
     if let Some((htod_async, memset_async)) = async_ops {
-        check_cuda(unsafe {
-            htod_async(
-                needles_guard.ptr,
-                needles.as_ptr().cast::<c_void>(),
-                needle_bytes,
-                stream,
-            )
-        })
-        .map_err(drain_err)?;
-        check_cuda(unsafe { memset_async(count_guard.ptr, 0, std::mem::size_of::<u32>(), stream) })
+        check_cuda(unsafe { htod_async(needles_arg, needles_host_ptr, needle_bytes, stream) })
+            .map_err(drain_err)?;
+        check_cuda(unsafe { memset_async(count_arg, 0, std::mem::size_of::<u32>(), stream) })
             .map_err(drain_err)?;
     } else {
-        check_cuda(unsafe {
-            cu_memcpy_htod(
-                needles_guard.ptr,
-                needles.as_ptr().cast::<c_void>(),
-                needle_bytes,
-            )
-        })
-        .map_err(drain_err)?;
-        check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })
+        check_cuda(unsafe { cu_memcpy_htod(needles_arg, needles_host_ptr, needle_bytes) })
+            .map_err(drain_err)?;
+        check_cuda(unsafe { cu_memset_d8(count_arg, 0, std::mem::size_of::<u32>()) })
             .map_err(drain_err)?;
     }
 
@@ -1291,18 +1325,5 @@ DONE:
             .map_err(drain_err)?;
     }
 
-    Ok(CudaI32EqualAnyProjectSubmission {
-        projection_count: projection_offsets.len(),
-        needles_len: needles.len(),
-        row_count,
-        primary,
-        values_guard,
-        indices_guard,
-        row_indices_guard,
-        count_guard,
-        _needles_guard: needles_guard,
-        stream: Some(stream_owned),
-        timed,
-        _wave_index_guard: Some(Arc::clone(index)),
-    })
+    Ok(submission)
 }

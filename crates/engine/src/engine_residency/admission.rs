@@ -562,6 +562,7 @@ impl Engine {
                 gpu_id,
                 schema: snapshot.schema.clone(),
                 table: snapshot.table.clone(),
+                point_route_generation: Arc::new(()),
                 device_memory_proof: snapshot.device_memory_proof.clone(),
                 invalidated_by_txn_id: None,
                 invalidated_at_index: None,
@@ -589,9 +590,11 @@ impl Engine {
         // Audit (S-d1) fix: the single-buffer path is authoritative here — clear any prior SHARD cell for
         // the table so a flag flip (ON->OFF) cannot leave a stale shard shadowing the fresh snapshot (the
         // read route checks shards FIRST, so a still-valid stale shard would serve wrong rows). Idempotent.
-        read_state.residency.with_shards_mut(|shards| {
-            shards.remove(table);
-        });
+        read_state
+            .residency
+            .with_shards_mut_for_table(table, |shards| {
+                shards.remove(table);
+            });
         read_state.residency.shard_device_memory.remove_table(table);
         // SV4 prereq #1 (lifecycle): the single-buffer path replaces the table's shards, so clear any stale
         // `deleted_by` regions -- a flag flip / re-admit must not leave a tombstone region shadowing the fresh

@@ -950,7 +950,7 @@ pub(super) fn launch_cuda_group_by_i32_count_sum(
 }
 
 /// Benchmark-only: time JUST the GROUP BY KERNEL (excluding the per-call alloc / H2D / D2H / host
-/// compaction that dominate the end-to-end latency) via CUDA events, returning the MIN over `runs`
+/// compaction that dominate the end-to-end latency) via CUDA events, returning p50 over `runs`
 /// kernel launches plus the result rows (for a correctness check). Sets up once; per run resets the
 /// global table (fill + memset) UNTIMED, then events bracket only the group kernel. Null stream.
 #[allow(unused_assignments)] // f0/f2 are re-read via the raw fill-arg pointers
@@ -1180,7 +1180,7 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
         .map(|x| (x as *mut u64).cast::<c_void>())
         .collect();
 
-    let mut best = f32::MAX;
+    let mut samples = Vec::with_capacity(runs as usize);
     for _ in 0..runs {
         check_cuda(unsafe { cu_memset(input_error.ptr, 0, std::mem::size_of::<u64>()) })?;
         check_cuda(unsafe { cu_memset(slot_count.ptr, 0, slot_bytes) })?;
@@ -1257,8 +1257,10 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
         check_cuda(unsafe { cu_stream_sync(null) })?;
         let mut ms = 0f32;
         check_cuda(unsafe { (primary.cu_event_elapsed_time)(&mut ms, start.event, stop.event) })?;
-        best = best.min(ms);
+        samples.push(ms);
     }
+    samples.sort_by(f32::total_cmp);
+    let p50 = samples[(samples.len() - 1) / 2];
 
     let mut invalid_input = 0u64;
     check_cuda(unsafe {
@@ -1311,5 +1313,5 @@ pub(super) fn launch_cuda_group_by_kernel_timed(
             });
         }
     }
-    Ok((groups, best))
+    Ok((groups, p50))
 }

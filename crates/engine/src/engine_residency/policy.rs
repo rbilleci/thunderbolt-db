@@ -114,6 +114,24 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// PERF-001: batches that reused the exact immutable shard generation's GPU descriptor plan. This is
+    /// the non-vacuity signal for removing descriptor/shard-count-scaled host submission from the hot path.
+    pub fn sharded_point_route_cache_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .sharded_point_route_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_sharded_point_cuda_failure(&self, phase: u8) {
+        assert!((1..=3).contains(&phase));
+        self.read_state
+            .residency
+            .sharded_point_forced_cuda_failure
+            .store(phase, std::sync::atomic::Ordering::Release);
+    }
+
     /// Sub-slice 8 v3 (O(1) routing): count of GPU-native batches where the multi-shard kernel took the
     /// BINARY-SEARCH path (host-proven ascending-disjoint shards -> each needle routes to its one shard in
     /// O(log shards)). Non-vacuity signal that binary routing (vs the linear fallback) fired.

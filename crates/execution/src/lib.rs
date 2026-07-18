@@ -179,10 +179,15 @@ use point_read_submit::{
 };
 mod point_read_dense;
 use point_read_dense::{
+    prepare_cuda_resident_i32_multi_shard_index_probe_dense,
     submit_cuda_resident_i32_index_probe_dense,
     submit_cuda_resident_i32_multi_shard_index_probe_dense,
+    submit_cuda_resident_i32_multi_shard_index_probe_dense_prepared,
 };
-pub use point_read_dense::{CudaI32IndexProbeDenseSubmission, MultiShardProbeShard};
+pub use point_read_dense::{
+    CudaI32DenseBatchProjection, CudaI32IndexProbeDenseSubmission, CudaI32MultiShardProbePlan,
+    MultiShardProbeShard,
+};
 mod point_read_bloom;
 use point_read_bloom::probe_cuda_chunk_blooms;
 pub use point_read_bloom::ChunkBloomProbeShard;
@@ -191,6 +196,7 @@ use point_read_text::launch_cuda_resident_i32_equal_any_project_text;
 mod point_read_rows;
 use point_read_rows::launch_cuda_resident_i32_equal_row_indices;
 mod point_read_submission;
+use point_read_submission::{validate_i32_index_geometry, I32NeedlesHostGuard};
 pub use point_read_submission::{
     CudaI32BatchProjectionColumns, CudaI32BatchProjectionRow, CudaI32EqualAnyProjectSubmission,
     CudaI32TextBatchProjectionRow,
@@ -895,8 +901,8 @@ impl CudaResidentDeviceMemory {
         launch_validated_group_by(self, input, indices, two_level, grouped_agg_mask::ALL)
     }
 
-    /// Benchmark entry: time JUST the GROUP BY kernel (CUDA events, min of `runs`), returning the
-    /// per-group rows + the min kernel milliseconds. Isolates the kernel from the alloc/H2D/D2H/compact
+    /// Benchmark entry: time JUST the GROUP BY kernel (CUDA events, p50 of `runs`), returning the
+    /// per-group rows + the p50 kernel milliseconds. Isolates the kernel from the alloc/H2D/D2H/compact
     /// overhead, so the two-level vs single-level difference is visible. Perf comparison only.
     pub fn group_by_i32_count_sum_kernel_timed(
         &self,
@@ -1302,6 +1308,32 @@ impl CudaResidentDeviceMemory {
         read_snapshot: u64,
     ) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
         submit_cuda_resident_i32_multi_shard_index_probe_dense(self, shards, needles, read_snapshot)
+    }
+
+    /// Prepare one immutable, generation-owned multi-shard point route. The returned plan keeps its
+    /// GPU descriptor table and every referenced shard/index/MVCC resource resident for reuse.
+    pub fn prepare_multi_shard_i32_index_probe_dense(
+        &self,
+        shards: &[MultiShardProbeShard],
+    ) -> Result<Arc<CudaI32MultiShardProbePlan>, CudaRuntimeProbeError> {
+        Ok(Arc::new(
+            prepare_cuda_resident_i32_multi_shard_index_probe_dense(self, shards)?,
+        ))
+    }
+
+    /// Submit needles through a previously prepared generation-owned multi-shard point route.
+    pub fn submit_prepared_multi_shard_i32_index_probe_dense(
+        &self,
+        plan: &Arc<CudaI32MultiShardProbePlan>,
+        needles: &[i32],
+        read_snapshot: u64,
+    ) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
+        submit_cuda_resident_i32_multi_shard_index_probe_dense_prepared(
+            self,
+            Arc::clone(plan),
+            needles,
+            read_snapshot,
+        )
     }
 
     /// P5-later: probe compact per-chunk Bloom filters on-device and return candidate chunk indexes per needle.

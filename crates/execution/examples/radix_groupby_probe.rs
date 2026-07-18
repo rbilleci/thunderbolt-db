@@ -61,7 +61,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
-    // Two-level CUDA-event runs (kernel-only timing averages min of `runs` internally).
+    // Two-level CUDA-event runs (kernel-only timing reports p50 of `runs` internally).
     let kruns: u32 = std::env::var("KRUNS")
         .ok()
         .and_then(|v| v.parse().ok())

@@ -1,5 +1,5 @@
 use std::os::raw::c_void;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use libloading::Library;
 
@@ -170,18 +170,17 @@ impl CudaDriverRuntime {
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
         let resident = launch_cuda_resident_device_memory(gpu_id, payload)?;
-        Ok(CudaResidentDeviceMemory {
-            metadata: CudaDeviceMemoryProof {
+        Ok(CudaResidentDeviceMemory::from_raw_parts(
+            CudaDeviceMemoryProof {
                 gpu_id,
                 device_name: device.name,
                 allocated_bytes: payload.len() as u64,
                 copied_bytes: payload.len() as u64,
                 retained: true,
             },
-            device_ptr: resident.device_ptr,
-            primary: resident.primary,
-            last_kernel_event_elapsed_us: Mutex::new(None),
-        })
+            resident.device_ptr,
+            resident.primary,
+        ))
     }
 
     /// Allocate a retained device buffer and initialize every byte with `cuMemsetD8`. This is the
@@ -272,8 +271,8 @@ impl CudaDriverRuntime {
             return Err(err);
         }
         // From here the allocation is RAII-owned by the memory handle (its Drop frees it).
-        let memory = CudaResidentDeviceMemory {
-            metadata: CudaDeviceMemoryProof {
+        let memory = CudaResidentDeviceMemory::from_raw_parts(
+            CudaDeviceMemoryProof {
                 gpu_id,
                 device_name: device.name,
                 allocated_bytes: payload.len() as u64,
@@ -281,9 +280,8 @@ impl CudaDriverRuntime {
                 retained: true,
             },
             device_ptr,
-            primary: Arc::clone(&primary),
-            last_kernel_event_elapsed_us: Mutex::new(None),
-        };
+            Arc::clone(&primary),
+        );
         if let Err(err) = check_cuda(unsafe {
             htod_async(
                 device_ptr,
@@ -353,18 +351,17 @@ impl CudaDriverRuntime {
             .cloned()
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
         let resident = launch_cuda_resident_device_memory_chunks(gpu_id, allocated_len, chunks)?;
-        Ok(CudaResidentDeviceMemory {
-            metadata: CudaDeviceMemoryProof {
+        Ok(CudaResidentDeviceMemory::from_raw_parts(
+            CudaDeviceMemoryProof {
                 gpu_id,
                 device_name: device.name,
                 allocated_bytes,
                 copied_bytes,
                 retained: true,
             },
-            device_ptr: resident.device_ptr,
-            primary: resident.primary,
-            last_kernel_event_elapsed_us: Mutex::new(None),
-        })
+            resident.device_ptr,
+            resident.primary,
+        ))
     }
 
     pub fn retain_device_memory_owned_chunks<I>(
@@ -394,18 +391,17 @@ impl CudaDriverRuntime {
             .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
         let resident =
             launch_cuda_resident_device_memory_owned_chunks(gpu_id, allocated_len, chunks)?;
-        Ok(CudaResidentDeviceMemory {
-            metadata: CudaDeviceMemoryProof {
+        Ok(CudaResidentDeviceMemory::from_raw_parts(
+            CudaDeviceMemoryProof {
                 gpu_id,
                 device_name: device.name,
                 allocated_bytes,
                 copied_bytes: resident.copied_bytes,
                 retained: true,
             },
-            device_ptr: resident.device_ptr,
-            primary: resident.primary,
-            last_kernel_event_elapsed_us: Mutex::new(None),
-        })
+            resident.device_ptr,
+            resident.primary,
+        ))
     }
 
     /// S10c slice 2a: build ONE unified resident buffer fully ON-DEVICE by allocating
@@ -446,18 +442,17 @@ impl CudaDriverRuntime {
             fills,
             segments,
         )?;
-        Ok(CudaResidentDeviceMemory {
-            metadata: CudaDeviceMemoryProof {
+        Ok(CudaResidentDeviceMemory::from_raw_parts(
+            CudaDeviceMemoryProof {
                 gpu_id,
                 device_name: device.name,
                 allocated_bytes,
                 copied_bytes: allocated_bytes,
                 retained: true,
             },
-            device_ptr: resident.device_ptr,
-            primary: resident.primary,
-            last_kernel_event_elapsed_us: Mutex::new(None),
-        })
+            resident.device_ptr,
+            resident.primary,
+        ))
     }
 }
 

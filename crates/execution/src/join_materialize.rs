@@ -1,9 +1,6 @@
 //! Device-resident join materialization ownership.
 
-use std::{
-    os::raw::c_void,
-    sync::{Arc, Mutex},
-};
+use std::{os::raw::c_void, sync::Arc};
 
 use super::{
     check_cuda, CudaDeviceMemoryProof, CudaJoinCoordinatesU32, CudaJoinPayloadKey,
@@ -223,18 +220,17 @@ O_LOOP:setp.ge.u32 %p,%r7,%r1;@%p bra O_DONE;mul.wide.u32 %rd4,%r7,8;add.u64 %rd
     let allocated = cursor.max(1);
     let mut ptr = 0;
     check_cuda(unsafe { (primary.cu_mem_alloc)(&mut ptr, allocated as usize) })?;
-    let memory = CudaResidentDeviceMemory {
-        metadata: CudaDeviceMemoryProof {
+    let memory = CudaResidentDeviceMemory::from_raw_parts(
+        CudaDeviceMemoryProof {
             gpu_id: ctx.metadata.gpu_id,
             device_name: ctx.metadata.device_name.clone(),
             allocated_bytes: allocated,
             copied_bytes: 0,
             retained: true,
         },
-        device_ptr: ptr,
-        primary: Arc::clone(&primary),
-        last_kernel_event_elapsed_us: Mutex::new(None),
-    };
+        ptr,
+        Arc::clone(&primary),
+    );
     let memset = unsafe {
         primary
             .lib()
@@ -717,18 +713,17 @@ TC_NEXT: add.u32 %r8,%r8,%r9; bra TC_LOOP; TC_DONE: ret;
     let allocated = cursor.max(1);
     let mut ptr = 0_u64;
     check_cuda(unsafe { (primary.cu_mem_alloc)(&mut ptr, allocated as usize) })?;
-    let memory = CudaResidentDeviceMemory {
-        metadata: CudaDeviceMemoryProof {
+    let memory = CudaResidentDeviceMemory::from_raw_parts(
+        CudaDeviceMemoryProof {
             gpu_id: ctx.metadata.gpu_id,
             device_name: ctx.metadata.device_name.clone(),
             allocated_bytes: allocated,
             copied_bytes: 0,
             retained: true,
         },
-        device_ptr: ptr,
-        primary: Arc::clone(&primary),
-        last_kernel_event_elapsed_us: Mutex::new(None),
-    };
+        ptr,
+        Arc::clone(&primary),
+    );
     check_cuda(unsafe { memset(memory.device_ptr, 0, allocated as usize) })?;
     for (index, column) in columns.iter().enumerate() {
         let layout = layouts[index];

@@ -1,11 +1,9 @@
-//! lpb-index A/B — the index-route vs full-scan instrument (ADR-009 R1).
+//! Production sharded point-read result-path instrument.
 //!
-//! This benchmark measures the resident int4 unique-key point-lookup route **through the engine** — the
-//! real retained-read template path the production batcher drives — across two byte-identical routes:
-//!   - `scan`      : index off (`index_probe_enabled` off)  -> full-scan equal_any  (O(rows)/batch)
-//!   - `lpb-index` : `index_probe_enabled` on               -> launch-per-batch GPU hash-index (O(1)/needle)
-//!
-//! It also sweeps the index route's atomic vs DENSE completion kernel on the batched path.
+//! This benchmark measures the authoritative-shard int4 unique-key point route through two genuinely distinct
+//! result contracts over the same prepared multi-shard dense kernel:
+//!   - `compat-public`: retained-template completion materializes the public one-range-per-needle result;
+//!   - `production-compact`: the facade's production entry keeps the internal all-present identity mapping.
 //!
 //! WHAT THIS MEASURES (and what it does NOT). In production, point reads flow through the facade's SINGLE
 //! coalescer thread, so the production-relevant regime is ONE caller varying BATCH size (a higher offered
@@ -16,11 +14,12 @@
 //! NON-VACUITY: every route is asserted BYTE-IDENTICAL before any timing (a silent wrong/empty result can't
 //! win).
 //!
-//! Env: GPU_DB_BENCH_ROWS (single table size, default 1048576 — lpb-vs-scan; both index probes are
-//! O(1)/needle), GPU_DB_BENCH_BATCH (comma-separated batch sizes to sweep, default "1,8,32,256,4096,16384,65536"),
+//! Env: GPU_DB_BENCH_ROWS (single table size, default 1048576), GPU_DB_BENCH_BATCH
+//! (comma-separated batch sizes to sweep, default "1,8,32,256,4096,16384,65536"),
 //! GPU_DB_BENCH_BATCHES (measured batches/mode, default 2000), GPU_DB_BENCH_WARMUP (untimed warmup
 //! batches/mode, default 20 — lpb builds the index), GPU_DB_BENCH_THREADS (concurrent section thread
-//! counts, default "1,2,4,8"; "" disables it).
+//! counts, default "1,2,4,8"; "" disables it), GPU_DB_BENCH_INSERT_CHUNK (rows per authoritative
+//! insert publication; also the fixed-row descriptor-count sweep control).
 //!
 //! Run (RTX box; never `--gpu-reset`, always under `timeout`):
 //!   timeout 900 cargo run --release --example r2_wave_engine_ab -p gpu_db_engine
@@ -31,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpu_db_engine::{Engine, RelationalRetainedReadTemplate, RowBlock};
-use gpu_db_sql::{parse_command, Command, Select};
+use gpu_db_sql::{parse_command, Command, Select, SqlValue};
 
 fn parse_select(sql: &str) -> Select {
     match parse_command(sql).expect("parse") {
@@ -47,32 +46,6 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
         a = t;
     }
     a
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Scan,
-    Lpb,
-}
-
-impl Mode {
-    fn label(self) -> &'static str {
-        match self {
-            Mode::Scan => "scan",
-            Mode::Lpb => "lpb-index",
-        }
-    }
-    /// Set the index-route flag for this route: `lpb` needs it on, `scan` off.
-    fn configure(self, e: &Engine) {
-        match self {
-            Mode::Scan => {
-                e.set_index_probe_enabled(false);
-            }
-            Mode::Lpb => {
-                e.set_index_probe_enabled(true);
-            }
-        }
-    }
 }
 
 struct Lat {
@@ -158,7 +131,8 @@ fn build_resident_engine(rows: i64) -> Result<Engine, Box<dyn Error>> {
     let t_insert = t_build.elapsed();
     e.populate_relational_residency_snapshot("accounts")?;
     println!(
-        "# build: {rows} rows loaded + made resident in {:.1}s (insert {:.1}s + residency {:.1}s)",
+        "# build: {rows} rows across {} authoritative shards, loaded + made resident in {:.1}s (insert {:.1}s + residency {:.1}s)",
+        e.resident_shard_count("accounts"),
         t_build.elapsed().as_secs_f64(),
         t_insert.as_secs_f64(),
         (t_build.elapsed() - t_insert).as_secs_f64(),
@@ -168,8 +142,8 @@ fn build_resident_engine(rows: i64) -> Result<Engine, Box<dyn Error>> {
 
 /// Deterministic distinct needles for batch `b`: `(g*step) % rows` over `batch` consecutive `g`, `step`
 /// coprime to `rows` ⇒ distinct within a batch (the index/wave routes require distinct needles, which the
-/// batcher's `dedup_needles` guarantees in production). Indexing by `b` makes every mode issue the SAME
-/// lookups in batch `b`.
+/// batcher's `dedup_needles` guarantees in production). Indexing by `b` makes both result contracts issue
+/// the same lookups in batch `b`.
 fn needles_for_batch(b: usize, batch: usize, step: u64, rows: u64) -> Vec<i32> {
     let mut v = Vec::with_capacity(batch);
     for k in 0..batch {
@@ -183,15 +157,13 @@ fn needles_for_batch(b: usize, batch: usize, step: u64, rows: u64) -> Vec<i32> {
 fn measure(
     e: &Engine,
     template: &RelationalRetainedReadTemplate,
-    mode: Mode,
     batch: usize,
     batches: usize,
     warmup: usize,
     step: u64,
     rows: u64,
 ) -> Result<Lat, Box<dyn Error>> {
-    mode.configure(e);
-    // Warmup: lpb builds the index; also JIT/allocator.
+    // Warm the prepared route, JIT, and allocator.
     for b in 0..warmup {
         let needles = needles_for_batch(b, batch, step, rows);
         let sub = e.submit_relational_retained_template_point_lookups(template, &needles)?;
@@ -210,64 +182,44 @@ fn measure(
     Ok(summarize(batch_micros, batches * batch, wall))
 }
 
-/// Like `measure` but completes via the BATCHED path (`complete_relational_retained_read_submission_batched`)
-/// — one flat result + per-needle ranges instead of N per-needle structs (DECISIONS "Result-path
-/// optimization"). Shows how close the per-needle-result-model change gets end-to-end to the GPU drain.
+/// Production facade entry: one compact result whose all-present case retains an internal identity mapping.
 #[allow(clippy::too_many_arguments)]
 fn measure_batched(
     e: &Engine,
-    template: &RelationalRetainedReadTemplate,
-    mode: Mode,
+    select: &Select,
     batch: usize,
     batches: usize,
     warmup: usize,
     step: u64,
     rows: u64,
 ) -> Result<Lat, Box<dyn Error>> {
-    measure_batched_dense(e, template, mode, batch, batches, warmup, step, rows, false)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn measure_batched_dense(
-    e: &Engine,
-    template: &RelationalRetainedReadTemplate,
-    mode: Mode,
-    batch: usize,
-    batches: usize,
-    warmup: usize,
-    step: u64,
-    rows: u64,
-    dense: bool,
-) -> Result<Lat, Box<dyn Error>> {
-    mode.configure(e);
-    e.set_dense_index_probe_enabled(dense);
     for b in 0..warmup {
         let needles = needles_for_batch(b, batch, step, rows);
-        let sub = e.submit_relational_retained_template_point_lookups(template, &needles)?;
-        let _ = e.complete_relational_retained_read_submission_batched(sub)?;
+        let result = e
+            .submit_sharded_point_lookups_batched_compact(select, &needles)?
+            .ok_or("production compact point route declined during warmup")?;
+        std::hint::black_box(result.needle_count());
     }
     let mut batch_micros = Vec::with_capacity(batches);
     let t = Instant::now();
     for b in 0..batches {
         let needles = needles_for_batch(b, batch, step, rows);
         let s0 = Instant::now();
-        let sub = e.submit_relational_retained_template_point_lookups(template, &needles)?;
-        let _ = e.complete_relational_retained_read_submission_batched(sub)?;
+        let result = e
+            .submit_sharded_point_lookups_batched_compact(select, &needles)?
+            .ok_or("production compact point route declined during measurement")?;
+        std::hint::black_box(result.needle_count());
         batch_micros.push(s0.elapsed().as_micros());
     }
-    let lat = summarize(batch_micros, batches * batch, t.elapsed());
-    e.set_dense_index_probe_enabled(false);
-    Ok(lat)
+    Ok(summarize(batch_micros, batches * batch, t.elapsed()))
 }
 
-/// Rows from one batch in `mode`, for the byte-identity gate.
+/// Public compatibility rows from one batch, for the exact-value gate.
 fn rows_once(
     e: &Engine,
     template: &RelationalRetainedReadTemplate,
-    mode: Mode,
     needles: &[i32],
 ) -> Result<Vec<RowBlock>, Box<dyn Error>> {
-    mode.configure(e);
     Ok(e.complete_relational_retained_read_submission(
         e.submit_relational_retained_template_point_lookups(template, needles)?,
     )?
@@ -276,29 +228,26 @@ fn rows_once(
     .collect())
 }
 
-/// Concurrent section: `threads` workers each run `per_thread` batches through ONE shared engine in `mode`.
-/// The GPU pipelines the per-batch launches. Returns aggregate lookups/s. NOT the production coalescer path.
+/// Concurrent section: `threads` workers each run `per_thread` compact batches through ONE shared engine.
+/// The GPU pipelines the per-batch launches. Returns per-batch latency and aggregate throughput. NOT the
+/// production coalescer path.
 #[allow(clippy::too_many_arguments)] // Benchmark dimensions stay explicit at every measured call site.
 fn measure_concurrent(
     engine: &Arc<Engine>,
     select: &Select,
-    mode: Mode,
     batch: usize,
     threads: usize,
     per_thread: usize,
     step: u64,
     rows: u64,
-) -> Result<f64, Box<dyn Error>> {
-    mode.configure(engine);
-    // Warm the route (build the engine/index) before the timed concurrent run.
-    {
-        let template = engine.prepare_relational_retained_read_template(select)?;
-        for b in 0..4 {
-            let needles = needles_for_batch(b, batch, step, rows);
-            let sub =
-                engine.submit_relational_retained_template_point_lookups(&template, &needles)?;
-            let _ = engine.complete_relational_retained_read_submission(sub)?;
-        }
+) -> Result<Lat, Box<dyn Error>> {
+    // Warm the exact production compact route before the timed concurrent run.
+    for b in 0..4 {
+        let needles = needles_for_batch(b, batch, step, rows);
+        let result = engine
+            .submit_sharded_point_lookups_batched_compact(select, &needles)?
+            .ok_or("production compact point route declined during concurrent warmup")?;
+        std::hint::black_box(result.needle_count());
     }
     let barrier = Arc::new(std::sync::Barrier::new(threads));
     let t = Instant::now();
@@ -307,33 +256,40 @@ fn measure_concurrent(
             let engine = Arc::clone(engine);
             let barrier = Arc::clone(&barrier);
             let select = select.clone();
-            std::thread::spawn(move || -> Result<(), String> {
-                let template = engine
-                    .prepare_relational_retained_read_template(&select)
-                    .map_err(|e| e.to_string())?;
+            std::thread::spawn(move || -> Result<Vec<u128>, String> {
+                let mut batch_micros = Vec::with_capacity(per_thread);
                 barrier.wait();
                 for i in 0..per_thread {
                     // Disjoint needle streams per worker so they don't all hit one cached needle.
                     let needles = needles_for_batch(w * per_thread + i, batch, step, rows);
-                    let sub = engine
-                        .submit_relational_retained_template_point_lookups(&template, &needles)
-                        .map_err(|e| e.to_string())?;
-                    engine
-                        .complete_relational_retained_read_submission(sub)
-                        .map_err(|e| e.to_string())?;
+                    let s0 = Instant::now();
+                    let result = engine
+                        .submit_sharded_point_lookups_batched_compact(&select, &needles)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| {
+                            "production compact point route declined during concurrent run"
+                                .to_string()
+                        })?;
+                    std::hint::black_box(result.needle_count());
+                    batch_micros.push(s0.elapsed().as_micros());
                 }
-                Ok(())
+                Ok(batch_micros)
             })
         })
         .collect();
+    let mut batch_micros = Vec::with_capacity(threads * per_thread);
     for w in workers {
-        w.join()
-            .expect("worker panicked")
-            .map_err(|e| -> Box<dyn Error> { e.into() })?;
+        batch_micros.extend(
+            w.join()
+                .expect("worker panicked")
+                .map_err(|e| -> Box<dyn Error> { e.into() })?,
+        );
     }
-    let secs = t.elapsed().as_secs_f64();
-    let total = (threads * per_thread * batch) as f64;
-    Ok(if secs == 0.0 { 0.0 } else { total / secs })
+    Ok(summarize(
+        batch_micros,
+        threads * per_thread * batch,
+        t.elapsed(),
+    ))
 }
 
 fn parse_csv_usize(s: &str) -> Vec<usize> {
@@ -372,10 +328,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     println!(
-        "# lpb-index A/B  rows={rows}  batches={batch_sizes:?}  measured_batches={batches}  warmup={warmup}"
+        "# sharded point result paths  rows={rows}  batches={batch_sizes:?}  measured_batches={batches}  warmup={warmup}"
     );
-    println!("# scan=index off | lpb-index=index_probe_enabled (GPU hash-index probe)");
-    println!("# single-flight = the production single-coalescer path; concurrent = the multi-producer ceiling\n");
+    println!(
+        "# compat-public = prepared dense route + established one-range-per-needle materialization"
+    );
+    println!(
+        "# production-compact = facade production entry + private all-present identity mapping"
+    );
+    println!(
+        "# one-caller sweep = production coalescer regime; concurrent = multi-producer ceiling\n"
+    );
 
     let rows_u = rows as u64;
     let mut step = 0x9E37_79B1u64 % rows_u.max(2);
@@ -399,90 +362,88 @@ fn main() -> Result<(), Box<dyn Error>> {
     let template = e.prepare_relational_retained_read_template(&select)?;
     println!("# executed_target={exec_target}\n");
 
-    // (batch, scan_ops, lpb_ops) for the closing summary.
-    let mut headline: Vec<(usize, f64, f64)> = Vec::new();
+    // (batch, compatibility p50/throughput, compact-production p50/throughput) for the closing summary.
+    let mut headline: Vec<(usize, u128, f64, u128, f64)> = Vec::new();
 
-    println!(
-        "## SINGLE-FLIGHT (one caller, varying batch) — the production single-coalescer regime"
-    );
+    println!("## ONE CALLER (varying batch) — the production single-coalescer regime");
     for &b in &batch_sizes {
         let batch = b.min(rows as usize);
 
-        // Correctness gate: scan == lpb, byte-identical, before any timing.
+        // Correctness gate: both result contracts are exact and non-vacuous before any timing.
         let probe = needles_for_batch(0, batch, step, rows_u);
-        let scan_rows = rows_once(&e, &template, Mode::Scan, &probe)?;
-        let lpb_rows = rows_once(&e, &template, Mode::Lpb, &probe)?;
-        assert_eq!(lpb_rows, scan_rows, "batch={batch}: lpb != scan");
+        let compat_rows = rows_once(&e, &template, &probe)?;
+        assert_eq!(
+            compat_rows.len(),
+            probe.len(),
+            "one result block per needle"
+        );
+        for (row, &needle) in compat_rows.iter().zip(&probe) {
+            assert_eq!(row.len(), 1, "every benchmark needle is present and unique");
+            assert_eq!(
+                row.row(0),
+                [
+                    SqlValue::Int4(needle),
+                    SqlValue::Int4(((i64::from(needle) * 7) % 100_000) as i32),
+                ],
+                "per-needle compatibility result is non-vacuous"
+            );
+        }
+        let compact = e
+            .submit_sharded_point_lookups_batched_compact(&select, &probe)?
+            .expect("production compact point route must serve the benchmark shape");
+        assert_eq!(compact.needle_count(), probe.len());
+        for (needle, &value) in probe.iter().enumerate() {
+            assert_eq!(
+                compact.needle_values(needle),
+                [value, ((i64::from(value) * 7) % 100_000) as i32],
+                "production compact result is byte-identical and non-vacuous"
+            );
+        }
 
-        let scan = measure(
-            &e,
-            &template,
-            Mode::Scan,
-            batch,
-            batches,
-            warmup,
-            step,
-            rows_u,
-        )?;
-        let lpb = measure(
-            &e,
-            &template,
-            Mode::Lpb,
-            batch,
-            batches,
-            warmup,
-            step,
-            rows_u,
-        )?;
-        let lpb_b = measure_batched(
-            &e,
-            &template,
-            Mode::Lpb,
-            batch,
-            batches,
-            warmup,
-            step,
-            rows_u,
-        )?;
-        let lpb_dense_b = measure_batched_dense(
-            &e,
-            &template,
-            Mode::Lpb,
-            batch,
-            batches,
-            warmup,
-            step,
-            rows_u,
-            true,
-        )?;
-        let sp_scan = if scan.ops_per_s > 0.0 {
-            lpb.ops_per_s / scan.ops_per_s
+        let compat = measure(&e, &template, batch, batches, warmup, step, rows_u)?;
+        let compact = measure_batched(&e, &select, batch, batches, warmup, step, rows_u)?;
+        let compact_speedup = if compat.ops_per_s > 0.0 {
+            compact.ops_per_s / compat.ops_per_s
         } else {
             0.0
         };
         println!("\n### batch={batch}");
-        print_lat(Mode::Scan.label(), &scan);
-        print_lat(Mode::Lpb.label(), &lpb);
-        print_lat("lpb-batched", &lpb_b);
-        print_lat("lpb-DENSE-batched", &lpb_dense_b);
-        let sp_dense_b = if lpb_b.ops_per_s > 0.0 {
-            lpb_dense_b.ops_per_s / lpb_b.ops_per_s
+        print_lat("compat-public", &compat);
+        print_lat("prod-compact", &compact);
+        println!(
+            "  compact/public comparison: p50 batch latency {}/{}us | throughput {:.0}/{:.0} \
+             lookups/s ({compact_speedup:.2}x)",
+            compact.p50, compat.p50, compact.ops_per_s, compat.ops_per_s
+        );
+        headline.push((
+            batch,
+            compat.p50,
+            compat.ops_per_s,
+            compact.p50,
+            compact.ops_per_s,
+        ));
+    }
+
+    println!("\n## ONE-CALLER summary  (p50 batch latency + lookups/s by batch)");
+    println!(
+        "  {:>8}  {:>14}  {:>17}  {:>14}  {:>17}  {:>10}",
+        "batch",
+        "compat p50 us",
+        "compat lookups/s",
+        "compact p50 us",
+        "compact lookups/s",
+        "compact/compat"
+    );
+    for (b, compat_p50, compat_ops, compact_p50, compact_ops) in &headline {
+        let speedup = if *compat_ops > 0.0 {
+            compact_ops / compat_ops
         } else {
             0.0
         };
-        println!("  lpb/scan: {sp_scan:.2}x lookups/s");
-        println!("  BATCHED dense/atomic: {sp_dense_b:.2}x    (batched completion = one flat result, no per-needle structs)");
-        headline.push((batch, scan.ops_per_s, lpb.ops_per_s));
-    }
-
-    println!("\n## SINGLE-FLIGHT summary  (lookups/s by batch)");
-    println!(
-        "  {:>8}  {:>13}  {:>13}  {:>10}",
-        "batch", "scan", "lpb-index", "lpb/scan"
-    );
-    for (b, s, l) in &headline {
-        let spl = if *s > 0.0 { l / s } else { 0.0 };
-        println!("  {b:>8}  {s:>13.0}  {l:>13.0}  {spl:>9.2}x");
+        println!(
+            "  {b:>8}  {compat_p50:>14}  {compat_ops:>17.0}  {compact_p50:>14}  \
+             {compact_ops:>17.0}  {speedup:>9.2}x"
+        );
     }
 
     // Concurrent section — N producers hammering one shared Engine (NOT the production single-coalescer path).
@@ -493,34 +454,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!(
             "\n## CONCURRENT (N threads, one shared Engine, batch={conc_batch}, {per_thread} batches/thread)"
         );
-        println!("# scan/lpb pipeline the per-batch launches across threads. NOT the prod single-coalescer path.");
+        println!("# production compact batches pipeline launches across threads; not the single-coalescer path.");
         println!(
-            "  {:>8}  {:>13}  {:>13}  {:>10}",
-            "threads", "scan", "lpb-index", "lpb/scan"
+            "  {:>8}  {:>14}  {:>17}  {:>14}",
+            "threads", "p50 batch us", "lookups/s", "us/lookup"
         );
         for &threads in &thread_counts {
-            let s = measure_concurrent(
-                &engine,
-                &select,
-                Mode::Scan,
-                conc_batch,
-                threads,
-                per_thread,
-                step,
-                rows_u,
+            let compact = measure_concurrent(
+                &engine, &select, conc_batch, threads, per_thread, step, rows_u,
             )?;
-            let l = measure_concurrent(
-                &engine,
-                &select,
-                Mode::Lpb,
-                conc_batch,
-                threads,
-                per_thread,
-                step,
-                rows_u,
-            )?;
-            let spl = if s > 0.0 { l / s } else { 0.0 };
-            println!("  {threads:>8}  {s:>13.0}  {l:>13.0}  {spl:>9.2}x");
+            println!(
+                "  {threads:>8}  {:>14}  {:>17.0}  {:>14.3}",
+                compact.p50, compact.ops_per_s, compact.per_lookup_us
+            );
         }
     }
 

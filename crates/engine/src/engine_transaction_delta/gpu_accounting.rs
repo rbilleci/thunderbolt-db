@@ -377,6 +377,7 @@ impl Engine {
             gpu_id,
             schema: table.schema.clone(),
             table: table.name.clone(),
+            point_route_generation: Arc::new(()),
             device_memory_proof: Some(memory.metadata().clone()),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,

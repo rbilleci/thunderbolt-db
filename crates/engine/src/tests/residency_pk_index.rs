@@ -238,6 +238,306 @@ fn cross_shard_pk_index_cache_rebuilds_on_in_place_append() {
     assert_eq!(appended.len(), 1, "appended id=250 is located");
 }
 
+/// Append publication must advance only the exact index allocation that received the inserted keys. A
+/// same-payload/same-row-count replacement between kernel completion and cache update is deliberately installed
+/// for both unfused and fused apply; its old basis must force a rebuild instead of becoming a false-complete miss.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn cross_shard_pk_index_append_success_requires_exact_index_owner() {
+    let run = |fused: bool| {
+        let e = std::sync::Arc::new(Engine::new_local());
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_fused_apply_enabled(fused);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE append_owner (id INT PRIMARY KEY, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                i as u64 + 2,
+                &format!(
+                    "INSERT INTO append_owner (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
+            )
+            .unwrap();
+        }
+        let table = e.relational_catalog_table("append_owner").unwrap();
+        let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+        assert_eq!(
+            e.locate_resident_pk_via_shard_index(&table, id_col, 195)
+                .unwrap()
+                .len(),
+            1,
+            "precondition: open-shard index is cached"
+        );
+        let fused_hits_before_target = e.fused_apply_hits();
+
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        e.set_shard_pk_index_append_post_launch_hook(
+            std::sync::Arc::clone(&reached),
+            std::sync::Arc::clone(&resume),
+        );
+        let writer_engine = std::sync::Arc::clone(&e);
+        let writer = std::thread::spawn(move || {
+            writer_engine.execute_text(
+                10_000,
+                "INSERT INTO append_owner (id, balance) VALUES (250, 2500)",
+            )
+        });
+        reached.wait();
+
+        let (cache_key, old_row_count, gpu_id, index_bytes) = {
+            let cache = e
+                .read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (key, entry) = cache
+                .iter()
+                .find(|((table, _, key_id), entry)| {
+                    table == "append_owner" && *key_id == id_col && entry.device_index.is_some()
+                })
+                .expect("launched index remains map-owned while writer is paused");
+            let index = entry.device_index.as_ref().unwrap();
+            (
+                key.clone(),
+                entry.row_count,
+                index.metadata().gpu_id,
+                index.metadata().allocated_bytes,
+            )
+        };
+        let replacement = std::sync::Arc::new(
+            e.cuda_driver_probe_runtime()
+                .retain_device_memory_zeroed(gpu_id, index_bytes)
+                .unwrap(),
+        );
+        {
+            let mut cache = e
+                .read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.get_mut(&cache_key).unwrap().device_index = Some(std::sync::Arc::clone(&replacement));
+        }
+        resume.wait();
+        writer.join().unwrap().unwrap();
+
+        {
+            let cache = e
+                .read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = cache.get(&cache_key).expect("replacement remains cached");
+            assert_eq!(
+                entry.row_count, old_row_count,
+                "{} success cannot advance an allocation that did not receive the key",
+                if fused { "fused" } else { "unfused" }
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                entry.device_index.as_ref().unwrap(),
+                &replacement
+            ));
+        }
+        let current = e.relational_catalog_table("append_owner").unwrap();
+        assert_eq!(
+            e.locate_resident_pk_via_shard_index(&current, id_col, 250)
+                .unwrap()
+                .len(),
+            1,
+            "the old replacement basis forces an exact rebuild containing the committed key"
+        );
+        assert_eq!(
+            e.fused_apply_hits(),
+            fused_hits_before_target + u64::from(fused),
+            "the target append must execute exactly the requested fused/unfused path"
+        );
+    };
+    run(false);
+    run(true);
+}
+
+/// Reinstalling benchmark-owned shards is a full payload-generation replacement. The common shard
+/// publication enforcement point must retire the old PK index before returning, or its resident guard
+/// pins the replaced payload outside current-residency accounting until an unrelated future lookup.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn benchmark_shard_reinstall_retires_old_pk_index_and_payload() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE benchmark_reinstall (id INT PRIMARY KEY)")
+        .unwrap();
+
+    let install = |e: &mut Engine, values: &[i32]| {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let allocated_bytes = bytes.len() as u64;
+        e.install_benchmark_relational_residency_owned_shards(
+            BenchmarkRelationalResidencyOwnedShardInstall {
+                table: "benchmark_reinstall",
+                gpu_id: 0,
+                shards: vec![BenchmarkRelationalResidencyOwnedShard {
+                    shard_id: 0,
+                    row_start: 0,
+                    row_count: values.len(),
+                    resident_bytes: allocated_bytes,
+                    allocated_bytes,
+                    resident_device_int4_columns: vec!["id".to_string()],
+                    resident_device_text_columns: Vec::new(),
+                    chunks: vec![CudaOwnedDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes,
+                    }],
+                }],
+            },
+        )
+        .unwrap();
+        allocated_bytes
+    };
+
+    install(&mut e, &[1, 2, 3, 4]);
+    let table = e.relational_catalog_table("benchmark_reinstall").unwrap();
+    let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+    assert_eq!(
+        e.locate_resident_pk_via_shard_index(&table, id_col, 3)
+            .unwrap()
+            .len(),
+        1,
+        "precondition: the first payload has a cached device index"
+    );
+    let (old_payload, old_index) = {
+        let cache = e
+            .read_state
+            .residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = cache
+            .iter()
+            .find(|((table, _, key_id), _)| {
+                table == "benchmark_reinstall" && *key_id == id_col
+            })
+            .map(|(_, entry)| entry)
+            .expect("first-generation index is cached");
+        (
+            std::sync::Arc::downgrade(&entry._resident_guard),
+            std::sync::Arc::downgrade(entry.device_index.as_ref().unwrap()),
+        )
+    };
+
+    let replacement_bytes = install(&mut e, &[10, 20, 30, 40]);
+    assert!(
+        e.read_state
+            .residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .all(|(table, _, _)| table != "benchmark_reinstall"),
+        "replacement returns with no index that pins the prior payload"
+    );
+    assert!(old_index.upgrade().is_none(), "old index allocation retired");
+    assert!(
+        old_payload.upgrade().is_none(),
+        "old payload has no hidden index guard owner"
+    );
+    assert_eq!(
+        e.relational_resident_bytes_for_gpu(0),
+        replacement_bytes,
+        "hard-budget accounting contains only the current replacement payload"
+    );
+}
+
+/// A synthetic all-live benchmark generation must also replace every version/identity sidecar from a prior
+/// normally admitted generation. Otherwise a new index build can consume old DELETE stamps and the orphan bytes
+/// disappear from current-descriptor hard-budget accounting.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn benchmark_shard_install_retires_prior_generation_sidecars() {
+    let mut e = Engine::new_local();
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE TABLE benchmark_history (id INT PRIMARY KEY)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO benchmark_history VALUES (1), (2), (3), (4)")
+        .unwrap();
+    e.execute_text(3, "DELETE FROM benchmark_history WHERE id >= 0")
+        .unwrap();
+    let old_sidecar = {
+        let shards = e.read_state.residency.shards.load();
+        let shard = shards
+            .get("benchmark_history")
+            .and_then(|shards| shards.iter().find(|shard| shard.deleted_by_region.is_some()))
+            .expect("normal DELETE generation carries a deleted_by sidecar");
+        std::sync::Arc::downgrade(shard.deleted_by_region.as_ref().unwrap())
+    };
+
+    let values = [10_i32, 20, 30, 40];
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let replacement_bytes = bytes.len() as u64;
+    e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
+            table: "benchmark_history",
+            gpu_id: 0,
+            shards: vec![BenchmarkRelationalResidencyOwnedShard {
+                shard_id: 0,
+                row_start: 0,
+                row_count: values.len(),
+                resident_bytes: replacement_bytes,
+                allocated_bytes: replacement_bytes,
+                resident_device_int4_columns: vec!["id".to_string()],
+                resident_device_text_columns: Vec::new(),
+                chunks: vec![CudaOwnedDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes,
+                }],
+            }],
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !table_has_any_deleted_by_cell(&e, "benchmark_history")
+            && !table_has_any_created_by_cell(&e, "benchmark_history")
+            && e
+                .read_state
+                .residency
+                .shard_row_id_memory
+                .get(&("benchmark_history".to_string(), 0))
+                .is_none(),
+        "sidecar-free replacement publishes no prior version sidecar"
+    );
+    assert!(
+        old_sidecar.upgrade().is_none(),
+        "prior-generation sidecar has no hidden durable owner"
+    );
+    assert_eq!(
+        e.relational_resident_bytes_for_gpu(0),
+        replacement_bytes,
+        "accounting contains only the current synthetic payload before index construction"
+    );
+    let table = e.relational_catalog_table("benchmark_history").unwrap();
+    let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+    assert_eq!(
+        e.locate_resident_pk_via_shard_index(&table, id_col, 20)
+            .unwrap()
+            .len(),
+        1,
+        "replacement index ignores retired DELETE stamps and finds the new row"
+    );
+}
+
 /// CROSS-SHARD PK INDEX sub-slice 3b (cache LIFECYCLE CLEANUP): the device index cache is PURGED for a
 /// table on the residency-change lifecycle events (an explicit vacuum rebuild, and DROP), so a
 /// wired index route can't leak the pinned shard buffers of a no-longer-resident table. Sabotage: make

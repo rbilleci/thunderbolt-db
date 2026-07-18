@@ -72,6 +72,7 @@ fn sharded_device_index_declines_at_residency_budget() {
             &[id, balance],
             &[20],
         )
+        .expect("batched GPU route completed")
         .is_none(),
         "the capped optional index must decline"
     );

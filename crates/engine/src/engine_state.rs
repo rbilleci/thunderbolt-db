@@ -541,6 +541,34 @@ pub(crate) struct ResidencyReadState {
     /// residency-retire site.
     pub(crate) shard_pk_device_index:
         Mutex<BTreeMap<(String, u32, usize), CachedShardPkDeviceIndex>>,
+    /// Generation-owned, GPU-resident multi-shard point route keyed by table/filter/projection shape.
+    /// Exact Arc publication identity makes a route reusable without re-enumerating every shard per batch;
+    /// a new publication misses and replaces it while in-flight readers keep the old plan pinned.
+    pub(crate) sharded_point_routes: ArcSwap<ShardedPointRouteMap>,
+    /// Serializes rare route-cache COW publications and retirement purges; cache-hit reads stay lock-free.
+    pub(crate) sharded_point_route_publish_lock: Mutex<()>,
+    /// PERF-001: count of batches that reused an exact-generation GPU-resident shard descriptor plan.
+    /// A nonzero value proves the hot route avoided per-batch shard enumeration and descriptor upload;
+    /// generation replacement/purge still forces a miss and rebuild.
+    pub(crate) sharded_point_route_cache_hits: std::sync::atomic::AtomicU64,
+    /// Test-only one-shot fault seam: 1=prepare, 2=submit, 3=completion. Production has no branch/state.
+    #[cfg(test)]
+    pub(crate) sharded_point_forced_cuda_failure: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    pub(crate) sharded_point_route_pre_publish_hook:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    /// Test-only interleaving seam after an index build completes but before it can publish.
+    #[cfg(test)]
+    pub(crate) shard_pk_index_pre_publish_hook:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    /// Test-only interleaving seam after append mutates its captured index but before basis publication.
+    #[cfg(test)]
+    pub(crate) shard_pk_index_append_post_launch_hook:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    /// Test-only interleaving seam after NULL eligibility is checked on the captured shard snapshot.
+    #[cfg(test)]
+    pub(crate) sharded_point_after_eligibility_hook:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     /// S-F/R-1 hard-cap serialization. Every allocation that becomes part of the durable
     /// relational resident set (admission payloads/mandatory regions and lazy device indexes)
     /// holds this lock from its budget preflight through publication. That closes the otherwise
@@ -747,13 +775,69 @@ pub(crate) struct ResidencyReadState {
 }
 
 impl ResidencyReadState {
+    #[cfg(test)]
+    pub(crate) fn run_shard_pk_index_append_post_launch_hook(&self) {
+        let hook = self
+            .shard_pk_index_append_post_launch_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((reached, resume)) = hook {
+            reached.wait();
+            resume.wait();
+        }
+    }
+
     /// Drop every cached device PK index for `table` at residency-retire sites so the cache does
     /// not retain a stale shard buffer or device allocation across a generation replacement.
     pub(crate) fn purge_shard_pk_index_for_table(&self, table: &str) {
+        // Route -> index is the global ownership order. Retire cached plans while their indexes remain
+        // map-accounted, drop this method's old-map guard, and only then remove the index entries. Prepared
+        // route publication holds the same route lock through its under-lock index-identity validation, so a
+        // purge cannot slip between validation and cache store.
+        let _publish = self
+            .sharded_point_route_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let current = self.sharded_point_routes.load();
+            if current
+                .keys()
+                .any(|(cached_table, _, _)| cached_table == table)
+            {
+                let mut next = (**current).clone();
+                next.retain(|(cached_table, _, _), _| cached_table != table);
+                self.sharded_point_routes.store(Arc::new(next));
+            }
+        }
         self.shard_pk_device_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|(cached_table, _, _), _| cached_table != table);
+    }
+
+    /// Retire cached prepared routes for the named tables. An already-submitted reader retains its
+    /// own plan Arc through completion, but the global cache stops pinning the generation before return.
+    fn purge_sharded_point_routes_for_tables<'a>(&self, tables: impl IntoIterator<Item = &'a str>) {
+        let tables = tables
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if tables.is_empty() {
+            return;
+        }
+        let _publish = self
+            .sharded_point_route_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.sharded_point_routes.load();
+        if current
+            .keys()
+            .any(|(cached_table, _, _)| tables.contains(cached_table.as_str()))
+        {
+            let mut next = (**current).clone();
+            next.retain(|(cached_table, _, _), _| !tables.contains(cached_table.as_str()));
+            self.sharded_point_routes.store(Arc::new(next));
+        }
     }
 
     /// W0: flag `table`'s residency descriptors (snapshot + every shard) invalidated at
@@ -808,6 +892,7 @@ impl ResidencyReadState {
         if !shards_flagged {
             let mut next = (**self.shards.load()).clone();
             if let Some(shards) = next.get_mut(table) {
+                let generation = Arc::new(());
                 for shard in shards.iter_mut() {
                     if shard.invalidated_by_txn_id.is_none() {
                         shard.invalidated_by_txn_id = Some(txn_id);
@@ -816,9 +901,14 @@ impl ResidencyReadState {
                     if let Some(proof) = shard.device_memory_proof.as_mut() {
                         proof.retained = false;
                     }
+                    shard.point_route_generation = Arc::clone(&generation);
                 }
             }
             self.shards.store(Arc::new(next));
+            // The invalidated publication is a new table generation even though its payload Arc is retained
+            // for already-captured readers. Rotate before purging while descriptor publication stays locked,
+            // so a G0 preparer cannot pass its route-lock recheck and republish after retirement.
+            self.purge_sharded_point_routes_for_tables(std::iter::once(table));
         }
     }
 
@@ -852,9 +942,60 @@ impl ResidencyReadState {
             .descriptor_publish_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut next = (**self.shards.load()).clone();
+        let current = self.shards.load_full();
+        let mut next = (*current).clone();
         let result = mutate(&mut next);
+        // Derive the exact changed-table set while publication is serialized, so no caller can forget
+        // to rotate the per-table token or retire its plan. RelationalResidentShard equality deliberately
+        // excludes `point_route_generation`; the comparison therefore reflects real descriptor changes.
+        let table_names = current
+            .keys()
+            .chain(next.keys())
+            .collect::<std::collections::BTreeSet<_>>();
+        let changed_tables = table_names
+            .into_iter()
+            .filter(|table| current.get(*table) != next.get(*table))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for table in &changed_tables {
+            if let Some(shards) = next.get_mut(table) {
+                let generation = Arc::new(());
+                for shard in shards {
+                    shard.point_route_generation = Arc::clone(&generation);
+                }
+            }
+        }
         self.shards.store(Arc::new(next));
+        // Store-before-purge is deliberate. New readers immediately see a new table token; old readers
+        // fail their under-lock global-token recheck. Retaining descriptor_publish_lock through this purge
+        // closes the prior purge-before-publication re-insertion window.
+        self.purge_sharded_point_routes_for_tables(changed_tables.iter().map(String::as_str));
+        result
+    }
+
+    /// Publish a mutation whose owner already knows the one affected table. Hot append/admission paths use
+    /// this form so rotating the point-route token stays O(1) beyond the shard-map clone they already pay;
+    /// the generic form above remains for rare multi-table maintenance and derives its changed set exactly.
+    pub(crate) fn with_shards_mut_for_table<R>(
+        &self,
+        table: &str,
+        mutate: impl FnOnce(&mut BTreeMap<String, Vec<RelationalResidentShard>>) -> R,
+    ) -> R {
+        let _publish = self
+            .descriptor_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.shards.load_full();
+        let mut next = (*current).clone();
+        let result = mutate(&mut next);
+        if let Some(shards) = next.get_mut(table) {
+            let generation = Arc::new(());
+            for shard in shards {
+                shard.point_route_generation = Arc::clone(&generation);
+            }
+        }
+        self.shards.store(Arc::new(next));
+        self.purge_sharded_point_routes_for_tables(std::iter::once(table));
         result
     }
 }

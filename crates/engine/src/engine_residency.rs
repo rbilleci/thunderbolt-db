@@ -441,6 +441,15 @@ impl Engine {
             .filter(|memory| memory.metadata().gpu_id == gpu_id)
             .map(|memory| memory.metadata().allocated_bytes)
             .sum::<u64>();
+        let route_descriptors = self
+            .read_state
+            .residency
+            .sharded_point_routes
+            .load()
+            .iter()
+            .filter(|((name, _, _), route)| name.as_str() != table && route.gpu_id == gpu_id)
+            .map(|(_, route)| route.plan.descriptor_allocated_bytes())
+            .sum::<u64>();
         // Transaction-private device generations are not attributable to an evictable global
         // table. Keep their retained charge in every "excluding table" admission projection.
         let private_bytes = self
@@ -455,6 +464,7 @@ impl Engine {
             .saturating_add(shard_bytes)
             .saturating_add(single_indexes)
             .saturating_add(shard_indexes)
+            .saturating_add(route_descriptors)
             .saturating_add(private_bytes)
     }
 
@@ -538,11 +548,22 @@ impl Engine {
             .filter(|memory| memory.metadata().gpu_id == gpu_id)
             .map(|memory| memory.metadata().allocated_bytes)
             .sum::<u64>();
+        let route_descriptor_bytes = self
+            .read_state
+            .residency
+            .sharded_point_routes
+            .load()
+            .iter()
+            .filter(|((name, _, _), route)| name == table && route.gpu_id == gpu_id)
+            .map(|(_, route)| route.plan.descriptor_allocated_bytes())
+            .sum::<u64>();
         (
             snapshot_bytes
                 .saturating_add(snapshot_sidecar_bytes)
                 .saturating_add(shard_bytes),
-            single_index_bytes.saturating_add(shard_index_bytes),
+            single_index_bytes
+                .saturating_add(shard_index_bytes)
+                .saturating_add(route_descriptor_bytes),
         )
     }
 

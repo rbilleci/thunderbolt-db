@@ -466,25 +466,28 @@ impl Engine {
                     );
                 }
             }
-            self.read_state.residency.with_shards_mut(|shards| {
-                if let Some(table_shards) = shards.get_mut(table) {
-                    if let Some(open) = table_shards.last_mut() {
-                        open.row_count += k;
-                        // D3: the high-water publishes WITH the row_count that exposes the slots —
-                        // a reader at s >= hwm treats the shard as effectively version-free.
-                        open.max_created_by = open.max_created_by.max(stamps_max);
-                        open.resident_bytes = open.resident_bytes.saturating_add(appended_bytes);
-                        for (stat, (lo, hi)) in open
-                            .resident_device_int4_column_stats
-                            .iter_mut()
-                            .zip(new_min_max.iter())
-                        {
-                            stat.min = stat.min.min(*lo);
-                            stat.max = stat.max.max(*hi);
+            self.read_state
+                .residency
+                .with_shards_mut_for_table(table, |shards| {
+                    if let Some(table_shards) = shards.get_mut(table) {
+                        if let Some(open) = table_shards.last_mut() {
+                            open.row_count += k;
+                            // D3: the high-water publishes WITH the row_count that exposes the slots —
+                            // a reader at s >= hwm treats the shard as effectively version-free.
+                            open.max_created_by = open.max_created_by.max(stamps_max);
+                            open.resident_bytes =
+                                open.resident_bytes.saturating_add(appended_bytes);
+                            for (stat, (lo, hi)) in open
+                                .resident_device_int4_column_stats
+                                .iter_mut()
+                                .zip(new_min_max.iter())
+                            {
+                                stat.min = stat.min.min(*lo);
+                                stat.max = stat.max.max(*hi);
+                            }
                         }
                     }
-                }
-            });
+                });
             self.read_state
                 .residency
                 .open_shard_append_hits
@@ -673,6 +676,7 @@ impl Engine {
             gpu_id,
             schema,
             table: table.to_string(),
+            point_route_generation: Arc::new(()),
             device_memory_proof: Some(new_device_memory.metadata().clone()),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
@@ -708,11 +712,13 @@ impl Engine {
             new_shard_id,
             new_device_memory,
         );
-        self.read_state.residency.with_shards_mut(|shards| {
-            if let Some(table_shards) = shards.get_mut(table) {
-                table_shards.push(new_shard);
-            }
-        });
+        self.read_state
+            .residency
+            .with_shards_mut_for_table(table, |shards| {
+                if let Some(table_shards) = shards.get_mut(table) {
+                    table_shards.push(new_shard);
+                }
+            });
         self.read_state
             .residency
             .open_shard_append_hits
@@ -856,15 +862,17 @@ impl Engine {
                         .insert_shard(table, shard_id, Arc::clone(&region));
                     // D4: republish the descriptor with the same region before releasing the
                     // allocation transaction; readers obtain resources from one shard snapshot.
-                    self.read_state.residency.with_shards_mut(|shards| {
-                        if let Some(table_shards) = shards.get_mut(table) {
-                            if let Some(shard) =
-                                table_shards.iter_mut().find(|s| s.shard_id == shard_id)
-                            {
-                                shard.deleted_by_region = Some(Arc::clone(&region));
+                    self.read_state
+                        .residency
+                        .with_shards_mut_for_table(table, |shards| {
+                            if let Some(table_shards) = shards.get_mut(table) {
+                                if let Some(shard) =
+                                    table_shards.iter_mut().find(|s| s.shard_id == shard_id)
+                                {
+                                    shard.deleted_by_region = Some(Arc::clone(&region));
+                                }
                             }
-                        }
-                    });
+                        });
                     region
                 }
             }
@@ -946,13 +954,15 @@ impl Engine {
         // D4 (ADR-013 pre2): REPUBLISH the descriptor with the new region (see the
         // deleted_by twin above). Born all-visible (fill 0), so a reader observing the
         // republished descriptor mid-commit is unchanged until the stamps + row_count land.
-        self.read_state.residency.with_shards_mut(|shards| {
-            if let Some(table_shards) = shards.get_mut(table) {
-                if let Some(shard) = table_shards.iter_mut().find(|s| s.shard_id == shard_id) {
-                    shard.created_by_region = Some(Arc::clone(&region));
+        self.read_state
+            .residency
+            .with_shards_mut_for_table(table, |shards| {
+                if let Some(table_shards) = shards.get_mut(table) {
+                    if let Some(shard) = table_shards.iter_mut().find(|s| s.shard_id == shard_id) {
+                        shard.created_by_region = Some(Arc::clone(&region));
+                    }
                 }
-            }
-        });
+            });
         Some(region)
     }
 
@@ -1022,6 +1032,7 @@ impl Engine {
         // More than one live entry -> not eligible (the fused kernel inserts into one index).
         let mut index_arg: Option<gpu_db_execution::CudaWriteIndex> = None;
         let mut index_col: Option<usize> = None;
+        let mut index_owner: Option<Arc<CudaResidentDeviceMemory>> = None;
         {
             let new_count = row_count + k;
             let device_ptr = shard_device_memory.device_ptr();
@@ -1057,11 +1068,9 @@ impl Engine {
                         // the grown size (unfused rule), then run WITHOUT index maintenance.
                         self.read_state
                             .residency
-                            .shard_pk_device_index
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .remove(&(table.to_string(), shard_id, col_idx));
+                            .purge_shard_pk_index_for_table(table);
                     } else {
+                        index_owner = Some(Arc::clone(&index));
                         index_arg = Some(gpu_db_execution::CudaWriteIndex {
                             memory: index,
                             table_mask,
@@ -1100,25 +1109,43 @@ impl Engine {
                 byte_offset: 0,
             },
         };
-        match shard_device_memory.submit_i32_fused_apply(&request) {
+        let apply_result = shard_device_memory.submit_i32_fused_apply(&request);
+        #[cfg(test)]
+        if matches!(&apply_result, Ok(false)) {
+            self.read_state
+                .residency
+                .run_shard_pk_index_append_post_launch_hook();
+        }
+        match apply_result {
             Ok(dup) => {
                 if let Some(col_idx) = index_col {
-                    // Post-launch entry update, mirroring the unfused path: advance the basis,
-                    // or DECLINE monotonically on a dup/overflow verdict.
-                    let mut cache = self
-                        .read_state
-                        .residency
-                        .shard_pk_device_index
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Some(entry) = cache.get_mut(&(table.to_string(), shard_id, col_idx)) {
-                        if entry.resident_device_ptr == shard_device_memory.device_ptr()
-                            && entry.row_count == row_count
+                    if dup {
+                        // The fused insert overflowed its bounded probe. Retire prepared routes before the
+                        // unusable index leaves the accounted map; a later probe rebuilds safely.
+                        self.read_state
+                            .residency
+                            .purge_shard_pk_index_for_table(table);
+                    } else {
+                        // Post-launch entry update, mirroring the unfused path: advance the basis,
+                        // while preserving the same allocation/accounting owner.
+                        let mut cache = self
+                            .read_state
+                            .residency
+                            .shard_pk_device_index
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(entry) = cache.get_mut(&(table.to_string(), shard_id, col_idx))
                         {
-                            if dup {
-                                entry.device_index = None;
+                            if entry.resident_device_ptr == shard_device_memory.device_ptr()
+                                && entry.row_count == row_count
+                                && entry.device_index.as_ref().is_some_and(|current| {
+                                    index_owner
+                                        .as_ref()
+                                        .is_some_and(|launched| Arc::ptr_eq(current, launched))
+                                })
+                            {
+                                entry.row_count = row_count + k;
                             }
-                            entry.row_count = row_count + k;
                         }
                     }
                 }
@@ -1129,15 +1156,12 @@ impl Engine {
                 Some(true)
             }
             Err(_) => {
-                if let Some(col_idx) = index_col {
+                if index_col.is_some() {
                     // A failed launch may have partially mutated the index -> drop the entry
                     // (rebuild on next probe); never a wrong index. Same as the unfused path.
                     self.read_state
                         .residency
-                        .shard_pk_device_index
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&(table.to_string(), shard_id, col_idx));
+                        .purge_shard_pk_index_for_table(table);
                 }
                 Some(false)
             }

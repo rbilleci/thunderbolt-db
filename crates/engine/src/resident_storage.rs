@@ -39,11 +39,29 @@ pub(crate) struct WaveResidentIndex {
 pub(crate) struct CachedShardPkDeviceIndex {
     pub(crate) resident_device_ptr: u64,
     pub(crate) row_count: usize,
+    /// Rows deleted at or below this boundary were omitted when the index was built. A cached index
+    /// can serve a reader only when this boundary is no newer than the reader's pinned snapshot.
+    pub(crate) gc_boundary: Index,
     pub(crate) _resident_guard: Arc<CudaResidentDeviceMemory>,
     pub(crate) device_index: Option<Arc<CudaResidentDeviceMemory>>,
     pub(crate) table_mask: u32,
     pub(crate) hash_shift: u32,
 }
+
+/// Prepared GPU-native point route for one exact published shard generation and projection shape.
+/// `table_generation` is the immutable per-table publication identity; `plan` owns the device descriptor
+/// table and pins the exact payload/index/MVCC resources it names. Unrelated tables do not invalidate it.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedShardedPointRoute {
+    pub(crate) table_generation: Arc<()>,
+    pub(crate) read_boundary: Index,
+    pub(crate) gpu_id: u16,
+    pub(crate) launch_resident: Arc<CudaResidentDeviceMemory>,
+    pub(crate) plan: Arc<gpu_db_execution::CudaI32MultiShardProbePlan>,
+}
+
+pub(crate) type ShardedPointRouteKey = (String, usize, Vec<usize>);
+pub(crate) type ShardedPointRouteMap = BTreeMap<ShardedPointRouteKey, CachedShardedPointRoute>;
 
 /// Per-table GPU-resident device memory, each table behind its own [`SnapshotCell`]
 /// generation. A reader `get`s an owned `Arc` (a refcount bump, no borrow of the map)
@@ -916,6 +934,9 @@ pub(crate) struct RelationalResidentShard {
     pub(crate) gpu_id: u16,
     pub(crate) schema: String,
     pub(crate) table: String,
+    /// O(1) per-table identity used by prepared point routes. Every published metadata/resource change
+    /// for this table installs one new token across all of its shards; unrelated table COW does not.
+    pub(crate) point_route_generation: Arc<()>,
     pub(crate) device_memory_proof: Option<CudaDeviceMemoryProof>,
     pub(crate) invalidated_by_txn_id: Option<TxnId>,
     pub(crate) invalidated_at_index: Option<Index>,
@@ -1024,7 +1045,7 @@ impl RelationalResidentCache {
     ) {
         residency.with_snapshots_mut(|snapshots| snapshots.remove(table));
         residency.device_memory.remove(table);
-        residency.with_shards_mut(|shards| shards.remove(table));
+        residency.with_shards_mut_for_table(table, |shards| shards.remove(table));
         residency.shard_device_memory.remove_table(table);
         // SV4 prereq #1 (lifecycle): this is the BUDGET-EVICTION cleanup (a table evicted to make room while a
         // DIFFERENT table is admitted) -- there is NO preceding `invalidate_*` for the evictee, so release its
@@ -1079,9 +1100,56 @@ impl RelationalResidentCache {
         for shard in &mut shards {
             shard.device_memory = device_memory.get(&shard.shard_id).cloned();
         }
+        let deleted_by_memory = shards
+            .iter()
+            .filter_map(|shard| {
+                shard
+                    .deleted_by_region
+                    .as_ref()
+                    .map(|memory| (shard.shard_id, Arc::clone(memory)))
+            })
+            .collect();
+        let created_by_memory = shards
+            .iter()
+            .filter_map(|shard| {
+                shard
+                    .created_by_region
+                    .as_ref()
+                    .map(|memory| (shard.shard_id, Arc::clone(memory)))
+            })
+            .collect();
+        let row_id_memory = shards
+            .iter()
+            .filter_map(|shard| {
+                shard
+                    .row_id_region
+                    .as_ref()
+                    .map(|memory| (shard.shard_id, Arc::clone(memory)))
+            })
+            .collect();
         residency
             .shard_device_memory
             .install_table_shards(&table, device_memory);
-        residency.with_shards_mut(|map| map.insert(table, shards));
+        // Side maps are generation state too. Republish the exact regions carried by the replacement
+        // descriptors (and tombstone every absent prior region) before those descriptors become visible. This
+        // prevents a sidecar-free benchmark replacement from inheriting prior DELETE/CREATE/row-id state or
+        // leaving that old allocation outside current-descriptor budget accounting.
+        residency
+            .shard_deleted_by_memory
+            .install_table_shards(&table, deleted_by_memory);
+        residency
+            .shard_created_by_memory
+            .install_table_shards(&table, created_by_memory);
+        residency
+            .shard_row_id_memory
+            .install_table_shards(&table, row_id_memory);
+        // Replacing the globally-current payload generation retires every index and prepared route that
+        // pins the prior generation. Publish the new side-map cells first so an old concurrent builder's
+        // pre-publication identity check cannot install durably; this ordered purge then removes any entry
+        // published before the replacement. Keep this at the common installation enforcement point so
+        // benchmark reinstallation cannot retain an unaccounted old payload through an index guard.
+        residency.purge_shard_pk_index_for_table(&table);
+        let generation_table = table.clone();
+        residency.with_shards_mut_for_table(&generation_table, |map| map.insert(table, shards));
     }
 }
