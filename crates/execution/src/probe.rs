@@ -66,6 +66,15 @@ impl Probe {
         }
     }
 
+    /// Print a measured scalar beside the wall-clock phases (for example a CUDA event duration). Empty
+    /// when `probe-timing` is off. Keeping scalar reporting here gives permanent probes one stable output
+    /// format without making production callers carry feature gates.
+    #[inline(always)]
+    pub fn value(_label: &str, _value: u64, _unit: &str) {
+        #[cfg(feature = "probe-timing")]
+        eprintln!("[probe] {_label} {_value}{_unit}");
+    }
+
     /// A drop-scoped timer: prints `label` + the elapsed time when the returned guard drops (e.g. at the end
     /// of the enclosing function/block). Convenient for whole-function timing without a trailing `mark`.
     #[inline(always)]

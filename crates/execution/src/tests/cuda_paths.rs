@@ -228,6 +228,42 @@
                 },
             ]
         );
+
+        // The public read view and split submission are independently owned safe handles. Prove both layers:
+        // the view remains usable after the allocation facade drops, then the returned submission pins the exact
+        // source allocation after the view drops. The Weak witness makes this independent of `cuMemFree`'s
+        // synchronizing behavior (which could otherwise let a broken submit-before-drop test pass vacuously).
+        let read_view = resident.read_view();
+        let allocation = resident.allocation_weak_for_test();
+        drop(resident);
+        assert!(
+            allocation.is_alive(),
+            "the independently owned read view retains the source allocation"
+        );
+        let detached = read_view
+            .submit_match_project_i32_equal_any_from_payload(
+                filter_offset,
+                &[2, 4],
+                &[projection_offset],
+                row_count,
+            )
+            .expect("submit through surviving independently owned read view");
+        drop(read_view);
+        assert!(
+            allocation.is_alive(),
+            "the deferred submission retains the source allocation after the view drops"
+        );
+        assert_eq!(
+            detached
+                .complete_detached()
+                .expect("submission retains source allocation after owner/view drop")
+                .0,
+            sync_rows
+        );
+        assert!(
+            !allocation.is_alive(),
+            "completion releases the submission's final allocation guard"
+        );
     }
 
     #[test]
@@ -388,6 +424,56 @@
             final_rows, expected,
             "pools left unsound after drop-without-complete reuse"
         );
+
+        let mut caller_needles = vec![2, 4];
+        let staged = resident
+            .submit_match_project_i32_equal_any_from_payload(
+                filter_offset,
+                &caller_needles,
+                &[projection_offset],
+                row_count,
+            )
+            .expect("owned-source submit");
+        assert_ne!(
+            staged.staged_needles_ptr_for_test(),
+            caller_needles.as_ptr().cast(),
+            "safe deferred submission must DMA from an owned copy, not the caller slice"
+        );
+        caller_needles.fill(-1);
+        assert_eq!(
+            staged.complete(&resident).expect("owned-source complete"),
+            expected,
+            "caller mutation after submit cannot alter the staged H2D source"
+        );
+
+        // Panic after the first result D2H has been queued. The local host-copy drain must synchronize before
+        // any pinned lease/Vec unwinds; submission Drop then returns all shared resources in a reusable state.
+        let completion = resident
+            .submit_match_project_i32_equal_any_from_payload(
+                filter_offset,
+                &[2, 4],
+                &[projection_offset],
+                row_count,
+            )
+            .expect("submit before atomic completion panic");
+        crate::point_read_submission::force_next_atomic_completion_panic(1);
+        let completion_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = completion.complete_detached_columnar();
+        }));
+        assert!(completion_panic.is_err(), "the atomic completion panic hook fired");
+        assert_eq!(
+            resident
+                .submit_match_project_i32_equal_any_from_payload(
+                    filter_offset,
+                    &[2, 4],
+                    &[projection_offset],
+                    row_count,
+                )
+                .expect("submit after atomic completion panic")
+                .complete(&resident)
+                .expect("shared pools remain reusable after atomic completion panic"),
+            expected
+        );
     }
 
     #[test]
@@ -421,6 +507,96 @@
         );
         let projection_offsets = [0, row_count * std::mem::size_of::<i32>() as u64];
         let needles = [1, 2_048, 4_096, -1];
+
+        let bounded_resident = runtime
+            .retain_device_memory_copy(0, &7_i32.to_le_bytes())
+            .expect("one-row resident memory");
+        let bounded_mask = 1_u32;
+        let bounded_shift = 31_u32;
+        let mut corrupt_index = [0_u64; 2];
+        let corrupt_slot = (7_u32.wrapping_mul(0x9E37_79B1) >> bounded_shift) & bounded_mask;
+        corrupt_index[corrupt_slot as usize] = (7_u64 << 32) | 2;
+        let corrupt_bytes: Vec<u8> = corrupt_index
+            .iter()
+            .flat_map(|entry| entry.to_le_bytes())
+            .collect();
+        let corrupt_index = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &corrupt_bytes)
+                .expect("corrupt-row index memory"),
+        );
+        let corrupt_dense = bounded_resident
+            .submit_match_project_i32_index_probe_dense_from_payload(
+                &corrupt_index,
+                bounded_mask,
+                bounded_shift,
+                &[7],
+                &[0],
+                1,
+            )
+            .expect("structurally valid corrupt-row dense submit")
+            .complete_detached_columnar()
+            .expect("corrupt row fails closed without a device fault")
+            .0;
+        assert_eq!(corrupt_dense.status, [2]);
+        let corrupt_atomic = bounded_resident
+            .submit_match_project_i32_index_probe_from_payload(
+                &corrupt_index,
+                bounded_mask,
+                bounded_shift,
+                &[7],
+                &[0],
+                1,
+            )
+            .expect("structurally valid corrupt-row atomic submit")
+            .complete(&bounded_resident)
+            .expect("atomic corrupt row fails closed without a device fault");
+        assert!(corrupt_atomic.is_empty());
+
+        let short_index = Arc::new(
+            runtime
+                .retain_device_memory_zeroed(0, std::mem::size_of::<u64>() as u64)
+                .expect("short index allocation"),
+        );
+        assert!(
+            resident
+                .submit_match_project_i32_index_probe_dense_from_payload(
+                    &short_index,
+                    table_mask,
+                    hash_shift,
+                    &needles,
+                    &projection_offsets,
+                    row_count,
+                )
+                .is_err(),
+            "safe dense API rejects an index allocation shorter than mask geometry"
+        );
+        assert!(
+            resident
+                .submit_match_project_i32_index_probe_dense_from_payload(
+                    &index,
+                    table_mask,
+                    hash_shift.wrapping_add(1),
+                    &needles,
+                    &projection_offsets,
+                    row_count,
+                )
+                .is_err(),
+            "safe dense API rejects incoherent mask/hash-shift geometry"
+        );
+        assert!(
+            resident
+                .submit_match_project_i32_index_probe_dense_from_payload(
+                    &index,
+                    table_mask,
+                    hash_shift,
+                    &needles,
+                    &[1],
+                    row_count,
+                )
+                .is_err(),
+            "safe dense API rejects a misaligned projection before launch"
+        );
 
         let assert_complete = |columns: CudaI32BatchProjectionColumns| {
             assert_eq!(columns.status, [1, 1, 1, 2]);

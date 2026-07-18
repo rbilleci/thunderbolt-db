@@ -50,7 +50,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use gpu_db_batching::{Batch, DualTriggerBatcher};
-use gpu_db_engine::{Engine, ExecuteError, RelationalRetainedBatchResult};
+use gpu_db_engine::{
+    Engine, ExecuteError, RelationalColumn, RelationalPointBatchResult,
+    RelationalRetainedBatchResult,
+};
 use gpu_db_sql::Select;
 use tokio::sync::oneshot;
 
@@ -585,15 +588,22 @@ fn run_group(
     // the batched cross-shard gather when `shard_batched_point_read_enabled` is ON. `None` = the flag is OFF,
     // the table is not shard-resident, or the gather declined (e.g. a duplicate int4 key) -> fall through to
     // the single-buffer template (single-buffer tables) / the per-query fallback (shard-resident decline).
-    if let Some(batched) =
-        engine.submit_sharded_point_lookups_batched(&group[0].select, &distinct_needles)
-    {
-        activity
-            .sharded_batched_groups
-            .fetch_add(1, AtomicOrdering::Relaxed);
-        debug_assert_eq!(batched.needle_count(), distinct_needles.len());
-        distribute_results_batched(group, request_result_index, batched);
-        return;
+    match engine.submit_sharded_point_lookups_batched_compact(&group[0].select, &distinct_needles) {
+        Ok(Some(batched)) => {
+            activity
+                .sharded_batched_groups
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            debug_assert_eq!(batched.needle_count(), distinct_needles.len());
+            distribute_results_batched(group, request_result_index, batched);
+            return;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            // A CUDA/runtime failure is not an eligibility decline. Fan it out directly; never retry the
+            // same request through another relational route and thereby mask the originating device fault.
+            fail_group(group, err);
+            return;
+        }
     }
     // A shard-resident gather decline must take the byte-identical per-query GPU route directly.
     // Do not attempt the single-buffer template: a compatibility snapshot may produce a `Ready`
@@ -694,12 +704,55 @@ fn dedup_needles(group: &[PointLookupRequest]) -> (Vec<i32>, Vec<usize>) {
 /// (was per-needle), then slice the one flat `RowBlock` by each needle's range to build that request's
 /// `QueryOutcome::Rows` — avoiding the N per-needle `RelationalSelectResult` structs + N column re-maps.
 /// Byte-identical neutral output to the per-query path. A dropped receiver makes `send` fail harmlessly.
-fn distribute_results_batched(
+trait PointBatchResultView {
+    fn columns(&self) -> &[RelationalColumn];
+    fn ncols(&self) -> usize;
+    fn needle_count(&self) -> usize;
+    fn needle_values(&self, needle: usize) -> &[i32];
+}
+
+impl PointBatchResultView for RelationalRetainedBatchResult {
+    fn columns(&self) -> &[RelationalColumn] {
+        &self.columns
+    }
+
+    fn ncols(&self) -> usize {
+        self.ncols()
+    }
+
+    fn needle_count(&self) -> usize {
+        self.needle_count()
+    }
+
+    fn needle_values(&self, needle: usize) -> &[i32] {
+        self.needle_values(needle)
+    }
+}
+
+impl PointBatchResultView for RelationalPointBatchResult {
+    fn columns(&self) -> &[RelationalColumn] {
+        self.columns()
+    }
+
+    fn ncols(&self) -> usize {
+        self.ncols()
+    }
+
+    fn needle_count(&self) -> usize {
+        self.needle_count()
+    }
+
+    fn needle_values(&self, needle: usize) -> &[i32] {
+        self.needle_values(needle)
+    }
+}
+
+fn distribute_results_batched<B: PointBatchResultView>(
     group: Vec<PointLookupRequest>,
     request_result_index: Vec<usize>,
-    batched: RelationalRetainedBatchResult,
+    batched: B,
 ) {
-    let columns: Vec<_> = batched.columns.iter().map(map_column).collect();
+    let columns: Vec<_> = batched.columns().iter().map(map_column).collect();
     let ncols = batched.ncols();
     for (request, result_idx) in group.into_iter().zip(request_result_index) {
         let outcome = if result_idx < batched.needle_count() {

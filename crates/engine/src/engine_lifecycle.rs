@@ -1316,6 +1316,15 @@ impl Engine {
             .filter(|memory| memory.metadata().gpu_id == gpu_id)
             .map(|memory| memory.metadata().allocated_bytes)
             .sum::<u64>();
+        let route_descriptors = self
+            .read_state
+            .residency
+            .sharded_point_routes
+            .load()
+            .values()
+            .filter(|route| route.gpu_id == gpu_id)
+            .map(|route| route.plan.descriptor_allocated_bytes())
+            .sum::<u64>();
         let private_bytes = self
             .transaction_private_gpu_bytes
             .lock()
@@ -1328,6 +1337,7 @@ impl Engine {
             .saturating_add(shard_bytes)
             .saturating_add(single_indexes)
             .saturating_add(shard_indexes)
+            .saturating_add(route_descriptors)
             .saturating_add(private_bytes)
     }
 

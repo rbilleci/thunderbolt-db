@@ -4,8 +4,61 @@ use std::sync::Arc;
 use crate::cuda_context::{
     check_cuda, GpuPrimaryContext, PooledDeviceBufferOwned, PooledStreamOwned,
 };
-use crate::resident_memory::CudaResidentDeviceMemory;
+use crate::resident_memory::{CudaResidentDeviceAllocation, CudaResidentDeviceMemory};
 use crate::{copy_pinned_into, stage_result_dtoh_async, CudaRuntimeProbeError};
+
+#[cfg(test)]
+std::thread_local! {
+    static ATOMIC_COMPLETION_PANIC_PHASE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_next_atomic_completion_panic(phase: u8) {
+    ATOMIC_COMPLETION_PANIC_PHASE.with(|pending| pending.set(phase));
+}
+
+#[cfg(test)]
+fn panic_at_atomic_completion_phase(phase: u8) {
+    ATOMIC_COMPLETION_PANIC_PHASE.with(|pending| {
+        if pending.get() == phase {
+            pending.set(0);
+            panic!("injected atomic asynchronous completion panic at phase {phase}");
+        }
+    });
+}
+
+/// Panic/error guard for host destinations of an asynchronous D2H. It is declared after every
+/// destination and pinned-lease slot, so its Drop synchronizes before any of that memory is released.
+struct InFlightHostCopyDrain {
+    primary: Arc<GpuPrimaryContext>,
+    stream: *mut c_void,
+    armed: bool,
+}
+
+impl InFlightHostCopyDrain {
+    fn new(primary: Arc<GpuPrimaryContext>, stream: *mut c_void) -> Self {
+        Self {
+            primary,
+            stream,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightHostCopyDrain {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.primary.set_current();
+            unsafe {
+                let _ = (self.primary.cu_stream_synchronize)(self.stream);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CudaI32BatchProjectionRow {
@@ -28,9 +81,11 @@ pub struct CudaI32BatchProjectionColumns {
     pub projection_count: usize,
     /// DENSE LAYOUT marker (DECISIONS "lpb read levers" #1): EMPTY for the compacted atomic/wave form above.
     /// When NON-empty, `values` is the DENSE form — one slot per needle (`status.len()` needles, gaps for
-    /// absent), so `values[i*projection_count..]` is NEEDLE `i`'s projection and `status[i]` is 1 (found) /
-    /// 2 (not-found); `needle_indices`/`row_indices` are empty. The engine assemble compacts it in ONE
-    /// sequential pass (no host scatter), instead of re-compacting an already-compacted result.
+    /// absent), so `values[i*projection_count..]` is NEEDLE `i`'s projection and `status[i]` is 1 (found) or
+    /// 2 (not-found); `needle_indices`/`row_indices` are empty. Multi-shard duplicate status 3 is retained only
+    /// by the opaque compact production result so the engine can decline/re-resolve it; compatibility
+    /// completion returns [`CudaRuntimeProbeError::DuplicatePointReadMatch`] instead of exposing or silently
+    /// dropping it. The engine assemble compacts this form in one sequential pass (no host scatter).
     pub status: Vec<u32>,
 }
 
@@ -85,6 +140,11 @@ impl CudaI32BatchProjectionColumns {
         // DENSE layout (status set): slot `i` is needle `i`; keep status==1. Cold per-needle path; row_index
         // synthesized 0 (unique => never read).
         if !self.status.is_empty() {
+            assert!(
+                self.status.iter().all(|status| matches!(*status, 1 | 2)),
+                "into_rows received invalid dense status; compatibility completion must reject duplicate/\
+                 incomplete slots"
+            );
             let p = self.projection_count.max(1);
             let mut rows = Vec::new();
             for i in 0..self.status.len() {
@@ -120,6 +180,91 @@ impl CudaI32BatchProjectionColumns {
     }
 }
 
+/// Owns the exact host bytes consumed by an asynchronous needle H2D until submission synchronization.
+/// Prefer pooled page-locked staging for real overlap; retain an owned pageable Vec when pinned allocation is
+/// unavailable. Both the atomic and dense safe deferred APIs use this owner instead of retaining a caller borrow.
+pub(super) enum I32NeedlesHostGuard {
+    Pinned {
+        primary: Arc<GpuPrimaryContext>,
+        ptr: *mut c_void,
+        capacity: usize,
+    },
+    Pageable(Vec<i32>),
+}
+
+impl I32NeedlesHostGuard {
+    pub(super) fn stage(primary: &Arc<GpuPrimaryContext>, needles: &[i32]) -> Self {
+        let bytes = std::mem::size_of_val(needles);
+        if let Some(pinned) = primary.lease_pinned_host_buffer(bytes) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    needles.as_ptr().cast::<u8>(),
+                    pinned.ptr.cast::<u8>(),
+                    bytes,
+                );
+            }
+            let ptr = pinned.ptr;
+            let capacity = pinned.capacity;
+            std::mem::forget(pinned);
+            Self::Pinned {
+                primary: Arc::clone(primary),
+                ptr,
+                capacity,
+            }
+        } else {
+            Self::Pageable(needles.to_vec())
+        }
+    }
+
+    pub(super) fn as_ptr(&self) -> *const c_void {
+        match self {
+            Self::Pinned { ptr, .. } => ptr.cast_const(),
+            Self::Pageable(values) => values.as_ptr().cast::<c_void>(),
+        }
+    }
+}
+
+impl Drop for I32NeedlesHostGuard {
+    fn drop(&mut self) {
+        if let Self::Pinned {
+            primary,
+            ptr,
+            capacity,
+        } = self
+        {
+            primary.release_pinned_host_buffer(*ptr, *capacity);
+        }
+    }
+}
+
+// The raw pointer names allocation owned by `primary`; submission Drop synchronizes before this field releases.
+unsafe impl Send for I32NeedlesHostGuard {}
+
+pub(super) fn validate_i32_index_geometry(
+    allocated_bytes: u64,
+    table_mask: u32,
+    hash_shift: u32,
+) -> Result<(), CudaRuntimeProbeError> {
+    let table_slots = u64::from(table_mask)
+        .checked_add(1)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if table_slots < 2 || !table_slots.is_power_of_two() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            table_mask as usize,
+        ));
+    }
+    let required_bytes = table_slots
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let expected_shift = 32 - table_slots.trailing_zeros();
+    if hash_shift != expected_shift || required_bytes > allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(required_bytes).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
+}
+
 pub struct CudaI32EqualAnyProjectSubmission {
     pub(super) projection_count: usize,
     pub(super) needles_len: usize,
@@ -128,6 +273,7 @@ pub struct CudaI32EqualAnyProjectSubmission {
     // pools and the (optional) async transfer symbols, exactly like the synchronous routes get
     // via `resident.primary()`. Cheap `Arc` clone; already `Send + Sync`.
     pub(super) primary: Arc<GpuPrimaryContext>,
+    pub(super) _resident_allocation_guard: Arc<CudaResidentDeviceAllocation>,
     // P2-M2 (equal_any split-route migration): the device buffers are now leased from the shared
     // `OutputBufferPool` (no per-call `cuMemAlloc`/`cuMemFree`) and the kernel runs on a pooled
     // private stream (no NULL-stream context-wide barrier), mirroring the text route. Because this
@@ -142,6 +288,7 @@ pub struct CudaI32EqualAnyProjectSubmission {
     pub(super) row_indices_guard: PooledDeviceBufferOwned,
     pub(super) count_guard: PooledDeviceBufferOwned,
     pub(super) _needles_guard: PooledDeviceBufferOwned,
+    pub(super) _needles_host_guard: I32NeedlesHostGuard,
     // Held (not released in `submit`) so its timing events stay valid for `complete` and no other
     // reader leases this stream while our kernel is still enqueued on it. Released on Drop.
     //
@@ -164,11 +311,16 @@ pub struct CudaI32EqualAnyProjectSubmission {
     pub(super) _wave_index_guard: Option<Arc<CudaResidentDeviceMemory>>,
 }
 
-// Pending read submissions own their temporary CUDA allocations/events/module.
-// The resident allocation itself remains owned elsewhere and must outlive
-// completion.
+// Pending read submissions own their temporary CUDA allocations/events/module and a strong guard for the
+// exact resident source allocation. Consequently the public safe split API remains valid even when its owner
+// or read view is dropped between submit and completion.
 unsafe impl Send for CudaI32EqualAnyProjectSubmission {}
 impl CudaI32EqualAnyProjectSubmission {
+    #[cfg(test)]
+    pub(crate) fn staged_needles_ptr_for_test(&self) -> *const c_void {
+        self._needles_host_guard.as_ptr()
+    }
+
     pub fn complete(
         self,
         resident: &CudaResidentDeviceMemory,
@@ -193,20 +345,20 @@ impl CudaI32EqualAnyProjectSubmission {
     ) -> Result<(CudaI32BatchProjectionColumns, Option<u64>), CudaRuntimeProbeError> {
         let primary = Arc::clone(&self.primary);
         primary.set_current()?;
-        // Take ownership of the pooled stream out of the submission. This local guard keeps the
-        // stream alive (and pool-bound only on its own Drop at the end of this function) for the
-        // whole completion, AND leaves `self.stream == None` so the submission's `Drop` does NOT
-        // re-sync on this success path (no double-drain). The covering sync below is the single
-        // drain for the success path.
-        let stream_owned = self
-            .stream
-            .take()
-            .expect("pooled stream held until complete");
-        let pooled = stream_owned
-            .pooled
-            .as_ref()
-            .expect("pooled stream held until complete");
-        let stream = pooled.stream;
+        // Keep the stream in `self` until every covering sync and validation succeeds. Any early error or
+        // panic therefore reaches submission Drop with the stream still owned and drains it before returning
+        // device resources to shared pools. Host D2H destinations get the additional local drain guards below.
+        let (stream, start_event, stop_event) = {
+            let stream_owned = self
+                .stream
+                .as_ref()
+                .expect("pooled stream held until complete");
+            let pooled = stream_owned
+                .pooled
+                .as_ref()
+                .expect("pooled stream held until complete");
+            (pooled.stream, pooled.start_event, pooled.stop_event)
+        };
 
         // The kernel + its HtoD/memset were enqueued (not synced) on this private stream in
         // `submit`. One stream sync here drains all of that: it is the deferred counterpart of the
@@ -217,11 +369,7 @@ impl CudaI32EqualAnyProjectSubmission {
         let elapsed_us = if self.timed {
             let mut elapsed_ms = 0.0_f32;
             check_cuda(unsafe {
-                (primary.cu_event_elapsed_time)(
-                    &mut elapsed_ms,
-                    pooled.start_event,
-                    pooled.stop_event,
-                )
+                (primary.cu_event_elapsed_time)(&mut elapsed_ms, start_event, stop_event)
             })?;
             Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64)
         } else {
@@ -256,6 +404,8 @@ impl CudaI32EqualAnyProjectSubmission {
         let mut match_count_host = 0_u32;
         if let Some(dtoh_async) = async_dtoh {
             let count_pinned = primary.lease_pinned_host_buffer(std::mem::size_of::<u32>());
+            // Declared after the stack destination and pinned lease, so unwinding drains first.
+            let mut count_copy_drain = InFlightHostCopyDrain::new(Arc::clone(&primary), stream);
             let count_dst: *mut c_void = count_pinned
                 .as_ref()
                 .map(|p| p.ptr)
@@ -270,6 +420,7 @@ impl CudaI32EqualAnyProjectSubmission {
             })
             .map_err(drain_err)?;
             check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+            count_copy_drain.disarm();
             if let Some(pinned) = &count_pinned {
                 // SAFETY: the sync completed the 4-byte D2H into the page-aligned pinned region.
                 unsafe {
@@ -301,10 +452,16 @@ impl CudaI32EqualAnyProjectSubmission {
         let mut row_indices = vec![0_u64; match_count_usize];
 
         if let Some(dtoh_async) = async_dtoh {
+            let values_pinned;
+            let needle_indices_pinned;
+            let row_indices_pinned;
+            // Declared after all owned destinations and pinned-lease slots. On panic/error it synchronizes
+            // before any async target or lease is released/re-entered into a shared pool.
+            let mut host_copy_drain = InFlightHostCopyDrain::new(Arc::clone(&primary), stream);
             // Stream-ordered result D2H into pooled pinned buffers, each only over the populated
             // [0, count) prefix, behind ONE covering sync — so the three copies overlap on the
             // copy engine instead of serializing as blocking barriers.
-            let values_pinned = stage_result_dtoh_async(
+            values_pinned = stage_result_dtoh_async(
                 primary.as_ref(),
                 dtoh_async,
                 stream,
@@ -312,7 +469,9 @@ impl CudaI32EqualAnyProjectSubmission {
                 &mut values,
             )
             .map_err(drain_err)?;
-            let needle_indices_pinned = stage_result_dtoh_async(
+            #[cfg(test)]
+            panic_at_atomic_completion_phase(1);
+            needle_indices_pinned = stage_result_dtoh_async(
                 primary.as_ref(),
                 dtoh_async,
                 stream,
@@ -320,7 +479,7 @@ impl CudaI32EqualAnyProjectSubmission {
                 &mut needle_indices,
             )
             .map_err(drain_err)?;
-            let row_indices_pinned = stage_result_dtoh_async(
+            row_indices_pinned = stage_result_dtoh_async(
                 primary.as_ref(),
                 dtoh_async,
                 stream,
@@ -329,6 +488,7 @@ impl CudaI32EqualAnyProjectSubmission {
             )
             .map_err(drain_err)?;
             check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+            host_copy_drain.disarm();
             copy_pinned_into(&values_pinned, &mut values);
             copy_pinned_into(&needle_indices_pinned, &mut needle_indices);
             copy_pinned_into(&row_indices_pinned, &mut row_indices);
@@ -378,6 +538,12 @@ impl CudaI32EqualAnyProjectSubmission {
                 return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
             }
         }
+        // Every operation that may reference device buffers, stream events, or host D2H destinations is
+        // complete. Transfer the stream out only on this successful tail to avoid a redundant Drop drain.
+        let _stream_owned = self
+            .stream
+            .take()
+            .expect("pooled stream held through covering synchronization");
         let columns = CudaI32BatchProjectionColumns {
             values,
             needle_indices,
@@ -429,6 +595,24 @@ impl Drop for CudaI32EqualAnyProjectSubmission {
         }
         // Fields drop after this body: the buffer/stream guards now return to their pools AFTER the
         // drain above, so the next leaser never observes memory still under an in-flight kernel.
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::CudaI32BatchProjectionColumns;
+
+    #[test]
+    #[should_panic(expected = "into_rows received invalid dense status")]
+    fn public_dense_rows_fail_loud_on_duplicate_status() {
+        let _ = CudaI32BatchProjectionColumns {
+            values: vec![41],
+            needle_indices: Vec::new(),
+            row_indices: Vec::new(),
+            projection_count: 1,
+            status: vec![3],
+        }
+        .into_rows();
     }
 }
 

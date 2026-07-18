@@ -1340,7 +1340,7 @@ impl Engine {
             // tables have no shards, so this is a no-op for them.)
             self.read_state
                 .residency
-                .with_shards_mut(|shards| shards.remove(name));
+                .with_shards_mut_for_table(name, |shards| shards.remove(name));
             self.read_state
                 .residency
                 .shard_device_memory

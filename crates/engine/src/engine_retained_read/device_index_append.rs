@@ -1,14 +1,28 @@
 use super::{Engine, SqlValue};
 
 impl Engine {
+    #[cfg(test)]
+    pub(crate) fn set_shard_pk_index_append_post_launch_hook(
+        &self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .read_state
+            .residency
+            .shard_pk_index_append_post_launch_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((reached, resume));
+    }
+
     /// M1 (ledger #24): INCREMENTALLY maintain a cached DEVICE PK index over an in-place append —
     /// insert only the k appended keys via the `index_insert` kernel (O(k)) instead of the O(rows)
     /// rebuild (`ensure_shard_pk_device_index`) the (ptr,row_count) validation would otherwise force
     /// every wave (the measured 305us/wave bottleneck). Called at the append chokepoint with the appended
     /// values in hand (no DtoH). Per entry: a different ptr (re-admit) or a basis != `base_row_count`
-    /// (a prober rebuilt) is skipped; a DECLINED entry stays declined (monotone); probe overflow ->
-    /// DECLINED; past the load rule (`2*new_count > table_size`) the entry is DROPPED (the next probe
-    /// rebuilds at the grown size).
+    /// (a prober rebuilt) is skipped; a DECLINED build entry stays declined (monotone); probe overflow or
+    /// crossing the load rule (`2*new_count > table_size`) retires the table's cached routes/indexes so the
+    /// next probe rebuilds at the grown, boundary-gated size without leaving a hidden route pin.
     pub(crate) fn extend_shard_pk_device_index_on_append(
         &self,
         table_name: &str,
@@ -118,10 +132,7 @@ impl Engine {
                 // Past the builder's load rule -> drop so the next probe rebuilds at the grown size.
                 self.read_state
                     .residency
-                    .shard_pk_device_index
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&key);
+                    .purge_shard_pk_index_for_table(&key.0);
                 return;
             }
             let Ok(base_row_u32) = u32::try_from(base_row_count) else {
@@ -131,6 +142,18 @@ impl Engine {
             // drop the entry (rebuild next probe); never a wrong index.
             match index.submit_i32_index_insert(table_mask, hash_shift, tail, base_row_u32) {
                 Ok(dup) => {
+                    if dup {
+                        // Probe overflow makes this allocation unusable. Retire any prepared route before
+                        // removing its accounted index-map owner; the next probe may rebuild at a wider size.
+                        self.read_state
+                            .residency
+                            .purge_shard_pk_index_for_table(&key.0);
+                        return;
+                    }
+                    #[cfg(test)]
+                    self.read_state
+                        .residency
+                        .run_shard_pk_index_append_post_launch_hook();
                     let mut cache = self
                         .read_state
                         .residency
@@ -145,24 +168,21 @@ impl Engine {
                     {
                         return;
                     }
-                    if dup {
-                        // F3/U4: the insert kernel now PLACES version twins, so `dup` no longer
-                        // means "duplicate key" — it fires ONLY on a 256-probe OVERFLOW (a shard
-                        // whose live+twin fan-out overran the probe cap). Drop the index so the
-                        // next probe rebuilds at the grown, boundary-gated size (dead-below-GC
-                        // twins are dropped there). A pathological hot-key with >256 un-GC'd
-                        // versions stays declined until its readers release — a bounded transient.
-                        entry.device_index = None;
+                    let Some(current_index) = entry.device_index.as_ref() else {
+                        return;
+                    };
+                    if !std::sync::Arc::ptr_eq(current_index, &index) {
+                        // A boundary-aware rebuild replaced the map entry while the insertion was in
+                        // flight. Only `index` received the appended keys; advancing the replacement's
+                        // basis would make it look complete and create a false-negative point probe.
+                        return;
                     }
                     entry.row_count = new_count;
                 }
                 Err(_) => {
                     self.read_state
                         .residency
-                        .shard_pk_device_index
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&key);
+                        .purge_shard_pk_index_for_table(&key.0);
                 }
             }
         }

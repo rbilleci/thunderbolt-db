@@ -1144,7 +1144,9 @@ fn central_commit_wedge_drains_classic_queue_and_rejects_reads_writes_and_driver
         .contains("restart recovery"));
     assert!(e
         .submit_sharded_point_lookups_batched(&surface_select, &[1])
-        .is_none());
+        .unwrap_err()
+        .to_string()
+        .contains("restart recovery"));
     assert!(e
         .relational_retained_snapshot_handle("surface_gate")
         .is_none());

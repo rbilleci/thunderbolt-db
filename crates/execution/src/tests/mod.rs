@@ -479,6 +479,65 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
     // An append-mutated index may be ahead of a reader's captured descriptor. With no birth region in that
     // older descriptor, row_count is the only sound upper bound: slot 2 must not leak through row_count 2.
     let (resident, index, mask, shift) = build(&[1, 2, 3], &[10, 20, 30]);
+    let malformed_zone = MultiShardProbeShard {
+        resident: Arc::clone(&resident),
+        index: Arc::clone(&index),
+        table_mask: mask,
+        hash_shift: shift,
+        projection_offsets: vec![0, 12],
+        row_count: 2,
+        created_by: None,
+        deleted_by: None,
+        min: 4,
+        max: 3,
+    };
+    assert!(
+        resident
+            .prepare_multi_shard_i32_index_probe_dense(&[malformed_zone])
+            .is_err(),
+        "safe plan API rejects min > max before binary routing"
+    );
+    let malformed_projection = MultiShardProbeShard {
+        resident: Arc::clone(&resident),
+        index: Arc::clone(&index),
+        table_mask: mask,
+        hash_shift: shift,
+        projection_offsets: vec![resident.metadata().allocated_bytes],
+        row_count: 2,
+        created_by: None,
+        deleted_by: None,
+        min: 1,
+        max: 3,
+    };
+    assert!(
+        resident
+            .prepare_multi_shard_i32_index_probe_dense(&[malformed_projection])
+            .is_err(),
+        "safe plan API rejects an out-of-bounds projection span"
+    );
+    let short_created = Arc::new(
+        runtime
+            .retain_device_memory_copy(0, &1_u64.to_le_bytes())
+            .unwrap(),
+    );
+    let malformed_visibility = MultiShardProbeShard {
+        resident: Arc::clone(&resident),
+        index: Arc::clone(&index),
+        table_mask: mask,
+        hash_shift: shift,
+        projection_offsets: vec![0],
+        row_count: 2,
+        created_by: Some(short_created),
+        deleted_by: None,
+        min: 1,
+        max: 3,
+    };
+    assert!(
+        resident
+            .prepare_multi_shard_i32_index_probe_dense(&[malformed_visibility])
+            .is_err(),
+        "safe plan API rejects a short MVCC visibility region"
+    );
     let ahead = MultiShardProbeShard {
         resident: Arc::clone(&resident),
         index,
@@ -491,8 +550,31 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         min: 1,
         max: 3,
     };
+    let ahead_plan = resident
+        .prepare_multi_shard_i32_index_probe_dense(&[ahead])
+        .expect("prepare ahead-index plan");
+
+    // Panic after async H2D/memset but before launch instrumentation. The submission owner must already exist
+    // and drain before its pooled device buffers/stream or the borrowed needle bytes can be released.
+    crate::point_read_dense::force_next_dense_panic(1);
+    let submit_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = resident.submit_prepared_multi_shard_i32_index_probe_dense(&ahead_plan, &[3], 100);
+    }));
+    assert!(submit_panic.is_err(), "the submit panic hook fired");
+
+    // Panic after asynchronous D2H is queued. The host-copy guard must drain before local pinned leases/Vecs
+    // unwind, and the surrounding submission must then leave all shared pools reusable.
+    let completion = resident
+        .submit_prepared_multi_shard_i32_index_probe_dense(&ahead_plan, &[3], 100)
+        .expect("submit before completion panic");
+    crate::point_read_dense::force_next_dense_panic(2);
+    let completion_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = completion.complete_detached_columnar();
+    }));
+    assert!(completion_panic.is_err(), "the completion panic hook fired");
+
     let (cols, _) = resident
-        .submit_multi_shard_i32_index_probe_dense(&[ahead], &[3], 100)
+        .submit_prepared_multi_shard_i32_index_probe_dense(&ahead_plan, &[3], 100)
         .unwrap()
         .complete_detached_columnar()
         .unwrap();
@@ -541,6 +623,81 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         vec![3, 31],
         "visible twin gathered after dead twin"
     );
+
+    // Two separately valid shards may transiently expose the same visible key. Exercise the real multi-shard
+    // kernel's status=3 contract directly: compact callers see the decline status, compatibility callers get a
+    // typed duplicate error, and the same pooled resources remain reusable for a subsequent exact normal read.
+    let (duplicate_resident_0, duplicate_index_0, duplicate_mask_0, duplicate_shift_0) =
+        build(&[7], &[70]);
+    let (duplicate_resident_1, duplicate_index_1, duplicate_mask_1, duplicate_shift_1) =
+        build(&[7], &[71]);
+    let duplicate_shards = [
+        MultiShardProbeShard {
+            resident: Arc::clone(&duplicate_resident_0),
+            index: duplicate_index_0,
+            table_mask: duplicate_mask_0,
+            hash_shift: duplicate_shift_0,
+            projection_offsets: vec![0, 4],
+            row_count: 1,
+            created_by: None,
+            deleted_by: None,
+            min: 7,
+            max: 7,
+        },
+        MultiShardProbeShard {
+            resident: duplicate_resident_1,
+            index: duplicate_index_1,
+            table_mask: duplicate_mask_1,
+            hash_shift: duplicate_shift_1,
+            projection_offsets: vec![0, 4],
+            row_count: 1,
+            created_by: None,
+            deleted_by: None,
+            min: 7,
+            max: 7,
+        },
+    ];
+    let duplicate_plan = duplicate_resident_0
+        .prepare_multi_shard_i32_index_probe_dense(&duplicate_shards)
+        .expect("prepare overlapping duplicate-key shards");
+    let (duplicate_compact, _) = duplicate_resident_0
+        .submit_prepared_multi_shard_i32_index_probe_dense(&duplicate_plan, &[7], 100)
+        .expect("submit duplicate compact probe")
+        .complete_detached_columnar_compact()
+        .expect("complete duplicate compact probe");
+    assert_eq!(
+        duplicate_compact.status(),
+        &[3],
+        "the real GPU kernel declines a duplicate visible match"
+    );
+    assert_eq!(
+        duplicate_resident_0
+            .submit_prepared_multi_shard_i32_index_probe_dense(&duplicate_plan, &[7], 100)
+            .expect("submit duplicate compatibility probe")
+            .complete_detached_columnar(),
+        Err(CudaRuntimeProbeError::DuplicatePointReadMatch(0)),
+        "compatibility completion surfaces duplicate status as a typed error"
+    );
+
+    let normal_shard = [MultiShardProbeShard {
+        resident: Arc::clone(&duplicate_resident_0),
+        index: Arc::clone(&duplicate_shards[0].index),
+        table_mask: duplicate_mask_0,
+        hash_shift: duplicate_shift_0,
+        projection_offsets: vec![0, 4],
+        row_count: 1,
+        created_by: None,
+        deleted_by: None,
+        min: 7,
+        max: 7,
+    }];
+    let (normal, _) = duplicate_resident_0
+        .submit_multi_shard_i32_index_probe_dense(&normal_shard, &[7], 100)
+        .expect("submit normal probe after duplicate decline")
+        .complete_detached_columnar()
+        .expect("pooled resources remain reusable after duplicate decline");
+    assert_eq!(normal.status, vec![1]);
+    assert_eq!(normal.values, vec![7, 70]);
 }
 
 #[test]

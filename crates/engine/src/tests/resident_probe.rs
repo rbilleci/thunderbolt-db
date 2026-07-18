@@ -2165,20 +2165,20 @@ fn gpu_d3_pinned_reader_is_hidden_an_unpublished_insert_append() {
     let table = e.relational_catalog_table("d3t").unwrap();
     let hidden = e
         .gather_sharded_int4_point_lookups_batched(s0, &table, 0, &[0, 1], &[99])
+        .expect("batched GPU route completed")
         .expect("the batched gather must answer (unique key, valid shard)");
-    let (h_start, h_end) = hidden.needle_ranges[0];
+    let (_, hidden_count) = hidden.needle_range(0);
     assert_eq!(
-        h_end - h_start,
-        0,
+        hidden_count, 0,
         "the appended key is HIDDEN from the pre-append boundary"
     );
     let visible = e
         .gather_sharded_int4_point_lookups_batched(s0 + 1, &table, 0, &[0, 1], &[99])
+        .expect("batched GPU route completed")
         .expect("the batched gather must answer at the append's own seq");
-    let (v_start, v_end) = visible.needle_ranges[0];
+    let (_, visible_count) = visible.needle_range(0);
     assert_eq!(
-        v_end - v_start,
-        1,
+        visible_count, 1,
         "the appended key is VISIBLE at its birth boundary"
     );
 }

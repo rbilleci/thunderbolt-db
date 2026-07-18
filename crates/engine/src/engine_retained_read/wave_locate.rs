@@ -158,6 +158,12 @@ impl Engine {
                 .then(|| vec![0u32; needles.len()]);
         }
         let runtime_snapshot = self.router.runtime().snapshot();
+        let gc_boundary = self
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .oldest()
+            .unwrap_or_else(|| self.committed_seq());
         let mut descs: Vec<WriteLocateShard> = Vec::new();
         for shard in table_shards.iter() {
             if shard.schema != table.schema || shard.table != table.name {
@@ -200,15 +206,21 @@ impl Engine {
                     &table.name,
                     shard.shard_id,
                     &device_memory,
-                    ShardDeviceIndexKey {
-                        key_id,
-                        positions: &positions,
-                        offsets: &offsets,
-                        blob_offsets: &blob_offsets,
-                        blob_lens: &blob_lens,
+                    super::shard_point_lookup::ShardDeviceIndexBuild {
+                        key: ShardDeviceIndexKey {
+                            key_id,
+                            positions: &positions,
+                            offsets: &offsets,
+                            blob_offsets: &blob_offsets,
+                            blob_lens: &blob_lens,
+                        },
+                        row_count: shard.row_count,
+                        gc_boundary,
+                        deleted_by: shard.deleted_by_region.clone(),
                     },
-                    shard.row_count,
-                )?;
+                )
+                .ok()
+                .flatten()?;
             descs.push(WriteLocateShard {
                 index: device_index,
                 table_mask,
@@ -268,6 +280,7 @@ impl Engine {
             return None;
         }
         let runtime_snapshot = self.router.runtime().snapshot();
+        let gc_boundary = snapshots.iter().copied().min()?;
         let mut descs: Vec<VisibleLocateShard> = Vec::new();
         // Parallel to `descs`: the probed shard's id + its MAIN device region (the W0 cell-
         // liveness identity) — plus pins for the version regions the kernel dereferences.
@@ -308,15 +321,21 @@ impl Engine {
                     &table.name,
                     shard.shard_id,
                     &device_memory,
-                    ShardDeviceIndexKey {
-                        key_id,
-                        positions: &positions,
-                        offsets: &offsets,
-                        blob_offsets: &blob_offsets,
-                        blob_lens: &blob_lens,
+                    super::shard_point_lookup::ShardDeviceIndexBuild {
+                        key: ShardDeviceIndexKey {
+                            key_id,
+                            positions: &positions,
+                            offsets: &offsets,
+                            blob_offsets: &blob_offsets,
+                            blob_lens: &blob_lens,
+                        },
+                        row_count: shard.row_count,
+                        gc_boundary,
+                        deleted_by: shard.deleted_by_region.clone(),
                     },
-                    shard.row_count,
-                )?;
+                )
+                .ok()
+                .flatten()?;
             let (bound_memory, created_by, deleted_by, row_id) =
                 if index_row_count == shard.row_count {
                     (

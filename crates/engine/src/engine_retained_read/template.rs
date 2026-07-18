@@ -1,5 +1,5 @@
 use super::{
-    Arc, Engine, EngineError, ExecuteError, Instant, RelationalRetainedBatchResult,
+    Arc, Engine, EngineError, ExecuteError, Instant, RelationalPointBatchResult,
     RelationalRetainedInt4ProjectionSubmission, RelationalRetainedReadSubmission,
     RelationalRetainedReadSubmissionInner, RelationalRetainedReadTemplate, Select,
 };
@@ -123,7 +123,7 @@ impl Engine {
                     template.filter_idx,
                     &template.selected_indexes,
                     needles,
-                ) {
+                )? {
                     let gpu_id = self
                         .read_residency_shards()
                         .get(&template.table.name)
@@ -142,14 +142,15 @@ impl Engine {
                             .unwrap_or(u64::MAX),
                         commit_path_wedged: Arc::clone(&self.commit_path_wedged),
                         inner: RelationalRetainedReadSubmissionInner::ReadyBatched(Box::new(
-                            RelationalRetainedBatchResult {
-                                columns: Arc::new(template.result_columns.clone()),
-                                access_path: Arc::new(template.access_path.clone()),
+                            RelationalPointBatchResult::new(
+                                Arc::new(template.result_columns.clone()),
+                                Arc::new(template.access_path.clone()),
                                 gpu_id,
-                                values: projected.values,
-                                ncols: projected.ncols,
-                                needle_ranges: projected.needle_ranges,
-                            },
+                                projected.values,
+                                projected.ncols,
+                                projected.needle_ranges,
+                            )
+                            .into_compat(),
                         )),
                     });
                 }

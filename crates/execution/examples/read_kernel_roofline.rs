@@ -31,8 +31,8 @@
 //!       wall includes a per-call index H2D (the single-launch gather kernel is isolated via the CUDA
 //!       event when the pooled stream is timed -- see the gather block).
 //!   (3) ALGORITHMIC -- sort / join / grouped: reported as M-elem/s (NOT pure bandwidth; O(n log^2 n) /
-//!       random / hash-cardinality bound). Run at a smaller SORT_N -- this is a SINGLE pass, sized by
-//!       SORT_N (NOT part of the IN-L2/OUT-OF-L2 row sweep).
+//!       random / hash-cardinality bound). Sort/join run at the smaller SORT_N; GROUP BY is a full `ROWS`
+//!       pass. This section is not part of the IN-L2/OUT-OF-L2 row sweep.
 //!
 //! Run (never --gpu-reset, always under timeout):
 //!   timeout 300 cargo run --release --example read_kernel_roofline -p gpu_db_execution
@@ -52,7 +52,12 @@ fn p50(mut v: Vec<u128>) -> u128 {
 /// Run the section (1) resident scans + section (2) gather over one resident dataset of `rows` rows.
 /// Returns the `sum_i32` roofline GB/s (so the caller can compare passes). Every line prints p50
 /// latency AND throughput. `iters` controls the timed-sample count (lowered for the larger pass).
-fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usize) -> Option<f64> {
+fn run_scan_pass(
+    runtime: &CudaDriverRuntime,
+    label: &str,
+    rows: u64,
+    iters: usize,
+) -> Option<(f64, f64)> {
     let n = rows as usize;
 
     // Layout: [8B row_count][A: N i32][B: N i32][C: N i64][D: N i128]. A = scrambled key in [0,1<<20);
@@ -113,7 +118,7 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
     };
 
     // bench: `gb` = the input bytes touched (GB) for this kernel; reports BOTH p50 latency (us) AND GB/s.
-    let bench = |label: &str, gb: f64, mut run: Box<dyn FnMut() -> usize>| -> f64 {
+    let bench = |label: &str, gb: f64, mut run: Box<dyn FnMut() -> usize>| -> (f64, f64) {
         for _ in 0..3 {
             run();
         }
@@ -130,7 +135,7 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
             "  {label:<40} {us:>9.0}us  {:>8.1} GB/s   (sink {sink})",
             gbps
         );
-        gbps
+        (gbps, us)
     };
 
     let g4 = (rows * 4) as f64 / 1e9;
@@ -144,7 +149,7 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
     println!("\n# (1) RESIDENT-INPUT scans -- kernel-clean, wall ~= kernel (vs the sum_i32 read roofline) ---");
     let needles_miss: Vec<i32> = (0..8).map(|k| -(k + 1)).collect(); // negative -> never match A
                                                                      // ROOFLINE = sum_i32: a pure 1-pass read+reduce over the same i32 column -> the HBM streaming peak.
-    let roof = bench(
+    let (roof, roof_us) = bench(
         "sum_i32 (ROOFLINE: pure 1-pass read+reduce)",
         g4,
         Box::new(|| resident.sum_i32_from_payload(off_a, rows).unwrap() as usize),
@@ -280,15 +285,22 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
                     .len()
             }),
         );
-        resident.clear_last_kernel_event_elapsed_us();
-        let n_gathered = resident
-            .project_i32_rows_from_payload(off_b, i)
-            .unwrap()
-            .len();
-        match resident.last_kernel_event_elapsed_us() {
-            Some(ev_us) if ev_us > 0 => {
-                let kus = ev_us as f64;
-                // kernel-only line reports BOTH p50 latency (the CUDA-event us) AND GB/s.
+        let mut kernel_event_us = Vec::with_capacity(iters);
+        let mut n_gathered = 0;
+        for _ in 0..iters {
+            resident.clear_last_kernel_event_elapsed_us();
+            n_gathered = resident
+                .project_i32_rows_from_payload(off_b, i)
+                .unwrap()
+                .len();
+            if let Some(ev_us) = resident.last_kernel_event_elapsed_us().filter(|us| *us > 0) {
+                kernel_event_us.push(u128::from(ev_us));
+            }
+        }
+        match kernel_event_us.len() {
+            event_count if event_count == iters => {
+                let kus = p50(kernel_event_us) as f64;
+                // Kernel-only line reports BOTH p50 latency across the same timed-sample count and GB/s.
                 println!("  {:<40} {:>9.0}us  {:>8.1} GB/s   (kernel-only, CUDA-event; n {n_gathered})", "  ^ gather_i32 KERNEL (no H2D)", kus, gidx_gb4 / (kus / 1e6));
             }
             _ => println!("  {:<40}            (pooled stream untimed -- gather kernel not isolable; use the H2D-labeled wall above)", "  ^ gather_i32 KERNEL"),
@@ -308,7 +320,7 @@ fn run_scan_pass(runtime: &CudaDriverRuntime, label: &str, rows: u64, iters: usi
         );
     }
 
-    Some(roof)
+    Some((roof, roof_us))
 }
 
 fn main() {
@@ -387,12 +399,14 @@ fn main() {
     );
     let roof_out_l2 = run_scan_pass(&runtime, "(1b/2b) OUT-OF-L2", rows_large, iters_large);
 
-    // (3) ALGORITHMIC -- SINGLE pass, sized by SORT_N (NOT part of the IN-L2/OUT-OF-L2 row sweep). Runs on
-    // its own small resident column so it is independent of the two scan datasets above.
+    // (3) ALGORITHMIC -- sort/join are sized by SORT_N, while GROUP BY is a full ROWS pass. This section is
+    // not part of the IN-L2/OUT-OF-L2 row sweep and uses its own resident input.
     println!(
         "\n# ===================================================================================="
     );
-    println!("# (3) ALGORITHMIC (sort / join / grouped) -- SINGLE pass, sort_n-sized (NOT in the L2 sweep)");
+    println!(
+        "# (3) ALGORITHMIC -- sort/join use sort_n; GROUP BY uses full ROWS (NOT in the L2 sweep)"
+    );
     println!(
         "# ===================================================================================="
     );
@@ -522,15 +536,15 @@ fn main() {
     // ~1M-distinct key column A and summing B over a full-table scan (indices = 0..rows, as the executor
     // passes for an unfiltered GROUP BY). Replaces the removed `grouped_stats_i32` hash-agg measurement.
     //
-    // The kernel-timed call (CUDA-event over the LIVE two-level kernel, runs=10) is the HONEST aggregate
-    // KERNEL ms. The `from_payload` wall printed alongside is the END-TO-END result path: per-call it pays
+    // The kernel-timed call (CUDA-event p50 over the LIVE two-level kernel, runs=10) is the HONEST aggregate
+    // KERNEL p50 ms. The `from_payload` wall printed alongside is the END-TO-END result path: per-call it pays
     // the row-count index H2D (the engine's indices are already device-resident from its on-device filter
     // -- an artifact here), + the ~2*row_count slot-table setup, + the host build of the result Vec. NONE
     // of that is the kernel. See grouped_cardinality_probe for the end-to-end result path.
     let gb_indices: Vec<u32> = (0..rows as u32).collect();
     {
         let gi = &gb_indices;
-        // Honest KERNEL: CUDA-event timed, two-level kernel, 10 runs, full-compute mask.
+        // Honest KERNEL: CUDA-event p50, two-level kernel, 10 runs, full-compute mask.
         let (_rows, kernel_ms) = resident
             .group_by_i32_count_sum_kernel_timed(
                 gpu_db_execution::CudaGroupByInput::resident_i32(off_a, off_b, rows),
@@ -543,7 +557,7 @@ fn main() {
         let kernel_melem_s = rows as f64 / (kernel_ms as f64 * 1e3); // rows / (ms*1000 us) = rows/us = Melem/s
                                                                      // reports BOTH p50 latency (the CUDA-event ms) AND throughput (Melem/s).
         println!(
-            "  {:<40} {:>7.3}ms  {:>8.1} Melem/s (KERNEL only, CUDA-event)",
+            "  {:<40} {:>7.3}ms  {:>8.1} Melem/s (p50 KERNEL only, CUDA-event)",
             "group_by_i32 KERNEL (~1M groups)", kernel_ms, kernel_melem_s
         );
         // Full result path (index H2D + ~2*row_count table setup + host Vec build), labeled NON-kernel.
@@ -573,15 +587,15 @@ fn main() {
         "# ===================================================================================="
     );
     match (roof_in_l2, roof_out_l2) {
-        (Some(in_l2), Some(out_l2)) => {
-            println!("# sum_i32 ROOFLINE  in-L2 ({in_l2_col_mb:.0}MB/col) = {in_l2:.0} GB/s  vs  out-of-L2 ({out_l2_col_mb:.0}MB/col) = {out_l2:.0} GB/s");
+        (Some((in_l2, in_l2_us)), Some((out_l2, out_l2_us))) => {
+            println!("# sum_i32 ROOFLINE  in-L2 ({in_l2_col_mb:.0}MB/col) = {in_l2:.0} GB/s at p50 {in_l2_us:.0}us  vs  out-of-L2 ({out_l2_col_mb:.0}MB/col) = {out_l2:.0} GB/s at p50 {out_l2_us:.0}us");
             println!("#   -> out-of-L2 is {:.2}x the in-L2 roofline (out-of-L2 = the HONEST HBM/GDDR7-bound peak).", out_l2 / in_l2);
             println!("# The gather lines above show the cache effect most sharply: the in-L2 gather serves from the");
             println!("# {l2_mb:.0}MB L2 (cache-FLATTERED); the out-of-L2 gather scatters across {out_l2_col_mb:.0}MB > L2 (cache-MISS,");
             println!("# GDDR7-random) and should drop sharply. Compare the gather_i32/i64 GB/s + p50 latency between passes.");
         }
-        (Some(in_l2), None) => {
-            println!("# sum_i32 ROOFLINE  in-L2 ({in_l2_col_mb:.0}MB/col) = {in_l2:.0} GB/s.  OUT-OF-L2 pass was SKIPPED (see above) -- no cache-MISS roofline this run.");
+        (Some((in_l2, in_l2_us)), None) => {
+            println!("# sum_i32 ROOFLINE  in-L2 ({in_l2_col_mb:.0}MB/col) = {in_l2:.0} GB/s at p50 {in_l2_us:.0}us.  OUT-OF-L2 pass was SKIPPED (see above) -- no cache-MISS roofline this run.");
         }
         _ => {
             println!("# both passes unavailable (no roofline captured this run).");

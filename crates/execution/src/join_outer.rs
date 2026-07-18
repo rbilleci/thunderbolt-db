@@ -1,6 +1,6 @@
 //! GPU OUTER-join match marking and unmatched-coordinate completion ownership.
 
-use std::{os::raw::c_void, sync::Mutex};
+use std::os::raw::c_void;
 
 use super::{
     check_cuda, launch_cuda_resident_device_memory, CudaDeviceMemoryProof, CudaJoinCoordinatesU32,
@@ -19,18 +19,17 @@ impl CudaResidentDeviceMemory {
         let allocation =
             launch_cuda_resident_device_memory(self.metadata.gpu_id, &vec![0_u8; byte_len])?;
         Ok(CudaMatchBitmapU32 {
-            marks: CudaResidentDeviceMemory {
-                metadata: CudaDeviceMemoryProof {
+            marks: CudaResidentDeviceMemory::from_raw_parts(
+                CudaDeviceMemoryProof {
                     gpu_id: self.metadata.gpu_id,
                     device_name: self.metadata.device_name.clone(),
                     allocated_bytes: byte_len as u64,
                     copied_bytes: byte_len as u64,
                     retained: true,
                 },
-                device_ptr: allocation.device_ptr,
-                primary: allocation.primary,
-                last_kernel_event_elapsed_us: Mutex::new(None),
-            },
+                allocation.device_ptr,
+                allocation.primary,
+            ),
             row_count,
         })
     }

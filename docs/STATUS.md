@@ -267,8 +267,180 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   **89.6M lookups/s at p50 605us** in-L2 and **3.29M/s at p50 19.784ms** out-of-L2. The 48M-row build takes
   **1,620.4s**, so the canonical Section C timeout is now 2,400s. Raw kernels remain healthy; the point-path loss
   scales with the thousands of insert-published authoritative shard descriptors that R3-004 retains instead of
-  discarding through the retired late conversion. **PERF-001** owns removing that submission/representation cost
-  without host authority, late conversion, or weaker publication semantics.
+  discarding through the retired late conversion. **PERF-001** recovered that submission/representation cost
+  without host authority, late conversion, or weaker publication semantics; the accepted result is recorded below.
+
+## PERF-001 point-read recovery — accepted 2026-07-18
+
+- Permanent `probe-timing` phases now cover engine route preparation, descriptor enumeration, submission,
+  completion, and result assembly plus execution descriptor encoding, plan upload, transfer/launch enqueue,
+  CUDA-event kernel time, synchronization, and host copy. A fixed 262,144-row, 65,536-needle sweep measured
+  descriptor enumeration at about **17us / 45–54us / 164–165us / 681–711us** for
+  **33 / 129 / 513 / 2,049** authoritative shards while kernel time remained **17–23us**. Throughput fell from
+  **101.8M/s** to **43.4M/s**, identifying per-batch host descriptor/index traversal and descriptor encoding/upload
+  as the causal shard-count term rather than the resident read kernel.
+- The first independent three-agent adversarial audit rejected the implementation. It found a captured-payload/
+  newer-index publication race; unbounded, unaccounted route pins and stale republish windows; database-global
+  invalidation on unrelated table writes; swallowed CUDA prepare/submit/complete failures; public status/range
+  contract breaks; incomplete descriptor validation; and a vacuous compatibility benchmark seam.
+- The second independent three-agent audit rejected that first remediation. It found that an index rebuilt after a
+  concurrent DELETE could use a newer GC boundary than the point read; invalidation preserved the old table token;
+  retained route publication was outside the hard-budget transaction; CUDA probe/pinned-buffer panics could unwind
+  before a draining owner covered launched work; NULL eligibility and route preparation reloaded different shard
+  generations; the R3 helper counted the internal dense identity as zero; and the R2 scan/index plus atomic/dense
+  labels did not select distinct production routes.
+- The first follow-up re-audit accepted the contract/evidence disposition but rejected three remaining cases. A
+  route built at a newer DELETE/GC boundary could cache-hit for an older paused reader; the multi-shard submit owner
+  was constructed after async H2D and a timing probe; and completion's local pinned/pageable D2H destinations would
+  unwind before the by-value submission parameter performed its drain.
+- The second publication follow-up found one accounting consequence: replacing a boundary-narrow index in the
+  index map could leave the old allocation durably pinned only by a cached route, while accounting counted neither
+  that index nor more than the route's descriptor allocation.
+- The next accounting follow-up found the same ownership invariant was not yet global: incremental and fused append
+  could remove a load-exhausted, probe-overflowed, or launch-failed index directly, before later mutation
+  publication retired a cached route that still pinned the allocation.
+- The next three-agent full follow-up rejected three more interleavings. Normal append success could mutate index
+  `I1` but advance a same-basis replacement `I2`; an index build paused inside CUDA construction could publish its
+  retired payload after DROP's purge; and the safe independent dense submission borrowed caller needle bytes for
+  an asynchronous H2D without owning them or carrying their lifetime.
+- The latest follow-up found three narrower enforcement/evidence gaps. The public single-shard dense safe entry did
+  not yet validate index context, allocation geometry, or projection alignment like the multi-shard entry;
+  repeated benchmark shard installation replaced the current payload without centrally purging an index guard that
+  pinned the old payload; and the fused append race gate asserted only a cumulative nonzero hit count. Both dense
+  entries now apply the same total preflight, common shard installation publishes the new payload cells then
+  performs ordered route/index retirement before descriptor publication, and the target insert must contribute an
+  exact fused-hit delta.
+- The subsequent reviewers found four more gaps. A structurally valid index slot could encode a row beyond the
+  single-shard resident extent; the older atomic deferred point APIs still DMA-read a caller borrow after returning;
+  a sidecar-free synthetic replacement left prior DELETE/CREATE/row-id regions globally published; and the R3
+  attribution example mislabeled its default 4MB column as out-of-L2 while printing only cumulative binary hits.
+  Both single-shard probe kernels now reject decoded rows before gather, and both atomic/dense submissions own an
+  exact pinned/pageable needle copy inside a drain owner constructed before enqueue. Common shard publication now
+  republishes/tombstones the exact sidecars carried by its replacement descriptors, while index construction
+  consumes the captured descriptor's DELETE generation rather than reloading a global cell. The R3 example makes
+  no cache-regime claim and asserts a positive measured-loop binary-hit delta for its labelled case.
+- The most recent independent pass accepted publication/accounting and rejected three CUDA/public-contract cases
+  plus four evidence-record cases. A public read view retained only a raw pointer and context, atomic completion
+  removed its stream owner before staged result D2H was panic-safe, and multi-shard duplicate status 3 could become
+  an empty compatibility result. The timed R3 SQL row/route was not checked, R2 summary/concurrent rows omitted p50,
+  PLAN claimed unsupported corrected-card numbers, and the recorded engine count predated two tests. Allocation
+  lifetime is now one shared guard retained by the owner, every read view, and every deferred submission. Atomic
+  count and result D2H have local unwind drains while the submission retains its stream until the successful tail.
+  Compatibility completion returns a typed duplicate-match error and public row conversion fails loud on invalid
+  dense status. R3 proves every timed SQL row/value and GPU target plus a positive measured-loop route-hit delta;
+  every R2 performance row reports p50 and throughput; and all ledgers use only supported evidence and exact counts.
+- The next publication re-audit accepted the exact tree, while the CUDA and contract/evidence reviewers rejected
+  four remaining proof/measurement gaps. The allocation regression submitted before dropping its owner, so
+  synchronizing `cuMemFree` could make a broken lifetime implementation pass; duplicate status 3 was exercised
+  only with fabricated host data; the Layer-1 GROUP BY line called p50 while its CUDA-event helper returned the
+  minimum of ten runs; and R3 route labels required only positive rather than exact per-call counter deltas. The
+  lifetime regression now drops the owner before submitting through the surviving read view and uses a test-only
+  Weak allocation witness to prove view and submission retention separately. A real-GPU two-shard duplicate-key
+  case observes compact status 3, the typed compatibility error, and exact pool reuse. The GROUP BY helper now
+  returns nearest-rank event p50, and every timed R3 SQL/batched regime requires exactly one matching route/probe
+  hit per call, with zero binary hits in one-shard regimes. Both focused GPU regressions, the 50-test active
+  execution suite, the exact **129/129** include-ignored execution suite, workspace all-target/all-feature check,
+  strict execution/engine/facade Clippy, formatting, diff whitespace, and changed-source-size gates pass. A fresh
+  three-lane re-audit and the corrected complete report card remain the acceptance gates.
+- On that restarted tree, publication/accounting and CUDA ownership accepted; contract/evidence rejected the
+  isolated gather kernel's single event sample under a p50 label and the archive's continued presentation of the
+  historical minimum-based GROUP BY number as valid. Isolated gather now collects an event sample for every timed
+  iteration, and the closing roofline comparison retains both regimes' `sum_i32` p50 plus throughput. The archive
+  invalidates the former grouped minimum. A corrected raw run completed both regimes: in/out-of-L2 `sum_i32` was
+  **1,476.9 GB/s at p50 23us / 1,450.6 GB/s at p50 185us**, isolated gather was **349.5 GB/s at p50 6us /
+  155.3 GB/s at p50 108us**, and GROUP BY was **1,671.8M elements/s at p50 5.018ms**. Strict example Clippy,
+  example compilation, formatting, and diff whitespace pass. The complete three-lane re-audit and canonical card
+  remain pending.
+- The next full read-only pass found only two low-severity label contradictions: Layer-1 prose called GROUP BY
+  `SORT_N`-sized although it uses full `ROWS`, and the public dense-submission rustdoc named only status 1/2 although
+  its multi-shard route may emit status 3. Module/header prose now distinguishes sort/join `SORT_N` from full-row
+  GROUP BY, and the public submission contract distinguishes single-shard 1/2 from multi-shard 1/2/3 decline.
+  Runtime, sampling, and supported evidence are unchanged. A final exact-tree three-lane audit and the canonical
+  card remain pending.
+- The current candidate owns one stable generation token per table publication and rotates it across every shard
+  before invalidation can purge routes. It pins one exact shard map for NULL eligibility and route capture, validates
+  the captured live cell around index preparation, and rechecks generation under the publication lock. Device-index
+  cache entries carry their build GC boundary; point reads build for their exact read boundary and cache hits require
+  a boundary at least as conservative, preserving rows visible to older lock-free readers. Shared preparation
+  declines explicit/private transactions. Prepared-route cache hits apply the same `route_boundary <= read_boundary`
+  rule, and within one generation/shape the oldest semantic-superset route dominates publication. Route retention
+  is bounded to one shape per table and 64 globally,
+  descriptor bytes are charged to residency, and budget preflight-through-publication is serialized with every
+  other durable allocation; over-budget plans run transiently.
+- Boundary-driven index replacement now takes budget -> route -> index locks, stores route retirement while the old
+  index remains accounted, then replaces the index-map entry before releasing the budget transaction. Prepared
+  route publication revalidates every index Arc under the same lock order, so a plan superseded between preparation
+  and publication can execute once but cannot become an unaccounted durable cache owner.
+- All append-side index-map exits now share the ordered route -> index purge. Both incremental index insertion and
+  fused append use it for load-rule rollover, bounded-probe overflow, and launch failure, so a cached route is
+  retired while the old index is still map-accounted. Successful in-place extension retains and advances the same
+  allocation owner.
+- Successful incremental and fused append now publish a new row-count basis only when the current map entry's
+  device-index Arc is pointer-identical to the allocation that received the keys. A deterministic test replaces
+  that entry after launch in both modes, proves its old basis remains, then proves the next probe rebuilds and finds
+  the committed key.
+- Index construction revalidates the globally current payload Arc while holding the same route lock as lifecycle
+  purge. A lifecycle change that already won makes the completed build transient-only; one that starts later must
+  purge after publication. A paused-build/DROP regression proves no dropped-table cache owner can republish.
+- CUDA index preparation, submission, and completion return typed errors through the engine and facade without
+  retry. Before the first async H2D/memset enqueue, every deferred point submission owns all device resources and an
+  exact pooled-pinned or pageable copy of the caller's needle bytes; the safe returned handle never references the
+  caller's source after submission.
+  Completion retains that owner through event readback and declares an additional host-copy drain after every pinned/pageable D2H
+  destination, so panic unwind synchronizes before any local destination drops. Owner, read view, and the returned
+  submission also share the exact allocation lifetime, so either public facade may be dropped before completion.
+  One-shot tests cover all three
+  failure phases, drop-without-complete pool reuse, and injected panics immediately after H2D and D2H. The public
+  `Vec<u32>` status and one-range-per-needle
+  retained-result contracts are restored; opaque internal dense types retain one-byte status and all-present
+  identity only on the production hot path. Duplicate status remains an opaque production decline and becomes a
+  typed error at the public compatibility bridge rather than a false not-found. Preflight checks context/pointer
+  ownership, min/max ordering,
+  projection alignment and visibility spans, index context/geometry/extents, checked capacities/sizes, and
+  impossible row counts before launch in both the single- and multi-shard entries.
+- At 2,049 shards the fixed-row case improved to **97.5M/s at p50 547us**; cached route preparation measured
+  **8–16us** and kernel time **12–13us**, so the measured descriptor slope is gone. On the remediation tree, the
+  permanent 1M-row/526-shard probe records **46,200** one-time descriptor bytes, **3–7us** cached enumeration,
+  **262,144 H2D bytes**, **589,824 D2H bytes**, **11–13us** kernel events, roughly **54–68us** submission,
+  **85–95us** completion, and **42–78us** assembly per 65,536-needle batch.
+- The complete card before the public-range correction retained valid raw and production-compact measurements:
+  `sum_i32` was **1,468.4/1,450.6 GB/s** in/out of L2, while the production compact route reached **232.594M/s at
+  p50 154us** in-L2 and **199.671M/s at p50 201us** out-of-L2. Its former `scan` and compatibility `lpb` rows were
+  vacuous and are invalid evidence. A separately labelled `dense` row was another invocation of the same compact
+  production route, so it is not distinct A/B evidence. After restoring one public range per needle and wiring the
+  benchmark directly to the compact production entry, non-vacuous in-L2 production evidence is **231.565M/s at
+  p50 154us**, with a **232.87M/s at p50 152us** confirmation; real public compatibility materialization is about
+  **8.04ms p50 / 7.95–7.97M/s**. R2 now reports only those two genuinely distinct result contracts over the same
+  production sharded kernel: `compat-public` and `prod-compact`. At that checkpoint, the corrected complete card
+  remained the acceptance gate later closed below.
+- Before the final card, those supported production measurements implied about **12.3% in-L2** and **27.6%
+  out-of-L2** throughput gaps. The required H2D/D2H bytes are common to both representations and do not explain the
+  delta. Fragmented device payload/descriptor traversal is a bounded inference, not a proven causal attribution;
+  proving it directly would require restoring the forbidden retired representation.
+- Byte/NULL/visibility differentials, exact-generation cache reuse, budget accounting, public result shape, failure
+  fan-out, and malformed geometry tests pass. Deterministic tests cover old-boundary DELETE rebuild,
+  invalidation-before-purge republish, NULL-generation replacement, and budget-publication serialization. The
+  nine-test actual-GPU family passed three sequential plus two simultaneous HAZARD invocations. On the exact latest
+  tree, engine passes **1,026/1,026** including ignored GPU tests in 397.69s; execution passes **129/129** including
+  ignored tests. Facade ordinary all-target tests pass **39 with 8 GPU-ignored**, and serialized concurrency passes
+  **13 with 1 GPU-ignored**. Workspace all-target/all-feature check, strict execution/engine/facade Clippy,
+  formatting, diff whitespace, and changed-source-size gates pass.
+  The remediation evidence is archived in
+  [`perf-001-remediation-2026-07-18.md`](archive/testing/reports/perf-001-remediation-2026-07-18.md).
+- Final acceptance is complete. Three independent read-only lanes accepted the exact code/evidence tree with no
+  remaining severity finding: publication/accounting, CUDA ownership/public contracts, and benchmark/evidence.
+  The canonical two-layer/two-cache card then completed with exit 0. Layer 1 in/out-of-L2 `sum_i32` measured
+  **1,313.7 GB/s at p50 26us / 1,433.8 GB/s at p50 187us**; `equal_any` was **624.4/139.6 GB/s**,
+  compare-count **1,223.7/1,449.9 GB/s**, between-count **608.4/727.8 GB/s**, constant-mask output
+  **1,097.9/1,458.4 GB/s**, isolated gather **349.5 GB/s at p50 6us / 155.3 GB/s at p50 108us**, sort/join
+  **348.1M/258.4M elements/s**, and GROUP BY **1,673.5M elements/s at p50 5.012ms**. Ratios to each run's
+  `sum_i32` roofline and the algorithmic rates are stable or better than the standard baseline; no regression
+  signal fired. Layer 2 production compact reached **232.641M lookups/s at p50 156us** in-L2 and
+  **198.933M/s at p50 203us** out-of-L2. The out-of-L2 result is within **0.4%** of the valid pre-correction
+  **199.671M/s** arm; the 48M-row fixture built in **1,633.7s** without late conversion. Relative to the retired
+  unified comparison only, the accepted residual gaps are **11.9% in-L2 / 27.8% out-of-L2**. Required transfers
+  remain common to both representations, and fragmentation remains an inference rather than proven attribution.
+  PERF-001 is closed and removed from PLAN; **RETIRE-003** is promoted to NOW.
 
 ## Structural decomposition
 
@@ -4079,7 +4251,6 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Boundary | Work ID |
 |---|---|
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
-| Insert-published authoritative-shard point reads remain roughly 3x slower in-L2 and 84–86x slower out-of-L2 than the pre-R3-004 late-converted evidence | **PERF-001** |
 | Non-int4 O(1) point-lookup breadth | **READ-002** |
 | Reverse-gather/deauthorization/scan-build DDL and recovery repair | **RETIRE-002** |
 | Generic CUDA-MVCC host compaction, ordering, projection, and result assembly | **RETIRE-003** |
