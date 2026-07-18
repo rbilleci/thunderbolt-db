@@ -11,7 +11,7 @@ fn gpu_streaming_ordered_top_n_across_chunks() {
     // device sort + the real window produces the answer. The global top-N spans chunks (ascending
     // values inserted in scan order, so the DESC winners live in the LAST chunk — a first-chunk-only
     // fold would answer wrongly).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -86,27 +86,33 @@ fn gpu_streaming_ordered_top_n_across_chunks() {
         "filtered ordered window"
     );
 
-    // COMPACTION: LIMIT 400 -> each chunk contributes up to 400 run rows (1600B), the accumulator
-    // crosses the 2KB target after chunk 2 and must device-compact — the result stays exact.
-    let compacted = e
+    // LIMIT 400 produces runs that cannot remain within this 4 KiB budget. The streaming route must
+    // decline loudly without recording a successful hit or borrowing a host answer.
+    let hits_before_decline = e.streaming_fold_hits();
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select("SELECT a FROM big ORDER BY a LIMIT 400"))
-        .unwrap();
-    let expected_top400: Vec<Vec<SqlValue>> = (0..400).map(|i| vec![SqlValue::Int4(i)]).collect();
-    assert_eq!(
-        compacted.rows.clone().into_boxed(),
-        expected_top400,
-        "top-400 exact THROUGH the mid-scan compaction"
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "big",
+        fallback_before,
     );
+    assert_eq!(e.streaming_fold_hits(), hits_before_decline);
 
-    // Differential vs the CPU pinned path.
+    // The exact closed-form DESC result above owns semantics. Disabling streaming must make the
+    // unsupported route fail loudly rather than obtain a host answer.
     e.clear_relational_residency_budget_bytes(0);
-    let cpu = e
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select("SELECT a FROM big ORDER BY a DESC LIMIT 5"))
-        .unwrap();
-    assert_eq!(
-        cpu.rows.clone().into_boxed(),
-        expected_desc,
-        "CPU oracle DESC top-5"
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "big",
+        fallback_before,
     );
 }
 
@@ -115,8 +121,8 @@ fn gpu_streaming_ordered_top_n_across_chunks() {
 fn gpu_streaming_ordered_unbounded_fits_or_defers() {
     // S-E.4 unbounded ORDER BY: a selective WHERE whose survivor set fits the budget streams (per-chunk
     // plain filter/project, ONE final device sort); a survivor set that outgrows the budget DEFERS
-    // honestly to the CPU path (its final device sort could not fit) — correct rows, no hit.
-    let mut e = Engine::new_local_cpu_oracle();
+    // honestly and fails loudly (its final device sort could not fit), with no streaming hit.
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -150,19 +156,16 @@ fn gpu_streaming_ordered_unbounded_fits_or_defers() {
     let hits_after = e.streaming_fold_hits();
     assert!(hits_after >= 1, "unbounded ordered fold fired");
 
-    // Non-selective: 1500 survivors (6000B) outgrow the 4096B budget -> DEFER (no hit), CPU serves it.
-    let deferred = e
+    // Non-selective: 1500 survivors (6000B) outgrow the 4096B budget -> DEFER and fail loudly.
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select("SELECT a FROM big ORDER BY a"))
-        .unwrap();
-    assert_eq!(
-        deferred.rows.len(),
-        N as usize,
-        "deferred full ordered scan served by CPU"
-    );
-    assert_eq!(
-        deferred.rows.clone().into_boxed()[0],
-        vec![SqlValue::Int4(0)],
-        "CPU order correct"
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "big",
+        fallback_before,
     );
     assert_eq!(
         e.streaming_fold_hits(),

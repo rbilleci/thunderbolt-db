@@ -6,7 +6,7 @@ use crate::{
 
 #[test]
 fn execute_mvcc_query_supports_multi_frame_provenance_filters_and_projection() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -16,7 +16,7 @@ fn execute_mvcc_query_supports_multi_frame_provenance_filters_and_projection() {
     e.execute_text(7, "SET team:beta:2=Bianca").unwrap();
 
     let query = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -63,14 +63,14 @@ fn execute_mvcc_query_supports_multi_frame_provenance_filters_and_projection() {
 
 #[test]
 fn execute_mvcc_query_preserves_multi_frame_provenance_identity_under_concat_distinct() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:shared").unwrap();
     e.execute_text(3, "SET team:shared=member:1").unwrap();
     e.execute_text(4, "SET member:1=Alice").unwrap();
 
     let distinct = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::ConcatDistinct {
                 sources: vec![
                     MvccReadSource::FollowValueChain {
@@ -120,7 +120,7 @@ fn execute_mvcc_query_preserves_multi_frame_provenance_identity_under_concat_dis
 
 #[test]
 fn execute_mvcc_query_supports_provenance_path_summary_projection() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -130,7 +130,7 @@ fn execute_mvcc_query_supports_provenance_path_summary_projection() {
     e.execute_text(7, "SET team:beta:1=Bob").unwrap();
 
     let query = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -173,11 +173,11 @@ fn execute_mvcc_query_supports_provenance_path_summary_projection() {
 
 #[test]
 fn execute_mvcc_query_provenance_summary_projection_keeps_non_join_shapes_stable() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET standalone:1=Loose").unwrap();
 
     let query = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 1 },
             filter: Some(MvccReadFilter::KeyPrefix("standalone:".to_string())),
@@ -201,7 +201,7 @@ fn execute_mvcc_query_provenance_summary_projection_keeps_non_join_shapes_stable
 
 #[test]
 fn execute_mvcc_query_supports_frame_aware_provenance_ordering() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -212,7 +212,7 @@ fn execute_mvcc_query_supports_frame_aware_provenance_ordering() {
     e.execute_text(8, "SET team:beta:2=Bianca").unwrap();
 
     let query = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -262,7 +262,7 @@ fn execute_mvcc_query_supports_frame_aware_provenance_ordering() {
 
 #[test]
 fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -273,7 +273,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     e.execute_text(8, "SET member:2=Bob").unwrap();
 
     let ordered = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -312,7 +312,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     );
 
     let filtered = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -345,7 +345,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     );
 
     let key_ordered = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -380,7 +380,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     );
 
     let key_exact = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -413,7 +413,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     );
 
     let key_value_exact = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -449,7 +449,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     );
 
     let cross_frame_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -476,7 +476,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     assert!(cross_frame_miss.rows.is_empty());
 
     let key_path_exact = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -510,7 +510,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     );
 
     let value_path_exact = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -548,7 +548,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     );
 
     let ordered_path_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -575,7 +575,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     assert!(ordered_path_miss.rows.is_empty());
 
     let key_path_contains = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -609,7 +609,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     );
 
     let truncated_bundle_contains_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -636,7 +636,7 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
     assert!(truncated_bundle_contains_miss.rows.is_empty());
 
     let ordered_subpath_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -668,14 +668,14 @@ fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
 
 #[test]
 fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
     e.execute_text(4, "SET profile:noop=acct:noop").unwrap();
 
     let key_count = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:noop".to_string()],
                 plan: MvccValueChainPlan {
@@ -709,7 +709,7 @@ fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filte
     );
 
     let value_count = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -743,7 +743,7 @@ fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filte
     );
 
     let key_value_count = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -781,7 +781,7 @@ fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filte
     );
 
     let position_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -816,7 +816,7 @@ fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filte
     );
 
     let position_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -841,7 +841,7 @@ fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filte
     assert!(position_miss.rows.is_empty());
 
     let threshold_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -867,14 +867,14 @@ fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filte
 
 #[test]
 fn execute_mvcc_query_supports_repeated_provenance_bundle_subpath_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
     e.execute_text(4, "SET profile:solo=team:solo").unwrap();
 
     let repeated_subpath = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![
                     MvccReadSource::FollowValueChain {
@@ -921,7 +921,7 @@ fn execute_mvcc_query_supports_repeated_provenance_bundle_subpath_filters() {
     );
 
     let truncated_bundle_repeat_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -946,7 +946,7 @@ fn execute_mvcc_query_supports_repeated_provenance_bundle_subpath_filters() {
     assert!(truncated_bundle_repeat_miss.rows.is_empty());
 
     let impossible_repeat_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -973,14 +973,14 @@ fn execute_mvcc_query_supports_repeated_provenance_bundle_subpath_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_relative_provenance_bundle_distance_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
     e.execute_text(4, "SET profile:solo=team:solo").unwrap();
 
     let distance_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![
                     MvccReadSource::FollowValueChain {
@@ -1028,7 +1028,7 @@ fn execute_mvcc_query_supports_relative_provenance_bundle_distance_filters() {
     );
 
     let truncated_distance_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -1054,7 +1054,7 @@ fn execute_mvcc_query_supports_relative_provenance_bundle_distance_filters() {
     assert!(truncated_distance_miss.rows.is_empty());
 
     let mismatch_distance_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -1082,14 +1082,14 @@ fn execute_mvcc_query_supports_relative_provenance_bundle_distance_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_provenance_bundle_suffix_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
     e.execute_text(4, "SET profile:solo=team:solo").unwrap();
 
     let suffix_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![
                     MvccReadSource::FollowValueChain {
@@ -1139,7 +1139,7 @@ fn execute_mvcc_query_supports_provenance_bundle_suffix_filters() {
     );
 
     let truncated_suffix_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -1167,7 +1167,7 @@ fn execute_mvcc_query_supports_provenance_bundle_suffix_filters() {
     assert!(truncated_suffix_miss.rows.is_empty());
 
     let mismatch_suffix_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -1193,14 +1193,14 @@ fn execute_mvcc_query_supports_provenance_bundle_suffix_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_provenance_bundle_prefix_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
     e.execute_text(4, "SET profile:solo=team:solo").unwrap();
 
     let prefix_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![
                     MvccReadSource::FollowValueChain {
@@ -1246,7 +1246,7 @@ fn execute_mvcc_query_supports_provenance_bundle_prefix_filters() {
     );
 
     let truncated_prefix_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -1280,7 +1280,7 @@ fn execute_mvcc_query_supports_provenance_bundle_prefix_filters() {
     );
 
     let mismatch_prefix_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -1306,14 +1306,14 @@ fn execute_mvcc_query_supports_provenance_bundle_prefix_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_provenance_bundle_slice_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
     e.execute_text(4, "SET profile:solo=team:solo").unwrap();
 
     let anchored_slice_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![
                     MvccReadSource::FollowValueChain {
@@ -1360,7 +1360,7 @@ fn execute_mvcc_query_supports_provenance_bundle_slice_filters() {
     );
 
     let truncated_slice_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -1395,7 +1395,7 @@ fn execute_mvcc_query_supports_provenance_bundle_slice_filters() {
     );
 
     let wrong_anchor_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -1420,7 +1420,7 @@ fn execute_mvcc_query_supports_provenance_bundle_slice_filters() {
     assert!(wrong_anchor_miss.rows.is_empty());
 
     let out_of_range_slice_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {

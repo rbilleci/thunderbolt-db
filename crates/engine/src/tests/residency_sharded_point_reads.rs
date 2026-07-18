@@ -114,7 +114,7 @@ fn sharded_predicate_null_3vl_on_versioned_shard() {
 /// `SqlValue::Null`, not the raw-0 placeholder the ledger flagged as SQL-WRONG. The sharded scan's
 /// recompaction rebuilds each column's validity bitmap into the unified buffer + labels the unified
 /// descriptor, so the general executor emits NULLs. Asserts the SQL-SPEC-CORRECT result directly (the
-/// authoritative reference — [[sql-spec-over-cpu-parity]]) for a NULL in the PROJECTED column AND a NULL in
+/// authoritative fixture-derived reference) for a NULL in the PROJECTED column AND a NULL in
 /// the KEY column. Sabotage: passing an empty `unified_null_columns` (or dropping the null-region
 /// fills/segments) reverts to raw-0 -> the NULL cells read back as Int4(0), failing the assertions below.
 /// (IS NULL / IS NOT NULL predicates are a separate sharded-router-eligibility concern, out of scope here.)
@@ -157,7 +157,7 @@ fn sharded_null_read_projects_sql_null() {
 }
 
 /// STEP 1 (lpb-for-shards) — the BATCHED cross-shard point-lookup gather returns, per needle, rows
-/// BYTE-IDENTICAL to the single-flight 3b route (which is itself == scan == host), across
+/// BYTE-IDENTICAL to the single-flight 3b GPU route, across
 /// present / absent / multi-shard / NULL-blind, and the batched path FIRES (`sharded_point_batch_hits`
 /// advances). Sabotage: dropping the slot from the gather (`project_i32_rows_from_payload(col_base, [0;n])`)
 /// returns row-0 values for every needle → diverges from the single-flight route.
@@ -216,11 +216,11 @@ fn sharded_point_batch_matches_single_flight_route() {
         e.sharded_point_binary_route_hits() > bin_hb,
         "the O(1) BINARY-SEARCH route FIRED (ascending-disjoint shards)"
     );
-    // Sub-slice 8: this delete-free table takes the FULLY-GPU dense-emit path (not the host-probe
-    // fallback) — prove it fired, so the byte-identical comparison below is validating the GPU path.
+    // Sub-slice 8: this delete-free table takes the fully GPU-native dense-emit path. Prove it
+    // fired so the byte-identical comparison below validates the intended route.
     assert!(
         e.sharded_point_gpu_probe_hits() > gpu_hb,
-        "the GPU-native dense-emit probe path FIRED (delete-free -> not the host fallback)"
+        "the GPU-native dense-emit probe path FIRED"
     );
     assert_eq!(proj.ncols, 2, "id, balance");
     // Per-needle rows from the flat batched projection.
@@ -236,15 +236,16 @@ fn sharded_point_batch_matches_single_flight_route() {
         })
         .collect();
 
-    // Single-flight 3b route (== scan == host) as the per-needle oracle.
+    // Single-flight 3b route as the per-needle GPU baseline.
     for (i, &k) in needles.iter().enumerate() {
-        let rows = e
+        let result = e
             .execute_relational_select_text(&format!(
                 "SELECT id, balance FROM accounts WHERE id = {k}"
             ))
-            .unwrap()
-            .rows
-            .into_boxed();
+            .unwrap();
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        let rows = result.rows.into_boxed();
         let want: Vec<Vec<i32>> = rows
             .iter()
             .map(|r| {
@@ -469,7 +470,7 @@ fn sharded_point_batch_binary_route_deep_shards() {
         .expect("batched served (delete-free)");
     assert!(
         k.sharded_point_gpu_probe_hits() > gpu_hb,
-        "the GPU-native probe fired (not host fallback)"
+        "the GPU-native probe fired"
     );
     assert!(
         k.sharded_point_binary_route_hits() > bin_hb,

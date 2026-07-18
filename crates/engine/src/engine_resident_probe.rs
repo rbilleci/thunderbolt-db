@@ -265,8 +265,8 @@ fn compile_resident_plan(
 /// kernel returns (shared by the filtered and BETWEEN scalar-aggregate paths). `count == 0` (no
 /// surviving rows) ⇒ SQL NULL for every aggregate — PG: an aggregate of no rows is NULL (SUM/AVG/MIN/MAX),
 /// never 0 or an empty-text sentinel. This matches [`finalize_direct_scalar_stats`]; the old empty-text
-/// sentinel was legacy byte-parity with the CPU engine, but that path is interim debt (ADR-006) and
-/// PG-correctness wins over matching it (see the `sql-spec-over-cpu-parity` working agreement).
+/// sentinel was legacy byte-parity with the now-retired CPU engine; PG correctness is pinned by the
+/// independent SQL specification instead.
 fn materialize_resident_scalar_stats(
     aggregate: ResidentScalarAggregate,
     stats: &CudaI32Stats,
@@ -599,8 +599,8 @@ impl Engine {
                     // with group == value, which built an O(distinct)-entry hash table just to reduce —
                     // collapsing to ~182 Melem/s and falling at high distinctness (e.g. a unique 8M-row
                     // id). The result is
-                    // byte-identical: the kernel's (count, sum, min, max) equals what the self-grouped
-                    // path produced and the host reduced (same i64 two's-complement sum, same min/max,
+                    // byte-identical to the historical implementation: the kernel's (count, sum,
+                    // min, max) equals what the self-grouped path produced before its bounded host reduction (same i64 two's-complement sum, same min/max,
                     // same AVG rounding via `average_sql_value`). D2H is now a fixed 24-byte stats struct
                     // (count u64 + sum i64 + min/max i32), independent of distinctness.
                     let started = Instant::now();
@@ -1503,8 +1503,8 @@ impl Engine {
                         }
                         text_values.insert(*idx, values);
                     }
-                    // See the multi-column route above: typed columns take the CPU path; this
-                    // GPU projection only handles int4/text.
+                    // See the multi-column route above: this specialized GPU projection handles
+                    // only int4/text; typed columns decline to the general CUDA executor.
                     SqlType::Int2
                     | SqlType::Int8
                     | SqlType::Numeric { .. }
@@ -1671,11 +1671,10 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn execute_relational_select_with_backend<B: MvccExecutionBackend>(
+    pub(crate) fn evaluate_relational_select_specification_with_cuda_driver(
         &mut self,
         select: &Select,
-        backend: &B,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
+    ) -> Result<RelationalSelectSpecificationFixture, ExecuteError> {
         if self.table_device_authoritative(&select.table) {
             self.rehydrate_elided_serialized(&select.table)
                 .map_err(ExecuteError::Engine)?;
@@ -1684,14 +1683,24 @@ impl Engine {
         let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =
             self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
-        let result = self.execute_mvcc_query_with_fallback_reason(
-            pin.store(),
-            &query,
-            backend,
-            None,
-            false,
-        )?;
-        self.finalize_relational_select(select, table, bound, access_path, result)
+        let result =
+            self.execute_mvcc_query_with_cuda_driver_probe_on_store(pin.store(), &query)?;
+        let MvccReadResult {
+            planned_target,
+            executed_target,
+            fallback_reason,
+            rows,
+        } = result;
+        let specification =
+            self.finalize_relational_select_specification(select, table, bound, access_path, rows)?;
+        Ok(RelationalSelectSpecificationFixture {
+            specification,
+            execution: MvccExecutionEvidence {
+                planned_target,
+                executed_target,
+                fallback_reason,
+            },
+        })
     }
 
     /// Test-only: total number of route-execution telemetry observations recorded so far.

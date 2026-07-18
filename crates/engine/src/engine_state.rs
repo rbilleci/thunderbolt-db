@@ -607,15 +607,15 @@ pub(crate) struct ResidencyReadState {
     /// load-bearing one. `Relaxed` monotonic counter.
     pub(crate) dml_device_validate_hits: std::sync::atomic::AtomicU64,
     /// CPU-ENGINE RETIREMENT (ADR-006): count of relational SELECTs that the SPECIALIZED resident route
-    /// DECLINED but the GENERAL GPU Expr executor then served on-device (instead of de-eliding to the CPU
-    /// pinned path). The non-vacuity signal that a wider-type / non-enumerated read shape stayed on the
-    /// GPU — output equality with the CPU oracle can't prove WHICH engine ran. `Relaxed` monotonic counter.
+    /// DECLINED but the GENERAL GPU Expr executor then served on-device. The non-vacuity signal that a
+    /// wider-type / non-enumerated read shape stayed on the GPU — output equality with a rows-only
+    /// specification cannot prove WHICH engine ran. `Relaxed` monotonic counter.
     pub(crate) general_read_fallback_hits: std::sync::atomic::AtomicU64,
     /// STRATA S-E.1 (streaming executor, ADR-012): count of relational SELECTs whose scalar reduction
     /// (COUNT(*) / SUM / MIN / MAX) was served OUT-OF-CORE by the streaming fold — the table's visible
     /// rows chunked to a per-GPU byte budget, each chunk uploaded + reduced ON THE DEVICE, partials
-    /// combined host-side (control plane), never all shards resident at once. The non-vacuity signal
-    /// that an over-VRAM aggregate stayed on the GPU instead of the interim CPU host engine. `Relaxed`.
+    /// combined by a final device reduction, never all shards resident at once. The non-vacuity signal
+    /// that an over-VRAM aggregate stayed on the GPU. `Relaxed`.
     pub(crate) streaming_fold_hits: std::sync::atomic::AtomicU64,
     /// STRATA S-E.1: total streaming chunks reduced across all folds (a fold over an over-budget table
     /// runs >1). Proves bounded-residency chunking actually fired (a single-chunk fold == 1).

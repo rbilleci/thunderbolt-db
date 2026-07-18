@@ -16,10 +16,6 @@ use gpu_db_execution::{
     MockGpuRuntime, PlannedOp, ResidentElemType, RouteDecision, VisibleLocateShard,
     WriteLocateShard,
 };
-#[cfg(test)]
-use gpu_db_execution::{
-    FilterOperator, LimitOperator, Operator, ProjectOperator, ScanOperator, SortOperator,
-};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
     ActiveFallbackReason, EngineStatusSnapshot, EngineTelemetrySnapshot, FallbackStatus,
@@ -257,9 +253,8 @@ impl ExecuteError {
     /// under this statement" case (write-half MVCC, Stage 4): a concurrent committer tombstoned the
     /// table's device-memory `SnapshotCell` (`publish(None)`) between this statement's resident-route
     /// plan (which saw it published) and the GPU probe (which loaded the now-`None` cell). It is NOT a
-    /// genuine GPU/CUDA failure — the engine can transparently re-serve the statement from the CPU
-    /// pinned-read path against the current published data generation. Matched on the precise probe
-    /// message so a real device error (which carries a different message) is never masked.
+    /// genuine GPU/CUDA failure. It is classified precisely so dispatch can decline through the
+    /// fail-loud GPU-required boundary without masking a real device error.
     fn is_residency_invalidated(&self) -> bool {
         matches!(
             self,
@@ -273,8 +268,7 @@ impl ExecuteError {
 }
 
 /// The substring every GPU resident-route probe uses when a table's device-memory cell is `None`
-/// (tombstoned/never-populated). Used to detect the residency-invalidated-mid-statement case so the
-/// read can fall back to the CPU pinned-read path (write-half MVCC, Stage 4).
+/// (tombstoned/never-populated). Used to detect the residency-invalidated-mid-statement case.
 const RESIDENT_DEVICE_MEMORY_MISSING: &str = "has no retained resident device memory";
 
 /// W0c (audit B2): the SHARDED unified-source errors (`build_sharded_unified_exec_source`'s
@@ -283,8 +277,8 @@ const RESIDENT_DEVICE_MEMORY_MISSING: &str = "has no retained resident device me
 /// plan accepted an earlier generation and a concurrent commit flagged the shards before the
 /// executor's own load. W0 made that window COMMON under OLTP write load (every concurrent
 /// invalidation now flags descriptors), and without these matches a racing reader got a hard
-/// client error where the transparent CPU pinned-read fallback is the correct behavior. Matched
-/// as (prefix AND suffix) so a genuine device/CUDA error is never masked.
+/// classified route decline. Matched as (prefix AND suffix) so a genuine device/CUDA error is never
+/// masked.
 const RESIDENT_SHARD_PREFIX: &str = "resident shard ";
 const RESIDENT_SHARD_INVALID: &str = " is invalid";
 const RESIDENT_SHARD_MEMORY_MISSING: &str = " has no retained device memory";

@@ -254,7 +254,7 @@ impl Engine {
 
         // 6c-0: the cross-chunk OFFSET/LIMIT window — ONE device pass over the collected survivors
         // (the executor's own window path); without a window the concat IS the result. A window-pass
-        // decline (e.g. the collected set over budget) defers to the CPU path — never a wrong window.
+        // decline (e.g. the collected set over budget) fails loudly — never a wrong window.
         if (select.limit.is_some() || select.offset.is_some())
             && self
                 .window_streaming_rows(select, bound, copin_s, &mut rows_out, budget)

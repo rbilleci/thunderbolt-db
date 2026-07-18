@@ -4,7 +4,7 @@ mod sharded_reductions;
 
 #[test]
 fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -67,16 +67,15 @@ fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
         &decision
     );
 
-    let normal = e.execute_relational_select(&count_select).unwrap();
-    assert_eq!(normal.planned_target, DeviceTarget::Gpu(0));
     if decision.accepted {
+        let normal = e.execute_relational_select(&count_select).unwrap();
+        assert_eq!(normal.planned_target, DeviceTarget::Gpu(0));
         assert_eq!(normal.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(normal.fallback_reason, None);
     } else {
-        assert_eq!(
-            normal.fallback_reason,
-            Some(FallbackReason::GpuMvccReadParityGap)
-        );
+        let fallback_before = e.metrics().snapshot().fallback_total;
+        let error = e.execute_relational_select(&count_select).unwrap_err();
+        assert_gpu_relational_execution_required(&e, error, "events", fallback_before);
     }
 
     let Command::Select(unsupported) = parse_command("SELECT * FROM events").unwrap() else {
@@ -106,17 +105,16 @@ fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
 
 #[test]
 fn p8_default_resident_route_executes_accepted_shapes() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE events (id INT, bucket INT, amount INT, label TEXT)",
     )
     .unwrap();
-    // Bucket 1 (10+20) and bucket 2 (30) both sum to 30 — a deliberate tie that all three paths
-    // (resident GPU probe, cuda-driver-probe, default host) must resolve IDENTICALLY: equal SUMs
-    // break by group ASC, so `... ORDER BY sum DESC LIMIT 1` is deterministically bucket 1. The
-    // resident path finalizes this in the per-group two-level GROUP BY kernel; the host paths in
-    // `finalize_relational_select` (direction applied to the aggregate, group-ASC tie-break kept).
+    // Bucket 1 (10+20) and bucket 2 (30) both sum to 30 — a deliberate tie that the explicit
+    // resident route and the default GPU route must match against the closed-form expected rows:
+    // equal SUMs break by group ASC, so `... ORDER BY sum DESC LIMIT 1` is deterministically bucket
+    // 1. The resident path resolves this in the per-group two-level GROUP BY kernel.
     e.execute_text(
             2,
             "INSERT INTO events (id, bucket, amount, label) VALUES (1, 1, 10, 'alpha'), (2, 1, 20, 'beta'), (3, 2, 30, 'alpine')",
@@ -438,7 +436,7 @@ fn p8_default_resident_route_executes_accepted_shapes() {
 
 #[test]
 fn p8_resident_route_batches_int4_equality_projection_literals() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE events (id INT, bucket INT, amount INT, label TEXT)",
@@ -668,7 +666,7 @@ fn p8_resident_route_batches_int4_equality_projection_literals() {
 
 #[test]
 fn p8_resident_route_executes_same_column_equality_projection() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, amount INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -922,7 +920,7 @@ fn p8_resident_route_executes_same_column_equality_projection() {
 
 #[test]
 fn p8_opt_in_resident_route_rejects_before_execution() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -967,17 +965,17 @@ fn p8_opt_in_resident_route_rejects_before_execution() {
             .cache_state,
         "Invalidated"
     );
-    let fallback = e.execute_relational_select(&absent).unwrap();
-    assert_eq!(fallback.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(
-        fallback.fallback_reason,
-        Some(FallbackReason::GpuMvccReadParityGap)
-    );
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e.execute_relational_select(&absent).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("GPU execution is required for SELECT on relation \"events\""));
+    assert_eq!(e.metrics().snapshot().fallback_total, fallback_before);
 }
 
 #[test]
 fn p8_resident_route_decisions_reject_evicted_and_memory_pressured_snapshots() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
@@ -1037,7 +1035,7 @@ fn p8_resident_route_decisions_reject_evicted_and_memory_pressured_snapshots() {
 
 #[test]
 fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -1155,7 +1153,7 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
 
 #[test]
 fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
@@ -1248,7 +1246,7 @@ fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
 
 #[test]
 fn p8_resident_maintenance_tick_summarizes_refresh_and_route_readiness() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
@@ -1322,7 +1320,7 @@ fn p8_resident_maintenance_tick_summarizes_refresh_and_route_readiness() {
 
 #[test]
 fn p8_resident_maintenance_tick_reports_pressure_and_budget_blockers() {
-    let mut pressured = Engine::new_local_cpu_oracle();
+    let mut pressured = Engine::new_local_test_engine();
     pressured
         .execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
@@ -1345,7 +1343,7 @@ fn p8_resident_maintenance_tick_reports_pressure_and_budget_blockers() {
     );
     assert!(pressured.relational_residency_snapshot("events").is_none());
 
-    let mut oversized = Engine::new_local_cpu_oracle();
+    let mut oversized = Engine::new_local_test_engine();
     oversized
         .execute_text(1, "CREATE TABLE oversized (id INT, label TEXT)")
         .unwrap();
@@ -1409,7 +1407,7 @@ fn telemetry_snapshot_reflects_replication_lag_and_runtime_metrics() {
 
 #[test]
 fn status_snapshot_answers_snapshot_and_replication_health_questions() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let token = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     let exported = e.export_snapshot_meta();
 
@@ -1433,7 +1431,7 @@ fn status_snapshot_answers_snapshot_and_replication_health_questions() {
 
 #[test]
 fn status_snapshot_surfaces_active_fallback_reasons_and_rollups() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.mark_gpu_unavailable(0);
     e.set_gpu_runtime_saturated(true);
 
@@ -1469,7 +1467,7 @@ fn status_snapshot_surfaces_active_fallback_reasons_and_rollups() {
 // general SUM's empty-set hard error while staying PG-correct.
 #[test]
 fn p8_sharded_resident_sum_all_empty_returns_null() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -1576,7 +1574,7 @@ fn p8_sharded_resident_sum_all_empty_returns_null() {
 // the bridge enforces uniformity itself; the route's referenced-column membership check does not catch it.
 #[test]
 fn p8_sharded_resident_rejects_nonuniform_int4_layout() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -1703,7 +1701,7 @@ fn s10c_2b_logical_rows() -> Vec<(i32, i32)> {
 /// k contiguous, then v contiguous). Returns `None` (caller should `return`) if there is no local GPU/driver.
 #[cfg(test)]
 fn s10c_2b_sharded_engine() -> Option<Engine> {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE pt (k INT, v INT)").unwrap();
     let shards = s10c_2b_shard_values()
         .iter()
@@ -1754,7 +1752,7 @@ fn s10c_2b_sharded_engine() -> Option<Engine> {
 /// (caller should `return`) if there is no local GPU/driver (no device-memory proof).
 #[cfg(test)]
 fn s10c_2b_single_store_engine() -> Option<Engine> {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE pt (k INT, v INT)").unwrap();
     let values = s10c_2b_logical_rows()
         .into_iter()
@@ -1960,7 +1958,7 @@ fn s_b_auto_admit_on_commit_makes_committed_table_gpu_resident() {
     };
 
     // Auto-admit ON, and NO explicit populate/warm call — residency must come purely from the commit.
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute_text(
@@ -1998,7 +1996,7 @@ fn s_b_auto_admit_on_commit_makes_committed_table_gpu_resident() {
     );
 
     // Flag OFF (default): DML still establishes the mandatory device generation.
-    let mandatory = Engine::new_local_cpu_oracle();
+    let mandatory = Engine::new_local_test_engine();
     mandatory
         .execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
@@ -2024,7 +2022,7 @@ fn s_b_auto_admit_fires_on_the_concurrent_dml_commit_path() {
         vec![SqlValue::Int4(2), SqlValue::Null],
         vec![SqlValue::Int4(3), SqlValue::Int4(30)],
     ];
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     // Drive the INSERT through the concurrent path that production uses for a no-sequence-default
@@ -2071,7 +2069,7 @@ fn s_b_auto_admit_fires_on_the_concurrent_dml_commit_path() {
 /// gracefully when there is no GPU residency route (CI without a GPU).
 #[test]
 fn r1_wave_index_probe_matches_scan_differential() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
@@ -2234,7 +2232,7 @@ fn r1_wave_index_probe_matches_scan_differential() {
 /// remain at or below the cap.
 #[test]
 fn wave_index_declines_at_residency_budget_without_losing_gpu_scan() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE capped_index (id INT, balance INT)")
         .unwrap();
     e.execute_text(
@@ -2294,7 +2292,7 @@ fn wave_index_declines_at_residency_budget_without_losing_gpu_scan() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_batched_completion_matches_per_needle() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
@@ -2379,7 +2377,7 @@ fn r2_batched_completion_matches_per_needle() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_batched_completion_matches_per_needle_multirow() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",

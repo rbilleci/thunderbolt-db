@@ -1,13 +1,12 @@
 //! STRATA S-E.1 — out-of-core streaming scalar reductions (ADR-012 / PLAN S-E).
 //!
-//! A table whose bytes exceed the configured per-GPU residency budget has no all-resident representation,
-//! so today its aggregate would de-elide to the CPU host engine (the ADR-006 charter violation). The
-//! streaming fold serves `COUNT(*)`/`SUM`/`MIN`/`MAX` OUT-OF-CORE: the visible rows are chunked to the
+//! A table whose bytes exceed the configured per-GPU residency budget has no all-resident representation.
+//! The streaming fold serves `COUNT(*)`/`SUM`/`MIN`/`MAX` OUT-OF-CORE: the visible rows are chunked to the
 //! budget, each chunk uploaded + reduced ON THE DEVICE, and partials combined by one final device pass. The
 //! non-vacuity proof is the fired counter + `streaming_fold_chunks > 1` (a genuine multi-chunk fold) +
 //! `streaming_fold_peak_chunk_bytes <= budget` (the largest single descriptor stays bounded). S-E.5
-//! lookahead overlaps at most two chunks, each targeted at budget/2. The differential is the SAME engine's
-//! CPU-pinned answer with the budget cleared.
+//! lookahead overlaps at most two chunks, each targeted at budget/2. Every result has a closed-form expected
+//! value; clearing the budget proves the unsupported route fails loudly without fallback telemetry.
 
 use super::{gpu_available, select};
 use crate::Engine;
@@ -17,7 +16,7 @@ use gpu_db_sql::{Decimal128, SqlValue};
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_reduction_over_budget_stays_on_device_out_of_core() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -56,7 +55,7 @@ fn gpu_streaming_reduction_over_budget_stays_on_device_out_of_core() {
     assert_eq!(count.fallback_reason, None);
     assert!(
         e.streaming_fold_hits() >= 1,
-        "the streaming fold must have fired (not the CPU host engine)"
+        "the streaming fold must have fired"
     );
     assert!(
         e.streaming_fold_chunks() > 1,
@@ -104,20 +103,24 @@ fn gpu_streaming_reduction_over_budget_stays_on_device_out_of_core() {
         "device-filtered COUNT(*)"
     );
 
-    // Differential: the SAME engine on the CPU-pinned path (budget cleared) must produce IDENTICAL rows.
+    // The closed-form SUM assertion above owns semantics. With streaming disabled, the same shape must
+    // fail loudly rather than manufacture a host result or fallback telemetry.
     e.clear_relational_residency_budget_bytes(0);
-    let hits_before_cpu = e.streaming_fold_hits();
-    let cpu_sum = e
+    let hits_before_decline = e.streaming_fold_hits();
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select("SELECT SUM(a) FROM big"))
-        .unwrap();
-    assert_eq!(
-        cpu_sum.rows, sum.rows,
-        "GPU streaming SUM must equal the CPU oracle SUM"
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "big",
+        fallback_before,
     );
     assert_eq!(
         e.streaming_fold_hits(),
-        hits_before_cpu,
-        "with the budget cleared the streaming fold must NOT fire (CPU path)"
+        hits_before_decline,
+        "with the budget cleared the streaming fold must not fire"
     );
 }
 
@@ -131,7 +134,7 @@ fn gpu_streaming_scalar_partial_combine_executes_chunks_on_multiple_gpus() {
         return;
     }
 
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.set_auto_admit_on_commit(false);
     let mut seq = 0_u64;
     if !gpu_available(&mut e, &mut seq) {
@@ -173,7 +176,7 @@ fn gpu_streaming_scalar_partial_combine_executes_chunks_on_multiple_gpus() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_reduction_bigint_sum_combines_as_numeric() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -214,15 +217,14 @@ fn gpu_streaming_reduction_bigint_sum_combines_as_numeric() {
         e.streaming_fold_chunks()
     );
 
-    // Streaming SUM(bigint) STRICTLY EXTENDS coverage: the CPU host reduction cannot serve it (the host
-    // `int4_aggregate_value` extracts an i32 and hard-errors on an int8 column), so with the budget
-    // cleared the same query is a clean error. The streaming device fold is the ONLY engine that answers
-    // it — proving the charter win is real, not a re-route of an already-supported host shape.
+    // Streaming SUM(bigint) STRICTLY EXTENDS coverage: with the budget cleared no GPU route accepts
+    // this over-budget statement, so it fails loudly. The streaming device fold is the only accepted
+    // route for this fixture.
     e.clear_relational_residency_budget_bytes(0);
     assert!(
         e.execute_relational_select(&select("SELECT SUM(v) FROM amounts"))
             .is_err(),
-        "the CPU host path cannot compute SUM(bigint); the streaming fold is the only path that can"
+        "without the streaming budget no GPU route accepts SUM(bigint) for this fixture"
     );
 }
 
@@ -233,7 +235,7 @@ fn gpu_streaming_reduction_null_heavy_table_stays_bounded() {
     // over-budget table must STILL chunk. Before the fix (chunk sizing by logical value bytes, 0 for
     // NULL) the whole table accumulated into one chunk and the out-of-core bound broke. Also exercises
     // MIN/MAX skipping NULL across chunks (the min of the sparse non-null values, not NULL).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -300,7 +302,7 @@ fn gpu_streaming_reduction_null_heavy_table_stays_bounded() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_reduction_empty_table_pg_semantics() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -346,21 +348,22 @@ fn gpu_streaming_reduction_empty_table_pg_semantics() {
     );
 }
 
-/// No-regression + non-vacuity WITHOUT a GPU: with NO budget configured, the streaming fold must NOT fire
-/// and the CPU host path serves the aggregate identically. Runs in the normal (non-ignored) suite so the
-/// default byte-identical behavior is gated everywhere.
+/// With no streaming budget configured, the mandatory resident generation serves the aggregate on the
+/// GPU and the streaming fold stays inactive.
 #[test]
-fn streaming_reduction_absent_without_budget_uses_host_path() {
-    let e = Engine::new_local_cpu_oracle();
+fn streaming_reduction_absent_without_budget_uses_resident_gpu_path() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a) VALUES (1), (2), (3), (4)")
         .unwrap();
 
-    // No budget set -> the streaming gate returns None -> the CPU pinned path serves it.
+    // No budget set -> the streaming gate returns None -> the resident GPU route serves it.
     let count = e
         .execute_relational_select(&select("SELECT COUNT(*) FROM t"))
         .unwrap();
     assert_eq!(count.rows, vec![vec![SqlValue::Int8(4)]]);
+    assert_eq!(count.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(count.fallback_reason, None);
     assert_eq!(
         e.streaming_fold_hits(),
         0,
@@ -371,5 +374,11 @@ fn streaming_reduction_absent_without_budget_uses_host_path() {
         .execute_relational_select(&select("SELECT SUM(a) FROM t"))
         .unwrap();
     assert_eq!(sum.rows, vec![vec![SqlValue::Int8(10)]]);
-    assert_eq!(e.streaming_fold_hits(), 0, "SUM stays on the host path too");
+    assert_eq!(sum.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(sum.fallback_reason, None);
+    assert_eq!(
+        e.streaming_fold_hits(),
+        0,
+        "SUM stays on the resident path too"
+    );
 }

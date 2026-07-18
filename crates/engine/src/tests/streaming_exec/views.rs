@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_views_expand_into_device_fold() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0_u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -62,7 +62,7 @@ fn gpu_streaming_views_expand_into_device_fold() {
 
 #[test]
 fn layered_view_keeps_one_catalog_data_boundary_across_ddl() {
-    let e = Arc::new(Engine::new_local_cpu_oracle());
+    let e = Arc::new(Engine::new_local_test_engine());
     e.execute_text(1, "CREATE TABLE vd (a INT, b INT)").unwrap();
     e.execute_text(2, "INSERT INTO vd VALUES (1, 10), (2, 20)")
         .unwrap();

@@ -161,12 +161,12 @@ impl Engine {
             && insert.rows.len() == 1
             && self.insert_unique_wave_batchable(&catalog, table);
         // P5-2 (S-E.P5, the KEYED-CLASS lift): a CHUNK-AUTHORITATIVE keyed table validates
-        // uniqueness ON-DEVICE — every host arm below sees the RECLAIMED (empty) store and
-        // passes VACUOUSLY (the C2 hazard: a vacuously-acked duplicate is WAL-durable and
-        // recovery's host-path replay REJECTS it). Probe the per-chunk key indexes and
-        // device-recheck each hit at this statement's snapshot; a decline (NULL key, unfoldable
+        // uniqueness ON-DEVICE. The reclaimed tuple store is not a relational authority, so a
+        // device verdict is the sole admission decision: probe the per-chunk key indexes and
+        // device-recheck each hit at this statement's snapshot. A decline fails closed before
+        // durability; it never transfers validation to a host replay arm.
         // shape, any failure) DE-AUTHORITIZES so the ladder below validates against the
-        // then-whole store.
+        // The caller reports the unavailable device verdict as an apply failure.
         if self.table_chunk_authoritative(&table.name).is_some()
             && table.indexes.iter().any(|index| index.unique)
         {
@@ -500,7 +500,7 @@ impl Engine {
     ///                       tombstoned at-or-before it) — the device analog of a fetch miss;
     ///   `None`            — DECLINE: this primitive cannot answer (a null-bearing shard whose raw
     ///                       i32 read would alias NULL as 0, a non-int4 column, or a device-read
-    ///                       failure) -> the caller must use the host fetch.
+    ///                       failure) -> the caller must fail closed.
     /// Visibility semantics are SV3b/SV6's exactly: visible ⟺ `created_by <= read_txn_id <
     /// deleted_by`, with an ABSENT created_by region = born-visible (0) and an ABSENT deleted_by
     /// region = never-deleted (+inf).
@@ -529,7 +529,7 @@ impl Engine {
         // section materializes with its CATALOG-derived variant — i32 via one u32/slot, i64 via two
         // (the 4-mod-8 discipline), b128 (Numeric/Uuid) via four. TEXT (variable-length) materializes
         // this slot's blob span from the shard's text section (offsets+blob) — the compound-text-key
-        // recheck reads the resident key on-device instead of de-eliding to the host fetch.
+        // recheck reads the resident key on-device without transferring relational authority.
         if table.columns.iter().any(|column| {
             !matches!(
                 column.ty,

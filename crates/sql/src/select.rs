@@ -70,7 +70,7 @@ pub enum SelectProjection {
     /// A grouped SELECT projecting N aggregates over one GROUP BY key (the general grouped form on the
     /// Expr path). Each aggregate carries its own function + value column (None for COUNT(*)). The
     /// single Grouped{Count,Sum,Avg,Min,Max} variants above remain the legacy 1-aggregate shapes used
-    /// by the hand-rolled CPU path.
+    /// by the hand-rolled enumerated GPU route.
     GroupedAggregates {
         group_column: String,
         aggregates: Vec<GroupedAggregate>,

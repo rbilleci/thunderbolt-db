@@ -9,7 +9,7 @@ use gpu_db_execution::DeviceTarget;
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_historical_key_lookup_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET acct:1=closed").unwrap();
@@ -44,7 +44,7 @@ fn execute_mvcc_query_cuda_driver_runs_historical_key_lookup_without_fallback() 
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_key_batch_lookup_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET acct:3=closed").unwrap();
@@ -102,7 +102,7 @@ fn execute_mvcc_query_cuda_driver_runs_key_batch_lookup_without_fallback() {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_follow_value_chain_source_resolution_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -151,7 +151,7 @@ fn execute_mvcc_query_cuda_driver_runs_follow_value_chain_source_resolution_with
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_concat_native_sources_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=closed").unwrap();
     e.execute_text(3, "SET acct:3=open").unwrap();
@@ -206,7 +206,7 @@ fn execute_mvcc_query_cuda_driver_runs_concat_native_sources_without_fallback() 
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_concat_limit_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=closed").unwrap();
     e.execute_text(3, "SET acct:3=open").unwrap();
@@ -256,7 +256,7 @@ fn execute_mvcc_query_cuda_driver_runs_concat_limit_without_fallback() {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_key_order_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:3=closed").unwrap();
     e.execute_text(3, "SET acct:2=pending").unwrap();
@@ -301,7 +301,7 @@ fn execute_mvcc_query_cuda_driver_runs_key_order_without_fallback() {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_value_order_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:3=closed").unwrap();
     e.execute_text(3, "SET acct:2=pending").unwrap();
@@ -346,7 +346,7 @@ fn execute_mvcc_query_cuda_driver_runs_value_order_without_fallback() {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_fan_in_order_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=closed").unwrap();
     e.execute_text(3, "SET acct:3=pending").unwrap();
@@ -401,7 +401,7 @@ fn execute_mvcc_query_cuda_driver_runs_fan_in_order_without_fallback() {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_ordered_limit_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:3=closed").unwrap();
     e.execute_text(3, "SET acct:2=pending").unwrap();
@@ -441,7 +441,7 @@ fn execute_mvcc_query_cuda_driver_runs_ordered_limit_without_fallback() {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_general_key_range_filter_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:0=cold").unwrap();
     e.execute_text(2, "SET acct:1=open").unwrap();
     e.execute_text(3, "SET acct:7=hold").unwrap();
@@ -486,7 +486,7 @@ fn execute_mvcc_query_cuda_driver_runs_general_key_range_filter_without_fallback
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_prefix_equivalent_key_range_filter_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET user:1=active").unwrap();
@@ -529,7 +529,7 @@ fn execute_mvcc_query_cuda_driver_runs_prefix_equivalent_key_range_filter_withou
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_key_prefix_filter_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET user:1=active").unwrap();
@@ -569,7 +569,7 @@ fn execute_mvcc_query_cuda_driver_runs_key_prefix_filter_without_fallback() {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_string_value_equals_filter_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET acct:3=open").unwrap();
@@ -609,7 +609,7 @@ fn execute_mvcc_query_cuda_driver_runs_string_value_equals_filter_without_fallba
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_numeric_value_equals_filter_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=7").unwrap();
     e.execute_text(2, "SET acct:2=8").unwrap();
     e.execute_text(3, "SET acct:3=7").unwrap();
@@ -649,7 +649,7 @@ fn execute_mvcc_query_cuda_driver_runs_numeric_value_equals_filter_without_fallb
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_filterless_full_scan_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
 
@@ -688,7 +688,7 @@ fn execute_mvcc_query_cuda_driver_runs_filterless_full_scan_without_fallback() {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_historical_visibility_mask_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET acct:1=closed").unwrap();
@@ -729,7 +729,7 @@ fn execute_mvcc_query_cuda_driver_runs_historical_visibility_mask_without_fallba
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_logical_supported_filters_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:0=cold").unwrap();
     e.execute_text(2, "SET acct:1=open").unwrap();
     e.execute_text(3, "SET acct:2=hold").unwrap();
@@ -780,7 +780,7 @@ fn execute_mvcc_query_cuda_driver_runs_logical_supported_filters_without_fallbac
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_provenance_filters_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -840,7 +840,7 @@ fn execute_mvcc_query_cuda_driver_runs_provenance_filters_without_fallback() {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_source_relative_filters_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -891,7 +891,7 @@ fn execute_mvcc_query_cuda_driver_runs_source_relative_filters_without_fallback(
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_source_relative_order_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=member:1").unwrap();
@@ -952,7 +952,7 @@ fn execute_mvcc_query_cuda_driver_runs_source_relative_order_without_fallback() 
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_cpu_resolved_key_value_order_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1000,7 +1000,7 @@ fn execute_mvcc_query_cuda_driver_runs_cpu_resolved_key_value_order_without_fall
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_source_relative_projection_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=Alpha Team").unwrap();
@@ -1044,7 +1044,7 @@ fn execute_mvcc_query_cuda_driver_runs_source_relative_projection_without_fallba
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_concat_cpu_resolved_sources_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1104,7 +1104,7 @@ fn execute_mvcc_query_cuda_driver_runs_concat_cpu_resolved_sources_without_fallb
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_distinct_cpu_resolved_sources_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();

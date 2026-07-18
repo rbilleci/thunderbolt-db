@@ -9,7 +9,7 @@ fn gpu_grouped_count_distinct_basic() {
     //   g=1: v in {10,10,20} -> 2 distinct (< count 3, has a duplicate)
     //   g=2: v in {5,15,25}  -> 3 distinct (== count 3, all distinct)
     //   g=3: v in {7}        -> 1 distinct (single value)
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     let rows: &[(i32, i32)] = &[(1, 10), (1, 10), (1, 20), (2, 5), (2, 15), (2, 25), (3, 7)];
     let values = rows
@@ -43,7 +43,7 @@ fn gpu_grouped_count_distinct_basic() {
 fn gpu_grouped_count_distinct_combined_with_count_star() {
     // SELECT g, COUNT(*), COUNT(DISTINCT v) FROM t GROUP BY g -- the multi-aggregate merge folds a
     // direct COUNT(*) pass and the sort-based COUNT(DISTINCT) pass by group key. count >= distinct.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     let rows: &[(i32, i32)] = &[(1, 10), (1, 10), (1, 20), (2, 5), (2, 15), (2, 25), (3, 7)];
     let values = rows
@@ -77,7 +77,7 @@ fn gpu_grouped_count_distinct_combined_with_count_star() {
 fn gpu_grouped_count_distinct_with_sum_same_column() {
     // SELECT g, SUM(v), COUNT(DISTINCT v) FROM t GROUP BY g -- a DIRECT (SUM) pass AND a CountDistinct
     // pass over the SAME value column; the result builder must read the right pass for each.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     let rows: &[(i32, i32)] = &[(1, 10), (1, 10), (1, 20), (2, 5), (2, 15), (2, 25), (3, 7)];
     let values = rows
@@ -113,7 +113,7 @@ fn gpu_grouped_count_distinct_int8_negative_and_large() {
     // COUNT(DISTINCT v) over a BIGINT column spanning negatives + a value beyond int4 range.
     //   g=1: v in {-5, -5, 9000000000} -> 2 distinct
     //   g=2: v in {0}                  -> 1 distinct
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)")
         .unwrap();
     e.execute_text(
@@ -149,7 +149,7 @@ fn gpu_grouped_count_distinct_numeric_value() {
     //   g=2: {3.00, 4.00, 5.00} -> 3 distinct (all distinct)
     //   g=3: {7.25}             -> 1 distinct (single)
     //   g=4: {8.40, 8.4}        -> 1 distinct (equal numerics, different display scale)
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(10,2))")
         .unwrap();
     e.execute_text(
@@ -192,7 +192,7 @@ fn gpu_grouped_count_distinct_uuid_value() {
     let c = "33333333-3333-3333-3333-333333333333";
     let d = "44444444-4444-4444-4444-444444444444";
     let f = "55555555-5555-5555-5555-555555555555";
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v UUID)").unwrap();
     e.execute_text(
         2,
@@ -229,7 +229,7 @@ fn gpu_grouped_count_distinct_numeric_combined_with_count_star() {
     // the MATERIALIZED group key, so the count and the distinct count align per group. count >= distinct.
     //   g=1: {1.50, 1.50, 2.50} -> count 3, distinct 2
     //   g=2: {3.00, 4.00, 5.00} -> count 3, distinct 3
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(10,2))")
         .unwrap();
     e.execute_text(
@@ -266,7 +266,7 @@ fn gpu_grouped_count_distinct_text_value() {
     //   g=1: {"apple", "apple", "banana"} -> 2 distinct (a duplicate)
     //   g=2: {"x", "xy", "xyz"}           -> 3 distinct (each a prefix of the next; lengths differ)
     //   g=3: {"hello"}                     -> 1 distinct (single)
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v TEXT)").unwrap();
     e.execute_text(
         2,
@@ -301,7 +301,7 @@ fn gpu_grouped_count_distinct_text_combined_with_count_star() {
     // EMPTY STRING (a valid distinct value, length 0 -> the byte loop runs zero iterations).
     //   g=1: {"", "", "z"}   -> count 3, distinct 2 (empty duplicated)
     //   g=2: {"foo", "bar"}  -> count 2, distinct 2
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v TEXT)").unwrap();
     e.execute_text(
         2,
@@ -336,7 +336,7 @@ fn gpu_grouped_count_distinct_text_shared_value_across_groups() {
     //   g=1: {"same", "same"} -> 1 distinct
     //   g=2: {"same"}         -> 1 distinct (text equals g=1's, but a new group)
     //   g=3: {"same", "zzz"}  -> 2 distinct (shared "same" + a distinct value)
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v TEXT)").unwrap();
     e.execute_text(
         2,
@@ -367,7 +367,7 @@ fn gpu_grouped_count_distinct_text_shared_value_across_groups() {
 fn gpu_scalar_count_distinct_int() {
     // Scalar COUNT(DISTINCT v) with NO GROUP BY -> one group (g=0). KNOWN BY CONSTRUCTION: v in
     // {10,10,20,20,20,30,30} -> 3 distinct values across the whole table.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (v INT)").unwrap();
     e.execute_text(
         2,
@@ -396,7 +396,7 @@ fn gpu_scalar_count_distinct_int() {
 fn gpu_scalar_count_distinct_text_numeric_and_filtered() {
     // Scalar COUNT(DISTINCT) over a TEXT value, a NUMERIC value, and an int value WITH a WHERE filter
     // (so the surviving indices are not the full scan), plus an empty-result case (PG -> 0, not NULL).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (k INT, v INT, s TEXT, n NUMERIC(10,2))")
         .unwrap();
     e.execute_text(
@@ -445,7 +445,7 @@ fn gpu_scalar_count_distinct_text_numeric_and_filtered() {
 fn gpu_grouped_count_distinct_text_group_key() {
     // COUNT(DISTINCT v) over a TEXT group key (the GROUP-BY-(g,v) reduction: distinct (cat, uid) pairs
     // per cat). cat=a: uid in {1,1,2} -> 2 distinct; cat=b: {5,5} -> 1 distinct.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)")
         .unwrap();
     e.execute_text(
@@ -476,7 +476,7 @@ fn gpu_grouped_count_distinct_text_group_key() {
 fn gpu_grouped_count_distinct_text_group_and_text_value() {
     // COUNT(DISTINCT v) where BOTH the group key AND the value are TEXT -> the (g, v) reduction's step 1
     // is a two-text composite. cat=a: tag in {x,x,y} -> 2; cat=b: {z} -> 1.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (cat TEXT, tag TEXT)")
         .unwrap();
     e.execute_text(
@@ -507,7 +507,7 @@ fn gpu_grouped_count_distinct_text_group_and_text_value() {
 fn gpu_grouped_count_distinct_text_group_combined_with_count_star() {
     // A TEXT group key (not composite) supports COUNT(*) (direct pass) + COUNT(DISTINCT) (reduction)
     // merged by the group key. cat=a: count 3, distinct{1,2}=2; cat=b: count 1, distinct{5}=1.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)")
         .unwrap();
     e.execute_text(
@@ -548,7 +548,7 @@ fn gpu_grouped_count_distinct_text_group_combined_with_count_star() {
 fn gpu_grouped_count_distinct_numeric_group_key() {
     // COUNT(DISTINCT v) over a NUMERIC group key (i128 key; the (g,v) reduction's step 1 is a
     // (numeric, int) wide-key). g=1.50: v in {5,5,7} -> 2; g=2.50: {9} -> 1.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g NUMERIC(10,2), v INT)")
         .unwrap();
     e.execute_text(
@@ -580,7 +580,7 @@ fn gpu_grouped_count_distinct_numeric_group_key() {
 fn gpu_grouped_count_distinct_composite_group_key() {
     // COUNT(DISTINCT v) over a COMPOSITE (int, int) group key (single aggregate). step 1 = (a,b,v)
     // wide-key; step 2 = (a,b) i64-pack over the reps. (1,1): v{5,5,7}->2; (1,2): {9}->1; (2,1): {9}->1.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT, v INT)")
         .unwrap();
     e.execute_text(
@@ -611,7 +611,7 @@ fn gpu_grouped_count_distinct_composite_group_key() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_count_distinct_text_group_key_empty() {
     // A WHERE that drops every row -> no groups (the reduction handles empty survivors / empty reps).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO t (cat, uid) VALUES ('a',1),('b',2)")
@@ -633,7 +633,7 @@ fn gpu_grouped_count_distinct_text_group_key_empty() {
 fn gpu_grouped_count_distinct_numeric_value_text_group_shared() {
     // COUNT(DISTINCT numeric_value) over a TEXT group key, with a value SHARED across groups: 1.50
     // appears under cat=a AND cat=b -> it counts once PER group. a: {1.50,2.50}=2; b: {1.50}=1.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (cat TEXT, n NUMERIC(10,2))")
         .unwrap();
     e.execute_text(
@@ -666,7 +666,7 @@ fn gpu_grouped_count_distinct_expr_group_key() {
     // DERIVED buffer as the wide-key's kind-4 (i32) member; step 2 reuses the expr key_base_override.
     // v=5 and v=9 are SHARED across groups (so distinct-per-group != global distinct -> the derived
     // member is load-bearing). a+b=2: v{5,5,7,9}->3; a+b=3: {9,5}->2; a+b=0: {3}->1. Order: 0,2,3.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT, v INT)")
         .unwrap();
     e.execute_text(
@@ -700,7 +700,7 @@ fn gpu_grouped_count_distinct_expr_group_key_int8() {
     // is i64, so the wide key uses kind 5 (i64 derived) and step 2 reuses the int8 expr config. The
     // expr value is beyond the int4 range; v=5 and v=9 are SHARED across the two groups (derived member
     // load-bearing). a+c=10000000000: v{5,5,7,9}->3; a+c=5: {9,5}->2.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a BIGINT, c BIGINT, v INT)")
         .unwrap();
     e.execute_text(
@@ -734,7 +734,7 @@ fn gpu_grouped_mixed_int_width_expr_key_rejected() {
     // mono-typed, so a mixed expr would load the int4 column at the wrong stride (garbage). An honest
     // error, not a wrong answer (pre-existing latent bug; surfaced + guarded). Covers the plain GROUP BY
     // (no CD) AND the COUNT(DISTINCT) reduction (which reuses this expr key buffer).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a BIGINT, b INT, v INT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO t (a,b,v) VALUES (10000000000,1,5),(5,2,9)")
@@ -764,7 +764,7 @@ fn gpu_grouped_mixed_int_width_expr_key_rejected() {
 fn gpu_grouped_count_distinct_bool_group_key() {
     // COUNT(DISTINCT v) over a BOOL group key: the (bool, v) reduction (step 1 uses build kind 3 for the
     // bool member; step 2 reuses the bool->int4 key buffer). flag=true: v{1,1,2}->2; flag=false: {5}->1.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (flag BOOL, v INT)")
         .unwrap();
     e.execute_text(

@@ -7,7 +7,7 @@ use gpu_db_sql::{parse_command, Command, SqlValue};
 
 #[test]
 fn p8_sharded_resident_count_reduces_valid_shards_and_rejects_invalidated() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -110,7 +110,7 @@ fn p8_sharded_resident_count_reduces_valid_shards_and_rejects_invalidated() {
 
 #[test]
 fn p8_sharded_resident_key_lookup_merges_matches_and_rejects_invalidated() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -223,7 +223,7 @@ fn p8_sharded_resident_key_lookup_merges_matches_and_rejects_invalidated() {
 
 #[test]
 fn p8_sharded_resident_multi_column_lookup_merges_projected_rows_and_rejects_missing_layout() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -389,7 +389,7 @@ fn p8_sharded_resident_multi_column_lookup_merges_projected_rows_and_rejects_mis
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
+    let mut missing_layout_engine = Engine::new_local_test_engine();
     missing_layout_engine
             .execute_text(
                 1,
@@ -476,7 +476,7 @@ fn p8_sharded_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_
     // below and breaking the sharded ascending-merge. It passes only because the route now
     // sorts the [0, count) indices host-side. The loop re-runs the query so a sort-less route
     // surfaces a wrong ordering on at least one iteration.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -620,7 +620,7 @@ fn p8_batched_multi_column_projection_matches_per_query_for_more_than_one_warp_o
     // reference is NOT value-sorted and NOT the atomic-append order. WITHOUT the stable-order
     // sort the batched scatter would emit a non-deterministic permutation (caught by the exact
     // comparison and the 25× loop), and it would differ from the per-query path.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // R3-004: the retained API must preserve stable row order over the authoritative shard set.
     e.execute_text(1, "CREATE TABLE t (k INT, seq INT)")
         .unwrap();
@@ -729,7 +729,7 @@ fn p8_batched_mixed_column_projection_matches_per_query_for_more_than_one_warp_o
     // Non-vacuous: the projected `label` text is a by-row SCRAMBLED value, so the ascending-by-row
     // reference is neither value-sorted nor the atomic-append order. WITHOUT the sort the scatter
     // is a non-deterministic permutation (caught by the exact comparison + the 25× loop).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (k INT, label TEXT)")
         .unwrap();
     const NEEDLE: i32 = 7;

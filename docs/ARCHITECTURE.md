@@ -15,8 +15,9 @@ The engine has three planes:
 - **Durable plane:** WAL, checkpoints, cold artifacts, and replication state on durable storage. GPU memory is
   volatile and reconstructible; it is never the sole durable copy of acknowledged data.
 
-The CPU must not become a co-equal relational execution tier. Temporary test or repair debt is named in
-**RETIRE-001**, **RETIRE-002**, and **RETIRE-003**.
+The CPU must not become a co-equal relational execution tier. RETIRE-001 completed the temporary test-oracle
+retirement; remaining repair and generic result-postprocessing debt is named only in **RETIRE-002** and
+**RETIRE-003** in `PLAN.md`.
 
 ## 2. Layering and ownership
 
@@ -147,7 +148,7 @@ ADR-014 makes the user-transaction envelope and isolation boundary explicit:
 The full accepted lifecycle, SQL-sequence, retry-identity, and compatibility contract is ADR-014's detailed design
 [`design/write-path-adr-014.md`](design/write-path-adr-014.md). R3-002/R3-003 device-index, transaction,
 conflict-history, and reclamation graduation is complete; the canonical durable envelope and destructive fault
-qualification remain **DUR-002**.
+qualification completed under historical **DUR-002**.
 
 The binding latency classes are defined in `CHARTER.md`: R1 bounded reads target 0.5/1/5-ms p50/p99/p99.9; W1
 single keyed synchronous mutations target 0.8/1.5/5 ms; T8 transactions contain 2–8 predeclared operations with at
@@ -272,7 +273,7 @@ has no exactly-once promise.
   five-minute contract.
 
 Automatic cut-exact checkpoint cadence and PITR are **DUR-001**; the canonical WAL/status format and complete crash,
-power-fail, filesystem, orphan, publication, migration, and GPU-context-loss campaign are **DUR-002**; device-native
+power-fail, filesystem, orphan, publication, migration, and GPU-context-loss campaign completed under historical **DUR-002**; device-native
 repair replacing reverse gather/deauthorization is **RETIRE-002**.
 
 A post-durable repair failure may poison availability, but it may not discard or make an acknowledged commit

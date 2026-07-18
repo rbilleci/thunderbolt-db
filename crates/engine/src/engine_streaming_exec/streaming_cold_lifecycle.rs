@@ -46,8 +46,8 @@ impl Engine {
     /// the entry lets the next read rebuild it.
     pub(super) fn evict_streaming_cold(&self, table_name: &str) {
         // Audit H2: a CHUNK-AUTHORITATIVE table's entry is the record-of-truth for post-freeze
-        // writes — fold-failure eviction must never remove it (the fold falls to the CPU-pinned
-        // path whose guard de-authoritizes WITH the entry present, replaying the delta).
+        // writes — fold-failure eviction must never remove it. A read decline fails loudly, and the
+        // explicit RETIRE-002 repair boundary still needs the entry to replay the delta.
         if self.table_chunk_authoritative(table_name).is_some() {
             return;
         }

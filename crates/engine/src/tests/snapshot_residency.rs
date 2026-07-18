@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn snapshot_export_tracks_last_applied_index() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let token = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
 
     let exported = e.export_snapshot_meta();
@@ -16,7 +16,7 @@ fn snapshot_export_tracks_last_applied_index() {
 
 #[test]
 fn install_snapshot_advances_visible_and_replication_watermarks() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.install_snapshot(SnapshotMeta {
         last_included_index: 7,
         last_included_term: 3,
@@ -42,7 +42,7 @@ fn install_snapshot_advances_visible_and_replication_watermarks() {
 
 #[test]
 fn export_snapshot_meta_is_reflected_in_replication_watermarks() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
 
     assert_eq!(e.replication_watermarks().snapshot_id, 0);
 
@@ -55,7 +55,7 @@ fn export_snapshot_meta_is_reflected_in_replication_watermarks() {
 
 #[test]
 fn relational_residency_snapshot_accounts_bytes_and_invalidates_on_later_wal_apply() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -113,7 +113,7 @@ fn relational_residency_snapshot_accounts_bytes_and_invalidates_on_later_wal_app
 #[test]
 fn mutation_maintains_only_the_mutated_device_generation() {
     // R3-004: a write maintains its target generation without disturbing another table.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
     e.execute_text(2, "CREATE TABLE b (id INT)").unwrap();
     e.execute_text(3, "INSERT INTO a (id) VALUES (1)").unwrap();
@@ -143,7 +143,7 @@ fn mutation_maintains_only_the_mutated_device_generation() {
 fn create_table_does_not_invalidate_existing_residency() {
     // CREATE TABLE introduces a brand-new table with no prior residency, so it must
     // touch no existing table's snapshot (scope contributes the empty set).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
     e.execute_text(2, "INSERT INTO a (id) VALUES (1)").unwrap();
     e.populate_relational_residency_snapshot("a").unwrap();
@@ -160,7 +160,7 @@ fn create_table_does_not_invalidate_existing_residency() {
 fn unscoped_ddl_refreshes_previously_authoritative_unrelated_residency() {
     // A schema change still invalidates globally at publication, then refreshes every previously
     // authoritative device generation before service resumes.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
     e.execute_text(2, "CREATE TABLE b (id INT)").unwrap();
     e.execute_text(3, "INSERT INTO a (id) VALUES (1)").unwrap();
@@ -230,7 +230,7 @@ fn residency_snapshot_retains_int8_columns_at_the_layout_offset() {
     // device payload, so residency retains int8 columns as fixed 8-byte row-major data AFTER the int4
     // section. Verify the bookkeeping (the column list + the offset resolver); the on-device read is
     // exercised by the int8 VM slice. CPU-side bookkeeping, so this runs without a GPU.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, big BIGINT, b INT, big2 BIGINT)")
         .unwrap();
     e.execute_text(
@@ -277,7 +277,7 @@ fn residency_snapshot_retains_numeric_columns_at_the_layout_offset() {
     // device payload, so residency retains numeric columns as fixed 16-byte i128 mantissas AFTER the
     // int4 AND int8 sections (before text). Verify the bookkeeping (the column list + the offset
     // resolver); the on-device read is exercised by the numeric VM slice. CPU-side, no GPU needed.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (a INT, big BIGINT, price NUMERIC(10,2), b INT, tax NUMERIC(10,2), label TEXT)",

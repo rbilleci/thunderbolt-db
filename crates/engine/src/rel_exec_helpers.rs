@@ -1592,31 +1592,6 @@ pub(crate) fn relational_select_limit_satisfied_by_access_path(
                 && matches!(access_path, RelationalAccessPath::OrderedKeyBatch { .. })))
 }
 
-#[cfg(test)]
-pub(crate) fn relational_select_needs_host_sql_finalization(
-    select: &Select,
-    access_path: &RelationalAccessPath,
-) -> bool {
-    (select_has_relational_filters(select)
-        && !matches!(
-            access_path,
-            RelationalAccessPath::EqualityIndex { .. }
-                | RelationalAccessPath::FilteredKeyBatch { .. }
-                | RelationalAccessPath::ConjunctiveFilteredKeyBatch { .. }
-                | RelationalAccessPath::DisjunctiveFilteredKeyBatch { .. }
-                | RelationalAccessPath::OrderedKeyBatch {
-                    predicate_column: Some(_),
-                    ..
-                }
-        ))
-        || (!select.order_by.is_empty()
-            && !matches!(access_path, RelationalAccessPath::OrderedKeyBatch { .. }))
-        || (select.limit.is_some()
-            && select.offset.is_none()
-            && !select.distinct
-            && !relational_select_limit_satisfied_by_access_path(select, access_path))
-}
-
 pub(crate) fn select_has_relational_filters(select: &Select) -> bool {
     select.filter.is_some() || !select.filters.is_empty() || !select.filter_groups.is_empty()
 }

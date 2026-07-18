@@ -7,7 +7,7 @@ use gpu_db_sql::{parse_command, Command, SelectFilterOp, SqlType, SqlValue};
 
 #[test]
 fn relational_catalog_assigns_stable_public_schema_and_type_metadata() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
 
@@ -54,7 +54,7 @@ fn relational_catalog_assigns_stable_public_schema_and_type_metadata() {
 
 #[test]
 fn relational_catalog_records_create_index_and_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE INDEX people_name_idx ON people (name)")
@@ -99,7 +99,7 @@ fn relational_catalog_records_create_index_and_replays_from_wal() {
         "{duplicate_err}"
     );
 
-    let missing = Engine::new_local_cpu_oracle();
+    let missing = Engine::new_local_test_engine();
     missing
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -112,7 +112,7 @@ fn relational_catalog_records_create_index_and_replays_from_wal() {
 
 #[test]
 fn relational_unique_index_rejects_duplicate_create_insert_update_and_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -181,7 +181,7 @@ fn relational_unique_index_rejects_duplicate_create_insert_update_and_replays_fr
         indexes
     );
 
-    let duplicate_existing = Engine::new_local_cpu_oracle();
+    let duplicate_existing = Engine::new_local_test_engine();
     duplicate_existing
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -203,7 +203,7 @@ fn relational_unique_index_rejects_duplicate_create_insert_update_and_replays_fr
 
 #[test]
 fn relational_unique_constraints_reject_duplicates_and_replay_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE people (id INT, name TEXT UNIQUE, CONSTRAINT people_id_key UNIQUE (id))",
@@ -270,7 +270,7 @@ fn relational_unique_constraints_reject_duplicates_and_replay_from_wal() {
         indexes
     );
 
-    let alter = Engine::new_local_cpu_oracle();
+    let alter = Engine::new_local_test_engine();
     alter
         .execute_text(1, "CREATE TABLE teams (id INT, name TEXT)")
         .unwrap();
@@ -295,7 +295,7 @@ fn relational_unique_constraints_reject_duplicates_and_replay_from_wal() {
 
 #[test]
 fn relational_check_constraints_enforce_and_replay_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE people (id INT, name TEXT, CONSTRAINT people_id_positive CHECK (id > 0))",
@@ -379,7 +379,7 @@ fn relational_check_constraints_enforce_and_replay_from_wal() {
         renamed_checks
     );
 
-    let alter = Engine::new_local_cpu_oracle();
+    let alter = Engine::new_local_test_engine();
     alter
         .execute_text(1, "CREATE TABLE teams (id INT, name TEXT)")
         .unwrap();
@@ -425,7 +425,7 @@ fn relational_check_constraints_enforce_and_replay_from_wal() {
 /// (`select_filter_matches` returns false on NULL — correct for WHERE, wrong for CHECK).
 #[test]
 fn check_constraint_null_is_satisfied_pg_semantics() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE m (id INT PRIMARY KEY, v INT, CONSTRAINT v_pos CHECK (v > 0))",
@@ -469,7 +469,7 @@ fn check_constraint_null_is_satisfied_pg_semantics() {
 /// and a real missing key still rejects (both validator families share the rule).
 #[test]
 fn foreign_key_null_is_satisfied_pg_semantics() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE p (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE c (id INT PRIMARY KEY, pid INT)")
@@ -499,7 +499,7 @@ fn foreign_key_null_is_satisfied_pg_semantics() {
 
 #[test]
 fn relational_foreign_keys_enforce_and_replay_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -560,7 +560,7 @@ fn relational_foreign_keys_enforce_and_replay_from_wal() {
 
 #[test]
 fn relational_primary_key_rejects_duplicates_and_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -613,7 +613,7 @@ fn relational_primary_key_rejects_duplicates_and_replays_from_wal() {
         indexes
     );
 
-    let alter = Engine::new_local_cpu_oracle();
+    let alter = Engine::new_local_test_engine();
     alter
         .execute_text(1, "CREATE TABLE teams (id INT, name TEXT)")
         .unwrap();
@@ -635,7 +635,7 @@ fn relational_primary_key_rejects_duplicates_and_replays_from_wal() {
         .to_string()
         .contains("duplicate key value violates unique index"));
 
-    let duplicate_existing = Engine::new_local_cpu_oracle();
+    let duplicate_existing = Engine::new_local_test_engine();
     duplicate_existing
         .execute_text(1, "CREATE TABLE dupes (id INT, name TEXT)")
         .unwrap();
@@ -657,7 +657,7 @@ fn relational_primary_key_rejects_duplicates_and_replays_from_wal() {
 
 #[test]
 fn relational_catalog_drops_index_and_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE INDEX people_name_idx ON people (name)")
@@ -688,7 +688,7 @@ fn relational_catalog_drops_index_and_replays_from_wal() {
         "{missing_err}"
     );
 
-    let multi = Engine::new_local_cpu_oracle();
+    let multi = Engine::new_local_test_engine();
     multi
         .execute_text(
             1,
@@ -779,7 +779,7 @@ fn relational_catalog_drops_index_and_replays_from_wal() {
 
 #[test]
 fn relational_catalog_renames_index_and_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -868,7 +868,7 @@ fn relational_catalog_renames_index_and_replays_from_wal() {
         "{missing_err}"
     );
 
-    let constrained = Engine::new_local_cpu_oracle();
+    let constrained = Engine::new_local_test_engine();
     constrained
         .execute_text(1, "CREATE TABLE keyed_people (id INT PRIMARY KEY)")
         .unwrap();
@@ -887,7 +887,7 @@ fn relational_catalog_renames_index_and_replays_from_wal() {
 
 #[test]
 fn relational_catalog_drops_constraints_and_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE people (id INT PRIMARY KEY, name TEXT UNIQUE)",
@@ -970,7 +970,7 @@ fn relational_catalog_drops_constraints_and_replays_from_wal() {
 
 #[test]
 fn relational_catalog_drops_table_and_replays_from_wal() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE people (id INT PRIMARY KEY, name TEXT UNIQUE)",
@@ -1053,7 +1053,7 @@ fn relational_catalog_drops_table_and_replays_from_wal() {
         "{missing_drop}"
     );
 
-    let with_view = Engine::new_local_cpu_oracle();
+    let with_view = Engine::new_local_test_engine();
     with_view
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1073,7 +1073,7 @@ fn relational_catalog_drops_table_and_replays_from_wal() {
 
 #[test]
 fn relational_catalog_drops_table_batches_atomically_and_replays() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE batch_people (id INT PRIMARY KEY, name TEXT)",
@@ -1131,7 +1131,7 @@ fn relational_catalog_drops_table_batches_atomically_and_replays() {
     assert!(recovered.relational_catalog_table("batch_teams").is_none());
     assert!(recovered.relational_catalog_table("batch_keep").is_some());
 
-    let atomic = Engine::new_local_cpu_oracle();
+    let atomic = Engine::new_local_test_engine();
     atomic
         .execute_text(1, "CREATE TABLE atomic_people (id INT, name TEXT)")
         .unwrap();

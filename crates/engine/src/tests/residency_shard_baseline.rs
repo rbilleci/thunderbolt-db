@@ -5,7 +5,7 @@
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn shard_residency_admit_reads_match_single_buffer() {
-    let run = |shard: bool| -> (RowBlock, RowBlock, RowBlock, bool) {
+    let run = |shard: bool| {
         let mut e = Engine::new_local();
         // Normal fixture construction remains shard-authoritative; the legacy read-layout arm
         // crosses the explicit test repair boundary only after all writes finish.
@@ -44,7 +44,7 @@ fn shard_residency_admit_reads_match_single_buffer() {
             .load()
             .get("accounts")
             .is_some_and(|s| !s.is_empty());
-        let sel = |sql: &str| -> RowBlock { e.execute_relational_select_text(sql).unwrap().rows };
+        let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap();
         (
             sel("SELECT id, balance FROM accounts WHERE id = 137"),
             sel("SELECT id, balance FROM accounts ORDER BY id"),
@@ -63,22 +63,25 @@ fn shard_residency_admit_reads_match_single_buffer() {
         !off_in_shards,
         "flag OFF must use the single buffer (no shard)"
     );
-    // point-lookup + COUNT(*) ARE served by the sharded route (the non-vacuous sharded gates); the
-    // ORDER BY scan on a shard table takes the CPU fallback (a shard has no `snapshots` entry, so the
-    // gpu-sortable gate declines) — kept as a correctness check (CPU shard path == GPU single buffer).
+    // Point lookup, ORDER BY, and COUNT(*) must all execute on the GPU for both physical layouts;
+    // result equality alone would not prove that the sharded scan avoided a retired host oracle.
+    for result in [&on_pt, &on_scan, &on_cnt, &off_pt, &off_scan, &off_cnt] {
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+    }
     assert_eq!(
-        on_pt, off_pt,
+        on_pt.rows, off_pt.rows,
         "sharded point lookup == single-buffer baseline"
     );
     assert_eq!(
-        on_scan, off_scan,
-        "scan (CPU fallback) == single-buffer baseline"
+        on_scan.rows, off_scan.rows,
+        "sharded GPU scan == single-buffer GPU baseline"
     );
     assert_eq!(
-        on_cnt, off_cnt,
+        on_cnt.rows, off_cnt.rows,
         "sharded COUNT(*) == single-buffer baseline"
     );
-    assert_eq!(on_scan.len(), 1000, "all 1000 rows present");
+    assert_eq!(on_scan.rows.len(), 1000, "all 1000 rows present");
 
     // S-d2a non-vacuity: the OPEN shard carries capacity HEADROOM (capacity > row_count), and the
     // capacity-aware sharded recompaction above addressed it correctly (the reads matched the

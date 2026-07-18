@@ -10,7 +10,7 @@
 //! INSERT rows, `populate_relational_residency_snapshot` to make it GPU-resident, then a
 //! **GPU-acceptance gate** — each candidate query is run through
 //! `execute_relational_select_with_resident_route`, which returns `Err` if the resident route
-//! would reject (CPU fallback); only queries it accepts are benchmarked, so every reported
+//! would reject; only queries it accepts are benchmarked, so every reported
 //! number is genuinely the GPU-retained path. The warmed engine is then served via
 //! `serve_async_with_engine` (async, default) or `serve_with_engine` (concurrent).
 //!
@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("  GPU-accepted: {name:<22} ({} row(s))", result.rows.len());
                 gpu_queries.push((name, sql.clone()));
             }
-            Err(err) => eprintln!("  CPU-fallback (excluded): {name} -> {err}"),
+            Err(err) => eprintln!("  GPU-route decline (excluded): {name} -> {err}"),
         }
     }
     if gpu_queries.is_empty() {

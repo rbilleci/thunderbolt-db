@@ -41,7 +41,7 @@ fn select(sql: &str) -> Select {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_inner_join_two_over_budget_relations() {
     let _entry_disabled = ClassEntryDisabled::new();
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0_u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -535,7 +535,7 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_join_mixed_int4_int8_keys() {
     let _entry_disabled = ClassEntryDisabled::new();
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0_u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -617,7 +617,7 @@ impl Drop for ChunkKeyIndexCapOverride {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_device_slot_recheck_matches_host_decoder() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -746,7 +746,7 @@ fn gpu_device_slot_recheck_matches_host_decoder() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_key_index_builds_probes_and_rechecks() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -947,7 +947,7 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1081,7 +1081,7 @@ fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0_u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1291,7 +1291,7 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
     let _forced_over_cap = ChunkKeyIndexCapOverride::tiny();
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0_u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1441,7 +1441,7 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_bloom_global_cap_rolls_back_failed_admission() {
     let _forced_over_cap = ChunkKeyIndexCapOverride::tiny();
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0_u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1512,7 +1512,7 @@ fn gpu_chunk_bloom_spill_is_primed_before_class_entry() {
     crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
         .store(1024, std::sync::atomic::Ordering::Relaxed);
     let result = std::panic::catch_unwind(|| {
-        let mut e = Engine::new_local_cpu_oracle();
+        let mut e = Engine::new_local_test_engine();
         let mut seq = 0_u64;
         if !gpu_available(&mut e, &mut seq) {
             return;
@@ -1598,7 +1598,7 @@ fn gpu_chunk_class_unique_batch_bound_fails_closed_at_257() {
         }
     }
 
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1671,7 +1671,7 @@ fn gpu_chunk_class_unique_batch_bound_fails_closed_at_257() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_update_self_exclusion() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1795,7 +1795,7 @@ fn gpu_chunk_class_keyed_compound_fold_parity_and_collision() {
     );
     assert!((a1, b1) != (a2, b2), "distinct tuples");
 
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1873,7 +1873,7 @@ fn gpu_chunk_class_keyed_compound_fold_parity_and_collision() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_null_unique_stays_device_native() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -1969,7 +1969,7 @@ fn gpu_chunk_class_compound_partial_null_unique_device_and_replay() {
     std::fs::create_dir_all(&dir).unwrap();
     let base = dir.join("db.wal");
     let expected = {
-        let mut e = Engine::new_local_cpu_oracle();
+        let mut e = Engine::new_local_test_engine();
         e.commit_state_mut().wal = WalBuffer::with_durable_segment(&base);
         let mut seq = 0u64;
         if !gpu_available(&mut e, &mut seq) {
@@ -2099,7 +2099,7 @@ fn gpu_chunk_class_keyed_replay_differential() {
     let base = dir.join("db.wal");
     const N: i32 = 1000;
     let (count_live, sum_live) = {
-        let mut e = Engine::new_local_cpu_oracle();
+        let mut e = Engine::new_local_test_engine();
         e.commit_state_mut().wal = WalBuffer::with_durable_segment(&base);
         let mut seq = 0u64;
         if !gpu_available(&mut e, &mut seq) {
@@ -2178,8 +2178,8 @@ fn gpu_chunk_class_keyed_replay_differential() {
         // DROP = the crash: no checkpoint, the WAL is the only truth.
     };
 
-    // Recovery replays the acked history through the HOST path — it must accept every acked
-    // commit (C2) and land value-identical.
+    // RETIRE-002 recovery repair replays the acked history and must accept every acked commit
+    // (C2), then publish a value-identical device generation.
     let e = Engine::open_durable_wal_segment(&base).expect("recovery must replay cleanly (C2)");
     let count = match e
         .execute_relational_select(&select("SELECT COUNT(*) FROM kr"))
@@ -2218,7 +2218,7 @@ fn gpu_chunk_class_keyed_replay_differential() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_txn_insert_is_private_atomic_and_recoverable() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2396,7 +2396,7 @@ fn gpu_chunk_class_keyed_txn_insert_is_private_atomic_and_recoverable() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_transaction_second_cow_failure_publishes_nothing_and_recovers_exactly() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2476,7 +2476,7 @@ fn gpu_chunk_class_keyed_text_key_probe_and_replay() {
     let base = dir.join("db.wal");
     const N: i32 = 1000;
     let (count_live, sum_live) = {
-        let mut e = Engine::new_local_cpu_oracle();
+        let mut e = Engine::new_local_test_engine();
         e.commit_state_mut().wal = WalBuffer::with_durable_segment(&base);
         let mut seq = 0u64;
         if !gpu_available(&mut e, &mut seq) {
@@ -2560,7 +2560,7 @@ fn gpu_chunk_class_keyed_text_key_probe_and_replay() {
         // DROP = the crash.
     };
 
-    // C2: the acked text-key history must replay cleanly through the host path.
+    // C2: RETIRE-002 recovery repair must replay the acked text-key history cleanly.
     let e = Engine::open_durable_wal_segment(&base).expect("recovery must replay cleanly (C2)");
     let count = match e
         .execute_relational_select(&select("SELECT COUNT(*) FROM kx"))
@@ -2593,7 +2593,7 @@ fn gpu_chunk_class_keyed_text_key_probe_and_replay() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_dml_key_locate() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -2733,7 +2733,7 @@ fn gpu_chunk_class_keyed_dml_key_locate() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_sidecar_republish() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut engine, &mut seq) {
         return;
@@ -2815,7 +2815,7 @@ fn gpu_chunk_class_offlock_prepare_pins_one_entry_across_sidecar_republish() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_compound_dml_key_locate() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;

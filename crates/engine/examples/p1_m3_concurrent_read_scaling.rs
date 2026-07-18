@@ -13,12 +13,12 @@
 //!
 //! Noise control: each (concurrency, mode) cell runs N repetitions; the reported p50
 //! and qps are the median across repetitions. Run on a GPU host so the resident route
-//! is taken (otherwise it falls back to the CPU path, which still shows the lock vs
-//! no-lock contrast).
+//! is taken; the non-resident arm uses the default transient GPU route and fails loudly
+//! if no GPU route accepts the query.
 //!
 //! Env: GPU_DB_SCALE_CONCURRENCY (default 1,2,4,8,16,32,64), GPU_DB_SCALE_OPS_PER_THREAD
 //! (default 200), GPU_DB_SCALE_REPS (default 5), GPU_DB_SCALE_ROWS (default 512),
-//! GPU_DB_SCALE_RESIDENT (default 1; 0 = CPU path).
+//! GPU_DB_SCALE_RESIDENT (default 1; 0 = non-resident GPU route).
 
 use std::env;
 use std::error::Error;
@@ -139,8 +139,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     engine.execute_text(2, &insert)?;
     // GPU_DB_SCALE_RESIDENT=1 (default) populates GPU residency so reads take the
-    // resident kernel route; =0 leaves it non-resident so reads take the CPU path. The
-    // CPU path isolates the &self concurrency win from the GPU-side bottleneck.
+    // resident kernel route; =0 leaves it non-resident so reads take the default transient
+    // GPU route. Both arms isolate the &self concurrency win from serialized lock ownership.
     let make_resident = env_usize("GPU_DB_SCALE_RESIDENT", 1) != 0;
     let resident_on_gpu = if make_resident {
         let snapshot = engine.populate_relational_residency_snapshot("order_line")?;

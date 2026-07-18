@@ -7,7 +7,7 @@ use gpu_db_sql::{Decimal128, SqlValue};
 fn gpu_execute_resident_expr_select_sql_runs_group_by() {
     // GROUP BY an int4 key on the general GPU executor (hash aggregation): COUNT/SUM/AVG per group,
     // results sorted by key for determinism. Groups: g=1 -> v{10,20,30}, g=2 -> v{5,15}, g=3 -> v{100}.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -102,7 +102,7 @@ fn gpu_group_by_expression() {
     // GROUP BY a+b: the expression is materialized ON-DEVICE into a derived int key column the kernel
     // groups by (key_base_override); the result group VALUE is the distinct a+b (not raw a/b), and the
     // SELECT projection of the same expression reads it. Result is key-sorted.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
         .unwrap();
     // a+b: (1,2)=3,(2,1)=3,(5,5)=10,(4,4)=8,(3,0)=3,(6,4)=10. groups 3{c:10,20,30}/8{c:40}/10{c:100,200}.
@@ -146,7 +146,7 @@ fn gpu_group_by_expression() {
 fn gpu_group_by_expression_minmax() {
     // MIN/MAX over a value column with an EXPRESSION group key -- orthogonal mechanisms (group by the
     // derived a+b, MIN/MAX over the real column c). Closes the audit-flagged coverage gap.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
         .unwrap();
     // a+b groups: (1,2)->3{c=10,30}, (5,3)->8{c=40}, (5,5)->10{c=100}.
@@ -180,7 +180,7 @@ fn gpu_group_by_expression_empty_table() {
     // GROUP BY <expr> on an EMPTY table -> 0 groups (PG returns no rows), matching the plain-column
     // path. Guards the audit P1: the on-device arith materialize rejects n=0, so the grouped branch
     // now skips it for 0 rows instead of erroring.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
@@ -201,7 +201,7 @@ fn gpu_group_by_expression_empty_table() {
 fn gpu_group_by_expression_overflow_is_pg_error() {
     // GROUP BY a+b where a+b overflows int4 -> a clean PG "integer out of range" (checked on-device,
     // no wrap, no CPU), inherited from the arith VM -- same as the WHERE/ORDER BY expression paths.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a,b) VALUES (2147483647, 1), (1, 1)")
         .unwrap();
@@ -226,7 +226,7 @@ fn gpu_execute_resident_expr_select_sql_runs_grouped_min_max() {
     // atom.min/max). Expected values are CONSTRUCTED from the inserted rows (a GPU-native oracle, not
     // a CPU re-fold): g=1 -> v{10,30,20}; g=2 -> v{5,15,-7}; g=3 -> v{100}. A NEGATIVE value exercises
     // the signed min.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -305,7 +305,7 @@ fn gpu_grouped_min_max_over_uuid_value() {
     //          01000000-..                      uhi 0x0100000000000000
     //          ff000000-..                      uhi 0xff00000000000000      <- MAX
     //   g=3  single row -> min == max == the value.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, u UUID)").unwrap();
     let rows: &[(i32, &str)] = &[
         (1, "00000000-0000-0000-0100-000000000000"),
@@ -394,7 +394,7 @@ fn gpu_grouped_by_numeric_key() {
     // slot_keys_i128 (single-level kernel). Covers a NEGATIVE key + a key whose mantissa exceeds 2^64
     // (non-zero HIGH limb), and reconstructs the mantissa @ the column scale. EMPTY128 = i128::MIN is
     // outside the +/-10^38 numeric range, so no real numeric key ever collides with the sentinel.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g NUMERIC(30,4), v INT)")
         .unwrap();
     let rows: &[(&str, i32)] = &[
@@ -453,7 +453,7 @@ fn gpu_grouped_by_numeric_key() {
 fn gpu_group_by_bool_key() {
     // GROUP BY a BOOL column -- 2 groups (false<true) via the bool->int4 materialize + key_base_override
     // (the audited int4 path; NO bool GROUP BY kernel -> no concurrency hazard).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (flag BOOL, i INT)")
         .unwrap();
     // false: i={10,30} (count 2, sum 40); true: i={20,40,50} (count 3, sum 110).
@@ -496,7 +496,7 @@ fn gpu_group_by_bool_key() {
 fn gpu_group_by_bool_minmax_value() {
     // MIN/MAX over a BOOL VALUE (int key): group all-false -> min=max=false; all-true -> true; mixed ->
     // min=false, max=true. Via bool->int4 materialize + value_base_override.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (k INT, flag BOOL)")
         .unwrap();
     // k=1: {false,false}; k=2: {true,true}; k=3: {false,true}.

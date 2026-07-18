@@ -146,7 +146,7 @@ impl Planner {
             Command::SelectFunction(_) => PlanNode {
                 op: PlannedOp {
                     name: "routine_select".to_string(),
-                    target: DeviceTarget::Cpu,
+                    target: DeviceTarget::Gpu(self.cfg.default_gpu_id),
                 },
                 kind: PlanKind::Read,
             },
@@ -239,6 +239,19 @@ mod tests {
         let node = &plan.nodes()[0];
         assert_eq!(node.kind, PlanKind::Read);
         assert_eq!(node.op.target, DeviceTarget::Gpu(0));
+    }
+
+    #[test]
+    fn planner_marks_sql_function_select_as_gpu_targeted() {
+        let planner = Planner::new(PlannerConfig { default_gpu_id: 3 });
+        let plan = planner.plan_command(&Command::SelectFunction(gpu_db_sql::SelectFunction {
+            name: "answer".to_string(),
+        }));
+
+        let node = &plan.nodes()[0];
+        assert_eq!(node.kind, PlanKind::Read);
+        assert_eq!(node.op.name, "routine_select");
+        assert_eq!(node.op.target, DeviceTarget::Gpu(3));
     }
 
     #[test]

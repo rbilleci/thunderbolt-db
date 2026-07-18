@@ -493,16 +493,16 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn finalize_relational_select(
+    pub(crate) fn finalize_relational_select_specification(
         &self,
         select: &Select,
         table: RelationalTable,
         bound: BoundRelationalSelect,
         access_path: RelationalAccessPath,
-        mvcc_result: MvccReadResult,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
+        mvcc_rows: Vec<MvccReadRow>,
+    ) -> Result<RelationalSelectSpecificationResult, ExecuteError> {
         let mut rows = Vec::new();
-        for row in mvcc_result.rows {
+        for row in mvcc_rows {
             let Some(value) = row.value else {
                 continue;
             };
@@ -753,12 +753,9 @@ impl Engine {
                 aggregate_rows.truncate(limit);
             }
 
-            return Ok(RelationalSelectResult {
+            return Ok(RelationalSelectSpecificationResult {
                 columns: Arc::new(bound.selected_columns),
                 rows: (aggregate_rows).into(),
-                planned_target: mvcc_result.planned_target,
-                executed_target: mvcc_result.executed_target,
-                fallback_reason: mvcc_result.fallback_reason,
                 access_path: Arc::new(access_path),
             });
         }
@@ -796,12 +793,9 @@ impl Engine {
                 projected.truncate(limit);
             }
 
-            return Ok(RelationalSelectResult {
+            return Ok(RelationalSelectSpecificationResult {
                 columns: Arc::new(bound.selected_columns),
                 rows: (projected).into(),
-                planned_target: mvcc_result.planned_target,
-                executed_target: mvcc_result.executed_target,
-                fallback_reason: mvcc_result.fallback_reason,
                 access_path: Arc::new(access_path),
             });
         }
@@ -834,21 +828,9 @@ impl Engine {
             })
             .collect::<Vec<Vec<SqlValue>>>();
 
-        let mut fallback_reason = mvcc_result.fallback_reason;
-        if fallback_reason.is_none()
-            && relational_select_needs_host_sql_finalization(select, &access_path)
-        {
-            fallback_reason = Some(FallbackReason::GpuMvccReadParityGap);
-            self.metrics
-                .inc_fallback(FallbackReason::GpuMvccReadParityGap);
-        }
-
-        Ok(RelationalSelectResult {
+        Ok(RelationalSelectSpecificationResult {
             columns: Arc::new(bound.selected_columns),
             rows: rows.into(),
-            planned_target: mvcc_result.planned_target,
-            executed_target: mvcc_result.executed_target,
-            fallback_reason,
             access_path: Arc::new(access_path),
         })
     }

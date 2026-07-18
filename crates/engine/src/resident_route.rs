@@ -146,13 +146,12 @@ pub(crate) fn resident_route_query_shape(
                 return None;
             }
             // R-ver (read version resolution) + TYPE-COVERAGE #14 (numeric): an UNFILTERED projection
-            // (`SELECT <cols> FROM t`, no WHERE) has no resident-route shape today, so it drops to the
-            // CPU-pinned host path — which REHYDRATES + de-elides an ELIDED table (and, for a numeric-
-            // bearing elided table, the device gather then DECLINES numeric -> a hard error). Route it
-            // on-device iff every projected column is a DEVICE-SERVABLE FIXED-WIDTH type
+            // (`SELECT <cols> FROM t`, no WHERE) needs an explicit resident-route shape to avoid a
+            // fail-loud decline. Route it on-device iff every projected column is a DEVICE-SERVABLE
+            // FIXED-WIDTH type
             // (int4/int8/date/timestamp/int2/numeric/uuid — the general executor + the recompaction
             // gather serve every fixed-width section, with the SV3b visibility conjunct threaded). A
-            // text/bool column keeps the projection on the host path (variable-length is out of scope).
+            // text/bool column is handled by the general GPU executor when this matcher declines it.
             // Placed BEFORE the int4-only FILTERED-shape logic below.
             if bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty()
             {
@@ -232,14 +231,14 @@ pub(crate) fn resident_route_query_shape(
             // R-ver: `SELECT * FROM t` (no WHERE) over an ALL-INT4 resident table routes on-device
             // like the explicit-column unfiltered projection (order_by/group_by/offset/having are
             // excluded by the guards above; distinct at the top). Any non-int4 column or a LIMIT
-            // keeps `SELECT *` on the CPU path (the general executor treats All == Columns of every
-            // column, so an all-int4 table projects every column with the SV3b visibility conjunct).
+            // declines this specialized matcher for the general CUDA executor (which treats All ==
+            // Columns of every column) or the common fail-loud boundary.
             let unfiltered = bound.filter.is_none()
                 && bound.filters.is_empty()
                 && bound.filter_groups.is_empty();
             // TYPE-COVERAGE #14: `SELECT *` routes on-device iff EVERY column is a device-servable
-            // fixed-width type (int4/int8/date/timestamp/int2/numeric/uuid). A text/bool column keeps
-            // `SELECT *` on the host path.
+            // fixed-width type (int4/int8/date/timestamp/int2/numeric/uuid). A text/bool column
+            // declines to the general CUDA executor.
             let all_fixed_width = table.columns.iter().all(|column| {
                 matches!(
                     column.ty,
@@ -253,10 +252,9 @@ pub(crate) fn resident_route_query_shape(
                         | SqlType::Bool
                 )
             });
-            // NB: TEXT is intentionally NOT in this `SELECT *` arm — a `SELECT *` over a text table stays
-            // on the existing route (CPU-pinned -> rehydrate for an elided table). On-device text reads go
-            // through the EXPLICIT-column projection arm above (which the elided-text gate exercises); the
-            // `SELECT *` shape keeps its legacy classification so the route-decision tests are unchanged.
+            // NB: TEXT is intentionally NOT in this `SELECT *` arm. On-device text reads go through
+            // the explicit-column projection arm above or the general GPU executor; the `SELECT *`
+            // shape keeps its legacy specialized-route classification so route-decision tests remain stable.
             (unfiltered && all_fixed_width && select.limit.is_none())
                 .then(|| "int4_projection_all".to_string())
         }

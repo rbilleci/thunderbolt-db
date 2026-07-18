@@ -212,7 +212,7 @@ impl Engine {
     /// (int8 / numeric / uuid / bool / text) shapes run on-device, unlike the int4-only
     /// `execute_resident_sharded_via_general`. Mirrors that method's shape dispatch (distinct-first, then
     /// grouped for GROUP BY / ORDER BY). Errors (never mis-answers) on a shape it cannot express; the
-    /// caller then serves it from the CPU pinned path.
+    /// caller then fails loudly through the GPU-required boundary.
     pub(crate) fn execute_resident_select_via_general(
         &self,
         select: &Select,

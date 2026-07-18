@@ -25,7 +25,7 @@ mod sql_scalar_predicates;
 fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
     // No WHERE clause = a full-table scan (indices 0..row_count): aggregates reduce over every row and
     // projection materializes every row, all on the general GPU executor.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(
         2,
@@ -104,7 +104,7 @@ fn gpu_grouped_by_text_key() {
     // Covers duplicates (apple x3), an EMPTY string, different lengths, and a SHARED PREFIX (app vs
     // apple) to exercise the length-check + byte-compare in the verify. Result key is read host-side
     // from the representative row.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g TEXT, v INT)").unwrap();
     let rows: &[(&str, i32)] = &[
         ("apple", 10),
@@ -170,7 +170,7 @@ fn gpu_grouped_min_max_over_text_value() {
     // (first differing byte unsigned; a strict prefix is smaller). Exercises a shared PREFIX (app<apple),
     // an EMPTY string (the MIN of its group), different lengths, a last-byte-only difference, and a
     // single-row group (MIN == MAX). Result text is read host-side from the winning row.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, s TEXT)").unwrap();
     let rows: &[(i32, &str)] = &[
         (1, "apple"),
@@ -243,7 +243,7 @@ fn gpu_grouped_text_value_after_text_key_offset_alignment() {
     // pinned the GPU ~20s) until engine_residency aligned every varlen offsets section to 8 bytes. The
     // key bytes here sum to 11 ('app'x2 + 'be'x2 + 'c' -- a non-4-multiple), which previously misaligned
     // the value offsets. GROUP BY a text key with MIN/MAX over a text value must now run cleanly.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE w (k TEXT, v TEXT)")
         .unwrap();
     let rows: &[(&str, &str)] = &[
@@ -303,7 +303,7 @@ const GROUPED_CLAUSE_ROWS: &str =
 fn gpu_grouped_order_by_and_limit() {
     // ORDER BY (the key DESC, and an AGGREGATE DESC) + LIMIT/OFFSET windowed ON-DEVICE (a slice of the
     // gpu_sort_permutation index vector, gathering only the kept window) on the Expr path.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -355,7 +355,7 @@ fn gpu_grouped_limit_offset_window_edges() {
     // These edge cases pin the windowing math against the prior drain/truncate: OFFSET past the end,
     // LIMIT 0, and OFFSET+LIMIT running past the end (clamped), plus a no-LIMIT default-order sanity.
     // group counts (GROUPED_CLAUSE_ROWS): g1=3, g2=1, g3=2, g4=4, g5=1 -> default key order is g ASC.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -410,7 +410,7 @@ fn gpu_grouped_limit_offset_window_edges() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_having_and_combined() {
     // HAVING filters groups by an aggregate (or key) predicate; combined HAVING + ORDER BY + LIMIT.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -456,7 +456,7 @@ fn gpu_grouped_having_and_combined() {
 fn gpu_grouped_having_sum_and_dnf_runs_on_gpu() {
     // Regression coverage (audit-found): a HAVING over an int8 SUM(int4) result and a DNF mixing an int4
     // group key with an int8 COUNT must RUN on the GPU, not error.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -513,7 +513,7 @@ fn gpu_grouped_having_numeric_int_mixed_dnf_runs_on_gpu() {
     // Regression coverage (2nd audit): a HAVING DNF mixing a NUMERIC aggregate with an integer COUNT must
     // RUN on the GPU -- the integers are promoted to Numeric so the predicate is a single i128 width --
     // rather than clean-error.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (k INT, n NUMERIC(10,2))")
         .unwrap();
     e.execute_text(
@@ -559,7 +559,7 @@ fn gpu_grouped_having_avg_heterogeneous_scale_on_gpu() {
     // Regression coverage (3rd audit, a SILENT WRONG ANSWER): AVG yields per-GROUP Numeric scales (PG
     // division). The HAVING transient must normalize each value to the column's (max) scale, else a
     // low-AVG group's mantissa is misread at a smaller scale as a huge number and wrongly KEPT.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (g, v) VALUES (1,3), (2,10), (3,1)")
         .unwrap();
@@ -605,7 +605,7 @@ fn gpu_grouped_having_avg_heterogeneous_scale_on_gpu() {
 fn gpu_grouped_duplicate_aggregate_name_is_ambiguous() {
     // Two same-function aggregates share a result-column name ("sum"); referencing it in ORDER BY or
     // HAVING is ambiguous (PG: "column reference ... is ambiguous") -> error, not silent first-match.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT, w INT)")
         .unwrap();
     e.execute_text(
@@ -639,7 +639,7 @@ fn gpu_grouped_by_uuid_key() {
     // GROUP BY a UUID (i128) key via atom.cas.b128; output sorts by canonical/memcmp byte order. Uses
     // early-byte AND late-byte differences (exercises the sort + the full 128-bit key equality), and
     // INCLUDES the uuid whose LE i128 == EMPTY128 (i128::MIN) -> the DEDICATED slot path for i128 keys.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE u (id UUID, v INT)")
         .unwrap();
     let rows: &[(&str, i32)] = &[
@@ -683,7 +683,7 @@ fn gpu_grouped_by_uuid_key() {
 fn gpu_grouped_uuid_key_and_uuid_value_min() {
     // Compose both b128 paths in one query: GROUP BY a uuid KEY (atom.cas.b128 claim) while taking MIN
     // of a uuid VALUE (the b128 CAS loop).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE w (k UUID, val UUID)")
         .unwrap();
     let rows: &[(&str, &str)] = &[
@@ -741,7 +741,7 @@ fn gpu_grouped_min_max_over_int8_value() {
     //   g=2 -> {i64::MAX, -9e18}        (min -9e18, max i64::MAX)
     // The i64::MAX value also probes that the min-identity (i64::MAX) collision is benign (the slot
     // is occupied, so the real value is read even when it equals the fill identity).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)")
         .unwrap();
     e.execute_text(
@@ -789,7 +789,7 @@ fn gpu_grouped_sum_avg_over_int8_value() {
     //   g=1 -> {5e18, 5e18}     sum  1.0e19  (> i64::MAX)
     //   g=2 -> {-6e18, -6e18}   sum -1.2e19  (< i64::MIN)
     //   g=3 -> {100, 200, 300}  sum  600     (fits i64)
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)")
         .unwrap();
     e.execute_text(
@@ -860,7 +860,7 @@ fn gpu_grouped_int8_sum_survives_many_low_limb_wraps() {
     // double-counted carry shows up as the high limb (sum_hi) off by the wrap count. A second group
     // of N x i64::MIN stresses the negative path. Oracle = N * value as i128 (computed, not hardcoded).
     const N: usize = 1000;
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)")
         .unwrap();
     let pos = vec!["(1,9223372036854775807)"; N].join(",");
@@ -902,7 +902,7 @@ fn gpu_grouped_by_int8_key() {
     //   g=1e10     -> v{10,20,30}  (count 3, sum 60, min 10)
     //   g=-8e9     -> v{5,15}      (count 2, sum 20, min 5)
     //   g=i64::MIN -> v{100,200}   (count 2, sum 300, min 100)  [dedicated-slot edge]
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g BIGINT, v INT)")
         .unwrap();
     e.execute_text(
@@ -970,7 +970,7 @@ fn gpu_grouped_sum_avg_over_numeric_value() {
     // scale (2). Constructed oracle:
     //   g=1 -> {10.50, 20.25, -3.75}  sum 27.00
     //   g=2 -> {100.00, -50.50}        sum 49.50
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(20,2))")
         .unwrap();
     e.execute_text(
@@ -1026,7 +1026,7 @@ fn gpu_grouped_numeric_sum_overflow_errors() {
     // A per-group numeric SUM that exceeds the i128 mantissa range must ERROR (PG numeric field
     // overflow), never silently wrap. Two values ~9e37 in one group -> ~1.8e38 > i128::MAX (~1.7e38);
     // the kernel's on-device per-add overflow check sets the flag and the host surfaces it.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // NUMERIC(38,19) value 9e18 -> mantissa 9e18 * 10^19 = 9e37 (the literal 9e18 fits the parser's
     // i64 range; the scale lifts the mantissa to 9e37). Two in one group sum to 1.8e38 > i128::MAX.
     e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))")
@@ -1062,7 +1062,7 @@ fn gpu_grouped_numeric_sum_large_high_limb_no_overflow() {
     // fractional test (mantissas fit i64, so val_hi == 0) and the overflow test (errors before a
     // result). NUMERIC(38,19) value 5.0 has mantissa 5*10^19 > i64::MAX, so val_hi != 0; the per-group
     // sums stay within i128. A wrong high-limb carry would corrupt the result by multiples of 2^64.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))")
         .unwrap();
     e.execute_text(
@@ -1119,7 +1119,7 @@ fn gpu_grouped_numeric_min_max() {
     // duplicate max. Constructed oracle:
     //   g=1 -> {10.50, -3.25, 7.00}        min -3.25   max 10.50
     //   g=2 -> {100.00, -50.50, 100.00}    min -50.50  max 100.00 (duplicate max)
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(10,2))")
         .unwrap();
     e.execute_text(
@@ -1175,7 +1175,7 @@ fn gpu_grouped_numeric_min_max_large_high_limb() {
     //   g=1 -> {5.0, 2.5, -5.0, 1.0}  min -5.0  max 5.0
     //   g=2 -> {-2.0, -8.0, -1.0}     min -8.0  max -1.0  (ordering among negatives)
     //   g=3 -> {0.0}                  min  0.0  max 0.0   (single row -> identity overwritten)
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))")
         .unwrap();
     e.execute_text(
@@ -1258,7 +1258,7 @@ fn gpu_grouped_numeric_min_max_same_high_limb_tie() {
         "the decoy must have a DIFFERENT high limb"
     );
 
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))")
         .unwrap();
     e.execute_text(
@@ -1306,7 +1306,7 @@ fn gpu_grouped_reuse_types_int2_date_timestamp() {
     // Int2 + Date ride the int4 (4-byte) read; Timestamp rides the int8 (8-byte) read -- executor
     // type-recognition only, no kernel change. Verify GROUP BY keys + MIN/MAX narrow back to the right
     // SqlType, and int2 SUM (PG SUM(int2) -> int8).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (g INT, d DATE, ts TIMESTAMP, s SMALLINT)",
@@ -1399,7 +1399,7 @@ fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys
     // across many blocks). Both assert against host oracles -- a wrong merge would surface here.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE lo (g INT, v INT)").unwrap();
     let n = 10_000usize;
     let ngroups = 7usize;
@@ -1438,7 +1438,7 @@ fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     assert_eq!(s.rows, exp_s, "low-card SUM at scale");
 
     // HIGH cardinality: every key distinct -> one group per row, merged across many blocks.
-    let mut e2 = Engine::new_local_cpu_oracle();
+    let mut e2 = Engine::new_local_test_engine();
     e2.execute_text(1, "CREATE TABLE hi (g INT, v INT)")
         .unwrap();
     let h = 3000usize;
@@ -1477,7 +1477,7 @@ fn gpu_resident_expr_select_evaluates_is_null_and_is_not_null_via_validity_bitma
     // bitmap (slice 2a) feeds the SAME bitmap->mask kernel as a bool column, pointed at the validity
     // bitmap. GPU-native oracle = CONSTRUCTION (we know which rows are NULL by the insert rule). Projects
     // `id` (which has no NULLs) for the surviving rows.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
 
     const N: i32 = 300;
@@ -1554,7 +1554,7 @@ fn gpu_resident_expr_is_null_on_a_column_with_no_nulls_uses_a_constant_mask() {
     // `IS NULL`/`IS NOT NULL` lowers to a CONSTANT mask in the predicate VM (a device memset, no kernel) --
     // IS NOT NULL is all-1, IS NULL all-0. Combined with `id < K` to prove the constant is real (not just
     // "all rows" / "no rows" by accident).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE u (id INT, w INT)").unwrap();
     const N: i32 = 200;
     let mut values = String::new();
@@ -1665,7 +1665,7 @@ fn audit_s4_grouped_single_group_default_limit() {
     // With EXACTLY ONE group + a LIMIT, the OLD code SKIPPED the sort entirely (rows.len() <= 1) and ran
     // drain/truncate on the 1 row. The NEW code now ENTERS the block and calls gpu_sort_permutation on a
     // 1-row payload (which must return identity, not error). Verify the single group still comes back.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (g, v) VALUES (7,1),(7,2),(7,3)")
         .unwrap();
@@ -1710,7 +1710,7 @@ fn audit_s4_grouped_single_text_group_order_limit() {
     // RISK (claim #2): a single TEXT group + ORDER BY + LIMIT 1 now builds the hetero payload over a
     // 1-row result and calls gpu_sort_permutation. gpu_sort_permutation short-circuits rows.len()<=1 to
     // identity BEFORE building any payload, so this must NOT error and must return the one group.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g TEXT, v INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (g, v) VALUES ('apple',10),('apple',20)")
         .unwrap();
@@ -1737,7 +1737,7 @@ fn audit_s4_grouped_composite_single_group_limit() {
     // RISK (claim #2): a single COMPOSITE-key group + LIMIT now enters the windowing block. The default
     // branch computes n_group_cols=2 for the composite key; gpu_sort_permutation identity-short-circuits
     // at 1 row so the 2-col order is never evaluated. Verify the group survives.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT, v INT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO t (a,b,v) VALUES (1,2,10),(1,2,20),(1,2,30)")
@@ -1772,7 +1772,7 @@ fn audit_s4_grouped_having_empties_then_limit() {
     // RISK (claim #4): HAVING filters EVERYTHING -> rows is empty, but LIMIT is present so the windowing
     // block is entered with an EMPTY perm. perm[start..end] must be the empty slice (no panic), result
     // empty. Then a HAVING that leaves exactly ONE group + LIMIT (the 1-row windowing path post-HAVING).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -1821,7 +1821,7 @@ fn audit_s4_grouped_multi_aggregate_order_limit_offset() {
     // RISK (claim #6, #30 alignment): a MULTI-aggregate GROUP BY (SUM + MIN + MAX) where the multi-pass
     // alignment built `rows`, then ORDER BY an AGGREGATE + LIMIT + OFFSET windows the permutation. Verify
     // the windowed rows are exactly the right groups with the right (cross-pass-aligned) aggregate values.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -1863,7 +1863,7 @@ fn audit_s4_resident_limit_no_order_index_order_preserved() {
     // gathered all then drained/truncated. Both must yield the SAME rows in the SAME order. With values
     // chosen so the stored row order != value order, this distinguishes "windowed survivor indices" from
     // any accidental sort. Insert order = stored order on a fresh table.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a) VALUES (50),(20),(80),(10),(90),(30)")
         .unwrap();
@@ -1908,7 +1908,7 @@ fn audit_s4_resident_with_where_limit_window() {
     // RISK: LIMIT windowing interacts with a WHERE filter (indices_u64 is the SURVIVOR set). Window must
     // slice survivors, not raw rows. WHERE a > 25 over [50,20,80,10,90,30] -> survivors [50,80,90,30]
     // (stored order). LIMIT 2 OFFSET 1 -> [80,90].
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a) VALUES (50),(20),(80),(10),(90),(30)")
         .unwrap();
@@ -1950,7 +1950,7 @@ fn audit_s4_resident_with_where_limit_window() {
 fn audit_s4_resident_limit_zero_and_huge() {
     // RISK (claim #1): LIMIT 0 -> empty; a HUGE LIMIT (well past len) -> the whole (windowed) set; OFFSET
     // exactly == len -> empty. saturating_add must keep a huge LIMIT from overflowing start+l.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a) VALUES (5),(2),(8),(1)")
         .unwrap();
@@ -1998,7 +1998,7 @@ fn audit_s4_grouped_nulls_override_with_limit_window() {
     // KEY forms a NULL group; with explicit NULLS LAST
     // the NULL group must sort LAST (overriding the ASC default of FIRST), then a LIMIT window must keep
     // the right groups. This is a MULTI-group result so the real sort runs (not the 1-row identity).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tg (k INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -2108,7 +2108,7 @@ fn audit_s4_windowing_math_equals_drain_truncate() {
 ///   k=2  {4, 3}     cnt2 sum7   avg3.5   min3   max4
 ///   k=3  {-10}      cnt1 sum-10 avg-10   min-10 max-10
 fn s8_resident_g() -> Option<Engine> {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE g (k INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -2341,7 +2341,7 @@ fn audit_s8_grouped_order_by_aggregate_tie_break() {
     // Without it, the order among groups that tie on the aggregate is implementation-defined and a LIMIT
     // would pick a DIFFERENT group (the auditor measured [10,3] vs [20,3] for `ORDER BY count DESC
     // LIMIT 1`). These asserts pin the group-ASC tie order, so they FAIL if the tie-break regresses.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE g3 (k INT, v INT)").unwrap();
     // k=-5: v=-3,-3   -> cnt2 sum-6  ;  k=10: v=10,10,10 -> cnt3 sum30
     // k=20: v=5,10,15 -> cnt3 sum30  ;  k=30: v=10       -> cnt1 sum10  ;  k=40: v=2,8 -> cnt2 sum10
@@ -2399,7 +2399,7 @@ fn audit_s8_grouped_materialized_view_via_bridge() {
     // MATERIALIZED VIEW ... WITH DATA runs its grouped SELECT through `execute_relational_select(&Select)`
     // -> the bridge AT CREATE TIME (no raw SQL text), so this proves a grouped view/CTAS materializes
     // correctly on the GPU. The auditor confirmed these rows are byte-identical to the parent (probe).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE base (k INT, v INT)")
         .unwrap();
     // k=1 {10,20} sum30 cnt2 ; k=2 {5,5,5} sum15 cnt3 ; k=3 {-7,100} sum93 cnt2 (v>=5 drops -7 -> cnt1).

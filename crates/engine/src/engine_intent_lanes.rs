@@ -1143,7 +1143,7 @@ mod tests {
 
     #[test]
     fn synchronous_commit_off_compatibility_setting_keeps_the_strict_gate() {
-        let mut engine = crate::Engine::new_local_cpu_oracle();
+        let mut engine = crate::Engine::new_local_test_engine();
         let base = std::env::temp_dir().join(format!(
             "gpu-db-strict-commit-setting-{}-{:?}.wal",
             std::process::id(),

@@ -7,7 +7,8 @@
 //!   IS the old cost model (groups of 1, one fsync per commit): compare commits/sec at c=1 vs c=N
 //!   and the reported mean group size.
 //!
-//! CPU + disk only — no GPU residency, no CUDA initialization.
+//! The benchmark does not explicitly warm residency; relational generation remains
+//! device-authoritative and may initialize CUDA, while the measured differentiator is disk flush grouping.
 //!
 //! Run:  cargo run --release -p gpu_db_engine --example wal_group_commit_benchmark
 //! Env:  GPU_DB_BENCH_WRITERS (default "1,2,4,8"), GPU_DB_BENCH_COMMITS_PER_WRITER (default 200),

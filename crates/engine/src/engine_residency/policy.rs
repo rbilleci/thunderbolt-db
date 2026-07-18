@@ -133,8 +133,8 @@ impl Engine {
     }
 
     /// CPU-ENGINE RETIREMENT (ADR-006): count of SELECTs the specialized route declined but the GENERAL
-    /// GPU Expr executor served on-device (instead of de-eliding to the CPU pinned path). Non-vacuity
-    /// signal for the read fallback — proves a wider-type/non-enumerated shape stayed on the GPU.
+    /// GPU Expr executor served on-device. Non-vacuity signal for the specialized-route decline —
+    /// proves a wider-type/non-enumerated shape stayed on the GPU.
     pub fn general_read_fallback_hits(&self) -> u64 {
         self.read_state
             .residency
@@ -339,8 +339,8 @@ impl Engine {
             //
             // OUTBOUND FKs no longer block (ADR-006 FK elision, child side) when the table is
             // not SELF-REFERENCING (the prepare ladders' self-FK arm keeps the scan-validator
-            // semantics — "a new row may provide for another new row" — which wants the host
-            // path). The inbound child-reference check (`does any child row carry fk_col =
+            // semantics — "a new row may provide for another new row" — whose device-native
+            // statement-local provider/consumer route is not yet admitted). The inbound child-reference check (`does any child row carry fk_col =
             // departed_parent_key?`) stays device-native for EVERY fk column type the column
             // gate above admits: the ELIDED scan fallback in `device_visible_row_with_value`
             // serves it via the Eq scan-locate (`device_eq_scan_literal` has one canonical arm

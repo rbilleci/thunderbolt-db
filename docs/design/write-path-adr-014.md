@@ -9,7 +9,8 @@ not claim the current implementation passes its performance, fault, coverage, or
 
 **Post-acceptance update, 2026-07-17:** R3-002/R3-003 subsequently passed independent adversarial acceptance.
 References to those IDs below are historical graduation labels, not open work. The canonical durable envelope and
-destructive recovery campaign remain **DUR-002**; current sequencing is owned only by `../PLAN.md`.
+destructive recovery campaign completed under historical **DUR-002**; current sequencing is owned only by
+`../PLAN.md`.
 
 **Decision scope:** relational row/version identity, transaction/isolation semantics, mutation representation,
 index visibility, deterministic conflict control, latency/throughput adaptation, publication, GC,
@@ -250,7 +251,8 @@ transactional sequence restart roll back to the saved overlay state while sessio
 Read-only mode rejects every supported user data/catalog mutation and sequence mutation before it occurs. PostgreSQL
 16 permits writes to temporary relations in a read-only transaction, but temporary relations are not in the current
 supported SQL/storage surface: `CREATE TEMP[ORARY] TABLE` and dependent temporary-relation operations fail loud
-rather than being treated as permanent relations. **PRODUCT-002** owns any later compatibility expansion. An
+rather than being treated as permanent relations. `../PLAN.md` tracks any later compatibility expansion under
+**PRODUCT-002**. An
 ordinary read-only transaction with no system side effect completes after its final read and state transition
 without a relational `commit_seq`, user outcome marker, or publication object. `CommitNoOp` is reserved for a
 mutating or predeclared sequenced attempt whose durable relational result is no-op; it is not the representation of
@@ -1141,8 +1143,8 @@ joins, version selection, and repair remain device operations. Reverse gather/de
 debt only until **RETIRE-002** closes. Recovery is byte-bounded STRATA streaming, with durable artifact capacity and
 maximum device/scratch overlap preflighted. Every index required by an admitted route is ready before service;
 optional slow-class indexes may rebuild lazily only while those routes are explicitly unready. Checkpoint cadence
-must bound worst-case bytes/records so measured full GPU recovery meets the five-minute RTO; **DUR-001** owns the
-automatic cadence, and **DUR-002** owns the repeated-crash/power-fail campaign.
+must bound worst-case bytes/records so measured full GPU recovery meets the five-minute RTO; `../PLAN.md` tracks
+automatic cadence under **DUR-001**, while historical **DUR-002** completed the repeated-crash/power-fail campaign.
 
 The initial standalone RTO profile permits at most 32 GiB of checkpoint-referenced serving bytes and 1,000,000
 complete suffix outcomes, requires at least 512 MiB/s effective artifact restore and 19,200 outcomes/s replay,
@@ -1241,21 +1243,23 @@ authority and evidence that cross-lane coalescing plus WAL-first ordering revers
   retry integration, complete deterministic conflict control, per-stage credit/deadline adaptation, bounded
   automatic index/GC/STRATA maintenance, and update-heavy capacity gates against this contract. `SERIALIZABLE`
   remains rejected until separately designed and proven.
-- **DUR-001** implements automatic cut-exact checkpoint cadence, format lineage, and PITR pins within the replay/RTO
-  ceiling.
-- **DUR-002** implements the non-circular typed fragmented WAL/catalog/status format, lane-local physical/global-
-  logical merger, ordered stable-ID lifecycle/reset/rewrite/sequence records, explicit genesis, checkpointed claim/
-  status reconciliation, and proves the full crash, power-fail, filesystem, allocator, GPU-context-loss, orphan, and
-  post-durable-apply campaign before standalone host-store deletion.
-- **HA-001** maps the physical range/outcome marker and `commit_seq` to replicated term/index authority and makes
-  referenced artifacts part of quorum snapshot installation before node-loss RPO 0 is claimed.
+- `../PLAN.md` tracks automatic cut-exact checkpoint cadence, format lineage, and PITR pins within the replay/RTO
+  ceiling under **DUR-001**.
+- Historical **DUR-002** implemented the non-circular typed fragmented WAL/catalog/status format, lane-local
+  physical/global-logical merger, ordered stable-ID lifecycle/reset/rewrite/sequence records, explicit genesis,
+  checkpointed claim/status reconciliation, and proved the full crash, power-fail, filesystem, allocator,
+  GPU-context-loss, orphan, and post-durable-apply campaign before standalone host-store deletion.
+- `../PLAN.md` tracks mapping the physical range/outcome marker and `commit_seq` to replicated term/index authority,
+  including quorum snapshot installation of referenced artifacts before node-loss RPO 0 is claimed, under
+  **HA-001**.
 - Host write/store/index authority retirement is complete after **R3-002/003** and **DUR-002** acceptance. The
-  RPO-preserving reverse-gather repair boundary remains explicit until **RETIRE-002** replaces it; **DUR-001** adds
-  automatic checkpoint/PITR policy independently. **HA-001** is additionally required only for a replicated/
-  node-loss-RPO deployment.
-- **RETIRE-002** removes reverse-gather, deauthorization, and host reconstruction after device-native repair exists.
-- **CFG-001** reckons internal setters and losing arms when their replacement path is complete; this ADR does not
-  turn internal A/B gates into product configuration.
+  RPO-preserving reverse-gather repair boundary remains explicit; `../PLAN.md` tracks its replacement under
+  **RETIRE-002**, automatic checkpoint/PITR policy under **DUR-001**, and any replicated/node-loss-RPO deployment
+  work under **HA-001**.
+- `../PLAN.md` tracks removal of reverse-gather, deauthorization, and host reconstruction after device-native repair
+  exists under **RETIRE-002**.
+- `../PLAN.md` tracks reckoning internal setters and losing arms when their replacement path is complete under
+  **CFG-001**; this ADR does not turn internal A/B gates into product configuration.
 
 ## Evidence and graduation gates
 

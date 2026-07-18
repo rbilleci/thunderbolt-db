@@ -88,7 +88,8 @@ fn streaming_shape(select: &Select) -> Option<StreamShape> {
     // S-E.3 GROUP BY: normalize the legacy 1-aggregate forms to GroupedAggregates (as the grouped
     // bridge does) and accept only associatively-decomposable kinds: COUNT merges as SUM(count),
     // SUM as SUM(sum), MIN as MIN(min), MAX as MAX(max). AVG needs the (sum,count) pair and
-    // COUNT(DISTINCT) is not decomposable from per-chunk distinct counts — both decline to CPU.
+    // COUNT(DISTINCT) is not decomposable from per-chunk distinct counts — both decline so the
+    // caller reaches the fail-loud boundary.
     if let Some(group_column) = &select.group_by {
         if select.limit.is_some() || select.offset.is_some() {
             return None;
@@ -140,9 +141,9 @@ fn streaming_shape(select: &Select) -> Option<StreamShape> {
 impl Engine {
     /// STRATA S-E.1/S-E.2: try to serve a SELECT OUT-OF-CORE via a streaming fold — a scalar reduction
     /// (combine partials) or a filter/project (concat + windowing). Returns `Some(result)` when the
-    /// streaming path handled the read (`Ok`) or must surface a genuine SQL error (`Err`); `None` to fall
-    /// through to the caller's path (the CPU pinned read). It NEVER returns a wrong answer: any shape the
-    /// device cannot express defers to the authoritative CPU path.
+    /// streaming path handled the read (`Ok`) or must surface a genuine SQL error (`Err`); `None` lets
+    /// the caller try another GPU route and ultimately fail loudly. It never returns a host-computed
+    /// relational answer.
     pub(crate) fn try_streaming_select(
         &self,
         select: &Select,
@@ -158,8 +159,7 @@ impl Engine {
         let shape = streaming_shape(select)?;
         let gpu_id = self.planner.default_gpu_id();
         // Activation gate: a per-GPU residency budget must be configured (the operator's VRAM-management
-        // signal). With no budget there is no notion of "over-VRAM" -> stay on the interim host path
-        // (byte-identical default behavior).
+        // signal). With no budget there is no notion of "over-VRAM", so this route declines.
         let budget = self.relational_residency_budget_bytes(gpu_id)?;
         if budget == 0 {
             return None;
@@ -170,7 +170,7 @@ impl Engine {
             return None;
         }
         // Bind + lower the WHERE to a device predicate exactly as the sharded bridge does. A bind failure
-        // or an un-lowerable predicate falls through to the host path (never a wrong answer).
+        // or an un-lowerable predicate declines this route (never a wrong answer).
         let (table, mut bound, copin_s) = self
             .bind_relational_select_at(select, statement_copin_s)
             .ok()?;

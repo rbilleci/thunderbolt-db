@@ -31,7 +31,7 @@ fn audit_join_matched_row_value_null_every_type() {
     // for EVERY nullable type -- not the device placeholder (0/""/0-mantissa/zero-uuid/false). The
     // committed test only proves int4/text/numeric. Here: int2, int8, date, timestamp, uuid, bool,
     // numeric@scale4. The join KEY (id) is non-null; every value column carries a NULL on the matched row.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
     e.execute_text(
         2,
@@ -106,7 +106,7 @@ fn audit_join_outer_pad_on_nonnullable_columns_all_types() {
     // HUNT #2 + #3: an OUTER pad must force NULL on a column that has NO validity bitmap (non-nullable),
     // independent of validity -- AND must not leak row-0's value (pads use placeholder index 0). Row 0 of
     // the padded relation holds DISTINCTIVE values for every type; the unmatched left rows must be NULL.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
     // r has NO nullable columns (none of these ever hold a NULL -> no validity bitmap is built).
     e.execute_text(
@@ -172,7 +172,7 @@ fn audit_join_outer_pad_on_nonnullable_columns_all_types() {
 fn audit_join_empty_padded_side_right_full() {
     // HUNT #3: a relation whose row_count==0 appears as a PADDED side (RIGHT/FULL with an empty side).
     // gather_col must early-return all-NULL (no device read at index 0 into an empty payload) -- no panic.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, w INT)")
@@ -221,7 +221,7 @@ fn audit_join_limit_offset_no_orderby_matches_join_order() {
     // HUNT #5: LIMIT/OFFSET WITHOUT ORDER BY must window the join result in JOIN ORDER (identity perm),
     // exactly as the old drain/truncate did. We make the join order deterministic (unique 1:1 keys, build
     // on the unique side) and verify the windowed slice is a contiguous slice of the full result.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, score INT)")
@@ -280,7 +280,7 @@ fn audit_join_limit_offset_no_orderby_matches_join_order() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_join_empty_result_no_matches() {
     // HUNT #9: no matches -> work_n == 0 -> the gather returns empty, transpose -> 0 rows, no panic.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, w NUMERIC(10,2))")
@@ -320,7 +320,7 @@ fn audit_join_empty_result_no_matches() {
 fn audit_join_nn_and_multiway_gather_right_rows() {
     // HUNT #8: N:N many-to-many + a 3-way chain. The carried index vectors must gather the RIGHT rows
     // from each side's device payload (text + numeric + null values), not misaligned values.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // N:N on an int key: l has key 1 twice, r has key 1 twice -> 4 result rows, each a distinct (l,r) pair.
     e.execute_text(1, "CREATE TABLE l (k INT, lv TEXT)")
         .unwrap();
@@ -416,7 +416,7 @@ fn audit_join_nn_and_multiway_gather_right_rows() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_join_using_natural_and_star_gather() {
     // HUNT #7: USING coalesced column (mapped to rel 0) + bare `*` gather correctly.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, lname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (id INT, rscore INT)")
@@ -475,7 +475,7 @@ fn audit_nonvacuity_placeholder_would_leak_without_override() {
     // asserts the placeholder values directly via a deliberately-WRONG expectation -- it MUST PANIC,
     // proving the SqlValue::Null in the real test is the validity override doing real work (not that the
     // device happens to be empty/absent). If this test ever PASSES, the placeholder is leaking == bug.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
     e.execute_text(
         2,
@@ -527,7 +527,7 @@ fn audit_join_order_by_nullable_value_with_window() {
     // HUNT #5 + #1 cross: ORDER BY a device-gathered NULLABLE value column on the join, then window it.
     // The gathered NULL must (a) render Null and (b) sort to PG default (NULLs last ASC), and the window
     // must slice the SORTED order (not join order). A divergence would silently reorder/mis-window.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, w INT)")
         .unwrap();
@@ -607,7 +607,7 @@ fn audit_join_order_by_nullable_value_with_window() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_uuid_byteorder_value_exactness() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE gd (gid UUID, gname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE ud (uid INT, gid UUID)")
@@ -701,7 +701,7 @@ fn audit_s5_uuid_byteorder_value_exactness() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_numeric_mantissa_exactness_negatives_and_large() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // scale 0. NEGATIVES are the high-limb probe: a -1 mantissa is 0xFF..FF across ALL 16 bytes
     // (including the HIGH 64-bit limb); a dropped/zeroed high limb in project_i128 would turn it into a
     // large POSITIVE value and break the match. Also a beyond-i32 positive (3e9) crosses the 32-bit line.
@@ -805,7 +805,7 @@ fn audit_s5_numeric_mantissa_exactness_negatives_and_large() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_b128_key_in_later_multiway_step() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // r0 (int pk) -> r1 (int fk to r0, uuid u) -> r2 (uuid u). The uuid join is the SECOND step, joining
     // the ACCUMULATED (r0,r1) on r1.u against r2.u. r1.u is gathered at carried r1 indices.
     e.execute_text(1, "CREATE TABLE r0 (id INT, tag TEXT)")
@@ -884,7 +884,7 @@ fn audit_s5_b128_key_in_later_multiway_step() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_empty_side_before_b128_and_text_step() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE gu (gid UUID, gname TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE uu (uid INT, gid UUID)")
@@ -966,7 +966,7 @@ fn audit_s5_empty_side_before_b128_and_text_step() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_nn_numeric_with_null_key_gate() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE ln (lid INT, amt NUMERIC(10,2))")
         .unwrap();
     e.execute_text(2, "CREATE TABLE rn (rid INT, amt NUMERIC(10,2))")
@@ -1029,7 +1029,7 @@ fn audit_s5_nn_numeric_with_null_key_gate() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_mixed_uuid_numeric_end_to_end() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE k (gid UUID, amt NUMERIC(12,3))")
         .unwrap();
     e.execute_text(2, "CREATE TABLE p (gid UUID, tag TEXT)")

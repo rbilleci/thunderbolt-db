@@ -326,9 +326,8 @@ impl Engine {
         self.capture_read_snapshot(boundary, false)
     }
 
-    /// Capture an autocommit statement generation. It has the same ownership guarantees as an
-    /// explicit transaction, but a representation-changing repair may replace it before execution
-    /// because no earlier statement in the transaction depends on the old generation.
+    /// Capture an autocommit statement generation. It has the same descriptor ownership guarantees
+    /// as an explicit transaction but need not retain global index resources beyond the one read.
     pub(crate) fn capture_statement_snapshot(&self, boundary: Index) -> Arc<TransactionSnapshot> {
         self.capture_read_snapshot(boundary, true)
     }
@@ -413,7 +412,6 @@ impl Engine {
         }
         Arc::new(TransactionSnapshot {
             boundary,
-            statement_owned,
             next_row_id: self.read_state.mvcc.current_row_id(),
             catalog,
             table_versions,

@@ -13,8 +13,41 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   generations, and the host write/commit/MVCC tuple-store path, `CachedShardPkIndex`, and host DML/constraint
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
-- Generic CUDA-MVCC host result post-processing and test-only CPU semantic infrastructure remain under
-  **RETIRE-003** and **RETIRE-001**. R3-002/R3-003 passed independent adversarial acceptance on 2026-07-17.
+- Generic CUDA-MVCC host result post-processing remains under **RETIRE-003**. R3-002/R3-003 passed independent
+  adversarial acceptance on 2026-07-17.
+
+## RETIRE-001 test-oracle retirement — complete 2026-07-18
+
+- Test-only CPU relational execution is deleted. `CpuMvccExecutionBackend`, `FirstCudaSliceParityBackend`, the
+  fallback-chain adapter, `execution::reference_operators`, `new_local_cpu_oracle`, and the merged host SQL
+  finalization fixture have no live source or re-export. The neutral test constructor is `new_local_test_engine`.
+- Host-neutral MVCC semantics use a rows-only closed-form specification oracle. Relational specification fixtures
+  carry only schema, rows, and access-path semantics; actual CUDA fixtures keep separately typed execution evidence
+  from the engine's cached CUDA-driver dispatcher. Neither specification type can implement a backend, claim a
+  device target, or manufacture fallback telemetry.
+- The remaining production CPU-pinned compatibility names perform no relational work: every unsupported resident,
+  streaming, or legacy-probe shape fails loudly with unchanged fallback counters. Actual-GPU streaming, numeric,
+  compound-key, wide-type, catalog, DML, and MVCC differentials now assert exact device results or an explicit
+  fail-loud boundary; recovery and report fixtures no longer accept or fabricate CPU execution.
+- A shard-resident flat-int4 batch decline now routes directly to the byte-identical per-query GPU path instead of
+  attempting a compatibility `Ready` fold that cannot encode structural NULLs. The coarse/fine-shard pgwire gate
+  asserts `Gpu(0)` with no fallback before serving and validates exact scalar and wire-NULL fixture results.
+- Final gates pass: engine **486/486** ordinary and **1,017/1,017** including ignored GPU tests; execution **47/47**
+  ordinary and **126/126** including ignored GPU tests; facade **47/47** plus its serialized concurrency integration
+  suite **14/14**. The final relational bridge HAZARD family passed three sequential and two concurrent **23/23**
+  waves with no CUDA 700/716/717/719 or context-loss signature. Workspace all-target/all-feature check, strict
+  Clippy, formatting, diff whitespace, scoped stale-seam searches, and all slice audits/re-audits are clean.
+- The canonical report card completed both layers and cache regimes. Layer-1 `sum_i32` rooflines were
+  **1,478.8 GB/s** in-L2 and **1,450.6 GB/s** out-of-L2; COUNT compare reached **0.88x/1.01x**, constant-mask fill
+  reached **1,178.1/1,492.6 GB/s**, and grouped kernel throughput was **1,678.0M elements/s**. Layer-2 default
+  batched point reads reached **87.3M/s at p50 622us** in-L2 and **3.20M/s at p50 20.324ms** out-of-L2, within
+  roughly 3% of the R3-004 **89.6M/s / 605us** and **3.29M/s / 19.784ms** baseline.
+- The legacy relational residency and workload benchmark examples now establish separate resident GPU
+  baselines, reject non-GPU/fallback results, and complete their 64-row audit fixtures. Their obsolete cold-host,
+  direct single-buffer, budget, and pressure arms are gone. The result comparison is explicitly a consistency
+  differential between separate engines on the same production GPU path, not an independent semantic oracle.
+- RETIRE-001-created benchmark/test logs, temporary benchmark databases, and semantic-sweep inventories were
+  removed after verification; no task-created process remained live.
 
 ## Read path and STRATA
 
@@ -239,9 +272,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 ## Structural decomposition
 
-- **STRUCT-001** began with the execution facade. Device-routing policy now lives in `execution::routing`, and
-  the RETIRE-001-owned host-reference iterator operators live in `execution::reference_operators`; stable
-  crate-root re-exports preserve downstream APIs. The MVCC device-transfer layout and validation contract now
+- **STRUCT-001** began with the execution facade. Device-routing policy now lives in `execution::routing`; its
+  temporary host-reference iterator extraction and crate-root re-exports were later deleted by RETIRE-001. The
+  MVCC device-transfer layout and validation contract now
   lives in `execution::mvcc_batch`, with its encoding tests. These pure-move slices passed all 24 non-ignored
   execution tests and downstream engine/planner/metrics/observability checks. CUDA runtime/device snapshots,
   device-memory proof, and the typed CUDA error taxonomy now live in `execution::runtime_contract`; exact
@@ -1618,8 +1651,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   engine root is 6,355 lines, and the 992-test/76-family inventories remain exact. Seven GPU gates passed 21
   sequential and 14 concurrent invocations with zero CUDA 700/716/717; both ordinary modes passed 505/487, and
   all-target check, strict clippy, scoped formatting/diff/reference checks, and independent audit are clean. The
-  inherited CPU-pinned mixed-type oracle remains test-only; no production route or architectural behavior
-  changed, so the report card was not applicable.
+  inherited CPU-pinned mixed-type oracle was test-only at that structural checkpoint; RETIRE-001 later removed
+  the host relational oracle. No production route or architectural behavior changed in STRUCT-001EU, so the
+  report card was not applicable.
   STRUCT-001EV externalized the final three-test capacity/open-payload/residency-budget family into the rustfmt-
   clean 87-line `tests/residency_capacity_budget.rs` owner immediately before the parent module close. Normalized
   comparison differs only in two rustfmt binding layouts; all bodies, attributes, names, and order remain
@@ -2597,7 +2631,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   classifier-doc correction; the intervening multi-GPU scheduler remains byte-for-byte in the root. `StreamShape`
   and `streaming_shape` remain private, both inherent routes remain `pub(crate)`, and all three current-boundary plus
   one explicit-boundary callers are unchanged. Every HAVING/ORDER/DISTINCT/group/plain/scalar classification,
-  top-N/normalization/decline, budget/elision/class guard, catalog-data boundary bind, cold probe/CPU fallback,
+  top-N/normalization/decline, budget/elision/class guard, catalog-data boundary bind, and the then-current cold
+  probe/CPU-fallback seam,
   predicate lowering/filter clearing, fold argument, and `Some`/`None` invariant is exact. The only other change
   corrected the audit-proven stale claim that scalar partials combine on the host; the final combine is on device.
   Seven route controls passed three serial plus two concurrent rounds each, the no-budget fallback passed, both
@@ -3601,8 +3636,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   sidecar, compaction, generation, counter, SQL, and result assertions are preserved through three import
   declarations/five names. Only private `gpu_available`/`select` are consumed; history assigns the range exactly to
   the P4 class/reclaim commits, with no visibility bridge, path/include indirection, unsafe, context bag, numbered
-  shard, external-name reference, or stale copy. Host/store twins and the CPU-pinned deauthorization exit remain
-  explicitly parity/bootstrap evidence and gated debt, never product direction. Twelve local plus 12 independent-
+  shard, external-name reference, or stale copy. Host/store twins and the CPU-pinned deauthorization exit were
+  explicitly parity/bootstrap evidence and gated debt at that checkpoint, never product direction; RETIRE-001
+  later removed the host relational exit. Twelve local plus 12 independent-
   audit actual-GPU executions passed; local concurrent PIDs `122547`/`122551` overlapped in four samples and audit
   PIDs `134466`/`134474` in 14, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary modes
   passed 505/487 in 14.27s/7.98s, the complete include-ignored suite passed 992/992 in 188.63s, and workspace all-
@@ -3683,11 +3719,11 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   limits, rows, and miss assertions are preserved through one explicit import declaration/14 names. History is
   exactly the original MVCC-suite split plus STRATA commit, with no glob/super dependency, visibility bridge, path/
   include indirection, unsafe, context bag, numbered shard, external-name reference, or stale copy. The moved
-  `execute_mvcc_query` tests use the cfg(test) `CpuMvccExecutionBackend` with `GpuMvccReadParityGap` and remain
-  explicit parity/bootstrap debt, never product direction; three matching CUDA-driver bundle controls provide the
-  GPU evidence. Thirty-six local plus 36 independent-audit CPU-parity executions and nine local plus nine audit
-  actual-GPU executions passed; local concurrent GPU PIDs `172548`/`172552` overlapped in 20 samples and audit PIDs
-  `184659`/`184664` overlapped repeatedly, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary
+  `execute_mvcc_query` tests used the cfg(test) CPU semantic backend at this structural checkpoint; RETIRE-001 later
+  replaced those fixtures with the rows-only specification oracle. Three matching CUDA-driver bundle controls
+  provided the GPU evidence. Thirty-six local plus 36 independent-audit CPU-parity executions and nine local plus
+  nine audit actual-GPU executions passed; local concurrent GPU PIDs `172548`/`172552` overlapped in 20 samples and
+  audit PIDs `184659`/`184664` overlapped repeatedly, with zero CUDA 700/716/719 or related faults. Both debug/release ordinary
   modes passed 505/487 in 23.15s/9.83s, the complete include-ignored suite passed 992/992 in 185.75s, and workspace
   all-target/all-feature check, strict engine Clippy, private rustdoc with the known 25-warning baseline, scoped
   source/child-format/diff/cleanup gates, fresh 10-file inventory, and independent audit are clean. Runtime behavior
@@ -3705,8 +3741,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   miss assertions are preserved through one explicit import declaration/13 names. History is exactly the original
   MVCC-suite split plus STRATA commit, with no glob/super dependency, visibility bridge, path/include indirection,
   unsafe, context bag, numbered shard, external-name reference, or stale copy. The moved `execute_mvcc_query` tests
-  use the cfg(test) CPU semantic backend and remain parity/bootstrap debt only; the same three CUDA-driver bundle
-  controls provide GPU nonvacuity. Twenty-one local plus 21 independent-audit CPU-parity executions and nine local
+  used the cfg(test) CPU semantic backend as parity/bootstrap debt at that checkpoint; RETIRE-001 later replaced
+  those fixtures with the rows-only specification oracle. The same three CUDA-driver bundle controls provided GPU
+  nonvacuity. Twenty-one local plus 21 independent-audit CPU-parity executions and nine local
   plus nine independent-audit actual-GPU executions passed. Local concurrent GPU PIDs `187588`/`187592` overlapped
   in 14 samples and audit PIDs `199588`/`199593` were repeatedly observed together, with zero CUDA 700/716/719 or
   related faults. Both debug/release ordinary modes passed 505/487 in 14.31s/8.08s, the complete include-ignored
@@ -3802,8 +3839,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   passed. Both debug/release ordinary modes passed 505/487 in 30.07s/9.83s, the complete include-ignored suite
   passed 992/992 in 173.19s, and workspace all-target/all-feature check, strict engine Clippy, private rustdoc with
   the known 25-warning baseline, scoped source/child-format/diff/cleanup gates, fresh six-file inventory, and
-  independent audit are clean. The 24 `new_local_cpu_oracle` constructions remain explicitly test-only parity/
-  bootstrap evidence; runtime behavior is unchanged, so GPU nonvacuity, HAZARD, and report card were inapplicable.
+  independent audit are clean. At this structural checkpoint, 24 `new_local_cpu_oracle` constructions remained as
+  test-only parity/bootstrap evidence; RETIRE-001 later replaced and deleted that constructor. Runtime behavior was
+  unchanged, so GPU nonvacuity, HAZARD, and report card were inapplicable.
   STRUCT-001KY owns current `tests/mvcc_query.rs` lines 1141–2296 as the complete initial actual-CUDA driver route
   matrix and will complete that test root below 3,000 lines.
 
@@ -4042,7 +4080,6 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 |---|---|
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Non-int4 O(1) point-lookup breadth | **READ-002** |
-| Test-only CPU semantic oracle | **RETIRE-001** |
 | Reverse-gather/deauthorization/scan-build DDL and recovery repair | **RETIRE-002** |
 | Generic CUDA-MVCC host compaction, ordering, projection, and result assembly | **RETIRE-003** |
 | Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |

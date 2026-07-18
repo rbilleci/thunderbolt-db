@@ -55,7 +55,7 @@ fn eval_single_col_predicate(
     values: &[i32],
     predicate: &ResidentExpr,
 ) -> Option<Result<RelationalSelectResult, ExecuteError>> {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, &format!("CREATE TABLE {table} (a INT)"))
         .unwrap();
     let tuples = values

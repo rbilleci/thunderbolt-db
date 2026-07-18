@@ -14,7 +14,7 @@ fn concurrent_readers_execute_relational_select_on_shared_engine() {
     // execute_relational_select against ONE shared engine (one published residency
     // generation) concurrently — there is no `&mut self` bottleneck. This is the
     // property the whole P1-M3 substrate exists to enable.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -59,11 +59,11 @@ fn concurrent_readers_execute_relational_select_on_shared_engine() {
 
 #[test]
 fn residency_invalidated_error_is_classified_precisely() {
-    // BUG 3 seam (classification half). The CPU-fallback decision in
-    // `execute_relational_select` keys off `ExecuteError::is_residency_invalidated`. It must be
+    // BUG 3 seam (classification half). The resident dispatcher keys off
+    // `ExecuteError::is_residency_invalidated` to distinguish a concurrent residency tombstone. It must be
     // TRUE for exactly the GPU-probe "no retained resident device memory" tombstone error (the
     // case a concurrent committer creates by `publish(None)` mid-statement) and FALSE for every
-    // other error, so a genuine device/bind error is never masked by the fallback.
+    // other error, so a genuine device/bind error is never masked by the common fail-loud decline.
     let invalidated = ExecuteError::Engine(EngineError::ApplyFailed(format!(
         "relation \"{}\" has no retained resident device memory",
         "events"
@@ -73,7 +73,7 @@ fn residency_invalidated_error_is_classified_precisely() {
         "the exact probe tombstone message must be recognized as residency-invalidated"
     );
 
-    // Genuine, non-fallbackable errors must NOT be misclassified.
+    // Genuine device and binding errors must NOT be misclassified.
     let real_gpu_error = ExecuteError::Engine(EngineError::ApplyFailed(
         "CUDA_ERROR_INVALID_CONTEXT launching kernel".to_string(),
     ));
@@ -89,41 +89,20 @@ fn residency_invalidated_error_is_classified_precisely() {
 }
 
 #[test]
-fn execute_relational_select_cpu_pinned_matches_the_public_select() {
-    // BUG 3 seam (fallback-target half). When a resident route's residency is invalidated
-    // mid-statement, `execute_relational_select` re-serves the statement from
-    // `execute_relational_select_cpu_pinned`. That fallback target must produce exactly the
-    // result the public device path does. R3-004 makes the DML generation mandatory, so the public
-    // route may legitimately report a different access-path implementation; rows and columns are
-    // the semantic seam the parity oracle owns.
-    let e = Engine::new_local_cpu_oracle();
+fn retired_relational_cpu_pinned_dispatch_fails_loudly_without_fallback_telemetry() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
-    for id in 1..=5 {
-        e.execute_text(
-            (id + 1) as u64,
-            &format!("INSERT INTO t (id, v) VALUES ({id}, {})", id * 10),
-        )
-        .unwrap();
-    }
-    for sql in [
-        "SELECT id FROM t ORDER BY id",
-        "SELECT COUNT(*) FROM t",
-        "SELECT id, v FROM t WHERE id = 3",
-    ] {
-        let Command::Select(select) = parse_command(sql).unwrap() else {
-            unreachable!("{sql} is a SELECT")
-        };
-        let via_public = e.execute_relational_select(&select).unwrap();
-        let via_fallback = e.execute_relational_select_cpu_pinned(&select).unwrap();
-        assert_eq!(
-            via_fallback.rows, via_public.rows,
-            "{sql}: CPU-fallback rows must equal the public select"
-        );
-        assert_eq!(
-            *via_fallback.columns, *via_public.columns,
-            "{sql}: CPU-fallback columns must equal the public select"
-        );
-    }
+    let Command::Select(select) = parse_command("SELECT id FROM t ORDER BY id").unwrap() else {
+        unreachable!("fixture is a SELECT")
+    };
+    let fallback_before = e.metrics().snapshot().fallback_total;
+
+    let error = e.execute_relational_select_cpu_pinned(&select).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("GPU execution is required for SELECT on relation \"t\""));
+    assert_eq!(e.metrics().snapshot().fallback_total, fallback_before);
 }
 
 // ----------------------------------------------------------------------------------------
@@ -306,7 +285,7 @@ fn stage3_old_table_generation_retired_only_after_last_reader_drains() {
 /// dispatching production execution to the host value index.
 #[test]
 fn stage3_resident_equality_read_uses_device_generation() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     // 200 rows; only 2 carry name='Ada'. A version-chain scan would touch all 200; the

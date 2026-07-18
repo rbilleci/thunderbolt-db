@@ -11,7 +11,7 @@ use std::sync::Arc;
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_rank_windows_over_ordered_input() {
     let _entry_disabled = ClassEntryDisabled::new();
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0_u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -385,7 +385,7 @@ fn gpu_streaming_rank_windows_over_ordered_input() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_rank_keeps_one_catalog_data_boundary_across_ddl() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     let mut seq = 0_u64;
     if !gpu_available(&mut engine, &mut seq) {
         return;

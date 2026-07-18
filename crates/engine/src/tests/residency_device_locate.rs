@@ -141,9 +141,9 @@ fn device_locate_same_shard_twin_point_read_and_reinsert() {
 /// R-ver (read version resolution): a plain unfiltered `SELECT <cols> FROM t` over a VERSIONED
 /// ELIDED table must (1) stay ELIDED — no de-elide — and (2) hide the tombstoned row. Before
 /// this slice the unfiltered projection had no resident-route shape, so it dropped to the
-/// CPU-pinned host path which REHYDRATES + de-elides. Now it routes to the sharded unified
+/// retired CPU-pinned host path which rehydrated + de-elided. Now it routes to the sharded unified
 /// executor with the SV3b `deleted_by` conjunct threaded. Sabotage: removing the
-/// `int4_projection_all` route classification de-elides (the read falls to the CPU seam).
+/// `int4_projection_all` route classification makes the GPU-required read decline loudly.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn plain_scan_over_versioned_elided_table_stays_elided() {

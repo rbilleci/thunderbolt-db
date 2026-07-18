@@ -11,7 +11,7 @@ use gpu_db_sql::{SelectFilterOp, SqlValue};
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_native_locate_matches_store_locate() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -95,7 +95,7 @@ fn gpu_chunk_native_locate_matches_store_locate() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_locate_driven_stamp_masks_rows_without_store() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;

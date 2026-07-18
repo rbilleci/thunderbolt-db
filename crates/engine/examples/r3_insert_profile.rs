@@ -369,8 +369,8 @@ fn print_reconciliation(
     println!("  Of the SQL-honest {a_us:.3} us/row:");
     println!("  - [CTRL] parse/plan (stays host):            {parse_us:.3} us/row");
     println!("  - [CTRL] render WAL + fsync/log (stays host): {durability_log_us:.3} us/row");
-    println!("  - [DATA] constraints+encode+mvcc+index (-> GPU): {data_plane_us:.3} us/row");
-    println!("  - [DUAL] residency invalidation (ELIMINATED):  {dual_artifact_us:.3} us/row");
-    println!("  Read: [DATA]+[DUAL] is the cost the host engine carries that the control-plane target removes;");
-    println!("  [CTRL] is the floor that remains. (Stage truncation caveat applies to the sub-us [DATA] leaves.)");
+    println!("  - [DATA] device constraints+encode+mvcc+index: {data_plane_us:.3} us/row");
+    println!("  - [PUB] device-generation publication/maintenance: {dual_artifact_us:.3} us/row");
+    println!("  Read: [DATA] is GPU execution and [PUB] is generation maintenance; neither is a host relational tier.");
+    println!("  [CTRL] remains the host control-plane floor. (Stage truncation caveat applies to sub-us leaves.)");
 }

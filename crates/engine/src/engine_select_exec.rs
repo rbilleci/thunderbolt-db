@@ -1,9 +1,9 @@
 //! Relational SELECT entry + dispatch (P0 §9.6 decomposition, behavior-preserving):
 //! a focused `impl Engine` block for the public SELECT entry points
-//! (execute_relational_select, _text, _instrumented, _cpu_pinned[_instrumented],
+//! (execute_relational_select, _text, _instrumented, and the retired-host decline seam,
 //! execute_relational_function) and the device-route dispatch variants
 //! (_with_cuda_driver_probe, _with_resident_snapshot_probe, _with_resident_route)
-//! that pick the CPU/GPU path and hand off to the resident-probe executors.
+//! that pick a GPU path or fail loudly and hand off to the resident-probe executors.
 
 use super::*;
 use crate::engine_expr::ResidentExecSource;
@@ -14,7 +14,7 @@ use crate::engine_expr::ResidentExecSource;
 /// the surviving rows on the GPU (multi-key bitonic) -- the charter-native path, retiring the
 /// enumerated ordered-projection shape for this case. A SINGLE text key also routes here (the byte-wise
 /// GPU text sort), and a MIXED int+text tuple uses the heterogeneous comparator. Other shapes --
-/// numeric/uuid keys, expressions -- stay on the existing path transitionally; the enumerated/CPU path
+/// numeric/uuid keys, expressions -- stay on the existing path transitionally; the enumerated route
 /// rejects multi-key, so a multi-key sort with a non-routable key is a clean error, never first-key-only.
 fn select_is_gpu_sortable_projection(select: &Select, table: &RelationalTable) -> bool {
     if select.group_by.is_some() || !select.having_groups.is_empty() {
@@ -125,7 +125,7 @@ impl Engine {
     /// path, so simple shapes keep their fused kernels and there is no perf regression. The general
     /// path runs on the GPU only when the residency snapshot reflects the visible committed set (it
     /// enforces the snapshot validity/identity invariant) and raises a hard error otherwise — there is
-    /// no CPU re-execution of an arithmetic predicate (the hand-rolled CPU path cannot express it).
+    /// no host re-execution of an arithmetic predicate.
     /// The strict `parse_command` entry the legacy pgwire server uses is untouched (dual-entry).
     pub fn execute_relational_select_text(
         &self,
@@ -140,23 +140,18 @@ impl Engine {
             Ok(Command::Select(select)) => {
                 // A non-grouped ORDER BY over an i64-sortable int key is a charter-native GPU sort: run
                 // it through the general Expr executor (which sorts on the GPU via the bitonic sort),
-                // NOT the enumerated ordered-projection shape (Charter rule 2) or the CPU path.
+                // NOT the enumerated ordered-projection shape (Charter rule 2).
                 if let Some(table) = self.relational_catalog_table(&select.table) {
-                    // Only route to the general GPU path when the table is GPU-resident: that path has
-                    // no CPU fallback, so for a non-resident table it would hard-error -- whereas the
-                    // strict/CPU-pinned path below serves non-resident tables correctly. (The general
-                    // path is the GPU-native one; this gate just preserves the entry's contract for
-                    // tables not yet resident.) SLICE B: SHARD-resident tables qualify too — the general
+                    // Only route to the general GPU path when the table is GPU-resident; a non-resident
+                    // table reaches the strict dispatcher below and fails loudly if no GPU route accepts.
+                    // SLICE B: SHARD-resident tables qualify too — the general
                     // path now recompacts them into the unified exec source, so a sortable projection
                     // gets the SAME NULL-correct on-device sort instead of falling through the rejected
-                    // shape route to the CPU engine's host sort (whose NULL placement diverges from PG —
-                    // caught by the sharded-vs-single-buffer ORDER BY differential). The shard arm
+                    // shape route. The shard arm
                     // requires a PURELY int4-section table (int4/int2/date): the unified exec source
                     // gathers only the int4 sections (+ null bitmaps), so a text/int8/numeric/bool
-                    // column reference would hard-error on the no-fallback general path where the CPU
-                    // pinned path previously returned rows (audit P2: `mt (id INT, name TEXT)` sharded +
-                    // `ORDER BY id`). Mixed-type sharded tables keep the CPU pinned path until the
-                    // unified source gathers every section.
+                    // column reference hard-errors on the no-fallback general path. Mixed-type sharded
+                    // tables therefore require every referenced section in the unified source.
                     let shard_resident_int4_only = || {
                         table.columns.iter().all(|c| {
                             // TYPE-COVERAGE track 2 slice 2: the unified exec source now
@@ -167,12 +162,11 @@ impl Engine {
                             // numeric slice: the b128 sections (Numeric / Uuid, 16-byte) are
                             // now gathered by the unified exec source too, so those columns
                             // route to the GPU sort as well -- a plain-column ORDER BY over a
-                            // numeric/uuid table no longer falls through to the CPU pinned
-                            // path (the sharded b128 ORDER BY differential).
+                            // numeric/uuid table remains on the GPU path.
                             // TYPE-COVERAGE #14 (bool): the bool bitmap section is gathered into the
                             // unified source too, so a bool column no longer forces an ORDER BY over
-                            // a bool-bearing elided table onto the CPU pinned path (which would
-                            // rehydrate-decline). Bool is carried/projected here, not a sort key.
+                            // a bool-bearing elided table to decline. Bool is carried/projected here,
+                            // not a sort key.
                             matches!(
                                 c.ty,
                                 SqlType::Int4
@@ -247,7 +241,7 @@ impl Engine {
             statement_snapshot.map(|snapshot| self.enter_transaction_read(snapshot));
         // Multi-key ORDER BY (`ORDER BY a, b, ...`) is GPU-only: it runs on the general Expr executor's
         // bitonic-sort path, routed in `execute_relational_select_text` when every key is an i64-sortable
-        // base column on a GPU-resident table. This enumerated/CPU path has no multi-key sort and must
+        // base column on a GPU-resident table. This enumerated path has no multi-key sort and must
         // NOT silently sort by the first key only -- so reject it. A multi-key sort reaching here means a
         // non-routable key (text/numeric/uuid/expression) or a non-resident table: a clean error, never a
         // wrong (first-key-only) result.
@@ -266,14 +260,10 @@ impl Engine {
                     .to_string(),
             )));
         }
-        // PART B test seam. The hook is threaded to the CPU pinned read, where it fires in the window
-        // BETWEEN binding the catalog and pinning the data — exactly the window co-pinning closes. The
-        // test parks a reader there while a writer commits a shape-changing DDL: with co-pinning the
-        // data pin reuses the SAME boundary the bind selected its catalog at, so the (catalog, data)
-        // pair stays consistent; without it the pin re-loads `committed_seq` (now newer) while the
-        // catalog is older, and the decode mismatches the catalog shape. A view/matview is resolved
-        // as-of the boundary too; for a plain table SELECT (the test's case) the read goes straight to
-        // the co-pinned CPU path.
+        // PART B test seam. Device routes fire the hook after retaining the statement generation; if
+        // no route accepts, the retired-host decline seam fires it before returning the loud error so
+        // a barrier-based concurrency test cannot deadlock. Views/materialized views are resolved at
+        // the same retained boundary.
         //
         // The read pins ONE `committed_seq` boundary and resolves the catalog as-of it. It does NOT
         // register an active snapshot (reads stay OFF the `active_snapshots` mutex — true lock-free):
@@ -367,9 +357,8 @@ impl Engine {
                 // under the commit_mutex AFTER we accepted the resident route but BEFORE the probe
                 // loaded the device-memory cell (the writer holds only the engine READ lock, so it
                 // races our read). That surfaces as the precise "no retained resident device memory"
-                // probe error — NOT a genuine device failure. Transparently fall back to the CPU
-                // pinned-read path (which reads the current published data generation at one pinned
-                // boundary), exactly as a non-resident table would. Any OTHER error (a real
+                // probe error — NOT a genuine device failure. The route declines through the common
+                // fail-loud boundary. Any OTHER error (a real
                 // GPU/CUDA failure, a bind error, etc.) propagates unchanged so we never mask it.
                 Err(err) if err.is_residency_invalidated() => {
                     return self.execute_relational_select_cpu_pinned(select);
@@ -379,17 +368,15 @@ impl Engine {
         }
         // CPU-ENGINE RETIREMENT (ADR-006): the SPECIALIZED resident route declined this shape (a
         // wider-type filtered projection / aggregate / GROUP BY / DISTINCT / ORDER BY / OFFSET the
-        // enumerated matcher does not recognize). Before de-eliding to the CPU pinned path (which
-        // REHYDRATES the elided table + runs the host relational engine — the very engine ADR-006
-        // deletes), route it to the GENERAL GPU Expr executor: `execute_resident_grouped_via_general`
+        // enumerated matcher does not recognize). Route it to the GENERAL GPU Expr executor:
+        // `execute_resident_grouped_via_general`
         // binds the `&Select`, rebuilds the WHERE as a `ResidentExpr`, and runs projection / aggregate /
         // GROUP BY / DISTINCT / ORDER BY / LIMIT / OFFSET ON THE DEVICE for every retained type, over the
         // whole-table buffer or the unified shard source (versioned-aware). It is GATED on residency: the
-        // general path has NO CPU fallback and hard-errors on a non-resident table, so a table with no
-        // snapshot/shards must skip it and take the CPU pinned path (which serves non-resident tables).
+        // general path has no host fallback and hard-errors on a non-resident table, so a table with no
+        // snapshot/shards skips it and ultimately fails loudly if streaming also declines.
         // The general executor ERRORS (never mis-answers) on a shape it cannot express, so on ANY error we
-        // fall to the CPU pinned path, which serves it — honest partial coverage that only ever ADDS
-        // on-device reach, never a wrong result. `general_read_fallback_hits` proves the on-device path
+        // fall through to the fail-loud boundary. `general_read_fallback_hits` proves the on-device path
         // fired (a silent de-elide would pass output equality while abandoning the elision).
         if self.table_is_gpu_resident(&select.table) {
             on_pinned();
@@ -402,20 +389,18 @@ impl Engine {
                     return Ok(result);
                 }
                 // Residency invalidated mid-statement, OR a shape the general executor cannot express:
-                // serve it from the CPU pinned path (de-eliding an elided table if needed). The hook
-                // already fired above, so this uses the no-op-hook entry.
+                // decline loudly. The hook already fired above, so this uses the no-op-hook entry.
                 Err(_) => return self.execute_relational_select_cpu_pinned(select),
             }
         }
-        // STRATA S-E.1/S-E.2 (streaming executor, ADR-012): before de-eliding an over-VRAM read to the CPU
-        // host engine, try the OUT-OF-CORE streaming fold — chunk the table's visible rows to the residency
+        // STRATA S-E.1/S-E.2 (streaming executor, ADR-012): for an over-VRAM read, try the OUT-OF-CORE
+        // streaming fold before reaching the fail-loud boundary — chunk the table's visible rows to the residency
         // budget and run each chunk ON THE DEVICE: a scalar reduction (COUNT(*)/SUM/MIN/MAX) combines
         // partials in one final device pass; a filter/project CONCATs survivors with LIMIT/OFFSET as
         // cross-chunk windowing (a satisfied LIMIT stops the scan early). Never all shards resident at
         // once. Gated on a configured per-GPU budget + a foldable shape; `None` = not applicable -> the
-        // CPU path runs unchanged (default behavior is byte-identical). Any shape the device cannot
-        // express defers to the CPU path INSIDE the fold, so this only ever ADDS on-device reach — never
-        // a wrong result.
+        // caller reaches the fail-loud boundary. A fold that cannot express a shape declines rather
+        // than returning a host-computed result.
         if let Some(result) = self.try_streaming_select(select) {
             on_pinned();
             return result;
@@ -453,8 +438,7 @@ impl Engine {
     /// single-buffer residency snapshot OR at least one live shard? The general Expr executor has no CPU
     /// fallback and hard-errors on a non-resident table, so the declined-route fallback gates on this
     /// (mirrors the `execute_relational_select_text` residency gate). A racing invalidation between this
-    /// check and the executor's own load surfaces as an `is_residency_invalidated` error, which the
-    /// fallback already routes to the CPU pinned path.
+    /// check and the executor's own load surfaces as a loud `is_residency_invalidated` route decline.
     pub(crate) fn table_is_gpu_resident(&self, table: &str) -> bool {
         self.relational_residency_snapshot(table).is_some()
             || self
@@ -488,13 +472,42 @@ impl Engine {
         )
     }
 
-    /// The CPU pinned-read path for a relational SELECT (write-half MVCC, Stage 4): bind, pin ONE
-    /// generation + ONE visibility boundary for the whole statement (prereq #1 — the value-index
-    /// lookup AND the row resolution both read from `pin`, never two `load_table()`s), build + run
-    /// the MVCC query, finalize. Used both when the table is not GPU-resident AND as the transparent
-    /// fallback when a resident route's residency was invalidated mid-statement by a concurrent
-    /// committer (see [`Engine::execute_relational_select`]).
+    /// Evaluate a non-resident relational fixture without claiming an execution route.
+    ///
+    /// Device- or chunk-authoritative relations are rejected so this specification seam cannot
+    /// become a host fallback for product state whose rows live outside the tuple store.
     #[cfg(test)]
+    pub(crate) fn evaluate_relational_select_specification(
+        &self,
+        select: &Select,
+    ) -> Result<RelationalSelectSpecificationResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        if self.table_device_authoritative(&select.table)
+            || self.table_chunk_authoritative(&select.table).is_some()
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relational specification requires tuple-store authority for relation \"{}\"",
+                select.table
+            ))));
+        }
+
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        let pin = self.pin_relational_read_at(&select.table, copin_s);
+        let (query, access_path) =
+            self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
+        let specification = self.evaluate_mvcc_query_specification_on_pin(&pin, &query)?;
+        self.finalize_relational_select_specification(
+            select,
+            table,
+            bound,
+            access_path,
+            specification.rows,
+        )
+    }
+
+    /// Compatibility name for the retired host-dispatch boundary. No relational work executes here:
+    /// every caller receives the same fail-loud GPU-required error without fallback telemetry.
     pub(crate) fn execute_relational_select_cpu_pinned(
         &self,
         select: &Select,
@@ -502,33 +515,8 @@ impl Engine {
         self.execute_relational_select_cpu_pinned_instrumented(select, || {})
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn execute_relational_select_cpu_pinned(
-        &self,
-        select: &Select,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
-        Err(self.gpu_read_required(select, "no GPU route accepted the statement"))
-    }
-
-    /// [`Engine::execute_relational_select_cpu_pinned`] with the PART B test hook fired in the window
-    /// BETWEEN binding the catalog (which captures the co-pin boundary `copin_s`) and pinning the data
-    /// at that SAME `copin_s`. This is precisely the window co-pinning closes: the pin reuses
-    /// `copin_s`, so a DDL committed while the hook is parked cannot make the data pin a different
-    /// generation than the bound catalog. Production passes an empty hook (zero overhead).
-    #[cfg(test)]
-    fn execute_relational_select_cpu_pinned_instrumented(
-        &self,
-        select: &Select,
-        on_bound_before_pin: impl FnOnce(),
-    ) -> Result<RelationalSelectResult, ExecuteError> {
-        self.execute_relational_select_cpu_pinned_at(
-            select,
-            self.read_snapshot_boundary(),
-            on_bound_before_pin,
-        )
-    }
-
-    #[cfg(not(test))]
+    /// Retired host-dispatch seam. The hook is fired so concurrency tests cannot deadlock when a
+    /// route declines, then the read fails loudly under the same policy in every build profile.
     fn execute_relational_select_cpu_pinned_instrumented(
         &self,
         select: &Select,
@@ -538,66 +526,6 @@ impl Engine {
         Err(self.gpu_read_required(select, "no GPU route accepted the statement"))
     }
 
-    #[cfg(test)]
-    fn execute_relational_select_cpu_pinned_at(
-        &self,
-        select: &Select,
-        statement_copin_s: Index,
-        on_bound_before_pin: impl FnOnce(),
-    ) -> Result<RelationalSelectResult, ExecuteError> {
-        // RETIREMENT A4e — the READ-SIDE ladder seam: a host-path read on an ELIDED table would
-        // scan the STALE store (elided commits never installed). Rehydrate first (device gather +
-        // reconciliation, sticky de-elision), exactly like the DML ladder — any read shape the
-        // device routes cannot serve costs one O(table) rehydration instead of wrong results.
-        let mut representation_changed = false;
-        if self.table_device_authoritative(&select.table) {
-            // Audit B3: the rehydration store-write must hold the COMMIT LOCK (readers hold no
-            // lock; a lost COW update would leave the table de-elided WITH a stale store). The
-            // helper detects mid-commit internal reads (matview refresh) and skips the
-            // self-deadlocking re-acquisition.
-            self.rehydrate_elided_serialized(&select.table)
-                .map_err(ExecuteError::Engine)?;
-            representation_changed = true;
-        }
-        // P4-2b (S-E.P4): the CPU-pinned path on a CHUNK-AUTHORITATIVE table would scan the
-        // FROZEN store (post-freeze writes live only in the chunks) — DE-AUTHORITIZE first (the
-        // sticky exit replays the post-freeze delta into the store; loud + counted), exactly the
-        // elided-rehydrate discipline above.
-        if self.table_chunk_authoritative(&select.table).is_some() {
-            self.deauthoritize_chunk_table(&select.table, false)
-                .map_err(ExecuteError::Engine)?;
-            representation_changed = true;
-        }
-        // The outer autocommit statement snapshot deliberately retains the representation that was
-        // current before the fallback repair above. Re-capture after the serialized transition so
-        // the fallback binds the newly published repair generation. Explicit transactions never
-        // take this arm: they remain fixed to their BEGIN generation and unsupported shapes fail.
-        let statement_owned = self
-            .current_transaction_read_snapshot()
-            .is_some_and(|snapshot| snapshot.statement_owned);
-        let mut effective_copin_s = statement_copin_s;
-        let rebound_snapshot = if representation_changed && statement_owned {
-            let commit = self.commit_state();
-            self.ensure_commit_path_available()
-                .map_err(ExecuteError::Engine)?;
-            effective_copin_s = self.committed_seq();
-            let snapshot = self.capture_statement_snapshot(effective_copin_s);
-            drop(commit);
-            Some(snapshot)
-        } else {
-            None
-        };
-        let _rebound_scope = rebound_snapshot.map(|snapshot| self.enter_transaction_read(snapshot));
-        let (table, bound, copin_s) = self.bind_relational_select_at(select, effective_copin_s)?;
-        on_bound_before_pin();
-        let pin = self.pin_relational_read_at(&select.table, copin_s);
-        let (query, access_path) =
-            self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
-        let result = self.execute_mvcc_query_on_pin(&pin, &query)?;
-        self.finalize_relational_select(select, table, bound, access_path, result)
-    }
-
-    #[cfg(not(test))]
     fn execute_relational_select_cpu_pinned_at(
         &self,
         select: &Select,
@@ -608,7 +536,6 @@ impl Engine {
         Err(self.gpu_read_required(select, "the pinned GPU route became unavailable"))
     }
 
-    #[cfg(not(test))]
     fn gpu_read_required(&self, select: &Select, detail: &str) -> ExecuteError {
         ExecuteError::Engine(EngineError::ApplyFailed(format!(
             "GPU execution is required for SELECT on relation \"{}\": {detail}",
@@ -685,29 +612,16 @@ impl Engine {
                 "commit path is wedged; restart recovery required".to_string(),
             )));
         }
-        #[cfg(not(test))]
-        {
-            if self.table_is_gpu_resident(&select.table) {
-                return self.execute_resident_select_via_general(select);
-            }
-            if let Some(result) = self.try_streaming_select(select) {
-                return result;
-            }
-            Err(self.gpu_read_required(
-                select,
-                "the legacy CUDA-probe entry has no resident or streaming source",
-            ))
+        if self.table_is_gpu_resident(&select.table) {
+            return self.execute_resident_select_via_general(select);
         }
-        #[cfg(test)]
-        {
-            let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-            let pin = self.pin_relational_read_at(&select.table, copin_s);
-            let (query, access_path) =
-                self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
-            let result =
-                self.execute_mvcc_query_with_cuda_driver_probe_on_store(pin.store(), &query)?;
-            self.finalize_relational_select(select, table, bound, access_path, result)
+        if let Some(result) = self.try_streaming_select(select) {
+            return result;
         }
+        Err(self.gpu_read_required(
+            select,
+            "the legacy CUDA-probe entry has no resident or streaming source",
+        ))
     }
 
     pub fn execute_relational_select_with_resident_route(
@@ -770,7 +684,7 @@ impl Engine {
             // R-ver: the UNFILTERED int4 projection (SELECT <cols> FROM t, no WHERE). The general
             // executor runs its plain-projection path with predicate = None and threads the SV3b
             // `deleted_by` visibility conjunct for versioned shards — so this read stays on the
-            // resident route instead of falling to the CPU-pinned path (which rehydrates + de-elides).
+            // resident route instead of declining through the retired-host boundary.
             | "sharded_int4_projection_all"
             | "sharded_int4_composite_equality_multi_column_projection"
             | "sharded_int4_equality_projection"
@@ -825,7 +739,7 @@ impl Engine {
             // R-ver: the UNFILTERED int4 projection on a NON-sharded snapshot-resident table (the
             // sharded twin is `sharded_int4_projection_all` above). The general executor's
             // plain-projection path (predicate = None -> every row) serves it, so an unfiltered
-            // scan of a resident table stays on the resident route instead of the CPU-pinned path.
+            // scan of a resident table stays on the resident route instead of declining.
             | "int4_projection_all"
             | "int4_equality_projection"
             | "int4_equality_multi_column_projection"

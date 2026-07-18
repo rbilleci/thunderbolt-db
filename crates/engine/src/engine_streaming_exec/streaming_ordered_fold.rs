@@ -315,7 +315,7 @@ impl Engine {
                                 }
                             }
                             // UNBOUNDED: the survivor set itself outgrew the budget — its final
-                            // device sort cannot fit. Defer honestly (the CPU path serves it).
+                            // device sort cannot fit. Decline honestly and fail loudly.
                             None => {
                                 if runs_bytes > budget {
                                     return self.execute_relational_select_cpu_pinned(select);

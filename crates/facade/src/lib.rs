@@ -1564,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn numeric_equality_is_scale_insensitive_on_the_cpu_path() {
+    fn numeric_equality_is_scale_insensitive() {
         // A stored `1.0` (declared NUMERIC(12,2), so persisted as 1.00) must match a
         // `WHERE bal = 1.00` literal — canonical-by-construction value-index equality.
         let mut facade = EngineFacade::new();

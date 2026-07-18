@@ -564,10 +564,11 @@ impl Engine {
                     }) {
                         Some(conflict) => conflict,
                         None => {
-                            // Ordinary CPU-oracle unit tests keep their parity ledger. Production has
-                            // no host authority: a missing device history verdict fails closed. Test
-                            // builds follow that same law once a table is device-authoritative, so an
-                            // actual-GPU acceptance target cannot pass via the cfg(test) parity map.
+                            // Host-neutral specification fixtures keep their parity ledger without
+                            // claiming execution. Production has no host authority: a missing device
+                            // history verdict fails closed. Test builds follow that same law once a
+                            // table is device-authoritative, so an actual-GPU acceptance target cannot
+                            // pass via the cfg(test) parity map.
                             #[cfg(test)]
                             {
                                 let device_authoritative = match &item.cmd {

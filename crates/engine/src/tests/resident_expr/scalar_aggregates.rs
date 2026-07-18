@@ -8,7 +8,7 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
     // First operator-axis aggregate: COUNT(*) WHERE <pred> on the general GPU executor. The count is
     // the GPU filter's surviving-row count (the compaction result); PG returns bigint. a[i] = i,
     // flag[i] = (i % 3 == 0).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, flag BOOL)")
         .unwrap();
     const N: i64 = 50;
@@ -295,7 +295,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
     // int8 aggregates: MIN/MAX -> int8, SUM/AVG -> numeric (a sum of int8 can exceed i64, so SUM
     // reduces to i128 via the two-atomic carry kernel). Values span > i32::MAX, negatives, and a
     // subset (rows 0,1) whose SUM EXCEEDS i64::MAX. label = row index (the int4 filter column).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (b BIGINT, label INT)")
         .unwrap();
     let vals: [i64; 6] = [
@@ -408,7 +408,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
 fn gpu_execute_resident_expr_select_sql_runs_numeric_minmax() {
     // MIN/MAX(numeric) over a filtered set -> numeric (PG preserves the type). Reduces the i128
     // mantissas via the partials + host-combine reduction. label = row index (int4 filter col).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (p NUMERIC(10,2), label INT)")
         .unwrap();
     let prices = ["12.50", "-3.75", "100.00", "0.01", "-99.99", "42.42"];
@@ -465,7 +465,7 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_sum_avg() {
     // SUM(numeric) -> numeric at the column scale (i128 mantissa sum); AVG(numeric) -> numeric at PG's
     // division scale. Expected values derived from PG's numeric semantics (SUM keeps scale 2; AVG of a
     // weight-0 quotient over a scale-2 dividend has rscale max(2, 16) = 16).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (p NUMERIC(10,2), label INT)")
         .unwrap();
     let prices = ["12.50", "-3.75", "100.00", "0.01", "-99.99", "42.42"];
@@ -550,7 +550,7 @@ fn gpu_execute_resident_expr_select_sql_numeric_sum_overflow_errors() {
     // SUM(numeric) is CHECKED: a mantissa sum exceeding i128 is PG `numeric field overflow`, NEVER a
     // silent wrap. Each mantissa is 9e18 * 10^19 = 9e37 (column NUMERIC(38,19), integer part 9e18 fits
     // the legacy parser's i64 literal range); two sum to 1.8e38 > i128::MAX (~1.7e38).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE big (v NUMERIC(38,19), label INT)")
         .unwrap();
     let big = "9000000000000000000"; // 9e18, fits i64

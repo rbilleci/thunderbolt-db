@@ -1,6 +1,6 @@
 //! MVCC read-query dispatch (P0 §9.6 decomposition, behavior-preserving): a
 //! focused `impl Engine` block that drives an MvccReadQuery through the resident
-//! CUDA-native source path / the Cpu+Cuda execution backends with fallback, and
+//! CUDA-native source path / CUDA execution backend, and
 //! records the probe + read-result metrics. The backends/model live in
 //! mvcc_read_exec / mvcc_read_model; this is the Engine-side orchestration.
 
@@ -9,7 +9,7 @@ use super::*;
 impl Engine {
     /// Resolve a `MvccReadQuery` against the **KV partition** (the non-relational namespace).
     /// This is the table-agnostic entry the KV `MvccReadSource` machinery uses; relational reads
-    /// go through [`Engine::execute_mvcc_query_on_pin`] so they resolve against the SAME pinned
+    /// go through the pinned relational read path so they resolve against the SAME pinned
     /// generation their value-index lookup used (write-half Stage 4, prereq #1).
     pub fn execute_mvcc_query(
         &self,
@@ -17,39 +17,42 @@ impl Engine {
     ) -> Result<MvccReadResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
-        #[cfg(not(test))]
-        return self.execute_mvcc_query_with_cuda_driver_probe(query);
-        #[cfg(test)]
-        {
-            let backend = CpuMvccExecutionBackend;
-            let kv = self.read_state.mvcc.load_kv();
-            self.execute_mvcc_query_with_fallback_reason(
-                kv.get(),
-                query,
-                &backend,
-                Some(FallbackReason::GpuMvccReadParityGap),
-                false,
-            )
-        }
+        self.execute_mvcc_query_with_cuda_driver_probe(query)
     }
 
-    /// Resolve a `MvccReadQuery` against the SAME pinned generation the query was built from
-    /// (prereq #1, Stage 4) — the rows come from the exact `commit_seq` whose value-index produced
-    /// the keys, so no concurrent publish can interleave index and rows.
+    /// Evaluate an MVCC fixture against the closed-form specification without claiming execution.
     #[cfg(test)]
-    pub(crate) fn execute_mvcc_query_on_pin(
+    pub(crate) fn evaluate_mvcc_query_specification(
+        &self,
+        query: &MvccReadQuery,
+    ) -> Result<MvccSpecificationResult, ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        let kv = self.read_state.mvcc.load_kv();
+        self.evaluate_mvcc_query_specification_on_store(kv.get(), query)
+    }
+
+    /// Evaluate against the SAME pinned generation used to construct a relational fixture.
+    #[cfg(test)]
+    pub(crate) fn evaluate_mvcc_query_specification_on_pin(
         &self,
         pin: &RelationalReadPin,
         query: &MvccReadQuery,
-    ) -> Result<MvccReadResult, ExecuteError> {
-        let backend = CpuMvccExecutionBackend;
-        self.execute_mvcc_query_with_fallback_reason(
-            pin.store(),
-            query,
-            &backend,
-            Some(FallbackReason::GpuMvccReadParityGap),
-            false,
-        )
+    ) -> Result<MvccSpecificationResult, ExecuteError> {
+        self.evaluate_mvcc_query_specification_on_store(pin.store(), query)
+    }
+
+    #[cfg(test)]
+    fn evaluate_mvcc_query_specification_on_store(
+        &self,
+        read_store: &InMemoryTupleStore,
+        query: &MvccReadQuery,
+    ) -> Result<MvccSpecificationResult, ExecuteError> {
+        if !self.mvcc_read_skips_leader_check() && self.repl_role() != Role::Leader {
+            return Err(ExecuteError::Engine(EngineError::NotLeader));
+        }
+        let rows = resolve_mvcc_source(read_store, &query.source, query.visibility)?;
+        Ok(evaluate_mvcc_specification(query, rows))
     }
 
     pub fn execute_mvcc_query_with_cuda_driver_probe(
@@ -86,17 +89,7 @@ impl Engine {
 
     #[cfg(test)]
     pub(crate) fn execute_mvcc_query_with_backend<B: MvccExecutionBackend>(
-        &mut self,
-        query: &MvccReadQuery,
-        backend: &B,
-    ) -> Result<MvccReadResult, ExecuteError> {
-        let kv = self.read_state.mvcc.load_kv();
-        self.execute_mvcc_query_with_fallback_reason(kv.get(), query, backend, None, false)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn execute_mvcc_query_with_backend_fallback<B: MvccExecutionBackend>(
-        &mut self,
+        &self,
         query: &MvccReadQuery,
         backend: &B,
     ) -> Result<MvccReadResult, ExecuteError> {
@@ -143,10 +136,6 @@ impl Engine {
         };
 
         let cuda_start = observe_cuda_probe_metrics.then(Instant::now);
-        #[cfg(test)]
-        let backend_result =
-            execute_mvcc_backend_chain(query, rows, backend, &CpuMvccExecutionBackend);
-        #[cfg(not(test))]
         let backend_result = match backend.execute(query, rows) {
             MvccBackendDispatch::Executed(executed) => FinalizedMvccBackendExecution {
                 executed_target: executed.executed_target,
@@ -246,23 +235,6 @@ impl Engine {
             }
             _ => execute_cuda_native_single_source_query(query, rows, backend),
         };
-        #[cfg(test)]
-        let backend_result = backend_attempt.unwrap_or_else(|reason| {
-            let visible_rows = resolve_mvcc_source(read_store, &query.source, query.visibility)
-                .expect("visibility was validated before native CUDA dispatch");
-            let cpu_execution = match CpuMvccExecutionBackend.execute(query, visible_rows) {
-                MvccBackendDispatch::Executed(executed) => executed,
-                MvccBackendDispatch::Fallback { .. } => {
-                    unreachable!("CPU fallback backend must execute")
-                }
-            };
-            FinalizedMvccBackendExecution {
-                executed_target: cpu_execution.executed_target,
-                fallback_reason: Some(reason),
-                rows: cpu_execution.rows,
-            }
-        });
-        #[cfg(not(test))]
         let backend_result = backend_attempt.map_err(|reason| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "GPU execution is required for MVCC reads: {reason:?}"

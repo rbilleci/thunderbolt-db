@@ -244,8 +244,9 @@ impl RowBlock {
 /// A BATCHED retained-read result: ONE shared schema + ONE flat i32 buffer over ALL needles' rows (in needle
 /// order) + per-needle row ranges. Replaces the N-per-needle `RelationalSelectResult` structs + by-needle
 /// grouping + 2N `Arc` clones + N column re-maps — the residual that capped end-to-end point reads below the
-/// GPU drain (DECISIONS "Result-path optimization"). The int4 point-read route is ALWAYS i32 (NULL already
-/// encoded as 0), so `values` holds raw `i32` rather than a fat `Vec<SqlValue>` (~24-32B/entry, ~3MB/65536-
+/// GPU drain (DECISIONS "Result-path optimization"). This ABI is deliberately non-null i32-only;
+/// structural NULL projections take the per-query GPU route. Stored `values` are raw `i32` rather
+/// than a fat `Vec<SqlValue>` (~24-32B/entry, ~3MB/65536-
 /// batch) — the batcher maps `i32 -> DbValue::Int4` directly, skipping the SqlValue intermediate entirely.
 /// The batcher slices `values` by `needle_ranges[i]` to answer needle `i`'s request, mapping the schema ONCE.
 #[derive(Debug, Clone)]
@@ -327,6 +328,29 @@ pub struct RelationalSelectResult {
     pub fallback_reason: Option<FallbackReason>,
     /// `Arc`-shared for the same reason as `columns` (a batched point-read shares one access path).
     pub access_path: Arc<RelationalAccessPath>,
+}
+
+/// Test-only SQL semantic outcome produced without claiming an execution route.
+///
+/// Specification fixtures carry schema, rows, and the independently derived access-path contract,
+/// but cannot manufacture device targets or fallback telemetry.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelationalSelectSpecificationResult {
+    pub(crate) columns: Arc<Vec<RelationalColumn>>,
+    pub(crate) rows: RowBlock,
+    pub(crate) access_path: Arc<RelationalAccessPath>,
+}
+
+/// Test-only fixture that keeps closed-form SQL semantics separate from actual device evidence.
+///
+/// There is intentionally no flattened `RelationalSelectResult` view: tests must say whether an
+/// assertion belongs to the specification oracle or to the execution backend.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelationalSelectSpecificationFixture {
+    pub(crate) specification: RelationalSelectSpecificationResult,
+    pub(crate) execution: MvccExecutionEvidence,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -475,6 +499,7 @@ pub struct RelationalRetainedReadTemplate {
     pub snapshot_generation: u64,
     pub(crate) selected_indexes: Vec<usize>,
     pub(crate) result_columns: Vec<RelationalColumn>,
+    pub(crate) flat_i32_projection_null_free: bool,
     pub(crate) filter_idx: usize,
     pub(crate) access_path: RelationalAccessPath,
     pub(crate) select: Select,
@@ -490,6 +515,12 @@ impl RelationalRetainedReadTemplate {
         self.result_columns
             .iter()
             .all(|column| column.ty == SqlType::Int4)
+    }
+
+    /// True when the flat retained-batch ABI can represent every projected value without a
+    /// validity sidecar. Structural NULLs take the per-query GPU route instead.
+    pub fn is_flat_i32_batch_safe(&self) -> bool {
+        self.is_int4_only_projection() && self.flat_i32_projection_null_free
     }
 }
 

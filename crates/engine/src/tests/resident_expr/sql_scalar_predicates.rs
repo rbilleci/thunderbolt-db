@@ -8,7 +8,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_predicates() {
     // int8 (BIGINT) end to end on the general GPU executor from SQL text (the type matrix, doc 19):
     // scalar comparison, column-vs-column with values ABOVE i32::MAX (proving genuine 64-bit), the Ne
     // operator, and both int8 + int4 projection. Plus the unsupported-int8-shape hard errors.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (a INT, big BIGINT, big2 BIGINT, small BIGINT)",
@@ -85,7 +85,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_arithmetic() {
     // int8 (BIGINT) ARITHMETIC on the general GPU executor (the type matrix, doc 19): the i64 buffer
     // VM evaluates int8 arith trees (add/sub/mul, col-vs-col + scalar) with values ABOVE i32::MAX.
     // Closed-form oracle: a[i]=BASE+i, b[i]=BASE, c[i]=2*BASE+300, small[i]=i.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, small BIGINT)",
@@ -181,7 +181,7 @@ fn gpu_execute_resident_expr_select_sql_raises_int8_integer_out_of_range_on_over
 /// Build a single-BIGINT-column table `t(a) = [2, boundary]`, push a GPU snapshot, and run
 /// `SELECT a FROM t WHERE a * a > 0` on the general executor. Returns `None` off-GPU.
 fn run_int8_square_gt_zero(boundary: i64) -> Option<Result<RelationalSelectResult, ExecuteError>> {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a BIGINT)").unwrap();
     e.execute_text(2, &format!("INSERT INTO t (a) VALUES (2), ({boundary})"))
         .unwrap();
@@ -196,7 +196,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
     // REGRESSION (the audit's P0): int8 AND/OR predicates must run on the i64 VM, NOT silently route
     // to the i32 VM (which read int8 columns at the wrong 4-byte stride -> garbage rows). The same
     // routing gap also bypassed the mixed-int4/int8 guard, so a mixed AND must still hard-error.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (a INT, small BIGINT, big BIGINT, big2 BIGINT)",
@@ -276,7 +276,7 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
     // numeric (NUMERIC / i128) comparison + projection end-to-end from SQL (the type matrix, doc 19).
     // price[i] = i.50 (NUMERIC(10,2)), cost[i] = (N-1-i).50. Closed-form oracles; the i128 signedness
     // is proven separately in the execution-crate primitive test.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (price NUMERIC(10,2), cost NUMERIC(10,2), label INT)",
@@ -386,7 +386,7 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
 fn gpu_execute_resident_expr_select_sql_runs_numeric_arithmetic() {
     // numeric (i128) CHECKED add/sub arithmetic end-to-end from SQL (the type matrix, doc 19).
     // price[i]=i.50, cost[i]=i.25 (NUMERIC(10,2)), label[i]=i. Closed-form; mul + mixed are rejected.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (price NUMERIC(10,2), cost NUMERIC(10,2), label INT)",
@@ -459,7 +459,7 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_multiply() {
     // numeric (i128) CHECKED multiply by an INTEGER literal end-to-end from SQL (the type matrix,
     // doc 19): price*2 = 2i+1.00 (mantissa 200i+100). Fractional + column*column multipliers (which
     // change the result scale) are rejected.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (price NUMERIC(10,2), cost NUMERIC(10,2), label INT)",
@@ -550,7 +550,7 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_comparisons() {
     // CROSS-SCALE numeric comparison (the type matrix, doc 19): operands of different scales are
     // rescaled UP to the common (max) scale on-device (mantissa * 10^k) before comparing.
     // p2 = i.50 (NUMERIC(10,2)), p4 = (2i).0000 (NUMERIC(10,4)), label = i.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (p2 NUMERIC(10,2), p4 NUMERIC(10,4), label INT)",
@@ -617,7 +617,7 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_add_sub() {
     // CROSS-SCALE numeric ADD/SUB (the type matrix, doc 19): operands of different scales are rescaled
     // UP to the common (max) scale before the buffer add/sub. p2 = i.50 (NUMERIC(10,2)), p4 = (2i).2500
     // (NUMERIC(10,4)), label = i.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (p2 NUMERIC(10,2), p4 NUMERIC(10,4), label INT)",
@@ -679,7 +679,7 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_add_sub() {
 fn gpu_execute_resident_expr_select_sql_runs_numeric_and_or() {
     // numeric AND/OR (the type matrix, doc 19): each comparison -> a mask via the i128 VM, MaskBinary
     // combines, terminal compact. price = i.50 (NUMERIC(10,2)), cost = i.2500 (NUMERIC(10,4)).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (price NUMERIC(10,2), cost NUMERIC(10,4), label INT)",
@@ -770,7 +770,7 @@ fn gpu_execute_resident_expr_select_sql_runs_text_equality() {
     // Text equality on the general GPU executor (the type matrix, doc 19): byte-wise = / <>. The
     // residency builder pads the text offsets section to its required 8-byte alignment even after an
     // odd-sized int4 section.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)")
         .unwrap();
     let names = ["alice", "bob", "alice", "carol", "bob", "alice", "dave"];
@@ -863,7 +863,7 @@ fn gpu_execute_resident_expr_select_sql_runs_text_like() {
     // Text LIKE on the general GPU executor (the type matrix, doc 19): general %/_ backtracking match.
     // The offsets section remains 8-byte aligned after the odd-sized int4 section. Includes the `\_`
     // escape vs a bare `_`.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)")
         .unwrap();
     // "a_b" stores a literal underscore; "axb" distinguishes the `_` wildcard from the `\_` escape.
@@ -942,7 +942,7 @@ fn gpu_execute_resident_expr_select_sql_runs_date_comparisons() {
     // Date comparison on the general GPU executor (the type matrix, doc 19): a `date` is i32 days
     // since 2000-01-01, reusing the int4 residency section + the I32 VM. hire_date[i] = 2024-01-(i+1),
     // label = i. The string literal is coerced to a day count at lowering (like PG).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (hire_date DATE, label INT)")
         .unwrap();
     const N: i64 = 30; // 2024-01-01 .. 2024-01-30
@@ -1031,7 +1031,7 @@ fn gpu_execute_resident_expr_select_sql_runs_timestamp_comparisons() {
     // i64 microseconds since 2000-01-01, reusing the int8 section + the i64 compare kernels (the i64
     // micro literal exceeds the i32 VM scalar, so it uses expr_i64_compare_scalar_filter directly).
     // event_at[i] = 2024-01-15 i:00:00, created_at = constant 2024-01-15 12:00:00, label = i.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (event_at TIMESTAMP, created_at TIMESTAMP, label INT)",
@@ -1145,7 +1145,7 @@ fn gpu_execute_resident_expr_select_sql_runs_uuid_comparisons() {
     // in the i128 (16-byte) section, compared by an unsigned big-endian memcmp kernel (PG's uuid
     // order). id[i] = ...{i:02x} (last byte = i, so byte-wise ascending), peer = constant ...0a,
     // label = i.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id UUID, peer UUID, label INT)")
         .unwrap();
     const N: i64 = 20;
@@ -1259,7 +1259,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int2_comparisons() {
     // smallint comparison on the general GPU executor (the type matrix, doc 19): a `smallint` is
     // stored WIDENED to i32 in the int4 section, so it reuses the i32 compare VM. sz[i] = i - 10
     // (so -10..9, exercising negatives + sign extension), peer = 0, label = i.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (sz SMALLINT, peer SMALLINT, label INT)")
         .unwrap();
     const N: i64 = 20;
@@ -1351,7 +1351,7 @@ fn gpu_execute_resident_expr_select_sql_runs_bool_predicate() {
     // bool-predicate on the general GPU executor (the type matrix, doc 19): a bool column is a
     // 1-bit-per-row BITMAP, so `WHERE flag` expands the bitmap straight to the row mask -- no compare.
     // flag[i] = (i even), label = i.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (flag BOOL, label INT)")
         .unwrap();
     const N: i64 = 20;

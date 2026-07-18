@@ -10,7 +10,7 @@ fn gpu_inner_join_two_relations_int_key() {
     // is UNIQUE (the build side); child.parent_id is the FK (1:N + an orphan + a childless parent).
     //   parent: (1,a),(2,b),(3,c)   child: (1,x),(1,y),(2,z),(99,orphan)
     //   parent JOIN child ON parent.id = child.parent_id -> (a,x),(a,y),(b,z); 99 + parent 3 dropped.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE parent (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE child (parent_id INT, label TEXT)")
@@ -108,7 +108,7 @@ fn gpu_inner_join_excludes_null_keys_three_valued_logic() {
     // M3 NULL-key gate (doc 21): in an equi-join `NULL = x` is UNKNOWN, so a row whose join key is NULL
     // matches NOTHING -- on BOTH sides. INT keys would otherwise share the 0 placeholder and SPURIOUSLY
     // match each other; TEXT/b128 keys would otherwise ERROR in the key gather. Both NULL-key rows drop.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let pairs = |res: &RelationalSelectResult| -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = res
             .rows
@@ -253,7 +253,7 @@ fn gpu_join_null_keys_at_scale_grid_stride_v1b() {
     // from colliding with the real key 0 (which DOES exist here). bigp.id is unique on its non-NULL rows, so
     // the unique-build kernel runs; if the skip were broken, a NULL build row (placeholder 0) would collide
     // with real key 0 -> a spurious DuplicateBuildKey N:N fallback + wrong pairs, caught by the exact set.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     const N: i32 = 600;
     let mut pv = String::new();
     let mut cv = String::new();
@@ -324,7 +324,7 @@ fn gpu_join_null_keys_int2_int8_uuid_v1b() {
     // exercise the i64-section gather; key 0 is a real key on both sides, so the NULL row's 0 placeholder
     // (a NULL int8 cell stores 0, NOT i64::MIN, so the launcher's i64::MIN reject is not tripped) must not
     // collide with it.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE i2a (k INT2, x TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE i2b (k INT2, y TEXT)")
@@ -427,7 +427,7 @@ fn gpu_join_null_keys_n_to_n_int_and_text_v1b() {
     // a NULL PROBE key emits nothing. Both sides carry DUPLICATE keys (forcing the N:N fallback) PLUS NULLs;
     // key 0 (int) / 'm' (text) is a real DUPLICATED key, so a broken skip would chain the placeholder-0 /
     // empty-string NULL rows into that key's cross-product and emit spurious pairs.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE nna (k INT, x TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE nnb (k INT, y TEXT)")
@@ -512,7 +512,7 @@ fn gpu_join_null_keys_right_and_full_outer_padded_v1b() {
     // outer side, never dropped or spuriously matched against the OTHER side's NULL-key row. RIGHT keeps
     // every right row (its NULL-key row left-padded; the left NULL-key row is left-only -> dropped); FULL
     // keeps both sides' unmatched rows (incl. both NULL-key rows).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE ol (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE orr (rid INT, label TEXT)")
@@ -583,7 +583,7 @@ fn audit_v1b_all_null_build_column_empty_effective_build() {
     // empty => nothing matches, EVEN against a real probe key 0. The build's placeholder index 0 is itself
     // a NULL row. Skip-disabled: the two NULL build rows (placeholder key 0) collide => DuplicateBuildKey =>
     // N:N => both spuriously match the probe's real key 0.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE ba (k INT, x TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE bb (k INT, y TEXT)")
@@ -614,7 +614,7 @@ fn audit_v1b_null_on_build_side_when_smaller_side_swaps() {
     // The bitmaps must SWAP with the keys when the smaller side becomes the build. Here the NEW (right) side
     // is smaller, so the hash join builds on it (build/probe swap); the right bitmap must follow to the build
     // slot. NULLs on BOTH sides. Skip-disabled or a mis-swapped bitmap => a NULL row leaks into the result.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // acc (left) = 3 rows incl a NULL; new (right) = 2 rows incl a NULL => smaller_is_left = false => the
     // build swaps to the right side.
     e.execute_text(1, "CREATE TABLE sa (k INT, x TEXT)")
@@ -659,7 +659,7 @@ fn audit_v1b_composite_one_member_null_other_equals_real_row() {
     // AND'd across BOTH members, so `(5,NULL)` is skipped. The NULL member's 0 placeholder makes `(5,NULL)`
     // pack identically to a real `(5,0)` row on the other side -- if validity were checked on member0 only,
     // `(5,NULL)` would spuriously match `(5,0)`.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE ca (k1 INT, k2 INT, x TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE cb (k1 INT, k2 INT, y TEXT)")
@@ -703,7 +703,7 @@ fn audit_v1b_anti_join_left_where_inner_is_null_with_null_keys() {
     // The anti-join `LEFT JOIN ... WHERE inner IS NULL` with NULL keys on BOTH sides. The left NULL-key row
     // matches nothing => it is NULL-padded => WHERE inner IS NULL KEEPS it. If the two NULL rows spuriously
     // matched, the left NULL-key row would be a MATCH (inner not NULL) and silently DROPPED -- data loss.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE la (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE lb (rid INT, label TEXT)")
@@ -746,7 +746,7 @@ fn audit_v1b_anti_join_left_where_inner_is_null_with_null_keys() {
 fn audit_v1b_null_at_word_boundary_index_32() {
     // The ONLY NULL key is at row index 32 -- bitmap word 1 (32>>5), bit 0 (32&31). Catches any off-by-one
     // in the kernel's bitmap word/bit math: exactly row 32 must be skipped, every other row matches 1:1.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     const N: i32 = 40;
     let mut wa = String::new();
     let mut wb = String::new();

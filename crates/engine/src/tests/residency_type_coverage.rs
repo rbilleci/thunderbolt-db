@@ -135,7 +135,7 @@ fn date_int2_pk_table_elision_matches_install_twin() {
 ///
 /// COVERAGE BOUNDARY (deliberate): a stage-(i) table is single-shard by construction (no
 /// appends -> no rollover), so device service goes through the ZERO-COPY single-shard
-/// source (`resident_snapshot_for_shard`, int8-labeled) and the CPU-pinned host path — the
+/// source (`resident_snapshot_for_shard`, int8-labeled) and the single-buffer GPU twin — the
 /// multi-shard i64 RECOMPACTION axis is unreachable here and gets its non-vacuous
 /// differential + sabotage with stage (ii)'s rollover-created multi-shard tables.
 #[test]
@@ -303,23 +303,43 @@ fn int8_section_appends_roll_over_and_recompact_to_parity() {
         shards_on >= 2,
         "non-vacuity: the appends must ROLL OVER to multiple shards (got {shards_on})"
     );
-    // Every query must succeed on the device-authoritative multi-shard generation.
+    // The full, point, and ordered GPU shapes succeed on the device-authoritative multi-shard
+    // generation. Wide-value equality is not yet a served GPU route and must fail loudly rather
+    // than borrow the retired host dispatcher.
     assert!(
-        on.iter().all(|o| o.is_ok()),
-        "all stage-(ii) shapes must succeed: {on:?}"
+        on[0].is_ok() && on[1].is_ok() && on[3].is_ok(),
+        "all supported stage-(ii) shapes must succeed: {on:?}"
     );
-    assert_eq!(on[0].as_ref().unwrap().len(), 300, "100 seeds + 200 appends");
+    assert!(
+        on[2]
+            .as_ref()
+            .unwrap_err()
+            .contains("GPU execution is required for SELECT on relation \"t8\""),
+        "unsupported wide-value equality must fail loudly: {:?}",
+        on[2]
+    );
+    assert_eq!(
+        on[0].as_ref().unwrap().len(),
+        300,
+        "100 seeds + 200 appends"
+    );
     assert_eq!(
         on[1].as_ref().unwrap(),
         &vec![vec![SqlValue::Int8(6_000_000_100)]],
         "point read returns the exact beyond-i32 value"
     );
     assert_eq!(
-        on[2].as_ref().unwrap(),
-        &vec![vec![SqlValue::Int4(1100)]],
-        "wide-value equality resolves the exact entity"
+        on[3].as_ref().unwrap().len(),
+        300,
+        "ordered projection is complete"
     );
-    assert_eq!(on[3].as_ref().unwrap().len(), 300, "ordered projection is complete");
+    assert!(
+        on[3]
+            .as_ref()
+            .unwrap()
+            .contains(&vec![SqlValue::Int4(1100), SqlValue::Int8(6_000_000_100),]),
+        "the supported ordered GPU projection preserves the exact wide-value entity"
+    );
 }
 
 /// TYPE-COVERAGE track 2 slice 2, stage (iii) — the i64-PAYLOAD ELISION differential: an
@@ -419,7 +439,10 @@ fn int8_payload_elision_matches_install_twin() {
         )
         .unwrap();
     }
-    assert!(on.table_device_authoritative("u8"), "BIGINT UNIQUE must elide");
+    assert!(
+        on.table_device_authoritative("u8"),
+        "BIGINT UNIQUE must elide"
+    );
     let locate_before = on.device_write_locate_hits();
     assert!(
         on.execute_dml_concurrent(750, "INSERT INTO u8 (v, x) VALUES (8100000005, 9)")

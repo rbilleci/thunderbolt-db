@@ -19,11 +19,12 @@ impl Engine {
         Self::with_planner_config(PlannerConfig::default())
     }
 
-    /// Unit-test parity-oracle constructor. Production constructors keep STRATA S-F ON; tests
-    /// whose subject is SQL/MVCC semantics rather than residency opt out explicitly so their
-    /// result metadata and storage authority do not depend on whether the test host has CUDA.
+    /// Unit-test configuration with automatic residency admission disabled.
+    ///
+    /// This constructor does not select an execution backend. Each test explicitly chooses a
+    /// rows-only specification API or an actual device route while retaining deterministic setup.
     #[cfg(test)]
-    pub(crate) fn new_local_cpu_oracle() -> Self {
+    pub(crate) fn new_local_test_engine() -> Self {
         let engine = Self::new_local();
         engine.set_auto_admit_on_commit(false);
         engine

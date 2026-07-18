@@ -3,7 +3,7 @@
 //! percentiles for the concurrent DML path (`execute_dml_concurrent`). This is an isolated W1
 //! INSERT characterization: its latency reference is **p50/p99/p99.9 < 0.8/1.5/5 ms**, while its
 //! TPS is diagnostic only. The binding >100k sustained / ≥400k burst gate belongs to the
-//! canonical mixed-system BENCH-001 workload, not this CPU-only single-operation benchmark.
+//! canonical mixed-system BENCH-001 workload, not this isolated single-operation benchmark.
 //!
 //! Closed-loop: N writer threads each drive single-row INSERTs on a plain (constraint-free)
 //! table — the ADR-009 homogeneous fast-path wave shape — for a fixed duration, timing every

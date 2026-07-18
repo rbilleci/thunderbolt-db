@@ -12,7 +12,7 @@ mod wide_unique_index;
 /// clear error instead of silently taking an unvalidated fast path.
 #[test]
 fn covered_insert_route_requires_covered_shape() {
-    let engine = Engine::new_local_cpu_oracle();
+    let engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -58,7 +58,7 @@ fn covered_insert_route_requires_covered_shape() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,
@@ -171,7 +171,7 @@ fn gpu_compound_primary_key_elides_and_validates_uniqueness_on_device() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,
@@ -273,7 +273,7 @@ fn gpu_compound_b128_uuid_key_elides_and_validates_on_device() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_text_key_elides_and_validates_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,
@@ -374,7 +374,7 @@ fn gpu_compound_text_key_elides_and_validates_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,
@@ -498,7 +498,7 @@ fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
         assert!(
             fired,
             "shape {shape:?} must be served by the GENERAL GPU executor (fallback counter must advance), \
-             not de-elided to the CPU engine"
+             without transferring relational authority off device"
         );
         assert!(
             elided_after,
@@ -518,7 +518,7 @@ fn gpu_general_read_fallback_serves_declined_wider_type_shapes_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_zero_match_dml_keeps_table_elided() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8, s TEXT)")
         .unwrap();
@@ -611,7 +611,7 @@ fn gpu_zero_match_dml_keeps_table_elided() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -686,20 +686,20 @@ fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
         "reads must not de-elide the null-bearing table"
     );
 
-    // A DML that must REHYDRATE the null-bearing table (materialize declines a null shard) de-elides
-    // SAFELY now that the gather materializes nulls — no "device-authoritative invariant broken" crash.
+    // When device materialization declines, the RETIRE-002 repair path rehydrates this
+    // null-bearing table safely and preserves structural NULLs.
     engine
         .execute_dml_concurrent(txn, "DELETE FROM t WHERE id = 5")
         .unwrap();
     assert_eq!(
         read(&engine, "SELECT COUNT(*) FROM t"),
         vec![vec![SqlValue::Int8(6)]],
-        "the DELETE removed exactly one row (no crash on the null-bearing rehydrate)"
+        "the DELETE removed exactly one row (repair preserved the null-bearing table)"
     );
     assert_eq!(
         read(&engine, "SELECT id, v FROM t WHERE id = 7"),
         vec![vec![SqlValue::Int4(7), SqlValue::Null]],
-        "the null row survives the rehydrate with its NULL intact"
+        "the null row survives repair with its NULL intact"
     );
 }
 
@@ -712,7 +712,7 @@ fn gpu_null_insert_keeps_table_elided_and_reads_correctly() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_range_dml_resolves_on_device_without_deelide() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -841,7 +841,7 @@ fn gpu_range_dml_resolves_on_device_without_deelide() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_int8_range_dml_resolves_on_device() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, b INT8)")
         .unwrap();
@@ -956,7 +956,7 @@ fn gpu_int8_range_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_timestamp_range_delete_resolves_on_device() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)")
         .unwrap();
@@ -1038,7 +1038,7 @@ fn gpu_timestamp_range_delete_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)")
         .unwrap();
@@ -1124,7 +1124,7 @@ fn gpu_timestamp_multibound_range_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_nullable_column_dml_resolves_on_device() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, notes TEXT)")
         .unwrap();
@@ -1222,7 +1222,7 @@ fn gpu_nullable_column_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_numeric_range_dml_resolves_on_device() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, amt NUMERIC(12,2))")
         .unwrap();
@@ -1314,19 +1314,22 @@ fn gpu_numeric_range_dml_resolves_on_device() {
         (1..=5).collect::<Vec<_>>(),
         "UPDATE changed no id set"
     );
-    let Command::Select(cnt) = parse_command("SELECT COUNT(*) FROM t WHERE amt = 0.00").unwrap()
-    else {
-        unreachable!()
-    };
+    let rows = engine
+        .execute_relational_select_text("SELECT id, amt FROM t")
+        .unwrap()
+        .rows
+        .into_boxed();
+    let mut zero_ids = rows
+        .iter()
+        .filter_map(|row| match row.as_slice() {
+            [SqlValue::Int4(id), SqlValue::Numeric(value)] if value.mantissa == 0 => Some(*id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    zero_ids.sort_unstable();
     assert_eq!(
-        engine
-            .execute_relational_select(&cnt)
-            .unwrap()
-            .rows
-            .iter()
-            .next()
-            .and_then(|r| r.first()),
-        Some(&SqlValue::Int8(3)),
+        zero_ids,
+        vec![2, 3, 4],
         "exactly ids 2,3,4 (amt 100,150,200) now have amt=0"
     );
 }
@@ -1340,7 +1343,7 @@ fn gpu_numeric_range_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_text_predicate_dml_resolves_on_device() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -1450,7 +1453,7 @@ fn gpu_text_predicate_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_like_prefix_dml_resolves_on_device() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -1524,7 +1527,7 @@ fn gpu_like_prefix_dml_resolves_on_device() {
 /// Returns `None` (self-guard) with no usable GPU. `col_ddl` is the extra column (e.g. "u UUID").
 #[cfg(test)]
 fn gpu_elided_pk_table_with_column(col_ddl: &str, seed: &[(i64, &str)]) -> Option<Engine> {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,
@@ -1904,8 +1907,8 @@ fn gpu_date_range_dml_resolves_on_device() {
             );
             assert!(
                 engine.table_device_authoritative("t"),
-                "the date range READ must run ON-DEVICE (stay elided) — a de-elide means the read \
-                 fell to the CPU pinned path and the [1,3] result proves nothing about the device"
+                "the date range READ must run ON-DEVICE (stay elided); otherwise the [1,3] result \
+                 proves nothing about the device route"
             );
         }
         let before = engine.dml_device_resolve_hits();
@@ -2217,7 +2220,7 @@ fn gpu_text_range_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_multi_entry_insert_batch_stays_elided() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
@@ -2301,7 +2304,7 @@ fn gpu_multi_entry_insert_batch_stays_elided() {
 /// install was skipped without device backing.
 #[test]
 fn zero_row_dml_establishes_device_authority_without_losing_followup_writes() {
-    let engine = Engine::new_local_cpu_oracle();
+    let engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -2357,7 +2360,7 @@ fn zero_row_dml_establishes_device_authority_without_losing_followup_writes() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,
@@ -2423,9 +2426,8 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
 
     // DELETE + UPDATE by the i64 compound key stay DEVICE-NATIVE (Stage 2b: the SV4b in-place
     // tombstone-locate folds the i64 fingerprint + tuple-verifies the slot, so no int4-predicate
-    // de-elide). Run BOTH write ops FIRST and assert elision-retention immediately: a verifying SELECT
-    // on a VERSIONED wider-type table de-elides it (a read-path limitation — R-ver is int4-only —
-    // orthogonal to these WRITE ops), so correctness is checked AFTER the elision asserts.
+    // de-elide). Run BOTH write ops FIRST and assert elision-retention immediately, then verify through
+    // the supported full GPU projection rather than the retired host-pinned predicate path.
     sql!("INSERT INTO ct VALUES (5000000000, 3, 30)").unwrap();
     let resolve_before = engine.dml_device_resolve_hits();
     sql!("DELETE FROM ct WHERE a = 5000000000 AND b = 1").unwrap();
@@ -2443,27 +2445,36 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
         "i64 compound UPDATE must stay device-native (fingerprint tombstone-locate), not de-elide"
     );
 
-    // Correctness (may de-elide the versioned table — checked AFTER the elision-retention asserts):
-    // deleted only (5000000000,1) [b=2 and b=3 remain]; the UPDATE set v=777 on exactly (5000000000,2).
-    let Command::Select(count) =
-        parse_command("SELECT COUNT(*) FROM ct WHERE a = 5000000000").unwrap()
-    else {
-        unreachable!()
-    };
+    // Correctness: deleted only (5000000000,1) [b=2 and b=3 remain]; the UPDATE set v=777 on
+    // exactly (5000000000,2).
+    let rows = engine
+        .execute_relational_select_text("SELECT a, b, v FROM ct")
+        .unwrap()
+        .rows
+        .into_boxed();
+    let mut target_rows = rows
+        .into_iter()
+        .filter(|row| row.first() == Some(&SqlValue::Int8(5_000_000_000)))
+        .collect::<Vec<_>>();
+    target_rows.sort_by_key(|row| match row.get(1) {
+        Some(SqlValue::Int8(value)) => *value,
+        other => panic!("unexpected compound key: {other:?}"),
+    });
     assert_eq!(
-        engine.execute_relational_select(&count).unwrap().rows,
-        vec![vec![SqlValue::Int8(2)]],
-        "deleted only (5000000000,1); b=2 and b=3 remain"
-    );
-    let Command::Select(sel) =
-        parse_command("SELECT v FROM ct WHERE a = 5000000000 AND b = 2").unwrap()
-    else {
-        unreachable!()
-    };
-    assert_eq!(
-        engine.execute_relational_select(&sel).unwrap().rows,
-        vec![vec![SqlValue::Int4(777)]],
-        "i64 compound UPDATE sets v=777 on exactly the (5000000000,2) tuple"
+        target_rows,
+        vec![
+            vec![
+                SqlValue::Int8(5_000_000_000),
+                SqlValue::Int8(2),
+                SqlValue::Int4(777),
+            ],
+            vec![
+                SqlValue::Int8(5_000_000_000),
+                SqlValue::Int8(3),
+                SqlValue::Int4(30),
+            ],
+        ],
+        "the full GPU projection proves the delete and update were tuple-exact"
     );
 
     // MIXED int4+int8 compound key: elide + enforce uniqueness.
@@ -2510,7 +2521,7 @@ fn gpu_compound_i64_and_mixed_key_elides_and_validates_on_device() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_delete_update_by_key_stays_device_native() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,
@@ -2615,7 +2626,7 @@ fn gpu_compound_delete_update_by_key_stays_device_native() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_drop_constraint_shifts_ordinal_without_aliasing_the_device_index() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,

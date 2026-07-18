@@ -293,7 +293,7 @@ impl WriteDelta {
 
 /// The recent row-identity ledger: every committed `(table, row-key)` carries the highest
 /// `commit_seq` that wrote it. Unique-slot history is device-authoritative in production; the two
-/// unique maps below exist only in `cfg(test)` as the driverless CPU semantic oracle. Row entries
+/// unique maps below exist only in `cfg(test)` as a host-neutral parity ledger. Row entries
 /// are pruned below the oldest active read snapshot, which is also the safe MVCC GC boundary.
 #[derive(Debug, Default)]
 pub(crate) struct RecentCommitsLedger {
@@ -378,11 +378,6 @@ impl RecentCommitsLedger {
 #[derive(Debug)]
 pub(crate) struct TransactionSnapshot {
     pub(crate) boundary: Index,
-    /// Autocommit statements retain the same immutable bundle as transactions, but may rebind once
-    /// after an explicit representation transition (device/class authority -> repair store). An
-    /// explicit transaction must never rebind its BEGIN generation.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) statement_owned: bool,
     /// Row-identity allocator boundary captured with the transaction generation. INSERT prepare
     /// must not derive provisional identities from a newer allocator observation; the private
     /// transaction delta will apply its own deterministic offset before COMMIT assigns final slots.

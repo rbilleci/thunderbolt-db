@@ -2,7 +2,8 @@
 /// multiple DENSE shards (rollover-only — variable-length has no headroom), and READS correctly via
 /// the cross-shard gather (each shard's bytes blob byte-copies at a running blob_base; a per-element
 /// offset-rebase kernel adds that blob_base to the shard's offsets). VARIED-LENGTH strings incl EMPTY
-/// exercise the offset math across shard + blob boundaries. Differential vs the CPU host oracle.
+/// exercise the offset math across shard + blob boundaries. The expected rows are fixture-derived;
+/// route telemetry proves that the actual result came from the GPU.
 /// Sabotage: dropping the rebase (or the blob segment) diverges the differential.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
@@ -41,18 +42,18 @@ fn text_column_elides_appends_and_reads_multishard() {
             .rows
             .into_boxed();
         rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        // A FILTERED text projection is NOT a served on-device shape -> CPU-pinned path -> (elided)
-        // rehydrate device->host FIRST (the text arm of gather_resident_table_rows_from_device).
-        // id=3 -> "v3-xxx" (3 % 7 == 3 -> 3 'x'). Without the text rehydration arm this hard-errors.
-        let filtered = e
+        // The filtered projection is served by the general CUDA path after the specialized matcher
+        // declines it. id=3 -> "v3-xxx" (3 % 7 == 3 -> 3 'x').
+        let filtered_result = e
             .execute_relational_select_text("SELECT id, s FROM t WHERE id = 3")
-            .unwrap()
-            .rows
-            .into_boxed();
+            .unwrap();
+        assert_eq!(filtered_result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(filtered_result.fallback_reason, None);
+        let filtered = filtered_result.rows.into_boxed();
         assert_eq!(filtered.len(), 1, "filtered text read returns exactly id=3");
         assert!(
             matches!(filtered[0].get(1), Some(SqlValue::Text(t)) if t == "v3-xxx"),
-            "the rehydrated text value is exact, got {:?}",
+            "the GPU-projected text value is exact, got {:?}",
             filtered[0].get(1)
         );
         (elided, shard_count, rows)
@@ -72,7 +73,7 @@ fn text_column_elides_appends_and_reads_multishard() {
     );
     assert_eq!(
         on_rows, off_rows,
-        "elided multi-shard text read == CPU host oracle (blob concat + offset rebase are correct)"
+        "elided multi-shard text read == fixture baseline (blob concat + offset rebase are correct)"
     );
     // A non-empty string materializes with its exact bytes.
     assert!(
@@ -86,7 +87,7 @@ fn text_column_elides_appends_and_reads_multishard() {
 /// TYPE-COVERAGE #14 (numeric): a NUMERIC value column rides the device-authoritative / elided
 /// fast path — the table ELIDES, INSERTs append device-authoritatively into the b128 (16-byte)
 /// section, the table rolls over to MULTIPLE shards, and reads over the numeric column match the
-/// CPU (host) oracle byte-for-byte — proving the correctness-critical recompaction GATHER of the
+/// fixture-derived baseline byte-for-byte — proving the correctness-critical recompaction GATHER of the
 /// b128 section into the unified multi-shard buffer. Sabotage: dropping the numeric gather
 /// segment (or the shard/unified descriptor's numeric labels) reads garbage -> the differential
 /// diverges.
@@ -113,11 +114,12 @@ fn numeric_column_elides_appends_and_reads_multishard() {
         }
         let elided = e.table_device_authoritative("t");
         let shard_count = e.resident_shard_count("t");
-        let mut rows = e
+        let result = e
             .execute_relational_select_text("SELECT id, amt FROM t")
-            .unwrap()
-            .rows
-            .into_boxed();
+            .unwrap();
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        let mut rows = result.rows.into_boxed();
         rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         (elided, shard_count, rows)
     };
@@ -136,7 +138,7 @@ fn numeric_column_elides_appends_and_reads_multishard() {
     );
     assert_eq!(
         on_rows, off_rows,
-        "elided multi-shard numeric read == CPU host oracle (the b128 gather is correct)"
+        "elided multi-shard numeric read == fixture baseline (the b128 gather is correct)"
     );
     // Spot-check a numeric value is not a zeroed/garbage placeholder.
     assert!(
@@ -151,7 +153,7 @@ fn numeric_column_elides_appends_and_reads_multishard() {
 /// TYPE-COVERAGE #14 (bool): a BOOLEAN value column is device-authoritative (elided), APPENDS in
 /// place (the device atomicOr bitmap set-range op writes each appended row's bit into the pre-zeroed
 /// headroom), ROLLS OVER to multiple shards, and READS correctly via the cross-shard bitmap gather
-/// (32-row-aligned byte-copy of each shard's live words). The differential vs the CPU host oracle
+/// (32-row-aligned byte-copy of each shard's live words). The fixture-derived differential
 /// proves every bit lands right across shard + word boundaries (200 rows, shard_size 64 => ~4 shards,
 /// so a word-crossing true/false spread must survive both the append op and the recompaction). Both
 /// truth values materialize as SqlValue::Bool. Sabotage: dropping the bool gather segment (or the
@@ -180,42 +182,43 @@ fn bool_column_elides_appends_and_reads_multishard() {
         }
         let elided = e.table_device_authoritative("t");
         let shard_count = e.resident_shard_count("t");
-        let mut rows = e
+        let result = e
             .execute_relational_select_text("SELECT id, flag FROM t")
-            .unwrap()
-            .rows
-            .into_boxed();
+            .unwrap();
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        let mut rows = result.rows.into_boxed();
         rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         // An ORDER BY over a bool-bearing elided table must ALSO route on-device (the bool column
-        // is carried through the sort's unified source, not sent to the CPU pinned path where it
-        // would rehydrate-decline). Same rows, so the sorted-by-debug comparison folds it in.
-        let ordered = e
+        // is carried through the sort's unified source). Same rows, so the sorted-by-debug
+        // comparison folds it in.
+        let ordered_result = e
             .execute_relational_select_text("SELECT id, flag FROM t ORDER BY id")
-            .unwrap()
-            .rows
-            .into_boxed();
+            .unwrap();
+        assert_eq!(ordered_result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(ordered_result.fallback_reason, None);
+        let ordered = ordered_result.rows.into_boxed();
         assert_eq!(
             ordered.len(),
             rows.len(),
             "ORDER BY over the bool table serves the same row set on-device"
         );
-        // A FILTERED bool projection is NOT a served on-device shape -> it falls to the CPU-pinned
-        // path, which for an ELIDED table rehydrates device->host FIRST. Without bool in the
-        // rehydration gather this hard-errors ("device-authoritative invariant broken"); with it,
-        // the row reads correctly. Row id=3 is true (3 % 3 == 0), id=5 is false.
-        let filtered = e
+        // The general CUDA path serves the filtered bool projection after the specialized matcher
+        // declines it. Row id=3 is true (3 % 3 == 0), id=5 is false.
+        let filtered_result = e
             .execute_relational_select_text("SELECT id, flag FROM t WHERE id = 3")
-            .unwrap()
-            .rows
-            .into_boxed();
+            .unwrap();
+        assert_eq!(filtered_result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(filtered_result.fallback_reason, None);
+        let filtered = filtered_result.rows.into_boxed();
         assert_eq!(
             filtered.len(),
             1,
-            "a filtered bool projection rehydrates + reads (no device-authoritative hard-error)"
+            "a filtered bool projection returns one row on-device"
         );
         assert!(
             matches!(filtered[0].get(1), Some(SqlValue::Bool(true))),
-            "the rehydrated bool value is correct (id=3 -> true), got {:?}",
+            "the GPU-projected bool value is correct (id=3 -> true), got {:?}",
             filtered[0].get(1)
         );
         (elided, shard_count, rows)
@@ -235,7 +238,7 @@ fn bool_column_elides_appends_and_reads_multishard() {
     );
     assert_eq!(
         on_rows, off_rows,
-        "elided multi-shard bool read == CPU host oracle (the 1-bit/row gather is correct)"
+        "elided multi-shard bool read == fixture baseline (the 1-bit/row gather is correct)"
     );
     // Both truth values must materialize as real SqlValue::Bool (not dropped / all-zeroed).
     assert!(
@@ -252,12 +255,9 @@ fn bool_column_elides_appends_and_reads_multishard() {
     );
 }
 
-/// TYPE-COVERAGE #14: the DEVICE->HOST rehydration gather materializes NUMERIC + UUID (both the
-/// 16-byte b128 section) AND BIGINT (the i64 section) — so a read shape the on-device routes cannot
-/// serve (here a FILTERED projection of the value column) falls to the CPU-pinned path and
-/// rehydrates device->host correctly instead of hard-erroring ("device-authoritative invariant
-/// broken"). Differential vs the CPU host oracle over the filtered read, one case per type.
-/// Sabotage: declining any of these types in `gather_resident_table_rows_from_device` re-errors.
+/// TYPE-COVERAGE #14: the general CUDA path serves filtered NUMERIC + UUID (both the 16-byte b128
+/// section) and BIGINT (the i64 section) from a device-authoritative table after the specialized
+/// matcher declines the shape. Fixture-derived expected rows cover one case per type.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn b128_and_bigint_filtered_rehydration_reads_from_device() {
@@ -295,13 +295,14 @@ fn b128_and_bigint_filtered_rehydration_reads_from_device() {
                 .unwrap();
             }
             let elided = e.table_device_authoritative("t");
-            // A FILTERED projection of the value column is NOT a served on-device shape -> CPU-pinned
-            // path -> (elided) rehydrate device->host FIRST. id=3 lands in shard 0.
-            let rows = e
+            // The specialized matcher declines this filtered projection; the general CUDA path
+            // serves it from the unified shard source. id=3 lands in shard 0.
+            let result = e
                 .execute_relational_select_text("SELECT id, val FROM t WHERE id = 3")
-                .unwrap()
-                .rows
-                .into_boxed();
+                .unwrap();
+            assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+            assert_eq!(result.fallback_reason, None);
+            let rows = result.rows.into_boxed();
             (elided, rows)
         };
         let (on_elided, on_rows) = run(true);
@@ -320,7 +321,7 @@ fn b128_and_bigint_filtered_rehydration_reads_from_device() {
         );
         assert_eq!(
             on_rows, off_rows,
-            "{ty}: elided filtered read (rehydrated device->host) == CPU host oracle"
+            "{ty}: elided filtered GPU read == fixture baseline"
         );
     }
 }

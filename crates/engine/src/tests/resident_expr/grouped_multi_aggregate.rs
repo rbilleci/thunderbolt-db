@@ -7,7 +7,7 @@ use gpu_db_sql::SqlValue;
 fn gpu_grouped_multiple_aggregates_same_value_column() {
     // SELECT g, COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t GROUP BY g -- FIVE aggregates over ONE
     // value column, projected from a SINGLE kernel pass (count+sum+min+max are computed together).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     let rows: &[(i32, i32)] = &[(1, 10), (1, 20), (1, 30), (2, 5), (2, 15), (3, 100)];
     let values = rows
@@ -65,7 +65,7 @@ fn gpu_grouped_multiple_aggregates_same_value_column() {
 fn gpu_grouped_multiple_aggregates_different_value_columns() {
     // SELECT g, SUM(v), MIN(w), MAX(w) FROM t GROUP BY g -- aggregates over TWO different value columns
     // (v int4, w int8) -> two grouping passes (single-level forced) merged by group index.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT, w BIGINT)")
         .unwrap();
     let rows: &[(i32, i32, i64)] = &[
@@ -116,7 +116,7 @@ fn gpu_grouped_multiple_aggregates_different_value_columns() {
 fn gpu_grouped_count_with_text_value_min() {
     // SELECT g, COUNT(*), MIN(s) FROM t GROUP BY g -- COUNT alongside a TEXT-value MIN (the text-value
     // pass yields both the group count and the lexicographic-min winner's row index).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, s TEXT)").unwrap();
     let rows: &[(i32, &str)] = &[
         (1, "banana"),
@@ -165,7 +165,7 @@ fn gpu_grouped_text_key_multiple_value_columns() {
     // The cross-pass merge is by group INDEX; for a text key each pass's representative row index can
     // differ (parallel claim race), but the slot assignment (hence compaction order) is deterministic
     // for the same texts, so the i-th group of each pass is the same key. This pins that invariant.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (k TEXT, v INT, w BIGINT)")
         .unwrap();
     let rows: &[(&str, i32, i64)] = &[
@@ -221,7 +221,7 @@ fn gpu_grouped_multi_aggregate_cross_pass_merge_alignment() {
     // be aligned by the MATERIALIZED group key (a sort), NOT by slot index. With many groups (hash
     // collisions guaranteed) a slot-index merge silently misattributes aggregates. The bug surfaced in
     // audit only on the 6th launch of an int8 key, so run the query many times to defeat the race.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT, w BIGINT)")
         .unwrap();
     let n: i32 = 130;
@@ -272,7 +272,7 @@ fn gpu_grouped_multi_aggregate_text_key_merge_alignment() {
     // The same race, but a TEXT key: the per-pass merge must sort by the materialized STRING (a text
     // group's key_i128 is a per-pass representative row index, which differs across passes), so the
     // index-merge would misalign without the key-sort. Many groups + repeated launches.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (k TEXT, v INT, w BIGINT)")
         .unwrap();
     let n: i32 = 110;

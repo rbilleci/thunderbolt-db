@@ -7,7 +7,8 @@ canonical transaction, WAL, checkpoint, or recovery implementation exists. Those
 the PLAN owners named below; this document owns no work.
 
 R3-002/R3-003 labels below are historical graduation labels; both passed independent acceptance on 2026-07-17.
-The remaining canonical durability and recovery seams are owned by **DUR-002** in `../PLAN.md`.
+The canonical durability and recovery campaign completed under historical **DUR-002**; `../PLAN.md` exclusively
+owns any remaining sequencing.
 
 ## Review method and pass condition
 

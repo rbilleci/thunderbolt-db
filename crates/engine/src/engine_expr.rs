@@ -300,8 +300,8 @@ impl Engine {
         // predicate mixed-width) is no longer VM-lowerable -> CLEAN ERROR where the pre-fix code
         // returned a NULL-BLIND value (wrong for MIN/MAX/AVG, coincidentally right for SUM). A clean
         // error strictly dominates a silent wrong result; do NOT "fix" this by dropping the conjunct
-        // on un-lowerable shapes — route those to the (now NULL-correct) host finalizer instead when
-        // the coverage gap matters (type-coverage ledger).
+        // on un-lowerable shapes. The GPU lowering must be extended when the coverage gap matters;
+        // a host relational finalizer is not an accepted repair (type-coverage ledger).
         let aggregate_validity_conjunct: Option<ResidentExpr> = match &select.projection {
             SelectProjection::Sum { column }
             | SelectProjection::Avg { column }
