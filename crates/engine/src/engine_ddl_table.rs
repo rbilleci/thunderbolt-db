@@ -560,7 +560,7 @@ impl Engine {
         // the flag-off scan validators would bypass unique/FK checks). Rehydrate FIRST, whatever
         // the caller: this fn is elision-safe by construction, not by caller discipline.
         let mut visibility = visibility;
-        if self.table_install_elided(&table.name) {
+        if self.table_device_authoritative(&table.name) {
             if self.current_transaction_read_snapshot().is_some() {
                 return Err(EngineError::ApplyFailed(format!(
                     "transaction-generation DML validation for \"{}\" declined its retained \
@@ -611,7 +611,7 @@ impl Engine {
         table: &str,
         txn_id: TxnId,
     ) -> Result<StorageVisibility, EngineError> {
-        if self.table_install_elided(table) {
+        if self.table_device_authoritative(table) {
             self.rehydrate_elided_serialized(table)?;
         }
         Ok(StorageVisibility {
@@ -1111,8 +1111,8 @@ impl Engine {
         // The moved table starts NON-elided under its new name, and the OLD name's flag must
         // not linger (the SF4 drop-purge discipline): an orphaned entry would mislabel a
         // future same-name table as device-authoritative.
-        self.set_table_install_elided(&rename.old_name, false);
-        self.set_table_install_elided(&rename.new_name, false);
+        self.set_table_device_authoritative(&rename.old_name, false);
+        self.set_table_device_authoritative(&rename.new_name, false);
         // Read the rows to move out of the OLD partition's published generation.
         let mut moves = Vec::new();
         {
@@ -1271,7 +1271,7 @@ impl Engine {
             // RETIREMENT A4e (audit SF4): a dropped table must LEAVE the elided set — a later
             // CREATE reusing the name would otherwise skip its first installs against a
             // non-authoritative device (divergence). Mirrors the shard-region purge discipline.
-            self.set_table_install_elided(name, false);
+            self.set_table_device_authoritative(name, false);
             let Some(table) = cat.relational_catalog.remove(name) else {
                 continue;
             };

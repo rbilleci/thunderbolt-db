@@ -21,12 +21,8 @@ fn gpu_check_constrained_table_elides() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
 
     engine
         .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 10)")
@@ -42,7 +38,7 @@ fn gpu_check_constrained_table_elides() {
         .execute_dml_concurrent(3, "INSERT INTO t VALUES (2, 20)")
         .unwrap();
     assert!(
-        engine.table_install_elided("t"),
+        engine.table_device_authoritative("t"),
         "a CHECK-constrained (FK-free) table must now ELIDE (CHECK is row-local)"
     );
 
@@ -56,7 +52,7 @@ fn gpu_check_constrained_table_elides() {
         "violation must name the CHECK, got: {err}"
     );
     assert!(
-        engine.table_install_elided("t"),
+        engine.table_device_authoritative("t"),
         "a rejected insert must not de-elide"
     );
     assert_eq!(
@@ -69,7 +65,7 @@ fn gpu_check_constrained_table_elides() {
     engine
         .execute_dml_concurrent(5, "INSERT INTO t VALUES (3, 30)")
         .unwrap();
-    assert!(engine.table_install_elided("t"));
+    assert!(engine.table_device_authoritative("t"));
     assert_eq!(gpu_ids_of_t(&engine), vec![1, 2, 3]);
 
     // A VIOLATING UPDATE errors (the candidate new image is built from the DEVICE-materialized row).
@@ -82,7 +78,7 @@ fn gpu_check_constrained_table_elides() {
         "update violation must name the CHECK, got: {err}"
     );
     assert!(
-        engine.table_install_elided("t"),
+        engine.table_device_authoritative("t"),
         "a rejected update must not de-elide"
     );
 
@@ -138,12 +134,8 @@ fn gpu_fk_referenced_parent_elides() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
 
     engine
         .execute_dml_concurrent(3, "INSERT INTO customers VALUES (1, 'ada')")
@@ -159,7 +151,7 @@ fn gpu_fk_referenced_parent_elides() {
         .execute_dml_concurrent(4, "INSERT INTO customers VALUES (2, 'bob')")
         .unwrap();
     assert!(
-        engine.table_install_elided("customers"),
+        engine.table_device_authoritative("customers"),
         "an FK-REFERENCED parent (i32 PK) must now ELIDE"
     );
     // ELIDED-ERA parent key: device-only (the stale host store cannot see it).
@@ -167,7 +159,7 @@ fn gpu_fk_referenced_parent_elides() {
         .execute_dml_concurrent(5, "INSERT INTO customers VALUES (3, 'eve')")
         .unwrap();
     assert!(
-        engine.table_install_elided("customers"),
+        engine.table_device_authoritative("customers"),
         "still elided after the device-only insert"
     );
 
@@ -177,7 +169,7 @@ fn gpu_fk_referenced_parent_elides() {
         .execute_text(6, "INSERT INTO orders VALUES (100, 3)")
         .unwrap();
     assert!(
-        engine.table_install_elided("customers"),
+        engine.table_device_authoritative("customers"),
         "the parent probe must run ON-DEVICE (the parent stays elided; a de-elide means the \
          validator fell back to rehydration)"
     );
@@ -257,12 +249,8 @@ fn gpu_fk_child_table_elides() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
 
     engine
         .execute_text(4, "INSERT INTO customers VALUES (1, 'ada')")
@@ -284,7 +272,7 @@ fn gpu_fk_child_table_elides() {
         .execute_dml_concurrent(7, "INSERT INTO orders VALUES (101, 1)")
         .unwrap();
     assert!(
-        engine.table_install_elided("orders"),
+        engine.table_device_authoritative("orders"),
         "an FK-CHILD table (outbound i32 fk, non-self-ref) must now ELIDE"
     );
     // ELIDED-ERA child rows referencing customer 2 (device-only; two rows -> the fk column is
@@ -296,7 +284,7 @@ fn gpu_fk_child_table_elides() {
         .execute_dml_concurrent(9, "INSERT INTO orders VALUES (103, 2)")
         .unwrap();
     assert!(
-        engine.table_install_elided("orders"),
+        engine.table_device_authoritative("orders"),
         "still elided (device-only referencing rows)"
     );
 
@@ -312,7 +300,7 @@ fn gpu_fk_child_table_elides() {
         "deleting a parent referenced by elided-era child rows must reject, got: {err}"
     );
     assert!(
-        engine.table_install_elided("orders"),
+        engine.table_device_authoritative("orders"),
         "the child-reference check must run ON-DEVICE (the child stays elided)"
     );
     // Child INSERT with a missing parent still rejects while elided; a valid one lands.
@@ -328,7 +316,7 @@ fn gpu_fk_child_table_elides() {
         .execute_text(12, "INSERT INTO orders VALUES (105, 1)")
         .unwrap();
     assert!(
-        engine.table_install_elided("orders"),
+        engine.table_device_authoritative("orders"),
         "valid child insert keeps the child elided"
     );
 }
@@ -357,12 +345,8 @@ fn gpu_fk_child_date_fk_stays_elided() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
 
     engine
         .execute_text(4, "INSERT INTO days VALUES ('2024-03-01', 'kickoff')")
@@ -384,7 +368,7 @@ fn gpu_fk_child_date_fk_stays_elided() {
         .execute_dml_concurrent(7, "INSERT INTO events VALUES (2, '2024-03-01')")
         .unwrap();
     assert!(
-        engine.table_install_elided("events"),
+        engine.table_device_authoritative("events"),
         "an FK-CHILD table (outbound DATE fk, non-self-ref) must now ELIDE"
     );
     // ELIDED-ERA rows referencing '2024-03-02' — duplicated so the hash-index probe declines and
@@ -396,7 +380,7 @@ fn gpu_fk_child_date_fk_stays_elided() {
         .execute_dml_concurrent(9, "INSERT INTO events VALUES (4, '2024-03-02')")
         .unwrap();
     assert!(
-        engine.table_install_elided("events"),
+        engine.table_device_authoritative("events"),
         "still elided (device-only referencing rows)"
     );
 
@@ -411,7 +395,7 @@ fn gpu_fk_child_date_fk_stays_elided() {
         "deleting a date referenced by elided-era child rows must reject, got: {err}"
     );
     assert!(
-        engine.table_install_elided("events"),
+        engine.table_device_authoritative("events"),
         "the DATE child-reference check must run ON-DEVICE (the child stays elided)"
     );
     // An UNREFERENCED-date parent delete probes the same scan arm (finds rows with the fk value
@@ -423,7 +407,7 @@ fn gpu_fk_child_date_fk_stays_elided() {
         .execute_text(12, "DELETE FROM days WHERE d = '2024-03-03'")
         .unwrap();
     assert!(
-        engine.table_install_elided("events"),
+        engine.table_device_authoritative("events"),
         "an allowed parent delete keeps the child elided (no-match scan answered on-device)"
     );
 }
@@ -442,6 +426,7 @@ fn gpu_fk_child_date_fk_stays_elided() {
 fn gpu_fk_child_noni32_fk_columns_stay_elided() {
     const TXN0: u64 = 1000;
     let mut engine = Engine::new_local_cpu_oracle();
+    let mut txn_id = TXN0;
     for (parent_ddl, child_ddl, fk_ddl) in [
         (
             "CREATE TABLE vendors (vid UUID PRIMARY KEY, vname TEXT)",
@@ -476,17 +461,16 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
     ] {
         // One monotone facade txn-id stream keeps this older cross-type fixture independent of
         // commit-sequence allocation details.
-        engine.execute_text(TXN0 + 1, parent_ddl).unwrap();
-        engine.execute_text(TXN0 + 2, child_ddl).unwrap();
-        engine.execute_text(TXN0 + 3, fk_ddl).unwrap();
+        txn_id += 1;
+        engine.execute_text(txn_id, parent_ddl).unwrap();
+        txn_id += 1;
+        engine.execute_text(txn_id, child_ddl).unwrap();
+        txn_id += 1;
+        engine.execute_text(txn_id, fk_ddl).unwrap();
     }
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
 
     // Per pair: (child, parent, pk_col, [kept, departing, missing] key literals).
     let sections: [(&str, &str, &str, [&str; 3]); 5] = [
@@ -520,7 +504,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
             ],
         ),
     ];
-    let txn_ids = AtomicU64::new(TXN0 + 10);
+    let txn_ids = AtomicU64::new(txn_id + 1);
     let mut gpu_checked = false;
     for (child, parent, pk_col, [kept, departing, missing]) in sections {
         macro_rules! sql {
@@ -531,7 +515,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         sql!(format!("INSERT INTO {parent} VALUES ({kept}, 'keep')")).unwrap();
         sql!(format!("INSERT INTO {parent} VALUES ({departing}, 'ref')")).unwrap();
         assert!(
-            engine.table_install_elided(parent),
+            engine.table_device_authoritative(parent),
             "{parent}: a foldable single-wide parent key must elide"
         );
         let parent_validate_before = engine.dml_device_validate_hits();
@@ -552,7 +536,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         }
         sql!(format!("INSERT INTO {child} VALUES (2, {kept})")).unwrap();
         assert!(
-            engine.table_install_elided(child),
+            engine.table_device_authoritative(child),
             "{child}: a non-i32 fk child (outbound fk, non-self-ref) must now ELIDE"
         );
         // ELIDED-ERA rows referencing the departing key — duplicated, and non-i32 columns have
@@ -561,7 +545,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         sql!(format!("INSERT INTO {child} VALUES (3, {departing})")).unwrap();
         sql!(format!("INSERT INTO {child} VALUES (4, {departing})")).unwrap();
         assert!(
-            engine.table_install_elided(child),
+            engine.table_device_authoritative(child),
             "{child}: still elided (device-only referencing rows)"
         );
         let err = sql!(format!("DELETE FROM {parent} WHERE {pk_col} = {departing}"))
@@ -572,7 +556,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
             "{parent}: deleting a key referenced by elided-era child rows must reject, got: {err}"
         );
         assert!(
-            engine.table_install_elided(child),
+            engine.table_device_authoritative(child),
             "{child}: the child-reference check must run ON-DEVICE (the child stays elided)"
         );
         // A child INSERT with a missing parent still rejects while elided; a valid one lands.
@@ -585,7 +569,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         );
         sql!(format!("INSERT INTO {child} VALUES (10, {kept})")).unwrap();
         assert!(
-            engine.table_install_elided(child),
+            engine.table_device_authoritative(child),
             "{child}: rejected + valid inserts keep the child elided"
         );
         // An UNREFERENCED parent key deletes fine — the no-match scan answers on-device and the
@@ -593,7 +577,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         sql!(format!("INSERT INTO {parent} VALUES ({missing}, 'spare')")).unwrap();
         sql!(format!("DELETE FROM {parent} WHERE {pk_col} = {missing}")).unwrap();
         assert!(
-            engine.table_install_elided(child),
+            engine.table_device_authoritative(child),
             "{child}: an allowed parent delete keeps the child elided"
         );
     }
@@ -625,7 +609,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         .execute_text(txn(), "INSERT INTO toggles VALUES (false, 'off')")
         .unwrap();
     assert!(
-        engine.table_install_elided("toggles"),
+        engine.table_device_authoritative("toggles"),
         "a BOOL-PK parent must elide through the bitmap fingerprint index"
     );
     let bool_parent_validate_before = engine.dml_device_validate_hits();
@@ -640,7 +624,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         .execute_text(txn(), "INSERT INTO states VALUES (2, false)")
         .unwrap();
     assert!(
-        engine.table_install_elided("states"),
+        engine.table_device_authoritative("states"),
         "states: a bool fk child must now ELIDE"
     );
     let err = engine
@@ -652,14 +636,14 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
         "referenced bool parent must reject, got: {err}"
     );
     assert!(
-        engine.table_install_elided("states"),
+        engine.table_device_authoritative("states"),
         "states: the bool child-reference check must run ON-DEVICE (the child stays elided)"
     );
     engine
         .execute_text(txn(), "DELETE FROM toggles WHERE f = true")
         .unwrap();
     assert!(
-        engine.table_install_elided("states"),
+        engine.table_device_authoritative("states"),
         "states: an allowed bool parent delete keeps the child elided"
     );
 }
@@ -682,12 +666,8 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
 
     let mut txn = 2u64;
     engine
@@ -717,7 +697,7 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         txn += 1;
     }
     assert!(
-        engine.table_install_elided("m"),
+        engine.table_device_authoritative("m"),
         "the table must elide first"
     );
 
@@ -755,7 +735,7 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         "a mixed int8+text DELETE must RESOLVE on the device"
     );
     assert!(
-        engine.table_install_elided("m"),
+        engine.table_device_authoritative("m"),
         "a mixed int8+text DELETE must NOT de-elide"
     );
     assert_eq!(
@@ -778,7 +758,7 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         "a mixed bool+int8 UPDATE must RESOLVE on the device"
     );
     assert!(
-        engine.table_install_elided("m"),
+        engine.table_device_authoritative("m"),
         "a mixed bool+int8 UPDATE must NOT de-elide"
     );
 
@@ -801,7 +781,7 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         "versioned-shard mixed read: exactly the LIVE id-5 twin (no tombstoned duplicate)"
     );
     assert!(
-        engine.table_install_elided("m"),
+        engine.table_device_authoritative("m"),
         "the versioned-shard mixed read must NOT de-elide (the visibility-branch fallback)"
     );
 
@@ -817,7 +797,7 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         "a mixed int4+int8 DELETE over versioned shards must RESOLVE on the device"
     );
     assert!(
-        engine.table_install_elided("m"),
+        engine.table_device_authoritative("m"),
         "the versioned-shard DELETE must NOT de-elide"
     );
     assert_eq!(
@@ -838,7 +818,7 @@ fn gpu_mixed_width_dml_resolves_on_device() {
         "a bool-inequality DELETE must RESOLVE on the device"
     );
     assert!(
-        engine.table_install_elided("m"),
+        engine.table_device_authoritative("m"),
         "a bool-inequality DELETE must NOT de-elide"
     );
     assert_eq!(
@@ -867,12 +847,8 @@ fn gpu_check_elided_preflight_rehydrate_no_bypass() {
         )
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
 
     engine
         .execute_dml_concurrent(2, "INSERT INTO t VALUES (1, 5, 'x', 10)")
@@ -888,7 +864,7 @@ fn gpu_check_elided_preflight_rehydrate_no_bypass() {
         .execute_dml_concurrent(3, "INSERT INTO t VALUES (2, 7, 'y', 20)")
         .unwrap();
     assert!(
-        engine.table_install_elided("t"),
+        engine.table_device_authoritative("t"),
         "the CHECK table must elide first"
     );
     // THE LOAD-BEARING ROW: inserted AFTER elision entered, so it is ELIDED-ERA (device-only — the
@@ -897,7 +873,7 @@ fn gpu_check_elided_preflight_rehydrate_no_bypass() {
         .execute_dml_concurrent(4, "INSERT INTO t VALUES (3, 9, 'z', 30)")
         .unwrap();
     assert!(
-        engine.table_install_elided("t"),
+        engine.table_device_authoritative("t"),
         "still elided after the device-only insert"
     );
 

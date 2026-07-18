@@ -1,11 +1,11 @@
 /// M1 design B — WAVE-TIME batched validation differential: an elided PK'd table runs the
-/// constraint+DML gauntlet with wave-batch ON (device_write_locate + wave_batch) vs the
-/// host-probe oracle (both off). Every outcome (incl 23505 text) + read must match — the
+/// constraint+DML gauntlet through the concurrent wave sequencer vs the serialized
+/// device-validation oracle. Every outcome (incl 23505 text) + read must match — the
 /// deferred INSERT unique check now happens at wave time, batched. NON-VACUITY: the batched
 /// locate FIRED (device_write_locate_hits > 0).
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn wave_batch_validation_matches_host_oracle() {
+fn wave_batch_validation_matches_serialized_device_oracle() {
     let run = |wave_batch: bool| {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
@@ -38,11 +38,12 @@ fn wave_batch_validation_matches_host_oracle() {
         ];
         let mut outcomes: Vec<Result<(), String>> = Vec::new();
         for sql in &ladder {
-            outcomes.push(
+            let result = if wave_batch {
+                e.execute_dml_concurrent(seq, sql)
+            } else {
                 e.execute_text(seq, sql)
-                    .map(|_| ())
-                    .map_err(|err| err.to_string()),
-            );
+            };
+            outcomes.push(result.map(|_| ()).map_err(|err| err.to_string()));
             seq += 1;
         }
         let mut rows = e
@@ -54,14 +55,13 @@ fn wave_batch_validation_matches_host_oracle() {
         (e, outcomes, rows)
     };
     let (on, on_out, on_rows) = run(true);
-    let (off, off_out, off_rows) = run(false);
-    assert_eq!(on_out, off_out, "wave-batch outcome ladder == host oracle");
-    assert_eq!(on_rows, off_rows, "wave-batch reads == host oracle");
+    let (_off, off_out, off_rows) = run(false);
+    assert_eq!(on_out, off_out, "wave-batch outcome ladder == serialized device oracle");
+    assert_eq!(on_rows, off_rows, "wave-batch reads == serialized device oracle");
     assert!(
         on.device_write_locate_hits() > 0,
         "non-vacuity: the batched locate must have FIRED"
     );
-    assert_eq!(off.device_write_locate_hits(), 0);
 }
 
 /// M1 design B — the CONCURRENT dup race through the WAVE-BATCH path: 8 writers contend for
@@ -95,7 +95,7 @@ fn wave_batch_concurrent_dup_race_single_winner() {
         )
         .unwrap();
     }
-    assert!(e.table_install_elided("t"), "premise: elided");
+    assert!(e.table_device_authoritative("t"), "premise: elided");
     let wins: Vec<std::sync::atomic::AtomicU32> = (0..200)
         .map(|_| std::sync::atomic::AtomicU32::new(0))
         .collect();
@@ -162,7 +162,6 @@ fn constrained_elision_same_snapshot_dup_insert_single_winner() {
     let e = std::sync::Arc::new(Engine::new_local());
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
-    e.set_constrained_elision_enabled(true);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     for (seq, chunk) in (2_u64..).zip(0..2_i64) {
@@ -183,7 +182,7 @@ fn constrained_elision_same_snapshot_dup_insert_single_winner() {
         )
         .unwrap();
     }
-    assert!(e.table_install_elided("t"), "premise: elided");
+    assert!(e.table_device_authoritative("t"), "premise: elided");
     for round in 0..20_u64 {
         let key = 7_000 + round;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -240,8 +239,6 @@ fn constrained_elision_concurrent_dup_race_single_winner_per_key() {
     let e = Engine::new_local();
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
-    e.set_host_install_elision_enabled(true);
-    e.set_constrained_elision_enabled(true);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     for (seq, chunk) in (2_u64..).zip(0..2_i64) {
@@ -306,10 +303,10 @@ fn constrained_elision_concurrent_dup_race_single_winner_per_key() {
         );
     }
     assert!(
-        e.table_install_elided("t"),
+        e.table_device_authoritative("t"),
         "INSERT-only dup race must not de-elide the table"
     );
-    assert!(e.host_install_elisions() > 0, "non-vacuity: elisions fired");
+    assert!(e.device_authoritative_commits() > 0, "non-vacuity: elisions fired");
     // Device truth: every contended key exactly once (no silent double-append survived).
     let rows = e
         .execute_relational_select_text("SELECT id, v FROM t")
@@ -334,7 +331,6 @@ fn a4e_multi_writer_waves_batch_appends_and_stay_elided() {
     let e = Engine::new_local();
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
-    e.set_host_install_elision_enabled(true);
     for (seq, name) in [(1_u64, "ta"), (2, "tb")] {
         e.execute_text(seq, &format!("CREATE TABLE {name} (id INT, v INT)"))
             .unwrap();
@@ -353,7 +349,7 @@ fn a4e_multi_writer_waves_batch_appends_and_stay_elided() {
             seq += 1;
         }
     }
-    let elisions_before = e.host_install_elisions();
+    let elisions_before = e.device_authoritative_commits();
     std::thread::scope(|s| {
         for w in 0..8_u64 {
             let e = &e;
@@ -370,7 +366,7 @@ fn a4e_multi_writer_waves_batch_appends_and_stay_elided() {
             });
         }
     });
-    let elided_through_load = e.table_install_elided("ta") && e.table_install_elided("tb");
+    let elided_through_load = e.table_device_authoritative("ta") && e.table_device_authoritative("tb");
     for name in ["ta", "tb"] {
         let rows = e
             .execute_relational_select_text(&format!("SELECT id, v FROM {name}"))
@@ -392,8 +388,8 @@ fn a4e_multi_writer_waves_batch_appends_and_stay_elided() {
         "both tables must stay ELIDED through the multi-writer load (no rehydration thrash)"
     );
     assert!(
-        e.host_install_elisions() - elisions_before >= 350,
+        e.device_authoritative_commits() - elisions_before >= 350,
         "non-vacuity: the waves must have SKIPPED installs (got {})",
-        e.host_install_elisions() - elisions_before
+        e.device_authoritative_commits() - elisions_before
     );
 }

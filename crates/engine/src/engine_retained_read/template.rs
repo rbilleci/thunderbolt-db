@@ -1,7 +1,7 @@
 use super::{
-    Arc, Engine, EngineError, ExecuteError, Instant, RelationalRetainedInt4ProjectionSubmission,
-    RelationalRetainedReadSubmission, RelationalRetainedReadSubmissionInner,
-    RelationalRetainedReadTemplate, Select,
+    Arc, Engine, EngineError, ExecuteError, Instant, RelationalRetainedBatchResult,
+    RelationalRetainedInt4ProjectionSubmission, RelationalRetainedReadSubmission,
+    RelationalRetainedReadSubmissionInner, RelationalRetainedReadTemplate, Select,
 };
 
 impl Engine {
@@ -45,6 +45,7 @@ impl Engine {
             filter_idx,
             access_path,
             table,
+            select: select.clone(),
         })
     }
 
@@ -74,6 +75,95 @@ impl Engine {
                     .unwrap_or(u64::MAX),
                 commit_path_wedged: Arc::clone(&self.commit_path_wedged),
                 inner: RelationalRetainedReadSubmissionInner::Ready(Vec::new()),
+            });
+        }
+        let query_shape = template.route_id.split(':').next().unwrap_or("unknown");
+        if matches!(
+            query_shape,
+            "sharded_int4_equality_projection"
+                | "sharded_int4_equality_multi_column_projection"
+                | "sharded_int4_equality_mixed_column_projection"
+        ) {
+            let current_generation = self.committed_seq();
+            if current_generation != template.snapshot_generation {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "retained sharded read template snapshot generation mismatch for relation \"{}\": template={}, current={}",
+                    template.table.name, template.snapshot_generation, current_generation
+                ))));
+            }
+            if template.is_int4_only_projection() {
+                if let Some(projected) = self.gather_sharded_int4_point_lookups_batched(
+                    current_generation,
+                    &template.table,
+                    template.filter_idx,
+                    &template.selected_indexes,
+                    needles,
+                ) {
+                    let gpu_id = self
+                        .read_residency_shards()
+                        .get(&template.table.name)
+                        .and_then(|shards| shards.first())
+                        .map(|shard| shard.gpu_id)
+                        .unwrap_or(0);
+                    return Ok(RelationalRetainedReadSubmission {
+                        route_id: template.route_id.clone(),
+                        table: template.table.name.clone(),
+                        snapshot_generation: template.snapshot_generation,
+                        job_count: needles.len(),
+                        submit_wall_micros: submit_started
+                            .elapsed()
+                            .as_micros()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                        commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+                        inner: RelationalRetainedReadSubmissionInner::ReadyBatched(Box::new(
+                            RelationalRetainedBatchResult {
+                                columns: Arc::new(template.result_columns.clone()),
+                                access_path: Arc::new(template.access_path.clone()),
+                                gpu_id,
+                                values: projected.values,
+                                ncols: projected.ncols,
+                                needle_ranges: projected.needle_ranges,
+                            },
+                        )),
+                    });
+                }
+            }
+            let filter_column = &template.table.columns[template.filter_idx].name;
+            let results = needles
+                .iter()
+                .map(|&needle| {
+                    let mut select = template.select.clone();
+                    if let Some(filter) = &mut select.filter {
+                        if filter.column == *filter_column {
+                            filter.value = gpu_db_sql::SqlValue::Int4(needle);
+                        }
+                    }
+                    for filter in &mut select.filters {
+                        if filter.column == *filter_column {
+                            filter.value = gpu_db_sql::SqlValue::Int4(needle);
+                        }
+                    }
+                    for filter in select.filter_groups.iter_mut().flatten() {
+                        if filter.column == *filter_column {
+                            filter.value = gpu_db_sql::SqlValue::Int4(needle);
+                        }
+                    }
+                    self.execute_relational_select(&select)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(RelationalRetainedReadSubmission {
+                route_id: template.route_id.clone(),
+                table: template.table.name.clone(),
+                snapshot_generation: template.snapshot_generation,
+                job_count: needles.len(),
+                submit_wall_micros: submit_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+                inner: RelationalRetainedReadSubmissionInner::Ready(results),
             });
         }
         // Validate the resident snapshot still matches the generation the template was prepared against

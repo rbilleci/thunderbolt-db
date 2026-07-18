@@ -521,64 +521,6 @@ impl Engine {
             .cloned()
     }
 
-    /// 6c-3 — EAGER COLD-TIER MAINTENANCE AT COMMIT: for each committed table that HAS a cold
-    /// entry, patch it in place (O(delta) via the 6c-1 patcher) so subsequent READS never pay the
-    /// maintenance. Self-gating on entry existence (no flag — the no-flag mandate); entirely
-    /// best-effort (any failure -> the read path patches lazily as before; NEVER fails the
-    /// already-durable commit); runs post-publish under the held commit mutex. That mutex does not freeze
-    /// lock-free intent-lane `committed_seq`; strict frontier equality plus generation identity make a
-    /// racing bump a safe maintenance miss. Catalog resolution uses the PUBLISHED snapshot,
-    /// never the latch (the rehydrate lesson). First builds stay LAZY on first read (an eager
-    /// O(table) first build would stall the commit; its deletion is the sealed-shards-primary arc).
-    pub(crate) fn maintain_streaming_cold_on_commit(
-        &self,
-        tables: &std::collections::BTreeSet<String>,
-    ) {
-        if tables.is_empty() {
-            return;
-        }
-        let map = self.read_state.residency.streaming_cold_chunks.load();
-        for table_name in tables {
-            let Some(entry) = map.get(table_name).cloned() else {
-                continue;
-            };
-            let current = self
-                .read_state
-                .mvcc
-                .table_rows(table_name)
-                .generation_payload();
-            if Arc::ptr_eq(&entry.generation, &current) {
-                continue; // already fresh
-            }
-            let Some(table) = self
-                .catalog_snapshot()
-                .relational_catalog
-                .get(table_name)
-                .cloned()
-            else {
-                continue;
-            };
-            // 6c-3 (audit MEDIUM): BOUND the eager work — the hook runs synchronously under the
-            // GLOBAL commit mutex, so a bulk write's tail rebuild (possibly with spill-file IO)
-            // must never head-of-line-block every committer. Oversized deltas defer to the lazy
-            // read-path patch (the unchanged correctness backstop).
-            let changed = entry.generation.rows.changed_tuple_ids(&current.rows);
-            if changed.len() > EAGER_PATCH_MAX_DELTA_ROWS {
-                continue;
-            }
-            let copin_s = self.committed_seq();
-            let _ = self.patch_streaming_cold(
-                table_name,
-                &table,
-                &entry,
-                &current,
-                copin_s,
-                entry.chunk_target_bytes,
-                true,
-            );
-        }
-    }
-
     /// S-E.6: the table's valid cold-tier chunks, or `None` (miss -> the caller scans + captures).
     /// A hit requires the SAME tuple-store generation (pointer equality — see [`ColdTableChunks`]),
     /// the same chunk target, AND `copin_s >= build_copin_s` (the boundary-invariance condition:

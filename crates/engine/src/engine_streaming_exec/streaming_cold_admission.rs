@@ -10,23 +10,18 @@ impl Engine {
         gpu_id: u16,
         input_cap: u64,
     ) -> Option<Arc<ColdTableChunks>> {
+        self.transition_oversized_device_table_to_streaming_repair(&table.name)
+            .ok()?;
         // Row-byte target is intentionally half the payload reservation: headers, text offset
         // arrays, validity, and section alignment also occupy the retained descriptor bytes.
         let chunk_target = (input_cap / 2).max(1);
         if let Some(cold) = self.load_streaming_cold(&table.name, table, chunk_target, copin_s) {
             return Some(cold);
         }
-        // A class entry is the record of truth and cannot be rescanned/re-tiled from its frozen
-        // store. It joins only when its existing chunks already satisfy the two-input target.
+        // A class entry is the record of truth. Re-tile its encoded payloads directly when a
+        // two-input operator needs a smaller target; never de-authoritize into host execution.
         if self.table_chunk_authoritative(&table.name).is_some() {
-            let cold = self
-                .read_state
-                .residency
-                .streaming_cold_chunks
-                .load()
-                .get(&table.name)
-                .cloned()?;
-            return (cold.chunk_target_bytes <= chunk_target).then_some(cold);
+            return self.rechunk_streaming_cold_class(table, chunk_target);
         }
         let count_select = Select {
             table: table.name.clone(),
@@ -55,6 +50,7 @@ impl Engine {
             input_cap.max(1),
         )
         .ok()?;
+        self.maybe_enter_chunk_class_from_cold(&table.name);
         self.load_streaming_cold(&table.name, table, chunk_target, copin_s)
     }
 }

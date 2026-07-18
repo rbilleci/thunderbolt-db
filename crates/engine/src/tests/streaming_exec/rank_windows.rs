@@ -1,4 +1,4 @@
-use super::{gpu_available, select};
+use super::{gpu_available, select, ClassEntryDisabled};
 use crate::{Engine, RelationalSelectResult};
 use gpu_db_execution::DeviceTarget;
 use gpu_db_sql::SqlValue;
@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_rank_windows_over_ordered_input() {
+    let _entry_disabled = ClassEntryDisabled::new();
     let mut e = Engine::new_local_cpu_oracle();
     let mut seq = 0_u64;
     if !gpu_available(&mut e, &mut seq) {
@@ -389,17 +390,19 @@ fn gpu_streaming_rank_keeps_one_catalog_data_boundary_across_ddl() {
     if !gpu_available(&mut engine, &mut seq) {
         return;
     }
-    engine.set_relational_residency_budget_bytes(0, 4096);
-    let e = Arc::new(engine);
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE wrd (a INT, score INT)")
+    engine
+        .execute_text(seq, "CREATE TABLE wrd (a INT, score INT)")
         .unwrap();
     seq += 1;
-    e.execute_text(
-        seq,
-        "INSERT INTO wrd VALUES (1, 30), (2, 10), (3, 20), (4, 20)",
-    )
-    .unwrap();
+    engine
+        .execute_text(
+            seq,
+            "INSERT INTO wrd VALUES (1, 30), (2, 10), (3, 20), (4, 20)",
+        )
+        .unwrap();
+    engine.set_relational_residency_budget_bytes(0, 4096);
+    let e = Arc::new(engine);
     let _ = e
         .execute_relational_select(&select("SELECT COUNT(*) FROM wrd"))
         .unwrap();

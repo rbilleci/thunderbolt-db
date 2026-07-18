@@ -89,6 +89,7 @@ mod resident_route;
 pub(crate) use resident_route::*;
 mod engine_catalog;
 mod engine_commit;
+mod engine_commit_residency;
 mod engine_ddl_acl;
 mod engine_ddl_alter;
 mod engine_ddl_objects;
@@ -416,8 +417,9 @@ pub struct Engine {
     // Lazily-probed CUDA runtime, behind a OnceLock so the probe getter is `&self`
     // (the read path lazily initializes it — P1-M3 step 3c).
     cached_cuda_probe_runtime: OnceLock<CudaDriverRuntime>,
-    /// STRATA S-B: when true, a committing mutation auto-admits its tables to GPU residency after the
-    /// commit publishes (best-effort, never fails the commit). Default off. Interior-mutable (`&self`).
+    /// STRATA S-B: when true, a committing mutation maintains its tables as GPU-resident authority.
+    /// Default on; a maintenance failure fails the commit path rather than acknowledging a host-only
+    /// relational image. Interior-mutable (`&self`).
     auto_admit_on_commit: AtomicBool,
     /// ADR-009 R1: when true, a resident int4 unique-key equality point lookup probes a GPU hash index
     /// (built lazily from the resident column, cached per generation) instead of a full-scan kernel —
@@ -435,27 +437,18 @@ pub struct Engine {
     /// Billions-of-rows scaling (segmented layout, S-d1): when true, a table is admitted as a SEGMENTED
     /// shard list (sealed shards + one bounded open shard) routed through the sharded resident read path,
     /// instead of one capacity-padded unified buffer that caps at ~536M rows and re-admits O(table). DEFAULT
-    /// OFF — production stays on the single buffer until seal/rollover (S-d2) + per-shard bloom index (S-d3)
-    /// make the shard path strictly better at scale; this flag is the A/B lever to validate it. Interior-mutable.
+    /// ON; this flag remains an A/B/test lever. Interior-mutable.
     shard_residency_enabled: AtomicBool,
-    /// SV4b: route a single-entry DELETE commit through the GPU-native tombstone (locate + stamp `deleted_by`
-    /// in place, O(rows)) instead of the O(table) invalidate + re-admit. DEFAULT OFF, nested under the shard
-    /// path (a DELETE re-admits exactly as before until this flips) — the independent A/B lever for the
-    /// incremental-DELETE win. Interior-mutable (read on the commit path).
-    resident_delete_tombstone_enabled: AtomicBool,
-    /// SV5: route a single-entry UPDATE commit through the GPU-native tombstone-old + append-new (O(rows))
-    /// instead of the O(table) invalidate + re-admit. DEFAULT OFF, nested under the shard path. Interior-mutable.
-    resident_update_tombstone_enabled: AtomicBool,
     /// Sub-slice 3b: route a shard-resident int4 UNIQUE-key equality POINT lookup through the CROSS-SHARD PK
     /// INDEX (cached hash+bloom `locate`) so the sharded read gathers ONLY the located shard(s) instead of
-    /// every zone-map-non-excluded shard. DEFAULT OFF, nested under `shard_residency_enabled` (the sharded read
-    /// falls back to the existing zone-map scan + recompaction until this flips — byte-identical). The A/B lever
+    /// every zone-map-non-excluded shard. DEFAULT ON, nested under `shard_residency_enabled` (the sharded read
+    /// falls back to the existing zone-map scan + recompaction when disabled — byte-identical). The A/B lever
     /// for the membership-pruning win that lets the shard path stay O(1) even when zone-maps degrade under
     /// UPDATE key-scatter (scalability-ledger #4/#8). Interior-mutable (the read path reads it).
     shard_index_probe_enabled: AtomicBool,
     /// lpb-for-shards wiring: admit a shard-resident int4 point-lookup BATCH into the facade point-lookup
     /// batcher and serve it via the batched cross-shard gather (`submit_sharded_point_lookups_batched`)
-    /// instead of degrading to per-query single-flight. DEFAULT OFF (nested under shard residency): OFF =>
+    /// instead of degrading to per-query single-flight. DEFAULT ON (nested under shard residency): OFF =>
     /// `submit_sharded_point_lookups_batched` returns `None` and the batcher keeps its existing behavior
     /// (byte-identical). The A/B lever that LANDS the ~310x batched throughput on real workloads. Interior-mutable.
     shard_batched_point_read_enabled: AtomicBool,
@@ -464,15 +457,9 @@ pub struct Engine {
     /// grows as bounded shards to billions of rows. Caps the admit headroom + sizes a rollover shard.
     /// Default 4M (seals in ~3ms, ~250 shards/1B per the admit-scaling measurement); settable small in
     /// tests. Interior-mutable.
-    host_install_elision_enabled: std::sync::atomic::AtomicBool,
     /// W5a: covered inserts log RESOLVED BINARY WAL records (decode+install replay) instead of
     /// SQL text. Default OFF until the replay-differential burn-in flips it.
     binary_wal_records_enabled: std::sync::atomic::AtomicBool,
-    /// TYPE-COVERAGE track 1: UNIQUE-INDEXED (PK'd) i32-section tables may ELIDE — the
-    /// core-banking table shape. Requires the resolve+validate ladders ON (eligibility checks
-    /// them). DEFAULT ON (the 2026-07-03 flip). Kill switch -> unique tables never enter
-    /// elision (already-elided tables rehydrate through the ladder seams as usual).
-    constrained_elision_enabled: std::sync::atomic::AtomicBool,
     /// TYPE-COVERAGE track 2 slice 2: sharded admission includes i64-SECTION columns
     /// (Int8/Timestamp) alongside the i32 sections — the first non-i32 shard section.
     /// DEFAULT ON (the 2026-07-03 flip). Kill switch -> int8-bearing tables admit

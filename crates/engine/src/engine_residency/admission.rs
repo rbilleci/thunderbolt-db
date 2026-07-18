@@ -3,6 +3,50 @@
 use super::*;
 
 impl Engine {
+    /// Return a descriptive snapshot for the currently published device-authoritative generation.
+    /// A sharded table deliberately has no entry in the single-buffer snapshot map, so aggregate
+    /// its shard descriptors for warmup callers without copying or republishing device data.
+    fn current_device_authoritative_snapshot(
+        &self,
+        cat: &DdlCatalogState,
+        table: &str,
+    ) -> Option<RelationalResidencySnapshot> {
+        if let Some(entry) = self.relational_residency_entry(table) {
+            let mut snapshot = (*entry.descriptor).clone();
+            let pressured = self
+                .router
+                .runtime()
+                .snapshot()
+                .memory_pressured_gpu_ids
+                .contains(&snapshot.gpu_id);
+            snapshot.memory_pressure_active = pressured;
+            if snapshot.is_valid() && entry.device_memory.is_some() && !pressured {
+                return Some(snapshot);
+            }
+            return None;
+        }
+
+        let catalog_table = cat.relational_catalog.get(table)?;
+        let pressured = self.router.runtime().snapshot().memory_pressured_gpu_ids;
+        let shards = self.read_residency_shards();
+        let table_shards = shards.get(table)?;
+        let first = table_shards.first()?;
+        if table_shards.iter().any(|shard| {
+            shard.device_memory.is_none()
+                || !shard.is_valid(pressured.contains(&shard.gpu_id))
+                || shard.schema != catalog_table.schema
+                || shard.table != catalog_table.name
+        }) {
+            return None;
+        }
+        let mut snapshot = self.resident_snapshot_for_shard(first, catalog_table);
+        snapshot.row_count = table_shards.iter().map(|shard| shard.row_count).sum();
+        snapshot.capacity = table_shards.iter().map(|shard| shard.capacity).sum();
+        snapshot.resident_bytes = table_shards.iter().map(|shard| shard.resident_bytes).sum();
+        snapshot.valid_through_index = self.read_snapshot_boundary();
+        Some(snapshot)
+    }
+
     pub fn populate_relational_residency_snapshot(
         &mut self,
         table: &str,
@@ -17,6 +61,19 @@ impl Engine {
         table: &str,
         gpu_id: u16,
     ) -> Result<RelationalResidencySnapshot, ExecuteError> {
+        // R3-004: normal DML no longer keeps a host tuple-store shadow. An explicit warmup of an
+        // already authoritative table therefore means "retain the current device generation", not
+        // "scan the host store and overwrite it". If that generation is unavailable, fail closed;
+        // only the explicit RETIRE-002 repair boundary may reverse-gather and clear elision first.
+        if self.table_device_authoritative(table) {
+            return self
+                .current_device_authoritative_snapshot(cat, table)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "device-authoritative relation \"{table}\" has no live generation"
+                    )))
+                });
+        }
         let previous_snapshot = self
             .read_state
             .residency
@@ -153,18 +210,15 @@ impl Engine {
                         | SqlType::Bool
                 )
             });
-        // TYPE-COVERAGE #14 (text): a keyed table with a TEXT column (+ supported companion types)
-        // shard-admits as a DENSE shard (capacity == row_count — text has no capacity-strided headroom).
-        // Unkeyed text relations retain the established single-buffer read layout; R3-004 attaches a
-        // row-identity sidecar to that generation so DML can still resolve on-device without diverting
-        // its mature read routes through incomplete sharded operators.
+        // TYPE-COVERAGE #14/R3-004: every supported relation with a TEXT column shard-admits as a
+        // DENSE shard (capacity == row_count — text has no capacity-strided headroom). Writes roll a
+        // fresh dense shard, which keeps the mutation path device-native independently of indexes.
         let text_sectioned = !purely_int4
             && !fixed_width_sections
             && self.shard_int8_section_enabled()
             && row_count < (1usize << 29)
             && !column_types.is_empty()
             && column_types.iter().any(|ty| matches!(ty, SqlType::Text))
-            && catalog_table.indexes.iter().any(|index| index.unique)
             && column_types.iter().all(|ty| {
                 matches!(
                     ty,
@@ -183,7 +237,12 @@ impl Engine {
         // INSERTs append in place (1b-ii). S-d2: the sharded read is now capacity-aware (the recompaction
         // gather + `resident_snapshot_for_shard` stride by `shard.capacity`), so the OPEN shard gets the
         // same headroom as the single buffer. Other shapes (and huge/empty tables) stay dense.
-        let capacity = if purely_int4 || fixed_width_sections {
+        let capacity = if row_count == 0 {
+            // An empty authoritative generation needs only its descriptor/header. Giving it the
+            // normal 262k-row open-shard floor consumes megabytes before the first write and can
+            // make a correctly configured small STRATA budget impossible to establish.
+            0
+        } else if purely_int4 || fixed_width_sections {
             let doubled = row_count.saturating_mul(2).next_power_of_two();
             // S-d2c: on the shard path, CAP the open shard at the target size (`row_count` if it already
             // exceeds it — a large admit is one dense shard) so it seals + rolls over at the target rather
@@ -194,10 +253,16 @@ impl Engine {
                 // RE-ADMITS geometrically as it fills — each re-admission is a
                 // full device gather+re-upload (hundreds of ms at multi-M rows),
                 // measured as the periodic stalls capping sustained lane TPS.
-                let floor: usize = std::env::var("GPU_DB_OPEN_SHARD_FLOOR_ROWS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(262_144);
+                let floor: usize = if self.relational_residency_budget_bytes(gpu_id).is_some() {
+                    // A configured STRATA budget is an explicit bound. Do not reserve the
+                    // throughput-oriented 262k-row growth floor inside a small bounded working set.
+                    1
+                } else {
+                    std::env::var("GPU_DB_OPEN_SHARD_FLOOR_ROWS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(262_144)
+                };
                 doubled
                     .max(floor.next_power_of_two())
                     .min(self.shard_size_target())

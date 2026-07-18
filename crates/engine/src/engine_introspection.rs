@@ -33,6 +33,20 @@ impl Engine {
         self.committed_seq()
     }
 
+    /// First transaction identity not already claimed by this engine's durable status index.
+    /// Wrappers that adopt a pre-seeded or recovered engine must start allocation here rather than
+    /// at one, or a new request can alias an earlier canonical WAL identity.
+    pub fn next_durable_transaction_id_floor(&self) -> TxnId {
+        self.commit_state()
+            .transaction_status
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .unwrap_or(TxnId::MAX)
+    }
+
     /// Acquire-load the MVCC visibility/publish boundary (the highest committed `commit_seq`). The
     /// commit critical section release-stores it LAST, so an acquire-load here observes a fully
     /// published commit's data (rows + value-index generation) — the reader-side half of the

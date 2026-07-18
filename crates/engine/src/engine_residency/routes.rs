@@ -440,6 +440,8 @@ impl Engine {
             "sharded_int4_equality_projection".to_string()
         } else if query_shape == "int4_equality_multi_column_projection" {
             "sharded_int4_equality_multi_column_projection".to_string()
+        } else if query_shape == "int4_equality_mixed_column_projection" {
+            "sharded_int4_equality_mixed_column_projection".to_string()
         } else if matches!(
             query_shape.as_str(),
             "sharded_int4_equality_sum"
@@ -544,6 +546,14 @@ impl Engine {
                         .unwrap_or(u64::MAX)
                         .saturating_mul(std::mem::size_of::<u64>() as u64),
                 )
+        } else if sharded_query_shape == "sharded_int4_equality_mixed_column_projection" {
+            // TEXT is variable-width. Conservatively bound the result by the complete resident
+            // footprint plus one row index per possible match.
+            total_resident_bytes.saturating_add(
+                u64::try_from(total_rows)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(std::mem::size_of::<u64>() as u64),
+            )
         } else {
             0
         };
@@ -594,6 +604,7 @@ impl Engine {
                 | "sharded_int4_composite_equality_multi_column_projection"
                 | "sharded_int4_equality_projection"
                 | "sharded_int4_equality_multi_column_projection"
+                | "sharded_int4_equality_mixed_column_projection"
                 | "sharded_int4_equality_sum"
                 | "sharded_int4_between_avg"
                 | "sharded_int4_filtered_avg"
@@ -616,8 +627,11 @@ impl Engine {
         // R-ver: the UNFILTERED projection (`sharded_int4_projection_all`) needs exactly its
         // projected columns resident — no filter columns (there is no WHERE by shape definition).
         // It shares the multi-column projection's extraction (the filter loops are no-ops here).
-        if decision.query_shape == "sharded_int4_equality_multi_column_projection"
-            || decision.query_shape == "sharded_int4_projection_all"
+        if matches!(
+            decision.query_shape.as_str(),
+            "sharded_int4_equality_multi_column_projection"
+                | "sharded_int4_equality_mixed_column_projection"
+        ) || decision.query_shape == "sharded_int4_projection_all"
         {
             match &select.projection {
                 SelectProjection::Columns(columns) => {

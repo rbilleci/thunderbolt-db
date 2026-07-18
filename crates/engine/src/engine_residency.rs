@@ -40,6 +40,10 @@ pub(crate) use payload::{
 #[allow(clippy::items_after_test_module)]
 mod capacity_payload_tests {
     use super::*;
+    use crate::tests::{
+        install_test_single_buffer_residency, invalidate_test_relational_residency,
+        repair_test_relational_host_copy,
+    };
 
     fn int4_cols() -> (Vec<String>, Vec<SqlType>) {
         (

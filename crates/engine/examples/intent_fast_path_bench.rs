@@ -71,10 +71,8 @@ fn build_engine(segment: &std::path::Path) -> Result<Engine, Box<dyn Error>> {
     let e = Engine::with_durable_wal_segment(segment);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")?;
     e.set_auto_admit_on_commit(true);
-    e.set_host_install_elision_enabled(true);
     e.set_binary_wal_records_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
-    e.set_constrained_elision_enabled(true);
     // GPU_DB_BENCH_SHARD_TARGET: pre-size the open shard (rows) to control
     // rollover frequency in-run (rollovers serialize under the apply path and,
     // in lanes mode, stall the global cut).
@@ -87,10 +85,10 @@ fn build_engine(segment: &std::path::Path) -> Result<Engine, Box<dyn Error>> {
     Ok(e)
 }
 
-/// Warm the table into the elided (device-authoritative) state: classic inserts
-/// until `table_install_elided` flips (admission + elide-entry are lazy).
+/// Warm the table into the device-authoritative state: classic inserts until
+/// `table_device_authoritative` flips after the initial publication.
 /// Warm-up ids live at the top of the int4 range, disjoint from bench ids.
-fn warm_up_elision(engine: &Engine, txn_ids: &AtomicU64) -> Result<usize, Box<dyn Error>> {
+fn warm_up_device_authority(engine: &Engine, txn_ids: &AtomicU64) -> Result<usize, Box<dyn Error>> {
     const WARMUP_BASE: i64 = 2_100_000_000;
     for i in 0..20_000_i64 {
         let txn_id = txn_ids.fetch_add(1, Ordering::Relaxed);
@@ -98,11 +96,11 @@ fn warm_up_elision(engine: &Engine, txn_ids: &AtomicU64) -> Result<usize, Box<dy
             txn_id,
             &format!("INSERT INTO t VALUES ({}, 1)", WARMUP_BASE + i),
         )?;
-        if engine.table_install_elided("t") {
+        if engine.table_device_authoritative("t") {
             return Ok(i as usize + 1);
         }
     }
-    Err("table never entered elision during warm-up (is a GPU available?)".into())
+    Err("table never established device authority during warm-up (is a GPU available?)".into())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -171,10 +169,8 @@ fn run_arm(
     // ~P% of the driver's ops covered full-row UPDATEs of an OLDER committed live key (a trailing
     // cursor, every update a guaranteed 1-row hit). This measures the update cost + the F3/U4
     // DEAD-TWIN churn: an update versions the shard and, under the in-flight window's active
-    // readers, its dead twin sits above the GC boundary → the pk-index rebuild declines → the
-    // locate declines → rehydrate → DE-ELIDE. So each writer re-prepares its update route on drift
-    // (the elision RE-ENTRY arm); the reported throughput is dominated by that rehydrate churn
-    // until the kernel index-entry-replacement fix (F3/U4) lands. 0 (default) = insert-only.
+    // readers, its dead twin sits above the GC boundary. The device locate must resolve that
+    // history without abandoning authority. 0 (default) = insert-only.
     let mix_update: i64 = std::env::var("GPU_DB_BENCH_MIX_UPDATE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -184,10 +180,10 @@ fn run_arm(
     remove_segment_files(&segment);
     let engine = build_engine(&segment)?;
     let txn_ids = Arc::new(AtomicU64::new(2));
-    let warmed = warm_up_elision(&engine, &txn_ids)?;
+    let warmed = warm_up_device_authority(&engine, &txn_ids)?;
     let route = Arc::new(engine.prepare_covered_insert_route("t")?);
     // U1: the covered-DELETE route (prepared only when the mix is enabled — a driverless /
-    // non-elided warm-up would have already returned above).
+    // non-authoritative warm-up would have already returned above).
     let delete_route = if arm == Arm::Driver && mix_delete > 0 {
         Some(Arc::new(engine.prepare_covered_delete_route("t")?))
     } else {

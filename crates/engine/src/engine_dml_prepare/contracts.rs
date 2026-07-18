@@ -274,6 +274,9 @@ pub(crate) fn dml_filter_groups_to_device_predicate(
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InsertPrepareValidation {
     Full,
+    /// Off-lock preparation for an item that is guaranteed to enter the classic commit-wave
+    /// sequencer. Eligible single-row unique checks may be deferred to its batched device locate.
+    WaveOffLock,
     /// Wave-time fallback after a batched device needle could not bind or a locate declined. This
     /// performs the full validator ladder but MUST NOT re-enter wave deferral, which would turn the
     /// fallback into a no-op (notably for structural NULL unique keys).

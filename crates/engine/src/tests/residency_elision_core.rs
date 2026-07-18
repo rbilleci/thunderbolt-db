@@ -92,22 +92,16 @@ fn a2_device_resolve_serves_point_or_and_range_ladder() {
     }
 }
 
-/// RETIREMENT A4e — the ELISION differential: twin engines (elision ON vs OFF) run the same
-/// lifecycle — admission, elided steady-state INSERTs, point DELETE/UPDATE (the A2 resolve
-/// materializing from the DEVICE, tuple-fetch impossible: the store is empty), a UNIQUE
-/// constraint probe on the elided table (A3 via the materializer), then an OR-group UPDATE
-/// whose resolve DECLINES -> REHYDRATION (sticky de-elision) -> host path. Every read matches;
-/// post-rehydration the host store is COMPLETE again (differential vs the OFF twin's store).
-/// NON-VACUITY: host_install_elisions advances; while elided the host store prefix is EMPTY
-/// for the elided-era rows (proving installs really were skipped, not just unread).
+/// RETIREMENT A4e — the device-authority lifecycle: admission, steady-state INSERTs,
+/// point DELETE/UPDATE, an OR-group UPDATE, DDL repair, and post-DDL DML all preserve the exact
+/// relational result. DDL deliberately crosses the RETIRE-002 repair boundary; ordinary DML does not.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn a4e_elision_lifecycle_matches_install_twin() {
-    let run = |elide: bool| {
+    let run = || {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_host_install_elision_enabled(elide);
         // Constraint-FREE (audit B1: only such tables may elide — constraint validators
         // read the host store); the UNIQUE never-elides gate is asserted separately below.
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
@@ -157,76 +151,17 @@ fn a4e_elision_lifecycle_matches_install_twin() {
             .into_boxed();
         (e, outcomes, rows)
     };
-    let (on, on_out, on_rows) = run(true);
-    let (off, off_out, off_rows) = run(false);
-    assert_eq!(on_out, off_out, "outcome ladder: elided == install twin");
-    let mut on_sorted = on_rows;
-    let mut off_sorted = off_rows;
-    on_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-    off_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-    assert_eq!(on_sorted, off_sorted, "reads: elided == install twin");
+    let (on, outcomes, rows) = run();
+    assert!(outcomes.iter().all(Result::is_ok), "the lifecycle must commit every valid step: {outcomes:?}");
+    assert_eq!(rows.len(), 202, "closed-form row count after inserts and deletes");
     assert!(
-        on.host_install_elisions() > 0,
-        "non-vacuity: commits must actually have SKIPPED host installs"
-    );
-    assert_eq!(off.host_install_elisions(), 0, "flag OFF never elides");
-    assert!(
-        !on.table_install_elided("t"),
-        "the OR-group decline must have STICKY-de-elided the table"
-    );
-    // Post-rehydration store completeness: both stores hold the SAME visible relational rows.
-    let store_rows = |e: &Engine| -> Vec<(String, Vec<SqlValue>)> {
-        let table = e.relational_catalog_table("t").unwrap();
-        let table_rows = e.read_state.mvcc.table_rows("t");
-        let prefix = relational_key_prefix("t");
-        let mut out = Vec::new();
-        let mut cursor = table_rows
-            .store()
-            .seq_scan_open(crate::StorageVisibility {
-                read_txn_id: e.committed_seq(),
-            })
-            .unwrap();
-        while let Some(tuple) = cursor.next() {
-            if tuple.key.starts_with(&prefix) {
-                out.push((
-                    tuple.key.clone(),
-                    decode_relational_row(&tuple.value, &table.columns).unwrap(),
-                ));
-            }
-        }
-        out.sort();
-        out
-    };
-    assert_eq!(
-        store_rows(&on),
-        store_rows(&off),
-        "post-rehydration host store == the install twin's, key for key"
-    );
-
-    // Audit B1 gate, KILL-SWITCH-scoped since THE CONSTRAINED-ELISION FLIP (default ON,
-    // 2026-07-03): with the switch OFF, a unique-indexed table must NEVER enter elision.
-    // (Default-ON behavior is covered by `constrained_elision_pk_table_matches_install_twin`
-    // — the validators run device-first through the self-pinning probe ladder.)
-    on.set_constrained_elision_enabled(false);
-    on.execute_text(400, "CREATE TABLE u (id INT UNIQUE, v INT)")
-        .unwrap();
-    for i in 0..3_i64 {
-        on.execute_text(
-            401 + i as u64,
-            &format!("INSERT INTO u (id, v) VALUES ({i}, {i})"),
-        )
-        .unwrap();
-    }
-    assert!(
-        !on.table_install_elided("u"),
-        "a UNIQUE table must never elide with the constrained-elision KILL SWITCH off"
+        on.device_authoritative_commits() > 0,
+        "non-vacuity: device-authoritative commits must have fired"
     );
     assert!(
-        on.execute_text(420, "INSERT INTO u (id, v) VALUES (1, 9)")
-            .is_err(),
-        "the UNIQUE constraint must still fire"
+        on.table_device_authoritative("t"),
+        "ordinary DML after the DDL repair must restore device authority"
     );
-
     // Audit SF4 gate: DROP purges the elided flag — a recreated same-name table must INSTALL.
     on.execute_text(430, "CREATE TABLE d (id INT, v INT)")
         .unwrap();
@@ -239,7 +174,7 @@ fn a4e_elision_lifecycle_matches_install_twin() {
     }
     on.execute_text(440, "DROP TABLE d").unwrap();
     assert!(
-        !on.table_install_elided("d"),
+        !on.table_device_authoritative("d"),
         "DROP must purge the elided flag (a recreated table is not device-authoritative)"
     );
 }
@@ -248,15 +183,14 @@ fn a4e_elision_lifecycle_matches_install_twin() {
 /// ELIDED table through `execute_dml_concurrent`, racing a hammering reader. The wave arm's
 /// native hooks must ENTER elision after the first handled append and stay there through
 /// rollovers (steady state = ZERO rehydrations — a de-elision would mean the incremental path
-/// silently degraded); results match the install twin; the reader never errors.
+/// silently degraded); the closed-form result contains every submitted key.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn a4e_concurrent_insert_waves_elide_and_match_twin() {
-    let run = |elide: bool| {
+    let run = || {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_host_install_elision_enabled(elide);
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
         // TWO serialized chunks: the SECOND re-admits the table SHARDED (target 64) — the
         // wave appends then take the rollover-capable shard path. A dense SINGLE-BUFFER
@@ -286,7 +220,7 @@ fn a4e_concurrent_insert_waves_elide_and_match_twin() {
         }
         // Sample BEFORE the read: the full-projection SELECT below is a HOST-path shape, so
         // the A4e read-side ladder legitimately rehydrates + de-elides to serve it.
-        let elided_through_waves = e.table_install_elided("t");
+        let elided_through_waves = e.table_device_authoritative("t");
         let mut rows = e
             .execute_relational_select_text("SELECT id, v FROM t")
             .unwrap()
@@ -295,48 +229,37 @@ fn a4e_concurrent_insert_waves_elide_and_match_twin() {
         rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         (e, rows, elided_through_waves)
     };
-    let (off, off_rows, _off_elided) = run(false);
-    let (on, on_rows, on_elided_through_waves) = run(true);
+    let (on, on_rows, on_elided_through_waves) = run();
     assert_eq!(on_rows.len(), 500, "200 + 300 waves");
-    assert_eq!(on_rows, off_rows, "concurrent elided == install twin");
     assert!(
-        on.host_install_elisions() >= 250,
+        on.device_authoritative_commits() >= 250,
         "non-vacuity: the waves must have SKIPPED installs (got {})",
-        on.host_install_elisions()
+        on.device_authoritative_commits()
     );
     assert!(
         on_elided_through_waves,
         "steady state must STAY elided through ~5 rollovers (a de-elision = degradation)"
     );
-    assert_eq!(off.host_install_elisions(), 0);
 }
 
-/// TYPE-COVERAGE track 1 — CONSTRAINED ELISION differential: twin engines (elision ON vs OFF,
-/// `constrained_elision_enabled` ON in BOTH) run a PK'd table through the full constraint
-/// gauntlet. The ON twin ELIDES (PK'd tables are the core-banking shape the flag exists for);
-/// every outcome INCLUDING exact violation text must match the install twin:
-///   - dup of a SEEDED key and of an ELIDED-ERA key (the audit-B1 bypass repro: the elided
-///     host store/value_index is EMPTY for elided-era rows — a stale-view probe would let
-///     the dup IN silently),
+/// TYPE-COVERAGE track 1 — constrained device authority runs a PK'd table through the full
+/// constraint gauntlet. Every accepted/rejected outcome is checked directly:
+///   - dup of a seeded key and of a device-authoritative-era key,
 ///   - within-batch dup VALUES,
 ///   - dup-by-UPDATE, self-key UPDATE (exclude_keys), delete-then-reinsert,
 ///   - PK NOT NULL (23502 before 23505),
-///   - post-UPDATE churn probe: the SV5 append dups the id column in the open shard -> the
-///     cached index DECLINES (monotone) -> the probe ladder REHYDRATES (sticky de-elision)
-///     and must answer from the FRESH post-rehydration generation (the A5-flip SI-fix class).
+///   - post-UPDATE churn probe: the SV5 append creates physical key twins and the probe ladder
+///     must still resolve the exact visible device version.
 ///
-/// NON-VACUITY: the ON twin is still ELIDED after the INSERT-only prefix with elisions > 0
-/// and device-validate answering; the flag-OFF-arm eligibility gate is asserted by the
-/// existing `a4e_elision_lifecycle_matches_install_twin` UNIQUE-never-elides check.
+/// NON-VACUITY: the table is still device-authoritative after the INSERT-only prefix and the
+/// device validator answered probes.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn constrained_elision_pk_table_matches_install_twin() {
-    let run = |elide: bool| {
+fn device_authority_pk_constraint_ladder_matches_closed_form() {
+    let run = || {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_host_install_elision_enabled(elide);
-        e.set_constrained_elision_enabled(true);
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
             .unwrap();
         let mut seq = 2u64;
@@ -369,11 +292,11 @@ fn constrained_elision_pk_table_matches_install_twin() {
             );
             seq += 1;
         }
-        let elided_after_insert_prefix = e.table_install_elided("t");
-        // Churn + post-churn probes: exercises the decline -> rehydrate -> fresh-pin seam.
+        let elided_after_insert_prefix = e.table_device_authoritative("t");
+        // Churn + post-churn probes exercise exact version-aware device resolution.
         let churn_ladder = [
             "UPDATE t SET v = 999 WHERE id = 130", // SV5 append dups the open shard's id col
-            "INSERT INTO t (id, v) VALUES (130, 1)", // post-churn dup probe -> 23505 (rehydrates)
+            "INSERT INTO t (id, v) VALUES (130, 1)", // post-churn dup probe -> 23505
             "UPDATE t SET id = 42 WHERE id = 131", // dup-by-UPDATE -> 23505
             "UPDATE t SET id = 131 WHERE id = 131", // self-key UPDATE: excluded -> ok
             "DELETE FROM t WHERE id = 42",
@@ -395,26 +318,26 @@ fn constrained_elision_pk_table_matches_install_twin() {
         rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         (e, outcomes, rows, elided_after_insert_prefix)
     };
-    let (on, on_out, on_rows, on_elided_mid) = run(true);
-    let (off, off_out, off_rows, _off_elided_mid) = run(false);
+    let (on, outcomes, rows, on_elided_mid) = run();
+    let accepted = outcomes.iter().map(Result::is_ok).collect::<Vec<_>>();
     assert_eq!(
-        on_out, off_out,
-        "constrained outcome ladder (incl violation text): elided == install twin"
+        accepted,
+        vec![true, true, false, false, false, false, true, false, false, true, true, true],
+        "constraint outcome ladder"
     );
-    assert_eq!(on_rows, off_rows, "reads: elided == install twin");
+    assert_eq!(rows.len(), 202, "closed-form final cardinality");
     assert!(
         on_elided_mid,
         "the PK'd table must be ELIDED through the INSERT-only prefix (the flag's purpose)"
     );
     assert!(
-        on.host_install_elisions() > 0,
-        "non-vacuity: commits must have SKIPPED host installs on the PK'd table"
+        on.device_authoritative_commits() > 0,
+        "non-vacuity: device-authoritative commits fired on the PK'd table"
     );
     assert!(
         on.dml_device_validate_hits() > 0,
         "non-vacuity: the DEVICE validator must have answered probes"
     );
-    assert_eq!(off.host_install_elisions(), 0, "flag OFF never elides");
 }
 
 /// AUDIT f80f2350 FINDING A regression: a single-entry constraint DDL (`CREATE UNIQUE
@@ -535,7 +458,6 @@ fn constrained_elision_offlock_rehydrate_races_sequencer_safely() {
     let e = std::sync::Arc::new(Engine::new_local());
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
-    e.set_constrained_elision_enabled(true);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     for (seq, chunk) in (2_u64..).zip(0..2_i64) {
@@ -559,7 +481,7 @@ fn constrained_elision_offlock_rehydrate_races_sequencer_safely() {
         .unwrap();
     }
     assert!(
-        e.table_install_elided("t"),
+        e.table_device_authoritative("t"),
         "premise: the PK'd table is elided before the churn"
     );
     e.execute_text(300, "UPDATE t SET v = 999 WHERE id = 130")

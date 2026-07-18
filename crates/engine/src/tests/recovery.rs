@@ -2044,47 +2044,6 @@ fn checkpoint_vacuum_prunes_mvcc_versions_only_at_durable_safe_boundary() {
 }
 
 #[test]
-fn checkpoint_vacuum_reclaims_relational_value_index_update_churn() {
-    let e = Engine::new_local_cpu_oracle();
-    e.execute_text(1, "CREATE TABLE churn (id INT PRIMARY KEY, v INT)")
-        .unwrap();
-    e.execute_text(2, "INSERT INTO churn (id, v) VALUES (1, 0)")
-        .unwrap();
-    for value in 1..=128 {
-        e.execute_text(
-            value as u64 + 2,
-            &format!("UPDATE churn SET v = {value} WHERE id = 1"),
-        )
-        .unwrap();
-    }
-    let before = e.read_state.mvcc.value_index_snapshot();
-    assert_eq!(
-        before
-            .keys()
-            .filter(|slot| slot.table == "churn" && slot.column == "v")
-            .count(),
-        129,
-        "every historical update value is indexed before the GC fence"
-    );
-
-    let safe = e.committed_seq();
-    let stats = e.checkpoint_vacuum_mvcc_versions(safe).unwrap();
-    assert_eq!(stats.removed_versions, 128);
-    let after = e.read_state.mvcc.value_index_snapshot();
-    let values = after
-        .keys()
-        .filter(|slot| slot.table == "churn" && slot.column == "v")
-        .map(|slot| slot.value.clone())
-        .collect::<Vec<_>>();
-    assert_eq!(values, vec!["i:128".to_string()]);
-    let row = match parse_command("SELECT v FROM churn WHERE id = 1").unwrap() {
-        Command::Select(select) => e.execute_relational_select(&select).unwrap(),
-        other => panic!("expected SELECT, got {other:?}"),
-    };
-    assert_eq!(row.rows.row(0)[0], SqlValue::Int4(128));
-}
-
-#[test]
 fn checkpoint_vacuum_rejects_unsafe_boundaries() {
     // Stage 4 reasons in `commit_seq`/`Index` space (was façade-`txn_id`): the durable boundary is
     // `committed_seq`, and the active-snapshot guard is the oldest active READ SNAPSHOT.
@@ -2338,15 +2297,14 @@ fn w5a_binary_wal_records_replay_identically_to_text() {
             let e = Engine::with_durable_wal_segment(&path);
             // This fixture manually forces the pre-admission elided state to exercise WAL
             // encoding. Keep S-F out of that setup; otherwise CREATE auto-admits an empty device
-            // generation before the synthetic `set_table_install_elided` transition.
+            // generation before the synthetic `set_table_device_authoritative` transition.
             e.set_auto_admit_on_commit(false);
-            e.set_host_install_elision_enabled(false);
             e.set_binary_wal_records_enabled(binary);
             e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
             // Force the covered class deterministically (no GPU needed for the WAL semantics
             // under test): an elided table's prepare skips the value-index, which is exactly
             // reresolve_reuse_eligible / the binary-record condition.
-            e.set_table_install_elided("t", true);
+            e.set_table_device_authoritative("t", true);
             for i in 0..6 {
                 e.execute_dml_concurrent(
                     2 + i,
@@ -2393,7 +2351,7 @@ fn w5a_binary_records_interleave_with_text_and_survive_rotation() {
         // Text-record inserts (serialized path) BEFORE elision.
         e.execute_text(2, "INSERT INTO t (id, v) VALUES (100, 1)")
             .unwrap();
-        e.set_table_install_elided("t", true);
+        e.set_table_device_authoritative("t", true);
         // Binary-record inserts (covered concurrent path).
         for i in 0..4 {
             e.execute_dml_concurrent(3 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 2)"))

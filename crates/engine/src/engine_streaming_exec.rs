@@ -271,26 +271,11 @@ pub(crate) fn install_class_resolve_pin_hook() -> ClassResolvePinHook {
     (pinned, resume)
 }
 
+/// Test-only policy override for store-driven cold-cache and resident-oracle gates. Production
+/// class entry is unconditional; ignored GPU tests run serially and restore this flag on drop.
 #[cfg(test)]
-type ChunkKeyPrimePinHook = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
-
-#[cfg(test)]
-fn chunk_key_prime_pin_hook() -> &'static std::sync::Mutex<Option<ChunkKeyPrimePinHook>> {
-    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ChunkKeyPrimePinHook>>> =
-        std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-pub(crate) fn install_chunk_key_prime_pin_hook() -> ChunkKeyPrimePinHook {
-    let pinned = Arc::new(std::sync::Barrier::new(2));
-    let resume = Arc::new(std::sync::Barrier::new(2));
-    *chunk_key_prime_pin_hook()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        Some((Arc::clone(&pinned), Arc::clone(&resume)));
-    (pinned, resume)
-}
+pub(crate) static CHUNK_CLASS_ENTRY_ENABLED_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 /// P5-1: the chunk CONTENT-identity allocator (fresh iff the payload bytes are new).
 static COLD_CHUNK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -520,10 +505,6 @@ const STREAMING_COLD_SPILL_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 /// exercising their machinery on tables that would otherwise class-enter mid-test. Production
 /// behavior is unconditional.
 #[cfg(test)]
-pub(crate) static CHUNK_CLASS_ENTRY_ENABLED_TEST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-#[cfg(test)]
 pub(crate) static STREAMING_COLD_SPILL_THRESHOLD_TEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -549,8 +530,6 @@ const STREAMING_COLD_DISK_CAP_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 /// 6c-3 (audit MEDIUM): the eager commit-hook patches only deltas up to this many changed chains —
 /// larger writes defer to the lazy read-path patch so a bulk insert never stalls the global commit
 /// mutex on decode/build/spill work. Engine-internal, not config.
-const EAGER_PATCH_MAX_DELTA_ROWS: usize = 4096;
-
 /// A device reduction error that is a genuine arithmetic OVERFLOW (matched on the executor's stable PG
 /// overflow phrases). Such an error must surface, not defer to the CPU path (audit Finding 2).
 fn is_overflow_error(err: &ExecuteError) -> bool {
@@ -695,43 +674,41 @@ impl Engine {
             .load(Ordering::Relaxed)
     }
 
-    /// P4-2b telemetry.
+    /// Device-authoritative commits maintained through the chunk-tail path.
+    pub fn chunk_class_device_commits(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_device_commits
+            .load(Ordering::Relaxed)
+    }
+    /// Current number of chunk-authoritative relations.
     pub fn chunk_class_entries(&self) -> u64 {
         self.read_state
             .residency
-            .chunk_class_entries
-            .load(Ordering::Relaxed)
-    }
-    pub fn chunk_class_skipped_installs(&self) -> u64 {
-        self.read_state
-            .residency
-            .chunk_class_skipped_installs
-            .load(Ordering::Relaxed)
-    }
-    pub fn chunk_class_deauths(&self) -> u64 {
-        self.read_state
-            .residency
-            .chunk_class_deauths
-            .load(Ordering::Relaxed)
-    }
-    /// P4 reclamation telemetry: host store versions deleted at class entry.
-    pub fn chunk_class_reclaimed_rows(&self) -> u64 {
-        self.read_state
-            .residency
-            .chunk_class_reclaimed_rows
-            .load(Ordering::Relaxed)
+            .chunk_authoritative_tables
+            .load()
+            .len() as u64
     }
     /// P4 compaction telemetry.
+    #[cfg(test)]
     pub fn chunk_class_compactions(&self) -> u64 {
         self.read_state
             .residency
             .chunk_class_compactions
             .load(Ordering::Relaxed)
     }
+    #[cfg(test)]
     pub fn chunk_class_compacted_slots(&self) -> u64 {
         self.read_state
             .residency
             .chunk_class_compacted_slots
+            .load(Ordering::Relaxed)
+    }
+    /// Explicit RETIRE-002 repair exits from chunk authority.
+    pub fn chunk_class_deauths(&self) -> u64 {
+        self.read_state
+            .residency
+            .chunk_class_deauths
             .load(Ordering::Relaxed)
     }
 

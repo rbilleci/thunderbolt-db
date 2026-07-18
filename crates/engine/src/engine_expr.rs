@@ -48,8 +48,6 @@ pub(crate) use execution_source::{
     ResidentExecSource, ResidentVisibility, ShardedUnifiedExecSource,
 };
 
-#[cfg(test)]
-mod group_bench;
 mod select_bridge;
 mod sharded_route;
 mod sharded_source;

@@ -19,8 +19,9 @@ fn sharded_predicate_null_3vl_matches_single_buffer_oracle() {
         )
         .unwrap();
     };
-    let o = Engine::new_local(); // single-buffer ORACLE (M3 3VL-proven path)
+    let mut o = Engine::new_local(); // explicit single-buffer read-layout oracle
     load(&o);
+    install_test_single_buffer_residency(&mut o, "nn");
     let e = Engine::new_local(); // sharded-only table (null-bearing => single shard by construction)
     e.set_shard_residency_enabled(true);
     load(&e);
@@ -62,7 +63,6 @@ fn sharded_predicate_null_3vl_matches_single_buffer_oracle() {
 fn flip_f1_filtered_shapes_gpu_served_and_match_single_buffer_oracle() {
     let load = |e: &Engine| {
         // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-        e.set_host_install_elision_enabled(false);
         e.set_auto_admit_on_commit(true);
         e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
             .unwrap();
@@ -77,9 +77,9 @@ fn flip_f1_filtered_shapes_gpu_served_and_match_single_buffer_oracle() {
             .unwrap();
         }
     };
-    let o = Engine::new_local(); // single-buffer ORACLE
-    o.set_shard_residency_enabled(false);
+    let mut o = Engine::new_local(); // explicit single-buffer read-layout oracle
     load(&o);
+    install_test_single_buffer_residency(&mut o, "t");
     let e = Engine::new_local(); // sharded by default
     load(&e);
     assert!(
@@ -133,9 +133,10 @@ fn flip_sharded_join_matches_single_buffer_oracle() {
         e.execute_text(4, "INSERT INTO r (k, w) VALUES (2,200),(3,300),(5,500)")
             .unwrap();
     };
-    let o = Engine::new_local();
-    o.set_shard_residency_enabled(false);
+    let mut o = Engine::new_local();
     load(&o);
+    install_test_single_buffer_residency(&mut o, "l");
+    install_test_single_buffer_residency(&mut o, "r");
     let e = Engine::new_local();
     load(&e);
     assert!(

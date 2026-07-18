@@ -149,8 +149,6 @@ fn device_locate_same_shard_twin_point_read_and_reinsert() {
 fn plain_scan_over_versioned_elided_table_stays_elided() {
     let e = Engine::new_local();
     e.set_auto_admit_on_commit(true);
-    e.set_host_install_elision_enabled(true);
-    e.set_constrained_elision_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
@@ -167,13 +165,13 @@ fn plain_scan_over_versioned_elided_table_stays_elided() {
         .unwrap();
         seq += 1;
     }
-    if !e.table_install_elided("t") {
+    if !e.table_device_authoritative("t") {
         return; // driverless box / never elided -> nothing to prove
     }
     // DELETE a row -> the shard becomes VERSIONED (a deleted_by region). Stays elided (U1).
     e.execute_text(seq, "DELETE FROM t WHERE id = 50").unwrap();
     assert!(
-        e.table_install_elided("t"),
+        e.table_device_authoritative("t"),
         "an in-place tombstone must not de-elide"
     );
     // THE GATE: a plain unfiltered scan must NOT de-elide, and must hide the tombstoned row.
@@ -183,7 +181,7 @@ fn plain_scan_over_versioned_elided_table_stays_elided() {
         .rows
         .into_boxed();
     assert!(
-        e.table_install_elided("t"),
+        e.table_device_authoritative("t"),
         "a plain scan over a versioned elided table must NOT de-elide (route it on-device)"
     );
     assert!(
@@ -195,7 +193,7 @@ fn plain_scan_over_versioned_elided_table_stays_elided() {
     let _ = e
         .execute_relational_select_text("SELECT id, v FROM t")
         .unwrap();
-    assert!(e.table_install_elided("t"), "repeat scan stays elided");
+    assert!(e.table_device_authoritative("t"), "repeat scan stays elided");
     // `SELECT *` (SelectProjection::All) over the all-int4 table ALSO stays elided + hides the
     // tombstone (the classifier's All arm routes it on-device too).
     let star = e
@@ -204,7 +202,7 @@ fn plain_scan_over_versioned_elided_table_stays_elided() {
         .rows
         .into_boxed();
     assert!(
-        e.table_install_elided("t"),
+        e.table_device_authoritative("t"),
         "SELECT * over a versioned elided table must NOT de-elide"
     );
     assert_eq!(star.len(), 199, "SELECT * hides the tombstoned row too");

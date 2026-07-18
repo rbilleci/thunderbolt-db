@@ -189,11 +189,11 @@ keep-shard-0 if all pruned) → then, in order:
    DEVICE hash index in-kernel (O(log shards) binary routing when the host proves ascending-disjoint
    zone maps), dense per-needle emit, one DtoH. Requires effectively-version-free shards (no
    in-kernel visibility gate — the host decline enforces it).
-2. **batched host gather**: cached per-shard bloom (no false negatives) → host hash probe → one
-   kernel-gather + bulk DtoH per (shard, column) → batched per-slot `deleted_by`/`created_by` gates at
-   the READER'S boundary → scatter to needle order.
-3. **3b single-flight locate**: per-hit `ShardPkHit` captures (descriptor, buffer, regions, slot) from
-   one snapshot; per-slot visibility gates; materializes one row.
+2. **batched GPU gather**: one multi-shard device locate/probe plus device gather emits a flat status/row
+   result for the whole needle batch, followed by one bounded DtoH. No per-needle host probe or merge occurs.
+3. **single-flight device locate**: a device write-locate returns bounded physical coordinates; each
+   `ShardPkHit` pins the descriptor, payload, and visibility regions from one captured generation before
+   the selected row is gathered.
 4. **the scan** (route 1..3 decline on: dup keys, non-int4, null-bearing table, oversize, versioned-
    beyond-hwm, any device error) — always correct, NULL-aware, visibility-gated.
 
@@ -202,13 +202,11 @@ All point-route declines are *result-invariant*: they only ever cost the slower 
 ## 7. Per-shard indexes
 
 Immutable per-shard PK indexes (billions-rows: maintenance is never O(table)):
-- **Host cache** (`CachedShardPkIndex`): open-addressing hash `(key<<32)|(row+1)` + membership bloom,
-  built once per shard generation from a DtoH of the key column; validated by `(resident_device_ptr,
-  row_count)`; the entry `Arc`-pins the buffer it indexed (ABA guard). `index: None` caches a DECLINE
-  (duplicate keys — e.g. an UPDATE's old+new versions in one shard — or oversize); dup-ness is
-  monotone under appends, so a decline is not rebuilt per statement.
-- **Device index** (`CachedShardPkDeviceIndex`): the same table uploaded once per generation for the
-  dense kernel; same validation + pinning.
+- **Device index** (`CachedShardPkDeviceIndex`): typed keys/fingerprints and exact collision checks are
+  built and probed on-device, cached per generation, validated by exact payload/index extents plus the
+  resident-buffer ABA guard, and pinned by the cache entry.
+- Duplicate, NULL, version, capacity, or device-validation declines never dispatch to a host index or
+  relational probe; the caller uses another GPU route or fails closed.
 - Sealed shards never rebuild. Any remaining open-shard index rebuild cost must be re-measured under
   **PERF-001** before an optimization is scheduled.
 - Purge: `purge_shard_pk_index_for_table` at all retire sites, 1:1 with the region purges.

@@ -88,7 +88,7 @@ fn cross_shard_pk_index_locate_matches_scan_locate() {
 }
 
 /// CROSS-SHARD PK INDEX sub-slice 3 (CACHE): the per-shard index cache is populated on first locate, and
-/// on a GENERATION CHANGE (a DELETE re-admits the table -> new device ptrs + SHIFTED row slots) the stale
+/// on a GENERATION CHANGE (an explicit post-DELETE vacuum -> new device ptrs + SHIFTED row slots) the stale
 /// cached index is NOT served -- ptr-validation rebuilds, so locate still == the scan on the NEW buffer.
 /// This is the load-bearing cache-correctness gate: deleting id=50 moves id=51 from slot 51 to slot 50 in
 /// shard 0, so a stale index would return the WRONG slot. Sabotage: drop the ptr check (serve stale) and
@@ -97,9 +97,6 @@ fn cross_shard_pk_index_locate_matches_scan_locate() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn cross_shard_pk_index_cache_rebuilds_on_generation_change() {
     let e = Engine::new_local();
-    // THE FLIP: this test exercises the re-admit/scan-layer semantics — pin the pre-flip
-    // configuration it tests (each flag remains a supported kill switch).
-    e.set_resident_delete_tombstone_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
@@ -150,10 +147,12 @@ fn cross_shard_pk_index_cache_rebuilds_on_generation_change() {
         "the per-shard PK index cache is populated after a locate"
     );
 
-    // GENERATION CHANGE: a DELETE (delete-tombstone flag OFF) invalidates + re-admits -> new device ptrs
-    // AND shifts shard-0 rows (id=50 removed -> id=51 moves from slot 51 to slot 50).
+    // GENERATION CHANGE: normal DELETE tombstones in place, then explicit vacuum rebuilds the
+    // authoritative device image with new ptrs and shifts shard-0 rows (id=50 removed -> id=51
+    // moves from slot 51 to slot 50).
     e.execute_text(202, "DELETE FROM accounts WHERE id = 50")
         .unwrap();
+    e.vacuum_table("accounts").unwrap();
     let table2 = e.relational_catalog_table("accounts").unwrap();
 
     // The stale cached index (old ptr) must NOT be served: ptr-validation rebuilds against the new buffer.
@@ -240,16 +239,13 @@ fn cross_shard_pk_index_cache_rebuilds_on_in_place_append() {
 }
 
 /// CROSS-SHARD PK INDEX sub-slice 3b (cache LIFECYCLE CLEANUP): the device index cache is PURGED for a
-/// table on the residency-change lifecycle events (an invalidating commit's re-admit, and DROP), so a
+/// table on the residency-change lifecycle events (an explicit vacuum rebuild, and DROP), so a
 /// wired index route can't leak the pinned shard buffers of a no-longer-resident table. Sabotage: make
-/// `purge_shard_pk_index_for_table` a no-op and the post-DELETE / post-DROP "cache empty" asserts FAIL.
+/// `purge_shard_pk_index_for_table` a no-op and the post-VACUUM / post-DROP "cache empty" asserts FAIL.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn cross_shard_pk_index_cache_purged_on_lifecycle() {
     let e = Engine::new_local();
-    // THE FLIP: this test exercises the re-admit/scan-layer semantics — pin the pre-flip
-    // configuration it tests (each flag remains a supported kill switch).
-    e.set_resident_delete_tombstone_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
@@ -289,13 +285,14 @@ fn cross_shard_pk_index_cache_purged_on_lifecycle() {
     assert_eq!(locate(130).len(), 1);
     assert!(entries("accounts") > 0, "cache populated after a locate");
 
-    // An invalidating commit (DELETE -> invalidate + re-admit) purges the table's cache.
+    // Normal DELETE remains device-native; explicit vacuum performs the rebuild and purges the cache.
     e.execute_text(202, "DELETE FROM accounts WHERE id = 5")
         .unwrap();
+    e.vacuum_table("accounts").unwrap();
     assert_eq!(
         entries("accounts"),
         0,
-        "invalidate/re-admit purged the cache (no leaked pinned buffers)"
+        "vacuum rebuild purged the cache (no leaked pinned buffers)"
     );
 
     // Re-populate, then DROP TABLE purges via apply_drop_table.
@@ -444,7 +441,6 @@ fn cross_shard_pk_index_route_deleted_by_gate() {
     let t = Engine::new_local();
     t.set_shard_residency_enabled(true);
     t.set_auto_admit_on_commit(true);
-    t.set_resident_delete_tombstone_enabled(true); // stamp deleted_by IN PLACE -> versioned shard
     t.set_shard_size_target(64);
     t.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
         .unwrap();

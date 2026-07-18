@@ -3,10 +3,12 @@
 //! `docs/PLAN.md` remains the sole owner of future version-storage, index, and concurrency design.
 
 use super::shard_pruning::{mandatory_int4_equalities, shard_zone_map_excludes};
-use crate::engine_expr_ir::{ResidentBinaryOp, ResidentExpr};
+use crate::engine_expr_ir::ResidentExpr;
 use crate::relational_model::RelationalTable;
-use crate::{DdlCatalogState, Engine};
-use gpu_db_sql::{SqlType, SqlValue};
+#[cfg(test)]
+use crate::DdlCatalogState;
+use crate::Engine;
+use gpu_db_sql::SqlValue;
 use gpu_db_types::Index;
 
 enum DetailedLocateAttempt {
@@ -21,11 +23,12 @@ impl Engine {
     /// `lower_resident_predicate`. PER-SHARD (NOT the recompacted unified buffer of the read path), so the
     /// returned slots are LOCAL to each shard's own device buffer -- exactly what the per-shard,
     /// local-slot-indexed `deleted_by` region needs. Returns `None` if the table is not shard-resident / a
-    /// shard is invalid or missing device memory / the predicate cannot lower on a shard (caller falls back to
-    /// the O(table) invalidate + re-admit). Visibility = `None`: locate addresses PHYSICAL positions (a DELETE
+    /// shard is invalid or missing device memory / the predicate cannot lower on a shard (the commit fails
+    /// closed). Visibility = `None`: locate addresses PHYSICAL positions (a DELETE
     /// stamps a row by WHERE IT SITS, independent of read-time visibility; the raw buffer's rows are present),
     /// and only reads that already-committed shard buffer. WIRED by SV4b (the DELETE commit path routes
-    /// through `try_tombstone_resident_delete_commit`).
+    /// through `try_tombstone_resident_delete_table`).
+    #[cfg(test)]
     pub(crate) fn locate_resident_delete_slots(
         &self,
         table: &RelationalTable,
@@ -99,9 +102,9 @@ impl Engine {
     /// liveness check. This closes the concurrent TOCTOU the slot-only variant would expose to a lock-free
     /// caller: a reordering re-admit (VACUUM / SV3a recompaction) between two independent `shards.load()`s
     /// could otherwise apply one generation's slots to another generation's compacted buffer = a wrong row.
-    /// Mirrors `locate_resident_pk_via_shard_index_detailed`'s single-snapshot discipline. `None` = decline
-    /// (the caller rehydrates): not shard-resident, a shard invalid / memory-pressured / catalog-mismatched /
-    /// superseded (W0) / missing its device memory, or a predicate that could not lower on a shard.
+    /// Mirrors `locate_resident_pk_via_shard_index_detailed`'s single-snapshot discipline. `None`
+    /// means no complete device verdict; a DML caller rejects before WAL or fails stop after the
+    /// durable cut rather than reconstructing host state.
     pub(crate) fn locate_resident_delete_slots_detailed(
         &self,
         table: &RelationalTable,
@@ -361,12 +364,10 @@ impl Engine {
 
     /// SV4 (GPU-native DELETE): LOCATE the resident slots matching `predicate` + stamp `deleted_by =
     /// commit_seq` on them IN PLACE (O(rows touched)), instead of the O(table) invalidate + re-admit. Returns
-    /// `Some(n)` = n slots tombstoned (n may be 0: the predicate matched no resident row -- still a success,
-    /// nothing to re-admit); `None` = the caller must fall back to invalidate + re-admit (not shard-resident /
-    /// locate could not run / a tombstone write failed). A PARTIAL stamp before a `None` is harmless: the
-    /// fallback re-admit rebuilds every shard all-live from the host store (which already applied the DELETE)
-    /// AND SV4-prereq-#1 releases any partial `deleted_by` region. MUST run under the commit lock so the
+    /// `Some(n)` = n slots tombstoned (n may be 0: the predicate matched no resident row -- still a success);
+    /// `None` = the test helper could not complete the device mutation. MUST run under the commit lock so the
     /// per-shard `deleted_by` get-or-allocate is atomic (SV2 prereq #2). WIRED by SV4b.
+    #[cfg(test)]
     pub(crate) fn try_tombstone_resident_delete(
         &self,
         table: &RelationalTable,
@@ -423,235 +424,13 @@ impl Engine {
         Some(total)
     }
 
-    /// Locate + tombstone the deleted row through one device-supported unique index. Raw single-i32
-    /// indexes use their literal needle; compound/wider indexes use their fingerprint. A NULL member
-    /// or index decline falls through to the canonical typed/`IS NULL` structural scan. Every hit is
-    /// materialized and tuple-rechecked before the exact-one stamp, so fingerprint collisions and
-    /// visibility drift fail closed.
-    fn try_tombstone_resident_delete_via_unique_index(
-        &self,
-        table: &RelationalTable,
-        index: &crate::relational_model::RelationalIndex,
-        ord: usize,
-        row: &[SqlValue],
-        commit_seq: Index,
-    ) -> Option<usize> {
-        let key_id = crate::engine_residency::index_probe_key_id(table, index, ord)?;
-        let key_positions = crate::engine_residency::index_key_column_positions(table, index)?;
-        let key_cols = key_positions
-            .iter()
-            .map(|&column_idx| Some((column_idx, row.get(column_idx)?.clone())))
-            .collect::<Option<Vec<_>>>()?;
-        let needle = if crate::engine_residency::index_uses_fingerprint(table, index) {
-            crate::engine_residency::compound_index_row_fingerprint(table, index, row)
-        } else {
-            let column_idx = *key_positions.first().filter(|_| key_positions.len() == 1)?;
-            crate::engine_residency::i32_section_needle(
-                table.columns.get(column_idx)?.ty,
-                row.get(column_idx)?,
-            )
-        };
-        let hits = needle
-            .and_then(|needle| {
-                self.locate_resident_pk_via_shard_index_detailed(table, key_id, needle)
-            })
-            .or_else(|| {
-                // Partial-NULL compound keys have no complete fingerprint, and a device-index
-                // decline is not permission to rehydrate a GPU-authoritative table. Use the same
-                // exact typed/IS-NULL predicate as constraint validation, then tuple-materialize
-                // below before stamping.
-                let predicate =
-                    crate::engine_dml_prepare::device_structural_tuple_predicate(table, &key_cols)?;
-                self.locate_resident_delete_slots_detailed(table, &predicate)
-            })?;
-        // TUPLE-VERIFY every fingerprint hit: materialize the slot at the commit boundary (created_by <=
-        // seq && deleted_by > seq = snapshot-live, so an already-tombstoned slot yields None and is
-        // dropped — the SI-fix already-dead discipline), then confirm the full key tuple matches. A device
-        // decline (materialize None) re-admits.
-        let mut matched: Vec<(u32, u32)> = Vec::new();
-        for hit in &hits {
-            let materialized = self.materialize_resident_row_via_hit(table, hit, commit_seq);
-            let mrow = match materialized {
-                Some(Some(mrow)) => mrow,
-                Some(None) => continue, // not snapshot-live (already dead / future): not our slot
-                None => return None, // can't materialize (device err / wider value column) -> re-admit
-            };
-            if key_positions.iter().all(|&p| mrow.get(p) == row.get(p)) {
-                matched.push((hit.shard_id, hit.slot));
-            }
-        }
-        // EXACT-1: a unique key identifies exactly one live slot. Anything else (0 = the resolved row
-        // moved/vanished; >1 = a fingerprint collision that both tuple-matched, impossible for a unique
-        // key but guarded) declines to the re-admit.
-        if matched.len() != 1 {
-            return None;
-        }
-        let (shard_id, slot) = matched[0];
-        if !self.tombstone_resident_shard_slots(&table.name, shard_id, &[slot], commit_seq) {
-            return None;
-        }
-        Some(1)
-    }
-
-    /// Pick a unique index requiring tuple-aware locate for this row. NULL-bearing indexes take
-    /// priority even when raw/all-i32 because their key has no probe needle. Otherwise a
-    /// fingerprint-backed compound/wider index covers columns the legacy int4 image cannot.
-    fn index_needing_tuple_locate<'a>(
-        table: &'a RelationalTable,
-        row: &[SqlValue],
-    ) -> Option<(usize, &'a crate::relational_model::RelationalIndex)> {
-        let eligible = |index: &crate::relational_model::RelationalIndex| {
-            index.unique && crate::engine_residency::index_all_key_columns_foldable(table, index)
-        };
-        table
-            .indexes
-            .iter()
-            .enumerate()
-            .find(|(_, index)| {
-                eligible(index)
-                    && crate::engine_residency::index_key_column_positions(table, index)
-                        .is_some_and(|positions| {
-                            positions
-                                .iter()
-                                .any(|&position| matches!(row.get(position), Some(SqlValue::Null)))
-                        })
-            })
-            .or_else(|| {
-                table.indexes.iter().enumerate().find(|(_, index)| {
-                    eligible(index) && crate::engine_residency::index_uses_fingerprint(table, index)
-                })
-            })
-    }
-
-    /// SV4b (commit path): for a single-entry DELETE commit, LOCATE + tombstone the deleted rows' resident
-    /// slots IN PLACE instead of the O(table) invalidate + re-admit. Builds an int4-equality predicate that
-    /// matches the deleted row's resident int4 columns and stamps the located slots. Returns `true` (the
-    /// caller SKIPS re-admit) ONLY when the located+tombstoned count EXACTLY equals the deleted-row count;
-    /// ANY ambiguity or unsupported shape returns `false` -> the caller invalidates + re-admits (rebuild
-    /// all-live from the host store = always correct, so a false here is only a missed optimization, never a
-    /// wrong result). Conservative FIRST-SLICE scope: exactly one deleted row, all int4 columns non-NULL
-    /// plain `Int4`. `cat` is the catalog the commit already holds (NO latch re-entry). Runs under
-    /// commit_mutex + catalog latch, so the per-shard `deleted_by` get-or-allocate is atomic (SV2 prereq #2).
-    /// (Audit note: `cat` is the WORKING catalog while `prepare_delete` decoded the row against the published
-    /// snapshot; for a single-entry non-DDL commit under the held latch these are the same shape, and any
-    /// mismatch is caught by the `row.len() != table.columns.len()` guard below -> fallback.)
-    pub(crate) fn try_tombstone_resident_delete_commit(
-        &self,
-        cat: &DdlCatalogState,
-        table_name: &str,
-        deleted_rows: &[Vec<SqlValue>],
-        commit_seq: Index,
-    ) -> bool {
-        let Some(table) = cat.relational_catalog.get(table_name) else {
-            return false;
-        };
-        self.try_tombstone_resident_delete_table(table, deleted_rows, commit_seq)
-    }
-
-    /// Concurrent-wave counterpart to [`Self::try_tombstone_resident_delete_commit`]. The wave
-    /// pins the published catalog generation before sequencing and cannot take the DDL latch while
-    /// holding the commit mutex, so it passes the table from that pinned generation directly.
-    pub(crate) fn try_tombstone_resident_delete_table(
-        &self,
-        table: &RelationalTable,
-        deleted_rows: &[Vec<SqlValue>],
-        commit_seq: Index,
-    ) -> bool {
-        // RETIREMENT A4b: MULTI-ROW — per-row locate + tombstone, each gated EXACT count == 1. Any
-        // ambiguity on ANY row (dup int4 values across the statement's rows, a locate miss, an
-        // int4-identical already-tombstoned slot, NULL/non-int4) returns false -> the caller
-        // invalidates + re-admits, which SUPERSEDES any tombstones already stamped this commit
-        // (they are pre-publish; the re-admit rebuilds all-live and releases the regions — the
-        // same partial-failure argument SV5 documented for tombstone-without-append).
-        if deleted_rows.is_empty() {
-            // ADR-006: a ZERO-ROW DELETE (WHERE matched nothing) is a data NO-OP — nothing to tombstone,
-            // the elided table is byte-unchanged. Report it HANDLED (`true`) so the commit path keeps the
-            // table ELIDED instead of treating the no-op as unhandled and REHYDRATING (de-eliding) it — a
-            // pure de-elide trigger on the common `DELETE ... WHERE <no match>` OLTP shape (confirmed via
-            // backtrace: apply_and_publish_committed_inner's `!handled && elided -> rehydrate` arm).
-            // `deleted_rows` is the APPLIED removed set (resolved at apply), so empty == genuinely zero
-            // matches, never a resolution failure. Elision-ENTER is separately gated on a non-empty applied
-            // set in the caller, so this no-op never drives a table INTO elision.
-            return true;
-        }
-        for row in deleted_rows {
-            if row.len() != table.columns.len() {
-                return false;
-            }
-            if let Some((ord, index)) = Self::index_needing_tuple_locate(table, row) {
-                if !matches!(
-                    self.try_tombstone_resident_delete_via_unique_index(
-                        table, index, ord, row, commit_seq
-                    ),
-                    Some(1)
-                ) {
-                    return false;
-                }
-                continue;
-            }
-            let Some(predicate) = Self::resident_int4_row_predicate(table, row) else {
-                return false;
-            };
-            // EXACT-1 per row. NOTE: a slot tombstoned by an EARLIER row of this same statement
-            // may still be visible to this locate (stamped at commit_seq, read below it) — that
-            // can only happen when two deleted rows are int4-identical, and then the FIRST row's
-            // locate already saw count 2 and bailed. The per-row gate is the wrong-results net.
-            if !matches!(
-                self.try_tombstone_resident_delete(table, &predicate, commit_seq),
-                Some(1)
-            ) {
-                return false;
-            }
-        }
-        // VACUUM #5: every stamped tombstone is a DEAD SLOT until a rebuild — feed the churn
-        // signal the auto-trigger reads (serialized path; the counter resets on any re-admit).
-        self.add_tombstone_churn(&table.name, deleted_rows.len() as u64);
-        true
-    }
-
-    /// The AND-of-int4-equalities predicate locating exactly one physical row image: `(col_i =
-    /// v_i)` over the table's plain-`Int4` columns. `None` when any int4 column holds NULL or a
-    /// non-`Int4` value, or the table has zero int4 columns (cannot safely locate) -> re-admit.
-    fn resident_int4_row_predicate(
-        table: &RelationalTable,
-        row: &[SqlValue],
-    ) -> Option<ResidentExpr> {
-        let mut predicate: Option<ResidentExpr> = None;
-        for (idx, column) in table.columns.iter().enumerate() {
-            if column.ty != SqlType::Int4 {
-                continue;
-            }
-            let value = match &row[idx] {
-                SqlValue::Int4(v) => *v,
-                _ => return None,
-            };
-            let eq = ResidentExpr::Binary {
-                op: ResidentBinaryOp::Eq,
-                lhs: Box::new(ResidentExpr::Column(idx)),
-                rhs: Box::new(ResidentExpr::Int4Literal(value)),
-            };
-            predicate = Some(match predicate {
-                None => eq,
-                Some(prev) => ResidentExpr::Binary {
-                    op: ResidentBinaryOp::And,
-                    lhs: Box::new(prev),
-                    rhs: Box::new(eq),
-                },
-            });
-        }
-        predicate
-    }
-
     /// SV5 (commit path): for a single-entry UPDATE commit, TOMBSTONE the OLD version's resident slot + APPEND
-    /// the NEW image to the open shard IN PLACE, instead of the O(table) invalidate + re-admit. ORDER matters:
+    /// the NEW image to the open shard IN PLACE. ORDER matters:
     /// tombstone-OLD FIRST so `locate` runs on the buffer BEFORE the new row is appended -- an UPDATE that
     /// leaves the int4 columns UNCHANGED still locates EXACTLY the old row (count 1) rather than matching both
-    /// the old + the just-appended new slot. Returns `true` (caller SKIPS re-admit) only if BOTH steps
-    /// succeed; ANY failure (multi-row / NULL / non-int4 / dup-ambiguous / non-resident / no append headroom)
-    /// returns `false` -> the caller invalidates + re-admits, which rebuilds the table all-live from the host
-    /// store (old hidden + new present, the version rewrite already applied) = always correct. So a partial
-    /// tombstone-without-append (append failed after the tombstone) is harmless -- the re-admit supersedes it
-    /// and SV4-prereq-#1 releases the partial region. Runs under commit_mutex + catalog latch.
+    /// the old + the just-appended new slot. Returns `true` only if BOTH steps succeed. Any failure
+    /// returns `false`; the enclosing durable apply then wedges before acknowledgement and WAL replay
+    /// reconstructs the device generation. Runs under commit_mutex + catalog latch.
     ///
     /// **SI (SV6 — the audit-flagged P2 flip-gate, FIXED):** the append + `row_count` bump happen BEFORE
     /// `publish_committed_seq`, and lock-free reads bind `read_txn_id = committed_seq()` then load `shards`
@@ -666,6 +445,7 @@ impl Engine {
     /// `sv6_created_by_gate_reader_at_prior_snapshot_never_sees_updated_key_twice` torn-window differential
     /// and the concurrent hammer test. (DELETE/SV4b needs no lower bound -- no new row; a plain INSERT
     /// append stays unstamped/born-visible, the milder as-if-later read of a decided commit.)
+    #[cfg(test)]
     pub(crate) fn try_update_resident_commit(
         &self,
         cat: &DdlCatalogState,
@@ -681,8 +461,7 @@ impl Engine {
         self.try_update_resident_table(table, old_rows, new_rows, commit_seq, row_ids)
     }
 
-    /// Concurrent-wave counterpart to [`Self::try_update_resident_commit`], using the table from
-    /// the wave's pinned catalog generation rather than re-entering the DDL latch.
+    /// Device UPDATE maintenance using a table from the caller's pinned catalog generation.
     pub(crate) fn try_update_resident_table(
         &self,
         table: &RelationalTable,
@@ -693,9 +472,8 @@ impl Engine {
     ) -> bool {
         // ADR-006: a ZERO-ROW UPDATE (WHERE matched nothing) is a data NO-OP — `old_rows`/`new_rows` are
         // both empty (parallel), nothing to tombstone or append, the elided table is byte-unchanged.
-        // Report it HANDLED (`true`) so the commit path keeps the table ELIDED instead of REHYDRATING it
-        // (the `DELETE/UPDATE ... WHERE <no match>` de-elide trigger). Elision-ENTER is separately gated on
-        // a non-empty applied set in the caller, so this no-op never drives a table INTO elision.
+        // Report it handled so the commit path retains the unchanged device generation. Authority entry
+        // is separately gated on a non-empty applied set, so the no-op cannot establish authority.
         if old_rows.is_empty() {
             return new_rows.is_empty();
         }
@@ -705,22 +483,26 @@ impl Engine {
         {
             return false;
         }
-        // 1. Tombstone every OLD version's slot (locates run on the buffer BEFORE the appends).
-        if !self.try_tombstone_resident_delete_table(table, old_rows, commit_seq) {
+        let Some(row_ids) = row_ids else {
+            return false;
+        };
+        // 1. Tombstone every OLD version by its stable device identity (locates run on the buffer
+        // BEFORE the appends). The identity+full-row verification covers nullable and mixed-width
+        // images that the retired all-int4 structural predicate could not name.
+        if !self.try_tombstone_rows_by_identity(table, old_rows, row_ids, commit_seq) {
             return false;
         }
         // 2. Append the NEW image to the open shard, stamped `created_by = commit_seq` (SV6 — the P2
         //    flip-gate fix): the append + row_count bump land BEFORE `publish_committed_seq`, so a
         //    concurrent reader bound to `committed_seq = C-1` can observe the appended slots; the stamp +
         //    the read path's `created_by <= read_txn_id` device conjunct hide the new version from that
-        //    reader (it sees exactly the OLD version, still live at its snapshot). If this fails AFTER the
-        //    tombstone, the caller's re-admit rebuilds all-live from the host store (which already applied
-        //    the version rewrite), superseding.
+        //    reader (it sees exactly the OLD version, still live at its snapshot). If this fails after
+        //    the tombstone, the enclosing commit wedges before acknowledgement and recovery replays WAL.
         if !self.try_append_resident_int4_open_shard(
             &table.name,
             new_rows,
             crate::engine_residency::AppendCreatedBy::UpdateNewVersion(commit_seq),
-            row_ids,
+            Some(row_ids),
         ) {
             return false;
         }

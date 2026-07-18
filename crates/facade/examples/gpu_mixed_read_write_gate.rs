@@ -3,7 +3,7 @@
 //! Readers use the real facade `PointLookupBatcher` over a sharded resident int4-PK table
 //! while concurrent facade writers append fresh rows. The run fails unless every read was admitted
 //! by the batcher with no per-query fallback, GPU multi-shard index-probe batches fired inside the exact
-//! writer-active interval, every write elided its host install, and resident device append waves fired.
+//! writer-active interval, every write published device authority, and resident append waves fired.
 //! Visibility-sensitive append windows must remain on the dense probe; any host-gather batch fails the gate.
 //! Its >100k read-QPS floor is a gate-local non-vacuity/capacity control, not the charter's aggregate
 //! committed-TPS target; BENCH-001 alone owns the canonical mixed-system throughput decision.
@@ -106,7 +106,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             "STRATA S-F regression: production auto-admission is not enabled by default".into(),
         );
     }
-    engine.set_host_install_elision_enabled(true);
     let shared = Arc::new(SharedEngine::from_engine(engine));
     execute_on_shared_engine(
         &shared,
@@ -345,8 +344,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .open_shard_append_commits
         .saturating_sub(before.open_shard_append_commits);
     let elisions = after
-        .host_install_elisions
-        .saturating_sub(before.host_install_elisions);
+        .device_authoritative_commits
+        .saturating_sub(before.device_authoritative_commits);
     let writes = committed_writes.load(Ordering::Relaxed);
     let overlaps = overlapping_writes.load(Ordering::Relaxed);
     let read_overlaps = overlapping_reads.load(Ordering::Relaxed);
@@ -423,7 +422,7 @@ fn main() -> Result<(), Box<dyn Error>> {
          writer_active_p99={writer_active_p99}us writer_active_p99.9={writer_active_p999}us \
          sharded_gpu_batches={gpu_batches} gpu_batches_during_writes={gpu_write_overlap} \
          host_gather_batches={} fallback_groups={} device_appends={appends} \
-         host_install_elisions={elisions}",
+         device_authoritative_commits={elisions}",
         sharded_batches - gpu_batches,
         sharded_fallback_groups
     );
@@ -439,7 +438,7 @@ fn main() -> Result<(), Box<dyn Error>> {
          \"host_gather_batches\":{},\
          \"sharded_fallback_groups\":{},\
          \"device_appends\":{appends},\
-         \"host_install_elisions\":{elisions}}}",
+         \"device_authoritative_commits\":{elisions}}}",
         readers * reader_warmup,
         warmup_elapsed.as_secs_f64() * 1_000.0,
         sharded_batches - gpu_batches,

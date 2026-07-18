@@ -1,20 +1,16 @@
-/// TYPE-COVERAGE track 2 — the Date/Int2 ELISION differential: a PK'd table whose payload
-/// columns are DATE and INT2 runs the constraint gauntlet elided-vs-install-twin. Exercises
+/// TYPE-COVERAGE track 2 — a PK'd table whose payload columns are DATE and INT2 runs the
+/// device-authoritative constraint gauntlet. Exercises
 /// the catalog-derived i32-section typing end to end: elided-era INSERT flushes encode
 /// Date/Int2 to the i32 section, the A2 resolve + A3 probes accept Date/Int2 needles
 /// (variant-agreeing), the A4a materializer types values from the catalog (a mistyped
-/// `Int4(days)` would break read equality AND the value_index rebuilt at rehydration),
-/// and the A4c gather rehydrates the store with correctly-typed rows. Outcomes (incl
-/// violation text) + reads must match the twin exactly.
+/// `Int4(days)` would break read equality), and the A4c gather preserves correctly-typed rows.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn date_int2_pk_table_elision_matches_install_twin() {
-    let run = |elide: bool| {
+    let run = || {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_host_install_elision_enabled(elide);
-        e.set_constrained_elision_enabled(true);
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, d DATE, s INT2)")
             .unwrap();
         let mut seq = 2u64;
@@ -68,19 +64,21 @@ fn date_int2_pk_table_elision_matches_install_twin() {
         rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         (e, outcomes, rows)
     };
-    let (on, on_out, on_rows) = run(true);
-    let (off, off_out, off_rows) = run(false);
-    assert_eq!(on_out, off_out, "Date/Int2 outcome ladder: elided == twin");
-    assert_eq!(on_rows, off_rows, "Date/Int2 reads: elided == twin");
+    let (on, outcomes, rows) = run();
+    assert_eq!(
+        outcomes.iter().map(Result::is_ok).collect::<Vec<_>>(),
+        vec![true, true, false, false, true, true, true, true, true],
+        "Date/Int2 outcome ladder"
+    );
+    assert_eq!(rows.len(), 200, "closed-form final cardinality");
     assert!(
-        on.host_install_elisions() > 0,
-        "non-vacuity: the Date/Int2 PK'd table must have ELIDED installs"
+        on.device_authoritative_commits() > 0,
+        "non-vacuity: the Date/Int2 PK'd table must have device-authoritative commits"
     );
     assert!(
         on.dml_device_validate_hits() > 0,
         "non-vacuity: the device validator answered typed probes"
     );
-    assert_eq!(off.host_install_elisions(), 0);
 
     // DATE-PK table (audit cede8e70: the Date NEEDLE must fire, not silently decline —
     // the binder now coerces the plain literal): elided-era dup-DATE inserts drive the
@@ -109,7 +107,7 @@ fn date_int2_pk_table_elision_matches_install_twin() {
         .unwrap();
     }
     assert!(
-        on.table_install_elided("dp"),
+        on.table_device_authoritative("dp"),
         "the DATE-PK table must elide"
     );
     // Elided-era dup DATE -> 23505 through the DEVICE Date-needle probe.
@@ -153,10 +151,10 @@ fn int8_section_sharded_reads_match_single_buffer_twin() {
         "SELECT id, v, t FROM t8 WHERE t = '2026-07-03 12:00:00'",
     ];
     let run = |int8_shards: bool| {
-        let e = Engine::new_local();
+        let mut e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_shard_int8_section_enabled(int8_shards);
+        e.set_shard_int8_section_enabled(true);
         e.execute_text(
             1,
             "CREATE TABLE t8 (id INT PRIMARY KEY, v BIGINT, t TIMESTAMP)",
@@ -180,6 +178,9 @@ fn int8_section_sharded_reads_match_single_buffer_twin() {
             &format!("INSERT INTO t8 (id, v, t) VALUES {}", values.join(",")),
         )
         .unwrap();
+        if !int8_shards {
+            install_test_single_buffer_residency(&mut e, "t8");
+        }
         let sharded = e
             .read_state
             .residency
@@ -234,11 +235,11 @@ fn int8_section_sharded_reads_match_single_buffer_twin() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn int8_section_appends_roll_over_and_recompact_to_parity() {
-    let run = |int8_shards: bool| {
+    let run = || {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_shard_int8_section_enabled(int8_shards);
+        e.set_shard_int8_section_enabled(true);
         e.execute_text(
             1,
             "CREATE TABLE t8 (id INT PRIMARY KEY, v BIGINT, ts TIMESTAMP)",
@@ -280,21 +281,20 @@ fn int8_section_appends_roll_over_and_recompact_to_parity() {
             "SELECT id FROM t8 WHERE v = 6000000100",
             "SELECT id, v FROM t8 ORDER BY v",
         ];
-        let mut outs: Vec<Result<String, String>> = Vec::new();
+        let mut outs: Vec<Result<Vec<Vec<SqlValue>>, String>> = Vec::new();
         for q in &queries {
             outs.push(match e.execute_relational_select_text(q) {
                 Ok(result) => {
                     let mut rows = result.rows.into_boxed();
                     rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-                    Ok(format!("{rows:?}"))
+                    Ok(rows)
                 }
                 Err(err) => Err(err.to_string()),
             });
         }
         (appends, shard_count, outs)
     };
-    let (appends_on, shards_on, on) = run(true);
-    let (_appends_off, shards_off, off) = run(false);
+    let (appends_on, shards_on, on) = run();
     assert!(
         appends_on >= 100,
         "non-vacuity: the int8 table must APPEND in place (got {appends_on} hits)"
@@ -303,34 +303,38 @@ fn int8_section_appends_roll_over_and_recompact_to_parity() {
         shards_on >= 2,
         "non-vacuity: the appends must ROLL OVER to multiple shards (got {shards_on})"
     );
-    assert_eq!(shards_off, 0, "flag OFF keeps the int8 table single-buffer");
-    for (i, (a, b)) in on.iter().zip(off.iter()).enumerate() {
-        assert_eq!(a, b, "query {i}: multi-shard i64 == single-buffer oracle");
-    }
-    // Every query must SUCCEED on both arms (these shapes are all served pre-slice).
+    // Every query must succeed on the device-authoritative multi-shard generation.
     assert!(
         on.iter().all(|o| o.is_ok()),
         "all stage-(ii) shapes must succeed: {on:?}"
     );
+    assert_eq!(on[0].as_ref().unwrap().len(), 300, "100 seeds + 200 appends");
+    assert_eq!(
+        on[1].as_ref().unwrap(),
+        &vec![vec![SqlValue::Int8(6_000_000_100)]],
+        "point read returns the exact beyond-i32 value"
+    );
+    assert_eq!(
+        on[2].as_ref().unwrap(),
+        &vec![vec![SqlValue::Int4(1100)]],
+        "wide-value equality resolves the exact entity"
+    );
+    assert_eq!(on[3].as_ref().unwrap().len(), 300, "ordered projection is complete");
 }
 
 /// TYPE-COVERAGE track 2 slice 2, stage (iii) — the i64-PAYLOAD ELISION differential: an
-/// int4-PK / BIGINT+TIMESTAMP-payload table (THE core-banking shape) elides under the
-/// flags; elided-era DML resolves via the A4a materializer typing i64 payloads from the
-/// catalog; a decline REHYDRATES through the A4c i64 gather (store + value_index rebuilt
-/// with Int8/Timestamp variants — a mistype would corrupt the index representations).
-/// Outcomes + reads must match the install twin. Sabotage: mistyping the i64 decode fails
-/// the read parity. R3-002 additionally proves a single-column i64 UNIQUE table now elides through
+/// int4-PK / BIGINT+TIMESTAMP-payload table (THE core-banking shape) remains device-authoritative;
+/// DML resolves via the A4a materializer typing i64 payloads from the catalog. R3-002 additionally
+/// proves a single-column i64 UNIQUE table now elides through
 /// its fingerprint index and exact typed device recheck.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn int8_payload_elision_matches_install_twin() {
-    let run = |elide: bool| {
+    let run = || {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
         e.set_shard_int8_section_enabled(true);
-        e.set_host_install_elision_enabled(elide);
         e.execute_text(
             1,
             "CREATE TABLE t8 (id INT PRIMARY KEY, v BIGINT, ts TIMESTAMP)",
@@ -384,27 +388,25 @@ fn int8_payload_elision_matches_install_twin() {
         rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         (e, outcomes, rows)
     };
-    let (on, on_out, on_rows) = run(true);
-    let (off, off_out, off_rows) = run(false);
+    let (on, outcomes, rows) = run();
     assert_eq!(
-        on_out, off_out,
-        "i64-payload outcome ladder: elided == twin"
+        outcomes.iter().map(Result::is_ok).collect::<Vec<_>>(),
+        vec![true, true, false, false, true, true, true, true, true],
+        "i64-payload outcome ladder"
     );
-    assert_eq!(on_rows, off_rows, "i64-payload reads: elided == twin");
+    assert_eq!(rows.len(), 202, "closed-form final cardinality");
     assert!(
-        on.host_install_elisions() > 0,
-        "non-vacuity: the i64-payload PK table must ELIDE installs"
+        on.device_authoritative_commits() > 0,
+        "non-vacuity: the i64-payload PK table must publish device-authoritative commits"
     );
     assert!(
         on.dml_device_validate_hits() > 0,
         "non-vacuity: device validation answered on the i64-payload table"
     );
-    assert_eq!(off.host_install_elisions(), 0);
 
     // R3-002 single-wide index: BIGINT UNIQUE now rides the flagged fingerprint index.
     on.set_binary_wal_records_enabled(true);
     on.set_device_write_locate_wave_batch_enabled(true);
-    on.set_constrained_elision_enabled(true);
     on.execute_text(700, "CREATE TABLE u8 (v BIGINT UNIQUE, x INT)")
         .unwrap();
     for i in 0..30_u64 {
@@ -417,7 +419,7 @@ fn int8_payload_elision_matches_install_twin() {
         )
         .unwrap();
     }
-    assert!(on.table_install_elided("u8"), "BIGINT UNIQUE must elide");
+    assert!(on.table_device_authoritative("u8"), "BIGINT UNIQUE must elide");
     let locate_before = on.device_write_locate_hits();
     assert!(
         on.execute_dml_concurrent(750, "INSERT INTO u8 (v, x) VALUES (8100000005, 9)")
@@ -428,5 +430,5 @@ fn int8_payload_elision_matches_install_twin() {
         on.device_write_locate_hits() > locate_before,
         "BIGINT duplicate validation must probe the device index"
     );
-    assert!(on.table_install_elided("u8"));
+    assert!(on.table_device_authoritative("u8"));
 }

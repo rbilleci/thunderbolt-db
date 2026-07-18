@@ -238,10 +238,9 @@ impl Engine {
             // the PK-index cache self-heals on first probe (rebuild-on-miss). A fresh engine
             // whose caller prepares before warming benefits identically — the arm is the same
             // lazy entry the wave append performs, hoisted to the explicit opt-in surface.
-            let reentered = self.host_install_elision_enabled()
-                && self.auto_admit_on_commit_enabled()
-                && !self.table_install_elided(table_name)
-                && self.table_elision_eligible(&catalog, table_name)
+            let reentered = self.auto_admit_on_commit_enabled()
+                && !self.table_device_authoritative(table_name)
+                && self.table_device_authority_eligible(&catalog, table_name)
                 && self
                     .populate_relational_residency_snapshot_shared(table_name)
                     .ok()
@@ -249,7 +248,7 @@ impl Engine {
                         snapshot.is_valid() && snapshot.device_memory_proof.is_some()
                     })
                 && {
-                    self.set_table_install_elided(table_name, true);
+                    self.set_table_device_authoritative(table_name, true);
                     true
                 };
             if !(reentered && self.insert_unique_wave_batchable(&catalog, table)) {
@@ -1049,7 +1048,6 @@ impl Engine {
             mutation: PreparedMutation::Insert {
                 table: route.table.clone(),
                 inserted_rows: vec![(row_key, values.clone())],
-                value_index_entries: BTreeMap::new(),
                 seq_advances: BTreeMap::new(),
             },
         };
@@ -1076,15 +1074,12 @@ impl Engine {
         // delta; the text payload is written verbatim only on its fallback arms (catalog drift
         // mid-wave, binary encode decline), so it must stay valid replayable SQL.
         let text = route.synthesize_text(params);
-        let mut residency_tables = BTreeSet::new();
-        residency_tables.insert(route.table.clone());
         IntentBuild::Item(self.make_covered_insert_wave_item(
             txn_id,
             cmd,
             &text,
             write_set,
             read_snapshot,
-            residency_tables,
             prepared_catalog_seq,
             Some(delta),
             binary_wal_template,

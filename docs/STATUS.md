@@ -9,10 +9,12 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   sequencing, WAL/durability, replication, staging upload, and final result readback.
 - Production relational reads execute through resident, streaming, transient-relation, or CUDA-native MVCC
   GPU paths. A decline or device fault fails loudly; it never executes relational work on the host.
-- Test-only CPU semantic infrastructure remains under `cfg(test)` pending **RETIRE-001**.
-- The host write/commit/MVCC tuple-store path and bootstrap DML indexes/probes remain pending **R3-004**;
-  generic CUDA-MVCC host result post-processing and recovery repair operators remain pending
-  **RETIRE-002** and **RETIRE-003**. R3-002/R3-003 passed independent adversarial acceptance on 2026-07-17.
+- R3-004 is complete: normal COPY/DML/replay commits publish and retain device-authoritative relational
+  generations, and the host write/commit/MVCC tuple-store path, `CachedShardPkIndex`, and host DML/constraint
+  probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
+  isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
+- Generic CUDA-MVCC host result post-processing and test-only CPU semantic infrastructure remain under
+  **RETIRE-003** and **RETIRE-001**. R3-002/R3-003 passed independent adversarial acceptance on 2026-07-17.
 
 ## Read path and STRATA
 
@@ -46,12 +48,11 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 
 - WAL-before-visibility is enforced. The durable path includes append-only/checkpointed WAL, FUA intent lanes,
   contiguous durable cuts, lane recovery/recycle, group commit, and fused device apply for eligible shapes.
-- Covered typed INSERT/UPDATE/DELETE intent paths and mixed GPU read/write execution are live. Typed-index and
-  full transaction/GC acceptance are complete; bootstrap host authority remains deletion debt under **R3-004**.
+- Covered typed INSERT/UPDATE/DELETE intent paths and mixed GPU read/write execution are live. Typed-index,
+  transaction/GC, and host-authority-retirement acceptance are complete.
 - ADR-014 selects append/tombstone MVCC as the single logical write model: stable entity identity, immutable
   versions, version-aware device indexes, and one visibility rule across temperature-specific resident/cold GPU
-  encodings. The current host-store-first recovery and host index/probe fallbacks are migration debt, not target
-  authority.
+  encodings. Recovery rebuilds device authority; host index/probe fallbacks no longer exist.
 - **R3-002 typed device indexes cover the supported write surface.** Single-column INT2/INT4/INT8/DATE/TIMESTAMP,
   NUMERIC, UUID, BOOL, and TEXT keys plus compound and nullable keys use raw keys or canonical fingerprints with
   exact typed collision recheck. Hot-shard and cold-chunk initial index construction now reads resident typed
@@ -61,7 +62,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   tuple/entity recheck. Authoritative hot/cold DML fails closed when no device verdict is available rather than
   rehydrating for `CachedShardPkIndex` or a host probe. Focused duplicate, GC-boundary, wide/text/BOOL, compound,
   partial-NULL, FK, recovery, and hot/cold controls pass. Independent adversarial audit accepted this boundary;
-  global deletion of bootstrap/test fallback source is **R3-004**.
+  R3-004 subsequently deleted the bootstrap host cache/probe source and dispatch.
 - **Production unique conflict history is device-current.** Visible-locate returns, per key, the maximum real
   `created_by`/`deleted_by` stamp across every matching physical version independently of the requested visibility
   snapshot. Classic typed hot and cold DML issue exact device predicates for every old released and new claimed
@@ -73,7 +74,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   claim/release controls prove that a currently free key still serializes a stale writer from device history.
 - **R3-003 stable entity identity is live end to end.** The GPU visible-locate kernel returns the matched version's
   resident identity with its `(shard, slot)` verdict; covered intent-lane UPDATE appends the replacement with that
-  same identity, the rare rehydrate fallback resolves key-to-identity without inventing one, and replay migrates
+  same identity, explicit RETIRE-002 repair preserves it without inventing one, and replay migrates
   existing v1 `new_row_id` records by treating that field only as the legacy allocator reservation. The PTX
   fail-closed/identity control, lane UPDATE identity gate (three sequential plus two concurrent executions),
   recovery, and sustained version-aware-index controls pass. The current engine library inventory is 523 ordinary
@@ -168,7 +169,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Crash-durable replay and the ADR-014 bounded fault campaign are accepted. Automatic lane checkpointing and PITR
   timestamps remain **DUR-001**; multi-node quorum integration remains **HA-001**.
 
-## Verification snapshot — 2026-07-17
+## R3-002/R3-003/DUR-002 verification snapshot — 2026-07-17
 
 - The current live-GPU engine library gate passes **533**, ignores **514** separately qualified GPU tests, and fails
   none. DUR-002's focused actual-GPU recovery gates pass for the intent/FUA insert route, strict compatibility
@@ -185,12 +186,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 - Production transient GPU integrations: catalog and bounded-function routes pass.
 - Pgwire: ordinary suite **3 passed** plus the ignored non-vacuous sharded/NULL GPU golden passes.
 - Production mixed gate: **116.2k reads/s**, p50 **246us**, p99 **501us**, p99.9 **671us**; zero host gathers,
-  zero fallback groups, and 160/160 host-install-elided writes.
+  zero fallback groups, and 160/160 device-authoritative writes.
 - Read roofline repeat: in-L2 ratios are `equal_any` **0.437x**, ordered projection **0.126x**, ordered compaction
   **0.023x**, arithmetic filter **0.023x**, compare count **0.880x**, and between count **0.450x** the same-run
   **1,464.0 GB/s** `sum_i32` roofline; out-of-L2 roofline is **1,451.9 GB/s**, gather is **349.5/155.3 GB/s**
   in/out of L2, constant-mask output is **1,141.7/1,497.4 GB/s**, and grouped kernel is **1,677.3 M elements/s**.
-- The canonical two-layer/two-cache-regime report card completes. Its 48M-row out-of-L2 batched route reaches
+- The pre-R3-004 canonical two-layer/two-cache-regime report card completed. Its late-converted unified-snapshot
+  48M-row out-of-L2 batched route reached
   **275.7M lookups/s, p50 110us** at batch 65,536; indexed single-flight reaches **37.7M lookups/s, p50 1,616us**
   and **3.19x** the scan route. The corresponding in-L2 batched route reaches **264.2M lookups/s, p50 118us**.
   The 48M-row build completes in **155.9s**. No material same-run baseline ratio regression is present.
@@ -199,6 +201,41 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   remaining blocker. The accepted R3 tree was preserved at `eb6f0319`, rebased onto the canonical ADR commit
   `84cbab44`, and requalified as integration commit `7e9e1568`; four conflict-sensitive GPU controls and all
   complete serialized library inventories above pass on that integrated tree.
+
+## R3-004 closeout — 2026-07-17
+
+- Normal relational apply no longer writes host tuple chains or value indexes. `apply_delta` advances only durable
+  row identity, sequence state, and device-authority telemetry; classic waves, intent lanes, explicit transactions,
+  COPY, multi-entry replay, and zero-row mutations publish maintained device generations or fail-stop before
+  acknowledgement. The obsolete host shard-PK cache, DML/constraint host probes, post-ack tail repair, cold-class
+  patch authority, and their fallback flags/tests/examples are deleted. DDL, recovery/import, VACUUM, and the
+  bounded query-triggered hot-to-cold transition use the explicit **RETIRE-002** representation-repair bridge;
+  no predicate, constraint, visibility, or result decision is evaluated there.
+- Device-authoritative shards now serve retained int4/TEXT mixed projections, including TEXT-only and nullable TEXT
+  (NULL remains distinct from empty). Int4 retained batches complete through one multi-shard device probe/gather and
+  one flat result, avoiding the temporary per-needle GPU-query regression discovered during qualification. Zero-row
+  bootstrap descriptors no longer force data-bearing mixed-width shards through synthetic recompaction.
+- Concurrent HAZARD qualification exposed and fixed a strict-ack TOCTOU: lane settlement previously read the
+  durable/applied cut twice, so another pump could advance between reads and allow acknowledgement against a newer
+  local cut while publishing an older global snapshot. Settlement now derives both boundaries from one captured
+  cut. Autocommit SELECT now retains one catalog/data/device generation across DDL, re-pins only after a serialized
+  representation repair, and excludes already-locked internal reads; commit-time delta reuse excludes outbound-FK
+  inserts so a concurrently deleted parent is revalidated. The formerly failing facade races and complete matrices
+  are green.
+- Engine library passes **1,016/1,016** with ignored GPU tests included; facade library passes **47/47** and its
+  serialized concurrency integration passes **14/14**. Nine NULL, FK, COPY/multi-entry, transaction-conflict, lane
+  replay, publication-lock, retained-completion, and TEXT families pass **27 sequential plus 18 concurrent** HAZARD
+  invocations with no CUDA 700/716/717. Workspace all-target/all-feature check, strict Clippy, formatting,
+  source-size, and diff-whitespace gates pass.
+- The canonical report card completes both layers and both cache regimes on the authoritative-shard representation.
+  Raw in/out-of-L2 `sum_i32` rooflines are **1,479.4/1,448.0 GB/s**. In-L2 ratios remain `equal_any` **0.429x**,
+  compare count **0.861x**, between count **0.446x**, and ordered projection **0.124x**; constant-mask output is
+  **1,167.1/1,489.1 GB/s** in/out of L2. At batch 65,536, the production batched point route reaches
+  **89.6M lookups/s at p50 605us** in-L2 and **3.29M/s at p50 19.784ms** out-of-L2. The 48M-row build takes
+  **1,620.4s**, so the canonical Section C timeout is now 2,400s. Raw kernels remain healthy; the point-path loss
+  scales with the thousands of insert-published authoritative shard descriptors that R3-004 retains instead of
+  discarding through the retired late conversion. **PERF-001** owns removing that submission/representation cost
+  without host authority, late conversion, or weaker publication semantics.
 
 ## Structural decomposition
 
@@ -4005,11 +4042,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 |---|---|
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Non-int4 O(1) point-lookup breadth | **READ-002** |
-| Host write/store deletion | **R3-004** |
 | Test-only CPU semantic oracle | **RETIRE-001** |
 | Reverse-gather/deauthorization/scan-build DDL and recovery repair | **RETIRE-002** |
 | Generic CUDA-MVCC host compaction, ordering, projection, and result assembly | **RETIRE-003** |
-| Host `CachedShardPkIndex` and bootstrap/test DML/constraint probe source | **R3-004** |
 | Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |
 | Two physical GPUs have not executed the scheduler, device-locate, or typed sidecar context gates | **MULTI-001**, **MULTI-002**, **MULTI-003** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |

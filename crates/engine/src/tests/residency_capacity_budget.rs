@@ -38,11 +38,12 @@ fn open_payload_rejects_text_and_undersize() {
 
 /// S-F/R-1: the per-shard device hash index obeys the same hard cap as base payloads.
 /// At a cap equal to the admitted shard+identity bytes, the optional index declines and the
-/// sharded point path still returns the correct row through its GPU-scan/host-routing fallback.
+/// sharded point path still returns the correct row through its GPU scan fallback.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn sharded_device_index_declines_at_residency_budget() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local();
+    e.set_auto_admit_on_commit(true);
     e.set_shard_residency_enabled(true);
     e.set_shard_index_probe_enabled(true);
     e.execute_text(1, "CREATE TABLE capped_shard_index (id INT, balance INT)")
@@ -63,16 +64,26 @@ fn sharded_device_index_declines_at_residency_budget() {
     let table = e.relational_catalog_table("capped_shard_index").unwrap();
     let id = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
     let balance = crate::rel_exec_helpers::relational_column_index(&table, "balance").unwrap();
-    let result = e
-        .gather_sharded_int4_point_lookups_batched(
+    assert!(
+        e.gather_sharded_int4_point_lookups_batched(
             e.committed_seq(),
             &table,
             id,
             &[id, balance],
             &[20],
         )
-        .expect("the capped index declines to the correct sharded fallback");
-    assert_eq!(result.values, vec![20, 200]);
+        .is_none(),
+        "the capped optional index must decline"
+    );
+    let result = e
+        .execute_relational_select_text(
+            "SELECT id, balance FROM capped_shard_index WHERE id = 20",
+        )
+        .expect("the SQL route falls back to the device scan");
+    assert_eq!(
+        result.rows.row(0),
+        &[SqlValue::Int4(20), SqlValue::Int4(200)]
+    );
     assert!(
         e.read_state
             .residency

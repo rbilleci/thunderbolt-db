@@ -821,7 +821,7 @@ fn multi_entry_apply_uses_the_working_catalog_before_publication() {
         .execute_relational_select_text("SELECT id, value, extra FROM working_batch ORDER BY id")
         .unwrap()
         .rows;
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 2, "mixed reset/rewrite rows: {rows:?}");
     assert_eq!(
         rows.row(0),
         &[SqlValue::Int4(2), SqlValue::Int4(20), SqlValue::Int4(7)]
@@ -1579,7 +1579,6 @@ fn explicit_transaction_select_reads_captured_catalog_and_table_generation() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn explicit_transaction_dml_prepare_and_conflict_check_use_begin_generation() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
@@ -1663,11 +1662,7 @@ fn explicit_transaction_unique_key_away_history_uses_device_stamps() {
     let e = Engine::new_local();
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.set_host_install_elision_enabled(true);
-    e.set_constrained_elision_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
-    e.set_resident_delete_tombstone_enabled(true);
-    e.set_resident_update_tombstone_enabled(true);
     e.execute_text(
         1,
         "CREATE TABLE history_accounts (id INT PRIMARY KEY, tenant_key INT UNIQUE)",
@@ -1688,11 +1683,11 @@ fn explicit_transaction_unique_key_away_history_uses_device_stamps() {
             ),
         )
         .unwrap();
-        if e.table_install_elided("history_accounts") {
+        if e.table_device_authoritative("history_accounts") {
             break;
         }
     }
-    assert!(e.table_install_elided("history_accounts"));
+    assert!(e.table_device_authoritative("history_accounts"));
     e.execute_text(190, "BEGIN").unwrap();
     e.execute_dml_concurrent(
         190,
@@ -1736,8 +1731,8 @@ fn explicit_transaction_unique_key_away_history_uses_device_stamps() {
     let err = e.execute_text(190, "COMMIT").unwrap_err();
     assert!(
         matches!(&err, ExecuteError::Serialization(message)
-            if message.contains("device unique-history verdict unavailable")),
-        "a current-only rebuild newer than BEGIN must make a history miss fail closed, got {err:?}"
+            if message.contains("device unique conflict")),
+        "a current-only rebuild newer than BEGIN must make incomplete device history fail closed, got {err:?}"
     );
     e.execute_text(190, "ROLLBACK").unwrap();
     let rows = e

@@ -789,17 +789,12 @@ mod tests {
         }
     }
 
-    /// A CPU-only `SharedEngine` with one table seeded but NOT warmed to GPU
-    /// residency: every retained-read job preparation fails (no resident snapshot),
-    /// which exercises the error-fanout / drain / dropped-receiver logic without a
-    /// GPU. The success-slicing path is GPU-gated (`#[ignore]`) below.
-    fn cpu_engine_with_table() -> Arc<SharedEngine> {
+    /// A small authoritative engine fixture for scheduler/fanout tests. R3-004 publishes the
+    /// inserted relation on the device even when optional auto-admission is disabled.
+    fn engine_with_table() -> Arc<SharedEngine> {
         let shared = Arc::new(SharedEngine::new());
-        // `SharedEngine::new()` follows the production auto-admission policy, so a GPU-equipped
-        // test host would otherwise turn these deliberately error-path tests into success-path
-        // tests. Disable admission before the first mutation to make the fixture deterministic.
+        // Keep optional warmup disabled; durable DML still establishes mandatory device authority.
         shared.engine.set_auto_admit_on_commit(false);
-        shared.engine.set_host_install_elision_enabled(false);
         execute_on_shared_engine(&shared, "CREATE TABLE t (id INT)").unwrap();
         execute_on_shared_engine(&shared, "INSERT INTO t (id) VALUES (1)").unwrap();
         shared
@@ -807,10 +802,10 @@ mod tests {
 
     #[test]
     fn prepare_error_is_fanned_out_to_the_waiter_not_hung() {
-        // No GPU residency ⇒ job prepare fails; the waiter must get that Err, never hang.
-        let engine = cpu_engine_with_table();
+        // An unknown relation fails during prepare; the waiter must get that Err, never hang.
+        let engine = engine_with_table();
         let batcher = PointLookupBatcher::with_triggers(engine, 4, Duration::from_millis(5));
-        let rx = batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), 1);
+        let rx = batcher.enqueue(select("SELECT id FROM missing WHERE id = 1"), 1);
         let outcome = recv_within(rx, Duration::from_secs(2)).expect("waiter must get a response");
         assert!(
             outcome.is_err(),
@@ -820,16 +815,15 @@ mod tests {
 
     #[test]
     fn every_request_in_a_batch_gets_a_response() {
-        // Several lookups coalesce into one batch; each must be answered (here all are
-        // prepare-errors, but completeness is the point — no connection left hung).
-        let engine = cpu_engine_with_table();
+        // Several lookups coalesce into one batch; each must be answered successfully.
+        let engine = engine_with_table();
         let batcher = PointLookupBatcher::with_triggers(engine, 8, Duration::from_millis(5));
         let receivers: Vec<_> = (0..8)
             .map(|needle| batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), needle))
             .collect();
         for rx in receivers {
             let outcome = recv_within(rx, Duration::from_secs(2)).expect("every waiter answered");
-            assert!(outcome.is_err());
+            assert!(outcome.is_ok(), "authoritative lookup failed: {outcome:?}");
         }
     }
 
@@ -837,7 +831,7 @@ mod tests {
     fn dropped_receiver_does_not_wedge_the_coalescer() {
         // A client disconnects while parked: drop its receiver. The coalescer's send
         // fails harmlessly and it must keep serving the next request.
-        let engine = cpu_engine_with_table();
+        let engine = engine_with_table();
         let batcher = PointLookupBatcher::with_triggers(engine, 1, Duration::from_millis(5));
         let abandoned = batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), 7);
         drop(abandoned); // client gone before the coalescer answers.
@@ -845,7 +839,10 @@ mod tests {
         let rx = batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), 8);
         let outcome =
             recv_within(rx, Duration::from_secs(2)).expect("coalescer still serves after a drop");
-        assert!(outcome.is_err());
+        assert!(
+            outcome.is_ok(),
+            "coalescer failed after receiver drop: {outcome:?}"
+        );
     }
 
     #[test]
@@ -853,7 +850,7 @@ mod tests {
         // Enqueue a burst with a long max_wait so they sit in the queue, then drop the
         // batcher. Every receiver must resolve (a real answer or channel-closed), never
         // hang — the shutdown drain guarantee.
-        let engine = cpu_engine_with_table();
+        let engine = engine_with_table();
         let batcher = PointLookupBatcher::with_triggers(engine, 1024, Duration::from_secs(3600));
         let receivers: Vec<_> = (0..16)
             .map(|needle| batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), needle))
@@ -1008,8 +1005,8 @@ mod tests {
             assert_eq!(got[i], want, "wired batched == per-query for id={k}");
         }
 
-        // Per-query FALLBACK: a duplicate int4 key -> the gather declines -> per-query fallback (multi-row),
-        // NOT a group failure.
+        // A duplicate int4 key remains batch-correct. The device gather may serve it directly or
+        // decline to the per-query GPU executor; either route must return every matching row.
         execute_on_shared_engine(&shared, "CREATE TABLE dup (id INT, balance INT)").unwrap();
         execute_on_shared_engine(
             &shared,
@@ -1020,7 +1017,6 @@ mod tests {
             let want_dup =
                 execute_on_shared_engine(&shared, "SELECT id, balance FROM dup WHERE id = 1")
                     .unwrap();
-            let fallback_before = batcher.activity_snapshot();
             let got_dup = match execute_on_shared_engine_batched(
                 &shared,
                 &batcher,
@@ -1033,12 +1029,6 @@ mod tests {
                     panic!("resident duplicate-key shape must enter the batcher before its gather declines")
                 }
             };
-            let fallback_after = batcher.activity_snapshot();
-            assert_eq!(
-                fallback_after.sharded_per_query_fallback_groups,
-                fallback_before.sharded_per_query_fallback_groups + 1,
-                "positive control: a declined sharded gather advances the per-query fallback counter"
-            );
             assert_eq!(
                 got_dup, want_dup,
                 "dup-key batched (per-query fallback) == per-query"
@@ -1068,7 +1058,6 @@ mod tests {
         engine.set_shard_index_probe_enabled(true);
         engine.set_shard_batched_point_read_enabled(true);
         engine.set_auto_admit_on_commit(true);
-        engine.set_host_install_elision_enabled(true);
         let shared = Arc::new(SharedEngine::from_engine(engine));
         execute_on_shared_engine(
             &shared,
@@ -1216,9 +1205,9 @@ mod tests {
             "concurrent writes appended to resident device memory"
         );
         assert_eq!(
-            after.host_install_elisions - before.host_install_elisions,
+            after.device_authoritative_commits - before.device_authoritative_commits,
             20,
-            "every concurrent write skipped the host tuple-store install"
+            "every concurrent write published device-authoritative state"
         );
         assert_eq!(
             overlapping_writes.load(Ordering::Relaxed),
@@ -1369,15 +1358,15 @@ mod tests {
     /// and require the answer well under it (generous margin for CI jitter).
     #[test]
     fn lone_request_flushes_with_near_zero_wait() {
-        let engine = cpu_engine_with_table();
+        let engine = engine_with_table();
         let max_wait = Duration::from_secs(1);
         let batcher = PointLookupBatcher::with_triggers(engine, 32, max_wait);
         let start = Instant::now();
         let rx = batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), 1);
-        // CPU engine ⇒ this resolves to an error, but it must resolve FAST.
+        // The device-authoritative lookup must resolve fast.
         let outcome = recv_within(rx, Duration::from_secs(2)).expect("waiter must get a response");
         let elapsed = start.elapsed();
-        assert!(outcome.is_err());
+        assert!(outcome.is_ok(), "authoritative lookup failed: {outcome:?}");
         assert!(
             elapsed < max_wait / 4,
             "a lone request waited {elapsed:?}, near the {max_wait:?} ceiling — adaptive \
@@ -1391,7 +1380,7 @@ mod tests {
     /// observer reports each flushed batch's size.
     #[test]
     fn concurrent_burst_still_coalesces() {
-        let engine = cpu_engine_with_table();
+        let engine = engine_with_table();
         let (obs_tx, obs_rx) = mpsc::channel::<usize>();
         // Count trigger (64) above the burst (16) so coalescing is via the wait,
         // not the count trigger; a 200ms ceiling gives the burst time to gather.
@@ -1428,7 +1417,7 @@ mod tests {
         // Every request is still answered (completeness preserved).
         for rx in receivers {
             let outcome = recv_within(rx, Duration::from_secs(3)).expect("every waiter answered");
-            assert!(outcome.is_err());
+            assert!(outcome.is_ok(), "authoritative lookup failed: {outcome:?}");
         }
         // Drop the batcher so the observer channel closes once the coalescer exits,
         // then collect every reported batch size.
@@ -1458,7 +1447,7 @@ mod tests {
     /// answered comfortably within a small multiple of the ceiling.
     #[test]
     fn held_partial_batch_never_starves_past_the_ceiling() {
-        let engine = cpu_engine_with_table();
+        let engine = engine_with_table();
         let max_wait = Duration::from_millis(20);
         // max_items=8 so two requests never hit the count trigger and the time
         // bound is the only thing that flushes them.
@@ -1469,7 +1458,10 @@ mod tests {
         let o1 = recv_within(r1, Duration::from_secs(2)).expect("first waiter answered");
         let o2 = recv_within(r2, Duration::from_secs(2)).expect("second waiter answered");
         let elapsed = start.elapsed();
-        assert!(o1.is_err() && o2.is_err());
+        assert!(
+            o1.is_ok() && o2.is_ok(),
+            "authoritative lookups failed: {o1:?} {o2:?}"
+        );
         // Bound: a held partial flushes by the ceiling. Allow generous slack for
         // scheduling jitter, but it must be a small multiple of max_wait, proving
         // the wait is bounded and not unbounded/forever.

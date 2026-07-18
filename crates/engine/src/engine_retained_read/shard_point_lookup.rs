@@ -100,8 +100,8 @@ impl Engine {
                 .map(|&p| shard_key_column_blob_len(shard, table, p))
                 .collect::<Option<Vec<u64>>>()?;
             let device_memory = shard.device_memory.clone()?;
-            // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
-            // concurrent invalidations); a stale shard declines the device locate to the ladder.
+            // The descriptor flag alone cannot observe a concurrent generation replacement;
+            // require the captured buffer to remain the authoritative device cell.
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
             }

@@ -75,7 +75,10 @@ fn shard_tombstone_allocates_region_and_stamps_out_of_line() {
         .shards
         .load()
         .get("accounts")
-        .unwrap()[0]
+        .unwrap()
+        .iter()
+        .find(|shard| shard.row_count > 0)
+        .expect("accounts has a non-empty shard")
         .shard_id;
 
     // Before any delete: NO region (the zero-cost property).
@@ -145,11 +148,8 @@ fn shard_tombstone_allocates_region_and_stamps_out_of_line() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn shard_deleted_by_region_released_on_invalidate_and_drop() {
-    // --- Path A: an invalidating commit (SQL DELETE -> invalidate + re-admit) releases the region ---
+    // --- Path A: explicit repair + invalidation + admission releases the region ---
     let e = Engine::new_local();
-    // THE FLIP: this test exercises the re-admit/scan-layer semantics — pin the pre-flip
-    // configuration it tests (each flag remains a supported kill switch).
-    e.set_resident_delete_tombstone_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
@@ -165,7 +165,10 @@ fn shard_deleted_by_region_released_on_invalidate_and_drop() {
         .shards
         .load()
         .get("accounts")
-        .unwrap()[0]
+        .unwrap()
+        .iter()
+        .find(|shard| shard.row_count > 0)
+        .expect("accounts has a non-empty shard")
         .shard_id;
     // The SV2 primitive allocates the region on this first tombstone.
     assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[1], 777));
@@ -173,15 +176,15 @@ fn shard_deleted_by_region_released_on_invalidate_and_drop() {
         table_has_any_deleted_by_cell(&e, "accounts"),
         "precondition: the tombstone allocated a live deleted_by region"
     );
-    // A DELETE goes through invalidate + the O(table) re-admit today (the path SV4 will replace).
-    e.execute_text(3, "DELETE FROM accounts WHERE id = 2")
+    repair_test_relational_host_copy(&e, "accounts");
+    invalidate_test_relational_residency(&e, "accounts");
+    e.populate_relational_residency_snapshot_shared("accounts")
         .unwrap();
     assert!(
         !table_has_any_deleted_by_cell(&e, "accounts"),
         "invalidate/re-admit must release the stale deleted_by region (leak + wrong-results guard)"
     );
-    // End-to-end: the DELETE really removed id=2, and the rebuilt buffer reads ALL-LIVE (no stale hide
-    // from the released tombstone region) -- id=1 was tombstoned resident-only, so it must reappear.
+    // End-to-end: the rebuilt buffer reads all three repaired rows with no stale hide.
     let rows = e
         .execute_relational_select_text("SELECT id FROM accounts")
         .unwrap()
@@ -195,8 +198,8 @@ fn shard_deleted_by_region_released_on_invalidate_and_drop() {
     ids.sort_unstable();
     assert_eq!(
         ids,
-        vec![1, 3],
-        "id=2 deleted; id=1 all-live again (stale tombstone released)"
+        vec![1, 2, 3],
+        "all repaired rows are live after the explicit rebuild"
     );
 
     // --- Path B: DROP TABLE releases the region ---
@@ -208,7 +211,10 @@ fn shard_deleted_by_region_released_on_invalidate_and_drop() {
         .shards
         .load()
         .get("accounts")
-        .unwrap()[0]
+        .unwrap()
+        .iter()
+        .find(|shard| shard.row_count > 0)
+        .expect("accounts has a non-empty shard")
         .shard_id;
     assert!(e.tombstone_resident_shard_slots("accounts", shard_id2, &[0], 888));
     assert!(
@@ -233,9 +239,9 @@ fn shard_deleted_by_region_released_on_invalidate_and_drop() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn shard_deleted_by_region_released_by_invalidate_alone() {
-    let mut e = Engine::new_local();
+    let e = Engine::new_local();
     e.set_shard_residency_enabled(true);
-    e.set_auto_admit_on_commit(false); // NO re-admit after the DELETE -> isolates the invalidate mirror
+    e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
         .unwrap();
     e.execute_text(
@@ -243,70 +249,26 @@ fn shard_deleted_by_region_released_by_invalidate_alone() {
         "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)",
     )
     .unwrap();
-    // Explicit shard-resident admit (auto-admit is off).
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
     let shard_id = e
         .read_state
         .residency
         .shards
         .load()
         .get("accounts")
-        .unwrap()[0]
+        .unwrap()
+        .iter()
+        .find(|shard| shard.row_count > 0)
+        .expect("accounts has a non-empty shard")
         .shard_id;
     assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[1], 777));
     assert!(
         table_has_any_deleted_by_cell(&e, "accounts"),
         "precondition: the tombstone allocated a live deleted_by region"
     );
-    // DELETE invalidates residency; with auto-admit OFF nothing re-admits -> the serialized-commit
-    // invalidate mirror is the ONLY thing that can release the region.
-    e.execute_text(3, "DELETE FROM accounts WHERE id = 2")
-        .unwrap();
+    invalidate_test_relational_residency(&e, "accounts");
     assert!(
         !table_has_any_deleted_by_cell(&e, "accounts"),
         "the serialized-commit invalidate mirror must release the region even with no re-admit"
-    );
-}
-
-/// SV4 prereq #1 (audit Finding 2): a WARMUP/REFRESH re-admit (`populate_relational_residency_snapshot`)
-/// reaches the SHARDED re-admit branch with NO preceding invalidate, so it must itself erase stale
-/// `deleted_by` regions -- else the fresh all-live shard 0 (reused shard_id) inherits the tombstone region
-/// and wrongly hides rows at SV4. NON-VACUITY: region proven present, then KEY-absent after the refresh.
-/// Sabotage: remove the sharded-branch `shard_deleted_by_memory.remove_table` and this FAILS.
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn shard_deleted_by_region_released_on_warmup_readmit() {
-    let mut e = Engine::new_local();
-    e.set_shard_residency_enabled(true);
-    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
-        .unwrap();
-    e.execute_text(
-        2,
-        "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)",
-    )
-    .unwrap();
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
-    let shard_id = e
-        .read_state
-        .residency
-        .shards
-        .load()
-        .get("accounts")
-        .unwrap()[0]
-        .shard_id;
-    assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[1], 777));
-    assert!(
-        table_has_any_deleted_by_cell(&e, "accounts"),
-        "precondition: the tombstone allocated a live deleted_by region"
-    );
-    // Warmup/refresh re-admit -- NO commit, so NO invalidate precedes it (the path Finding 2 patched).
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
-    assert!(
-        !table_has_any_deleted_by_key(&e, "accounts"),
-        "warmup re-admit (no preceding invalidate) must erase the stale deleted_by region"
     );
 }
 
@@ -334,7 +296,10 @@ fn resident_cache_remove_table_releases_deleted_by_region() {
         .shards
         .load()
         .get("accounts")
-        .unwrap()[0]
+        .unwrap()
+        .iter()
+        .find(|shard| shard.row_count > 0)
+        .expect("accounts has a non-empty shard")
         .shard_id;
     assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[0], 5));
     assert!(
@@ -405,7 +370,10 @@ fn shard_visibility_filter_hides_tombstoned_rows() {
         .shards
         .load()
         .get("accounts")
-        .unwrap()[0]
+        .unwrap()
+        .iter()
+        .find(|shard| shard.row_count > 0)
+        .expect("accounts has a non-empty shard")
         .shard_id;
     assert!(
         e.tombstone_resident_shard_slots("accounts", shard0, &[0], 5),

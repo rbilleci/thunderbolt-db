@@ -22,7 +22,10 @@ fn text_only_point_projection_runs_on_gpu_without_numeric_projection_slots() {
         route.accepted,
         "TEXT-only point route must be GPU-eligible: {route:?}"
     );
-    assert_eq!(route.query_shape, "int4_equality_mixed_column_projection");
+    assert_eq!(
+        route.query_shape,
+        "sharded_int4_equality_mixed_column_projection"
+    );
 
     let result = e.execute_relational_select(&present).unwrap();
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));

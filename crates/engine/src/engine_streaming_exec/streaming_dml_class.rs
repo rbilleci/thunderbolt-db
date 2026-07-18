@@ -55,29 +55,7 @@ impl Engine {
         Some(Ok(rows))
     }
 
-    /// P4-2a — THE CHUNK-NATIVE LOCATE (design-review C1: the P3 locate derives identity from a
-    /// STORE scan, unusable store-free): evaluate a DML predicate over the table's COLD CHUNKS
-    /// THEMSELVES, returning matching `(chunk_idx, local slots)` coordinates. Each chunk replays
-    /// through the SAME staging the read folds use (payload + sidecar upload) and the SAME
-    /// slot-locate primitive the resident shard DML uses (`lower_resident_predicate` — the mask VM
-    /// with the sidecar visibility ANDed on, so already-tombstoned slots never re-locate). No
-    /// store, no row decode, no projection — the device returns slots natively; the host only
-    /// orchestrates (charter: control plane). `None` = decline (no entry, a reader boundary below
-    /// the entry, any staging/lowering failure) — the caller falls to its store-era arm while one
-    /// exists.
-    /// ## P4-2b CALLER OBLIGATIONS (audit, forward-looking)
-    /// 1. COORDINATE TOKEN (MEDIUM latent): the slots are positions in the entry INSTALLED AT
-    ///    LOCATE TIME. `stamp_streaming_cold_slots` reloads the CURRENT entry — an intervening
-    ///    patch install (eager hook / lazy read patch) re-tiles chunks and the coordinates
-    ///    mis-align (the install guard cannot catch it: the new entry's generation IS current).
-    ///    The caller MUST run locate→stamp inside ONE commit-lock critical section with no
-    ///    intervening patch, or carry an entry-identity token and refuse on mismatch.
-    /// 2. STORE DIVERGENCE (LOW): a store-free stamp hides rows the store still holds; a LATER
-    ///    store-driven patch REBUILD of that chunk rebuilds from the store and RESURRECTS them
-    ///    (sidecar discarded). For chunk-authoritative tables the store must be dropped/frozen so
-    ///    the rebuild arm is unreachable — until then this primitive must not run beside live
-    ///    store writes to the same table.
-    // Production caller = P4-2b (the class write path); the differential gate exercises it now.
+    /// Test differential surface for the production entry-scoped device locate.
     #[cfg(test)]
     pub(crate) fn locate_streaming_cold_slots(
         &self,
@@ -322,15 +300,9 @@ impl Engine {
     /// token / single-critical-section rule, and the store-divergence rebuild hazard) apply to
     /// this pair as a unit.
     // Production caller = P4-2b; the isolation gate exercises it now.
-    /// P4 COMPACTION (safe-horizon fenced): rebuild ONE heavily-stamped chunk
-    /// from its SURVIVORS — a device projection gather (predicate=None + the sidecar mask over
-    /// the staged chunk), re-encoded as a fresh sidecar-free payload born at the compacting
-    /// boundary. In-flight folds keep the OLD entry Arc, while the driver additionally requires
-    /// every removed tombstone to be at-or-behind the oldest active snapshot. Thus retained
-    /// transactions keep both old-read visibility and key claim/release history. DELETES: the dead
-    /// slots' payload bytes + the whole sidecar.
-    /// `None` = the gather declined (device error) — the caller keeps the stamped, uncompacted
-    /// chunk (compaction is an optimization, never load-bearing).
+    /// Rebuild one heavily stamped class chunk from device-gathered survivors. The safe-horizon
+    /// driver below guarantees no retained reader still needs a removed tombstone.
+    #[cfg(test)]
     fn compact_streaming_cold_chunk(
         &self,
         table: &RelationalTable,
@@ -368,7 +340,7 @@ impl Engine {
                 &[],
             )
             .ok()?;
-        let survivors: Vec<Vec<SqlValue>> = result.rows.iter().map(|r| r.to_vec()).collect();
+        let survivors: Vec<Vec<SqlValue>> = result.rows.iter().map(|row| row.to_vec()).collect();
         if chunk.entity_ids.len() != chunk.row_count as usize {
             return None;
         }
@@ -405,7 +377,7 @@ impl Engine {
             snapshot,
             row_count: survivors.len() as u64,
             entity_ids: Arc::new(survivor_ids),
-            tuple_range: (1, 0), // class chunks carry no store ids (the sentinel)
+            tuple_range: (1, 0),
             payload_copin_s: boundary,
             deleted_by: None,
         })
@@ -569,18 +541,17 @@ impl Engine {
         true
     }
 
-    /// CLASS ENTRY — called from the applied-commit hook UNDER THE COMMIT LOCK, strictly in the
-    /// `else` of the elision ENTER (mutual exclusion by construction, review H1). Enters when the
-    /// table is eligible, NOT elided, has a FRESH cold entry (generation pointer-current AND
-    /// boundary == committed_seq — the eager patch for this very commit just ran), and streaming
-    /// is active (a budget is configured). The freeze boundary = the current commit index.
-    pub(crate) fn maybe_enter_chunk_class(&self, table_name: &str) {
+    /// RETIRE-002 scan-build bridge: after a complete oversized-device streaming capture,
+    /// atomically make those encoded chunks authoritative and reclaim the temporary host repair
+    /// rows. Relational filtering, constraints, and visibility remain device decisions.
+    pub(crate) fn maybe_enter_chunk_class_from_cold(&self, table_name: &str) {
         #[cfg(test)]
         if !CHUNK_CLASS_ENTRY_ENABLED_TEST.load(Ordering::Relaxed) {
             return;
         }
+        let _commit_guard = self.commit_state();
         if self.table_chunk_authoritative(table_name).is_some()
-            || self.table_install_elided(table_name)
+            || self.table_device_authoritative(table_name)
         {
             return;
         }
@@ -728,9 +699,6 @@ impl Engine {
             std::collections::BTreeMap::clone(&residency.chunk_authoritative_tables.load());
         map.insert(table_name.to_string(), boundary);
         residency.chunk_authoritative_tables.store(Arc::new(map));
-        residency
-            .chunk_class_entries
-            .fetch_add(1, Ordering::Relaxed);
         // P4 RECLAMATION — THE STORE-ROW DELETION (the arc's payoff): the class table's host
         // chains + value-index entries are DROPPED at entry. Sound without a reader fence:
         // (a) in-flight readers hold COW generation Arcs — the clear publishes a NEW generation
@@ -740,13 +708,6 @@ impl Engine {
         // v2 rebuilds chunk-only. The allocator is preserved (identities never reuse). The
         // cleared store publishes a fresh generation, so the entry RE-PINS it (the class
         // invariants key on generation pointer stability from here on).
-        let reclaimed: u64 = self
-            .read_state
-            .mvcc
-            .table_rows(table_name)
-            .store()
-            .all_versions()
-            .len() as u64;
         if self
             .read_state
             .mvcc
@@ -802,11 +763,107 @@ impl Engine {
             // the cleared generation) — if it ever does, exit the class LOUDLY rather than run
             // with a mismatched pin.
             let _ = self.deauthoritize_chunk_table(table_name, true);
-            return;
         }
-        residency
-            .chunk_class_reclaimed_rows
-            .fetch_add(reclaimed, Ordering::Relaxed);
+    }
+
+    /// RETIRE-002 representation repair: split an authoritative cold entry into a smaller
+    /// device-format tiling without returning relational authority to the tuple store. Rows are
+    /// decoded only as bounded staging input for the existing columnar payload builder; no
+    /// predicate, visibility decision, constraint, or result is evaluated on the host. Each
+    /// source chunk is split independently so its birth boundary remains exact, while stable
+    /// entity ids and deleted-by stamps stay slot-aligned with the rebuilt payloads.
+    pub(crate) fn rechunk_streaming_cold_class(
+        &self,
+        table: &RelationalTable,
+        chunk_target_bytes: u64,
+    ) -> Option<Arc<ColdTableChunks>> {
+        if chunk_target_bytes == 0 || self.mvcc_read_skips_leader_check() {
+            return None;
+        }
+        let _commit_guard = self.commit_state();
+        self.table_chunk_authoritative(&table.name)?;
+        let entry = self
+            .read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(&table.name)
+            .cloned()?;
+        if entry.chunk_target_bytes <= chunk_target_bytes {
+            return Some(entry);
+        }
+        let current = self
+            .read_state
+            .mvcc
+            .table_rows(&table.name)
+            .generation_payload();
+        if !Arc::ptr_eq(&entry.generation, &current) {
+            return None;
+        }
+
+        let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
+        let mut builder = ColdCacheBuilder {
+            generation: Arc::clone(&entry.generation),
+            build_copin_s: entry.build_copin_s,
+            chunk_target_bytes,
+            total_payload_bytes: 0,
+            column_signature: entry.column_signature.clone(),
+            chunks: Vec::new(),
+            spill: None,
+            poisoned: false,
+        };
+        for source in &entry.chunks {
+            let rows = decode_cold_chunk_rows(table, source, 0).ok()?;
+            if rows.len() != source.row_count as usize
+                || source.entity_ids.len() != source.row_count as usize
+                || source
+                    .deleted_by
+                    .as_ref()
+                    .is_some_and(|sidecar| sidecar.len() != source.row_count as usize * 8)
+            {
+                return None;
+            }
+            let mut start = 0usize;
+            while start < rows.len() {
+                let mut row_bytes = 0u64;
+                let mut end = start;
+                while end < rows.len() {
+                    row_bytes =
+                        row_bytes.saturating_add(chunk_row_device_bytes(&rows[end], &column_types));
+                    end += 1;
+                    if row_bytes >= chunk_target_bytes {
+                        break;
+                    }
+                }
+                let (snapshot, payload) = self
+                    .build_transient_relation_payload_only(table, &rows[start..end])
+                    .ok()?;
+                builder.push(payload, snapshot, (end - start) as u64, (1, 0));
+                if builder.poisoned {
+                    return None;
+                }
+                let rebuilt = builder.chunks.last_mut()?;
+                rebuilt.entity_ids = Arc::new(source.entity_ids[start..end].to_vec());
+                rebuilt.payload_copin_s = source.payload_copin_s;
+                if let Some(sidecar) = &source.deleted_by {
+                    let bytes = sidecar[start * 8..end * 8].to_vec();
+                    builder.total_payload_bytes = builder
+                        .total_payload_bytes
+                        .saturating_add(bytes.len() as u64);
+                    rebuilt.deleted_by = Some(Arc::new(bytes));
+                }
+                start = end;
+            }
+        }
+        if !self.install_streaming_cold_class(&table.name, builder) {
+            return None;
+        }
+        self.read_state
+            .residency
+            .streaming_cold_chunks
+            .load()
+            .get(&table.name)
+            .cloned()
     }
 
     /// Build a transaction-private class tail without publishing it. The appended chunks are born
@@ -1523,13 +1580,9 @@ impl Engine {
         found
     }
 
-    /// P4 COMPACTION driver — runs at the commit hook AFTER `publish_committed_seq` (the timing
-    /// is load-bearing: the compacted chunk is born at the CURRENT PUBLISHED boundary, so every
-    /// later bind pins at-or-above it and sees it; a PRE-publish install would let a concurrent
-    /// boundary-minus-one bind load the new entry and born-skip the chunk — its SURVIVORS would
-    /// vanish for that read. In-flight readers hold the old entry Arc either way). Scans the
-    /// class entry's sidecars; every chunk past the dead-fraction threshold rebuilds from its
-    /// survivors in ONE fresh install.
+    /// Rebuild class chunks whose reclaimable tombstone fraction reaches 25%. Readers retain the
+    /// old entry Arc; publication swaps one new entry after every selected chunk has rebuilt.
+    #[cfg(test)]
     pub(crate) fn maybe_compact_chunk_class(&self, table_name: &str) {
         if self.table_chunk_authoritative(table_name).is_none() {
             return;
@@ -1544,10 +1597,6 @@ impl Engine {
             return;
         };
         let live = i64::from_le_bytes([COLD_DELETED_BY_LIVE_FILL_BYTE; 8]);
-        // A current-only survivor rebuild may discard a tombstoned key version only when every
-        // still-servable snapshot is at-or-after that deletion. With no active transaction the
-        // current published boundary is the safe horizon; otherwise the oldest retained boundary
-        // is authoritative. A newer tombstone keeps its entire chunk unchanged.
         let safe_horizon = self
             .active_snapshots_oldest()
             .unwrap_or_else(|| self.committed_seq());
@@ -1589,20 +1638,19 @@ impl Engine {
             return;
         };
         let boundary = self.committed_seq();
-        let mut chunks: Vec<ColdChunk> = Vec::with_capacity(entry.chunks.len());
+        let mut chunks = Vec::with_capacity(entry.chunks.len());
         let mut total = entry.total_payload_bytes;
         for (idx, chunk) in entry.chunks.iter().enumerate() {
             if needs.contains(&idx) {
                 if let Some(compacted) = self.compact_streaming_cold_chunk(&table, chunk, boundary)
                 {
-                    // Cap accounting: subtract the replaced payload + sidecar, add the new.
                     let old_payload = match &chunk.payload {
-                        ColdPayload::Ram(b) => b.len() as u64,
+                        ColdPayload::Ram(bytes) => bytes.len() as u64,
                         ColdPayload::Spilled { len, .. } => *len as u64,
                     };
                     let old_sidecar = chunk.deleted_by.as_ref().map_or(0, |b| b.len() as u64);
                     let new_payload = match &compacted.payload {
-                        ColdPayload::Ram(b) => b.len() as u64,
+                        ColdPayload::Ram(bytes) => bytes.len() as u64,
                         ColdPayload::Spilled { len, .. } => *len as u64,
                     };
                     total = total

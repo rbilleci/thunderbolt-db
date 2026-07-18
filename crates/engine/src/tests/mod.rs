@@ -11,7 +11,7 @@ use gpu_db_observability::InMemoryTelemetrySink;
 // feature submodule reaches them via `use super::*`).
 mod commit_timestamps;
 mod common;
-use common::*;
+pub(crate) use common::*;
 
 static NEXT_TEST_WAL_PATH_ID: AtomicU64 = AtomicU64::new(1);
 

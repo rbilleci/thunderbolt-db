@@ -108,11 +108,7 @@ impl Engine {
                     .commit_wave
                     .tails_finished
                     .load(AtomicOrdering::Acquire);
-                let maintenance = self
-                    .commit_wave
-                    .tail_maintenance_pending
-                    .load(AtomicOrdering::Acquire);
-                if applied == finished && maintenance == 0 {
+                if applied == finished {
                     break commit;
                 }
                 drop(commit);
@@ -371,78 +367,17 @@ impl Engine {
             .drain_committed_from(commit.repl.applied_index())
             .cloned()
             .collect();
-        // RETIREMENT A4e (audit B2): a MULTI-ENTRY commit bypasses the single-mutation elision
-        // hooks below (they rehydrate exactly ONE mutation's delta) — every entry's apply would
-        // skip the host install and the final invalidate+re-admit would rebuild every touched
-        // table from its STALE store (elided-era rows lost). Rehydrate every elided table in the
-        // batch's scope FIRST (under this commit lock; state through committed_seq is fully on
-        // device) — the tables de-elide, the applies install normally, the re-admit is truthful.
-        // ADR-006 (multi-statement elision): EXCEPT the insert-only-touched elided tables — a
-        // multi-entry batch (the group-commit batcher grouping GpuBatched INSERTs under load) now
-        // KEEPS those ELIDED via a single incremental device append per table below (parity with the
-        // single-entry incremental path), instead of de-eliding to the CPU host store. A table
-        // touched by a DELETE/UPDATE, or every table in a batch carrying non-DML, still de-elides.
-        let keep_elided: BTreeSet<String> = if to_apply.len() > 1
-            && self.auto_admit_on_commit_enabled()
-            && self.host_install_elision_enabled()
-        {
-            self.batch_insert_only_elided_tables(&to_apply)
+        // Coalesce an insert-only durable batch into one device append per table. Every other DML
+        // entry is published at its exact durable boundary below so a following repair-consuming
+        // DDL observes it. No batch is de-authorized to a host tuple store.
+        let keep_device_authoritative: BTreeSet<String> = if to_apply.len() > 1 {
+            self.batch_insert_only_device_authoritative_tables(&to_apply)
+                .into_iter()
+                .filter(|table| self.table_device_authoritative(table))
+                .collect()
         } else {
             BTreeSet::new()
         };
-        if to_apply.len() > 1 && self.host_install_elision_enabled() {
-            if let Some(scope) = Self::residency_invalidation_scope(&to_apply) {
-                for table_name in &scope {
-                    if self.table_install_elided(table_name) && !keep_elided.contains(table_name) {
-                        let Some(table) = self.relational_catalog_table(table_name) else {
-                            continue;
-                        };
-                        let seq = self.committed_seq();
-                        if let Err(error) = self.rehydrate_elided_table(
-                            &table,
-                            seq,
-                            &Default::default(),
-                            &Default::default(),
-                            seq,
-                        ) {
-                            self.wedge_commit_path();
-                            return Err(error);
-                        }
-                    }
-                }
-            }
-        }
-        // P4-2b (S-E.P4): the SAME multi-entry discipline for CHUNK-AUTHORITATIVE tables — the
-        // single-mutation tail-append hook below sees only the LAST entry's rows, so a
-        // multi-entry batch touching a class table would lose the earlier entries' tails.
-        // De-authoritize them FIRST (under this commit lock); the applies then install normally.
-        if to_apply.len() > 1 {
-            match Self::residency_invalidation_scope(&to_apply) {
-                Some(scope) => {
-                    for table_name in &scope {
-                        if self.table_chunk_authoritative(table_name).is_some() {
-                            self.deauthoritize_chunk_table(table_name, true)?;
-                        }
-                    }
-                }
-                // Audit M3: an undecodable/imprecise scope must be CONSERVATIVE — de-auth every
-                // class table (the invalidate-globally precedent) rather than risk a lost tail.
-                None => {
-                    let class_tables: Vec<String> = self
-                        .read_state
-                        .residency
-                        .chunk_authoritative_tables
-                        .load()
-                        .keys()
-                        .cloned()
-                        .collect();
-                    for table_name in class_tables {
-                        self.deauthoritize_chunk_table(&table_name, true)?;
-                    }
-                }
-            }
-        }
-
         // Hold the catalog latch across the WHOLE apply loop AND the catalog publish (PART B), so a
         // DDL's working-map mutation + the published-snapshot push are atomic w.r.t. another DDL. Lock
         // order is fixed: commit_mutex (held by the caller) FIRST, then this latch.
@@ -468,14 +403,86 @@ impl Engine {
             let mut applied: Vec<AppliedRowMutation> = Vec::new();
             let mut recorded_write_set = false;
             let mut insert_batch: BTreeMap<String, InsertAccum> = BTreeMap::new();
+            let mut maintained: BTreeSet<String> = BTreeSet::new();
             let mut working_catalog_changed = false;
             for e in &to_apply {
+                // RETIRE-002 repair boundary: DML no longer maintains a host tuple-store shadow.
+                // A rare DDL/recovery operator that still consumes that repair representation must
+                // reconstruct it explicitly from the current device generation immediately before
+                // the DDL, at the preceding durable boundary. This is not write-path authority.
+                if Self::entry_requires_relational_repair(e) {
+                    let boundary = e.index.saturating_sub(1);
+                    let class_tables = self
+                        .read_state
+                        .residency
+                        .chunk_authoritative_tables
+                        .load()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for table_name in class_tables {
+                        self.deauthoritize_chunk_table(&table_name, true)?;
+                    }
+                    let elided = self
+                        .read_state
+                        .residency
+                        .device_authoritative_tables
+                        .load()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for table_name in elided {
+                        let Some(table) = cat.relational_catalog.get(&table_name) else {
+                            continue;
+                        };
+                        self.rehydrate_elided_table(
+                            table,
+                            boundary,
+                            &Default::default(),
+                            &Default::default(),
+                            boundary,
+                        )?;
+                    }
+                }
                 let working_catalog = working_catalog_changed
                     .then(|| Self::catalog_snapshot_from_working(cat, e.index.saturating_sub(1)));
                 let applied_entry = self.with_apply_catalog(working_catalog, || {
                     commit.sm.apply(e)?;
                     self.apply_mvcc_entry(e, cat)
                 })?;
+                if Self::entry_requires_relational_repair(e) {
+                    self.rebuild_device_generations_from_repair(cat, e.index)?;
+                }
+                // A mixed DDL/DML durable batch must publish each DML entry to the device before
+                // the following repair-consuming DDL reverse-gathers. Pure insert batches retain
+                // their coalesced append below; every other multi-entry DML is maintained now.
+                if to_apply.len() > 1
+                    && !atomic_transaction
+                    && !applied_entry.is_empty()
+                    && applied_entry.iter().all(|mutation| {
+                        !keep_device_authoritative.contains(&Self::applied_mutation_table(mutation))
+                    })
+                {
+                    let touched = applied_entry
+                        .iter()
+                        .map(Self::applied_mutation_table)
+                        .collect::<BTreeSet<_>>();
+                    for table in &touched {
+                        maintained.remove(table);
+                    }
+                    let working = Self::catalog_snapshot_from_working(cat, e.index);
+                    let entry_maintained = self.with_apply_catalog(Some(working), || {
+                        self.try_maintain_transaction_residency(cat, &applied_entry, e.index)
+                    })?;
+                    if let Some(table) = touched.difference(&entry_maintained).next() {
+                        self.wedge_commit_path();
+                        return Err(EngineError::ApplyFailed(format!(
+                            "durable DML for relation \"{table}\" could not publish its device generation at {}",
+                            e.index
+                        )));
+                    }
+                    maintained.extend(touched);
+                }
                 let affected_rows = applied_entry
                     .iter()
                     .map(AppliedRowMutation::rows_affected)
@@ -499,7 +506,7 @@ impl Engine {
                         ..
                     } = &m
                     {
-                        if keep_elided.contains(table) {
+                        if keep_device_authoritative.contains(table) {
                             let acc = insert_batch.entry(table.clone()).or_default();
                             acc.rows.extend(rows.iter().cloned());
                             acc.row_ids.extend(row_ids.iter().copied());
@@ -534,20 +541,21 @@ impl Engine {
             // guaranteed to find this generation — the catalog is visible no later than `committed_seq`.
             // That, with the per-boundary self-consistency of the data (MVCC versions stamp old/new
             // part-counts at the DDL's commit_seq), rules out a reader straddling a shape-changing DDL.
-            // Slice 1b-ii-c / SV4b: an INSERT or DELETE commit of EXACTLY ONE applied log entry maintains the
-            // resident shard INCREMENTALLY (O(rows touched)) instead of invalidating + re-admitting the whole
-            // table (the O(table) dual-store tax): INSERT appends its rows into the open shard's headroom;
-            // DELETE locates the deleted rows' resident slots (zone-map-pruned) and stamps `deleted_by` in
-            // place. The single-entry guard keeps the residency scope == {that one table} — a multi-entry
-            // batch / DDL / update falls back to the conservative invalidate below. Runs BEFORE
-            // publish_committed_seq, so a reader that observes the new committed_seq sees the change; append
-            // also drops the table's stale GPU index (audit Finding A). On ANY failure (not-int4-resident / no
-            // headroom / non-single-row / NULL-or-dup-ambiguous locate / device err) the helper returns false
-            // and we invalidate + re-admit (which rebuilds all-live from the host store = always correct).
-            // DELETE-tombstoning is gated behind `resident_delete_tombstone_enabled` (default OFF, nested under
-            // the shard path) so its A/B lever is independent; OFF => a DELETE re-admits exactly as before.
-            let mut maintained: BTreeSet<String> = BTreeSet::new();
-            let handled = if atomic_transaction {
+            // R3-004: an ordinary relational commit maintains its resident generation before the
+            // visibility cut. INSERT appends into open-shard headroom; UPDATE/DELETE stamps exact stable
+            // identities and UPDATE appends its new version. A device decline is handled below by wedging
+            // before acknowledgement; only DDL/recovery repair reaches conservative invalidation.
+            let handled = if applied.is_empty()
+                && to_apply.len() == 1
+                && Self::entry_is_relational_dml(&to_apply[0])
+            {
+                // A zero-row DELETE/UPDATE (including its typed WAL replay form) changes no
+                // relational bytes. Preserve the current device generation: invalidating it would
+                // manufacture a missing-authority gap before the next replayed/device-prepared DML.
+                // Allocator-only effects, such as a zero-row UPDATE's burned reservation, were
+                // already applied above and do not require a generation rewrite.
+                true
+            } else if atomic_transaction {
                 maintained =
                     self.try_maintain_transaction_residency(cat, &applied, publish_index)?;
                 let touched = applied
@@ -577,13 +585,28 @@ impl Engine {
                                 Some(row_ids),
                             )
                         }
-                        Some(AppliedRowMutation::Delete { table, rows, .. })
-                            if self.resident_delete_tombstone_enabled() =>
-                        {
-                            self.try_tombstone_resident_delete_commit(
+                        Some(AppliedRowMutation::Delete {
+                            table,
+                            rows,
+                            write_set,
+                            ..
+                        }) => {
+                            let prefix = relational_key_prefix(table);
+                            let row_ids = write_set
+                                .rows
+                                .iter()
+                                .filter_map(|key| {
+                                    crate::engine_residency::parse_relational_row_id(
+                                        &key.row_key,
+                                        &prefix,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            self.try_tombstone_transaction_rows_by_identity(
                                 cat,
                                 table,
                                 rows,
+                                &row_ids,
                                 publish_index,
                             )
                         }
@@ -591,29 +614,34 @@ impl Engine {
                             table,
                             old_rows,
                             new_rows,
-                            row_ids,
+                            row_ids: Some(row_ids),
                             ..
-                        }) if self.resident_update_tombstone_enabled() => {
-                            // RETIREMENT A1/A4b: the appended new versions keep the ORIGINAL rows'
-                            // identities — parsed from the installs' keys (exact parallel to
-                            // old_rows/new_rows), surfaced on the mutation.
-                            self.try_update_resident_commit(
-                                cat,
-                                table,
-                                old_rows,
-                                new_rows,
-                                publish_index,
-                                row_ids.as_deref(),
-                            )
+                        }) => {
+                            if old_rows.is_empty() {
+                                new_rows.is_empty()
+                            } else {
+                                self.try_tombstone_transaction_rows_by_identity(
+                                    cat,
+                                    table,
+                                    old_rows,
+                                    row_ids,
+                                    publish_index,
+                                ) && self.try_append_resident_int4_open_shard(
+                                    table,
+                                    new_rows,
+                                    crate::engine_residency::AppendCreatedBy::UpdateNewVersion(
+                                        publish_index,
+                                    ),
+                                    Some(row_ids),
+                                )
+                            }
                         }
                         _ => false,
                     }
             };
-            // RETIREMENT A4e: the ELIDED lifecycle. A handled incremental commit on an eligible
-            // strictly-Int4 table ENTERS elision (subsequent applies skip the host install); an
-            // UNHANDLED commit on an elided table REHYDRATES FIRST (device gather @ C-1 + this
-            // commit's delta -> the host store is complete again, sticky de-elision) so the
-            // invalidate+re-admit below rebuilds from a truthful store.
+            // A handled incremental commit confirms and advances the authoritative device
+            // generation. A DML decline below is fatal to this live apply and is never dispatched
+            // to a host tuple-store repair path.
             if !atomic_transaction {
                 if let Some(applied_ref) = applied.last() {
                     let table_name = match applied_ref {
@@ -621,15 +649,9 @@ impl Engine {
                         | AppliedRowMutation::Delete { table, .. }
                         | AppliedRowMutation::Update { table, .. } => table.as_str(),
                     };
-                    // ADR-006: a ZERO-ROW DELETE/UPDATE now reports HANDLED (`true`) so it does NOT de-elide an
-                    // already-elided table (the no-op is byte-unchanged). But `handled` ALSO drives elision-
-                    // ENTER below, and ENTER requires the device residency to be CONFIRMED CURRENT — which only
-                    // a NON-EMPTY append/tombstone establishes (they return `false` when the table is not
-                    // device-resident; `table_elision_eligible` is catalog-only and checks no residency). A
-                    // zero-row op touches the device not at all, so it must NEVER drive ENTER (that would elide a
-                    // possibly-non-resident table -> a later rehydrate hard-errors "device-authoritative
-                    // invariant broken"). Gate ENTER on the applied set being non-empty; the no-op leaves the
-                    // elision state unchanged (neither enters nor exits).
+                    // A zero-row UPDATE/DELETE is byte-unchanged. It reports handled so an already
+                    // authoritative generation stays current, but cannot establish authority for a table
+                    // whose residency was not confirmed by an actual append or tombstone.
                     let applied_changed_rows = match applied_ref {
                         AppliedRowMutation::Insert { rows, .. } => !rows.is_empty(),
                         AppliedRowMutation::Delete { rows, .. } => !rows.is_empty(),
@@ -637,36 +659,24 @@ impl Engine {
                     };
                     if handled
                         && applied_changed_rows
-                        && self.host_install_elision_enabled()
-                        && !self.table_install_elided(table_name)
+                        && !self.table_device_authoritative(table_name)
                     {
                         // Audit B1: eligibility = device-authoritative types AND FK-free both directions
                         // (CHECK is row-local and no longer blocks — ADR-006; the published snapshot is
                         // the same catalog `cat` mirrors here).
                         let snapshot = self.catalog_snapshot();
-                        if self.table_elision_eligible(&snapshot, table_name) {
-                            self.set_table_install_elided(table_name, true);
+                        if self.table_device_authority_eligible(&snapshot, table_name) {
+                            self.set_table_device_authoritative(table_name, true);
                         }
                     } else if !handled
-                        && self.table_install_elided(table_name)
-                        && !keep_elided.contains(table_name)
+                        && self.table_device_authoritative(table_name)
+                        && !keep_device_authoritative.contains(table_name)
+                        && !maintained.contains(table_name)
                     {
-                        // ADR-006 (multi-statement elision): a keep-elided table is maintained by the
-                        // multi-entry INSERT append below (on the FULL batch), NOT rehydrated/de-elided
-                        // here on just the last entry's delta. `keep_elided` is empty for the single-entry
-                        // and imprecise-scope cases, so this is inert there (behavior preserved); and the
-                        // ENTER arm above needs `handled`, which is false for a multi-entry commit, so a
-                        // keep-elided table never enters via the single-`applied` hook either.
-                        let (upserts, removals) = Self::elided_commit_delta(applied_ref);
-                        if let Some(table) = cat.relational_catalog.get(table_name) {
-                            self.rehydrate_elided_table(
-                                table,
-                                publish_index.saturating_sub(1),
-                                &upserts,
-                                &removals,
-                                publish_index,
-                            )?;
-                        }
+                        self.wedge_commit_path();
+                        return Err(EngineError::ApplyFailed(format!(
+                            "durable DML for relation \"{table_name}\" could not publish its device generation at {publish_index}"
+                        )));
                     }
                     // P4-2b (S-E.P4): the CHUNK-AUTHORITATIVE lifecycle — strictly the elision arm's
                     // ELSE (mutual exclusion, design review H1). A class INSERT materializes as a
@@ -675,8 +685,9 @@ impl Engine {
                     // DELETE/UPDATE that somehow reached apply with the flag still set (the prepare
                     // guard de-authoritizes first; this is the backstop) — exits the class LOUDLY.
                     // Class ENTRY happens after the cold maintenance below (the entry must be fresh).
-                    if !self.table_install_elided(table_name)
+                    if !self.table_device_authoritative(table_name)
                         && self.table_chunk_authoritative(table_name).is_some()
+                        && !maintained.contains(table_name)
                     {
                         match applied_ref {
                             AppliedRowMutation::Insert { rows, row_ids, .. }
@@ -779,21 +790,16 @@ impl Engine {
                     }
                 }
             }
-            // ADR-006 (multi-statement elision): drain the accumulated INSERTs for the keep-elided
-            // tables. ONE incremental device append per table (all the batch's rows, PER-ROW birth
-            // stamps like the concurrent wave flush) keeps the table ELIDED + current. A decline (no
-            // headroom on a single-buffer table, a NULL, a device error) de-elides that ONE table via
-            // a rehydrate carrying the batch's rows as the delta: the append is ATOMIC per call, so on
-            // decline NONE of these rows reached the device and the gather @ C-1 is the pre-commit
-            // state; the de-elided table then falls into the invalidate+re-admit set below. `handled`
-            // is false for a multi-entry commit, so the single-entry lifecycle above skipped these.
+            // Drain accumulated multi-statement INSERTs with one stamped device append per table.
+            // A decline wedges before acknowledgement; no host reconstruction or re-admission path
+            // is eligible for these durable rows.
             for (table_name, acc) in insert_batch {
                 if acc.rows.is_empty() {
                     continue;
                 }
                 debug_assert!(
-                    self.table_install_elided(&table_name),
-                    "keep_elided tables stay elided through the apply loop (commit_mutex held)"
+                    self.table_device_authoritative(&table_name),
+                    "device-authoritative insert batches retain authority through the apply loop"
                 );
                 let appended = self.try_append_resident_int4_open_shard(
                     &table_name,
@@ -803,29 +809,15 @@ impl Engine {
                 );
                 if appended {
                     maintained.insert(table_name);
-                } else if self.table_install_elided(&table_name) {
-                    let upserts: BTreeMap<u64, Vec<SqlValue>> = acc
-                        .row_ids
-                        .iter()
-                        .copied()
-                        .zip(acc.rows.iter().cloned())
-                        .collect();
-                    if let Some(table) = cat.relational_catalog.get(&table_name) {
-                        self.rehydrate_elided_table(
-                            table,
-                            publish_index.saturating_sub(1),
-                            &upserts,
-                            &Default::default(),
-                            publish_index,
-                        )?;
-                    }
+                } else {
+                    self.wedge_commit_path();
+                    return Err(EngineError::ApplyFailed(format!(
+                        "durable insert batch for relation \"{table_name}\" could not publish its device generation at {publish_index}"
+                    )));
                 }
             }
-            // VACUUM #5 auto-trigger: a handled incremental commit that pushed the table's
-            // tombstone churn past the threshold rebuilds it NOW, inside the held commit lock
-            // (dead slots bloat every scan and keep the PK index dup-declined; the rebuild is
-            // the same invalidate+re-admit a declined commit would do — pre-publish, so its
-            // all-live born-visible semantics match the existing re-admit class).
+            // VACUUM #5 auto-trigger: a handled incremental commit that pushed tombstone churn
+            // past the threshold schedules the explicit RETIRE-002 dense-repair boundary.
             if handled && self.auto_vacuum_enabled() {
                 if let Some(applied_ref) = applied.last() {
                     let table_name = match applied_ref {
@@ -849,9 +841,8 @@ impl Engine {
                 }
             }
             if !handled {
-                // ADR-006: SKIP the tables kept elided in place by the multi-entry INSERT append —
-                // invalidating them would re-admit from the (deliberately stale) host store.
-                // `maintained` is empty for the single-entry path (behavior preserved).
+                // Only representation-changing DDL/repair entries may remain unhandled here. Never
+                // invalidate a table whose device generation was maintained by this batch.
                 self.invalidate_relational_residency_for_commit_except(
                     &to_apply,
                     &maintained,
@@ -892,75 +883,14 @@ impl Engine {
             } else {
                 mandatory_refresh
             };
-            // A maintained table stays elided + current — re-admitting would rebuild it from the
-            // stale host store. `maintained` is empty for the single-entry path.
+            // Device-maintained tables are already current. Admission here is restricted to the
+            // non-authoritative bootstrap/repair scope.
             let admit: BTreeSet<String> = tables.difference(&maintained).cloned().collect();
             self.auto_admit_resident_tables(&admit);
         }
-        // 6c-3: EAGER streaming cold-tier maintenance — unconditional (self-gating on entry
-        // existence), best-effort, O(delta) per touched table with a cold entry. The commit mutex
-        // is HELD here (this whole apply runs inside the commit critical section), so the patch
-        // installs through the lock-held arm.
-        if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
-            self.maintain_streaming_cold_on_commit(&tables);
-            // P4-2b: class ENTRY — the maintenance above just brought each table's cold entry
-            // current at THIS commit (the freshness proof maybe_enter requires).
-            for table_name in &tables {
-                self.maybe_enter_chunk_class(table_name);
-                // P4 compaction: post-publish by design (a pre-publish install would let a
-                // boundary-minus-one bind born-skip the compacted survivors).
-                self.maybe_compact_chunk_class(table_name);
-            }
-        }
+        // R3-004: no commit-time cold-store patch or class entry. Normal relational DML publishes
+        // only its device generation; RETIRE-002 owns any future device-native cold repair/import.
         Ok(())
-    }
-
-    /// RETIREMENT A4e: an unhandled commit's (upserts, removals) by row identity — the delta the
-    /// device could not absorb, applied on top of the rehydration gather. Identities: INSERT/
-    /// UPDATE carry `row_ids` on the mutation; DELETE parses the write-set's row keys.
-    fn elided_commit_delta(
-        applied: &AppliedRowMutation,
-    ) -> (
-        std::collections::BTreeMap<u64, Vec<SqlValue>>,
-        std::collections::BTreeSet<u64>,
-    ) {
-        let mut upserts = std::collections::BTreeMap::new();
-        let mut removals = std::collections::BTreeSet::new();
-        match applied {
-            AppliedRowMutation::Insert {
-                table,
-                rows,
-                row_ids,
-                ..
-            } => {
-                let _ = table;
-                for (row_id, row) in row_ids.iter().zip(rows.iter()) {
-                    upserts.insert(*row_id, row.clone());
-                }
-            }
-            AppliedRowMutation::Update {
-                new_rows, row_ids, ..
-            } => {
-                if let Some(ids) = row_ids {
-                    for (row_id, row) in ids.iter().zip(new_rows.iter()) {
-                        upserts.insert(*row_id, row.clone());
-                    }
-                }
-            }
-            AppliedRowMutation::Delete {
-                table, write_set, ..
-            } => {
-                let prefix = relational_key_prefix(table);
-                for row in &write_set.rows {
-                    if let Some(row_id) =
-                        crate::engine_residency::parse_relational_row_id(&row.row_key, &prefix)
-                    {
-                        removals.insert(row_id);
-                    }
-                }
-            }
-        }
-        (upserts, removals)
     }
 
     pub(crate) fn commit_mutation_at_with_current_apply<F>(
@@ -975,7 +905,11 @@ impl Engine {
         // the directly-applied current entry stamps versions with the SAME commit-seq that
         // `apply_mvcc_entry` derives from `entry.index` on replay — keeping the live COPY hot path
         // byte-identical to a WAL replay of the same record (Stage 0 stamp/boundary unification).
-        F: FnMut(&Self, &mut DdlCatalogState, Index) -> Result<(), EngineError>,
+        F: FnMut(
+            &Self,
+            &mut DdlCatalogState,
+            Index,
+        ) -> Result<Option<crate::engine_dml_prepare::AppliedInsert>, EngineError>,
     {
         self.ensure_commit_path_available()?;
         self.intent_lanes_write_guard()?;
@@ -1027,74 +961,52 @@ impl Engine {
             .drain_committed_from(commit.repl.applied_index())
             .cloned()
             .collect();
-        // RETIREMENT A4e (audit B2): a MULTI-ENTRY commit bypasses the single-mutation elision
-        // hooks below (they rehydrate exactly ONE mutation's delta) — every entry's apply would
-        // skip the host install and the final invalidate+re-admit would rebuild every touched
-        // table from its STALE store (elided-era rows lost). Rehydrate every elided table in the
-        // batch's scope FIRST (under this commit lock; state through committed_seq is fully on
-        // device) — the tables de-elide, the applies install normally, the re-admit is truthful.
-        if to_apply.len() > 1 && self.host_install_elision_enabled() {
-            if let Some(scope) = Self::residency_invalidation_scope(&to_apply) {
-                for table_name in &scope {
-                    if self.table_install_elided(table_name) {
-                        let Some(table) = self.relational_catalog_table(table_name) else {
-                            continue;
-                        };
-                        let seq = self.committed_seq();
-                        self.rehydrate_elided_table(
-                            &table,
-                            seq,
-                            &Default::default(),
-                            &Default::default(),
-                            seq,
-                        )?;
-                    }
-                }
-            }
-        }
-
-        // P4-2b (S-E.P4): this path has NO applied-rows hook for the class tail append (the
-        // current-apply closure installs directly) — de-authoritize any CHUNK-AUTHORITATIVE table
-        // in scope FIRST (COPY-scale ingest exits the class; it re-enters on its next incremental
-        // commit with a fresh capture).
-        match Self::residency_invalidation_scope(&to_apply) {
-            Some(scope) => {
-                for table_name in &scope {
-                    if self.table_chunk_authoritative(table_name).is_some() {
-                        // Audit C1: this path HOLDS the commit mutex without the internal-read
-                        // flag — the explicit lock statement prevents the re-lock deadlock.
-                        if let Err(error) = self.deauthoritize_chunk_table(table_name, true) {
-                            self.wedge_commit_path();
-                            return Err(error);
-                        }
-                    }
-                }
-            }
-            None => {
-                let class_tables: Vec<String> = self
-                    .read_state
-                    .residency
-                    .chunk_authoritative_tables
-                    .load()
-                    .keys()
-                    .cloned()
-                    .collect();
-                for table_name in class_tables {
-                    if let Err(error) = self.deauthoritize_chunk_table(&table_name, true) {
-                        self.wedge_commit_path();
-                        return Err(error);
-                    }
-                }
-            }
-        }
         // Hold the catalog latch across the apply loop AND the catalog publish (PART B; lock order:
         // commit_mutex FIRST, then this latch).
         let residency_invalidation_micros;
+        let mut maintained = BTreeSet::new();
         {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
             let mut working_catalog_changed = false;
             for e in &to_apply {
+                if Self::entry_requires_relational_repair(e) {
+                    let boundary = e.index.saturating_sub(1);
+                    let class_tables = self
+                        .read_state
+                        .residency
+                        .chunk_authoritative_tables
+                        .load()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for table_name in class_tables {
+                        if let Err(error) = self.deauthoritize_chunk_table(&table_name, true) {
+                            self.wedge_commit_path();
+                            return Err(error);
+                        }
+                    }
+                    let elided = self
+                        .read_state
+                        .residency
+                        .device_authoritative_tables
+                        .load()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for table_name in elided {
+                        let Some(table) = cat.relational_catalog.get(&table_name) else {
+                            continue;
+                        };
+                        self.rehydrate_elided_table(
+                            table,
+                            boundary,
+                            &Default::default(),
+                            &Default::default(),
+                            boundary,
+                        )?;
+                    }
+                }
                 let working_catalog = working_catalog_changed
                     .then(|| Self::catalog_snapshot_from_working(cat, e.index.saturating_sub(1)));
                 let apply_entry = || {
@@ -1104,13 +1016,45 @@ impl Engine {
                         apply_current(self, cat, e.index)
                     } else {
                         commit.sm.apply(e)?;
-                        self.apply_mvcc_entry(e, cat).map(|_| ())
+                        self.apply_mvcc_entry(e, cat).map(|_| None)
                     }
                 };
                 let apply_result = self.with_apply_catalog(working_catalog, apply_entry);
-                if let Err(error) = apply_result {
-                    self.wedge_commit_path();
-                    return Err(error);
+                let applied_insert = match apply_result {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        self.wedge_commit_path();
+                        return Err(error);
+                    }
+                };
+                if let Some((table, rows, _write_set, row_ids)) = applied_insert {
+                    let appended = if rows.is_empty() {
+                        true
+                    } else if self.table_chunk_authoritative(&table).is_some() {
+                        cat.relational_catalog.get(&table).is_some_and(|relation| {
+                            self.append_streaming_cold_tail(relation, &rows, &row_ids, e.index)
+                        })
+                    } else {
+                        self.try_append_resident_int4_open_shard(
+                            &table,
+                            &rows,
+                            crate::engine_residency::AppendCreatedBy::InsertUniform(e.index),
+                            Some(&row_ids),
+                        )
+                    };
+                    if !appended {
+                        self.wedge_commit_path();
+                        return Err(EngineError::ApplyFailed(format!(
+                            "durable COPY for relation \"{table}\" could not publish its device generation"
+                        )));
+                    }
+                    maintained.insert(table);
+                }
+                if Self::entry_requires_relational_repair(e) {
+                    if let Err(error) = self.rebuild_device_generations_from_repair(cat, e.index) {
+                        self.wedge_commit_path();
+                        return Err(error);
+                    }
                 }
                 working_catalog_changed |= Self::entry_mutates_working_catalog(e, cat);
                 commit.repl.mark_applied(e.index);
@@ -1119,7 +1063,12 @@ impl Engine {
             // Publish ordering (PART B): residency → catalog ring push → `committed_seq` LAST (mirrors
             // `commit_mutation_at`). The current-apply closure already published data + mutated the maps.
             let residency_invalidation_started = Instant::now();
-            self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
+            self.invalidate_relational_residency_for_commit_except(
+                &to_apply,
+                &maintained,
+                txn_id,
+                token.index,
+            );
             residency_invalidation_micros = residency_invalidation_started.elapsed().as_micros();
             let prune_below = self.catalog_prune_boundary(token.index);
             self.publish_catalog_snapshot(cat, token.index, prune_below);
@@ -1149,21 +1098,11 @@ impl Engine {
                     resident
                 })
             };
-            self.auto_admit_resident_tables(&tables);
+            let admit = tables.difference(&maintained).cloned().collect();
+            self.auto_admit_resident_tables(&admit);
         }
-        // 6c-3: EAGER streaming cold-tier maintenance (see apply_and_publish_committed_inner's
-        // twin). The commit guard acquired at this fn's top is still held.
-        if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
-            self.maintain_streaming_cold_on_commit(&tables);
-            // P4-2b: class ENTRY — the maintenance above just brought each table's cold entry
-            // current at THIS commit (the freshness proof maybe_enter requires).
-            for table_name in &tables {
-                self.maybe_enter_chunk_class(table_name);
-                // P4 compaction: post-publish by design (a pre-publish install would let a
-                // boundary-minus-one bind born-skip the compacted survivors).
-                self.maybe_compact_chunk_class(table_name);
-            }
-        }
+        // R3-004: no commit-time cold-store patch or class entry. Normal relational DML publishes
+        // only its device generation; RETIRE-002 owns any future device-native cold repair/import.
         self.metrics.inc_commit();
 
         Ok((token, residency_invalidation_micros))
@@ -1173,7 +1112,7 @@ impl Engine {
     /// table. Retained as the **conservative fallback** for commit batches whose
     /// mutated tables cannot be determined precisely ([`Engine::residency_invalidation_scope`]
     /// returns `None`). Equivalent to invalidating each resident table individually.
-    fn invalidate_relational_residency(&self, txn_id: TxnId, index: Index) {
+    pub(crate) fn invalidate_relational_residency(&self, txn_id: TxnId, index: Index) {
         let tables: BTreeSet<String> = self
             .read_state
             .residency
@@ -1195,7 +1134,12 @@ impl Engine {
     /// previous global invalidation; the device-memory/shard removals here are
     /// unconditional, so in degenerate cache states it may clear a stray cross-map
     /// entry the old two-loop form left — strictly-safe extra cleanup, never stale.
-    fn invalidate_relational_residency_table(&self, table: &str, txn_id: TxnId, index: Index) {
+    pub(crate) fn invalidate_relational_residency_table(
+        &self,
+        table: &str,
+        txn_id: TxnId,
+        index: Index,
+    ) {
         // Stage 3 — blocker #2: the snapshot/shard flag maps are published behind `ArcSwap`;
         // W0 extracted the copy-on-write flagging into a helper SHARED with the concurrent
         // invalidation (publishers serialize on `descriptor_publish_lock`).
@@ -1205,17 +1149,14 @@ impl Engine {
             .residency
             .shard_device_memory
             .invalidate_table(table);
-        // SV4 prereq #1 (lifecycle): release the shard's on-demand `deleted_by` region alongside the
-        // resident buffer it annotates. The re-admit that follows an invalidating commit rebuilds the
-        // shard ALL-LIVE from the host store, so a surviving tombstone region would wrongly hide rows
-        // (and leak device memory). Mirrors `shard_device_memory` exactly. INERT until SV4 (no region
-        // exists in production today), so this leaves the OFF path byte-identical.
+        // Release the shard's on-demand `deleted_by` region alongside the resident buffer it
+        // annotates. The explicit repair rebuild publishes fresh version sidecars; retaining an old
+        // region would hide unrelated rows and leak device memory.
         self.read_state
             .residency
             .shard_deleted_by_memory
             .invalidate_table(table);
-        // SV6: the `created_by` region lives and dies with the buffer it annotates, exactly like
-        // `deleted_by` (a stale region surviving a re-admit would wrongly HIDE rebuilt all-live rows).
+        // The `created_by` region lives and dies with the buffer it annotates.
         self.read_state
             .residency
             .shard_created_by_memory
@@ -1254,17 +1195,13 @@ impl Engine {
             .flag_table_descriptors_invalidated(table, txn_id, index);
     }
 
-    /// Invalidate the GPU residency of the `tables` a CONCURRENT commit mutated, via `&self`
-    /// (write-half MVCC, Stage 4). Publishes a `None` tombstone on each table's resident
-    /// device-memory cell(s) — the authoritative gate the read-path's `plan_relational_resident_route`
-    /// checks (`has_retained_device_memory`), so after this a reader takes the CPU route on the new
-    /// committed data rather than a stale GPU snapshot (residency↔data consistency, design Risk #3).
-    /// Called INSIDE the commit critical section, before `committed_seq` is bumped, so a reader that
-    /// observes the new `committed_seq` also observes the residency tombstone.
+    /// Publish invalid descriptors for an explicit repair/vacuum/test transition. Ordinary DML
+    /// maintains device authority in place and must never call this as a fallback. Callers hold the
+    /// commit boundary until a replacement generation is rebuilt, so no acknowledged relational
+    /// state is exposed through a missing-device window.
     ///
     /// W0: it ALSO flags the `snapshots`/`shards` DESCRIPTOR maps (the pre-W0 form tombstoned only
-    /// the cells, believing "the cell tombstone alone forces the CPU route" — true for the
-    /// TABLE-level route, but the D4 SHARDED planner/executor and the write-locates read the
+    /// the cells, but the D4 SHARDED planner/executor and the write-locates read the
     /// descriptor's `is_valid()` + its riding `device_memory` Arc and never consult the cells, so
     /// a concurrent commit left them serving/probing STALE device bytes). The maps' publishers
     /// serialize on `descriptor_publish_lock`, so this is safe from the commit critical section
@@ -1315,242 +1252,6 @@ impl Engine {
         // (only when the wave route is enabled — default OFF).
     }
 
-    /// The set of tables a committed batch invalidates, or `None` to fall back to a
-    /// global invalidation. **Conservative by construction:** it narrows only for
-    /// commands whose mutated table(s) are unambiguous (single-table DML, TRUNCATE,
-    /// DROP TABLE) and treats CREATE TABLE as touching no existing residency. Any other
-    /// command — or a payload that fails to decode or parse — returns `None`, so
-    /// residency is never left stale. Over-invalidation is merely a performance cost;
-    /// under-invalidation would serve wrong rows, so this must never narrow when unsure.
-    pub(crate) fn residency_invalidation_scope(entries: &[LogEntry]) -> Option<BTreeSet<String>> {
-        let mut tables = BTreeSet::new();
-        for entry in entries {
-            // W5a: a binary record is single-table by construction; decode its header for the
-            // exact scope (an undecodable tagged record falls back to the conservative global
-            // invalidation, same as any unparseable payload).
-            if is_binary_wal_record(&entry.payload) {
-                match decode_binary_record(&entry.payload) {
-                    Ok(crate::wal_binary::BinaryWalRecord::Insert(record)) => {
-                        tables.insert(record.table);
-                        continue;
-                    }
-                    Ok(crate::wal_binary::BinaryWalRecord::DeleteByKey(record)) => {
-                        tables.insert(record.table);
-                        continue;
-                    }
-                    Ok(crate::wal_binary::BinaryWalRecord::UpdateByKey(record)) => {
-                        tables.insert(record.table);
-                        continue;
-                    }
-                    Ok(crate::wal_binary::BinaryWalRecord::Transaction(record)) => {
-                        for mutation in record.mutations {
-                            let table = match mutation {
-                                BinaryTransactionMutation::Insert { table, .. }
-                                | BinaryTransactionMutation::Update { table, .. }
-                                | BinaryTransactionMutation::Delete { table, .. } => table,
-                            };
-                            tables.insert(table);
-                        }
-                        continue;
-                    }
-                    Err(_) => return None,
-                }
-            }
-            let command = Self::decode_engine_command(&entry.payload).ok()??;
-            match command {
-                Command::Insert(insert) => {
-                    tables.insert(insert.table);
-                }
-                Command::Update(update) => {
-                    tables.insert(update.table);
-                }
-                Command::Delete(delete) => {
-                    tables.insert(delete.table);
-                }
-                Command::TruncateTable(truncate) => {
-                    tables.insert(truncate.name);
-                }
-                Command::DropTable(drop) => {
-                    tables.extend(drop.names);
-                }
-                // A brand-new table has no prior residency to invalidate.
-                Command::CreateTable(_) => {}
-                // Any other command (other DDL, ACL, KV, schema/db/role/...) is not yet
-                // precisely scoped; invalidate everything rather than risk staleness.
-                _ => return None,
-            }
-        }
-        Some(tables)
-    }
-
-    /// Invalidate residency for a committed batch: per-table when the mutated tables
-    /// can be determined, else a conservative global invalidation.
-    fn invalidate_relational_residency_for_commit(
-        &self,
-        entries: &[LogEntry],
-        txn_id: TxnId,
-        index: Index,
-    ) {
-        match Self::residency_invalidation_scope(entries) {
-            Some(tables) => {
-                for table in &tables {
-                    self.invalidate_relational_residency_table(table, txn_id, index);
-                }
-            }
-            None => self.invalidate_relational_residency(txn_id, index),
-        }
-    }
-
-    /// Like [`Engine::invalidate_relational_residency_for_commit`] but SKIPS any table in
-    /// `maintained` — the multi-entry INSERT batch kept those ELIDED + current via an in-place device
-    /// append, so they must NOT be invalidated (the re-admit would rebuild them from the deliberately
-    /// stale host store). If the scope is imprecise (`None`) NO table was maintained
-    /// (`batch_insert_only_elided_tables` returns empty there), so the conservative global
-    /// invalidation still runs.
-    fn invalidate_relational_residency_for_commit_except(
-        &self,
-        entries: &[LogEntry],
-        maintained: &BTreeSet<String>,
-        txn_id: TxnId,
-        index: Index,
-    ) {
-        match Self::residency_invalidation_scope(entries) {
-            Some(tables) => {
-                for table in &tables {
-                    if maintained.contains(table) {
-                        continue;
-                    }
-                    self.invalidate_relational_residency_table(table, txn_id, index);
-                }
-            }
-            None => self.invalidate_relational_residency(txn_id, index),
-        }
-    }
-
-    /// ADR-006 (multi-statement elision): the subset of `entries`' tables that a MULTI-ENTRY commit
-    /// can keep ELIDED by an incremental device append instead of de-eliding the whole scope — a
-    /// table touched ONLY by INSERTs in this batch AND already host-install-elided. A table touched by
-    /// any DELETE/UPDATE (device tombstone/version maintenance for a batch is a later slice), and
-    /// EVERY table when the batch contains anything but Insert/Update/Delete (DDL/truncate/other — the
-    /// scope turns imprecise, matching [`Engine::residency_invalidation_scope`] returning `None`), is
-    /// excluded and takes the conservative up-front de-elide. Insert-only is the dominant batched
-    /// shape: the batcher groups INSERTs under load, each of which alone would stay elided via the
-    /// single-entry incremental path — this restores that under batching.
-    fn batch_insert_only_elided_tables(&self, entries: &[LogEntry]) -> BTreeSet<String> {
-        let mut has_insert: BTreeSet<String> = BTreeSet::new();
-        let mut has_other: BTreeSet<String> = BTreeSet::new();
-        for entry in entries {
-            if is_binary_wal_record(&entry.payload) {
-                match decode_binary_record(&entry.payload) {
-                    Ok(crate::wal_binary::BinaryWalRecord::Insert(record)) => {
-                        has_insert.insert(record.table);
-                    }
-                    Ok(crate::wal_binary::BinaryWalRecord::DeleteByKey(record)) => {
-                        has_other.insert(record.table);
-                    }
-                    Ok(crate::wal_binary::BinaryWalRecord::UpdateByKey(record)) => {
-                        has_other.insert(record.table);
-                    }
-                    Ok(crate::wal_binary::BinaryWalRecord::Transaction(_)) => {
-                        return BTreeSet::new();
-                    }
-                    Err(_) => return BTreeSet::new(),
-                }
-                continue;
-            }
-            let Ok(Some(command)) = Self::decode_engine_command(&entry.payload) else {
-                return BTreeSet::new();
-            };
-            match command {
-                Command::Insert(insert) => {
-                    has_insert.insert(insert.table);
-                }
-                Command::Update(update) => {
-                    has_other.insert(update.table);
-                }
-                Command::Delete(delete) => {
-                    has_other.insert(delete.table);
-                }
-                // Any DDL / truncate / other command makes the scope imprecise — stay conservative.
-                _ => return BTreeSet::new(),
-            }
-        }
-        has_insert
-            .into_iter()
-            .filter(|table| !has_other.contains(table) && self.table_install_elided(table))
-            .collect()
-    }
-
-    pub(crate) fn invalidate_relational_residency_for_memory_pressure(&self, gpu_id: u16) {
-        // Stage 3 — blocker #2: COW the snapshot/shard flag maps under the catalog latch, then
-        // tombstone the device-memory cells of every table that was pressured (the cell `invalidate`
-        // is `&self`, done outside the COW closure on the collected tables).
-        let pressured_snapshot_tables = self.read_state.residency.with_snapshots_mut(|snapshots| {
-            let mut tables = Vec::new();
-            for (table, entry) in snapshots.iter_mut() {
-                if entry.descriptor.gpu_id == gpu_id {
-                    // COW only the pressured tables' descriptors.
-                    let snapshot = std::sync::Arc::make_mut(&mut entry.descriptor);
-                    snapshot.invalidated_by_memory_pressure = true;
-                    snapshot.memory_pressure_active = true;
-                    if let Some(proof) = snapshot.device_memory_proof.as_mut() {
-                        proof.retained = false;
-                    }
-                    tables.push(table.clone());
-                }
-            }
-            tables
-        });
-        for table in &pressured_snapshot_tables {
-            self.read_state.residency.device_memory.invalidate(table);
-        }
-        let pressured_shard_tables = self.read_state.residency.with_shards_mut(|shards| {
-            let mut tables = Vec::new();
-            for (table, table_shards) in shards.iter_mut() {
-                let mut table_pressured = false;
-                for shard in table_shards {
-                    if shard.gpu_id == gpu_id {
-                        shard.invalidated_by_memory_pressure = true;
-                        shard.memory_pressure_active = true;
-                        table_pressured = true;
-                        if let Some(proof) = shard.device_memory_proof.as_mut() {
-                            proof.retained = false;
-                        }
-                    }
-                }
-                if table_pressured {
-                    tables.push(table.clone());
-                }
-            }
-            tables
-        });
-        for table in &pressured_shard_tables {
-            self.read_state
-                .residency
-                .shard_device_memory
-                .invalidate_table(table);
-            // SV4 prereq #1: a pressured shard's deleted_by region is released with its buffer (INERT today).
-            self.read_state
-                .residency
-                .shard_deleted_by_memory
-                .invalidate_table(table);
-            // SV6: a pressured shard's created_by region is released with its buffer too.
-            self.read_state
-                .residency
-                .shard_created_by_memory
-                .invalidate_table(table);
-            // RETIREMENT A1: the row-identity region follows the buffer it annotates.
-            self.read_state
-                .residency
-                .shard_row_id_memory
-                .invalidate_table(table);
-            // Sub-slice 3b: drop the pressured table's cached per-shard PK indexes.
-            self.read_state
-                .residency
-                .purge_shard_pk_index_for_table(table);
-        }
-    }
-
     /// Apply one committed log entry to the engine state (`&self`). The caller holds the **catalog
     /// latch** and passes `&mut DdlCatalogState` so a DDL entry's working-map mutation can be made
     /// atomic with the subsequent catalog-snapshot publish (the caller holds the SAME guard across both
@@ -1562,9 +1263,7 @@ impl Engine {
     /// used. No parse, no coercion, no validation re-run: the record exists only because the
     /// original commit validated it, and it carries the ORIGINAL row ids (replay does not
     /// re-derive them from the allocator; the allocator advances by `rows_consumed` to stay in
-    /// lock-step for interleaved text records). `value_index_entries` ride empty — apply_delta's
-    /// deferred-recompute seam (`value_index_entries_for_deferred_apply`) builds them iff the
-    /// table is non-elided at apply time, exactly as the runtime elided path relies on.
+    /// lock-step for interleaved text records).
     fn apply_binary_wal_entry(
         &self,
         entry: &LogEntry,
@@ -1699,7 +1398,6 @@ impl Engine {
                     mutation: PreparedMutation::Insert {
                         table: record.table.clone(),
                         inserted_rows: vec![(row_key, new_values.clone())],
-                        value_index_entries: BTreeMap::new(),
                         seq_advances: BTreeMap::new(),
                     },
                 };
@@ -1756,7 +1454,6 @@ impl Engine {
             mutation: PreparedMutation::Insert {
                 table: record.table.clone(),
                 inserted_rows,
-                value_index_entries: BTreeMap::new(),
                 seq_advances: BTreeMap::new(),
             },
         };

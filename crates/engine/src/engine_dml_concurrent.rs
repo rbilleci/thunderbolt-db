@@ -17,7 +17,7 @@ pub(crate) use state::{
 };
 #[cfg(test)]
 use state::{wave_tail_failure_publish_hook, wave_tail_handoff_hook};
-use state::{CommitWaveDone, CommitWaveQueue, CommitWaveTail, TailMaintenanceCompletion};
+use state::{CommitWaveDone, CommitWaveQueue, CommitWaveTail};
 
 /// Upper bound on items per wave drain (keeps a single wave's worst-case commit latency bounded;
 /// under saturation the NEXT wave picks the rest up immediately).
@@ -323,12 +323,27 @@ impl Engine {
     /// allocations they describe. Cached device indexes are lifetime-pinned as optional accelerators
     /// and remain subject to their existing buffer-identity validation before execution.
     pub(crate) fn capture_transaction_snapshot(&self, boundary: Index) -> Arc<TransactionSnapshot> {
+        self.capture_read_snapshot(boundary, false)
+    }
+
+    /// Capture an autocommit statement generation. It has the same ownership guarantees as an
+    /// explicit transaction, but a representation-changing repair may replace it before execution
+    /// because no earlier statement in the transaction depends on the old generation.
+    pub(crate) fn capture_statement_snapshot(&self, boundary: Index) -> Arc<TransactionSnapshot> {
+        self.capture_read_snapshot(boundary, true)
+    }
+
+    fn capture_read_snapshot(
+        &self,
+        boundary: Index,
+        statement_owned: bool,
+    ) -> Arc<TransactionSnapshot> {
         let catalog = self.read_state.catalog_as_of(boundary);
         let table_versions = self.read_state.mvcc.capture_table_versions();
         let (
             resident_snapshots,
             resident_shards,
-            elided_tables,
+            device_authoritative_tables,
             chunk_authoritative_tables,
             streaming_cold_chunks,
         ) = {
@@ -341,7 +356,10 @@ impl Engine {
             (
                 self.read_state.residency.snapshots.load_full(),
                 self.read_state.residency.shards.load_full(),
-                self.read_state.residency.elided_tables.load_full(),
+                self.read_state
+                    .residency
+                    .device_authoritative_tables
+                    .load_full(),
                 self.read_state
                     .residency
                     .chunk_authoritative_tables
@@ -349,50 +367,59 @@ impl Engine {
                 self.read_state.residency.streaming_cold_chunks.load_full(),
             )
         };
-        let mut resident_index_resources = self
-            .read_state
-            .residency
-            .wave_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .filter_map(|index| index.index_memory.as_ref().cloned())
-            .collect::<Vec<_>>();
-        resident_index_resources.extend(
-            self.read_state
-                .residency
-                .shard_pk_device_index
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .values()
-                .filter_map(|index| index.device_index.as_ref().cloned()),
-        );
-        resident_index_resources.extend(
-            self.read_state
-                .residency
-                .chunk_key_index
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .values()
-                .map(|index| Arc::clone(&index.device)),
-        );
-        resident_index_resources.extend(
-            self.read_state
-                .residency
-                .chunk_key_bloom
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .values()
-                .map(|bloom| Arc::clone(&bloom.device)),
-        );
+        // Explicit transactions may execute many later statements, so retain every index allocation
+        // that was valid at BEGIN. A statement-owned snapshot only needs the base descriptors here:
+        // the one executing read clones its validated index Arc into the submission/job before launch.
+        // Walking four global index maps on every autocommit point read added a fixed latency tax
+        // without extending that already-bounded job lifetime.
+        let mut resident_index_resources = Vec::new();
+        if !statement_owned {
+            resident_index_resources.extend(
+                self.read_state
+                    .residency
+                    .wave_index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .filter_map(|index| index.index_memory.as_ref().cloned()),
+            );
+            resident_index_resources.extend(
+                self.read_state
+                    .residency
+                    .shard_pk_device_index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .filter_map(|index| index.device_index.as_ref().cloned()),
+            );
+            resident_index_resources.extend(
+                self.read_state
+                    .residency
+                    .chunk_key_index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .map(|index| Arc::clone(&index.device)),
+            );
+            resident_index_resources.extend(
+                self.read_state
+                    .residency
+                    .chunk_key_bloom
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .map(|bloom| Arc::clone(&bloom.device)),
+            );
+        }
         Arc::new(TransactionSnapshot {
             boundary,
+            statement_owned,
             next_row_id: self.read_state.mvcc.current_row_id(),
             catalog,
             table_versions,
             resident_snapshots,
             resident_shards: Arc::clone(&resident_shards),
-            elided_tables,
+            device_authoritative_tables,
             chunk_authoritative_tables,
             delta: std::sync::Mutex::new(TransactionDeltaState {
                 generation: 0,
@@ -549,21 +576,6 @@ impl Engine {
         // materialization per statement. The prepare below is the authoritative off-lock
         // validation; the serialized `execute_text` path keeps its preflight, where it is the gate
         // that stops a constraint-violating statement from ever reaching the WAL.
-        // RETIREMENT A4e GAP-1 guard: ELIDED (device-authoritative) tables take the SERIALIZED
-        // path — its commit arm carries the elision lifecycle hooks (elide-entry, rehydrate-on-
-        // unhandled). The concurrent arm has none yet: an unhandled concurrent commit would
-        // invalidate + re-admit from the EMPTY host store. Concurrent-native elision hooks are
-        // the ledgered follow-up (they are what the SLO target ultimately needs).
-        if transaction_snapshot.is_none()
-            && self.host_install_elision_enabled()
-            && !matches!(cmd, Command::Insert(_))
-            && Self::dml_mutated_tables(&cmd)
-                .iter()
-                .any(|table| self.table_install_elided(table))
-        {
-            drop(_snapshot_guard);
-            return self.execute_text(txn_id, text).map(|_| ());
-        }
         // Ledger #18 audit fix: capture the catalog generation BEFORE the prepare — the
         // prepare's own catalog bind is at least this fresh, so a stamp match at re-resolve
         // proves no constraint-adding DDL landed since the off-lock validation (a capture
@@ -585,9 +597,9 @@ impl Engine {
             loop {
                 let result = if let Some(generation) = transaction_snapshot.as_ref() {
                     let _scope = self.enter_transaction_read(Arc::clone(generation));
-                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)
+                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
                 } else {
-                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)
+                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
                 };
                 match result {
                     Ok(prepared) => break prepared,
@@ -607,8 +619,6 @@ impl Engine {
                 }
             }
         };
-        let residency_tables = Self::dml_mutated_tables(&cmd);
-
         // The snapshot is now pinned and prepare is done; the commit critical section has not started.
         // (Tests barrier here to align two writers' snapshots before their commits race.)
         on_prepared();
@@ -627,7 +637,6 @@ impl Engine {
             text,
             write_set,
             read_snapshot,
-            residency_tables,
             prepared_catalog_seq,
             offlock_delta,
         )
@@ -660,29 +669,36 @@ impl Engine {
     }
 
     /// DELTA-REUSE (B): is this off-lock-prepared delta safe to REUSE at the under-lock re-resolve
-    /// (re-key only) instead of re-preparing? An INSERT with (a) NO nextval advances (those route
-    /// through the serialized path) and (b) an EMPTY value-index. An empty value-index is the exact
-    /// ground truth that `prepare_insert` skipped it because the table was ELIDED at prepare (a
-    /// non-elided insert of >=1 row into a >=1-column table always yields >=1 entry) — and an elided
-    /// table is FK-free + CHECK-free by `table_elision_eligible`, so the re-resolve owes no
-    /// constraint re-validation beyond that device verdict. The generation gate
-    /// (`ReResolveDeviceCovered`) is
-    /// enforced at reuse time, so a post-prepare DDL (e.g. ADD FK) still forces the Full path.
-    fn reresolve_reuse_eligible(delta: &crate::write_path::WriteDelta) -> bool {
-        matches!(
-            &delta.mutation,
-            crate::write_path::PreparedMutation::Insert { seq_advances, value_index_entries, .. }
-                if seq_advances.is_empty() && value_index_entries.is_empty()
-        )
+    /// (re-key only) instead of re-preparing? An INSERT with no nextval advances (those route
+    /// through the serialized path) and no outbound FK. CHECK expressions are row-local and were
+    /// already validated off-lock; an FK depends on concurrently committed parent state and must
+    /// therefore re-run `prepare_insert` under the sequencer. The generation gate
+    /// (`ReResolveDeviceCovered`) is enforced at reuse time, so a post-prepare DDL (e.g. ADD FK)
+    /// still forces the Full path.
+    fn reresolve_reuse_eligible(
+        delta: &crate::write_path::WriteDelta,
+        catalog: &CatalogSnapshot,
+    ) -> bool {
+        let crate::write_path::PreparedMutation::Insert {
+            table,
+            seq_advances,
+            ..
+        } = &delta.mutation
+        else {
+            return false;
+        };
+        seq_advances.is_empty()
+            && catalog
+                .relational_catalog
+                .get(table)
+                .is_some_and(|table| table.foreign_keys.is_empty())
     }
 
     /// DELTA-REUSE (B): rebuild a reuse-eligible off-lock INSERT delta at `snapshot`'s
     /// `next_row_id`, recomputing ONLY the per-row keys (the sole `next_row_id`-dependent output).
     /// The coerced VALUES, the (value-derived) `write_set`, `rows_consumed`, and the empty
-    /// value-index / seq-advances are input-deterministic, so under a matched catalog generation
-    /// this equals a fresh `prepare_insert` re-resolve — minus the re-coerce + not-null + write-set
-    /// rebuild. (value-index stays empty; the apply recomputes it if the table de-elided —
-    /// `value_index_entries_for_deferred_apply`.)
+    /// sequence state are input-deterministic, so under a matched catalog generation this equals a
+    /// fresh `prepare_insert` re-resolve — minus the re-coerce + not-null + write-set rebuild.
     fn rekey_offlock_insert_delta(
         delta: &crate::write_path::WriteDelta,
         snapshot: DmlReadSnapshot,
@@ -690,7 +706,6 @@ impl Engine {
         let crate::write_path::PreparedMutation::Insert {
             table,
             inserted_rows,
-            value_index_entries,
             seq_advances,
         } = &delta.mutation
         else {
@@ -712,28 +727,9 @@ impl Engine {
             mutation: crate::write_path::PreparedMutation::Insert {
                 table: table.clone(),
                 inserted_rows: rekeyed,
-                value_index_entries: value_index_entries.clone(),
                 seq_advances: seq_advances.clone(),
             },
         }
-    }
-
-    /// The set of tables a DML command mutates (for per-table residency invalidation on commit).
-    fn dml_mutated_tables(cmd: &Command) -> BTreeSet<String> {
-        let mut tables = BTreeSet::new();
-        match cmd {
-            Command::Insert(insert) => {
-                tables.insert(insert.table.clone());
-            }
-            Command::Update(update) => {
-                tables.insert(update.table.clone());
-            }
-            Command::Delete(delete) => {
-                tables.insert(delete.table.clone());
-            }
-            _ => {}
-        }
-        tables
     }
 
     /// Enqueue one prepared concurrent DML commit into the deterministic commit WAVE and block
@@ -761,7 +757,6 @@ impl Engine {
         text: &str,
         write_set: WriteSet,
         read_snapshot: Index,
-        residency_tables: BTreeSet<String>,
         prepared_catalog_seq: Index,
         offlock_delta: Option<crate::write_path::WriteDelta>,
     ) -> Result<(), ExecuteError> {
@@ -774,7 +769,6 @@ impl Engine {
             binary_wal_template: None,
             write_set,
             read_snapshot,
-            residency_tables,
             outcome: Arc::new(CommitWaveDone::default()),
         };
         let outcome = self.enqueue_commit_wave_item(item)?;
@@ -800,7 +794,6 @@ impl Engine {
         text: &str,
         write_set: WriteSet,
         read_snapshot: Index,
-        residency_tables: BTreeSet<String>,
         prepared_catalog_seq: Index,
         offlock_delta: Option<crate::write_path::WriteDelta>,
         binary_wal_template: Option<(std::sync::Arc<[u8]>, u32)>,
@@ -814,7 +807,6 @@ impl Engine {
             binary_wal_template,
             write_set,
             read_snapshot,
-            residency_tables,
             outcome: Arc::new(CommitWaveDone::default()),
         }
     }
@@ -1107,18 +1099,13 @@ impl Engine {
                 wave_started.elapsed().as_nanos() as u64,
                 AtomicOrdering::Relaxed,
             );
-            if let Some((tail, admit_tables)) = tail {
+            if let Some(tail) = tail {
                 // W2b capacity gate: at most WAVE_TAIL_PIPELINE_DEPTH tails outstanding —
                 // consecutive waves' records coalesce into shared fsyncs while the bound caps
                 // applied-but-unpublished state. Claim tails ourselves when the pipe is full
                 // (under load the shared fsync already covered them and the finishes are
                 // instant).
                 self.wait_wave_tail_capacity(wave_tail_pipeline_depth() - 1);
-                // Publish the maintenance obligation before the tail can be claimed and finished.
-                // A transaction observing the finished count must therefore also observe either
-                // the completed re-admission or this pending count.
-                let maintenance =
-                    (!admit_tables.is_empty()).then(|| TailMaintenanceCompletion::new(self));
                 let mut tail = Some(tail);
                 let handed = {
                     let mut tails = self
@@ -1153,21 +1140,6 @@ impl Engine {
                     let _queue = self.lock_commit_wave_queue();
                     self.commit_wave.cv.notify_all();
                 }
-                if !admit_tables.is_empty() {
-                    // Rare (auto_admit ON + a committed item whose device append declined):
-                    // the re-admission must observe THIS wave's publish and must not overlap a
-                    // later wave's apply — drain the WHOLE pipeline, then re-admit, then
-                    // continue. AUDIT d6d10f8e E: on a WEDGED early-return the drain is NOT
-                    // complete (an in-flight tail may still legitimately publish after the
-                    // wedge via the durable-frontier fast path) — admitting then would install
-                    // a fresh valid snapshot gathered BELOW that late publish, serving stale
-                    // reads in the wedged-but-still-readable state. Skip the admit; residency
-                    // stays invalidated, which is always correct.
-                    if self.wait_wave_tail_capacity(0) {
-                        self.auto_admit_resident_tables(&admit_tables);
-                    }
-                }
-                drop(maintenance);
             } else {
                 let _queue = self.lock_commit_wave_queue();
                 self.commit_wave.cv.notify_all();
@@ -1327,7 +1299,7 @@ impl Engine {
             return;
         }
         self.publish_committed_seq(tail.last_seq);
-        for (position, _seq, _appended, rows) in &tail.committed {
+        for (position, _seq, rows) in &tail.committed {
             self.metrics.inc_commit();
             tail.batch[*position].set_outcome(Ok(*rows));
         }
@@ -1690,26 +1662,25 @@ impl Engine {
                 )));
             }
         }
-        // RETIREMENT A4e (audit B1-DDL/B2): any NON-DML command rehydrates every elided table
-        // FIRST (under the commit lock via the serialized helper) — DDL preflights/validators
-        // (ADD UNIQUE/PK/FK, CREATE INDEX) read the host store via visible_relational_rows, and a
-        // stale prefix would validate a constraint over data that violates it. DDL is rare and
-        // the elided set is tiny; the blunt sweep is the safe shape.
+        // RETIRE-002 boundary: representation-changing commands reverse-gather every
+        // device-authoritative table before DDL repair/validation. Normal DML and SELECT never
+        // enter this sweep, and no device decline dispatches here.
         let representation_neutral = matches!(
             &cmd,
             Command::Insert(_)
                 | Command::Update(_)
                 | Command::Delete(_)
                 | Command::Select(_)
+                | Command::CreateTable(_)
                 | Command::Begin
                 | Command::Commit { .. }
                 | Command::Rollback { .. }
         );
-        if self.host_install_elision_enabled() && !representation_neutral {
+        if !representation_neutral {
             let elided: Vec<String> = self
                 .read_state
                 .residency
-                .elided_tables
+                .device_authoritative_tables
                 .load()
                 .iter()
                 .cloned()

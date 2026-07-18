@@ -580,15 +580,6 @@ impl Engine {
         }
         let entry_chunk_ids: std::collections::BTreeSet<u64> =
             entry.chunks.iter().map(|chunk| chunk.chunk_id).collect();
-        #[cfg(test)]
-        if let Some((pinned, resume)) = chunk_key_prime_pin_hook()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            pinned.wait();
-            resume.wait();
-        }
         let mut complete = true;
         if Self::chunk_key_exact_set_bytes(table, entry) <= chunk_key_index_cap_bytes() {
             for (key_id, positions) in keys {
@@ -934,7 +925,9 @@ impl Engine {
             return Some(Ok(()));
         }
         if new_rows.len() > CLASS_DEVICE_UNIQUE_BATCH_MAX_ROWS {
-            return None;
+            return Some(Err(EngineError::ApplyFailed(format!(
+                "device exact unique batch limit is {CLASS_DEVICE_UNIQUE_BATCH_MAX_ROWS} rows"
+            ))));
         }
         let (snapshot, memory) = self
             .build_transient_relation_residency(table, new_rows)
@@ -996,7 +989,8 @@ impl Engine {
     /// match the probed entry or the coordinates may be misaligned (decline, never guess).
     ///
     /// `Some(Ok)` = validated; `Some(Err)` = duplicate (a statement error — the class stays);
-    /// `None` = DECLINE, the caller must DE-AUTHORITIZE and fall through to host validation.
+    /// `None` = device execution declined, so the caller must fail closed rather than transfer
+    /// relational authority to the host.
     /// NULL keys use the raw-payload placeholder fingerprint only to choose candidate chunks,
     /// then run an exact device `IS NULL` predicate, preserving structural NULL uniqueness
     /// without de-authorizing. Declines: an unfoldable needle, epoch drift, or a
@@ -1134,34 +1128,6 @@ impl Engine {
             .residency
             .chunk_key_bloom_bytes
             .load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stale_chunk_key_candidate_count(&self, table_name: &str) -> usize {
-        let live: std::collections::BTreeSet<u64> = self
-            .read_state
-            .residency
-            .streaming_cold_chunks
-            .load()
-            .get(table_name)
-            .map(|entry| entry.chunks.iter().map(|chunk| chunk.chunk_id).collect())
-            .unwrap_or_default();
-        let residency = &self.read_state.residency;
-        let indexes = residency
-            .chunk_key_index
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .keys()
-            .filter(|(table, chunk_id, _)| table == table_name && !live.contains(chunk_id))
-            .count();
-        let blooms = residency
-            .chunk_key_bloom
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .keys()
-            .filter(|(table, chunk_id, _)| table == table_name && !live.contains(chunk_id))
-            .count();
-        indexes + blooms
     }
 
     /// Candidate-index and structural-NULL validations whose authoritative exact predicate

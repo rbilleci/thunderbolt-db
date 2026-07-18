@@ -35,9 +35,9 @@ chronology or future sequencing. The full pre-unification record is archived at
   physical comparison, controller models, source crosswalk, packet manifests, and reviews are historical evidence
   in the acceptance archive. Candidate A's current implementation measurements still fail W1 and production
   graduation; acceptance selects the target, not the live implementation.
-- **Consequence:** R3-002/R3-003 device-native coverage, transactions, conflict history, and bounded reclamation are
-  accepted implementation facts. **DUR-001/002** implement and fault-qualify checkpoint/WAL/recovery;
-  **RETIRE-002** removes host repair; **R3-004** removes the host write/store path after **DUR-002**. **HA-001** is
+- **Consequence:** R3-002/R3-003 device-native coverage, transactions, conflict history, bounded reclamation,
+  DUR-002, and host write/store authority retirement are accepted implementation facts. **DUR-001** adds automatic
+  checkpoint/PITR policy; **RETIRE-002** removes the remaining explicit host repair boundary. **HA-001** is
   additionally required for replicated/node-loss-RPO deployment. **BENCH-001** remains the immutable performance
   evidence gate.
 
@@ -50,7 +50,7 @@ chronology or future sequencing. The full pre-unification record is archived at
 - **Reason:** Readers pinned before a commit must not see new rows, pair stale descriptors with new buffers, or
   resurrect tombstoned rows during republish/re-admit races.
 - **Consequence:** Newest-boundary reads may use high-water shortcuts; older snapshots take explicit visibility
-  gates. These invariants are prerequisites for **R3-004**.
+  gates. These invariants enabled the completed host-authority retirement.
 
 ## ADR-012 — STRATA streaming executor for working sets above GPU memory
 
@@ -118,16 +118,16 @@ chronology or future sequencing. The full pre-unification record is archived at
 - **Status:** Accepted, 2026-06-23.
 - **Decision:** No host relational implementation may become a permanent product path. Parity ultimately uses
   GPU-native or specification-derived oracles; the engine requires a GPU.
-- **Consequence:** Production read fallback is gone. Test oracle deletion is **RETIRE-001**; repair-operator
-  deletion is **RETIRE-002**; generic CUDA-MVCC result post-processing is **RETIRE-003**; write/store/index deletion
-  is **R3-004**.
+- **Consequence:** Production read fallback and host write/store/index authority are gone. Test oracle deletion is
+  **RETIRE-001**; repair-operator deletion is **RETIRE-002**; generic CUDA-MVCC result post-processing is
+  **RETIRE-003**.
 
 ## ADR-006 — GPU required; no CPU steady-state fallback
 
 - **Status:** Accepted, 2026-06-26; supersedes ADR-003.
 - **Decision:** A relational decline or GPU fault fails loudly rather than executing on the CPU. Host work remains
   legitimate only for the enumerated control-plane duties and explicitly gated bootstrap/repair debt.
-- **Consequence:** Fail-loud must not replace RPO-preserving recovery repair. See **RETIRE-001/002** and **R3-004**.
+- **Consequence:** Fail-loud must not replace RPO-preserving recovery repair. See **RETIRE-001/002**.
 
 ## ADR-005 — Snapshot/install-snapshot hooks are early contracts
 

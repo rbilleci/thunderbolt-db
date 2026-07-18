@@ -25,36 +25,11 @@ type AppliedUpdate = (
 mod preflight;
 
 impl Engine {
-    /// Recover the host value-index entries an INSERT delta deferred under the elided-skip
-    /// (`prepare_insert`): if `entries` is empty for a non-empty insert, the table was elided at
-    /// off-lock prepare but is NOT elided at this under-lock apply (a de-elision race), so the
-    /// per-row `ColumnValueKey`s were never computed. Recompute them from the published catalog so
-    /// the non-elided host install stays complete. A genuine insert of >=1 row into a >=1-column
-    /// table always yields >=1 entry, so `empty && rows non-empty` uniquely identifies the deferral
-    /// (never a legitimately-empty map). The common path (non-empty entries) returns untouched with
-    /// no catalog pin.
-    pub(crate) fn value_index_entries_for_deferred_apply(
-        &self,
-        table: &str,
-        inserted_rows: &[(String, Vec<SqlValue>)],
-        entries: BTreeMap<ColumnValueKey, Vec<String>>,
-    ) -> BTreeMap<ColumnValueKey, Vec<String>> {
-        if !entries.is_empty() || inserted_rows.is_empty() {
-            return entries;
-        }
-        match self.catalog_snapshot().relational_catalog.get(table) {
-            Some(t) => relational_value_index_entries_for_rows(&t.columns, inserted_rows),
-            None => entries,
-        }
-    }
-
-    /// Install a prepared [`WriteDelta`]'s data, stamping new versions with `commit_seq` (Stage 0
-    /// stamp/boundary unification: `commit_seq == commit Index`). `&self` (write-half Stage 4): it
-    /// mutates exactly the structures the write-set names — the mutated table's `TableVersionData`
-    /// (row chains + value-index, via the now-`&self` COW `with_table_mut`) and the atomic
-    /// relational row-id / tuple-id allocators — then **publishes** one new generation for that
-    /// table. The CALLER provides serialization (the commit critical section under the commit_mutex,
-    /// or a serialized DDL apply under the catalog latch), so concurrent committers never interleave.
+    /// Apply the host/control-plane portion of a prepared relational mutation. R3-004 retired the
+    /// tuple-store and value-index install: row images and version transitions publish through the
+    /// device generation maintained by the enclosing commit path, while WAL remains durability.
+    /// This method therefore advances only the durable row-identity allocator and marks the table
+    /// device-authoritative so a later RETIRE-002 repair operation can explicitly reverse-gather it.
     ///
     /// `nextval` sequence advancement is NOT applied here (sequences are not interior-mutable): a
     /// delta carrying `seq_advances` MUST go through the serialized [`Engine::apply_delta_serialized`]
@@ -63,108 +38,40 @@ impl Engine {
     pub(crate) fn apply_delta(
         &self,
         delta: WriteDelta,
-        commit_seq: TxnId,
-        mut profile: Option<&mut RelationalCopyAdmissionProfile>,
+        _commit_seq: TxnId,
+        _profile: Option<&mut RelationalCopyAdmissionProfile>,
     ) -> Result<(), EngineError> {
         match delta.mutation {
             PreparedMutation::Insert {
                 table,
                 inserted_rows,
-                value_index_entries,
                 seq_advances,
+                ..
             } => {
                 debug_assert!(
                     seq_advances.is_empty(),
                     "apply_delta (&self) cannot install nextval sequence advances; route through \
                      apply_delta_serialized"
                 );
-                // RETIREMENT A4e: an ELIDED (device-authoritative) table SKIPS the host tuple +
-                // value-index install — the device append (the commit arm's incremental path) is
-                // the data plane; WAL is durability. The ROW-ID allocator MUST still advance
-                // (prepare computed this delta's row keys from it; skipping would reuse
-                // identities). tuple_ids are a host-store-only artifact — none are consumed.
-                if self.table_install_elided(&table) {
-                    self.read_state
-                        .mvcc
-                        .advance_row_id(inserted_rows.len() as u64);
-                    self.read_state
-                        .residency
-                        .host_install_elisions
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    debug_assert_eq!(inserted_rows.len() as u64, delta.rows_consumed);
-                    return Ok(());
-                }
-                // P4-2b (S-E.P4): a CHUNK-AUTHORITATIVE table's store is FROZEN — the commit
-                // hook's tail append is the materialization (WAL = durability). The allocator
-                // still advances (identity discipline, the elision precedent above).
-                if self.table_chunk_authoritative(&table).is_some() {
-                    self.read_state
-                        .mvcc
-                        .advance_row_id(inserted_rows.len() as u64);
-                    self.read_state
-                        .residency
-                        .chunk_class_skipped_installs
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    debug_assert_eq!(inserted_rows.len() as u64, delta.rows_consumed);
-                    return Ok(());
-                }
-                // Non-elided install: recover any value-index entries deferred by the elided-skip
-                // (this table de-elided between prepare and now); a no-op on the common path.
-                let value_index_entries = self.value_index_entries_for_deferred_apply(
-                    &table,
-                    &inserted_rows,
-                    value_index_entries,
-                );
-                // Reserve the globally-unique tuple ids up front (the old in-line bump consumed one
-                // per row from the single shared allocator; `next_tuple_id` is now shared across all
-                // partitions so ids are identical). Advance the relational row-id allocator by the
-                // same count `prepare_insert` already computed its row keys from.
-                let tuple_ids: Vec<TupleId> = (0..inserted_rows.len())
-                    .map(|_| self.read_state.mvcc.reserve_tuple_id())
-                    .collect();
                 self.read_state
                     .mvcc
                     .advance_row_id(inserted_rows.len() as u64);
-                let mvcc_insert_started = Instant::now();
-                let insert_result = self.read_state.mvcc.with_table_mut(&table, |data| {
-                    for (tuple_id, (row_key, values)) in tuple_ids.iter().zip(inserted_rows.iter())
-                    {
-                        data.rows
-                            .tuple_insert_reserved_key_with_id(
-                                *tuple_id,
-                                NewTuple {
-                                    key: row_key.clone(),
-                                    value: encode_relational_row(values),
-                                },
-                                commit_seq,
-                            )
-                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                    }
-                    // Append the value-index entries within the SAME published generation, so a
-                    // reader that loads it sees rows + value-index mutually consistent. `Arc::make_mut`
-                    // copies a slot's row-key list ONLY if a live snapshot still shares it (COW),
-                    // keeping the per-commit cost O(k·log n) for the k touched slots.
-                    for (key, row_keys) in value_index_entries {
-                        let mut slot = data.value_index.get(&key).cloned().unwrap_or_default();
-                        slot.extend(row_keys);
-                        data.value_index.insert(key, slot);
-                    }
-                    Ok::<(), EngineError>(())
-                });
-                insert_result?;
-                if let Some(profile) = profile.as_mut() {
-                    // The row inserts and the value-index append now happen inside one published
-                    // mutation (`with_table_mut`); attribute the whole window to the insert timer.
-                    profile.mvcc_insert_micros += mvcc_insert_started.elapsed().as_micros();
+                if self.table_chunk_authoritative(&table).is_some() {
+                    self.read_state
+                        .residency
+                        .chunk_class_device_commits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    self.set_table_device_authoritative(&table, true);
+                    self.read_state
+                        .residency
+                        .device_authoritative_commits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 debug_assert_eq!(inserted_rows.len() as u64, delta.rows_consumed);
             }
             PreparedMutation::Update {
-                table,
-                installs,
-                value_index_entries,
-                updated_old_rows: _,
-                class_epoch,
+                table, class_epoch, ..
             } => {
                 // P4-2b-ii: a class UPDATE's store is frozen — the commit hook stamps the old
                 // coordinates + tail-appends the new images (the installs' ids are PACKED
@@ -172,74 +79,40 @@ impl Engine {
                 if class_epoch.is_some() {
                     self.read_state
                         .residency
-                        .chunk_class_skipped_installs
+                        .chunk_class_device_commits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(());
                 }
-                // RETIREMENT A4e: elided tables have no host tuples to rewrite — the device
-                // tombstone+append (SV5/A4b) is the data plane.
-                if self.table_install_elided(&table) {
-                    self.read_state
-                        .residency
-                        .host_install_elisions
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(());
-                }
-                self.read_state.mvcc.with_table_mut(&table, |data| {
-                    for (tuple_id, _row_key, values) in &installs {
-                        data.rows
-                            .tuple_update(*tuple_id, encode_relational_row(values), commit_seq)
-                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                    }
-                    for (key, row_keys) in value_index_entries {
-                        let mut slot = data.value_index.get(&key).cloned().unwrap_or_default();
-                        slot.extend(row_keys);
-                        data.value_index.insert(key, slot);
-                    }
-                    Ok::<(), EngineError>(())
-                })?;
+                self.set_table_device_authoritative(&table, true);
+                self.read_state
+                    .residency
+                    .device_authoritative_commits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             PreparedMutation::Delete {
-                table,
-                tuple_ids,
-                deleted_rows: _,
-                class_epoch,
+                table, class_epoch, ..
             } => {
                 // P4-2b-ii: class DELETE — the ids are packed coordinates; the hook stamps them.
                 if class_epoch.is_some() {
                     self.read_state
                         .residency
-                        .chunk_class_skipped_installs
+                        .chunk_class_device_commits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(());
                 }
-                // RETIREMENT A4e: elided tables have no host tuples to tombstone — the device
-                // tombstone (SV4b/A4b) is the data plane.
-                if self.table_install_elided(&table) {
-                    self.read_state
-                        .residency
-                        .host_install_elisions
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(());
-                }
-                self.read_state.mvcc.with_table_mut(&table, |data| {
-                    for tuple_id in tuple_ids {
-                        data.rows
-                            .tuple_delete(tuple_id, commit_seq)
-                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                    }
-                    Ok::<(), EngineError>(())
-                })?;
+                self.set_table_device_authoritative(&table, true);
+                self.read_state
+                    .residency
+                    .device_authoritative_commits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         Ok(())
     }
 
-    /// `&mut self` install for the SERIALIZED commit path (DDL / COPY / replay): apply any `nextval`
-    /// sequence advancement (needs `&mut self` — sequences are not interior-mutable) and then install
-    /// the rest of the delta via the `&self` [`Engine::apply_delta`]. Behaviorally identical to the
-    /// pre-Stage-4 `apply_delta` (sequence advance first, then rows + value-index), so the live
-    /// serialized apply stays byte-identical to a WAL replay.
+    /// Control-plane apply for the SERIALIZED commit path (DDL / COPY / replay): apply any `nextval`
+    /// sequence advancement and then advance identity/authority state through [`Engine::apply_delta`].
+    /// Relational row bytes and versions are published only by the enclosing device-maintenance step.
     pub(crate) fn apply_delta_serialized(
         &self,
         cat: &mut DdlCatalogState,

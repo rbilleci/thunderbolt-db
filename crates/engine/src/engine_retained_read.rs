@@ -103,6 +103,9 @@ impl Engine {
             "int4_equality_projection"
                 | "int4_equality_multi_column_projection"
                 | "int4_equality_mixed_column_projection"
+                | "sharded_int4_equality_projection"
+                | "sharded_int4_equality_multi_column_projection"
+                | "sharded_int4_equality_mixed_column_projection"
         ) {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "retained read jobs currently support only int4 equality projection routes, got {}",
@@ -110,26 +113,40 @@ impl Engine {
             ))));
         }
         let (table, bound, _copin_s) = self.bind_relational_select_for_execution(select)?;
-        let handle = self
-            .relational_retained_snapshot_handle(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no retained snapshot handle",
+        let snapshot_generation = if matches!(
+            decision.query_shape.as_str(),
+            "sharded_int4_equality_projection"
+                | "sharded_int4_equality_multi_column_projection"
+                | "sharded_int4_equality_mixed_column_projection"
+        ) {
+            // A shard generation is published as one ArcSwap bundle rather than a legacy
+            // single-snapshot descriptor. The route decision already proved every shard valid and
+            // device-backed; use the commit boundary as the retained job's conservative freshness
+            // token so any intervening publication makes submission decline.
+            self.committed_seq()
+        } else {
+            let handle = self
+                .relational_retained_snapshot_handle(&table.name)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" has no retained snapshot handle",
+                        table.name
+                    )))
+                })?;
+            if !handle.valid {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" retained snapshot handle is invalid",
                     table.name
-                )))
-            })?;
-        if !handle.valid {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" retained snapshot handle is invalid",
-                table.name
-            ))));
-        }
-        if !handle.has_retained_device_memory {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" retained snapshot handle has no device memory",
-                table.name
-            ))));
-        }
+                ))));
+            }
+            if !handle.has_retained_device_memory {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" retained snapshot handle has no device memory",
+                    table.name
+                ))));
+            }
+            handle.generation
+        };
         let filter_groups = if !bound.filter_groups.is_empty() {
             bound.filter_groups.clone()
         } else if !bound.filters.is_empty() {
@@ -173,7 +190,7 @@ impl Engine {
             route_id,
             schema: table.schema,
             table: table.name,
-            snapshot_generation: handle.generation,
+            snapshot_generation,
             params: vec![RelationalRetainedReadParam::Int4Eq {
                 column: filter_column,
                 value: needle,
@@ -198,6 +215,29 @@ impl Engine {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
         for job in jobs {
+            let query_shape = job.route_id.split(':').next().unwrap_or("unknown");
+            if matches!(
+                query_shape,
+                "sharded_int4_equality_projection"
+                    | "sharded_int4_equality_multi_column_projection"
+                    | "sharded_int4_equality_mixed_column_projection"
+            ) {
+                let decision = self.plan_relational_resident_route(&job.select);
+                if !decision.accepted || decision.query_shape != query_shape {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "retained sharded read job for relation \"{}\" is no longer route-valid: {}",
+                        job.table, decision.reason
+                    ))));
+                }
+                let current_generation = self.committed_seq();
+                if current_generation != job.snapshot_generation {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "retained sharded read job snapshot generation mismatch for relation \"{}\": job={}, current={}",
+                        job.table, job.snapshot_generation, current_generation
+                    ))));
+                }
+                continue;
+            }
             let handle = self
                 .relational_retained_snapshot_handle(&job.table)
                 .ok_or_else(|| {
@@ -226,6 +266,43 @@ impl Engine {
             }
         }
         let submit_started = Instant::now();
+        if jobs.iter().all(|job| {
+            job.route_id.split(':').next().is_some_and(|shape| {
+                matches!(
+                    shape,
+                    "sharded_int4_equality_projection"
+                        | "sharded_int4_equality_multi_column_projection"
+                        | "sharded_int4_equality_mixed_column_projection"
+                )
+            })
+        }) {
+            // Projections over the authoritative shard set use the sharded general executor. It
+            // recompacts referenced columns device-to-device and materializes only selected rows;
+            // the legacy single-buffer equal-any submission cannot address shard-local offsets.
+            // Keep the retained API's submission framing while returning a ready batch.
+            let results = jobs
+                .iter()
+                .map(|job| self.execute_relational_select(&job.select))
+                .collect::<Result<Vec<_>, _>>()?;
+            let first_job = jobs.first();
+            return Ok(RelationalRetainedReadSubmission {
+                route_id: first_job
+                    .map(|job| job.route_id.clone())
+                    .unwrap_or_else(|| "empty".to_string()),
+                table: first_job
+                    .map(|job| job.table.clone())
+                    .unwrap_or_else(|| "empty".to_string()),
+                snapshot_generation: first_job.map(|job| job.snapshot_generation).unwrap_or(0),
+                job_count: jobs.len(),
+                submit_wall_micros: submit_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                commit_path_wedged: Arc::clone(&self.commit_path_wedged),
+                inner: RelationalRetainedReadSubmissionInner::Ready(results),
+            });
+        }
         if let Some(submission) =
             self.try_submit_relational_retained_int4_projection_jobs(jobs, submit_started)?
         {
@@ -268,6 +345,9 @@ impl Engine {
         self.ensure_retained_submission_available(&origin_wedge)?;
         let results = match submission.inner {
             RelationalRetainedReadSubmissionInner::Ready(results) => results,
+            RelationalRetainedReadSubmissionInner::ReadyBatched(result) => {
+                Self::expand_ready_batched_result(*result)
+            }
             RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
                 self.complete_relational_retained_int4_projection_submission(*pending)?
             }
@@ -449,20 +529,11 @@ impl Engine {
             .map(|hits| hits.into_iter().map(|h| (h.shard_id, h.slot)).collect())
     }
 
-    /// W0 (concurrent-invalidation liveness): the CONCURRENT commit path invalidates residency by
-    /// tombstoning the device-memory CELL only (`invalidate_relational_residency_tables_concurrent`)
-    /// — the `shards` descriptor flags are owned by the SERIALIZED path (they are not interior-
-    /// mutable via `&self`), so `is_valid()` alone cannot prove a shard's bytes are current. Any
-    /// WRITE-locate that trusts the descriptor's riding buffer must ALSO require the authoritative
-    /// generation to own EXACTLY that Arc (ptr-identical). Transaction-scoped reads validate against
-    /// their captured shard generation; other callers validate against the current device-memory
-    /// cell. A tombstoned (`None`) or re-admitted (different-ptr) current cell declines the locate,
-    /// sending the caller to the always-correct host ladder. Without this gate, a concurrent
-    /// host-installed write purges the PK cache but leaves
-    /// the descriptor valid-looking, and the next probe REBUILDS the cache from STALE device bytes
-    /// — where a physical miss is load-bearing ("no visible duplicate" / "0 matches"): a duplicate
-    /// key FALSE-PASSES or an Eq-resolved UPDATE/DELETE loses its row. Repro + regression:
-    /// `w0_concurrent_invalidation_must_not_leave_write_locate_trusting_stale_shards`.
+    /// A write locate may trust a shard buffer only while the captured authoritative generation
+    /// owns exactly that `Arc` (pointer-identical). Transaction-scoped reads validate against their
+    /// captured shard generation; other callers validate against the current device-memory cell.
+    /// A tombstoned or replaced cell declines so no load-bearing miss can be answered from stale
+    /// device bytes.
     pub(crate) fn shard_write_locate_cell_live(
         &self,
         table_name: &str,
@@ -779,6 +850,7 @@ impl Engine {
             RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
                 Self::complete_int4_projection_batched_detached(*pending)?
             }
+            RelationalRetainedReadSubmissionInner::ReadyBatched(result) => *result,
             RelationalRetainedReadSubmissionInner::Ready(results) => {
                 Self::fold_ready_results_batched(results)
             }
@@ -787,6 +859,42 @@ impl Engine {
         self.run_retained_completion_post_hook();
         self.ensure_retained_submission_available(&origin_wedge)?;
         Ok(result)
+    }
+
+    pub(crate) fn expand_ready_batched_result(
+        result: RelationalRetainedBatchResult,
+    ) -> Vec<RelationalSelectResult> {
+        let RelationalRetainedBatchResult {
+            columns,
+            access_path,
+            gpu_id,
+            values,
+            ncols,
+            needle_ranges,
+        } = result;
+        needle_ranges
+            .into_iter()
+            .map(|(start, count)| {
+                let first = start as usize * ncols;
+                let last = first + count as usize * ncols;
+                let rows = RowBlock::flat(
+                    values[first..last]
+                        .iter()
+                        .copied()
+                        .map(SqlValue::Int4)
+                        .collect(),
+                    ncols,
+                );
+                RelationalSelectResult {
+                    columns: Arc::clone(&columns),
+                    rows,
+                    planned_target: DeviceTarget::Gpu(gpu_id),
+                    executed_target: DeviceTarget::Gpu(gpu_id),
+                    fallback_reason: None,
+                    access_path: Arc::clone(&access_path),
+                }
+            })
+            .collect()
     }
 
     /// Build the batched result from a drained int4 point-read submission: ONE sort by

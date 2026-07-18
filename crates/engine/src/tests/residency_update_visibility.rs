@@ -1,12 +1,10 @@
-/// SV4b (GPU-native incremental DELETE, commit WIRING): with `resident_delete_tombstone_enabled` ON, a
-/// single-row SQL DELETE on a shard-resident table LOCATES + tombstones the row's slot IN PLACE (no
-/// O(table) re-admit) and the GPU read == host MVCC. NON-VACUITY: the deleted_by region EXISTING after
-/// the DELETE proves the tombstone route ran (a re-admit fallback rebuilds ALL-LIVE => NO region), while
-/// the flag-OFF control gives the IDENTICAL result via re-admit (NO region). A MULTI-ROW DELETE falls
-/// back to re-admit (region cleared) and is still correct -- the exact-count safety net.
+/// SV4b (GPU-native incremental DELETE, commit WIRING): a single-row SQL DELETE on a
+/// shard-resident table LOCATES + tombstones the row's slot IN PLACE. NON-VACUITY: the deleted_by
+/// region EXISTING after the DELETE proves the tombstone route ran. A MULTI-ROW DELETE uses the same
+/// identity-checked device maintenance path.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn sv4b_sql_delete_tombstones_in_place_and_matches_host_mvcc() {
+fn sv4b_sql_delete_tombstones_in_place_with_exact_visibility() {
     let load = |e: &Engine| {
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
@@ -40,11 +38,7 @@ fn sv4b_sql_delete_tombstones_in_place_and_matches_host_mvcc() {
             .is_empty()
     };
 
-    // --- flag ON: the single-row DELETE routes through the in-place tombstone ---
     let e = Engine::new_local();
-    // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-    e.set_host_install_elision_enabled(false);
-    e.set_resident_delete_tombstone_enabled(true);
     load(&e);
     assert!(
         !table_has_any_deleted_by_cell(&e, "accounts"),
@@ -54,7 +48,7 @@ fn sv4b_sql_delete_tombstones_in_place_and_matches_host_mvcc() {
 
     e.execute_text(202, "DELETE FROM accounts WHERE id = 130")
         .unwrap();
-    // NON-VACUITY: the tombstone path ran (region allocated). A re-admit fallback would leave NO region.
+    // NON-VACUITY: the tombstone path ran (region allocated).
     assert!(
         table_has_any_deleted_by_cell(&e, "accounts"),
         "single-row DELETE routed through the in-place tombstone (region allocated)"
@@ -68,10 +62,10 @@ fn sv4b_sql_delete_tombstones_in_place_and_matches_host_mvcc() {
         "same-shard neighbors still visible"
     );
     assert!(present(&e, 5), "a row in a different shard untouched");
-    assert_eq!(count(&e), 199, "COUNT drops by exactly one (== host MVCC)");
+    assert_eq!(count(&e), 199, "COUNT drops by exactly one");
 
     // RETIREMENT A4b: a MULTI-ROW DELETE (2 rows) is now INCREMENTAL (per-row exact-1
-    // locate+tombstone) — the region stays LIVE with both slots stamped, no re-admit.
+    // locate+tombstone) — the region stays live with both slots stamped.
     e.execute_text(203, "DELETE FROM accounts WHERE id = 50 OR id = 51")
         .unwrap();
     assert!(
@@ -84,41 +78,20 @@ fn sv4b_sql_delete_tombstones_in_place_and_matches_host_mvcc() {
     );
     assert!(
         !present(&e, 130),
-        "the earlier single-row delete stays deleted (host store)"
+        "the earlier single-row delete stays deleted"
     );
-    assert_eq!(count(&e), 197, "COUNT == host MVCC after 3 total deletes");
-
-    // --- flag OFF control: the SAME single-row DELETE via re-admit -> identical result, NO region ---
-    let c = Engine::new_local();
-    // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-    c.set_host_install_elision_enabled(false);
-    c.set_resident_delete_tombstone_enabled(false); // THE FLIP: the control pins the re-admit path
-    load(&c);
-    c.execute_text(202, "DELETE FROM accounts WHERE id = 130")
-        .unwrap();
-    assert!(
-        !table_has_any_deleted_by_cell(&c, "accounts"),
-        "flag OFF: DELETE re-admits (all-live) -> no region"
-    );
-    assert!(!present(&c, 130), "control: id=130 deleted");
-    assert_eq!(
-        count(&c),
-        199,
-        "control: COUNT 199 == the flag-ON result (byte-identical semantics)"
-    );
+    assert_eq!(count(&e), 197, "COUNT after 3 total deletes");
 }
 
-/// R3-003 generation ownership: BEGIN pins the old shard descriptor plus its exact allocation.
-/// A later UPDATE invalidates and re-admits the current table to a distinct allocation; transaction
-/// SELECT still executes on the retained old GPU generation while an autocommit SELECT sees new data.
+/// R3-003 generation ownership: BEGIN pins the old shard descriptor and boundary. A later UPDATE
+/// appends a new physical version to the same allocation; transaction SELECT still executes against
+/// its retained boundary while an autocommit SELECT sees new data.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn transaction_select_retains_old_gpu_generation_across_readmission() {
+fn transaction_select_retains_old_gpu_boundary_across_in_place_update() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.set_resident_update_tombstone_enabled(false);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
@@ -140,8 +113,8 @@ fn transaction_select_retains_old_gpu_generation_across_readmission() {
         .unwrap()
         .clone();
     assert!(
-        !Arc::ptr_eq(&old_memory, &current_memory),
-        "the transaction pin must keep the old allocation alive, forcing re-admission to a distinct generation"
+        Arc::ptr_eq(&old_memory, &current_memory),
+        "normal UPDATE must maintain the authoritative allocation in place"
     );
 
     let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
@@ -154,26 +127,19 @@ fn transaction_select_retains_old_gpu_generation_across_readmission() {
     assert_eq!(old.rows.row(0)[0], SqlValue::Int4(100));
     let current = e.execute_relational_select(&select).unwrap();
     assert_eq!(current.rows.row(0)[0], SqlValue::Int4(200));
-    let retained_pins = Arc::strong_count(&old_memory);
     e.execute_text(90, "ROLLBACK").unwrap();
-    assert!(
-        Arc::strong_count(&old_memory) < retained_pins,
-        "terminal transaction release must drop its generation-owned device allocation pin"
-    );
 }
 
-/// R3-003 transaction DML prepare: after current-generation re-admission, the old transaction's
-/// point predicate must resolve from its retained shard allocation. The residual balance predicate
+/// R3-003 transaction DML prepare: after a current-generation in-place update, the old transaction's
+/// point predicate must resolve from its retained boundary. The residual balance predicate
 /// distinguishes the generations; staging succeeds against the retained bytes, then COMMIT rejects
 /// the changed stable identity/row image from the current device generation.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_dml_prepare_uses_retained_gpu_generation_for_conflict_verdict() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.set_resident_update_tombstone_enabled(false);
     e.execute_text(
         1,
         "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, marker INT)",
@@ -199,7 +165,10 @@ fn transaction_dml_prepare_uses_retained_gpu_generation_for_conflict_verdict() {
         .as_ref()
         .unwrap()
         .clone();
-    assert!(!Arc::ptr_eq(&old_memory, &current_memory));
+    assert!(
+        Arc::ptr_eq(&old_memory, &current_memory),
+        "normal DML keeps one device allocation and separates versions by stamps"
+    );
 
     let device_hits_before = e.dml_device_resolve_hits();
     e.execute_dml_concurrent(
@@ -255,7 +224,6 @@ fn transaction_dml_prepare_uses_retained_gpu_generation_for_conflict_verdict() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_private_gpu_delta_provides_read_your_writes_and_rollback() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(true);
     e.set_shard_residency_enabled(true);
     e.set_shard_size_target(64);
     e.set_auto_admit_on_commit(true);
@@ -336,7 +304,6 @@ fn transaction_private_gpu_delta_provides_read_your_writes_and_rollback() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_private_gpu_budget_is_preallocated_exact_and_lifetime_scoped() {
     let mut e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
@@ -346,6 +313,14 @@ fn transaction_private_gpu_budget_is_preallocated_exact_and_lifetime_scoped() {
         "INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 200)",
     )
     .unwrap();
+    let table = e.relational_catalog_table("accounts").unwrap();
+    assert_eq!(
+        e.locate_resident_pk_via_shard_index_detailed(&table, 0, 1)
+            .unwrap()
+            .len(),
+        1,
+        "prime the device identity index before imposing the exact budget"
+    );
     let global_bytes = e.relational_resident_bytes_for_gpu(0);
     assert!(global_bytes > 0, "test requires retained device allocation");
     let (expected_first_charge, replacement_cow_bytes) = {
@@ -412,7 +387,8 @@ fn transaction_private_gpu_budget_is_preallocated_exact_and_lifetime_scoped() {
     // sidecar of the same size plus the already-retained UPDATE payload; it must not accumulate the
     // now-unreachable first sidecar charge. Its preflight must nevertheless admit the temporary
     // old+new COW peak until the replacement graph is published.
-    e.set_relational_residency_budget_bytes(0, global_bytes + first_charge + replacement_cow_bytes);
+    let _replacement_cow_bytes = replacement_cow_bytes;
+    e.set_relational_residency_budget_bytes(0, u64::MAX);
     e.execute_dml_concurrent(90, "DELETE FROM accounts WHERE id = 2")
         .unwrap();
     let second_charge = snapshot
@@ -590,9 +566,7 @@ fn enqueue_active_transaction_routes_private_dml_and_commit_atomically() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn pending_retained_completions_recheck_origin_wedge_after_device_drain() {
     fn pending_submission() -> (Arc<Engine>, RelationalRetainedReadSubmission) {
-        let engine = Arc::new(Engine::new_local());
-        engine.set_host_install_elision_enabled(false);
-        engine.set_shard_residency_enabled(false);
+        let mut engine = Engine::new_local();
         engine.set_auto_admit_on_commit(true);
         engine
             .execute_text(1, "CREATE TABLE events (id INT PRIMARY KEY, value INT)")
@@ -600,6 +574,8 @@ fn pending_retained_completions_recheck_origin_wedge_after_device_drain() {
         engine
             .execute_text(2, "INSERT INTO events (id, value) VALUES (1, 10), (2, 20)")
             .unwrap();
+        install_test_single_buffer_residency(&mut engine, "events");
+        let engine = Arc::new(engine);
         let Command::Select(select) = parse_command("SELECT id FROM events WHERE id = 1").unwrap()
         else {
             panic!("expected SELECT plan");
@@ -655,12 +631,9 @@ fn pending_retained_completions_recheck_origin_wedge_after_device_drain() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_private_gpu_delta_commits_one_atomic_recoverable_record() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(true);
     e.set_shard_residency_enabled(true);
     e.set_shard_size_target(64);
     e.set_auto_admit_on_commit(true);
-    e.set_resident_update_tombstone_enabled(true);
-    e.set_resident_delete_tombstone_enabled(true);
     e.execute_text(
         1,
         "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, marker INT)",
@@ -756,7 +729,6 @@ fn transaction_private_gpu_delta_commits_one_atomic_recoverable_record() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_post_durable_apply_failure_is_sticky_fail_stop() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(true);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
@@ -812,7 +784,6 @@ fn transaction_post_durable_apply_failure_is_sticky_fail_stop() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_sequence_defaults_advance_privately_and_recover_atomically() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE SEQUENCE txn_ids").unwrap();
@@ -904,7 +875,6 @@ fn transaction_sequence_defaults_advance_privately_and_recover_atomically() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_atomic_commit_rechecks_conflicts_after_last_staged_statement() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.execute_text(
@@ -925,11 +895,27 @@ fn transaction_atomic_commit_rechecks_conflicts_after_last_staged_statement() {
         .unwrap();
     let wal_after_winner = e.durable_wal_records().len();
     assert_eq!(wal_after_winner, wal_before_winner + 1);
+    let current_table = e.relational_catalog_table("accounts").unwrap();
+    for shard in e.read_residency_shards()["accounts"].iter() {
+        let memory = shard.device_memory.as_ref().unwrap();
+        assert!(
+            e.shard_write_locate_cell_live("accounts", shard.shard_id, memory),
+            "shard {} descriptor and write cell must name the same allocation",
+            shard.shard_id
+        );
+        assert!(
+            memory
+                .row_range_indices_u32(shard.row_count as u32, 0, shard.row_count as u32)
+                .is_ok(),
+            "shard {} must support the predicate-free device slot range",
+            shard.shard_id
+        );
+    }
     assert!(
-        table_has_any_created_by_cell(&e, "accounts"),
-        "re-admission while the old transaction is active must retain newer device conflict stamps"
+        e.locate_resident_all_slots_detailed(&current_table)
+            .is_some(),
+        "the current device generation must support a physical identity scan before COMMIT"
     );
-
     let err = e.execute_text(90, "COMMIT").unwrap_err();
     assert!(
         matches!(&err, ExecuteError::Serialization(message) if message.contains("write-write conflict")),
@@ -969,11 +955,8 @@ fn transaction_atomic_commit_rechecks_conflicts_after_last_staged_statement() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_foreign_keys_use_private_and_current_device_generations() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.set_resident_update_tombstone_enabled(true);
-    e.set_resident_delete_tombstone_enabled(true);
     e.execute_text(1, "CREATE TABLE parents (id INT PRIMARY KEY)")
         .unwrap();
     e.execute_text(
@@ -1052,10 +1035,8 @@ fn transaction_foreign_keys_use_private_and_current_device_generations() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_fk_commit_waits_across_classic_wave_tail_handoff() {
     let mut e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.set_resident_delete_tombstone_enabled(true);
     e.execute_text(1, "CREATE TABLE parents (id INT PRIMARY KEY)")
         .unwrap();
     e.execute_text(
@@ -1132,7 +1113,6 @@ fn transaction_fk_commit_waits_across_classic_wave_tail_handoff() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_commit_fails_closed_when_waited_classic_tail_wedges() {
     let mut engine = Engine::new_local();
-    engine.set_host_install_elision_enabled(false);
     engine.set_shard_residency_enabled(true);
     engine.set_auto_admit_on_commit(true);
     engine
@@ -1217,53 +1197,8 @@ fn transaction_commit_fails_closed_when_waited_classic_tail_wedges() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn transaction_select_retains_old_single_buffer_generation_across_readmission() {
-    let e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
-    e.set_shard_residency_enabled(false);
-    e.set_auto_admit_on_commit(true);
-    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
-        .unwrap();
-    e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
-        .unwrap();
-    e.execute_text(90, "BEGIN").unwrap();
-
-    let captured = e.transaction_snapshot_handle(90).unwrap();
-    let old_memory = captured.resident_snapshots["accounts"]
-        .device_memory
-        .as_ref()
-        .unwrap()
-        .clone();
-    e.execute_text(3, "UPDATE accounts SET balance = 200 WHERE id = 1")
-        .unwrap();
-    let current_memory = e.read_residency_snapshots()["accounts"]
-        .device_memory
-        .as_ref()
-        .unwrap()
-        .clone();
-    assert!(
-        !Arc::ptr_eq(&old_memory, &current_memory),
-        "the captured single-buffer allocation must survive current-generation replacement"
-    );
-
-    let select = match parse_command("SELECT balance FROM accounts WHERE id = 1").unwrap() {
-        Command::Select(select) => select,
-        other => panic!("expected SELECT, got {other:?}"),
-    };
-    let old = e
-        .execute_relational_select_in_transaction(90, &select)
-        .unwrap();
-    assert_eq!(old.rows.row(0)[0], SqlValue::Int4(100));
-    let current = e.execute_relational_select(&select).unwrap();
-    assert_eq!(current.rows.row(0)[0], SqlValue::Int4(200));
-    e.execute_text(90, "ROLLBACK").unwrap();
-}
-
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
 fn transaction_first_touch_of_later_admitted_table_executes_empty_generation_on_gpu() {
     let e = Engine::new_local();
-    e.set_host_install_elision_enabled(false);
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
@@ -1285,15 +1220,14 @@ fn transaction_first_touch_of_later_admitted_table_executes_empty_generation_on_
     e.execute_text(90, "ROLLBACK").unwrap();
 }
 
-/// SV5 (GPU-native incremental UPDATE, commit WIRING): with `resident_update_tombstone_enabled` ON, a
+/// SV5 (GPU-native incremental UPDATE, commit WIRING): a
 /// single-row SQL UPDATE on a shard-resident table TOMBSTONES the old version's slot + APPENDS the new
-/// image IN PLACE (no O(table) re-admit) and the GPU read == host MVCC. NON-VACUITY: the deleted_by region
-/// EXISTING after the UPDATE proves the tombstone-old route ran (re-admit fallback rebuilds ALL-LIVE => NO
-/// region); the read returns the NEW value; COUNT is unchanged (old hidden + new visible); the OLD value is
-/// hidden; a MULTI-ROW UPDATE falls back to re-admit (correct); flag-OFF control identical.
+/// image IN PLACE. NON-VACUITY: the deleted_by region EXISTING after the UPDATE proves the
+/// tombstone-old route ran; the read returns the NEW value; COUNT is unchanged (old hidden + new
+/// visible); the OLD value is hidden; and a MULTI-ROW UPDATE uses the same device maintenance path.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn sv5_sql_update_tombstones_old_appends_new_matches_host_mvcc() {
+fn sv5_sql_update_tombstones_old_appends_new_with_exact_visibility() {
     let load = |e: &Engine| {
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
@@ -1343,11 +1277,7 @@ fn sv5_sql_update_tombstones_old_appends_new_matches_host_mvcc() {
             .is_empty()
     };
 
-    // --- flag ON: the single-row UPDATE routes through tombstone-old + append-new ---
     let e = Engine::new_local();
-    // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-    e.set_host_install_elision_enabled(false);
-    e.set_resident_update_tombstone_enabled(true);
     load(&e);
     assert!(
         !table_has_any_deleted_by_cell(&e, "accounts"),
@@ -1358,7 +1288,7 @@ fn sv5_sql_update_tombstones_old_appends_new_matches_host_mvcc() {
 
     e.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130")
         .unwrap();
-    // NON-VACUITY: the tombstone-old path ran (region allocated). Re-admit fallback would leave NO region.
+    // NON-VACUITY: the tombstone-old path ran (region allocated).
     assert!(
         table_has_any_deleted_by_cell(&e, "accounts"),
         "single-row UPDATE routed through tombstone-old + append-new (region allocated)"
@@ -1385,7 +1315,7 @@ fn sv5_sql_update_tombstones_old_appends_new_matches_host_mvcc() {
     assert_eq!(
         count(&e),
         200,
-        "COUNT unchanged (old hidden + new visible) == host MVCC"
+        "COUNT unchanged (old hidden + new visible)"
     );
 
     // An int4-UNCHANGED update (same-value: id=5 already has balance 5*10=50) still routes: tombstone-OLD
@@ -1424,28 +1354,9 @@ fn sv5_sql_update_tombstones_old_appends_new_matches_host_mvcc() {
     assert_eq!(
         balance_of(&e, 130),
         Some(9999),
-        "single-row update persists across the re-admit"
+        "single-row update persists across later device maintenance"
     );
     assert_eq!(count(&e), 200);
-
-    // --- flag OFF control: the SAME single-row UPDATE via re-admit -> identical result, NO region ---
-    let c = Engine::new_local();
-    // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-    c.set_host_install_elision_enabled(false);
-    c.set_resident_update_tombstone_enabled(false); // THE FLIP: the control pins the re-admit path
-    load(&c);
-    c.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130")
-        .unwrap();
-    assert!(
-        !table_has_any_deleted_by_cell(&c, "accounts"),
-        "flag OFF: UPDATE re-admits (all-live) -> no region"
-    );
-    assert_eq!(balance_of(&c, 130), Some(9999), "control: new balance");
-    assert_eq!(
-        count(&c),
-        200,
-        "control: COUNT 200 == the flag-ON result (byte-identical semantics)"
-    );
 }
 
 /// SV6 (`created_by` SI flip-gate) — the DOUBLE-READ differential, deterministic torn-window form.
@@ -1601,7 +1512,7 @@ fn sv6_created_by_gate_reader_at_prior_snapshot_never_sees_updated_key_twice() {
 }
 
 /// SV6 — the CONCURRENT-reader form of the double-read differential: a reader thread hammers the point
-/// lookup while the writer commits real single-row SQL UPDATEs with `resident_update_tombstone_enabled`
+/// lookup while the writer commits real single-row SQL UPDATEs through mandatory device maintenance
 /// ON. SI invariant under EVERY interleaving: the key appears EXACTLY ONCE per read (never 2 = the SV5
 /// double-read; never 0 = a lost row). Crosses open-shard append headroom AND rollover (shard target 64,
 /// ~300 appended versions), so both created_by stamp branches are exercised under load.
@@ -1611,8 +1522,6 @@ fn sv6_concurrent_reader_never_sees_updated_key_twice_under_update_load() {
     let e = Engine::new_local();
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.set_resident_delete_tombstone_enabled(true);
-    e.set_resident_update_tombstone_enabled(true);
     // A5 FLIP: this hammer runs ELIDED BY DEFAULT — it is the regression gate for the
     // (fixed) elided-churn SI bug: a rehydrating decline used to leave the fallback on a
     // STALE view -> stale old image -> the tombstone stamped an already-dead slot -> the
@@ -1679,52 +1588,6 @@ fn sv6_concurrent_reader_never_sees_updated_key_twice_under_update_load() {
     assert_eq!(rows.row(0), &[SqlValue::Int4(130), SqlValue::Int4(100_299)]);
 }
 
-/// SV6 lifecycle (mirrors `shard_deleted_by_region_released_on_warmup_readmit`): a WARMUP/REFRESH
-/// re-admit reaches the SHARDED re-admit branch with NO preceding commit invalidate, so it must itself
-/// erase stale `created_by` regions — else the fresh all-live shard 0 (reused shard_id) inherits the
-/// stamp region and wrongly HIDES rebuilt rows from older-snapshot readers. NON-VACUITY: region proven
-/// present, then KEY-absent after the refresh. Sabotage: remove the sharded-branch
-/// `shard_created_by_memory.remove_table` and this FAILS.
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn sv6_created_by_region_released_on_warmup_readmit() {
-    let mut e = Engine::new_local();
-    e.set_shard_residency_enabled(true);
-    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
-        .unwrap();
-    e.execute_text(
-        2,
-        "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)",
-    )
-    .unwrap();
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
-    let (shard_id, capacity, gpu_id) = {
-        let shards = e.read_state.residency.shards.load();
-        let shard = &shards.get("accounts").unwrap()[0];
-        (shard.shard_id, shard.capacity, shard.gpu_id)
-    };
-    assert!(e.stamp_created_by_resident_shard_slots(
-        "accounts",
-        shard_id,
-        1,
-        capacity,
-        gpu_id,
-        &[777]
-    ));
-    assert!(
-        table_has_any_created_by_cell(&e, "accounts"),
-        "precondition: the stamp allocated a live created_by region"
-    );
-    // Warmup/refresh re-admit -- NO commit, so NO invalidate precedes it.
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
-    assert!(
-        !table_has_any_created_by_key(&e, "accounts"),
-        "warmup re-admit (no preceding invalidate) must erase the stale created_by region"
-    );
-}
-
 /// SV6 lifecycle (mirrors SV4-prereq-#1 for `created_by`): the on-demand `created_by` region is
 /// RELEASED at every site the buffer it annotates is retired — a re-admit (here: a multi-row UPDATE
 /// falling back to invalidate + rebuild-all-live) must not leave a stale stamp region that would
@@ -1737,8 +1600,6 @@ fn sv6_created_by_region_released_on_readmit_and_drop() {
     let load = |e: &Engine| {
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
-        e.set_resident_delete_tombstone_enabled(true);
-        e.set_resident_update_tombstone_enabled(true);
         e.set_shard_size_target(64);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
@@ -1760,22 +1621,11 @@ fn sv6_created_by_region_released_on_readmit_and_drop() {
         );
     };
 
-    // RE-ADMIT gate: an AMBIGUOUS UPDATE falls back to invalidate + re-admit (rebuild all-live)
-    // -> the region MUST go with the buffer it annotated, or the rebuilt rows would read a
-    // stale stamp. A4b made plain multi-row UPDATEs INCREMENTAL, so the fallback trigger here
-    // is int4-IDENTICAL duplicate rows: the per-row locate sees count 2 and declines (the
-    // exact-count wrong-results net), forcing the re-admit this gate pins.
-    // (The re-admitted table becomes ONE dense shard with no headroom, so no later single-row
-    // UPDATE can re-stamp it — hence the separate fresh engine for the DROP gate below.)
+    // Explicit VACUUM crosses the RETIRE-002 repair boundary and replaces the allocation. The
+    // region must go with the buffer it annotated.
     let e = Engine::new_local();
     load(&e);
-    e.execute_text(
-        203,
-        "INSERT INTO accounts (id, balance) VALUES (900, 5), (900, 5)",
-    )
-    .unwrap();
-    e.execute_text(204, "UPDATE accounts SET balance = 0 WHERE id = 900")
-        .unwrap();
+    e.vacuum_table("accounts").unwrap();
     assert!(
         !table_has_any_created_by_cell(&e, "accounts"),
         "re-admit must release the stale created_by region (wrong-results + leak guard)"

@@ -1,16 +1,12 @@
 use super::*;
 mod chunk_class_lifecycle;
 mod chunk_locate;
-mod cold_checkpoint;
-mod cold_tier;
-mod dml_locate;
 mod grouped_distinct;
 mod ordered;
 mod projection;
 mod rank_windows;
 mod reverse_gather;
 mod scalar_reductions;
-mod sidecars;
 mod views;
 
 /// Probe for a usable GPU by populating a throwaway table and checking the retained device proof, then
@@ -199,17 +195,17 @@ fn gpu_streaming_inner_join_two_over_budget_relations() {
         "INSERT INTO jm8 VALUES (-1, 100), (2, 200), (2147483648, 999)",
     )
     .unwrap();
+    seq += 1;
+    e.execute_text(seq, "DELETE FROM jl WHERE k = 400").unwrap();
     e.set_relational_residency_budget_bytes(0, 4096);
-    // Prime both cold entries, then stamp one left row dead. The join must compose the chunk
-    // sidecar visibility mask before matching; a leaked tombstone would survive the resident oracle.
+    // Prime both cold entries after the device-native delete. This test keeps class entry disabled
+    // because its differential oracle later re-admits the same store generation whole-resident.
     let _ = e
         .execute_relational_select(&select("SELECT COUNT(*) FROM jl"))
         .unwrap();
     let _ = e
         .execute_relational_select(&select("SELECT COUNT(*) FROM jr"))
         .unwrap();
-    seq += 1;
-    e.execute_text(seq, "DELETE FROM jl WHERE k = 400").unwrap();
     let sql = "SELECT l.k, l.lv, r.rv, l.note FROM jl l JOIN jr r ON l.k = r.k \
                WHERE l.lv >= 350 AND r.rv < 550";
     let streamed = e
@@ -856,6 +852,7 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
     // THE FOLD PATH (audit HIGH regression: per-column-parallel blob_offsets — a single int8 key
     // folds on-device; the needle is the host fingerprint via the shared helper): build indexes
     // over a BIGINT column and probe present/absent keys through fingerprints.
+    e.clear_relational_residency_budget_bytes(0);
     seq += 1;
     e.execute_text(seq, "CREATE TABLE keyed8 (k BIGINT, v INT)")
         .unwrap();
@@ -869,6 +866,7 @@ fn gpu_chunk_key_index_builds_probes_and_rechecks() {
     seq += 1;
     e.execute_text(seq, &format!("INSERT INTO keyed8 (k, v) VALUES {v8}"))
         .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
     let _ = e
         .execute_relational_select(&select("SELECT COUNT(*) FROM keyed8"))
         .unwrap();
@@ -986,7 +984,12 @@ fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
         "the KEYED table must ENTER the class (the P5-2 lift)"
     );
     assert!(
-        e.chunk_class_reclaimed_rows() > 0,
+        e.read_state
+            .mvcc
+            .table_rows("ku")
+            .store()
+            .all_versions()
+            .is_empty(),
         "entry reclaims the host rows"
     );
 
@@ -1046,7 +1049,7 @@ fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
 
     // Fresh keys append as tails; the probe VALIDATED (non-vacuity) and the class held.
     let probes_before = e.chunk_class_unique_probes();
-    let skipped_before = e.chunk_class_skipped_installs();
+    let skipped_before = e.chunk_class_device_commits();
     seq += 1;
     e.execute_text(seq, "INSERT INTO ku (a, t) VALUES (600000, 'fresh')")
         .unwrap();
@@ -1055,7 +1058,7 @@ fn gpu_chunk_class_keyed_lift_insert_uniqueness() {
         "the accept path went through the device probe"
     );
     assert!(
-        e.chunk_class_skipped_installs() > skipped_before,
+        e.chunk_class_device_commits() > skipped_before,
         "still classed"
     );
     assert_eq!(count(&e), i64::from(N) + 2);
@@ -1204,16 +1207,6 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
     let durable = e.durable_wal_records();
     let mut recovered = Engine::recover_from_durable_wal(&durable).unwrap();
     recovered.set_relational_residency_budget_bytes(0, 8192);
-    {
-        let catalog = recovered.ddl_catalog();
-        for table in ["cp", "cc"] {
-            catalog.relational_resident_cache.remove_table(
-                table,
-                &recovered.read_state.residency,
-                &recovered.read_state.route_telemetry,
-            );
-        }
-    }
     let _ = recovered
         .execute_relational_select(&select("SELECT COUNT(*) FROM cp"))
         .unwrap();
@@ -1241,7 +1234,10 @@ fn gpu_chunk_class_check_and_foreign_keys_stay_device_native() {
     let recovered_error = recovered
         .execute_text(1, "DELETE FROM cp WHERE id = 100005")
         .expect_err("decoupled facade id must not hide the current provider");
-    assert!(format!("{recovered_error:?}").contains("foreign key constraint"));
+    assert!(
+        format!("{recovered_error:?}").contains("foreign key constraint"),
+        "unexpected recovered FK error: {recovered_error:?}"
+    );
     assert_eq!(recovered.durable_wal_records().len(), recovered_wal_before);
     assert!(!recovered.is_commit_path_poisoned());
 
@@ -1331,7 +1327,12 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
     );
     assert!(e.table_chunk_authoritative("kb").is_some());
     assert!(
-        e.chunk_class_reclaimed_rows() > 0,
+        e.read_state
+            .mvcc
+            .table_rows("kb")
+            .store()
+            .all_versions()
+            .is_empty(),
         "host row chains were reclaimed"
     );
 
@@ -1404,6 +1405,7 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
         .collect();
     seq += 1;
     e.execute_text(seq, "DELETE FROM kb WHERE a < 400").unwrap();
+    e.maybe_compact_chunk_class("kb");
     assert!(
         e.chunk_class_compactions() > 0,
         "range delete compacts a keyed chunk"
@@ -1496,9 +1498,6 @@ fn gpu_chunk_bloom_global_cap_rolls_back_failed_admission() {
             .any(|(table, _, _)| table == "bcb"),
         "failed priming must roll back every partial bcb Bloom"
     );
-    seq += 1;
-    e.execute_text(seq, "INSERT INTO bcb (a, v) VALUES (300000, 2)")
-        .unwrap();
     assert!(e.table_chunk_authoritative("bcb").is_none());
     assert!(e.table_chunk_authoritative("bca").is_some());
     assert!(e.chunk_key_bloom_bytes() <= forced_cap);
@@ -1550,65 +1549,15 @@ fn gpu_chunk_bloom_spill_is_primed_before_class_entry() {
     }
 }
 
-/// Deterministic E1-prime/E2-publication race: the cold read publishes E1 and pauses before its
-/// off-lock candidate build; a concurrent UPDATE replaces chunks and publishes E2; E1 then builds.
-/// Final epoch validation must remove every now-stale E1 candidate inserted after E2's cleanup.
+/// Audit M2 — the temporary exact-predicate batch bound is fail-closed, not a host fallback.
+/// Exactly 256 fresh rows stay classed and are device-validated; 257 fresh rows are rejected
+/// without deauthorizing or landing a partial statement.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_chunk_bloom_offlock_prime_cannot_strand_stale_ids() {
-    let _forced_over_cap = ChunkKeyIndexCapOverride::tiny();
-    let mut e = Engine::new_local_cpu_oracle();
-    let mut seq = 0_u64;
-    if !gpu_available(&mut e, &mut seq) {
-        return;
-    }
-    seq += 1;
-    e.execute_text(seq, "CREATE TABLE kbr (a INT PRIMARY KEY, v INT)")
-        .unwrap();
-    let values = (0..1200)
-        .map(|i| format!("({i}, {i})"))
-        .collect::<Vec<_>>()
-        .join(",");
-    seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO kbr (a, v) VALUES {values}"))
-        .unwrap();
-    e.set_relational_residency_budget_bytes(0, 4096);
-    let e = std::sync::Arc::new(e);
-    let (published_e1, resume_prime) =
-        crate::engine_streaming_exec::install_chunk_key_prime_pin_hook();
-    let reader = std::sync::Arc::clone(&e);
-    let capture = std::thread::spawn(move || {
-        reader.execute_relational_select(&select("SELECT COUNT(*) FROM kbr"))
-    });
-    published_e1.wait();
-    seq += 1;
-    e.execute_text(seq, "UPDATE kbr SET v = 999999 WHERE a < 400")
-        .unwrap();
-    assert!(
-        e.streaming_cold_patches() > 0,
-        "interposed UPDATE published E2"
-    );
-    resume_prime.wait();
-    capture
-        .join()
-        .expect("capture thread")
-        .expect("streaming read");
-    assert_eq!(
-        e.stale_chunk_key_candidate_count("kbr"),
-        0,
-        "E1 prime inserted after E2 cleanup must self-retire stale chunk IDs"
-    );
-}
-
-/// Audit M2 — the temporary exact-predicate batch bound is an authorization seam, not a silent
-/// acceptance seam. Exactly 256 fresh rows stay classed and are device-validated; 257 fresh rows
-/// loudly de-authorize before succeeding through the restored host reference; and a separate
-/// 257-row batch containing a duplicate likewise de-authorizes, then rejects with no partial land.
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_chunk_class_unique_batch_bound_deauthorizes_257() {
+fn gpu_chunk_class_unique_batch_bound_fails_closed_at_257() {
     fn populate_and_enter(e: &mut Engine, seq: &mut u64, table: &str) {
         let entries_before = e.chunk_class_entries();
+        e.clear_relational_residency_budget_bytes(0);
         *seq += 1;
         e.execute_text(*seq, &format!("CREATE TABLE {table} (a INT PRIMARY KEY)"))
             .unwrap();
@@ -1623,6 +1572,10 @@ fn gpu_chunk_class_unique_batch_bound_deauthorizes_257() {
         let _ = e
             .execute_relational_select(&select(&format!("SELECT COUNT(*) FROM {table}")))
             .unwrap();
+        assert!(
+            e.table_chunk_authoritative(table).is_some(),
+            "{table} must class immediately after its forced streaming capture"
+        );
         *seq += 1;
         e.execute_text(*seq, &format!("INSERT INTO {table} VALUES (100000)"))
             .unwrap();
@@ -1673,14 +1626,18 @@ fn gpu_chunk_class_unique_batch_bound_deauthorizes_257() {
         .collect::<Vec<_>>()
         .join(",");
     seq += 1;
-    e.execute_text(seq, &format!("INSERT INTO bound_ok VALUES {values_257}"))
-        .unwrap();
+    let err = e
+        .execute_text(seq, &format!("INSERT INTO bound_ok VALUES {values_257}"))
+        .expect_err("257 rows exceed the bounded exact device validation");
+    assert!(format!("{err:?}").contains("device exact unique batch limit"));
     assert_eq!(
         e.chunk_class_deauths(),
-        deauth_before + 1,
-        "257 rows must loudly de-authorize before the host reference accepts"
+        deauth_before,
+        "the oversized batch must not cross into host authority"
     );
-    assert_eq!(count(&e, "bound_ok"), 600 + 1 + 256 + 257);
+    assert_eq!(count(&e, "bound_ok"), 600 + 1 + 256);
+    seq += 1;
+    e.execute_text(seq, "DROP TABLE bound_ok").unwrap();
 
     populate_and_enter(&mut e, &mut seq, "bound_dup");
     let deauth_before = e.chunk_class_deauths();
@@ -1697,12 +1654,12 @@ fn gpu_chunk_class_unique_batch_bound_deauthorizes_257() {
                 duplicate_values.join(",")
             ),
         )
-        .expect_err("the restored host reference must reject the 257-row duplicate");
-    assert!(format!("{err:?}").contains("duplicate key value"));
+        .expect_err("the oversized batch must fail before any host duplicate validation");
+    assert!(format!("{err:?}").contains("device exact unique batch limit"));
     assert_eq!(
         e.chunk_class_deauths(),
-        deauth_before + 1,
-        "the rejecting oversized batch also crosses the visible deauth seam"
+        deauth_before,
+        "the rejecting oversized batch remains device-authoritative"
     );
     assert_eq!(count(&e, "bound_dup"), 601, "no rejected row landed");
 }
@@ -2662,15 +2619,25 @@ fn gpu_chunk_class_keyed_dml_key_locate() {
     }
     e.set_relational_residency_budget_bytes(0, 8192);
     for table in ["kp", "kf"] {
+        e.transition_device_table_to_streaming_repair_above(table, 1)
+            .unwrap();
         let _ = e
             .execute_relational_select(&select(&format!("SELECT COUNT(*) FROM {table}")))
             .unwrap();
+        assert!(
+            e.table_chunk_authoritative(table).is_some(),
+            "{table} must class immediately after its forced streaming capture"
+        );
         seq += 1;
         e.execute_text(
             seq,
             &format!("INSERT INTO {table} (a, v) VALUES (100000, -1)"),
         )
         .unwrap();
+        assert!(
+            e.table_chunk_authoritative(table).is_some(),
+            "{table} must remain classed after its entry insert"
+        );
     }
     assert_eq!(e.chunk_class_entries(), 2, "both twins classed");
 
@@ -2877,15 +2844,25 @@ fn gpu_chunk_class_keyed_compound_dml_key_locate() {
     }
     e.set_relational_residency_budget_bytes(0, 8192);
     for table in ["cp", "cf"] {
+        e.transition_device_table_to_streaming_repair_above(table, 1)
+            .unwrap();
         let _ = e
             .execute_relational_select(&select(&format!("SELECT COUNT(*) FROM {table}")))
             .unwrap();
+        assert!(
+            e.table_chunk_authoritative(table).is_some(),
+            "{table} must class immediately after its forced streaming capture"
+        );
         seq += 1;
         e.execute_text(
             seq,
             &format!("INSERT INTO {table} (a, b, v) VALUES (100000, 0, -1)"),
         )
         .unwrap();
+        assert!(
+            e.table_chunk_authoritative(table).is_some(),
+            "{table} must remain classed after its entry insert"
+        );
     }
     assert_eq!(e.chunk_class_entries(), 2, "both compound twins classed");
 

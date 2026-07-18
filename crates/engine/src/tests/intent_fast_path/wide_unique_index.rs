@@ -66,12 +66,8 @@ fn gpu_text_unique_key_away_history_conflicts_from_device_stamp() {
 
     let mut engine = Engine::new_local_cpu_oracle();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
     engine
         .execute_text(
             1,
@@ -93,11 +89,11 @@ fn gpu_text_unique_key_away_history_conflicts_from_device_stamp() {
                 &format!("INSERT INTO history_t VALUES ({i}, 'warm-{i}', {i})"),
             )
             .unwrap();
-        if engine.table_install_elided("history_t") {
+        if engine.table_device_authoritative("history_t") {
             break;
         }
     }
-    assert!(engine.table_install_elided("history_t"));
+    assert!(engine.table_device_authoritative("history_t"));
 
     let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
     let (continue_tx, continue_rx) = std::sync::mpsc::channel();
@@ -131,7 +127,7 @@ fn gpu_text_unique_key_away_history_conflicts_from_device_stamp() {
     // validation, so sampling before them would let the cfg(test) CPU ledger mask a missing stale
     // writer device verdict while this counter still advanced.
     assert!(
-        engine.table_install_elided("history_t"),
+        engine.table_device_authoritative("history_t"),
         "the stale writer must resume while the relation is still device-authoritative; otherwise the cfg(test) host oracle could mask the history verdict"
     );
     let stale_validate_before = engine.dml_device_validate_hits();
@@ -214,12 +210,8 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
         let mut engine = Engine::new_local_cpu_oracle();
         engine.commit_state_mut().wal = WalBuffer::with_durable_segment(&wal_path);
         engine.set_auto_admit_on_commit(true);
-        engine.set_host_install_elision_enabled(true);
         engine.set_binary_wal_records_enabled(true);
         engine.set_device_write_locate_wave_batch_enabled(true);
-        engine.set_constrained_elision_enabled(true);
-        engine.set_resident_delete_tombstone_enabled(true);
-        engine.set_resident_update_tombstone_enabled(true);
         let txn_ids = AtomicU64::new(1);
         macro_rules! sql {
             ($statement:expr) => {
@@ -259,12 +251,12 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
                 ))
                 .unwrap();
                 warm_rows += 1;
-                if engine.table_install_elided(shape.table) {
+                if engine.table_device_authoritative(shape.table) {
                     break;
                 }
             }
             assert!(
-                engine.table_install_elided(shape.table),
+                engine.table_device_authoritative(shape.table),
                 "{} never entered elision",
                 shape.table
             );
@@ -315,7 +307,7 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
             .unwrap();
             assert!(engine.dml_device_resolve_hits() > resolve_before);
             assert!(
-                engine.table_install_elided(shape.table),
+                engine.table_device_authoritative(shape.table),
                 "{} wide-key writes must remain device-authoritative",
                 shape.table
             );
@@ -353,11 +345,11 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
         for i in 0..512_u32 {
             sql!(&format!("INSERT INTO wide_only VALUES ('only-warm-{i}')")).unwrap();
             only_warm += 1;
-            if engine.table_install_elided("wide_only") {
+            if engine.table_device_authoritative("wide_only") {
                 break;
             }
         }
-        assert!(engine.table_install_elided("wide_only"));
+        assert!(engine.table_device_authoritative("wide_only"));
         let only_hits = engine.device_write_locate_hits();
         sql!("INSERT INTO wide_only VALUES ('only-next')").unwrap();
         let duplicate = sql!("INSERT INTO wide_only VALUES ('only-next')")
@@ -365,7 +357,7 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
             .to_string();
         assert!(duplicate.contains("duplicate key value"), "{duplicate}");
         assert!(engine.device_write_locate_hits() > only_hits);
-        assert!(engine.table_install_elided("wide_only"));
+        assert!(engine.table_device_authoritative("wide_only"));
         expected_counts.insert("wide_only".to_string(), only_warm + 2);
 
         // Adversarial collision: both distinct BIGINT keys must coexist in the same fingerprint
@@ -385,7 +377,7 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
         .unwrap_err()
         .to_string();
         assert!(duplicate.contains("duplicate key value"), "{duplicate}");
-        assert!(engine.table_install_elided("wide_i8"));
+        assert!(engine.table_device_authoritative("wide_i8"));
         *expected_counts.get_mut("wide_i8").unwrap() += 2;
 
         // Explicit transaction arbitration binds the BEGIN generation for staging, then checks the
@@ -463,12 +455,8 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
         let mut engine = Engine::new_local_cpu_oracle();
         engine.commit_state_mut().wal = WalBuffer::with_durable_segment(&wal_path);
         engine.set_auto_admit_on_commit(true);
-        engine.set_host_install_elision_enabled(true);
         engine.set_binary_wal_records_enabled(true);
         engine.set_device_write_locate_wave_batch_enabled(true);
-        engine.set_constrained_elision_enabled(true);
-        engine.set_resident_delete_tombstone_enabled(true);
-        engine.set_resident_update_tombstone_enabled(true);
         let txn_ids = AtomicU64::new(1);
         macro_rules! sql {
             ($statement:expr) => {
@@ -491,7 +479,7 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
         }
         let locate_before = engine.device_write_locate_hits();
         sql!("INSERT INTO bool_pk VALUES (true, 1, NULL)").unwrap();
-        assert!(engine.table_install_elided("bool_pk"));
+        assert!(engine.table_device_authoritative("bool_pk"));
         let duplicate = sql!("INSERT INTO bool_pk VALUES (false, 9, NULL)")
             .unwrap_err()
             .to_string();
@@ -502,7 +490,7 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
         sql!("DELETE FROM bool_pk WHERE k = false").unwrap();
         sql!("INSERT INTO bool_pk VALUES (false, 8, NULL)").unwrap();
         assert!(engine.dml_device_resolve_hits() > resolve_before);
-        assert!(engine.table_install_elided("bool_pk"));
+        assert!(engine.table_device_authoritative("bool_pk"));
 
         engine
             .execute_text(
@@ -516,11 +504,11 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
             .expect("populate nullable bool UNIQUE residency");
         assert!(snapshot.device_memory_proof.is_some());
         sql!("INSERT INTO bool_nullable VALUES (2, true, 20)").unwrap();
-        assert!(engine.table_install_elided("bool_nullable"));
+        assert!(engine.table_device_authoritative("bool_nullable"));
         let validate_before = engine.dml_device_validate_hits();
         sql!("INSERT INTO bool_nullable VALUES (3, NULL, 30)").unwrap();
         assert!(
-            engine.table_install_elided("bool_nullable"),
+            engine.table_device_authoritative("bool_nullable"),
             "the first NULL must be decided by the device validity scan"
         );
         let catalog = engine.catalog_snapshot();
@@ -564,7 +552,7 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
         );
         assert!(prepared.is_err());
         assert!(
-            engine.table_install_elided("bool_nullable"),
+            engine.table_device_authoritative("bool_nullable"),
             "non-deferrable full validation must stay device-native"
         );
         let duplicate = sql!("INSERT INTO bool_nullable VALUES (4, NULL, 40)")
@@ -573,7 +561,7 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
         assert!(duplicate.contains("duplicate key value"), "{duplicate}");
         assert!(engine.dml_device_validate_hits() > validate_before);
         assert!(
-            engine.table_install_elided("bool_nullable"),
+            engine.table_device_authoritative("bool_nullable"),
             "the duplicate NULL check must not rehydrate"
         );
 
@@ -621,12 +609,8 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
 fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
     let mut engine = Engine::new_local();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
 
     engine
         .execute_text(
@@ -646,7 +630,7 @@ fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
     engine
         .execute_dml_concurrent(3, "INSERT INTO nullable_tuple VALUES (2, 1, NULL)")
         .unwrap();
-    assert!(engine.table_install_elided("nullable_tuple"));
+    assert!(engine.table_device_authoritative("nullable_tuple"));
 
     let catalog = engine.catalog_snapshot();
     let table = catalog.relational_catalog.get("nullable_tuple").unwrap();
@@ -672,14 +656,14 @@ fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
         )
         .unwrap());
     assert!(engine.dml_device_validate_hits() > validate_before);
-    assert!(engine.table_install_elided("nullable_tuple"));
+    assert!(engine.table_device_authoritative("nullable_tuple"));
 
     let duplicate = engine
         .execute_dml_concurrent(4, "INSERT INTO nullable_tuple VALUES (3, 1, NULL)")
         .unwrap_err()
         .to_string();
     assert!(duplicate.contains("duplicate key value"), "{duplicate}");
-    assert!(engine.table_install_elided("nullable_tuple"));
+    assert!(engine.table_device_authoritative("nullable_tuple"));
     engine
         .execute_dml_concurrent(5, "INSERT INTO nullable_tuple VALUES (3, 2, NULL)")
         .unwrap();
@@ -699,7 +683,7 @@ fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
         .execute_dml_concurrent(92, "DELETE FROM nullable_tuple WHERE id = 5")
         .unwrap();
     assert!(
-        engine.table_install_elided("nullable_tuple"),
+        engine.table_device_authoritative("nullable_tuple"),
         "the partial-NULL stale commit must remain device-authoritative"
     );
     let history_before = engine.dml_device_validate_hits();
@@ -710,7 +694,7 @@ fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
         "partial-NULL key-away must conflict from the device verdict: {conflict:?}"
     );
     assert!(engine.dml_device_validate_hits() > history_before);
-    assert!(engine.table_install_elided("nullable_tuple"));
+    assert!(engine.table_device_authoritative("nullable_tuple"));
     engine.execute_text(STALE_TXN, "ROLLBACK").unwrap();
 }
 
@@ -724,12 +708,8 @@ fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
 fn gpu_nullable_i32_unique_mutations_remain_device_authoritative() {
     let mut engine = Engine::new_local();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
-    engine.set_resident_delete_tombstone_enabled(true);
-    engine.set_resident_update_tombstone_enabled(true);
 
     let cases = [
         (
@@ -772,7 +752,7 @@ fn gpu_nullable_i32_unique_mutations_remain_device_authoritative() {
         engine.execute_dml_concurrent(seq, insert_null).unwrap();
         seq += 1;
         assert!(
-            engine.table_install_elided(table),
+            engine.table_device_authoritative(table),
             "{table}: nullable insert must enter device authority"
         );
 
@@ -781,7 +761,7 @@ fn gpu_nullable_i32_unique_mutations_remain_device_authoritative() {
             .unwrap();
         seq += 1;
         assert!(
-            engine.table_install_elided(table),
+            engine.table_device_authoritative(table),
             "{table}: nullable UPDATE must not rehydrate"
         );
         let updated = engine
@@ -794,7 +774,7 @@ fn gpu_nullable_i32_unique_mutations_remain_device_authoritative() {
             .unwrap();
         seq += 1;
         assert!(
-            engine.table_install_elided(table),
+            engine.table_device_authoritative(table),
             "{table}: nullable DELETE must not rehydrate"
         );
         assert!(

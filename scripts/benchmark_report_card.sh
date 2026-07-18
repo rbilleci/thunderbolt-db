@@ -15,10 +15,10 @@
 # This card's L2 = 128 MB (measured via cudaDevAttrL2CacheSize; RTX PRO 6000 Blackwell Max-Q, 96GB).
 # OUT-OF-L2 needs the gathered i32 column (4B/row) to exceed 128MB => > 32M rows.
 #   - read_kernel_roofline emits IN-L2 (32MB/col, 8M rows) + OUT-OF-L2 (256MB/col, 64M rows) in ONE run.
-#   - r2_wave_engine_ab builds its table via a SQL INSERT loop (~11 us/row, CPU-bound parse+txn). At 48M
-#     rows (192MB/col = 1.5x L2 -> clearly out-of-L2) the build alone is ~9 min, so Section C gets its own
-#     larger timeout. A 2026-07-12 run measured 719s insert + 33s residency, and the batch-65536
-#     scan needs several more minutes; 700s and 1000s both cut off before the full card completed.
+#   - r2_wave_engine_ab builds its table via a CPU-bound SQL INSERT loop. At 48M rows (192MB/col =
+#     1.5x L2 -> clearly out-of-L2), the final R3-004 tree retains each device-authoritative insert
+#     publication instead of late-converting the fixture. A 2026-07-18 run measured 1620.4s insert +
+#     0.0s final residency; the former 1200s timeout expired during the build.
 #
 # Discipline: this is a shared GPU box. Never run two GPU examples back-to-back without a gap (sleep 12).
 # Never pass --gpu-reset anywhere. set -uo pipefail (NOT -e) so a timeout in one section does not abort
@@ -31,7 +31,7 @@
 #   OUT_OF_L2_BATCHES  measured batches for the large pass (default 300; p50 is stable at ~300)
 #   SECTION_A_TIMEOUT  roofline timeout, seconds           (default 280)
 #   SECTION_B_TIMEOUT  in-L2 engine timeout, seconds       (default 280)
-#   SECTION_C_TIMEOUT  out-of-L2 engine timeout, seconds   (default 1200; measured 752.6s build + large scans)
+#   SECTION_C_TIMEOUT  out-of-L2 engine timeout, seconds   (default 2400; measured 1620.4s build + sweeps)
 #   GPU_GAP            inter-section GPU cool-down, seconds (default 12)
 
 set -uo pipefail
@@ -43,7 +43,7 @@ OUT_OF_L2_ROWS="${OUT_OF_L2_ROWS:-48000000}"
 OUT_OF_L2_BATCHES="${OUT_OF_L2_BATCHES:-300}"
 SECTION_A_TIMEOUT="${SECTION_A_TIMEOUT:-280}"
 SECTION_B_TIMEOUT="${SECTION_B_TIMEOUT:-280}"
-SECTION_C_TIMEOUT="${SECTION_C_TIMEOUT:-1200}"
+SECTION_C_TIMEOUT="${SECTION_C_TIMEOUT:-2400}"
 GPU_GAP="${GPU_GAP:-12}"
 
 l2_mb=128

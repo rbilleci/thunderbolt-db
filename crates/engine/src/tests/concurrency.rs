@@ -54,10 +54,7 @@ fn concurrent_readers_execute_relational_select_on_shared_engine() {
         reader.join().expect("reader thread panicked");
     }
     // Residency survived concurrent reads and is still valid afterward.
-    assert!(engine
-        .relational_residency_snapshot("events")
-        .unwrap()
-        .is_valid());
+    assert!(engine.table_has_live_dml_generation("events"));
 }
 
 #[test]
@@ -339,32 +336,8 @@ fn stage3_resident_equality_read_uses_device_generation() {
         "both 'Ada' rows returned, no scan miss"
     );
 
-    // Directly: the loaded generation's value-index returns exactly the 2 'Ada' row keys
-    // (an O(log) map lookup), and far fewer than the 200 stored rows — proving the read hit
-    // the versioned value-index, not a chain scan.
-    let handle = e
-        .read_state
-        .mvcc
-        .load_table("people")
-        .expect("table published");
-    let ada_keys = handle.get().index_keys(
-        "name",
-        &relational_index_value(&SqlValue::Text("Ada".to_string())),
-    );
-    assert_eq!(ada_keys.len(), 2);
-    let total_rows = drain_cursor(
-        handle
-            .get()
-            .rows
-            .seq_scan_open(StorageVisibility {
-                read_txn_id: e.visible_up_to(),
-            })
-            .unwrap(),
-    )
-    .len();
-    assert_eq!(total_rows, 200);
-    assert!(
-        ada_keys.len() * 10 < total_rows,
-        "value-index lookup must be selective (index-targeted), not a full scan"
-    );
+    // R3-004 non-vacuity: the exact answer came from a live device generation while the retired
+    // host tuple/value-index generation was never installed.
+    assert!(e.table_has_live_dml_generation("people"));
+    assert!(e.read_state.mvcc.load_table("people").is_none());
 }

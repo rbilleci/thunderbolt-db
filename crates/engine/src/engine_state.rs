@@ -523,18 +523,17 @@ pub(crate) struct ResidencyReadState {
     pub(crate) shard_created_by_memory: ShardResidentDeviceMemoryMap,
     /// RETIREMENT A1 (ledger #2, option A — device-authoritative): the per-shard u64 ROW-IDENTITY
     /// region, keyed `(table, shard_id)`, same lifecycle discipline as the version regions. Slot `s`
-    /// holds the row's host `row_id` (the key is derivable: `rel/{table}/{row_id:020}`), stamped at
+    /// holds the row's durable `row_id` (the repair key is derivable: `rel/{table}/{row_id:020}`), stamped at
     /// admission (parsed from the scanned tuple keys) and on every append (parsed from the commit's
     /// write-set keys; an UPDATE-appended version carries the ORIGINAL row's id — same key). The
-    /// UNSTAMPED sentinel is `u64::MAX` (a benchmark/synthetic install has no host identity; a
-    /// device resolve finding the sentinel declines to the host path). 8 B/row device cost —
-    /// ledgered; range-compression is a later optimization. This is what lets the device locate
-    /// yield the WriteDelta's `(tuple_id, key)` without the host store (A2), and becomes the row
-    /// identity the SI ledger keys on once the host store is deleted (A4/A5).
+    /// UNSTAMPED sentinel is `u64::MAX` (a benchmark/synthetic install has no durable identity; a
+    /// device resolve finding the sentinel fails closed). 8 B/row device cost — ledgered;
+    /// range-compression is a later optimization. This lets device locate return the WriteDelta's
+    /// stable identity without consulting a host tuple store.
     pub(crate) shard_row_id_memory: ShardResidentDeviceMemoryMap,
     /// ADR-009 R1: per-table GPU hash-index reuse cache for the index-probe point-lookup route (built
-    /// lazily, behind the default-OFF `index_probe_enabled` flag). A plain `Mutex` (not the lock-free
-    /// `ArcSwap` the hot path uses) because the index route is opt-in + the lock is taken only off the
+    /// lazily, behind the default-ON `index_probe_enabled` flag). A plain `Mutex` (not the lock-free
+    /// `ArcSwap` the hot path uses) because the lock is taken only off the
     /// fast cache-hit path; staleness is handled by the per-entry `generation` tag, not by eviction.
     pub(crate) wave_index: Mutex<BTreeMap<String, WaveResidentIndex>>,
     /// Per-shard PK hash index resident on the device. Keyed `(table, shard_id, col_idx)`,
@@ -592,7 +591,7 @@ pub(crate) struct ResidencyReadState {
     /// Sub-slice 8 (GPU-native probe): count of batches served by the fully-GPU dense-emit path
     /// (`gather_sharded_int4_point_lookups_batched_gpu` — device-resident per-shard index + the
     /// `gpu_db_resident_i32_index_probe_dense` kernel probes+gathers+emits on the GPU, no host per-needle
-    /// probe). The non-vacuity signal that the GPU-native path (vs the host-probe fallback) served the batch.
+    /// probe). The non-vacuity signal that the fully device-probed path served the batch.
     pub(crate) sharded_point_gpu_probe_hits: std::sync::atomic::AtomicU64,
     /// Sub-slice 8 v3 (O(1) routing): count of GPU-native batches where the multi-shard kernel took the
     /// BINARY-SEARCH path (the shards were host-proven ascending-disjoint, so each needle routes to its one
@@ -667,32 +666,26 @@ pub(crate) struct ResidencyReadState {
     /// fold (a non-admitted table whose predicate the value index could not bound — previously the
     /// pure-host seq_scan+filter loop, the reachable CPU-relational-engine residue).
     pub(crate) dml_streaming_resolve_hits: std::sync::atomic::AtomicU64,
-    /// RETIREMENT A4e: tables whose commits ELIDE the host tuple-store + value-index install
-    /// (device-authoritative). Entered after first admission when eligible under the default-OFF
-    /// flag; LEFT (sticky de-elision) via rehydration when any resolve/gather declines. COW set —
-    /// readers load() wait-free on the apply path.
-    pub(crate) elided_tables: ArcSwap<std::collections::BTreeSet<String>>,
-    /// RETIREMENT A4e: commits that skipped the host install (the non-vacuity signal).
-    pub(crate) host_install_elisions: std::sync::atomic::AtomicU64,
-    /// P4-2b (S-E.P4): CHUNK-AUTHORITATIVE tables — name -> the FREEZE boundary (the commit index
-    /// at class entry). A class table's host store is FROZEN at that boundary (writes skip the
-    /// install; the cold chunks are the materialization); readers pinned BELOW it are served by
-    /// the frozen chains (exact MVCC), everything at-or-above streams. COW map, publishers
-    /// serialize on the commit path (entry/exit run under the commit lock).
+    /// R3-004: tables whose live relational image is device-authoritative. Normal DML enters this
+    /// set after publishing a maintained generation and never clears it through a fallback; only
+    /// explicit RETIRE-002 DDL/vacuum/recovery repair may reverse-gather and de-authorize. COW set;
+    /// readers load without waiting on the apply path.
+    pub(crate) device_authoritative_tables: ArcSwap<std::collections::BTreeSet<String>>,
+    /// R3-004: commits that published device-authoritative relational state.
+    pub(crate) device_authoritative_commits: std::sync::atomic::AtomicU64,
+    /// P4-2b (S-E.P4): CHUNK-AUTHORITATIVE tables — name -> the entry boundary. Cold chunks and
+    /// their sidecars are the live materialization; the boundary fences retained snapshots and
+    /// explicit RETIRE-002 repair. COW map, publishers serialize on the commit path.
     pub(crate) chunk_authoritative_tables: ArcSwap<std::collections::BTreeMap<String, Index>>,
-    /// P4-2b: class entries (the non-vacuity signal for the store deletion).
-    pub(crate) chunk_class_entries: std::sync::atomic::AtomicU64,
-    /// P4-2b: commits that skipped the host install for a class table.
-    pub(crate) chunk_class_skipped_installs: std::sync::atomic::AtomicU64,
-    /// P4-2b: sticky exits — a shape the chunks could not serve replayed the post-freeze delta
-    /// back into the store (the loud de-authoritization; not the steady state).
-    pub(crate) chunk_class_deauths: std::sync::atomic::AtomicU64,
-    /// P4 reclamation: host store versions DELETED at class entry (the store-deletion payoff).
-    pub(crate) chunk_class_reclaimed_rows: std::sync::atomic::AtomicU64,
-    /// P4 compaction: stamped chunks rebuilt from survivors (sidecar + dead slots deleted).
+    /// Device-authoritative commits maintained through the chunk-tail path.
+    pub(crate) chunk_class_device_commits: std::sync::atomic::AtomicU64,
+    /// P4 compactions and physically removed tombstoned slots.
+    #[cfg(test)]
     pub(crate) chunk_class_compactions: std::sync::atomic::AtomicU64,
-    /// P4 compaction: dead slots physically deleted across all compactions.
+    #[cfg(test)]
     pub(crate) chunk_class_compacted_slots: std::sync::atomic::AtomicU64,
+    /// RETIRE-002 repair exits that reverse-gather a chunk generation before deauthorization.
+    pub(crate) chunk_class_deauths: std::sync::atomic::AtomicU64,
     /// P5-1: the per-chunk device KEY-INDEX cache — (table, chunk_id, key_id) -> a persistent
     /// retained hash-index buffer over the chunk's key fingerprints (all-visible build; the
     /// sidecar applies at the probe's recheck). chunk_id is the validity token (fresh iff the

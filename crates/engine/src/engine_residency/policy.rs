@@ -44,7 +44,7 @@ impl Engine {
 
     /// Billions-of-rows segmented layout (S-d1): enable/disable admitting a table as a SEGMENTED shard list
     /// (routed through the sharded resident read path) instead of one capacity-padded unified buffer.
-    /// DEFAULT OFF — the A/B lever to validate the shard path before flipping the default. Interior-mutable.
+    /// DEFAULT ON; retained as an A/B/test lever. Interior-mutable.
     pub fn set_shard_residency_enabled(&self, on: bool) {
         self.shard_residency_enabled
             .store(on, std::sync::atomic::Ordering::Relaxed);
@@ -55,44 +55,9 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// SV4b: enable GPU-native incremental DELETE — a single-entry DELETE commit locates + tombstones the
-    /// deleted rows' resident slots IN PLACE (O(rows)) instead of the O(table) invalidate + re-admit. DEFAULT
-    /// OFF (nested under the shard path); OFF => a DELETE re-admits exactly as before (byte-identical). The
-    /// A/B lever for the incremental-DELETE win. Interior-mutable (the commit path reads it).
-    pub fn set_resident_delete_tombstone_enabled(&self, on: bool) {
-        self.resident_delete_tombstone_enabled
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn resident_delete_tombstone_enabled(&self) -> bool {
-        self.resident_delete_tombstone_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// SV5: enable GPU-native incremental UPDATE — a single-entry UPDATE commit tombstones the old version's
-    /// resident slot + appends the new image to the open shard IN PLACE (O(rows)) instead of the O(table)
-    /// invalidate + re-admit. DEFAULT OFF (nested under the shard path); OFF => an UPDATE re-admits exactly as
-    /// before (byte-identical). The A/B lever for the incremental-UPDATE win. Interior-mutable.
-    ///
-    /// **The audit-P2 `created_by` flip-gate is FIXED (SV6):** the appended new version is stamped
-    /// `created_by = commit_seq` and every sharded read path ANDs the device-side
-    /// `created_by <= read_txn_id` lower bound, so a concurrent reader at `committed_seq = C-1`
-    /// (pre-publish torn read) sees the updated key exactly once (the OLD version). Gated by the SV6
-    /// torn-window + concurrent-reader differentials. See `Engine::try_update_resident_commit`'s SI note.
-    /// (The default stays OFF pending the remaining shards-default gates — sharded predicate NULL 3VL.)
-    pub fn set_resident_update_tombstone_enabled(&self, on: bool) {
-        self.resident_update_tombstone_enabled
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn resident_update_tombstone_enabled(&self) -> bool {
-        self.resident_update_tombstone_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Sub-slice 3b: enable the CROSS-SHARD PK-INDEX point-lookup route on the sharded read path — a
     /// shard-resident int4 UNIQUE-key equality point lookup uses the cached hash+bloom `locate` to gather
-    /// ONLY the located shard(s) instead of every zone-map-non-excluded shard. DEFAULT OFF (nested under the
+    /// ONLY the located shard(s) instead of every zone-map-non-excluded shard. DEFAULT ON (nested under the
     /// shard path); OFF => the sharded read scans + recompacts exactly as before (byte-identical). The A/B
     /// lever for the membership-pruning win under UPDATE key-scatter. Interior-mutable (the read path reads it).
     pub fn set_shard_index_probe_enabled(&self, on: bool) {
@@ -106,7 +71,7 @@ impl Engine {
     }
 
     /// lpb-for-shards wiring: enable serving a shard-resident int4 point-lookup BATCH (from the facade
-    /// batcher) via the batched cross-shard gather instead of per-query single-flight. DEFAULT OFF; OFF =>
+    /// batcher) via the batched cross-shard gather instead of per-query single-flight. DEFAULT ON; OFF =>
     /// `submit_sharded_point_lookups_batched` returns `None` (byte-identical). The A/B lever that LANDS the
     /// ~310x batched throughput on real workloads. Public (the facade toggles + the batched entry reads it).
     pub fn set_shard_batched_point_read_enabled(&self, on: bool) {
@@ -141,7 +106,7 @@ impl Engine {
 
     /// Sub-slice 8 (GPU-native probe): count of batches served by the FULLY-GPU dense-emit path
     /// (`gather_sharded_int4_point_lookups_batched_gpu`). Non-vacuity signal that the GPU-native probe (vs the
-    /// host-probe fallback) served the batch — output equality can't prove which path ran.
+    /// alternate scan route) served the batch — output equality can't prove which path ran.
     pub fn sharded_point_gpu_probe_hits(&self) -> u64 {
         self.read_state
             .residency
@@ -200,29 +165,6 @@ impl Engine {
     pub(crate) fn binary_wal_records_enabled(&self) -> bool {
         self.binary_wal_records_enabled
             .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub fn set_host_install_elision_enabled(&self, on: bool) {
-        self.host_install_elision_enabled
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn host_install_elision_enabled(&self) -> bool {
-        self.host_install_elision_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// TYPE-COVERAGE track 1: enable/disable elision for UNIQUE-INDEXED (PK'd) i32-section
-    /// tables (Int4/Date/Int2). DEFAULT ON since the 2026-07-03 flip; OFF = the kill switch
-    /// (stops NEW elisions only — already-elided tables keep rehydrating through the seams).
-    pub fn set_constrained_elision_enabled(&self, on: bool) {
-        self.constrained_elision_enabled
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn constrained_elision_enabled(&self) -> bool {
-        self.constrained_elision_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// TYPE-COVERAGE track 2 slice 2: enable/disable i64-SECTION (Int8/Timestamp) columns in
@@ -284,7 +226,7 @@ impl Engine {
         if !self.device_write_locate_wave_batch_enabled() {
             return false;
         }
-        if !self.table_install_elided(&table.name) {
+        if !self.table_device_authoritative(&table.name) {
             return false;
         }
         if !table.check_constraints.is_empty() || !table.foreign_keys.is_empty() {
@@ -336,18 +278,12 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// RETIREMENT A4e (audit B1) + TYPE-COVERAGE track 1: may `table` ENTER elision?
-    /// Strictly-Int4, no checks, no outbound FKs, NO OTHER TABLE REFERENCES IT — and UNIQUE
-    /// indexes (PK'd tables, the core-banking shape) allowed ONLY under
-    /// `constrained_elision_enabled` with BOTH validator-ladder flags live. The original B1
-    /// hazard (constraint validation reading the elided host store's stale prefix = silent
-    /// bypass) is closed at both ends: every hot-path validator probe now runs through the
-    /// device-native ladder (`validate_dml_constraints_via_device` -> `visible_row_with_value`,
-    /// device-first, rehydrate-on-decline, self-pinned views — including `prepare_insert`,
-    /// this slice) and the residual scan arm's source (`visible_relational_rows`) rehydrates
+    /// May `table` publish as a device-authoritative DML relation? Every supported unique-key
+    /// shape is admitted unconditionally; constraint probes run through the device-native ladder
+    /// (`validate_dml_constraints_via_device` -> `visible_row_with_value`) and decline fails loud.
     /// elided tables itself. CHECK/FK exclusions stay: CHECKs ride the scan arm when the
     /// resolve flag is off, and FK elision is cross-table interplay (the ledgered next step).
-    pub(crate) fn table_elision_eligible(
+    pub(crate) fn table_device_authority_eligible(
         &self,
         catalog: &CatalogSnapshot,
         table_name: &str,
@@ -355,8 +291,6 @@ impl Engine {
         let Some(table) = catalog.relational_catalog.get(table_name) else {
             return false;
         };
-        let unique_ok =
-            !table.indexes.iter().any(|index| index.unique) || self.constrained_elision_enabled();
         table.columns.iter().all(|column| {
             // TYPE-COVERAGE track 2 (stages 1 + iii): every FIXED-WIDTH-section type is
             // device-authoritative-capable (A4a/A4c type from the catalog; appends ride the
@@ -395,7 +329,7 @@ impl Engine {
             // indexes keep their existing layout; compound and single wider/text keys use the
             // fingerprint index plus exact typed recheck.
             !index.unique || index_all_key_columns_foldable(table, index)
-        }) && unique_ok
+        })
             // CHECK constraints DO NOT block elision (ADR-006): CHECK validation is ROW-LOCAL —
             // `validate_check_constraints_for_rows` evaluates the NEW values only (host-held
             // control-plane literals / device-materialized update images), never the tuple store; and
@@ -422,11 +356,11 @@ impl Engine {
             // single-column foldable PK/UNIQUE — exactly the shape `device_visible_row_with_value`
             // answers ON THE DEVICE (`locate_resident_pk_via_shard_index_detailed` + the elided
             // materialize), so a child INSERT's parent-exists probe and a parent DELETE's
-            // surviving-provider probe stay device-native (a decline rehydrates — the existing
-            // safety net, never a wrong answer). The unique-index requirement means `unique_ok`
+            // surviving-provider probe stay device-native (a decline fails closed; explicit repair
+            // remains a RETIRE-002 boundary). The unique-index requirement means `unique_ok`
             // above already demanded the constrained-elision device flags for such a table.
-            // A parent DELETE/UPDATE's own inbound-FK validation reads the CHILDREN (non-elided —
-            // outbound FKs still block) via the host, and its own rows are the host-held candidates.
+            // A parent DELETE/UPDATE's own inbound-FK validation reads the CHILDREN through the
+            // device predicate path, and its candidate images are bounded control-plane values.
             && catalog.relational_catalog.values().all(|other| {
                 other.foreign_keys.iter().all(|fk| {
                     fk.referenced_table != table_name
@@ -440,46 +374,46 @@ impl Engine {
             })
     }
 
-    /// RETIREMENT A4e: is `table` device-authoritative (commits skip the host install)?
-    /// `pub` for bench/telemetry (read-only; the A/B arms assert steady-state elided-ness).
-    pub fn table_install_elided(&self, table: &str) -> bool {
+    /// R3-004: is `table` device-authoritative (its live relational image is device-resident)?
+    /// `pub` for benchmark and qualification telemetry.
+    pub fn table_device_authoritative(&self, table: &str) -> bool {
         if let Some(snapshot) = self.current_transaction_read_snapshot() {
-            return snapshot.elided_tables.contains(table);
+            return snapshot.device_authoritative_tables.contains(table);
         }
         self.read_state
             .residency
-            .elided_tables
+            .device_authoritative_tables
             .load()
             .contains(table)
     }
 
-    /// RETIREMENT A4e: commits that skipped the host install (non-vacuity telemetry).
-    pub fn host_install_elisions(&self) -> u64 {
+    /// R3-004: commits that published device-authoritative relational state.
+    pub fn device_authoritative_commits(&self) -> u64 {
         self.read_state
             .residency
-            .host_install_elisions
+            .device_authoritative_commits
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// RETIREMENT A4e: COW-add/remove a table from the elided set (serialized commit path only).
-    /// Testing/probe seam (W5a recovery probe): elision normally engages automatically at the
+    /// R3-004: COW-add/remove a table from the device-authority set (serialized commit path only).
+    /// Testing/probe seam (W5a recovery probe): authority normally engages automatically at the
     /// wave append flush; forcing it marks the table device-authoritative WITHOUT device
     /// backing, so use only in WAL/replay experiments that never read pre-restart state.
     #[doc(hidden)]
-    pub fn set_table_install_elided(&self, table: &str, elided: bool) {
-        let cur = self.read_state.residency.elided_tables.load();
-        if cur.contains(table) == elided {
+    pub fn set_table_device_authoritative(&self, table: &str, authoritative: bool) {
+        let cur = self.read_state.residency.device_authoritative_tables.load();
+        if cur.contains(table) == authoritative {
             return;
         }
         let mut next = (**cur).clone();
-        if elided {
+        if authoritative {
             next.insert(table.to_string());
         } else {
             next.remove(table);
         }
         self.read_state
             .residency
-            .elided_tables
+            .device_authoritative_tables
             .store(std::sync::Arc::new(next));
     }
 

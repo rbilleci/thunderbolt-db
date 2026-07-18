@@ -339,9 +339,10 @@ fn gpu_streaming_reduction_empty_table_pg_semantics() {
         vec![vec![SqlValue::Null]],
         "MAX over empty = NULL"
     );
-    assert!(
-        e.streaming_fold_hits() >= 1,
-        "streaming fold fired for the empty table"
+    assert_eq!(
+        e.streaming_fold_hits(),
+        0,
+        "an empty authoritative generation fits hot and needs no streaming fold"
     );
 }
 

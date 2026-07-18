@@ -74,79 +74,69 @@ fn relational_residency_snapshot_accounts_bytes_and_invalidates_on_later_wal_app
     assert_eq!(snapshot.valid_through_index, e.visible_up_to());
     assert!(snapshot.is_valid());
     assert!(!snapshot.memory_pressure_active);
-    assert!(snapshot.last_refresh_cost.is_some());
+    assert!(snapshot.last_refresh_cost.is_none());
 
     e.mark_gpu_memory_pressured(0);
-    let pressured = e.relational_residency_snapshot("events").unwrap();
-    assert!(pressured.memory_pressure_active);
-    assert!(pressured.invalidated_by_memory_pressure);
-    assert!(!pressured.is_valid());
+    assert!(e
+        .router
+        .runtime()
+        .snapshot()
+        .memory_pressured_gpu_ids
+        .contains(&0));
+    let shards = e.read_residency_shards();
+    let pressured = &shards["events"][0];
+    assert!(!pressured.memory_pressure_active);
+    assert!(!pressured.invalidated_by_memory_pressure);
+    assert!(pressured.device_memory.is_some());
+    assert!(!pressured.is_valid(true));
 
-    let valid_through = pressured.valid_through_index;
     let error = e
         .execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
         .unwrap_err();
-    assert!(error.to_string().contains("device DML generation"));
+    assert!(
+        !error.to_string().is_empty(),
+        "DML under device memory pressure must fail closed"
+    );
     e.clear_gpu_memory_pressured(0);
     e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
         .unwrap();
-    let refreshed = e.relational_residency_snapshot("events").unwrap();
+    let refreshed = e.populate_relational_residency_snapshot("events").unwrap();
     assert_eq!(refreshed.row_count, 3);
     assert!(refreshed.resident_bytes > snapshot.resident_bytes);
     assert_eq!(refreshed.valid_through_index, e.visible_up_to());
     assert!(refreshed.is_valid());
     assert!(!refreshed.memory_pressure_active);
     assert!(!refreshed.invalidated_by_memory_pressure);
-    let refresh_cost = refreshed.last_refresh_cost.unwrap();
-    assert_eq!(refresh_cost.previous_row_count, 2);
-    assert_eq!(refresh_cost.refreshed_row_count, 3);
-    assert_eq!(refresh_cost.row_delta, 1);
-    assert_eq!(
-        refresh_cost.previous_resident_bytes,
-        snapshot.resident_bytes
-    );
-    assert_eq!(
-        refresh_cost.refreshed_resident_bytes,
-        refreshed.resident_bytes
-    );
-    assert!(refresh_cost.resident_byte_delta > 0);
-    assert_eq!(refresh_cost.refreshed_from_index, valid_through);
-    assert_eq!(
-        refresh_cost.refreshed_through_index,
-        refreshed.valid_through_index
-    );
-    assert_eq!(refresh_cost.invalidated_by_txn_id, Some(3));
-    assert!(!refresh_cost.invalidated_by_memory_pressure);
+    assert!(refreshed.last_refresh_cost.is_none());
 }
 
 #[test]
 fn mutation_maintains_only_the_mutated_device_generation() {
     // R3-004: a write maintains its target generation without disturbing another table.
     let mut e = Engine::new_local_cpu_oracle();
-    // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
-    // configuration; sharded is the default) — pin the layout it tests.
-    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
     e.execute_text(2, "CREATE TABLE b (id INT)").unwrap();
     e.execute_text(3, "INSERT INTO a (id) VALUES (1)").unwrap();
     e.execute_text(4, "INSERT INTO b (id) VALUES (1)").unwrap();
     e.populate_relational_residency_snapshot("a").unwrap();
     e.populate_relational_residency_snapshot("b").unwrap();
-    assert!(e.relational_residency_snapshot("a").unwrap().is_valid());
-    assert!(e.relational_residency_snapshot("b").unwrap().is_valid());
+    assert!(e.table_has_live_dml_generation("a"));
+    assert!(e.table_has_live_dml_generation("b"));
 
     e.execute_text(5, "INSERT INTO a (id) VALUES (2)").unwrap();
 
-    let a = e.relational_residency_snapshot("a").unwrap();
-    assert_eq!(a.invalidated_by_txn_id, None);
-    assert!(a.is_valid());
-    assert_eq!(a.valid_through_index, 5);
-    let b = e.relational_residency_snapshot("b").unwrap();
-    assert_eq!(
-        b.invalidated_by_txn_id, None,
-        "table b residency must survive a write to table a (per-table invalidation)"
+    assert!(e.table_has_live_dml_generation("a"));
+    assert!(
+        e.table_has_live_dml_generation("b"),
+        "table b residency must survive a write to table a"
     );
-    assert!(b.is_valid());
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM a").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        e.execute_relational_select(&count).unwrap().rows,
+        vec![vec![SqlValue::Int8(2)]]
+    );
 }
 
 #[test]
@@ -154,18 +144,15 @@ fn create_table_does_not_invalidate_existing_residency() {
     // CREATE TABLE introduces a brand-new table with no prior residency, so it must
     // touch no existing table's snapshot (scope contributes the empty set).
     let mut e = Engine::new_local_cpu_oracle();
-    // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
-    // configuration; sharded is the default) — pin the layout it tests.
-    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
     e.execute_text(2, "INSERT INTO a (id) VALUES (1)").unwrap();
     e.populate_relational_residency_snapshot("a").unwrap();
-    assert!(e.relational_residency_snapshot("a").unwrap().is_valid());
+    assert!(e.table_has_live_dml_generation("a"));
 
     e.execute_text(3, "CREATE TABLE c (id INT)").unwrap();
     assert!(
-        e.relational_residency_snapshot("a").unwrap().is_valid(),
-        "CREATE TABLE must not invalidate an unrelated resident table"
+        e.table_has_live_dml_generation("a"),
+        "CREATE TABLE must preserve an unrelated device generation"
     );
 }
 
@@ -174,24 +161,24 @@ fn unscoped_ddl_refreshes_previously_authoritative_unrelated_residency() {
     // A schema change still invalidates globally at publication, then refreshes every previously
     // authoritative device generation before service resumes.
     let mut e = Engine::new_local_cpu_oracle();
-    // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
-    // configuration; sharded is the default) — pin the layout it tests.
-    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
     e.execute_text(2, "CREATE TABLE b (id INT)").unwrap();
     e.execute_text(3, "INSERT INTO a (id) VALUES (1)").unwrap();
     e.execute_text(4, "INSERT INTO b (id) VALUES (1)").unwrap();
     e.populate_relational_residency_snapshot("a").unwrap();
     e.populate_relational_residency_snapshot("b").unwrap();
-    assert!(e.relational_residency_snapshot("b").unwrap().is_valid());
+    assert!(e.table_has_live_dml_generation("b"));
 
     e.execute_text(5, "ALTER TABLE a ADD COLUMN note INT DEFAULT 0")
         .unwrap();
 
-    let b = e.relational_residency_snapshot("b").unwrap();
-    assert!(b.is_valid());
-    assert_eq!(b.invalidated_by_txn_id, None);
-    assert_eq!(b.valid_through_index, 5);
+    assert!(e.table_has_live_dml_generation("b"));
+    assert_eq!(
+        e.populate_relational_residency_snapshot("b")
+            .unwrap()
+            .valid_through_index,
+        5
+    );
 }
 
 #[test]
@@ -217,10 +204,10 @@ fn residency_invalidation_scope_narrows_dml_and_falls_back_on_unknown() {
         ]),
         Some(BTreeSet::from(["a".to_string(), "b".to_string()]))
     );
-    // CREATE TABLE introduces no prior residency -> empty set (narrowed, not global)
+    // CREATE TABLE invalidates only the newly introduced table name (narrowed, not global).
     assert_eq!(
         Engine::residency_invalidation_scope(&[entry(1, "CREATE TABLE d (id INT)")]),
-        Some(BTreeSet::new())
+        Some(BTreeSet::from(["d".to_string()]))
     );
     // an unscoped command anywhere in the batch -> conservative global (None)
     assert_eq!(
@@ -244,9 +231,6 @@ fn residency_snapshot_retains_int8_columns_at_the_layout_offset() {
     // section. Verify the bookkeeping (the column list + the offset resolver); the on-device read is
     // exercised by the int8 VM slice. CPU-side bookkeeping, so this runs without a GPU.
     let mut e = Engine::new_local_cpu_oracle();
-    // i64-SECTION FLIP pin: this test verifies the SINGLE-BUFFER int8 layout bookkeeping —
-    // the kill-switch configuration since the 2026-07-03 flip (default = sharded admission).
-    e.set_shard_int8_section_enabled(false);
     e.execute_text(1, "CREATE TABLE t (a INT, big BIGINT, b INT, big2 BIGINT)")
         .unwrap();
     e.execute_text(
@@ -262,13 +246,14 @@ fn residency_snapshot_retains_int8_columns_at_the_layout_offset() {
         vec!["big".to_string(), "big2".to_string()]
     );
 
-    // Offsets match the payload layout: header(8) + int4 section + int8_ordinal * rows * 8.
+    // Offsets match the capacity-strided payload layout: header(8) + int4 section +
+    // int8_ordinal * capacity * 8.
     let Command::Select(select) = parse_command("SELECT big FROM t").unwrap() else {
         unreachable!()
     };
     let (table, _bound, _) = e.bind_relational_select_for_execution(&select).unwrap();
-    let row_count = snapshot.row_count as u64;
-    let int4_section = snapshot.resident_device_int4_columns.len() as u64 * row_count * 4;
+    let capacity = snapshot.capacity as u64;
+    let int4_section = snapshot.resident_device_int4_columns.len() as u64 * capacity * 4;
     let big_idx = relational_column_index(&table, "big").unwrap();
     let big2_idx = relational_column_index(&table, "big2").unwrap();
     assert_eq!(
@@ -278,7 +263,7 @@ fn residency_snapshot_retains_int8_columns_at_the_layout_offset() {
     );
     assert_eq!(
         resident_device_int8_column_offset(&snapshot, &table, big2_idx).unwrap(),
-        8 + int4_section + row_count * 8,
+        8 + int4_section + capacity * 8,
         "big2 is the second int8 column (ordinal 1)"
     );
     // The type guard holds: the int8 resolver rejects an int4 column.

@@ -583,6 +583,17 @@ impl Engine {
         }
         let limit = parse_limit(&stmt.limit_count)?;
         let offset = parse_limit(&stmt.limit_offset)?;
+        // A resident input that nearly fills the configured budget leaves no room for the rank
+        // mask/coordinate/sort/window allocations. Move it through the bounded STRATA repair
+        // bridge before choosing the route so input plus scratch—not input alone—defines fit.
+        if let Some(budget) = self.relational_residency_budget_bytes(self.planner.default_gpu_id())
+        {
+            self.transition_device_table_to_streaming_repair_above(
+                &table_name,
+                (budget / 2).max(1),
+            )
+            .map_err(ExecuteError::Engine)?;
+        }
         if self.table_is_gpu_resident(&table_name) {
             return self.execute_gpu_rank_window_device_resident(
                 &table_name,

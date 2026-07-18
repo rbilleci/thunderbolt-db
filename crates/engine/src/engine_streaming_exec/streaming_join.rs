@@ -318,7 +318,7 @@ impl Engine {
             || plan
                 .relations
                 .iter()
-                .any(|r| self.table_install_elided(&r.table))
+                .any(|r| self.table_device_authoritative(&r.table))
         {
             return None;
         }
@@ -814,7 +814,7 @@ impl Engine {
             || plan
                 .relations
                 .iter()
-                .any(|r| self.table_install_elided(&r.table))
+                .any(|r| self.table_device_authoritative(&r.table))
         {
             return None;
         }

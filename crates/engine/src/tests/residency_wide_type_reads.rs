@@ -10,8 +10,6 @@ fn text_column_elides_appends_and_reads_multishard() {
     let run = |device: bool| -> (bool, usize, Vec<Vec<SqlValue>>) {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(device);
-        e.set_host_install_elision_enabled(device);
-        e.set_constrained_elision_enabled(device);
         e.set_device_write_locate_wave_batch_enabled(device);
         e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the text gather
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
@@ -35,7 +33,7 @@ fn text_column_elides_appends_and_reads_multishard() {
             )
             .unwrap();
         }
-        let elided = e.table_install_elided("t");
+        let elided = e.table_device_authoritative("t");
         let shard_count = e.resident_shard_count("t");
         let mut rows = e
             .execute_relational_select_text("SELECT id, s FROM t")
@@ -98,8 +96,6 @@ fn numeric_column_elides_appends_and_reads_multishard() {
     let run = |device: bool| -> (bool, usize, Vec<Vec<SqlValue>>) {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(device);
-        e.set_host_install_elision_enabled(device);
-        e.set_constrained_elision_enabled(device);
         e.set_device_write_locate_wave_batch_enabled(device);
         e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the gather
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, amt NUMERIC(20,4))")
@@ -115,7 +111,7 @@ fn numeric_column_elides_appends_and_reads_multishard() {
             )
             .unwrap();
         }
-        let elided = e.table_install_elided("t");
+        let elided = e.table_device_authoritative("t");
         let shard_count = e.resident_shard_count("t");
         let mut rows = e
             .execute_relational_select_text("SELECT id, amt FROM t")
@@ -166,8 +162,6 @@ fn bool_column_elides_appends_and_reads_multishard() {
     let run = |device: bool| -> (bool, usize, Vec<Vec<SqlValue>>) {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(device);
-        e.set_host_install_elision_enabled(device);
-        e.set_constrained_elision_enabled(device);
         e.set_device_write_locate_wave_batch_enabled(device);
         e.set_shard_size_target(64); // force MULTIPLE shards (rollover) -> exercise the bitmap gather
         e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, flag BOOLEAN)")
@@ -184,7 +178,7 @@ fn bool_column_elides_appends_and_reads_multishard() {
             )
             .unwrap();
         }
-        let elided = e.table_install_elided("t");
+        let elided = e.table_device_authoritative("t");
         let shard_count = e.resident_shard_count("t");
         let mut rows = e
             .execute_relational_select_text("SELECT id, flag FROM t")
@@ -286,8 +280,6 @@ fn b128_and_bigint_filtered_rehydration_reads_from_device() {
         let run = |device: bool| -> (bool, Vec<Vec<SqlValue>>) {
             let e = Engine::new_local();
             e.set_auto_admit_on_commit(device);
-            e.set_host_install_elision_enabled(device);
-            e.set_constrained_elision_enabled(device);
             e.set_device_write_locate_wave_batch_enabled(device);
             e.set_shard_size_target(64); // multi-shard -> the gather spans shards
             e.execute_text(1, &format!("CREATE TABLE t (id INT PRIMARY KEY, val {ty})"))
@@ -302,7 +294,7 @@ fn b128_and_bigint_filtered_rehydration_reads_from_device() {
                 )
                 .unwrap();
             }
-            let elided = e.table_install_elided("t");
+            let elided = e.table_device_authoritative("t");
             // A FILTERED projection of the value column is NOT a served on-device shape -> CPU-pinned
             // path -> (elided) rehydrate device->host FIRST. id=3 lands in shard 0.
             let rows = e
@@ -344,8 +336,6 @@ fn b128_and_bigint_filtered_rehydration_reads_from_device() {
 fn grouped_ordered_distinct_over_versioned_elided_hides_tombstones() {
     let e = Engine::new_local();
     e.set_auto_admit_on_commit(true);
-    e.set_host_install_elision_enabled(true);
-    e.set_constrained_elision_enabled(true);
     e.set_device_write_locate_wave_batch_enabled(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, g INT)")
@@ -363,7 +353,7 @@ fn grouped_ordered_distinct_over_versioned_elided_hides_tombstones() {
         .unwrap();
         seq += 1;
     }
-    if !e.table_install_elided("t") {
+    if !e.table_device_authoritative("t") {
         return;
     }
     // Fully tombstone GROUP 0 (ids 0..39) -> versioned shards; g=0 has NO visible rows.
@@ -429,7 +419,7 @@ fn grouped_ordered_distinct_over_versioned_elided_hides_tombstones() {
         "first ordered id is 40 — ids 0..39 are hidden, not leaked"
     );
     assert!(
-        e.table_install_elided("t"),
+        e.table_device_authoritative("t"),
         "grouped/distinct/ordered reads over a versioned table stay elided (routed on-device)"
     );
 }

@@ -505,6 +505,8 @@ impl Engine {
         // (which would need in-place bitmap maintenance). A fixed-width null-FREE batch keeps growth headroom.
         let new_capacity = if has_text || batch_has_null {
             k
+        } else if self.relational_residency_budget_bytes(gpu_id).is_some() {
+            k.saturating_mul(2).next_power_of_two()
         } else {
             self.shard_size_target()
                 .max(k.saturating_mul(2).next_power_of_two())
@@ -724,8 +726,9 @@ impl Engine {
     /// the `deleted_by` metadata word, NEVER the row's column bytes — so a lock-free, predicate-free reader
     /// can never observe a torn row (review Finding 3), and the change is a single aligned u64 store.
     ///
-    /// Returns `false` (caller must fall back to invalidate + re-admit) if the shard is missing / any slot is
-    /// out of `[0, row_count)` / the region allocation or device write fails. `slots` are LOCAL indices.
+    /// Returns `false` if the shard is missing, any slot is out of `[0, row_count)`, or the region
+    /// allocation/device write fails. A normal durable DML caller fails stop; it never treats false
+    /// as permission to use a host representation. `slots` are local indices.
     ///
     /// WIRED into the DELETE commit path by SV4b (slot-finding via the pruned-shard predicate).
     /// **SV4 PREREQUISITES (audit-flagged):**
@@ -742,8 +745,8 @@ impl Engine {
     ///         Gates (all sabotage-verified non-vacuous): `shard_deleted_by_region_released_on_invalidate_and_drop`
     ///         (invalidate + DROP), `shard_deleted_by_region_released_on_warmup_readmit` (sharded re-admit with no
     ///         preceding invalidate), and `resident_cache_remove_table_releases_deleted_by_region` (the eviction-
-    ///         cleanup method contract, currently defensive). This keeps a re-admit (rebuilt all-live from the host
-    ///         store) from inheriting a stale tombstone region and stops evicted/dropped tables leaking regions.
+    ///         cleanup method contract, currently defensive). This prevents a fresh explicit-repair
+    ///         generation from inheriting a stale tombstone region and stops leaks.
     ///  2. **Concurrency:** hold the COMMIT LOCK across the get-or-allocate below, else two concurrent
     ///     first-deletes to the same shard both allocate + the losing region's `Arc` leaks (writes still land
     ///     safely; only the buffer leaks). SV4 runs this under the serialized commit lock, which is the fix.

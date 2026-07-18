@@ -46,9 +46,9 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
             ref other => panic!("count: {other:?}"),
         }
     };
-    // Build the cold entry, then the ENTER commit (the eager patch makes the entry fresh at it).
+    // A complete cold capture enters chunk authority immediately.
     assert_eq!(count(&e), i64::from(N));
-    assert_eq!(e.chunk_class_entries(), 0);
+    assert_eq!(e.chunk_class_entries(), 1);
     seq += 1;
     e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')")
         .unwrap();
@@ -61,15 +61,11 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
     assert_eq!(
         e.chunk_class_entries(),
         1,
-        "the table must ENTER the class at this commit"
+        "the table remains in the class after its first tail append"
     );
 
     // RECLAIMED (P4): class entry DELETED the host chains — the store-deletion payoff; the
     // chunks are the representation. The count below is 0 and stays 0 through every class write.
-    assert!(
-        e.chunk_class_reclaimed_rows() > 0,
-        "entry must reclaim the host rows"
-    );
     let frozen_versions = e
         .read_state
         .mvcc
@@ -78,6 +74,7 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
         .all_versions()
         .len();
     assert_eq!(frozen_versions, 0, "the class table's host chains are GONE");
+    let class_commits_before = e.chunk_class_device_commits();
     for k in 0..5 {
         seq += 1;
         e.execute_text(
@@ -99,9 +96,9 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
         .unwrap();
     }
     assert_eq!(
-        e.chunk_class_skipped_installs(),
+        e.chunk_class_device_commits() - class_commits_before,
         5,
-        "five commits skipped the host install"
+        "five commits published directly through chunk authority"
     );
     assert_eq!(
         e.read_state
@@ -290,22 +287,24 @@ fn gpu_chunk_class_dml_stamps_without_deauth() {
     );
 
     // The class survives further INSERTs after DML.
-    let skipped_before = e.chunk_class_skipped_installs();
+    let skipped_before = e.chunk_class_device_commits();
     seq += 1;
     e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (500000, 'post')")
         .unwrap();
     assert!(
-        e.chunk_class_skipped_installs() > skipped_before,
+        e.chunk_class_device_commits() > skipped_before,
         "still classed"
     );
     assert_eq!(sum_a(&e), expected_sum - 1000 - 7 + 500000);
 
-    // The H2 DDL SWEEP exit: any non-DML statement de-authoritizes every class table BEFORE its
-    // preflight reads the store — the replayed store must be MVCC-whole (tails inserted at their
-    // born boundaries, every post-freeze stamp applied as a tombstone).
+    // The H2 repair-DDL exit: a representation-changing statement de-authoritizes every class
+    // table BEFORE its preflight reads the store — the replayed store must be MVCC-whole (tails
+    // inserted at their born boundaries, every post-freeze stamp applied as a tombstone).
+    e.clear_relational_residency_budget_bytes(0);
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE zzz (x INT)").unwrap();
-    assert_eq!(e.chunk_class_deauths(), 1, "the DDL sweep exits the class");
+    e.execute_text(seq, "ALTER TABLE facts ADD COLUMN z INT DEFAULT 0")
+        .unwrap();
+    assert_eq!(e.chunk_class_deauths(), 1, "the repair DDL exits the class");
     assert_eq!(
         count(&e),
         i64::from(N) - 4,
@@ -371,8 +370,8 @@ fn gpu_chunk_class_born_gate_serves_old_boundaries() {
         .unwrap();
     assert_eq!(
         at_freeze.len(),
-        (N + 1) as usize,
-        "the freeze boundary sees base + enter only"
+        N as usize,
+        "the freeze boundary sees the base snapshot only"
     );
     assert!(
         at_freeze.iter().any(|r| r[0] == SqlValue::Int4(5)),
@@ -485,6 +484,7 @@ fn gpu_chunk_class_compaction_deletes_dead_slots() {
     seq += 1;
     e.execute_text(seq, "DELETE FROM facts WHERE a < 200")
         .unwrap();
+    e.maybe_compact_chunk_class("facts");
     assert_eq!(e.chunk_class_deauths(), 0, "stays classed");
     assert!(
         e.chunk_class_compactions() >= 1,
@@ -530,12 +530,100 @@ fn gpu_chunk_class_compaction_deletes_dead_slots() {
         .unwrap();
     assert_eq!(e.chunk_class_deauths(), 0);
     assert_eq!(sum_a(&e), expected_sum - 500);
+    e.clear_relational_residency_budget_bytes(0);
     seq += 1;
-    e.execute_text(seq, "CREATE TABLE zzz2 (x INT)").unwrap(); // the DDL-sweep exit
+    e.execute_text(seq, "ALTER TABLE facts ADD COLUMN z INT DEFAULT 0")
+        .unwrap(); // the repair-DDL exit
     assert_eq!(e.chunk_class_deauths(), 1);
     assert_eq!(
         sum_a(&e),
         expected_sum - 500,
         "the de-authed store is value-exact"
+    );
+}
+
+/// R3-004: COPY and a multi-entry group commit append directly to the chunk-authoritative
+/// generation. Neither path may reverse-gather/deauthorize to make the host tuple store current.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_chunk_class_copy_and_multi_entry_batch_stay_device_authoritative() {
+    let mut e = Engine::new_local_cpu_oracle();
+    let mut seq = 0u64;
+    if !gpu_available(&mut e, &mut seq) {
+        return;
+    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE copy_batch (id INT, v INT)")
+        .unwrap();
+    let values = (0..900)
+        .map(|id| format!("({id}, {})", id * 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    seq += 1;
+    e.execute_text(
+        seq,
+        &format!("INSERT INTO copy_batch (id, v) VALUES {values}"),
+    )
+    .unwrap();
+    e.set_relational_residency_budget_bytes(0, 8192);
+    e.transition_device_table_to_streaming_repair_above("copy_batch", 1)
+        .unwrap();
+    let _ = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM copy_batch"))
+        .unwrap();
+    assert!(e.table_chunk_authoritative("copy_batch").is_some());
+
+    let copy = gpu_db_sql::CopyFromStdin {
+        table: "copy_batch".to_string(),
+        columns: Some(vec!["id".to_string(), "v".to_string()]),
+        options: gpu_db_sql::CopyOptions::TEXT,
+    };
+    e.execute_relational_copy_rows(
+        10_000,
+        &copy,
+        vec![
+            vec![SqlValue::Int4(100_000), SqlValue::Int4(1)],
+            vec![SqlValue::Int4(100_001), SqlValue::Int4(2)],
+        ],
+    )
+    .unwrap();
+    assert!(
+        e.table_chunk_authoritative("copy_batch").is_some(),
+        "COPY must preserve chunk authority"
+    );
+
+    let payload = |sql: &str| -> std::sync::Arc<[u8]> { std::sync::Arc::from(sql.as_bytes()) };
+    e.commit_mutation_batch(&[
+        (10_001, payload("INSERT INTO copy_batch VALUES (100002, 3)")),
+        (10_002, payload("INSERT INTO copy_batch VALUES (100003, 4)")),
+        (10_003, payload("INSERT INTO copy_batch VALUES (100004, 5)")),
+    ])
+    .map_err(|failure| failure.error)
+    .expect("multi-entry group commit");
+    assert!(
+        e.table_chunk_authoritative("copy_batch").is_some(),
+        "multi-entry DML must preserve chunk authority"
+    );
+    assert_eq!(e.chunk_class_deauths(), 0);
+
+    let count = e
+        .execute_relational_select(&select("SELECT COUNT(*) FROM copy_batch"))
+        .unwrap();
+    assert_eq!(
+        count
+            .rows
+            .iter()
+            .map(|row| row.to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![SqlValue::Int8(905)]]
+    );
+    let sum = e
+        .execute_relational_select(&select("SELECT SUM(v) FROM copy_batch"))
+        .unwrap();
+    assert_eq!(
+        sum.rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>(),
+        vec![vec![SqlValue::Int8(
+            (0..900i64).map(|id| id * 10).sum::<i64>() + 15
+        )]]
     );
 }

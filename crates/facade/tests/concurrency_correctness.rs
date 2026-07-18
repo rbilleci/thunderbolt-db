@@ -499,6 +499,11 @@ fn insert_child_with_concurrently_deleted_fk_parent_aborts_retryable_not_wedged(
                         // it), then delete + commit the parent.
                         child_prepared.wait();
                         let outcome = run_write(&shared, "DELETE FROM parent WHERE id = 1");
+                        assert_eq!(
+                            scalar_i64(&shared, "SELECT COUNT(*) FROM parent"),
+                            0,
+                            "the parent delete must be device-visible before the child resumes"
+                        );
                         // Signal the child that the parent is now gone, regardless of the delete's
                         // outcome, so the child never strands waiting (no panicable skip of the
                         // rendezvous).

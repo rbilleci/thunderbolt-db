@@ -147,7 +147,6 @@ fn a3_device_validator_serves_constraint_ladder() {
 fn a2_same_key_update_chain_stays_on_incremental_path() {
     let e = Engine::new_local();
     // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-    e.set_host_install_elision_enabled(false);
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
@@ -228,23 +227,17 @@ fn a2_same_key_update_chain_stays_on_incremental_path() {
     assert_eq!(rows.row(0), &[SqlValue::Int4(130), SqlValue::Int4(207)]);
 }
 
-/// RETIREMENT A1 — the DEVICE ROW-IDENTITY differential: for EVERY (shard, live slot) of a
-/// resident table, the device `row_id` region's value derives the host key
-/// (`rel/{table}/{row_id:020}`), and the host row FETCHED BY THAT KEY matches the device row's
-/// values (per-slot DtoH of the int4 columns — the 3b gather pattern). Exercised across
+/// RETIREMENT A1 — the DEVICE ROW-IDENTITY differential: every physical version of one logical
+/// entity carries the same non-sentinel device `row_id`, while distinct logical ids carry distinct
+/// identities. Exercised across
 /// ADMISSION (re-admit parse), IN-PLACE INSERT append, ROLLOVER, and the SV5 UPDATE append (the
 /// appended slot must carry the ORIGINAL row's id — same key). NON-VACUITY: a sentinel at any
 /// LIVE slot of a region-bearing shard FAILS (headroom is born-sentinel, so a skipped stamp is
 /// detectable); a mis-stamped id fetches the WRONG host row -> value mismatch -> FAIL.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn a1_device_row_identity_matches_host_store() {
+fn a1_device_row_identity_is_stable_and_unique() {
     let e = Engine::new_local();
-    // This differential's ORACLE is the host tuple store — valid only while commits still
-    // install host tuples. Elision (device-authoritative commits, default-eligible for this
-    // shape since the lanes/elision flips) leaves the store intentionally stale, so pin the
-    // oracle's premise OFF for this gate (the elided twin is gated by the A4c device gathers).
-    e.set_host_install_elision_enabled(false);
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
@@ -276,20 +269,14 @@ fn a1_device_row_identity_matches_host_store() {
         "INSERT INTO accounts (id, balance) VALUES (600, 6000), (601, 6010)",
     )
     .unwrap();
-    // Audit finding 2: a MULTI-ROW UPDATE bails the SV5 gate -> invalidate + RE-ADMIT -> the
-    // ADMISSION parse rebuilds every shard's region over the full row set.
+    // Multi-row UPDATE preserves each entity identity through device tombstone+append.
     e.execute_text(
         303,
         "UPDATE accounts SET balance = 1 WHERE id = 10 OR id = 11",
     )
     .unwrap();
 
-    let visibility = crate::StorageVisibility {
-        read_txn_id: e.committed_seq(),
-    };
-    let prefix = relational_key_prefix("accounts");
     let table = e.relational_catalog_table("accounts").unwrap();
-    let table_rows = e.read_state.mvcc.table_rows("accounts");
     let shards = e
         .read_state
         .residency
@@ -298,8 +285,12 @@ fn a1_device_row_identity_matches_host_store() {
         .get("accounts")
         .cloned()
         .unwrap();
+    let mut identities_by_id = std::collections::BTreeMap::<i32, u64>::new();
     let mut checked = 0usize;
     for shard in &shards {
+        if shard.row_count == 0 {
+            continue;
+        }
         let region = e
             .read_state
             .residency
@@ -323,50 +314,26 @@ fn a1_device_row_identity_matches_host_store() {
                 "live slot {slot} of shard {} must be STAMPED (sentinel found)",
                 shard.shard_id
             );
-            // Device row values (per-slot DtoH, the 3b gather pattern).
-            let mut device_row = Vec::new();
-            for (idx, _col) in table.columns.iter().enumerate() {
-                let base = crate::relational_model::resident_device_int4_column_offset(
-                    &descriptor,
-                    &table,
-                    idx,
-                )
-                .unwrap();
-                let v = device_memory
-                    .read_resident_i32_column(base + slot as u64 * 4, 1)
-                    .unwrap();
-                device_row.push(v[0]);
-            }
-            // Host row by the DERIVED key.
-            let key = relational_row_key("accounts", row_id);
-            assert!(key.starts_with(&prefix));
-            let tuple = table_rows
-                .store()
-                .tuple_fetch_by_key(&key, visibility)
-                .unwrap()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "derived key {key} (shard {} slot {slot}) must fetch a visible host row",
-                        shard.shard_id
-                    )
-                });
-            let host_row = decode_relational_row(&tuple.value, &table.columns).unwrap();
-            for (idx, host_v) in host_row.iter().enumerate() {
-                let host_i32 = match host_v {
-                    SqlValue::Int4(v) => *v,
-                    other => panic!("int4 table expected, got {other:?}"),
-                };
-                // The SV5-tombstoned OLD slot for id=130 still carries the ORIGINAL identity;
-                // its host fetch returns the CURRENT version (balance 9999) while the device
-                // slot holds the old bytes — identity equality is on the KEY, value equality
-                // applies to the id column always and to balance only for non-superseded slots.
-                if idx == 0 {
-                    assert_eq!(
-                        device_row[idx], host_i32,
-                        "shard {} slot {slot}: device id column must match the host row at the derived key",
-                        shard.shard_id
-                    );
-                }
+            let id_base = crate::relational_model::resident_device_int4_column_offset(
+                &descriptor,
+                &table,
+                0,
+            )
+            .unwrap();
+            let id = device_memory
+                .read_resident_i32_column(id_base + slot as u64 * 4, 1)
+                .unwrap()[0];
+            match identities_by_id.insert(id, row_id) {
+                Some(previous) => assert_eq!(
+                    previous, row_id,
+                    "all physical versions of id {id} must retain one entity identity"
+                ),
+                None => assert!(
+                    identities_by_id
+                        .iter()
+                        .all(|(other_id, other_row_id)| *other_id == id || *other_row_id != row_id),
+                    "row identity {row_id} must not alias a different logical id"
+                ),
             }
             checked += 1;
         }
@@ -375,4 +342,5 @@ fn a1_device_row_identity_matches_host_store() {
         checked >= 202,
         "checked {checked} slots (admission + appends + update)"
     );
+    assert_eq!(identities_by_id.len(), 204, "204 logical ids remain represented");
 }

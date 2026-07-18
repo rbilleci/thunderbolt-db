@@ -223,6 +223,7 @@ fn gpu_streaming_grouped_compaction_and_over_cardinality_defer() {
     assert!(hits_after_compaction >= 1, "compacted grouped fold fired");
 
     // (2) Over-cardinality: an all-unique key can never compact under the budget -> honest defer.
+    e.clear_relational_residency_budget_bytes(0);
     seq += 1;
     e.execute_text(seq, "CREATE TABLE uniq (g INT)").unwrap();
     let mut values = String::new();
@@ -235,6 +236,7 @@ fn gpu_streaming_grouped_compaction_and_over_cardinality_defer() {
     seq += 1;
     e.execute_text(seq, &format!("INSERT INTO uniq (g) VALUES {values}"))
         .unwrap();
+    e.set_relational_residency_budget_bytes(0, budget);
     let deferred = e
         .execute_relational_select(&select("SELECT g, COUNT(*) FROM uniq GROUP BY g"))
         .unwrap();
@@ -302,6 +304,7 @@ fn gpu_streaming_grouped_bigint_sum_repro() {
             .unwrap();
 
         // Phase 2: grouped SUM(bigint) over a streamed table -> numeric partials in the merge.
+        e.clear_relational_residency_budget_bytes(0);
         seq += 1;
         e.execute_text(seq, "CREATE TABLE gb (g INT, v BIGINT)")
             .unwrap();
@@ -315,6 +318,7 @@ fn gpu_streaming_grouped_bigint_sum_repro() {
         seq += 1;
         e.execute_text(seq, &format!("INSERT INTO gb (g, v) VALUES {values}"))
             .unwrap();
+        e.set_relational_residency_budget_bytes(0, 4096);
         let result = e
             .execute_relational_select(&select("SELECT g, SUM(v) FROM gb GROUP BY g"))
             .unwrap();

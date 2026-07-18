@@ -1,12 +1,8 @@
-/// SLICE B (audit P2 regression gate): a MIXED-TYPE shard-resident table (text column) keeps the CPU
-/// pinned path for sortable projections — the sortable gate's shard arm requires a PURELY
-/// int4-section table because the unified exec source gathers only int4 sections; routing a text
-/// reference to the no-fallback general path hard-errored where rows were previously returned. Both
-/// the ORDER BY shape (the regressed one) and the plain projection must return rows == the
-/// single-buffer oracle.
+/// SLICE B: a mixed-type shard-resident table (text column) serves sortable projections on the
+/// GPU and remains byte-identical to the explicitly repaired single-buffer read layout.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn sharded_mixed_type_sortable_projection_keeps_cpu_path() {
+fn sharded_mixed_type_sortable_projection_stays_gpu_native() {
     let load = |e: &Engine| {
         e.set_auto_admit_on_commit(true);
         e.execute_text(1, "CREATE TABLE mt (id INT, name TEXT)")
@@ -17,18 +13,16 @@ fn sharded_mixed_type_sortable_projection_keeps_cpu_path() {
         )
         .unwrap();
     };
-    let o = Engine::new_local(); // single-buffer oracle
+    let mut o = Engine::new_local(); // explicit single-buffer read-layout oracle
     load(&o);
+    install_test_single_buffer_residency(&mut o, "mt");
     let e = Engine::new_local();
     e.set_shard_residency_enabled(true);
     load(&e);
-    // THE FLIP: sharded admission is scoped to PURELY-int4-section tables, so a mixed-type table
-    // admits SINGLE-BUFFER by design (keeping its proven GPU text paths). The sortable-gate guard
-    // (`shard_resident_int4_only`) remains as defense for explicitly-installed mixed shards.
     assert!(
-        e.read_state.residency.snapshots.load().get("mt").is_some()
-            && e.read_state.residency.shards.load().get("mt").is_none(),
-        "precondition: a mixed-type table admits SINGLE-BUFFER under the flip"
+        e.read_state.residency.snapshots.load().get("mt").is_none()
+            && e.read_state.residency.shards.load().get("mt").is_some(),
+        "precondition: a mixed-type table is shard-authoritative"
     );
     for sql in [
         "SELECT id, name FROM mt ORDER BY id",
@@ -61,7 +55,6 @@ fn sharded_predicate_null_3vl_on_versioned_shard() {
     let e = Engine::new_local();
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.set_resident_delete_tombstone_enabled(true);
     e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)")
         .unwrap();
     e.execute_text(
@@ -525,7 +518,6 @@ fn sharded_point_batch_deleted_by_gate() {
     let t = Engine::new_local();
     t.set_shard_residency_enabled(true);
     t.set_auto_admit_on_commit(true);
-    t.set_resident_delete_tombstone_enabled(true); // stamp deleted_by in place -> versioned shard
     t.set_shard_index_probe_enabled(true);
     t.set_shard_size_target(64);
     t.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")

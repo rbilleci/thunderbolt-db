@@ -113,10 +113,8 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
 
     // GPU gate: this suite runs on driverless boxes too — skip without device
     // memory (the elision warm-up below can never succeed there).
@@ -143,7 +141,7 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
                 &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
             )
             .unwrap();
-        if engine.table_install_elided("t") {
+        if engine.table_device_authoritative("t") {
             warmed = true;
             break;
         }
@@ -287,10 +285,8 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
         // elision re-entry admits the recovered table with real device backing), and commit
         // fresh intents through the reopened lane set.
         recovered.set_auto_admit_on_commit(true);
-        recovered.set_host_install_elision_enabled(true);
         recovered.set_binary_wal_records_enabled(true);
         recovered.set_device_write_locate_wave_batch_enabled(true);
-        recovered.set_constrained_elision_enabled(true);
         let route = recovered
             .prepare_covered_insert_route("t")
             .expect("route re-prepares after reopen (elision re-entry)");
@@ -380,10 +376,8 @@ fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<Covered
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
     engine
         .execute_dml_concurrent(
             txn_ids.fetch_add(1, Ordering::Relaxed),
@@ -401,7 +395,7 @@ fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<Covered
                 &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
             )
             .unwrap();
-        if engine.table_install_elided("t") {
+        if engine.table_device_authoritative("t") {
             return Some(engine.prepare_covered_insert_route("t").unwrap());
         }
     }
@@ -1052,10 +1046,8 @@ fn gpu_synchronous_commit_off_remains_durable_and_recovers() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
 
     let txn_ids = AtomicU64::new(2);
     engine
@@ -1078,7 +1070,7 @@ fn gpu_synchronous_commit_off_remains_durable_and_recovers() {
                 &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
             )
             .unwrap();
-        if engine.table_install_elided("t") {
+        if engine.table_device_authoritative("t") {
             warmed = true;
             break;
         }
@@ -1204,10 +1196,8 @@ fn gpu_lane_delete_intents_end_to_end() {
         .execute_text(2, "CREATE TABLE t2 (a INT PRIMARY KEY, b INT UNIQUE)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
 
     let txn_ids = AtomicU64::new(10);
     engine
@@ -1230,7 +1220,7 @@ fn gpu_lane_delete_intents_end_to_end() {
                 &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
             )
             .unwrap();
-        if engine.table_install_elided("t") {
+        if engine.table_device_authoritative("t") {
             warmed = true;
             break;
         }
@@ -1275,7 +1265,7 @@ fn gpu_lane_delete_intents_end_to_end() {
         "deleting a visible row affects exactly one row"
     );
     assert!(
-        engine.table_install_elided("t"),
+        engine.table_device_authoritative("t"),
         "an in-place lane tombstone must not de-elide the table (fallback fired?)"
     );
     assert_eq!(
@@ -1289,7 +1279,7 @@ fn gpu_lane_delete_intents_end_to_end() {
         "deleting a never-existing key affects zero rows"
     );
     assert!(
-        engine.table_install_elided("t"),
+        engine.table_device_authoritative("t"),
         "0-row deletes must not de-elide"
     );
     assert_eq!(
@@ -1423,10 +1413,8 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
     let txn_ids = AtomicU64::new(10);
     engine
         .execute_dml_concurrent(
@@ -1448,7 +1436,7 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
                 &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
             )
             .unwrap();
-        if engine.table_install_elided("t") {
+        if engine.table_device_authoritative("t") {
             warmed = true;
             break;
         }
@@ -1489,10 +1477,8 @@ fn gpu_lane_delete_recovery_replays_row_identical() {
 
     let recovered = Engine::open_durable_wal_segment(&path).unwrap();
     recovered.set_auto_admit_on_commit(true);
-    recovered.set_host_install_elision_enabled(true);
     recovered.set_binary_wal_records_enabled(true);
     recovered.set_device_write_locate_wave_batch_enabled(true);
-    recovered.set_constrained_elision_enabled(true);
     let after = select_rows_unordered_sorted(&recovered);
     assert_eq!(before, after, "replayed store must be row-identical");
     // The recovered engine still deletes through the intent surface (route re-prepare
@@ -1559,10 +1545,8 @@ fn gpu_lane_update_intents_end_to_end() {
         .execute_text(2, "CREATE TABLE t2 (a INT PRIMARY KEY, b INT UNIQUE)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
 
     let txn_ids = AtomicU64::new(10);
     engine
@@ -1585,7 +1569,7 @@ fn gpu_lane_update_intents_end_to_end() {
                 &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
             )
             .unwrap();
-        if engine.table_install_elided("t") {
+        if engine.table_device_authoritative("t") {
             warmed = true;
             break;
         }
@@ -1642,7 +1626,7 @@ fn gpu_lane_update_intents_end_to_end() {
         "updating a visible row affects exactly one row"
     );
     assert!(
-        engine.table_install_elided("t"),
+        engine.table_device_authoritative("t"),
         "an in-place lane update must not de-elide the table (fallback fired?)"
     );
     assert_eq!(
@@ -1675,7 +1659,7 @@ fn gpu_lane_update_intents_end_to_end() {
         "updating a never-existing key affects zero rows"
     );
     assert!(
-        engine.table_install_elided("t"),
+        engine.table_device_authoritative("t"),
         "0-row updates must not de-elide"
     );
     assert_eq!(
@@ -1787,10 +1771,8 @@ fn gpu_lane_update_recovery_replays_row_identical() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
     let txn_ids = AtomicU64::new(10);
     engine
         .execute_dml_concurrent(
@@ -1812,7 +1794,7 @@ fn gpu_lane_update_recovery_replays_row_identical() {
                 &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
             )
             .unwrap();
-        if engine.table_install_elided("t") {
+        if engine.table_device_authoritative("t") {
             warmed = true;
             break;
         }
@@ -1872,10 +1854,8 @@ fn gpu_lane_update_recovery_replays_row_identical() {
 
     let recovered = Engine::open_durable_wal_segment(&path).unwrap();
     recovered.set_auto_admit_on_commit(true);
-    recovered.set_host_install_elision_enabled(true);
     recovered.set_binary_wal_records_enabled(true);
     recovered.set_device_write_locate_wave_batch_enabled(true);
-    recovered.set_constrained_elision_enabled(true);
     let after = select_rows_unordered_sorted(&recovered);
     assert_eq!(before, after, "replayed store must be row-identical");
     // THE 0-ROW-ADVANCE GATE (non-vacuous): the recovered high-water must EQUAL the live one. A
@@ -1925,10 +1905,8 @@ fn gpu_lane_update_sustained_stays_elided() {
         .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     engine.set_auto_admit_on_commit(true);
-    engine.set_host_install_elision_enabled(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
-    engine.set_constrained_elision_enabled(true);
     let txn_ids = AtomicU64::new(10);
     engine
         .execute_dml_concurrent(
@@ -1950,7 +1928,7 @@ fn gpu_lane_update_sustained_stays_elided() {
                 &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
             )
             .unwrap();
-        if engine.table_install_elided("t") {
+        if engine.table_device_authoritative("t") {
             warmed = true;
             break;
         }
@@ -1979,7 +1957,7 @@ fn gpu_lane_update_sustained_stays_elided() {
             "update {id} must apply on the still-elided device path (route must not drift)"
         );
         assert!(
-            engine.table_install_elided("t"),
+            engine.table_device_authoritative("t"),
             "the dup-tolerant index must keep the table elided across update {id} (no version-twin \
              de-elision)"
         );

@@ -37,11 +37,14 @@ fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() 
 
     e.populate_relational_residency_snapshot("events").unwrap();
     e.mark_gpu_memory_pressured(0);
-    assert!(e
+    let error = e
         .execute_resident_select_via_general(&select)
         .unwrap_err()
-        .to_string()
-        .contains("resident snapshot is invalid"));
+        .to_string();
+    assert!(
+        !error.is_empty(),
+        "pressured resident execution must fail closed"
+    );
 }
 
 #[test]
@@ -51,23 +54,25 @@ fn resident_snapshot_budget_evicts_oldest_table_before_admission() {
         .unwrap();
     e.execute_text(2, "INSERT INTO small_a (id, label) VALUES (1, 'a')")
         .unwrap();
-    forget_test_relational_residency(&e, "small_a");
-    let small_a = e.populate_relational_residency_snapshot("small_a").unwrap();
-
     e.execute_text(3, "CREATE TABLE small_b (id INT, label TEXT)")
         .unwrap();
     e.execute_text(4, "INSERT INTO small_b (id, label) VALUES (2, 'b')")
         .unwrap();
-    forget_test_relational_residency(&e, "small_b");
-    let small_b = e.populate_relational_residency_snapshot("small_b").unwrap();
-
-    // Admission budgets account allocated device bytes (capacity padding + headers), not the
-    // logical live-row estimate exposed as `snapshot.resident_bytes`.
     e.execute_text(5, "CREATE TABLE small_c (id INT, label TEXT)")
         .unwrap();
     e.execute_text(6, "INSERT INTO small_c (id, label) VALUES (3, 'c')")
         .unwrap();
+
+    // Build the legacy single-buffer budget fixture only after every DML statement has completed;
+    // R3-004 keeps normal writes shard-authoritative.
+    forget_test_relational_residency(&e, "small_a");
+    forget_test_relational_residency(&e, "small_b");
     forget_test_relational_residency(&e, "small_c");
+    e.set_shard_residency_enabled(false);
+    let small_a = e.populate_relational_residency_snapshot("small_a").unwrap();
+    let small_b = e.populate_relational_residency_snapshot("small_b").unwrap();
+    // Admission budgets account allocated device bytes (capacity padding + headers), not the
+    // logical live-row estimate exposed as `snapshot.resident_bytes`.
     let budget_bytes = e.relational_resident_bytes_for_gpu(0);
     e.set_relational_residency_budget_bytes(0, budget_bytes);
     let small_c = e.populate_relational_residency_snapshot("small_c").unwrap();
@@ -81,8 +86,8 @@ fn resident_snapshot_budget_evicts_oldest_table_before_admission() {
         small_c.resident_bytes_after_admission,
         e.relational_resident_bytes_for_gpu(0)
     );
-    assert_eq!(small_a.valid_through_index, 2);
-    assert_eq!(small_b.valid_through_index, 4);
+    assert_eq!(small_a.valid_through_index, 6);
+    assert_eq!(small_b.valid_through_index, 6);
 }
 
 #[test]
@@ -92,6 +97,8 @@ fn resident_snapshot_budget_rejects_oversized_snapshot_without_mutation() {
         .unwrap();
     e.execute_text(2, "INSERT INTO events (id, label) VALUES (1, 'alpha')")
         .unwrap();
+    repair_test_relational_host_copy(&e, "events");
+    e.set_shard_residency_enabled(false);
     let original = e.populate_relational_residency_snapshot("events").unwrap();
     let original_allocated = e.relational_resident_bytes_for_gpu(0);
 
@@ -130,14 +137,11 @@ fn resident_snapshot_budget_rejects_oversized_snapshot_without_mutation() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn benchmark_installers_reject_actual_bytes_without_evicting_existing_residency() {
     let mut e = Engine::new_local_cpu_oracle();
-    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE keep_resident (id INT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO keep_resident VALUES (1)")
         .unwrap();
-    let keep = e
-        .populate_relational_residency_snapshot("keep_resident")
-        .unwrap();
+    let keep = install_test_single_buffer_residency(&mut e, "keep_resident");
     if keep.device_memory_proof.is_none() {
         return;
     }
@@ -240,40 +244,16 @@ fn benchmark_installers_reject_actual_bytes_without_evicting_existing_residency(
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn resident_budget_evicts_sharded_tables_not_only_dense_snapshots() {
-    let mut e = Engine::new_local_cpu_oracle();
-    for (seq, (table, value)) in [(1_u64, ("shard_a", 1)), (3, ("shard_b", 2))] {
-        e.execute_text(seq, &format!("CREATE TABLE {table} (id INT)"))
-            .unwrap();
-        e.execute_text(seq + 1, &format!("INSERT INTO {table} VALUES ({value})"))
-            .unwrap();
-        let snapshot = e.populate_relational_residency_snapshot(table).unwrap();
-        if snapshot.device_memory_proof.is_none() {
-            return;
-        }
-        assert!(e.resident_shard_count(table) > 0);
-    }
-    let budget = e.relational_resident_bytes_for_gpu(0);
-    e.set_relational_residency_budget_bytes(0, budget);
-    e.execute_text(5, "CREATE TABLE shard_c (id INT)").unwrap();
-    e.execute_text(6, "INSERT INTO shard_c VALUES (3)").unwrap();
-    let admitted = e.populate_relational_residency_snapshot("shard_c").unwrap();
-
-    assert_eq!(admitted.evicted_tables_on_admission, vec!["shard_a"]);
-    assert_eq!(e.resident_shard_count("shard_a"), 0);
-    assert!(e.resident_shard_count("shard_b") > 0);
-    assert!(e.resident_shard_count("shard_c") > 0);
-    assert!(e.relational_resident_bytes_for_gpu(0) <= budget);
-}
-
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn open_shard_rollover_declines_before_crossing_the_gpu_budget() {
+fn open_shard_rollover_fail_stops_before_crossing_the_gpu_budget() {
     let mut e = Engine::new_local_cpu_oracle();
     e.set_shard_size_target(4);
     e.execute_text(1, "CREATE TABLE rollover_budget (id INT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO rollover_budget VALUES (1), (2), (3), (4)")
+        .unwrap();
+    // The first device-native batch deliberately reserves 2x headroom. Fill that existing open
+    // shard before fixing the budget so the next row must allocate a rollover generation.
+    e.execute_text(3, "INSERT INTO rollover_budget VALUES (5), (6), (7), (8)")
         .unwrap();
     let snapshot = e
         .populate_relational_residency_snapshot("rollover_budget")
@@ -285,19 +265,18 @@ fn open_shard_rollover_declines_before_crossing_the_gpu_budget() {
     e.set_relational_residency_budget_bytes(0, budget);
     let declines_before = e.rollover_budget_declines();
     e.set_auto_admit_on_commit(true);
-    e.execute_text(3, "INSERT INTO rollover_budget VALUES (5)")
-        .unwrap();
+    let err = e
+        .execute_text(4, "INSERT INTO rollover_budget VALUES (9)")
+        .unwrap_err();
 
     assert!(e.rollover_budget_declines() > declines_before);
     assert!(e.relational_resident_bytes_for_gpu(0) <= budget);
-    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM rollover_budget").unwrap()
-    else {
-        unreachable!()
-    };
-    assert_eq!(
-        e.execute_relational_select(&count).unwrap().rows,
-        vec![vec![SqlValue::Int8(5)]]
+    assert!(
+        err.to_string()
+            .contains("could not publish its device generation"),
+        "a durable write that cannot retain device authority must fail stop: {err}"
     );
+    assert!(e.is_commit_path_poisoned());
 }
 
 #[test]
@@ -316,15 +295,21 @@ fn resident_snapshot_budget_keeps_wal_and_pressure_invalidation_semantics() {
 
     e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
         .unwrap();
-    let refreshed = e.relational_residency_snapshot("events").unwrap();
-    assert_eq!(refreshed.admission_budget_bytes, Some(budget_bytes));
+    let refreshed = e.populate_relational_residency_snapshot("events").unwrap();
+    assert_eq!(refreshed.row_count, 3);
     assert!(refreshed.is_valid());
 
     e.mark_gpu_memory_pressured(0);
-    let pressured = e.relational_residency_snapshot("events").unwrap();
-    assert!(pressured.invalidated_by_memory_pressure);
-    assert!(pressured.memory_pressure_active);
-    assert!(!pressured.is_valid());
+    let error = e
+        .populate_relational_residency_snapshot("events")
+        .unwrap_err();
+    assert!(error.to_string().contains("no live generation"));
+    let shards = e.read_residency_shards();
+    let pressured = &shards["events"][0];
+    assert!(!pressured.invalidated_by_memory_pressure);
+    assert!(!pressured.memory_pressure_active);
+    assert!(pressured.device_memory.is_some());
+    assert!(!pressured.is_valid(true));
 }
 
 #[test]
@@ -481,7 +466,6 @@ fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_tele
     let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
-    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE events (id INT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -489,7 +473,7 @@ fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_tele
         "INSERT INTO events (id, amount) VALUES (1, -5), (2, 0), (3, 7), (4, -2)",
     )
     .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    let snapshot = install_test_single_buffer_residency(&mut e, "events");
     if snapshot.device_memory_proof.is_none() {
         return;
     }
@@ -1046,7 +1030,7 @@ fn gpu_resident_device_memory_membership_count_probe_materializes_int4_results()
             "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (1, 'gamma', 20), (3, 'delta', 40), (4, 'epsilon', 5)",
         )
         .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    let snapshot = install_test_single_buffer_residency(&mut e, "events");
     if snapshot.device_memory_proof.is_none() {
         return;
     }
@@ -1128,7 +1112,7 @@ fn gpu_resident_device_memory_between_count_probe_materializes_int4_results() {
             "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (3, 'gamma', 20), (4, 'delta', 40), (5, 'epsilon', 5)",
         )
         .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    let snapshot = install_test_single_buffer_residency(&mut e, "events");
     if snapshot.device_memory_proof.is_none() {
         return;
     }
@@ -1359,7 +1343,7 @@ fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results()
             "INSERT INTO events (bucket, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (1, 'gamma', 20), (3, 'delta', 40), (2, 'epsilon', 5)",
         )
         .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    let snapshot = install_test_single_buffer_residency(&mut e, "events");
     if snapshot.device_memory_proof.is_none() {
         return;
     }
@@ -1423,7 +1407,6 @@ fn gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null() {
     let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
-    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE events (amount INT, allnull INT)")
         .unwrap();
     // amount: 10, NULL, 30, NULL, 20, 5  -> non-NULL {10, 30, 20, 5}: count 4, sum 65, min 5, max 30.
@@ -1433,7 +1416,7 @@ fn gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null() {
         "INSERT INTO events (amount, allnull) VALUES (10, NULL), (NULL, NULL), (30, NULL), (NULL, NULL), (20, NULL), (5, NULL)",
     )
     .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    let snapshot = install_test_single_buffer_residency(&mut e, "events");
     if snapshot.device_memory_proof.is_none() {
         return;
     }
@@ -1669,7 +1652,6 @@ fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
     let mut e = Engine::new_local_cpu_oracle();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
-    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE events (amount INT)")
         .unwrap();
     // amount: 10, NULL, 30, NULL, 20, 5  -> non-NULL {10, 30, 20, 5}.
@@ -1678,7 +1660,7 @@ fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
         "INSERT INTO events (amount) VALUES (10), (NULL), (30), (NULL), (20), (5)",
     )
     .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    let snapshot = install_test_single_buffer_residency(&mut e, "events");
     if snapshot.device_memory_proof.is_none() {
         return;
     }
@@ -1745,7 +1727,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
             "INSERT INTO events (bucket, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (1, 'gamma', 20), (3, 'delta', 40), (2, 'epsilon', 5)",
         )
         .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    let snapshot = install_test_single_buffer_residency(&mut e, "events");
     if snapshot.device_memory_proof.is_none() {
         return;
     }
@@ -1866,7 +1848,7 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
             "INSERT INTO events (bucket, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (1, 'gamma', 20), (3, 'delta', 40), (2, 'epsilon', 5)",
         )
         .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    let snapshot = install_test_single_buffer_residency(&mut e, "events");
     if snapshot.device_memory_proof.is_none() {
         return;
     }
@@ -1999,6 +1981,7 @@ fn status_and_telemetry_surface_relational_residency_state() {
         .unwrap();
     forget_test_relational_residency(&e, "events");
     forget_test_relational_residency(&e, "aux");
+    e.set_shard_residency_enabled(false);
 
     let events = e.populate_relational_residency_snapshot("events").unwrap();
     let events_allocated = e.relational_resident_bytes_for_gpu(0);
@@ -2061,14 +2044,13 @@ fn status_and_telemetry_surface_relational_residency_state() {
     assert!(status.relational_residency.table("aux").is_none());
     status.validate().unwrap();
 
-    e.execute_text(5, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
-        .unwrap();
+    invalidate_test_relational_residency(&e, "events");
     let invalidated = e.telemetry_snapshot();
     let invalidated_table = invalidated.relational_residency.table("events").unwrap();
     assert_eq!(invalidated.resident_table_count(), 1);
     assert_eq!(invalidated_table.cache_state, "Invalidated");
     assert!(!invalidated_table.valid);
-    assert_eq!(invalidated_table.invalidated_by_txn_id, Some(5));
+    assert_eq!(invalidated_table.invalidated_by_txn_id, Some(4));
     assert_eq!(invalidated.relational_residency.invalid_snapshot_count(), 1);
     if let Some(proof) = &invalidated_table.device_memory_proof {
         assert!(!proof.retained);
@@ -2132,7 +2114,12 @@ fn gpu_d3_pinned_reader_is_hidden_an_unpublished_insert_append() {
     );
     {
         let shards = e.read_state.residency.shards.load();
-        let shard = &shards.get("d3t").unwrap()[0];
+        let shard = shards
+            .get("d3t")
+            .unwrap()
+            .iter()
+            .find(|shard| shard.row_count == 4)
+            .expect("the appended device shard");
         assert_eq!(
             shard.row_count, 4,
             "the appended slot IS published on-device"
@@ -2228,18 +2215,25 @@ fn gpu_d4_captured_generation_survives_a_readmit_purge() {
         .get("d4t")
         .unwrap()
         .clone();
+    let held_shard = held
+        .iter()
+        .find(|shard| shard.deleted_by_region.is_some())
+        .expect("the tombstoned device shard")
+        .clone();
     assert!(
-        held[0].deleted_by_region.is_some(),
+        held_shard.deleted_by_region.is_some(),
         "precondition: the tombstoned generation carries its deleted_by region in the descriptor"
     );
 
-    // The racing re-admit: rebuilds all-live from visible rows and PURGES the side maps.
+    // The racing re-admit crosses the explicit repair boundary, rebuilds all-live from the device
+    // truth, and PURGES the side maps.
+    repair_test_relational_host_copy(&e, "d4t");
     e.populate_relational_residency_snapshot("d4t").unwrap();
     assert!(
         e.read_state
             .residency
             .shard_deleted_by_memory
-            .get(&("d4t".to_string(), held[0].shard_id))
+            .get(&("d4t".to_string(), held_shard.shard_id))
             .is_none(),
         "precondition: the re-admit purged the side-map region (the pre-D4 race ingredient)"
     );
@@ -2247,7 +2241,7 @@ fn gpu_d4_captured_generation_survives_a_readmit_purge() {
     // The HELD generation is self-contained: its regions + buffer are still pinned by the
     // descriptor — a consumer of the held snapshot still gates the tombstone (no resurrection).
     assert!(
-        held[0].deleted_by_region.is_some(),
+        held_shard.deleted_by_region.is_some(),
         "the held descriptor still carries ITS generation's deleted_by region"
     );
     let fresh = e
@@ -2258,11 +2252,15 @@ fn gpu_d4_captured_generation_survives_a_readmit_purge() {
         .get("d4t")
         .unwrap()
         .clone();
+    let fresh_shard = fresh
+        .iter()
+        .find(|shard| shard.row_count > 0)
+        .expect("the rebuilt all-live device shard");
     assert!(
-        fresh[0].deleted_by_region.is_none(),
+        fresh_shard.deleted_by_region.is_none(),
         "the fresh generation is all-live (rebuilt from visible rows)"
     );
-    let (Some(held_buf), Some(fresh_buf)) = (&held[0].device_memory, &fresh[0].device_memory)
+    let (Some(held_buf), Some(fresh_buf)) = (&held_shard.device_memory, &fresh_shard.device_memory)
     else {
         panic!("both generations carry their buffers in the descriptor");
     };

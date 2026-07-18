@@ -224,6 +224,27 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
+        // Autocommit reads retain one immutable catalog+device generation for the full statement,
+        // just like an explicit transaction retains one for its lifetime. Capture is serialized
+        // only with the publication cut; kernel execution runs after the commit lock is released,
+        // so readers remain mutually concurrent. A shape-changing DDL can then invalidate the
+        // current maps without retiring or mismatching the generation this statement owns.
+        let statement_snapshot = if self.current_transaction_read_snapshot().is_none()
+            && !self.mvcc_read_skips_leader_check()
+        {
+            self.transition_oversized_device_table_to_streaming_repair(&select.table)
+                .map_err(ExecuteError::Engine)?;
+            let commit = self.commit_state();
+            self.ensure_commit_path_available()
+                .map_err(ExecuteError::Engine)?;
+            let snapshot = self.capture_statement_snapshot(self.committed_seq());
+            drop(commit);
+            Some(snapshot)
+        } else {
+            None
+        };
+        let _statement_scope =
+            statement_snapshot.map(|snapshot| self.enter_transaction_read(snapshot));
         // Multi-key ORDER BY (`ORDER BY a, b, ...`) is GPU-only: it runs on the general Expr executor's
         // bitonic-sort path, routed in `execute_relational_select_text` when every key is an i64-sortable
         // base column on a GPU-resident table. This enumerated/CPU path has no multi-key sort and must
@@ -528,13 +549,15 @@ impl Engine {
         // scan the STALE store (elided commits never installed). Rehydrate first (device gather +
         // reconciliation, sticky de-elision), exactly like the DML ladder — any read shape the
         // device routes cannot serve costs one O(table) rehydration instead of wrong results.
-        if self.host_install_elision_enabled() && self.table_install_elided(&select.table) {
+        let mut representation_changed = false;
+        if self.table_device_authoritative(&select.table) {
             // Audit B3: the rehydration store-write must hold the COMMIT LOCK (readers hold no
             // lock; a lost COW update would leave the table de-elided WITH a stale store). The
             // helper detects mid-commit internal reads (matview refresh) and skips the
             // self-deadlocking re-acquisition.
             self.rehydrate_elided_serialized(&select.table)
                 .map_err(ExecuteError::Engine)?;
+            representation_changed = true;
         }
         // P4-2b (S-E.P4): the CPU-pinned path on a CHUNK-AUTHORITATIVE table would scan the
         // FROZEN store (post-freeze writes live only in the chunks) — DE-AUTHORITIZE first (the
@@ -543,8 +566,29 @@ impl Engine {
         if self.table_chunk_authoritative(&select.table).is_some() {
             self.deauthoritize_chunk_table(&select.table, false)
                 .map_err(ExecuteError::Engine)?;
+            representation_changed = true;
         }
-        let (table, bound, copin_s) = self.bind_relational_select_at(select, statement_copin_s)?;
+        // The outer autocommit statement snapshot deliberately retains the representation that was
+        // current before the fallback repair above. Re-capture after the serialized transition so
+        // the fallback binds the newly published repair generation. Explicit transactions never
+        // take this arm: they remain fixed to their BEGIN generation and unsupported shapes fail.
+        let statement_owned = self
+            .current_transaction_read_snapshot()
+            .is_some_and(|snapshot| snapshot.statement_owned);
+        let mut effective_copin_s = statement_copin_s;
+        let rebound_snapshot = if representation_changed && statement_owned {
+            let commit = self.commit_state();
+            self.ensure_commit_path_available()
+                .map_err(ExecuteError::Engine)?;
+            effective_copin_s = self.committed_seq();
+            let snapshot = self.capture_statement_snapshot(effective_copin_s);
+            drop(commit);
+            Some(snapshot)
+        } else {
+            None
+        };
+        let _rebound_scope = rebound_snapshot.map(|snapshot| self.enter_transaction_read(snapshot));
+        let (table, bound, copin_s) = self.bind_relational_select_at(select, effective_copin_s)?;
         on_bound_before_pin();
         let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =
@@ -731,6 +775,7 @@ impl Engine {
             | "sharded_int4_composite_equality_multi_column_projection"
             | "sharded_int4_equality_projection"
             | "sharded_int4_equality_multi_column_projection"
+            | "sharded_int4_equality_mixed_column_projection"
             | "sharded_int4_equality_sum"
             | "sharded_int4_between_avg"
             | "sharded_int4_filtered_min"

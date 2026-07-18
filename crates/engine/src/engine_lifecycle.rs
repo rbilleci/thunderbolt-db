@@ -26,7 +26,6 @@ impl Engine {
     pub(crate) fn new_local_cpu_oracle() -> Self {
         let engine = Self::new_local();
         engine.set_auto_admit_on_commit(false);
-        engine.set_host_install_elision_enabled(false);
         engine
     }
 
@@ -53,7 +52,6 @@ impl Engine {
 
     fn begin_recovery_replay(&self) {
         self.set_auto_admit_on_commit(false);
-        self.set_host_install_elision_enabled(false);
     }
 
     fn finish_recovery_replay(&self) -> Result<(), EngineError> {
@@ -74,10 +72,12 @@ impl Engine {
             .cloned()
             .collect();
         for table in tables {
+            if self.table_has_live_dml_generation(&table) {
+                continue;
+            }
             self.populate_relational_residency_snapshot_shared(&table)
                 .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
         }
-        self.set_host_install_elision_enabled(true);
         self.set_auto_admit_on_commit(true);
         Ok(())
     }
@@ -350,11 +350,8 @@ impl Engine {
             // NULL 3VL); point reads are index-routed (3b/batched); scans are zero-copy at one surviving
             // shard, metadata-served for version-free COUNT(*), and recompaction-served otherwise (the
             // multi-shard aggregate kernel is the ledgered #4 endgame). Incremental DELETE/UPDATE
-            // (tombstone + stamped append, O(rows touched)) replace the O(table) re-admit. Each flag
-            // remains individually settable — the A/B levers and kill switches are unchanged.
+            // (identity locate + tombstone + stamped append, O(rows touched)) are mandatory.
             shard_residency_enabled: std::sync::atomic::AtomicBool::new(true),
-            resident_delete_tombstone_enabled: std::sync::atomic::AtomicBool::new(true),
-            resident_update_tombstone_enabled: std::sync::atomic::AtomicBool::new(true),
             shard_index_probe_enabled: std::sync::atomic::AtomicBool::new(true),
             shard_batched_point_read_enabled: std::sync::atomic::AtomicBool::new(true),
             // A5 THE FLIP (user-authorized 2026-07-03): device-authoritative commits are the
@@ -363,15 +360,8 @@ impl Engine {
             // rehydrating decline -> a dead slot re-tombstoned, the live version leaked) is
             // FIXED by re-pinning the view at every post-rehydration fallback — pinned by the
             // SV6 concurrent hammer, which now runs elided BY DEFAULT.
-            host_install_elision_enabled: std::sync::atomic::AtomicBool::new(true),
             binary_wal_records_enabled: std::sync::atomic::AtomicBool::new(false),
             // THE CONSTRAINED-ELISION FLIP (user-authorized 2026-07-03): unique/PK'd
-            // i32-section tables are device-authoritative BY DEFAULT — the core-banking shape
-            // runs 90-94k @32w vs 16.5k host-installed. Evidence at the flip: six GPU
-            // differentials + three deterministic CPU races (all sabotage-verified), three
-            // adversarial audits adopted to zero open findings; default-ON makes the whole
-            // suite the continuing burn-in (the A5-flip lesson). Kill switch retained.
-            constrained_elision_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_vacuum_enabled: std::sync::atomic::AtomicBool::new(true),
             // THE i64-SECTION FLIP (user-authorized 2026-07-03): Int8/Timestamp columns ride
             // sharded admission BY DEFAULT — the int8-payload core-banking shape runs 83-91k

@@ -3,11 +3,10 @@
 use super::*;
 
 impl Engine {
-    /// STRATA S-B: commit-triggered, best-effort GPU-residency admission for the tables a commit
-    /// mutated. Runs AFTER `publish_committed_seq` (so it snapshots the new generation) while the
-    /// commit_mutex is held; it can NEVER fail the commit — over-budget / memory-pressure / GPU-absent /
-    /// dropped-table simply leaves the table non-resident (reads fall back to the host path). N=1
-    /// unified buffer per table (single-GPU); shard/spill is S-C/S-E.
+    /// STRATA S-B: commit-triggered admission for non-authoritative bootstrap/repair tables. Runs
+    /// after `publish_committed_seq` while the commit mutex is held. Device-authoritative DML tables
+    /// are already maintained in place and never depend on this best-effort helper; a missing route
+    /// for them fails loudly instead of selecting a host execution tier.
     pub(crate) fn auto_admit_resident_tables(&self, tables: &std::collections::BTreeSet<String>) {
         // P4-2b (audit M4): NEVER admit a CHUNK-AUTHORITATIVE table — its store is FROZEN
         // (post-freeze writes live only in the chunks), so an admission (e.g. after a budget

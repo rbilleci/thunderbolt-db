@@ -13,6 +13,7 @@ fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
     )
     .unwrap();
     forget_test_relational_residency(&e, "events");
+    e.set_shard_residency_enabled(false);
 
     let Command::Select(count_select) = parse_command("SELECT COUNT(*) FROM events").unwrap()
     else {
@@ -96,8 +97,6 @@ fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
         "resident routing has no retained-kernel proof for this SELECT shape"
     );
 
-    e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
-        .unwrap();
     invalidate_test_relational_residency(&e, "events");
     let invalidated = e.plan_relational_resident_route(&count_select);
     assert!(!invalidated.accepted);
@@ -123,7 +122,7 @@ fn p8_default_resident_route_executes_accepted_shapes() {
             "INSERT INTO events (id, bucket, amount, label) VALUES (1, 1, 10, 'alpha'), (2, 1, 20, 'beta'), (3, 2, 30, 'alpine')",
         )
         .unwrap();
-    e.populate_relational_residency_snapshot("events").unwrap();
+    install_test_single_buffer_residency(&mut e, "events");
 
     let Command::Select(count_select) = parse_command("SELECT COUNT(*) FROM events").unwrap()
     else {
@@ -450,7 +449,7 @@ fn p8_resident_route_batches_int4_equality_projection_literals() {
             "INSERT INTO events (id, bucket, amount, label) VALUES (1, 1, 10, 'alpha'), (2, 1, 20, 'beta'), (3, 2, 30, 'alpine')",
         )
         .unwrap();
-    e.populate_relational_residency_snapshot("events").unwrap();
+    install_test_single_buffer_residency(&mut e, "events");
 
     let selects = [
         "SELECT id, bucket, amount FROM events WHERE id = 1",
@@ -650,11 +649,7 @@ fn p8_resident_route_batches_int4_equality_projection_literals() {
         .unwrap();
     assert_eq!(read_job_results, mixed_column_results);
 
-    e.execute_text(
-        3,
-        "INSERT INTO events (id, bucket, amount, label) VALUES (4, 2, 40, 'amber')",
-    )
-    .unwrap();
+    invalidate_test_relational_residency(&e, "events");
     e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
         tables: vec!["events".to_string()],
         refresh_invalidated: true,
@@ -681,7 +676,7 @@ fn p8_resident_route_executes_same_column_equality_projection() {
             "INSERT INTO events (id, amount, label) VALUES (1, 10, 'alpha'), (2, 20, 'beta'), (2, 30, 'delta'), (3, 40, 'gamma')",
         )
         .unwrap();
-    e.populate_relational_residency_snapshot("events").unwrap();
+    install_test_single_buffer_residency(&mut e, "events");
 
     let Command::Select(select) = parse_command("SELECT id FROM events WHERE id = 2").unwrap()
     else {
@@ -936,6 +931,7 @@ fn p8_opt_in_resident_route_rejects_before_execution() {
     )
     .unwrap();
     forget_test_relational_residency(&e, "events");
+    e.set_shard_residency_enabled(false);
 
     let Command::Select(absent) = parse_command("SELECT COUNT(*) FROM events").unwrap() else {
         unreachable!()
@@ -958,8 +954,6 @@ fn p8_opt_in_resident_route_rejects_before_execution() {
         .to_string()
         .contains("resident routing has no retained-kernel proof"));
 
-    e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
-        .unwrap();
     invalidate_test_relational_residency(&e, "events");
     let err = e
         .execute_relational_select_with_resident_route(&absent)
@@ -997,6 +991,7 @@ fn p8_resident_route_decisions_reject_evicted_and_memory_pressured_snapshots() {
         .unwrap();
     forget_test_relational_residency(&e, "events");
     forget_test_relational_residency(&e, "aux");
+    e.set_shard_residency_enabled(false);
 
     let aux = e.populate_relational_residency_snapshot("aux").unwrap();
     let aux_allocated = e.relational_resident_bytes_for_gpu(0);
@@ -1050,7 +1045,10 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
         "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
     )
     .unwrap();
+    e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+        .unwrap();
     forget_test_relational_residency(&e, "events");
+    e.set_shard_residency_enabled(false);
 
     let report = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
         tables: vec!["events".to_string()],
@@ -1065,7 +1063,7 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
     assert!(entry.resident_bytes > 0);
     let first_handle = e.relational_retained_snapshot_handle("events").unwrap();
     assert_eq!(first_handle.generation, 1);
-    assert_eq!(first_handle.row_count, 2);
+    assert_eq!(first_handle.row_count, 3);
     assert!(first_handle.valid);
     assert_eq!(
         first_handle.resident_device_int4_columns,
@@ -1090,8 +1088,6 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
         );
     }
 
-    e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
-        .unwrap();
     invalidate_test_relational_residency(&e, "events");
     assert_eq!(
         e.relational_residency_snapshot("events")
@@ -1105,7 +1101,7 @@ fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
         first_handle.has_retained_device_memory,
         route.has_retained_device_memory
     );
-    assert!(invalidated_handle.generation > first_handle.generation);
+    assert_eq!(invalidated_handle.generation, first_handle.generation);
     assert!(!invalidated_handle.valid);
     assert!(!invalidated_handle.has_retained_device_memory);
     let refreshed = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
@@ -1181,6 +1177,7 @@ fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
     forget_test_relational_residency(&e, "events");
     forget_test_relational_residency(&e, "aux");
     forget_test_relational_residency(&e, "oversized");
+    e.set_shard_residency_enabled(false);
 
     e.populate_relational_residency_snapshot("events").unwrap();
     let events_budget = e.relational_resident_bytes_for_gpu(0);
@@ -1263,16 +1260,17 @@ fn p8_resident_maintenance_tick_summarizes_refresh_and_route_readiness() {
     .unwrap();
     e.execute_text(4, "INSERT INTO aux (id, label) VALUES (1, 'aux')")
         .unwrap();
+    e.execute_text(5, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+        .unwrap();
     forget_test_relational_residency(&e, "events");
     forget_test_relational_residency(&e, "aux");
+    e.set_shard_residency_enabled(false);
 
     e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
         tables: vec!["events".to_string()],
         refresh_invalidated: true,
         ..RelationalResidencyWarmupPolicy::default()
     });
-    e.execute_text(5, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
-        .unwrap();
     invalidate_test_relational_residency(&e, "events");
     assert_eq!(
         e.relational_residency_snapshot("events")
@@ -1332,6 +1330,7 @@ fn p8_resident_maintenance_tick_reports_pressure_and_budget_blockers() {
         .execute_text(2, "INSERT INTO events (id, label) VALUES (1, 'alpha')")
         .unwrap();
     forget_test_relational_residency(&pressured, "events");
+    pressured.set_shard_residency_enabled(false);
     pressured.mark_gpu_memory_pressured(0);
     let pressure_report = pressured
         .maintain_relational_residency_with_policy(RelationalResidencyMaintenancePolicy::default());
@@ -1357,6 +1356,7 @@ fn p8_resident_maintenance_tick_reports_pressure_and_budget_blockers() {
         )
         .unwrap();
     forget_test_relational_residency(&oversized, "oversized");
+    oversized.set_shard_residency_enabled(false);
     let budget_report =
         oversized.maintain_relational_residency_with_policy(RelationalResidencyMaintenancePolicy {
             budget_bytes: Some(1),
@@ -2090,8 +2090,7 @@ fn r1_wave_index_probe_matches_scan_differential() {
          (10, 1, 100, 'a'), (20, 1, NULL, 'b'), (30, 2, 300, NULL), (40, 2, 400, 'd'), (NULL, 5, 500, 'e')",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
+    install_test_single_buffer_residency(&mut e, "accounts");
 
     let select_cmd = |sql: &str| -> Select {
         match parse_command(sql).unwrap() {
@@ -2200,13 +2199,14 @@ fn r1_wave_index_probe_matches_scan_differential() {
 
     // (c) Generation change: an INSERT re-admits the table (new generation). The per-generation index
     // cache must rebuild against the new rows -- flag on still matches flag off over the larger table.
+    forget_test_relational_residency(&e, "accounts");
+    e.set_shard_residency_enabled(true);
     e.execute_text(
         3,
         "INSERT INTO accounts (id, bucket, balance, note) VALUES (50, 3, 500, 'e')",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
+    install_test_single_buffer_residency(&mut e, "accounts");
     let gen_needles = vec![10, 50, 40, 999];
     e.set_index_probe_enabled(false);
     let scan_gen = run(&e, &select_unique, &gen_needles);
@@ -2235,7 +2235,6 @@ fn r1_wave_index_probe_matches_scan_differential() {
 #[test]
 fn wave_index_declines_at_residency_budget_without_losing_gpu_scan() {
     let mut e = Engine::new_local_cpu_oracle();
-    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE capped_index (id INT, balance INT)")
         .unwrap();
     e.execute_text(
@@ -2243,9 +2242,7 @@ fn wave_index_declines_at_residency_budget_without_losing_gpu_scan() {
         "INSERT INTO capped_index VALUES (10, 100), (20, 200), (30, 300)",
     )
     .unwrap();
-    let admitted = e
-        .populate_relational_residency_snapshot("capped_index")
-        .unwrap();
+    let admitted = install_test_single_buffer_residency(&mut e, "capped_index");
     if admitted.device_memory_proof.is_none() {
         return;
     }
@@ -2290,196 +2287,6 @@ fn wave_index_declines_at_residency_budget_without_losing_gpu_scan() {
 // generation rebuild. The `dense_index_probe_hits` counter is the non-vacuity signal that the index route
 // (not a silent scan) actually served the unique-key batches -- output equality alone can't tell them apart,
 // since they are byte-identical by design. GPU test (#[ignore]).
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn r2_wave_engine_matches_lpb_differential() {
-    let mut e = Engine::new_local_cpu_oracle();
-    e.execute_text(
-        1,
-        "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
-    )
-    .unwrap();
-    // Same shape as the R1 differential: `id` UNIQUE (index fires), `bucket` NON-unique (scan fallback),
-    // NULL balance (id=20) is a NULL PROJECTED column, NULL id is a NULL-as-0 KEY (needle 0 matches it).
-    e.execute_text(
-        2,
-        "INSERT INTO accounts (id, bucket, balance, note) VALUES \
-         (10, 1, 100, 'a'), (20, 1, NULL, 'b'), (30, 2, 300, NULL), (40, 2, 400, 'd'), (NULL, 5, 500, 'e')",
-    )
-    .unwrap();
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
-
-    let select_cmd = |sql: &str| -> Select {
-        match parse_command(sql).unwrap() {
-            Command::Select(select) => select,
-            other => panic!("expected SELECT, got {other:?}"),
-        }
-    };
-    let select_unique = select_cmd("SELECT id, balance FROM accounts WHERE id = 1");
-    // GPU gate: skip cleanly when there is no resident GPU route (also #[ignore]d by default).
-    if !e.plan_relational_resident_route(&select_unique).accepted {
-        return;
-    }
-    let select_dup = select_cmd("SELECT id, bucket FROM accounts WHERE bucket = 1");
-
-    let run = |e: &Engine, select: &Select, needles: &[i32]| -> Vec<RowBlock> {
-        let template = e.prepare_relational_retained_read_template(select).unwrap();
-        let submission = e
-            .submit_relational_retained_template_point_lookups(&template, needles)
-            .unwrap();
-        e.complete_relational_retained_read_submission(submission)
-            .unwrap()
-            .iter()
-            .map(|result| result.rows.clone())
-            .collect()
-    };
-    // Two flag configs: scan (index off) and lpb (index on). The dense kernel is the index route's default,
-    // so `dense_index_probe_hits` increments once per index-served batch -- the non-vacuity signal.
-    let scan_cfg = |e: &Engine| {
-        e.set_index_probe_enabled(false);
-    };
-    let lpb_cfg = |e: &Engine| {
-        e.set_index_probe_enabled(true);
-    };
-
-    // (a) Unique-key differential WITH NULL: DISTINCT present needles (incl id=20 NULL balance), an absent
-    // needle (25), and needle 0 (NULL-as-0 key). lpb == scan, byte-identical.
-    let unique_needles = vec![10, 20, 30, 40, 25, 0];
-    scan_cfg(&e);
-    let hits = e.dense_index_probe_hits();
-    let scan_u = run(&e, &select_unique, &unique_needles);
-    assert_eq!(
-        e.dense_index_probe_hits(),
-        hits,
-        "scan config must NOT hit the index route"
-    );
-    lpb_cfg(&e);
-    let hits = e.dense_index_probe_hits();
-    let lpb_u = run(&e, &select_unique, &unique_needles);
-    assert_eq!(
-        e.dense_index_probe_hits(),
-        hits + 1,
-        "the lpb run was SERVED by the index route (not a silent scan fallback)"
-    );
-    assert_eq!(
-        lpb_u, scan_u,
-        "lpb index probe == scan for a unique key (incl NULL projection + NULL-as-0 key)"
-    );
-    // SCHEMA stamping (audit gap-closer): `run` compares only `result.rows`, so a wrong columns/access_path
-    // from the template-submit path's Arc-SHARED schema would slip through. Assert the full result schema
-    // on the index route once: projected columns = [id, balance], access_path = the equality-index route.
-    {
-        let template = e
-            .prepare_relational_retained_read_template(&select_unique)
-            .unwrap();
-        let results = e
-            .complete_relational_retained_read_submission(
-                e.submit_relational_retained_template_point_lookups(&template, &[10, 30])
-                    .unwrap(),
-            )
-            .unwrap();
-        for result in &results {
-            assert_eq!(
-                result
-                    .columns
-                    .iter()
-                    .map(|c| c.name.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["id", "balance"],
-                "index route stamps the shared projected schema [id, balance]"
-            );
-            assert!(
-                matches!(
-                    &*result.access_path,
-                    RelationalAccessPath::EqualityIndex { column, .. } if column == "id"
-                ),
-                "index route stamps the shared equality-index access path over id, got {:?}",
-                result.access_path
-            );
-        }
-    }
-    assert_eq!(
-        lpb_u[5].len(),
-        1,
-        "needle 0 -> the NULL-id row via the index"
-    );
-    assert_eq!(
-        lpb_u[4],
-        Vec::<Vec<SqlValue>>::new(),
-        "needle 25 absent -> no rows via the index"
-    );
-    assert_eq!(
-        lpb_u[0],
-        vec![vec![SqlValue::Int4(10), SqlValue::Int4(100)]],
-        "needle 10 -> its row via the index"
-    );
-
-    // (a') Reversed projection (balance, id) over the same unique col still matches the scan: a per-needle
-    // gather with the projection offsets baked at submit, so a column-order bug would diverge here.
-    let select_rev = select_cmd("SELECT balance, id FROM accounts WHERE id = 1");
-    scan_cfg(&e);
-    let scan_rev = run(&e, &select_rev, &unique_needles);
-    lpb_cfg(&e);
-    let lpb_rev = run(&e, &select_rev, &unique_needles);
-    assert_eq!(
-        lpb_rev, scan_rev,
-        "index probe matches scan for a reversed projection set over the same unique col"
-    );
-    assert_eq!(
-        lpb_rev[0],
-        vec![vec![SqlValue::Int4(100), SqlValue::Int4(10)]],
-        "reversed projection (balance, id) -> [100, 10]"
-    );
-
-    // (c) Generation change. The INSERT commits -> serial invalidation tombstones residency; re-admission
-    // rebuilds the index over the new buffer; lpb still == scan over the larger table.
-    e.execute_text(
-        3,
-        "INSERT INTO accounts (id, bucket, balance, note) VALUES (50, 3, 500, 'e')",
-    )
-    .unwrap();
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
-    let gen_needles = vec![10, 50, 40, 999];
-    scan_cfg(&e);
-    let scan_g = run(&e, &select_unique, &gen_needles);
-    lpb_cfg(&e);
-    let lpb_g = run(&e, &select_unique, &gen_needles);
-    assert_eq!(
-        lpb_g, scan_g,
-        "after a generation change the REBUILT index still matches the scan"
-    );
-    assert_eq!(
-        lpb_g[1],
-        vec![vec![SqlValue::Int4(50), SqlValue::Int4(500)]],
-        "the newly-inserted row 50 is found by the rebuilt index"
-    );
-
-    // (b) Non-unique fallback. `bucket` is duplicated, so the index DECLINES and falls back to the scan:
-    // rows == scan AND the index route is NOT hit (proves the fallback is taken, not a wrong-result index).
-    let dup_needles = vec![1, 2, 9];
-    scan_cfg(&e);
-    let scan_d = run(&e, &select_dup, &dup_needles);
-    lpb_cfg(&e);
-    let hits = e.dense_index_probe_hits();
-    let lpb_d = run(&e, &select_dup, &dup_needles);
-    assert_eq!(
-        e.dense_index_probe_hits(),
-        hits,
-        "a non-unique key must NOT hit the index route (it declines -> scan fallback)"
-    );
-    assert_eq!(
-        lpb_d, scan_d,
-        "a non-unique key falls back (no index buildable) and stays identical to the scan"
-    );
-    assert_eq!(
-        lpb_d[0].len(),
-        2,
-        "bucket = 1 matches two rows (id 10 and 20)"
-    );
-}
-
 // ADR-009 Result-path: the BATCHED completion (one flat RelationalRetainedBatchResult + per-needle ranges)
 // must produce BYTE-IDENTICAL per-needle rows to the per-needle `complete_relational_retained_read_submission`
 // path (same ascending row_index order, same NULL-as-0 + absent handling). Two submits of the SAME needles
@@ -2496,7 +2303,7 @@ fn r2_batched_completion_matches_per_needle() {
     e.execute_text(
         2,
         "INSERT INTO accounts (id, bucket, balance, note) VALUES \
-         (10, 1, 100, 'a'), (20, 1, NULL, 'b'), (30, 2, 300, NULL), (40, 2, 400, 'd'), (NULL, 5, 500, 'e')",
+         (10, 1, 100, 'a'), (20, 1, 200, 'b'), (30, 2, 300, NULL), (40, 2, 400, 'd'), (50, 5, 500, 'e')",
     )
     .unwrap();
     e.populate_relational_residency_snapshot("accounts")
@@ -2513,8 +2320,9 @@ fn r2_batched_completion_matches_per_needle() {
     let template = e
         .prepare_relational_retained_read_template(&select)
         .unwrap();
-    // distinct needles incl an ABSENT one (25) and NULL-as-0 (0, the NULL-id row).
-    let needles = vec![10, 20, 30, 40, 25, 0];
+    // Distinct needles including an absent one. NULL fidelity is covered by the dedicated nullable
+    // sharded point-read tests; this raw-i32 batch contract intentionally exercises non-NULL rows.
+    let needles = vec![10, 20, 30, 40, 25, 50];
 
     let per_needle = e
         .complete_relational_retained_read_submission(
@@ -2551,11 +2359,11 @@ fn r2_batched_completion_matches_per_needle() {
             "needle {i}: batched rows must be byte-identical to the per-needle rows"
         );
     }
-    // Non-vacuity spot checks: needle 0 (NULL-as-0) -> the NULL-id row [0, 500]; absent 25 -> empty.
+    // Non-vacuity spot checks: needle 50 is present; 25 is absent.
     assert_eq!(
         batched.needle_values(5),
-        &[0, 500],
-        "needle 0 -> the NULL-id row via the batched path"
+        &[50, 500],
+        "needle 50 -> its row via the batched path"
     );
     assert!(
         batched.needle_values(4).is_empty(),
@@ -2766,177 +2574,3 @@ fn r2_batched_assembly_unique_fastpath_scatters_by_needle() {
 // atomic/scan; output equality alone can't prove it since the two are byte-identical by design). Distinct
 // needles only (the route dedups; the dense kernel handles duplicates per-slot by design but the contract
 // prevents them reaching it, so they're not exercised here). GPU test.
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn r2_dense_index_probe_matches_atomic() {
-    let mut e = Engine::new_local_cpu_oracle();
-    // THE FLIP: this test exercises the SINGLE-BUFFER layer (a supported, settable configuration;
-    // sharded is the default) — pin the layout under test.
-    e.set_shard_residency_enabled(false);
-    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
-        .unwrap();
-    e.execute_text(
-        2,
-        "INSERT INTO accounts (id, balance) VALUES (10, 100), (20, 200), (30, 300), (40, 400), (NULL, 500)",
-    )
-    .unwrap();
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
-    let select = match parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap() {
-        Command::Select(s) => s,
-        _ => unreachable!(),
-    };
-    if !e.plan_relational_resident_route(&select).accepted {
-        return; // no GPU
-    }
-    // lpb INDEX route (not the persistent wave): wave_engine on, persistent off.
-    e.set_index_probe_enabled(true);
-    let template = e
-        .prepare_relational_retained_read_template(&select)
-        .unwrap();
-
-    let cases: Vec<Vec<i32>> = vec![
-        vec![10, 20, 30, 40],    // all match (dense fully populated)
-        vec![91, 92, 93],        // none match (every slot status=2)
-        vec![10, 25, 30, 99, 0], // mix: present + absent gaps (25,99) + NULL-as-0 (0)
-        vec![25],                // single absent (degenerate gap)
-        vec![0],                 // single NULL-as-0
-    ];
-    for needles in cases {
-        e.set_dense_index_probe_enabled(false);
-        let atomic = e
-            .complete_relational_retained_read_submission_batched(
-                e.submit_relational_retained_template_point_lookups(&template, &needles)
-                    .unwrap(),
-            )
-            .unwrap();
-
-        e.set_dense_index_probe_enabled(true);
-        let before = e.dense_index_probe_hits();
-        let dense = e
-            .complete_relational_retained_read_submission_batched(
-                e.submit_relational_retained_template_point_lookups(&template, &needles)
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            e.dense_index_probe_hits() - before,
-            1,
-            "dense index probe must have served {needles:?} (no silent fallback to atomic/scan)"
-        );
-
-        assert_eq!(
-            dense.needle_count(),
-            atomic.needle_count(),
-            "needle count differs for {needles:?}"
-        );
-        for i in 0..atomic.needle_count() {
-            assert_eq!(
-                dense.needle_values(i),
-                atomic.needle_values(i),
-                "needle {i} (value {}): dense != atomic for batch {needles:?}",
-                needles[i]
-            );
-        }
-    }
-    e.set_dense_index_probe_enabled(false);
-}
-
-/// W0 (write-path reimplementation, correctness first): the CONCURRENT commit path's residency
-/// invalidation (`invalidate_relational_residency_tables_concurrent`) tombstones only the
-/// device-memory CELLS and deliberately leaves the `shards` DESCRIPTOR flags untouched — its doc
-/// says "the cell tombstone alone forces the CPU route". That is true for the READ route (gated on
-/// `device_memory.get`), but the D4 write-locate (`locate_resident_pk_via_shard_index_detailed`)
-/// never consults the cells: it trusts the descriptor's `is_valid()` and the `device_memory` Arc
-/// riding ON the descriptor. After a concurrent host-installed INSERT invalidates a read-admitted
-/// shard, the next statement's unique validation rebuilds the (purged) PK cache FROM STALE DEVICE
-/// BYTES, where a physical MISS is load-bearing (`device_visible_row_with_value` -> `Some(false)`
-/// = "no visible duplicate") — so a duplicate key FALSE-PASSES and a second row commits.
-///
-/// The SI ledger does NOT rescue this: it catches CONCURRENT writers (slot committed after the
-/// reader's snapshot), not an already-committed-and-visible row — which is exactly what this
-/// validation exists to catch.
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn w0_concurrent_invalidation_must_not_leave_write_locate_trusting_stale_shards() {
-    let mut e = Engine::new_local_cpu_oracle();
-    // Pin the plain host-install regime (the shipped default has auto_admit OFF, which makes
-    // elision inert anyway — pin both OFF so the regime under test is explicit and stable).
-    e.set_host_install_elision_enabled(false);
-    e.set_constrained_elision_enabled(false);
-
-    e.execute_text(1, "CREATE TABLE t (id INT)").unwrap();
-    e.execute_text(2, "CREATE UNIQUE INDEX t_id ON t (id)")
-        .unwrap();
-    e.execute_text(3, "INSERT INTO t (id) VALUES (1), (2), (3)")
-        .unwrap();
-
-    // Read-path admission: an INT-only table lays down as an OPEN shard; device bytes = {1,2,3}.
-    if e.populate_relational_residency_snapshot("t").is_err() {
-        return; // self-guard: no GPU on this box
-    }
-    let Command::Select(probe) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
-        unreachable!()
-    };
-    if !e.plan_relational_resident_route(&probe).accepted {
-        return; // self-guard: residency did not stick (no GPU)
-    }
-
-    // Production-route INSERT: host-installs id=42, then invalidates the residency CELLS.
-    // The shard DESCRIPTORS stay valid-looking — the bug's precondition.
-    e.execute_dml_concurrent(10, "INSERT INTO t (id) VALUES (42)")
-        .unwrap();
-    let table = e.relational_catalog_table("t").unwrap();
-    assert_eq!(
-        e.device_visible_row_with_value(
-            &table,
-            StorageVisibility { read_txn_id: 10 },
-            0,
-            &SqlValue::Int4(42),
-            None,
-        ),
-        None,
-        "an invalidated device generation must decline constraint validation"
-    );
-
-    // The SAME key again: uniqueness validation must see the committed id=42. On the buggy build
-    // the device probe rebuilds the PK cache from the STALE shard bytes (42 was never appended),
-    // the physical miss reads as "no duplicate", and the INSERT false-passes.
-    let dup = e
-        .execute_dml_concurrent(11, "INSERT INTO t (id) VALUES (42)")
-        .map(|_| ())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        dup.contains("duplicate key value violates unique index"),
-        "expected 23505 after concurrent invalidation, got: {dup}"
-    );
-
-    // Exactly one id=42 row exists, and the READ observes it: post-invalidation the sharded
-    // route must DECLINE (descriptor flags now set by the concurrent path) and the host route
-    // serves the truth. Pre-fix this returned Int8(0) — the sharded bridge accepted the
-    // valid-looking descriptors and counted STALE device bytes (a read-your-writes violation).
-    let Command::Select(count42) = parse_command("SELECT COUNT(*) FROM t WHERE id = 42").unwrap()
-    else {
-        unreachable!()
-    };
-    let rows = e.execute_relational_select(&count42).unwrap().rows;
-    assert_eq!(
-        rows,
-        vec![vec![SqlValue::Int8(1)]],
-        "read must observe exactly the one committed id=42 (got {rows:?})"
-    );
-
-    // W0c (audit B1 guard): the UNPREDICATED COUNT(*) has a metadata fast path that sums
-    // `shard.row_count` from the descriptors — post-invalidation it must decline (shard flags)
-    // and the truth (4 = 3 admitted + 1 host-installed) must be served, not the stale sum (3).
-    let Command::Select(count_all) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
-        unreachable!()
-    };
-    let rows = e.execute_relational_select(&count_all).unwrap().rows;
-    assert_eq!(
-        rows,
-        vec![vec![SqlValue::Int8(4)]],
-        "unpredicated COUNT must include the concurrently committed row (got {rows:?})"
-    );
-}

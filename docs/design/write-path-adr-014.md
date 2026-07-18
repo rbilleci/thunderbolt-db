@@ -40,7 +40,7 @@ The engine already has four related but non-identical write representations:
 All four derive visibility from `commit_seq`, but they do not share one logical row identity, index lifecycle,
 GC contract, or direct recovery format. Covered paths can also return to host value-index, predicate-recheck,
 rehydration, or deauthorization logic on a device decline. Extending type coverage or transaction-held snapshots
-before reconciling these rules would multiply the incompatible states that R3-004 must later delete.
+before reconciling these rules would have multiplied the incompatible states that R3-004 subsequently deleted.
 
 The charter requires the GPU to make relational decisions while the host remains the sequencing, durability,
 protocol, and orchestration control plane. ADR-009 already selects deterministic predeclarable waves as the fast
@@ -1249,9 +1249,10 @@ authority and evidence that cross-lane coalescing plus WAL-first ordering revers
   post-durable-apply campaign before standalone host-store deletion.
 - **HA-001** maps the physical range/outcome marker and `commit_seq` to replicated term/index authority and makes
   referenced artifacts part of quorum snapshot installation before node-loss RPO 0 is claimed.
-- **R3-004** removes the host tuple store, `CachedShardPkIndex`, and host DML/constraint fallback only after
-  **R3-002/003**, **DUR-001/002**, and **RETIRE-002** pass. **HA-001** is additionally required only for a
-  replicated/node-loss-RPO deployment; it is not a prerequisite to standalone host-store deletion.
+- Host write/store/index authority retirement is complete after **R3-002/003** and **DUR-002** acceptance. The
+  RPO-preserving reverse-gather repair boundary remains explicit until **RETIRE-002** replaces it; **DUR-001** adds
+  automatic checkpoint/PITR policy independently. **HA-001** is additionally required only for a replicated/
+  node-loss-RPO deployment.
 - **RETIRE-002** removes reverse-gather, deauthorization, and host reconstruction after device-native repair exists.
 - **CFG-001** reckons internal setters and losing arms when their replacement path is complete; this ADR does not
   turn internal A/B gates into product configuration.
@@ -1315,10 +1316,9 @@ representation gate.
 
 ### Post-acceptance implementation graduation
 
-After acceptance, **R3-002/003**, **DUR-001/002**, and **RETIRE-002** implement and qualify the standalone
-contract; **HA-001** additionally qualifies replicated/node-loss-RPO deployment. Before the canonical standalone
-path can become production authority or **R3-004** can delete the host recovery store, implementation evidence must
-include:
+After acceptance, **R3-002/003** and **DUR-002** qualified the canonical standalone write authority; the evidence
+below also governs later **DUR-001** and **RETIRE-002** work. **HA-001** additionally qualifies replicated/
+node-loss-RPO deployment. The accepted implementation evidence includes:
 
 - the selected append/tombstone W1/T8/T32 SLO matrices repeated on canonical bytes and controllers, with INSERT,
   UPDATE, DELETE, declared I/U/D mix, and each transaction envelope passing independently; mixed read/write runs also

@@ -621,9 +621,7 @@ fn p8_batched_multi_column_projection_matches_per_query_for_more_than_one_warp_o
     // sort the batched scatter would emit a non-deterministic permutation (caught by the exact
     // comparison and the 25× loop), and it would differ from the per-query path.
     let mut e = Engine::new_local_cpu_oracle();
-    // THE FLIP: the retained-jobs API is the SINGLE-BUFFER lpb layer (sharded tables are served by
-    // the sharded batched gather in production) — pin the layer under test.
-    e.set_shard_residency_enabled(false);
+    // R3-004: the retained API must preserve stable row order over the authoritative shard set.
     e.execute_text(1, "CREATE TABLE t (k INT, seq INT)")
         .unwrap();
     const NEEDLE: i32 = 7;
@@ -660,7 +658,10 @@ fn p8_batched_multi_column_projection_matches_per_query_for_more_than_one_warp_o
         );
         return;
     }
-    assert_eq!(route.query_shape, "int4_equality_multi_column_projection");
+    assert_eq!(
+        route.query_shape,
+        "sharded_int4_equality_multi_column_projection"
+    );
 
     // Ascending-by-row reference (independent of either GPU path).
     let expected: Vec<Vec<SqlValue>> = (0..rows)
@@ -767,7 +768,10 @@ fn p8_batched_mixed_column_projection_matches_per_query_for_more_than_one_warp_o
         );
         return;
     }
-    assert_eq!(route.query_shape, "int4_equality_mixed_column_projection");
+    assert_eq!(
+        route.query_shape,
+        "sharded_int4_equality_mixed_column_projection"
+    );
 
     let expected: Vec<Vec<SqlValue>> = (0..rows)
         .filter(|row| row % 2 == 0)

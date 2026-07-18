@@ -83,7 +83,6 @@ fn vacuum_auto_trigger_rebuilds_elided_table_and_reelides() {
     let e = Engine::new_local();
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
-    e.set_host_install_elision_enabled(true);
     e.set_auto_vacuum_enabled(true);
     e.set_tombstone_churn_threshold_override(3);
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
@@ -103,7 +102,7 @@ fn vacuum_auto_trigger_rebuilds_elided_table_and_reelides() {
         .unwrap();
     seq += 1;
     assert!(
-        e.table_install_elided("t"),
+        e.table_device_authoritative("t"),
         "precondition: elided before the churn"
     );
     // Three single-key updates = 3 tombstone stamps -> the third commit crosses the forced
@@ -143,7 +142,7 @@ fn vacuum_auto_trigger_rebuilds_elided_table_and_reelides() {
     e.execute_text(seq, "INSERT INTO t (id, v) VALUES (502, 5020)")
         .unwrap();
     assert!(
-        e.table_install_elided("t"),
+        e.table_device_authoritative("t"),
         "the table must RE-ENTER elision after the vacuum (the normal entry path)"
     );
     assert_eq!(
@@ -157,17 +156,15 @@ fn vacuum_auto_trigger_rebuilds_elided_table_and_reelides() {
 }
 
 /// RETIREMENT A4c — the DEVICE GATHER differential: `gather_resident_table_rows_from_device`
-/// (the re-admit / de-elision rebuild source) == the host store's visible rows, (row_id, row)
-/// for (row_id, row), across the full write lineage (admission, SV5 version-split update,
+/// matches the closed-form visible `(row_id, row)` set across the full write lineage (admission,
+/// SV5 version-split update,
 /// tombstoned DELETE, post-churn append, multi-row A4b update). The gather must SKIP
 /// tombstoned/old-version slots and carry every identity; a NULL-bearing table must DECLINE.
 /// Sabotage: invert the visibility filter and the tombstoned rows surface -> FAIL.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn a4c_device_gather_matches_host_store() {
+fn a4c_device_gather_matches_closed_form_state() {
     let e = Engine::new_local();
-    // Host-store oracle premise pinned (see a1_device_row_identity_matches_host_store).
-    e.set_host_install_elision_enabled(false);
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
@@ -199,26 +196,18 @@ fn a4c_device_gather_matches_host_store() {
     let mut got = e
         .gather_resident_table_rows_from_device(&table, now)
         .expect("the gather must ANSWER for a clean int4 lineage (else A4c is vacuous)");
-    // Host oracle: the seq-scan at the same snapshot, (row_id from key, decoded row).
-    let table_rows = e.read_state.mvcc.table_rows("accounts");
-    let prefix = relational_key_prefix("accounts");
-    let mut want: Vec<(u64, Vec<SqlValue>)> = Vec::new();
-    let mut cursor = table_rows
-        .store()
-        .seq_scan_open(crate::StorageVisibility { read_txn_id: now })
-        .unwrap();
-    while let Some(tuple) = cursor.next() {
-        if !tuple.key.starts_with(&prefix) {
-            continue;
-        }
-        let row_id = parse_relational_row_id(&tuple.key, &prefix)
-            .expect("every stored key parses (A1 invariant)");
-        want.push((
-            row_id,
-            decode_relational_row(&tuple.value, &table.columns).unwrap(),
-        ));
-    }
-    drop(cursor);
+    let mut want = (0_i32..200)
+        .filter(|id| *id != 42)
+        .map(|id| {
+            let balance = match id {
+                10 | 11 => 1,
+                130 => 9999,
+                _ => id * 10,
+            };
+            ((id as u64) + 1, vec![SqlValue::Int4(id), SqlValue::Int4(balance)])
+        })
+        .collect::<Vec<_>>();
+    want.push((201, vec![SqlValue::Int4(500), SqlValue::Int4(5000)]));
     got.sort_by_key(|(row_id, _)| *row_id);
     want.sort_by_key(|(row_id, _)| *row_id);
     assert_eq!(
@@ -228,7 +217,7 @@ fn a4c_device_gather_matches_host_store() {
     );
     assert_eq!(
         got, want,
-        "device gather == host store, identity for identity"
+        "device gather == closed-form state, identity for identity"
     );
 
     // NULL-bearing table: the gather is now NULL-AWARE (the ADR-006 alignment-free
@@ -256,8 +245,8 @@ fn a4c_device_gather_matches_host_store() {
 
 /// RETIREMENT A4b — MULTI-ROW incremental DML: multi-row UPDATE/DELETE commits are handled
 /// IN PLACE (per-row exact-1 locate+tombstone, one batched identity-stamped append) instead of
-/// the O(table) invalidate+re-admit. Twin-engine differential (incremental ON vs OFF=re-admit
-/// oracle) over multi-row UPDATE, multi-row DELETE, and an unchanged-values UPDATE; MECHANISM
+/// the O(table) invalidate+re-admit. Closed-form differential over multi-row UPDATE, multi-row
+/// DELETE, and an unchanged-values UPDATE; MECHANISM
 /// pin: every pre-statement device buffer SURVIVES on the incremental engine (a re-admit
 /// replaces all ptrs — output equality alone cannot see the fallback, the A2 lesson); IDENTITY
 /// pin: after the multi-row UPDATE each new version materializes (A4a) to exactly the host row
@@ -266,11 +255,9 @@ fn a4c_device_gather_matches_host_store() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn a4b_multi_row_dml_stays_incremental_and_matches_oracle() {
-    let load = |e: &Engine, incremental: bool| {
+    let load = |e: &Engine| {
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.set_resident_delete_tombstone_enabled(incremental);
-        e.set_resident_update_tombstone_enabled(incremental);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
         for i in 0..200_i64 {
@@ -292,13 +279,7 @@ fn a4b_multi_row_dml_stays_incremental_and_matches_oracle() {
         "UPDATE accounts SET balance = 1234 WHERE id = 40 OR id = 41",
     ];
     let e = Engine::new_local();
-    // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-    e.set_host_install_elision_enabled(false);
-    load(&e, true);
-    let o = Engine::new_local();
-    // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-    o.set_host_install_elision_enabled(false);
-    load(&o, false);
+    load(&e);
     let ptrs_before: Vec<(u32, u64)> = {
         let shards = e
             .read_state
@@ -323,7 +304,6 @@ fn a4b_multi_row_dml_stays_incremental_and_matches_oracle() {
     };
     for (seq, sql) in (300_u64..).zip(&statements) {
         e.execute_text(seq, sql).unwrap();
-        o.execute_text(seq, sql).unwrap();
     }
     for (shard_id, ptr) in &ptrs_before {
         let survived = e
@@ -342,24 +322,28 @@ fn a4b_multi_row_dml_stays_incremental_and_matches_oracle() {
         .unwrap()
         .rows
         .into_boxed();
-    let want = o
-        .execute_relational_select_text("SELECT id, balance FROM accounts")
-        .unwrap()
-        .rows
-        .into_boxed();
-    // The oracle re-admits (all-live rebuild) so its row ORDER can differ; compare as multisets.
     let mut got_rows = got;
-    let mut want_rows = want;
+    let mut want_rows = (0_i32..200)
+        .filter(|id| !matches!(id, 20..=22))
+        .map(|id| {
+            let balance = match id {
+                10 | 11 => 7777,
+                30 => 300,
+                40 | 41 => 1234,
+                _ => id * 10,
+            };
+            vec![SqlValue::Int4(id), SqlValue::Int4(balance)]
+        })
+        .collect::<Vec<_>>();
     got_rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
     want_rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
     assert_eq!(
         got_rows, want_rows,
-        "incremental multi-row DML == re-admit oracle"
+        "incremental multi-row DML == closed-form relational result"
     );
-    // IDENTITY pin (A4a composition): each updated key's visible version materializes from the
-    // device to exactly the host row fetched by its derived key.
+    // IDENTITY pin (A4a composition): each updated key has exactly one visible device version,
+    // carries the original entity identity, and materializes to the closed-form row image.
     let table = e.relational_catalog_table("accounts").unwrap();
-    let table_rows = e.read_state.mvcc.table_rows("accounts");
     let now = e.committed_seq();
     for id in [10_i32, 11, 40, 41, 30] {
         let hits = e
@@ -382,18 +366,17 @@ fn a4b_multi_row_dml_stays_incremental_and_matches_oracle() {
             .read_resident_i32_column(u64::from(region.0.slot) * 8, 2)
             .unwrap();
         let row_id = (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
-        let host = table_rows
-            .store()
-            .tuple_fetch_by_key(
-                &relational_row_key("accounts", row_id),
-                crate::StorageVisibility { read_txn_id: now },
-            )
-            .unwrap()
-            .map(|tuple| decode_relational_row(&tuple.value, &table.columns).unwrap());
+        assert_ne!(row_id, u64::MAX, "id {id}: device identity is populated");
+        let expected_balance = match id {
+            10 | 11 => 7777,
+            30 => 300,
+            40 | 41 => 1234,
+            _ => unreachable!(),
+        };
         assert_eq!(
-            host.as_ref(),
-            Some(&visible[0]),
-            "id {id}: device == host by derived key"
+            visible[0],
+            vec![SqlValue::Int4(id), SqlValue::Int4(expected_balance)],
+            "id {id}: device materialization matches the committed row image"
         );
     }
 }
@@ -410,8 +393,6 @@ fn a4b_concurrent_reader_exactly_once_under_multi_row_update_load() {
     let e = Engine::new_local();
     e.set_shard_residency_enabled(true);
     e.set_auto_admit_on_commit(true);
-    e.set_resident_delete_tombstone_enabled(true);
-    e.set_resident_update_tombstone_enabled(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
         .unwrap();
@@ -472,19 +453,16 @@ fn a4b_concurrent_reader_exactly_once_under_multi_row_update_load() {
 /// RETIREMENT A4a — the DEVICE MATERIALIZATION differential: for located hits across every
 /// write lineage (admission, SV5 update version-split + re-update chain, DELETE tombstone,
 /// post-churn append) and MULTIPLE time-travel snapshots (pre/at/post each commit),
-/// `materialize_resident_row_via_hit` == the host `tuple_fetch_by_key` at the same
-/// `read_txn_id`: visible rows carry IDENTICAL values, invisible slots answer `Some(None)`
-/// exactly where the host fetch misses. This is the primitive that REPLACES the host fetch
-/// when A4e elides installs — the visibility boundary (`created_by <= t < deleted_by`) is the
+/// `materialize_resident_row_via_hit` matches the closed-form state at the same `read_txn_id`:
+/// visible rows carry exact values and invisible slots answer `Some(None)`. The visibility
+/// boundary (`created_by <= t < deleted_by`) is the
 /// load-bearing edge, probed AT the exact commit seqs. A NULL-bearing shard must DECLINE
 /// (`None`, the M3 raw-i32 discipline). Sabotage: relax `read_txn_id < deleted_by` to `<=`
 /// and the at-boundary probes see tombstoned rows -> FAIL.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn a4a_device_materialization_matches_host_fetch() {
+fn a4a_device_materialization_matches_version_boundaries() {
     let e = Engine::new_local();
-    // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
-    e.set_host_install_elision_enabled(false);
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
@@ -515,7 +493,6 @@ fn a4a_device_materialization_matches_host_fetch() {
     let t_latest = e.committed_seq();
 
     let table = e.relational_catalog_table("accounts").unwrap();
-    let table_rows = e.read_state.mvcc.table_rows("accounts");
     let snapshots = [
         t_admitted,
         t_update - 1,
@@ -541,18 +518,6 @@ fn a4a_device_materialization_matches_host_fetch() {
             }
             let mut device_visible: Vec<Vec<SqlValue>> = Vec::new();
             for hit in &hits {
-                // Host oracle for THIS slot: the derived key fetched at the same snapshot.
-                let region = hit.row_id.as_ref().expect("identity region present");
-                let halves = region
-                    .read_resident_i32_column(u64::from(hit.slot) * 8, 2)
-                    .unwrap();
-                let row_id = (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
-                let key = relational_row_key("accounts", row_id);
-                let host = table_rows
-                    .store()
-                    .tuple_fetch_by_key(&key, crate::StorageVisibility { read_txn_id: txn })
-                    .unwrap()
-                    .map(|tuple| decode_relational_row(&tuple.value, &table.columns).unwrap());
                 let device = e
                     .materialize_resident_row_via_hit(&table, hit, txn)
                     .unwrap_or_else(|| {
@@ -565,41 +530,32 @@ fn a4a_device_materialization_matches_host_fetch() {
                 // only the visible direction, and per-(id, txn) the visible SETS must match.
                 match device {
                     Some(row) => {
-                        assert_eq!(
-                            Some(&row),
-                            host.as_ref(),
-                            "id {id} txn {txn} slot {}: device row == host fetch",
-                            hit.slot
-                        );
                         device_visible.push(row);
                         visible_checked += 1;
                     }
                     None => invisible_checked += 1,
                 }
             }
-            // Set-level: the host sees the id at txn ⟺ EXACTLY ONE device slot is visible.
-            let host_row = table_rows
-                .store()
-                .tuple_fetch_by_key(
-                    &relational_row_key(
-                        "accounts",
-                        // any hit's row_id resolves the same logical row for this unique id
-                        {
-                            let region = hits[0].row_id.as_ref().unwrap();
-                            let halves = region
-                                .read_resident_i32_column(u64::from(hits[0].slot) * 8, 2)
-                                .unwrap();
-                            (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32)
-                        },
-                    ),
-                    crate::StorageVisibility { read_txn_id: txn },
-                )
-                .unwrap();
+            let expected = match id {
+                130 => Some(vec![
+                    SqlValue::Int4(130),
+                    SqlValue::Int4(if txn < t_update { 1300 } else { 9999 }),
+                ]),
+                42 if txn >= t_delete => None,
+                42 => Some(vec![SqlValue::Int4(42), SqlValue::Int4(420)]),
+                500 => Some(vec![SqlValue::Int4(500), SqlValue::Int4(5000)]),
+                7 => Some(vec![SqlValue::Int4(7), SqlValue::Int4(70)]),
+                60 => Some(vec![SqlValue::Int4(60), SqlValue::Int4(600)]),
+                _ => unreachable!(),
+            };
             assert_eq!(
                 device_visible.len(),
-                usize::from(host_row.is_some()),
-                "id {id} txn {txn}: exactly one visible slot iff the host sees the row"
+                usize::from(expected.is_some()),
+                "id {id} txn {txn}: exactly one slot is visible when the entity exists"
             );
+            if let Some(expected) = expected {
+                assert_eq!(device_visible[0], expected, "id {id} txn {txn}: exact row image");
+            }
         }
     }
     assert!(
@@ -613,8 +569,7 @@ fn a4a_device_materialization_matches_host_fetch() {
 
     // Date column (audit A4 F1, LIFTED by type-coverage track 2): Date/Int2 share the
     // device i32 section; the materializer now derives the SqlValue variant from the
-    // CATALOG column type — the materialized row must carry `Date(days)` matching the host
-    // fetch EXACTLY (the F1 mistype `Int4(days)` would fail this equality).
+    // CATALOG column type — the materialized row must carry `Date(days)` exactly.
     e.execute_text(390, "CREATE TABLE dd (id INT, d DATE)")
         .unwrap();
     e.execute_text(
@@ -623,7 +578,6 @@ fn a4a_device_materialization_matches_host_fetch() {
     )
     .unwrap();
     let dd_table = e.relational_catalog_table("dd").unwrap();
-    let dd_rows = e.read_state.mvcc.table_rows("dd");
     let mut date_typed_checked = false;
     if let Some(hits) = e.locate_resident_pk_via_shard_index_detailed(&dd_table, 0, 1) {
         for hit in &hits {
@@ -636,25 +590,12 @@ fn a4a_device_materialization_matches_host_fetch() {
                 "the d column must materialize as Date, not Int4 (got {:?})",
                 device_row[1]
             );
-            let host_row = {
-                let region = hit.row_id.as_ref().unwrap();
-                let halves = region
-                    .read_resident_i32_column(u64::from(hit.slot) * 8, 2)
-                    .unwrap();
-                let row_id = (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
-                let tuple = dd_rows
-                    .store()
-                    .tuple_fetch_by_key(
-                        &relational_row_key("dd", row_id),
-                        crate::StorageVisibility {
-                            read_txn_id: e.committed_seq(),
-                        },
-                    )
-                    .unwrap()
-                    .expect("host row exists");
-                decode_relational_row(&tuple.value, &dd_table.columns).unwrap()
-            };
-            assert_eq!(device_row, host_row, "typed device row == host fetch");
+            let days = gpu_db_sql::datetime::parse_date("2026-07-02").unwrap();
+            assert_eq!(
+                device_row,
+                vec![SqlValue::Int4(1), SqlValue::Date(days)],
+                "typed device row == closed-form date row"
+            );
             date_typed_checked = true;
         }
     }

@@ -737,14 +737,22 @@ impl IntentLaneState {
     /// and applied (including pre-activation); publishing `base_seq + cut`
     /// would expose the next, uncovered slot.
     pub(crate) fn visible_inclusive_seq(&self) -> Result<Option<u64>, crate::EngineError> {
+        self.visible_boundary().map(|(_, inclusive)| inclusive)
+    }
+
+    /// Capture the lane-local cut and its global inclusive publication boundary from one
+    /// observation. Settlement must use this pair: two independent `durable_cut()` reads can
+    /// straddle another pump's cut advance, otherwise acknowledging against the newer local cut
+    /// while publishing the older global boundary.
+    pub(crate) fn visible_boundary(&self) -> Result<(u64, Option<u64>), crate::EngineError> {
         if !self.activated.load(Ordering::Acquire) {
-            return Ok(None);
+            return Ok((0, None));
         }
-        inclusive_seq_from_exclusive_prefix(
-            self.base_seq.load(Ordering::Acquire),
-            self.visible_local_cut(),
-        )
-        .map_err(|message| crate::EngineError::Durability(message.to_string()))
+        let local_cut = self.visible_local_cut();
+        let inclusive =
+            inclusive_seq_from_exclusive_prefix(self.base_seq.load(Ordering::Acquire), local_cut)
+                .map_err(|message| crate::EngineError::Durability(message.to_string()))?;
+        Ok((local_cut, inclusive))
     }
 
     /// Record a lane wave's applied block and refresh the lock-free mirror.

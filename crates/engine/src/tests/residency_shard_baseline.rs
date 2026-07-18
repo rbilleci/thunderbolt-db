@@ -7,11 +7,10 @@
 fn shard_residency_admit_reads_match_single_buffer() {
     let run = |shard: bool| -> (RowBlock, RowBlock, RowBlock, bool) {
         let mut e = Engine::new_local();
-        // This gate compares two EXPLICIT post-load admissions. Keep fixture construction in the
-        // host store so the production auto-admit/elision flip cannot make an earlier INSERT batch
-        // device-authoritative before the comparison snapshot is requested.
-        e.set_auto_admit_on_commit(false);
-        e.set_shard_residency_enabled(shard);
+        // Normal fixture construction remains shard-authoritative; the legacy read-layout arm
+        // crosses the explicit test repair boundary only after all writes finish.
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_residency_enabled(true);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
         let mut txn = 2u64;
@@ -35,8 +34,9 @@ fn shard_residency_admit_reads_match_single_buffer() {
             .unwrap();
             txn += 1;
         }
-        e.populate_relational_residency_snapshot("accounts")
-            .unwrap();
+        if !shard {
+            install_test_single_buffer_residency(&mut e, "accounts");
+        }
         let in_shards = e
             .read_state
             .residency
@@ -92,7 +92,12 @@ fn shard_residency_admit_reads_match_single_buffer() {
             .unwrap();
         e.populate_relational_residency_snapshot("t").unwrap();
         let shards = e.read_state.residency.shards.load();
-        let shard = &shards.get("t").expect("table admitted as a shard")[0];
+        let shard = shards
+            .get("t")
+            .expect("table admitted as a shard")
+            .iter()
+            .find(|shard| shard.row_count > 0)
+            .expect("table admitted with a non-empty shard");
         assert_eq!(shard.row_count, 3, "live row count");
         assert!(
             shard.capacity > shard.row_count,
@@ -135,10 +140,8 @@ fn shard_residency_flag_flip_clears_opposite_representation() {
             .is_some()
     };
 
-    // OFF -> single buffer.
-    e.set_shard_residency_enabled(false);
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
+    // Explicit test repair -> single buffer.
+    install_test_single_buffer_residency(&mut e, "accounts");
     assert!(
         in_snaps(&e) && !in_shards(&e),
         "OFF admits the single buffer"
@@ -151,10 +154,8 @@ fn shard_residency_flag_flip_clears_opposite_representation() {
         in_shards(&e) && !in_snaps(&e),
         "OFF->ON re-admit must clear the stale snapshot"
     );
-    // Flip OFF -> single buffer; the stale shard must be cleared (the wrong-rows footgun).
-    e.set_shard_residency_enabled(false);
-    e.populate_relational_residency_snapshot("accounts")
-        .unwrap();
+    // Explicit repair back to single buffer; the stale shard must be cleared.
+    install_test_single_buffer_residency(&mut e, "accounts");
     assert!(
         in_snaps(&e) && !in_shards(&e),
         "ON->OFF re-admit must clear the stale shard (else it shadows the fresh snapshot)"
@@ -346,7 +347,12 @@ fn shard_zone_map_prunes_point_lookup() {
     }
     let shard_count = {
         let shards = e.read_state.residency.shards.load();
-        shards.get("accounts").expect("shard-resident").len()
+        shards
+            .get("accounts")
+            .expect("shard-resident")
+            .iter()
+            .filter(|shard| shard.row_count > 0)
+            .count()
     };
     // (1) multiple shards, so a prune to 1 is meaningful.
     assert!(

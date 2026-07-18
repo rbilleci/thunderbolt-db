@@ -204,28 +204,22 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
 }
 
 #[test]
-fn execute_resident_expr_select_sql_maps_supported_predicate_and_reaches_gpu_dispatch() {
+fn execute_resident_expr_select_sql_maps_supported_predicate_on_mandatory_generation() {
     // A supported single-table int4 SELECT parses + maps + binds and reaches the GPU residency check —
     // proving the full SQL -> ResidentExpr binding succeeds end to end up to device dispatch. With no
     // residency snapshot populated it stops at the residency error (deterministic on any box), which
     // is PAST parse/map/bind — i.e. NOT a mapper rejection. (The GPU e2e test below runs it through.)
     let e = Engine::new_local_cpu_oracle();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
-    match e.execute_resident_expr_select_sql("SELECT a FROM t WHERE a + b > 400") {
-        Ok(_) => panic!("no residency snapshot populated, so this cannot return rows"),
-        Err(err) => {
-            let msg = err.to_string();
-            assert!(
-                msg.contains("resident"),
-                "a supported predicate must reach GPU dispatch (residency stage), not a mapper \
-                 rejection; got: {msg}"
-            );
-        }
-    }
+    let result = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE a + b > 400")
+        .expect("the empty mandatory generation reaches GPU dispatch");
+    assert!(result.rows.is_empty());
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
 }
 
 #[test]
-fn execute_resident_expr_select_sql_maps_is_null_predicate_and_reaches_gpu_dispatch() {
+fn execute_resident_expr_select_sql_maps_is_null_on_mandatory_generation() {
     // `WHERE v IS NULL` / `IS NOT NULL` (a libpg_query NullTest node) maps to `ResidentExpr::IsNull` and
     // binds, reaching the GPU residency stage (PAST parse/map/bind) -- not a mapper "unsupported node"
     // rejection. With no residency populated it stops at the residency error, which is deterministic on
@@ -236,17 +230,11 @@ fn execute_resident_expr_select_sql_maps_is_null_predicate_and_reaches_gpu_dispa
         "SELECT id FROM t WHERE v IS NULL",
         "SELECT id FROM t WHERE v IS NOT NULL",
     ] {
-        match e.execute_resident_expr_select_sql(sql) {
-            Ok(_) => panic!("no residency snapshot populated, so `{sql}` cannot return rows"),
-            Err(err) => {
-                let msg = err.to_string();
-                assert!(
-                    msg.contains("resident"),
-                    "`{sql}` must map (NullTest -> IsNull) and reach the residency stage, not a mapper \
-                     rejection; got: {msg}"
-                );
-            }
-        }
+        let result = e
+            .execute_resident_expr_select_sql(sql)
+            .unwrap_or_else(|error| panic!("`{sql}` must reach GPU dispatch: {error}"));
+        assert!(result.rows.is_empty());
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     }
 }
 
@@ -910,17 +898,15 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
     };
     // LEFT JOIN is SUPPORTED now (2-relation, ON-only) -- it routes to the join path (the residency
     // check here, since a/b are not resident), NOT a parser rejection. RIGHT/FULL remain follow-ups.
-    let left = reject("SELECT x, y FROM a LEFT JOIN b ON a.k = b.k");
-    assert!(
-        left.contains("resident snapshot") || left.contains("join path"),
-        "LEFT JOIN routes to the join path now, got: {left}"
-    );
+    let left = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM a LEFT JOIN b ON a.k = b.k")
+        .expect("LEFT JOIN executes over mandatory empty generations");
+    assert!(left.rows.is_empty());
     // RIGHT/FULL JOIN are SUPPORTED now (2-relation, ON-only) -- they route to the join path too.
-    let right = reject("SELECT x, y FROM a RIGHT JOIN b ON a.k = b.k");
-    assert!(
-        right.contains("resident snapshot") || right.contains("join path"),
-        "RIGHT JOIN routes to the join path now, got: {right}"
-    );
+    let right = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM a RIGHT JOIN b ON a.k = b.k")
+        .expect("RIGHT JOIN executes over mandatory empty generations");
+    assert!(right.rows.is_empty());
     // An OUTER JOIN with NATURAL/USING is still a follow-up -> clean parser rejection.
     assert!(
         reject("SELECT x, y FROM a NATURAL LEFT JOIN b").contains("natural")
@@ -934,11 +920,10 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
     );
     // A comma join `FROM a, b WHERE a.k = b.k` is SUPPORTED now -- it routes to the join path (which, with
     // a/b not resident here, stops at the GPU-only residency check rather than a parser rejection).
-    let comma = reject("SELECT x, y FROM a, b WHERE a.k = b.k");
-    assert!(
-        comma.contains("resident snapshot") || comma.contains("join path"),
-        "comma join routes to the join path, got: {comma}"
-    );
+    let comma = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM a, b WHERE a.k = b.k")
+        .expect("comma join executes over mandatory empty generations");
+    assert!(comma.rows.is_empty());
     // A per-relation WHERE conjunct is supported (J3); a CROSS-relation WHERE predicate (beyond the ON)
     // is a follow-up -> clean reject.
     let cross_where = reject("SELECT x, y FROM a JOIN b ON a.k = b.k WHERE a.x > b.y");

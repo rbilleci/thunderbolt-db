@@ -3,6 +3,75 @@
 use super::*;
 
 impl Engine {
+    /// RETIRE-002 bridge for an authoritative hot table that no longer fits its configured
+    /// residency budget. Reverse-gather the exact device generation into the temporary repair
+    /// store, retire the hot allocation, and let the existing streaming scan-build publish
+    /// device-format cold chunks. The caller must subsequently enter chunk authority after a
+    /// complete cold capture; no relational predicate or result is evaluated on the host here.
+    pub(crate) fn transition_oversized_device_table_to_streaming_repair(
+        &self,
+        table_name: &str,
+    ) -> Result<bool, EngineError> {
+        let gpu_id = self.planner.default_gpu_id();
+        let Some(budget) = self.relational_residency_budget_bytes(gpu_id) else {
+            return Ok(false);
+        };
+        if budget == 0 {
+            return Ok(false);
+        }
+        self.transition_device_table_to_streaming_repair_above(table_name, budget)
+    }
+
+    /// Query-working-set variant of the oversized transition. Operators that need substantial
+    /// scratch may set a lower resident-input ceiling than the table-wide residency budget.
+    pub(crate) fn transition_device_table_to_streaming_repair_above(
+        &self,
+        table_name: &str,
+        resident_input_ceiling: u64,
+    ) -> Result<bool, EngineError> {
+        if !self.table_device_authoritative(table_name) {
+            return Ok(false);
+        }
+        let gpu_id = self.planner.default_gpu_id();
+        // Compare the exact retained allocation charge—not logical live-row bytes. Open-shard
+        // capacity, MVCC/identity regions, and device indexes consume real VRAM and must trigger
+        // the transition even when the compact live image alone would appear to fit.
+        if self.relational_resident_table_bytes_for_gpu(table_name, gpu_id)
+            <= resident_input_ceiling
+        {
+            return Ok(false);
+        }
+
+        let _commit_guard = self.commit_state();
+        if !self.table_device_authoritative(table_name) {
+            return Ok(false);
+        }
+        let boundary = self.committed_seq();
+        let Some(table) = self
+            .catalog_snapshot()
+            .relational_catalog
+            .get(table_name)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        self.rehydrate_elided_table(
+            &table,
+            boundary,
+            &Default::default(),
+            &Default::default(),
+            boundary,
+        )?;
+        self.invalidate_relational_residency_table(table_name, boundary, boundary);
+        self.read_state.residency.with_snapshots_mut(|snapshots| {
+            snapshots.remove(table_name);
+        });
+        self.read_state.residency.with_shards_mut(|shards| {
+            shards.remove(table_name);
+        });
+        Ok(true)
+    }
+
     /// R3-003 bounded device-version GC. A created_by sidecar is redundant once the oldest active
     /// read boundary is at or beyond that shard's stamp high-water: every possible reader sees all
     /// its versions as born-visible, and new transactions begin no earlier. Republish current
@@ -49,24 +118,19 @@ impl Engine {
         removable.len()
     }
 
-    /// RETIREMENT A4e (audit B3): rehydrate an elided table FROM AN OFF-COMMIT-LOCK context
-    /// (the CPU-shape read seam, the execute_text DDL entry). `rehydrate_elided_table` mutates the
-    /// host store via COW `with_table_mut` — safe ONLY under the commit lock (writers + other
-    /// rehydrators serialize there; a lost-update would leave the table DE-ELIDED WITH A STALE
-    /// STORE = permanent wrong reads). Mid-commit internal reads (matview refresh) already HOLD
-    /// the lock — detected via the same thread-local that suppresses their leader check — so they
-    /// rehydrate directly (a second acquisition would self-deadlock). The elided-ness RE-CHECK
-    /// under the lock closes the race with a rehydrator that won the lock first.
+    /// RETIRE-002 repair entry for an off-commit-lock caller. It reverse-gathers the authoritative
+    /// device generation into the temporary DDL/vacuum/recovery representation under the commit
+    /// lock. Normal DML and production reads never call this as a fallback. Mid-commit repair work
+    /// already holds the lock, so the thread-local internal-read marker selects the direct arm and
+    /// avoids a non-reentrant acquisition.
     /// VACUUM #5 (A5 gate): REBUILD a churned table's residency DENSE + ALL-LIVE — reclaims
     /// tombstoned slots and stale duplicate physical keys (an SV5/A4b update-append leaves the
     /// old version's slot holding the key, which dup-declines the per-shard PK index until a
     /// rebuild changes the buffer ptr — the monotone decline clears BY DESIGN on a new
-    /// generation). Composition of audited pieces: an ELIDED table first REHYDRATES (the A4c
-    /// device gather is the truth; the host store is a stale prefix), then the standard
-    /// invalidate + re-admit rebuilds dense from the now-complete store; a non-elided table's
-    /// store is already complete, so it skips straight to the rebuild. The table RE-ENTERS
-    /// elision on its next handled commit (the normal entry path) — vacuum does not special-case
-    /// it. Runs under the COMMIT LOCK (the same discipline as `rehydrate_elided_serialized`; the
+    /// generation). Composition of audited pieces: an authoritative table reverse-gathers its
+    /// device truth across the explicit repair boundary, then invalidate + rebuild publishes a
+    /// dense replacement. Runs under the COMMIT LOCK (the same discipline as
+    /// `rehydrate_elided_serialized`; the
     /// mid-commit-read detection makes an auto-trigger from inside a commit safe). The churn
     /// counter resets so the auto-trigger re-arms.
     ///
@@ -98,7 +162,7 @@ impl Engine {
             {
                 return Ok(());
             }
-            if engine.table_install_elided(table_name) {
+            if engine.table_device_authoritative(table_name) {
                 engine.rehydrate_elided_table(
                     &table,
                     current,
@@ -192,7 +256,7 @@ impl Engine {
 
     pub(crate) fn rehydrate_elided_serialized(&self, table_name: &str) -> Result<(), EngineError> {
         let rehydrate = |engine: &Self| -> Result<(), EngineError> {
-            if !engine.table_install_elided(table_name) {
+            if !engine.table_device_authoritative(table_name) {
                 return Ok(()); // another rehydrator won the race
             }
             // PUBLISHED-SNAPSHOT catalog read, NEVER `relational_catalog_table` (audit f80f2350
@@ -228,72 +292,11 @@ impl Engine {
         rehydrate(self)
     }
 
-    /// RETIREMENT A4e: REHYDRATE an elided table — the STICKY DE-ELISION transition. The A4c
-    /// gather (at `read_txn`, the last seq whose state the device fully holds) repopulates the
-    /// host tuple store + value indexes THROUGH the normal install path (clearing the stale
-    /// pre-elision prefix first), then the table LEAVES the elided set. Callers: a DML
-    /// prepare/probe whose device resolve declines on an elided table (then the host path
-    /// proceeds, always correct), and the commit arm's !handled fallback (then the re-admit
-    /// rebuilds from the now-complete store). `extra_rows` carries an in-flight commit's rows
-    /// (the mutation the device could NOT absorb — e.g. a NULL append) that the gather at
-    /// `read_txn = C-1` cannot see. Returns Err when the gather declines — for an elided table
-    /// that is a broken invariant (elision eligibility ⊆ gather eligibility), and failing LOUDLY
-    /// beats a silently incomplete store.
-    /// U1: resolve elided rows' identities BY int4 KEY against the device gather at `read_txn`
-    /// — the rare lane-delete fallback's removal set (the tombstones' (shard, slot) targets are
-    /// exactly what a declined/stale device generation can no longer be trusted for; the KEY is
-    /// generation-independent). `keys` are `(column_index, value)`; a key with no visible match
-    /// at `read_txn` resolves to nothing (its delete was against a row this gather cannot see —
-    /// impossible for a wave-located 1-row target, but the resolve is total rather than lossy).
-    /// Returns `(row-id removals for the rehydrate, matched KEY -> stable entity id)`. The map
-    /// lets DELETE report rows affected and lets UPDATE preserve the old version's identity for
-    /// its appended replacement. A duplicate key mapping to different identities is an invariant
-    /// failure, never an arbitrary host-side choice.
-    pub(crate) fn resolve_elided_row_ids_by_int4_key(
-        &self,
-        table: &RelationalTable,
-        read_txn: u64,
-        keys: &[(usize, i32)],
-    ) -> Result<
-        (
-            std::collections::BTreeSet<u64>,
-            std::collections::HashMap<i32, u64>,
-        ),
-        EngineError,
-    > {
-        if keys.is_empty() {
-            return Ok(Default::default());
-        }
-        let gathered = self
-            .gather_resident_table_rows_from_device(table, read_txn)
-            .ok_or_else(|| {
-                EngineError::ApplyFailed(format!(
-                    "tombstone key-resolution gather declined for elided table \"{}\"",
-                    table.name
-                ))
-            })?;
-        let mut removals = std::collections::BTreeSet::new();
-        let mut matched = std::collections::HashMap::new();
-        for (row_id, values) in &gathered {
-            for &(column, key) in keys {
-                if values.get(column) == Some(&SqlValue::Int4(key)) {
-                    removals.insert(*row_id);
-                    if matched
-                        .insert(key, *row_id)
-                        .is_some_and(|prior| prior != *row_id)
-                    {
-                        return Err(EngineError::ApplyFailed(format!(
-                            "unique key {key} resolved to multiple entity identities while \
-                             rehydrating table \"{}\"",
-                            table.name
-                        )));
-                    }
-                }
-            }
-        }
-        Ok((removals, matched))
-    }
-
+    /// RETIRE-002 reverse-gather core. It reconstructs the temporary host repair representation
+    /// from one device generation and then clears device authority. `upserts`/`removals` are kept
+    /// for representation-changing repair callers; normal DML must publish in place or fail stop
+    /// before acknowledgement. A gather decline is an invariant failure, never permission to use
+    /// stale host tuples.
     pub(crate) fn rehydrate_elided_table(
         &self,
         table: &RelationalTable,
@@ -383,21 +386,18 @@ impl Engine {
             }
             Ok::<(), EngineError>(())
         })?;
-        self.set_table_install_elided(&table.name, false);
+        self.set_table_device_authoritative(&table.name, false);
         Ok(())
     }
 
-    /// RETIREMENT A4c: gather a shard-resident table's VISIBLE rows + identities ENTIRELY FROM
-    /// THE DEVICE — the rebuild source that replaces the host store for re-admits and for the
-    /// eligibility de-elision transition once A4e stops installing host rows. Per shard: one bulk
+    /// RETIRE-002: gather a shard-resident table's VISIBLE rows + identities ENTIRELY FROM
+    /// THE DEVICE for an explicit DDL/vacuum/recovery repair transition. Per shard: one bulk
     /// DtoH per int4 column + the row_id/deleted_by/created_by regions, then the host-side
     /// SV3b/SV6 visibility filter (`created_by <= read_txn < deleted_by`) — an amortized-once
     /// control-plane readback (the DATA SOURCE is the device generation, not host tuples); the
     /// device-to-device recompaction that avoids the round-trip is the ledgered follow-up.
-    /// Returns rows in (shard, slot) order with their identities. `None` = DECLINE (caller must
-    /// use the host store): invalid/mismatched shard, null-bearing shard (raw i32 would alias
-    /// NULL as 0), non-strictly-Int4 table (Date/Int2 would mistype — the A4a F1 discipline), a
-    /// missing identity region, an UNSTAMPED live slot (identity hole), or a device-read failure.
+    /// Returns rows in (shard, slot) order with their identities. `None` means the repair cannot
+    /// prove a complete device source and must fail loudly; it is never a host-fallback signal.
     /// Same born-visible contract as A4a, PLUS snapshot freshness (audit A4c F2): callers must
     /// run on the SERIALIZED commit path with `read_txn` >= every INSERT-appended slot's commit
     /// AND the loaded shard snapshot already reflecting every commit <= `read_txn` (re-admit

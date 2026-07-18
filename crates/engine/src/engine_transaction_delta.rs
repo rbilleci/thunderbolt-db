@@ -212,7 +212,7 @@ impl Engine {
         let snapshot = self
             .transaction_snapshot_handle(txn_id)
             .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
-        // A classic wave installs its device/host generations before its durability tail publishes
+        // A classic wave installs its device generation before its durability tail publishes
         // `committed_seq`. Explicit-transaction row/unique/FK validation must not inspect that
         // applied-but-unpublished interval. Drain first, then prove under the commit lock that no
         // sequencer handed off a new tail in the acquisition gap; retry until the cut is settled.
@@ -226,11 +226,7 @@ impl Engine {
                 .commit_wave
                 .tails_finished
                 .load(AtomicOrdering::Acquire);
-            let maintenance_pending = self
-                .commit_wave
-                .tail_maintenance_pending
-                .load(AtomicOrdering::Acquire);
-            if applied == finished && maintenance_pending == 0 {
+            if applied == finished {
                 // The tail that satisfied the barrier may have wedged while this COMMIT waited.
                 // Recheck while holding the publication lock, before allocator identity claims,
                 // WAL append, catalog mutation, or any transaction-visible state transition.
@@ -559,6 +555,10 @@ impl Engine {
         deltas: &[WriteDelta],
         provisional_inserts: &BTreeSet<(String, u64)>,
     ) -> Result<(), ExecuteError> {
+        debug_assert!(
+            self.current_transaction_read_snapshot().is_none(),
+            "COMMIT conflict validation must bind the current device generation"
+        );
         let current_boundary = self.committed_seq();
         let mut checked = BTreeSet::new();
         for delta in deltas {
@@ -631,17 +631,50 @@ impl Engine {
                     .enumerate()
                     .map(|(idx, value)| (idx, SelectFilterOp::Eq, value.clone()))
                     .collect::<Vec<_>>();
-                let Some((key_id, needle)) = self.dml_device_probe_key(table, &filters) else {
-                    return Err(ExecuteError::Serialization(format!(
-                        "device write-conflict verdict unavailable for relation \"{table_name}\""
-                    )));
-                };
-                let Some(hits) =
+                let probe = self.dml_device_probe_key(table, &filters);
+                let indexed = probe.and_then(|(key_id, needle)| {
                     self.locate_resident_pk_via_shard_index_detailed(table, key_id, needle)
-                else {
-                    return Err(ExecuteError::Serialization(format!(
-                        "device write-conflict verdict unavailable for relation \"{table_name}\""
-                    )));
+                });
+                let hits = match indexed {
+                    Some(hits) if !hits.is_empty() => hits,
+                    _ => {
+                        // Version churn can make a unique index decline because old and new
+                        // physical slots share a key. Scan the same probe key structurally when
+                        // possible; it may return multiple versions, which the identity, creation
+                        // stamp, and full-row materialization checks below disambiguate exactly.
+                        let key_cols = if let Some((key_id, _)) = probe {
+                            let Some(value) = expected_row.get(key_id) else {
+                                return Err(ExecuteError::Serialization(format!(
+                                    "device write-conflict predicate unavailable for relation \"{table_name}\""
+                                )));
+                            };
+                            vec![(key_id, value.clone())]
+                        } else {
+                            expected_row
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, value)| (idx, value.clone()))
+                                .collect::<Vec<_>>()
+                        };
+                        let Some(predicates) =
+                            crate::engine_dml_prepare::device_structural_tuple_predicates(
+                                table, &key_cols,
+                            )
+                        else {
+                            return Err(ExecuteError::Serialization(format!(
+                                "device write-conflict predicate unavailable for relation \"{table_name}\""
+                            )));
+                        };
+                        let Some(hits) = self
+                            .locate_resident_conjunct_slots_detailed(table, &predicates)
+                            .or_else(|| self.locate_resident_all_slots_detailed(table))
+                        else {
+                            return Err(ExecuteError::Serialization(format!(
+                                "device write-conflict locate unavailable for relation \"{table_name}\""
+                            )));
+                        };
+                        hits
+                    }
                 };
                 let mut matched = 0usize;
                 for hit in hits {

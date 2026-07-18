@@ -163,9 +163,9 @@ impl Engine {
     /// ONE open-shard append pass (rows + per-row created_by stamps + row ids).
     /// The leader lock serializes appends, so the PK-index extension chain
     /// (entry.row_count == base) is preserved exactly as under the old
-    /// exclusive section — just batched across lanes. The non-appended
-    /// fallback mirrors flush_wave_pending_appends' rehydrate/invalidate arm
-    /// using only request-carried data (no CommitWaveItem).
+    /// exclusive section — just batched across lanes. Any non-appended or incompletely stamped
+    /// durable request fails closed before acknowledgement; the lane never dispatches to a host
+    /// representation.
     pub(super) fn lane_apply_merged(&self, batch: &mut [crate::engine_intent_lanes::ApplyRequest]) {
         // P4-2b (audit L5): a CHUNK-AUTHORITATIVE table must be unreachable here — lane ingress
         // needs a covered/keyed route a keyless class table cannot build. Assert the invariant a
@@ -216,154 +216,30 @@ impl Engine {
                     crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
                     Some(&row_ids),
                 );
-            if appended
-                && !rows.is_empty()
-                && self.host_install_elision_enabled()
-                && !self.table_install_elided(table)
-            {
+            if appended && !rows.is_empty() && !self.table_device_authoritative(table) {
                 {
                     let snapshot = self.catalog_snapshot();
-                    if self.table_elision_eligible(&snapshot, table) {
-                        self.set_table_install_elided(table, true);
+                    if self.table_device_authority_eligible(&snapshot, table) {
+                        self.set_table_device_authoritative(table, true);
                     }
                 }
             }
-            // LOCATE + tombstone deletes on the device (only if the append path is intact — a
-            // failed append means the whole batch rehydrates anyway). Sets each delete's
-            // rows-affected cell (0 or 1). A decline routes to the rehydrate fallback, which
-            // resolves rows-affected BY KEY.
+            // LOCATE + tombstone deletes on the device. Sets each delete's rows-affected cell
+            // (0 or 1) only after the complete device verdict is available.
             let deletes_ok = tombstones.is_empty()
                 || (appended && self.apply_lane_tombstones_device(table, &tombstones));
             // U2 WAL-FIRST: LOCATE the update-olds, tombstone them, and CONDITIONALLY append the
             // new versions (only the 1-row updates append). Sets each update's rows-affected cell
-            // (0 or 1). Runs only if the insert append succeeded (a failed append rehydrates the
-            // whole batch anyway); a decline routes to the rehydrate fallback (by-key resolution).
+            // (0 or 1). A decline poisons the lane apply; WAL replay retries in a fresh context.
             let updates_ok =
                 updates.is_empty() || (appended && self.apply_lane_updates_device(table, &updates));
             if appended && deletes_ok && updates_ok {
                 continue;
             }
-            // AUDIT F1 (U1, MEDIUM adopted): a delete/update decline on a NON-elided table has no
-            // recovery arm below — falling through would advance the cut and ack for a mutation
-            // that never applied (silent live/durable divergence until restart). Fail LOUDLY:
-            // the panic rides the apply leader's catch_unwind (F2), failing the waiters and
-            // poisoning the lanes; recovery replays the durable W5b records.
-            if (!deletes_ok || !updates_ok) && !self.table_install_elided(table) {
-                panic!(
-                    "commit-path invariant violation: lane deletes/updates declined on the \
-                     non-elided table \"{table}\" — refusing to ack an unapplied mutation"
-                );
-            }
-            // Fallback (rare on the lanes path — intents gate on elided,
-            // auto-admit tables): rehydrate the merged batch as upserts +
-            // key-resolved removals and invalidate per txn, mirroring
-            // flush_wave_pending_appends. U1: the seq window spans appends AND
-            // tombstones; removals are resolved BY KEY against the pre-batch
-            // gather (the tombstones' (shard, slot) targets are exactly what a
-            // declined/stale device state can no longer be trusted for).
-            if self.table_install_elided(table) {
-                let first_seq = stamps
-                    .first()
-                    .copied()
-                    .into_iter()
-                    .chain(tombstones.first().map(|t| t.seq))
-                    .chain(updates.first().map(|u| u.seq))
-                    .min()
-                    .unwrap_or_default();
-                let last_seq = stamps
-                    .last()
-                    .copied()
-                    .into_iter()
-                    .chain(tombstones.last().map(|t| t.seq))
-                    .chain(updates.last().map(|u| u.seq))
-                    .max()
-                    .unwrap_or_default();
-                let gather_snapshot = first_seq.saturating_sub(1);
-                let mut upserts: BTreeMap<u64, Vec<SqlValue>> =
-                    row_ids.iter().copied().zip(rows.iter().cloned()).collect();
-                let catalog_table = self
-                    .relational_catalog_table(table)
-                    .expect("an elided table is in the catalog");
-                let (removals, matched_keys) = self
-                    .resolve_elided_row_ids_by_int4_key(
-                        &catalog_table,
-                        gather_snapshot,
-                        &tombstones
-                            .iter()
-                            .map(|t| (t.filter_idx as usize, t.pk))
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "commit-path invariant violation: tombstone key resolution for \
-                             the merged lane fallback on {table} failed: {err}"
-                        )
-                    });
-                // WAL-FIRST: set each delete's rows-affected from the by-key resolution (the
-                // device locate declined, so this host gather is authoritative). A matched key =
-                // one visible row = the rehydrate removes it = rows-affected 1; else 0.
-                for tombstone in &tombstones {
-                    tombstone.rows_affected.store(
-                        u64::from(matched_keys.contains_key(&tombstone.pk)),
-                        std::sync::atomic::Ordering::Release,
-                    );
-                }
-                // U2/R3 WAL-FIRST fallback: resolve the update-olds BY KEY too. A matched old
-                // supplies the stable entity id reused by the replacement upsert; the old image
-                // is overwritten by identity, not removed under one id and reinserted under a
-                // fresh one. An unmatched update appends nothing. Rows-affected = matched.
-                if !updates.is_empty() {
-                    let (_update_removals, update_entities) = self
-                        .resolve_elided_row_ids_by_int4_key(
-                            &catalog_table,
-                            gather_snapshot,
-                            &updates
-                                .iter()
-                                .map(|u| (u.filter_idx as usize, u.pk))
-                                .collect::<Vec<_>>(),
-                        )
-                        .unwrap_or_else(|err| {
-                            panic!(
-                                "commit-path invariant violation: update key resolution for \
-                                 the merged lane fallback on {table} failed: {err}"
-                            )
-                        });
-                    for update in &updates {
-                        let entity_id = update_entities.get(&update.pk).copied();
-                        if let Some(entity_id) = entity_id {
-                            upserts.insert(entity_id, update.new_values.clone());
-                        }
-                        update.rows_affected.store(
-                            u64::from(entity_id.is_some()),
-                            std::sync::atomic::Ordering::Release,
-                        );
-                    }
-                }
-                self.rehydrate_elided_table(
-                    &catalog_table,
-                    gather_snapshot,
-                    &upserts,
-                    &removals,
-                    last_seq,
-                )
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "commit-path invariant violation: elided rehydration for the \
-                         merged lane append on {table} failed: {err}"
-                    )
-                });
-            }
-            let residency: std::collections::BTreeSet<String> =
-                std::iter::once(table.to_string()).collect();
-            for &i in &requests {
-                for (offset, txn_id) in batch[i].txn_ids.iter().enumerate() {
-                    self.invalidate_relational_residency_tables_concurrent(
-                        &residency,
-                        *txn_id,
-                        batch[i].stamps[offset],
-                    );
-                }
-            }
+            panic!(
+                "commit-path invariant violation: durable lane DML for relation \"{table}\" \
+                 declined device publication — refusing acknowledgement; WAL replay is required"
+            );
         }
     }
 
@@ -372,8 +248,8 @@ impl Engine {
     /// resolves each to zero or one visible row; the located targets are stamped (scatter,
     /// grouped by shard with the cell-liveness recheck), and every delete's rows-affected cell
     /// is set only on FULL success. Returns `false` on ANY decline (declined locate, ambiguous
-    /// multiplicity, stale cell, stamp failure) WITHOUT setting cells — the caller's rehydrate
-    /// fallback then resolves rows-affected by key. Runs under the apply leader lock.
+    /// multiplicity, stale cell, stamp failure) WITHOUT setting cells — the caller then wedges the
+    /// live commit path and relies on WAL replay. Runs under the apply leader lock.
     fn apply_lane_tombstones_device(
         &self,
         table: &str,
@@ -386,7 +262,7 @@ impl Engine {
         // Covered-delete shape: one unique pk column, so a single (table, filter) group.
         let filter_idx = tombstones[0].filter_idx;
         if tombstones.iter().any(|t| t.filter_idx != filter_idx) {
-            return false; // mixed filters -> fallback (not reachable on the covered shape)
+            return false; // mixed filters are not reachable on the covered shape
         }
         let catalog = self.catalog_snapshot();
         let Some(rel) = catalog.relational_catalog.get(table) else {
@@ -397,7 +273,7 @@ impl Engine {
         let Some(locate) =
             self.wave_batch_visible_locate(rel, filter_idx as usize, &needles, &snapshots)
         else {
-            return false; // device decline -> rehydrate fallback resolves by key
+            return false; // device decline is fatal to this durable live apply
         };
         let expected = tombstones.len();
         if needles.len() != expected
@@ -481,7 +357,8 @@ impl Engine {
     /// reservation was already claimed and remains replayed for format/high-water compatibility. Every
     /// update's rows-affected cell is set only on FULL success. Returns `false` on ANY decline
     /// (declined locate, ambiguous multiplicity, stale cell, stamp/append failure) WITHOUT setting
-    /// cells — the caller's rehydrate fallback then resolves by key. Runs under the apply leader lock.
+    /// cells — the caller then wedges the live commit path and relies on WAL replay. Runs under the
+    /// apply leader lock.
     fn apply_lane_updates_device(
         &self,
         table: &str,
@@ -494,7 +371,7 @@ impl Engine {
         // Covered-update shape: one unique pk column, so a single (table, filter) group.
         let filter_idx = updates[0].filter_idx;
         if updates.iter().any(|u| u.filter_idx != filter_idx) {
-            return false; // mixed filters -> fallback (not reachable on the covered shape)
+            return false; // mixed filters are not reachable on the covered shape
         }
         let catalog = self.catalog_snapshot();
         let Some(rel) = catalog.relational_catalog.get(table) else {
@@ -505,7 +382,7 @@ impl Engine {
         let Some(locate) =
             self.wave_batch_visible_locate(rel, filter_idx as usize, &needles, &snapshots)
         else {
-            return false; // device decline -> rehydrate fallback resolves by key
+            return false; // device decline is fatal to this durable live apply
         };
         let expected = updates.len();
         if needles.len() != expected
@@ -578,9 +455,9 @@ impl Engine {
         }
         // CONDITIONAL new-version append: only the 1-row updates append (0-row updates appended
         // nothing above). The new versions carry created_by = their own seq, so no reader below
-        // the (not-yet-advanced) cut sees them; a decline here leaves the olds tombstoned but the
-        // news unappended — the rehydrate fallback rebuilds the table correctly (gather sees the
-        // old live at first_seq-1, delta removes it + upserts the new version).
+        // the (not-yet-advanced) cut sees them. A decline here leaves a partial unpublished device
+        // generation, so the enclosing lane apply wedges before acknowledgement; recovery rebuilds
+        // from the durable WAL prefix.
         if !append_rows.is_empty()
             && !self.try_append_resident_int4_open_shard(
                 table,
@@ -589,7 +466,7 @@ impl Engine {
                 Some(&append_row_ids),
             )
         {
-            return false; // append decline (rollover / null / not-int4-resident) -> fallback
+            return false; // append decline is fatal to this durable live apply
         }
         // FULL success — publish rows-affected (updates ack from these cells) + churn counters.
         for (update, count) in updates.iter().zip(counts.iter()) {
@@ -621,8 +498,8 @@ impl Engine {
         // would hang their clients forever instead of wedging loudly like the
         // classic path. The probes are lock-free flags; the mutex-walking
         // reason fetch (N poison locks) is paid only on an actual wedge.
-        let visible_seq = lanes.visible_inclusive_seq();
-        if visible_seq.is_err() {
+        let visible_boundary = lanes.visible_boundary();
+        if visible_boundary.is_err() {
             lanes
                 .apply_poisoned
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -633,7 +510,7 @@ impl Engine {
                 .apply_poisoned
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            let reason = if let Err(err) = &visible_seq {
+            let reason = if let Err(err) = &visible_boundary {
                 format!("intent lane visibility boundary invalid: {err}")
             } else if wal_poisoned {
                 let inner = lanes
@@ -659,8 +536,8 @@ impl Engine {
             }
             return settled;
         }
-        let local_cut = lanes.visible_local_cut();
-        if let Some(visible_seq) = visible_seq.expect("visibility error drained above") {
+        let (local_cut, visible_seq) = visible_boundary.expect("visibility error drained above");
+        if let Some(visible_seq) = visible_seq {
             self.publish_committed_seq(visible_seq);
         }
         let mut settled = false;

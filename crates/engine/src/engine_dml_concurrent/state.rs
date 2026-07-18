@@ -1,8 +1,8 @@
 //! Commit-wave and lane item ownership shared by the concurrent DML subpaths.
 
 use super::{
-    AtomicOrdering, AtomicU64, BTreeSet, Command, Engine, EngineError, ExecuteError, Index, Mutex,
-    SqlValue, WriteSet,
+    AtomicOrdering, AtomicU64, Command, Engine, EngineError, ExecuteError, Index, Mutex, SqlValue,
+    WriteSet,
 };
 use std::sync::Arc;
 
@@ -33,7 +33,6 @@ pub(crate) struct CommitWaveItem {
     pub(super) payload: Arc<[u8]>,
     pub(super) write_set: WriteSet,
     pub(super) read_snapshot: Index,
-    pub(super) residency_tables: BTreeSet<String>,
     /// The catalog generation the OFF-LOCK prepare validated against.
     /// The sequencer grants the device-covered re-resolve skip ONLY while the live catalog
     /// still carries this stamp — a constraint-adding DDL (ADD UNIQUE/CHECK) committing
@@ -263,10 +262,6 @@ pub(crate) struct CommitWaveState {
     /// apply-to-deque handoff gap that `tails_handed` cannot witness.
     pub(crate) tails_applied: AtomicU64,
     pub(crate) tails_finished: AtomicU64,
-    /// Post-tail residency maintenance that explicit-transaction quiescence must include. Kept
-    /// separate from `tails_finished` because the sequencer drains durability before doing this
-    /// work; folding it into the capacity counter would self-deadlock.
-    pub(crate) tail_maintenance_pending: AtomicU64,
 }
 
 impl Default for CommitWaveState {
@@ -278,42 +273,14 @@ impl Default for CommitWaveState {
             tails_handed: AtomicU64::new(0),
             tails_applied: AtomicU64::new(0),
             tails_finished: AtomicU64::new(0),
-            tail_maintenance_pending: AtomicU64::new(0),
         }
-    }
-}
-
-/// RAII completion for post-tail residency maintenance. Publishing the obligation before tail
-/// handoff closes the window in which an explicit transaction could observe a finished tail but
-/// validate against the generation that tail is about to replace.
-pub(super) struct TailMaintenanceCompletion<'a> {
-    engine: &'a Engine,
-}
-
-impl<'a> TailMaintenanceCompletion<'a> {
-    pub(super) fn new(engine: &'a Engine) -> Self {
-        engine
-            .commit_wave
-            .tail_maintenance_pending
-            .fetch_add(1, AtomicOrdering::Release);
-        Self { engine }
-    }
-}
-
-impl Drop for TailMaintenanceCompletion<'_> {
-    fn drop(&mut self) {
-        self.engine
-            .commit_wave
-            .tail_maintenance_pending
-            .fetch_sub(1, AtomicOrdering::Release);
-        self.engine.commit_wave.cv.notify_all();
     }
 }
 
 impl Engine {
     /// Passive explicit-transaction barrier: wait until every classic wave registered under the
-    /// commit lock has finished durability/visibility publication and its post-tail residency
-    /// maintenance. Unlike the sequencer capacity gate, this never claims another client's tail:
+    /// commit lock has finished durability/visibility publication. Unlike the sequencer capacity
+    /// gate, this never claims another client's tail:
     /// an injected fsync failure must reach COMMIT as the sticky fail-stop error, not as an
     /// unrelated tail-finisher panic on the transaction thread.
     pub(crate) fn wait_wave_tail_quiescence(&self) -> bool {
@@ -323,11 +290,7 @@ impl Engine {
                 .commit_wave
                 .tails_finished
                 .load(AtomicOrdering::Acquire);
-            let maintenance = self
-                .commit_wave
-                .tail_maintenance_pending
-                .load(AtomicOrdering::Acquire);
-            if applied == finished && maintenance == 0 {
+            if applied == finished {
                 return true;
             }
             let queue = self.lock_commit_wave_queue();
@@ -339,11 +302,7 @@ impl Engine {
                 .commit_wave
                 .tails_finished
                 .load(AtomicOrdering::Acquire);
-            let maintenance = self
-                .commit_wave
-                .tail_maintenance_pending
-                .load(AtomicOrdering::Acquire);
-            if applied == finished && maintenance == 0 {
+            if applied == finished {
                 return true;
             }
             let _queue = self
@@ -365,10 +324,10 @@ impl Engine {
 /// half of the wave.
 pub(super) struct CommitWaveTail {
     pub(super) batch: Vec<CommitWaveItem>,
-    /// `(batch position, commit_seq, appended, rows_affected)` for every item that reached the
+    /// `(batch position, commit_seq, rows_affected)` for every item that reached the
     /// durable-commit point, in wave order (aborted items' outcomes were already set in-section).
     /// `rows_affected` is the applied delta's exact row count — the Ok payload of the ack (U1).
-    pub(super) committed: Vec<(usize, Index, bool, u64)>,
+    pub(super) committed: Vec<(usize, Index, u64)>,
     pub(super) last_seq: Index,
     pub(super) last_position: usize,
     pub(super) armed: bool,

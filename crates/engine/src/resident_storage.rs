@@ -524,48 +524,6 @@ impl MvccData {
         result
     }
 
-    /// Clone a transaction record's complete table working set without publishing any member.
-    /// The caller mutates these COW roots and publishes only after every decode/target/store
-    /// operation succeeds, so a malformed durable record cannot strand a partial table prefix.
-    pub(crate) fn clone_transaction_tables(
-        &self,
-        tables: &BTreeSet<String>,
-    ) -> BTreeMap<String, TableVersionData> {
-        let current = self.tables_read();
-        tables
-            .iter()
-            .map(|table| {
-                let data = current
-                    .get(table)
-                    .map(|cell| TableVersionData::clone(cell.load().get()))
-                    .unwrap_or_default();
-                (table.clone(), data)
-            })
-            .collect()
-    }
-
-    /// Publish a fully staged explicit-transaction table set. Each row version is stamped with the
-    /// not-yet-published commit index, so readers pinned at the old `committed_seq` keep old-row
-    /// visibility even while these per-table roots are installed sequentially under commit lock.
-    pub(crate) fn publish_transaction_tables(&self, staged: BTreeMap<String, TableVersionData>) {
-        for (table, data) in staged {
-            let data = Arc::new(data);
-            if let Some(cell) = self.tables_read().get(&table) {
-                cell.publish(data);
-                continue;
-            }
-            let mut map = self.tables_write();
-            match map.get(&table) {
-                Some(cell) => {
-                    cell.publish(data);
-                }
-                None => {
-                    map.insert(table, SnapshotCell::new(data));
-                }
-            }
-        }
-    }
-
     /// Mutate the KV partition via copy-on-write and publish the new generation. `&self` (the cell
     /// publishes via `&self`); the caller serializes (commit critical section / serialized DDL apply).
     pub(crate) fn with_kv_mut<R>(&self, mutate: impl FnOnce(&mut InMemoryTupleStore) -> R) -> R {

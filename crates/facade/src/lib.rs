@@ -412,7 +412,7 @@ impl SharedSession {
 /// Protocol-neutral non-vacuity counters for mixed GPU-native workloads. These are monotonic
 /// process-local observations, intended for operational diagnostics and benchmark gates: result
 /// equality alone cannot prove whether a resident read silently fell back or whether a write
-/// reinstalled the host store. `resident_shards` is scoped to the table passed to
+/// published device authority. `resident_shards` is scoped to the table passed to
 /// [`SharedEngine::gpu_native_activity_snapshot`]; every other field is engine-global.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuNativeActivitySnapshot {
@@ -423,7 +423,7 @@ pub struct GpuNativeActivitySnapshot {
     pub sharded_gpu_probe_batches: u64,
     pub sharded_binary_route_batches: u64,
     pub open_shard_append_commits: u64,
-    pub host_install_elisions: u64,
+    pub device_authoritative_commits: u64,
 }
 
 impl SharedEngine {
@@ -436,9 +436,10 @@ impl SharedEngine {
     /// serving, so the served read path takes the resident route (used by the GPU-retained
     /// benchmark).
     pub fn from_engine(engine: Engine) -> Self {
+        let next_txn_id = engine.next_durable_transaction_id_floor();
         Self {
             engine: Arc::new(engine),
-            next_txn_id: AtomicU64::new(1),
+            next_txn_id: AtomicU64::new(next_txn_id),
         }
     }
 
@@ -505,7 +506,7 @@ impl SharedEngine {
             sharded_gpu_probe_batches: self.engine.sharded_point_gpu_probe_hits(),
             sharded_binary_route_batches: self.engine.sharded_point_binary_route_hits(),
             open_shard_append_commits: self.engine.open_shard_append_hits(),
-            host_install_elisions: self.engine.host_install_elisions(),
+            device_authoritative_commits: self.engine.device_authoritative_commits(),
         }
     }
 
@@ -1289,10 +1290,8 @@ mod tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn sequential_session_select_uses_its_retained_gpu_generation() {
         let mut facade = EngineFacade::new();
-        facade.engine.set_host_install_elision_enabled(false);
         facade.engine.set_shard_residency_enabled(true);
         facade.engine.set_auto_admit_on_commit(true);
-        facade.engine.set_resident_update_tombstone_enabled(false);
         let reader = facade.open_session();
         let writer = facade.open_session();
         facade
@@ -1320,10 +1319,8 @@ mod tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn shared_session_select_uses_its_retained_gpu_generation() {
         let engine = Engine::new_local();
-        engine.set_host_install_elision_enabled(false);
         engine.set_shard_residency_enabled(true);
         engine.set_auto_admit_on_commit(true);
-        engine.set_resident_update_tombstone_enabled(false);
         engine
             .execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
@@ -1353,10 +1350,8 @@ mod tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn sequential_session_dml_is_private_until_atomic_commit() {
         let mut facade = EngineFacade::new();
-        facade.engine.set_host_install_elision_enabled(false);
         facade.engine.set_shard_residency_enabled(true);
         facade.engine.set_auto_admit_on_commit(true);
-        facade.engine.set_resident_update_tombstone_enabled(true);
         let writer = facade.open_session();
         let observer = facade.open_session();
         facade
@@ -1405,10 +1400,8 @@ mod tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn shared_session_dml_is_private_until_atomic_commit() {
         let engine = Engine::new_local();
-        engine.set_host_install_elision_enabled(false);
         engine.set_shard_residency_enabled(true);
         engine.set_auto_admit_on_commit(true);
-        engine.set_resident_update_tombstone_enabled(true);
         engine
             .execute_text(1, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
             .unwrap();

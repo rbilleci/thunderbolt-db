@@ -160,12 +160,10 @@ impl WriteSet {
 
 /// The concrete, installable mutation a `prepare_*` produced, paired with its [`WriteSet`] in a
 /// [`WriteDelta`]. Holds everything `apply_delta` needs to mutate engine state and nothing it must
-/// recompute. The value-index entries (all columns, unique or not) are precomputed here so apply
-/// is a pure install.
+/// recompute.
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedMutation {
-    /// New rows to install at reserved keys; `inserted_rows` is `(row_key, values)` and
-    /// `value_index_entries` is the per-(table,column,value) row-key appends. `seq_advances`
+    /// New rows to publish on the device; `inserted_rows` is `(row_key, values)`. `seq_advances`
     /// is the post-state (`last_value`, `is_called`) for each sequence consumed by `nextval`
     /// column defaults: `prepare_insert` reads the sequence state and computes the values
     /// purely (into a local scratch), recording the final advancement here for `apply_delta`
@@ -173,18 +171,16 @@ pub(crate) enum PreparedMutation {
     Insert {
         table: String,
         inserted_rows: Vec<(String, Vec<SqlValue>)>,
-        value_index_entries: BTreeMap<ColumnValueKey, Vec<String>>,
         seq_advances: BTreeMap<String, (i64, bool)>,
     },
     /// In-place version rewrites; `installs` is `(tuple_id, row_key, new_values)` (tuple_id is the
-    /// existing version chain to tombstone+append onto), plus the new images' value-index appends.
+    /// existing device entity to tombstone+append onto).
     Update {
         table: String,
         installs: Vec<(u64, String, Vec<SqlValue>)>,
-        value_index_entries: BTreeMap<ColumnValueKey, Vec<String>>,
         /// SV5: the OLD row images (catalog order), PARALLEL to `installs` (same order), captured BEFORE the
         /// assignments overwrote them. The commit path tombstones the old resident slot + appends the new
-        /// image (from `installs`) in place instead of the O(table) re-admit.
+        /// image (from `installs`) in place in the authoritative device generation.
         updated_old_rows: Vec<Vec<SqlValue>>,
         /// P4-2b-ii: the class coordinate token (see `Delete::class_epoch`); `installs` ids are
         /// then packed coordinates of the OLD versions.
@@ -192,7 +188,7 @@ pub(crate) enum PreparedMutation {
     },
     /// Existing versions to tombstone, by tuple_id, in `table`'s partition. `deleted_rows` carries the
     /// resolved row images (catalog order) SV4b surfaces to the commit path so a single-entry DELETE can
-    /// LOCATE + tombstone them on the resident GPU shard IN PLACE instead of the O(table) invalidate+re-admit.
+    /// LOCATE + tombstone them on the authoritative resident GPU shard in place.
     Delete {
         table: String,
         tuple_ids: Vec<u64>,
@@ -207,7 +203,7 @@ pub(crate) enum PreparedMutation {
 
 /// The row-level mutation a single committed log entry applied, surfaced by `apply_mvcc_entry` so the
 /// commit path can maintain GPU residency INCREMENTALLY for a single-entry commit (INSERT=append,
-/// DELETE=tombstone, UPDATE=tombstone old + append new) instead of the O(table) invalidate + re-admit,
+/// DELETE=tombstone, UPDATE=tombstone old + append new),
 /// and record the applied [`WriteSet`] into the SI recent-commits ledger (C2, write-path assessment:
 /// the ledger must see SERIALIZED-path writes too, or a concurrent committer validating against an
 /// older snapshot silently misses them — a lost update). `None` for every other command.
@@ -217,7 +213,7 @@ pub(crate) enum AppliedRowMutation {
         table: String,
         rows: Vec<Vec<SqlValue>>,
         write_set: WriteSet,
-        /// RETIREMENT A1: the installed rows' host identities (parsed from the delta's
+        /// RETIREMENT A1: the installed rows' stable entity identities (parsed from the delta's
         /// `inserted_rows` keys — INSERT write-sets deliberately carry no row keys, so the delta is
         /// the identity source). Parallel to `rows`.
         row_ids: Vec<u64>,
@@ -236,8 +232,7 @@ pub(crate) enum AppliedRowMutation {
         new_rows: Vec<Vec<SqlValue>>,
         /// RETIREMENT A4b: the updated rows' IDENTITIES (parsed from the installs' row keys, EXACT
         /// parallel to `old_rows`/`new_rows` by construction) — the appended new versions keep
-        /// them (A1). `None` for any unparseable key -> the commit arm declines the incremental
-        /// path (re-admit, always correct).
+        /// them (A1). `None` for any unparseable key makes publication fail closed.
         row_ids: Option<Vec<u64>>,
         /// P4-2b-ii: the class stamp inputs — packed `(chunk_idx, slot)` coordinates plus the
         /// entry epoch. Stable logical identities remain in `row_ids`; never overload one as the
@@ -375,14 +370,19 @@ impl RecentCommitsLedger {
     }
 }
 
-/// One explicit transaction's generation-owned read world. `boundary` is the visibility stamp, but
+/// One transaction or autocommit statement's generation-owned read world. `boundary` is the visibility stamp, but
 /// correctness does not rely on that scalar alone: the exact catalog, per-table MVCC generations,
 /// single-buffer entries, shard descriptors, and already-built device index allocations are retained
-/// together until terminal transaction control. A later commit may invalidate/re-admit the current
-/// resident set; these owned generations remain alive and cannot be paired with newer descriptors.
+/// together until terminal transaction control. Later commits may publish replacement descriptors;
+/// these owned generations remain alive and cannot be paired with newer state.
 #[derive(Debug)]
 pub(crate) struct TransactionSnapshot {
     pub(crate) boundary: Index,
+    /// Autocommit statements retain the same immutable bundle as transactions, but may rebind once
+    /// after an explicit representation transition (device/class authority -> repair store). An
+    /// explicit transaction must never rebind its BEGIN generation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) statement_owned: bool,
     /// Row-identity allocator boundary captured with the transaction generation. INSERT prepare
     /// must not derive provisional identities from a newer allocator observation; the private
     /// transaction delta will apply its own deterministic offset before COMMIT assigns final slots.
@@ -394,7 +394,7 @@ pub(crate) struct TransactionSnapshot {
     /// Representation authority is part of the generation, not current global policy. An elided
     /// table's captured host generation is intentionally incomplete; a class table's captured cold
     /// entry is its post-freeze authority. DML prepare must retain and consult these exact maps.
-    pub(crate) elided_tables: Arc<BTreeSet<String>>,
+    pub(crate) device_authoritative_tables: Arc<BTreeSet<String>>,
     pub(crate) chunk_authoritative_tables: Arc<BTreeMap<String, Index>>,
     /// Transaction-private, device-resident write generation. Every successful DML statement
     /// replaces this state atomically with a new immutable shard map: retained base shards carry

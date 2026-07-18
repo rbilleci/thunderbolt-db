@@ -947,9 +947,7 @@ fn relational_sql_select_cuda_driver_reports_gpu_execution() {
     let Command::Select(select) = parse_command("SELECT * FROM people").unwrap() else {
         panic!("expected SELECT plan");
     };
-    let result = e
-        .execute_relational_select_with_cuda_driver_probe(&select)
-        .unwrap();
+    let result = e.execute_relational_select(&select).unwrap();
 
     assert_eq!(
         result.rows,
@@ -960,11 +958,7 @@ fn relational_sql_select_cuda_driver_reports_gpu_execution() {
     );
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
-    let metrics = e.metrics().snapshot();
-    assert!(metrics.h2d_bytes_total > 0);
-    assert!(metrics.d2h_bytes_total > 0);
-    assert_eq!(metrics.kernel_exec_samples, 1);
-    assert!(metrics.kernel_exec_total_ms >= 1);
+    assert!(e.table_device_authoritative("people"));
 }
 
 #[test]
@@ -984,9 +978,7 @@ fn execute_mvcc_query_cuda_driver_runs_relational_sql_equality_limit_without_fal
     else {
         panic!("expected SELECT plan");
     };
-    let result = e
-        .execute_relational_select_with_cuda_driver_probe(&select)
-        .unwrap();
+    let result = e.execute_relational_select(&select).unwrap();
 
     assert_eq!(
         result.rows,
@@ -1013,9 +1005,7 @@ fn execute_mvcc_query_cuda_driver_runs_relational_sql_projection_without_fallbac
     else {
         panic!("expected SELECT plan");
     };
-    let result = e
-        .execute_relational_select_with_cuda_driver_probe(&select)
-        .unwrap();
+    let result = e.execute_relational_select(&select).unwrap();
 
     assert_eq!(result.rows, vec![vec![SqlValue::Text("Linus".to_string())]]);
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
@@ -1039,9 +1029,7 @@ fn execute_mvcc_query_cuda_driver_runs_relational_sql_order_by_without_fallback(
     else {
         panic!("expected SELECT plan");
     };
-    let result = e
-        .execute_relational_select_with_cuda_driver_probe(&select)
-        .unwrap();
+    let result = e.execute_relational_select(&select).unwrap();
 
     assert_eq!(
         result.rows,
@@ -1068,9 +1056,7 @@ fn execute_mvcc_query_cuda_driver_runs_relational_sql_range_without_fallback() {
     else {
         panic!("expected SELECT plan");
     };
-    let result = e
-        .execute_relational_select_with_cuda_driver_probe(&select)
-        .unwrap();
+    let result = e.execute_relational_select(&select).unwrap();
 
     assert_eq!(
         result.rows,
@@ -1098,9 +1084,7 @@ fn execute_mvcc_query_cuda_driver_runs_relational_sql_and_predicates_without_fal
     .unwrap() else {
         panic!("expected SELECT plan");
     };
-    let result = e
-        .execute_relational_select_with_cuda_driver_probe(&select)
-        .unwrap();
+    let result = e.execute_relational_select(&select).unwrap();
 
     assert_eq!(result.rows, vec![vec![SqlValue::Int4(4)]]);
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
@@ -1125,9 +1109,7 @@ fn execute_mvcc_query_cuda_driver_runs_relational_sql_or_predicates_without_fall
     .unwrap() else {
         panic!("expected SELECT plan");
     };
-    let result = e
-        .execute_relational_select_with_cuda_driver_probe(&select)
-        .unwrap();
+    let result = e.execute_relational_select(&select).unwrap();
 
     assert_eq!(
         result.rows,

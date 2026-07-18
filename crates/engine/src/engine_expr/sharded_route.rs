@@ -46,7 +46,7 @@ impl Engine {
         bound.filter = None;
         bound.filters.clear();
         bound.filter_groups.clear();
-        // Sub-slice 3b: try the CROSS-SHARD PK-INDEX point-lookup route (flag-gated, DEFAULT OFF). On a hit
+        // Sub-slice 3b: try the CROSS-SHARD PK-INDEX point-lookup route (flag-gated, DEFAULT ON). On a hit
         // it uses the cached hash+bloom `locate` to jump straight to the (shard, slot) and gather ONLY that
         // row (a few tiny DtoH reads), skipping the zone-map scan + recompaction below; on ANY shape or
         // soundness guard it returns None and we fall through to the scan (byte-identical). Placed before the
@@ -92,9 +92,10 @@ impl Engine {
                 // window (copin_s < hwm) falls through to the gated device path.
                 // W0c (audit B1): ALSO require every shard VALID — this executor-side load can be
                 // NEWER than the accepted route plan's (a concurrent commit flags + publishes in
-                // between), and a flagged shard's row_count excludes the host-installed rows the
-                // reader's pinned boundary includes. An invalid shard falls through to the gated
-                // device path, whose source_for declines and the statement re-serves from the CPU.
+                // between), and a flagged shard's row_count may exclude a concurrently published
+                // generation the reader's pinned boundary includes. An invalid shard falls through
+                // to the gated device path, which either captures the authoritative generation or
+                // fails loudly.
                 let runtime_snapshot = self.router.runtime().snapshot();
                 let version_free = shards.iter().all(|shard| {
                     shard.is_valid(

@@ -52,6 +52,14 @@ impl Engine {
                 table.name
             ))));
         }
+        // CREATE TABLE publishes a zero-row bootstrap generation so the first write never needs a
+        // host authority hand-off. Once a non-empty shard exists, that descriptor contributes no
+        // rows, visibility, or payload and must not force the general multi-shard recompactor: in
+        // particular, doing so can replace a correctly padded fixed-width source with a synthetic
+        // mixed-width layout. Retain one empty descriptor only for a genuinely empty table.
+        if shards.iter().any(|shard| shard.row_count > 0) {
+            shards.retain(|shard| shard.row_count > 0);
+        }
         // S-d3 zone-map pruning: for a point-lookup shape (`col = needle`, ANDed at top level) drop every
         // shard whose min/max zone map for that column excludes the needle — it cannot hold a matching row,
         // so the recompaction never gathers it. This turns the sharded read from O(num_shards) toward O(1).

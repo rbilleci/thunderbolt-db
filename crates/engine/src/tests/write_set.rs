@@ -258,7 +258,7 @@ fn prepare_insert_failing_preflight_advances_nothing() {
 }
 
 #[test]
-fn write_set_is_exactly_the_keys_apply_touches_for_insert() {
+fn insert_write_set_is_independent_of_retired_host_apply() {
     // INSERT conflict-write-set invariant (BUG-1 fix): an INSERT claims a FRESH, unique row id at
     // install time, so its row slot can never truly collide with another writer's. Therefore the
     // conflict write-set records NO row keys for an INSERT (putting the predicted snapshot-base
@@ -290,19 +290,15 @@ fn write_set_is_exactly_the_keys_apply_touches_for_insert() {
     assert!(delta.write_set.unique_slots.is_empty());
     assert_eq!(delta.rows_consumed, 2);
 
-    // Apply STILL installs both rows (install is independent of the conflict write-set): exactly
-    // two new fresh-id row keys become visible at commit_seq, even though none were conflict keys.
+    // R3-004: the host/control-plane apply advances identity state but installs no relational rows;
+    // the enclosing commit publishes the corresponding device append.
     e.apply_delta(delta, commit_seq, None).unwrap();
     let touched = keys_touched_at(&e, commit_seq);
-    assert_eq!(
-        touched.len(),
-        2,
-        "apply must install both new rows even though they are not conflict keys"
-    );
     assert!(
-        touched.iter().all(|k| k.starts_with("rel/t/")),
-        "the installed keys are this table's fresh-id row keys: {touched:?}"
+        touched.is_empty(),
+        "host tuple apply is retired: {touched:?}"
     );
+    assert!(e.table_device_authoritative("t"));
 }
 
 #[test]
@@ -334,7 +330,7 @@ fn insert_write_set_records_unique_slots_but_not_row_keys() {
 }
 
 #[test]
-fn write_set_is_exactly_the_keys_apply_touches_for_update() {
+fn update_write_set_remains_exact_after_host_apply_retirement() {
     // Stage 2 invariant (b), UPDATE: the write-set's row keys equal exactly the row keys whose
     // chain apply rewrote (old tombstoned + new created at the same key).
     let e = Engine::new_local_cpu_oracle();
@@ -369,11 +365,16 @@ fn write_set_is_exactly_the_keys_apply_touches_for_update() {
 
     e.apply_delta(delta, commit_seq, None).unwrap();
     let touched = keys_touched_at(&e, commit_seq);
-    assert_eq!(declared, touched, "UPDATE write-set != keys apply touched");
+    assert!(
+        touched.is_empty(),
+        "host tuple apply is retired: {touched:?}"
+    );
+    assert_eq!(declared.len(), 2);
+    assert!(e.table_device_authoritative("t"));
 }
 
 #[test]
-fn write_set_is_exactly_the_keys_apply_touches_for_delete() {
+fn delete_write_set_remains_exact_after_host_apply_retirement() {
     // Stage 2 invariant (b), DELETE: the write-set's row keys equal exactly the row keys whose
     // version apply tombstoned.
     let e = Engine::new_local_cpu_oracle();
@@ -404,7 +405,12 @@ fn write_set_is_exactly_the_keys_apply_touches_for_delete() {
 
     e.apply_delta(delta, commit_seq, None).unwrap();
     let touched = keys_touched_at(&e, commit_seq);
-    assert_eq!(declared, touched, "DELETE write-set != keys apply touched");
+    assert!(
+        touched.is_empty(),
+        "host tuple apply is retired: {touched:?}"
+    );
+    assert_eq!(declared.len(), 2);
+    assert!(e.table_device_authoritative("t"));
 }
 
 #[test]

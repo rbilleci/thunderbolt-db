@@ -6,7 +6,7 @@ use super::*;
 const DELETED_BY_LIVE: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 
 impl Engine {
-    fn table_has_live_dml_generation(&self, table: &str) -> bool {
+    pub(crate) fn table_has_live_dml_generation(&self, table: &str) -> bool {
         if self.table_chunk_authoritative(table).is_some() {
             return true;
         }
@@ -148,12 +148,7 @@ impl Engine {
                 == self
                     .commit_wave
                     .tails_finished
-                    .load(AtomicOrdering::Acquire)
-                && self
-                    .commit_wave
-                    .tail_maintenance_pending
-                    .load(AtomicOrdering::Acquire)
-                    == 0;
+                    .load(AtomicOrdering::Acquire);
             if !settled {
                 drop(commit);
                 continue;

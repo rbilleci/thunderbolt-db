@@ -477,6 +477,7 @@ pub struct RelationalRetainedReadTemplate {
     pub(crate) result_columns: Vec<RelationalColumn>,
     pub(crate) filter_idx: usize,
     pub(crate) access_path: RelationalAccessPath,
+    pub(crate) select: Select,
 }
 
 impl RelationalRetainedReadTemplate {
@@ -519,6 +520,9 @@ impl RelationalRetainedReadSubmission {
         }
         let results = match self.inner {
             RelationalRetainedReadSubmissionInner::Ready(results) => results,
+            RelationalRetainedReadSubmissionInner::ReadyBatched(result) => {
+                Engine::expand_ready_batched_result(*result)
+            }
             RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
                 Engine::complete_relational_retained_int4_projection_submission_detached(*pending)?
                     .results
@@ -536,6 +540,7 @@ impl RelationalRetainedReadSubmission {
 
 pub(crate) enum RelationalRetainedReadSubmissionInner {
     Ready(Vec<RelationalSelectResult>),
+    ReadyBatched(Box<RelationalRetainedBatchResult>),
     // Boxed: this variant's payload is a large struct (table + several Vecs + a CUDA submission),
     // dwarfing the sibling `Ready(Vec<..>)`; boxing keeps the enum small to move (clippy
     // large_enum_variant). The submission is heap-heavy and created once per batch, so the box

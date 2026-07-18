@@ -160,10 +160,9 @@ impl Engine {
     }
 
     /// Maintain every row operation from one atomic transaction against the current resident
-    /// generation before publishing its shared commit sequence. Tables are independent: a table
-    /// whose incremental hook declines falls back to invalidate/re-admit, while successful tables
-    /// remain GPU-current. For an already-elided table the fallback first reconstructs the host
-    /// store from the C-1 device image plus the transaction's net identity delta.
+    /// generation before publishing its shared commit sequence. Tables are independent, but every
+    /// touched table must publish successfully: an incremental decline wedges the live commit path
+    /// before acknowledgement, leaving typed WAL replay as the recovery source.
     pub(crate) fn try_maintain_transaction_residency(
         &self,
         cat: &DdlCatalogState,
@@ -197,7 +196,7 @@ impl Engine {
                     ),
                 AppliedRowMutation::Delete {
                     rows, write_set, ..
-                } if self.resident_delete_tombstone_enabled() => {
+                } => {
                     let prefix = relational_key_prefix(&table);
                     let row_ids = write_set
                         .rows
@@ -219,25 +218,28 @@ impl Engine {
                     new_rows,
                     row_ids,
                     ..
-                } if self.resident_update_tombstone_enabled() => {
-                    row_ids.as_ref().is_some_and(|row_ids| {
-                        self.try_tombstone_transaction_rows_by_identity(
-                            cat,
-                            &table,
-                            old_rows,
-                            row_ids,
-                            publish_index,
-                        ) && self.try_append_resident_int4_open_shard(
-                            &table,
-                            new_rows,
-                            crate::engine_residency::AppendCreatedBy::UpdateNewVersion(
+                } => {
+                    if old_rows.is_empty() {
+                        new_rows.is_empty()
+                    } else {
+                        row_ids.as_ref().is_some_and(|row_ids| {
+                            self.try_tombstone_transaction_rows_by_identity(
+                                cat,
+                                &table,
+                                old_rows,
+                                row_ids,
                                 publish_index,
-                            ),
-                            Some(row_ids),
-                        )
-                    })
+                            ) && self.try_append_resident_int4_open_shard(
+                                &table,
+                                new_rows,
+                                crate::engine_residency::AppendCreatedBy::UpdateNewVersion(
+                                    publish_index,
+                                ),
+                                Some(row_ids),
+                            )
+                        })
+                    }
                 }
-                _ => false,
             };
         }
 
@@ -245,27 +247,19 @@ impl Engine {
         for (table_name, table_handled) in status {
             if table_handled {
                 maintained.insert(table_name.clone());
-                if self.host_install_elision_enabled()
-                    && self.table_chunk_authoritative(&table_name).is_none()
-                    && !self.table_install_elided(&table_name)
+                if self.table_chunk_authoritative(&table_name).is_none()
+                    && !self.table_device_authoritative(&table_name)
                 {
                     let snapshot = self.catalog_snapshot();
-                    if self.table_elision_eligible(&snapshot, &table_name) {
-                        self.set_table_install_elided(&table_name, true);
+                    if self.table_device_authority_eligible(&snapshot, &table_name) {
+                        self.set_table_device_authoritative(&table_name, true);
                     }
                 }
-            } else if self.table_install_elided(&table_name) {
-                let (upserts, removals) =
-                    Self::transaction_elided_commit_delta(applied, &table_name);
-                if let Some(table) = cat.relational_catalog.get(&table_name) {
-                    self.rehydrate_elided_table(
-                        table,
-                        publish_index.saturating_sub(1),
-                        &upserts,
-                        &removals,
-                        publish_index,
-                    )?;
-                }
+            } else {
+                self.wedge_commit_path();
+                return Err(EngineError::ApplyFailed(format!(
+                    "durable transaction DML for relation \"{table_name}\" could not publish its device generation at {publish_index}"
+                )));
             }
         }
         Ok(maintained)
@@ -274,7 +268,7 @@ impl Engine {
     /// Transaction commit already carries exact stable entity identities, so it need not fall back
     /// to the legacy all-non-NULL int4 row predicate. Probe a device key, verify identity plus the
     /// complete nullable row image, and stamp exactly that visible physical version.
-    fn try_tombstone_transaction_rows_by_identity(
+    pub(crate) fn try_tombstone_transaction_rows_by_identity(
         &self,
         cat: &DdlCatalogState,
         table_name: &str,
@@ -288,19 +282,59 @@ impl Engine {
         let Some(table) = cat.relational_catalog.get(table_name) else {
             return false;
         };
+        self.try_tombstone_rows_by_identity(table, rows, row_ids, commit_seq)
+    }
+
+    /// Stamp exact physical versions using the stable entity identities carried by every resolved
+    /// device DML delta. This is shared by explicit-transaction publication and autocommit
+    /// UPDATE/DELETE maintenance: nullable or otherwise non-legacy row shapes must never fall back
+    /// to an all-non-NULL int4 image predicate after the durable cut.
+    pub(crate) fn try_tombstone_rows_by_identity(
+        &self,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+        row_ids: &[u64],
+        commit_seq: Index,
+    ) -> bool {
+        if rows.len() != row_ids.len() {
+            return false;
+        }
         for (row, expected_row_id) in rows.iter().zip(row_ids) {
             let filters = row
                 .iter()
                 .enumerate()
                 .map(|(idx, value)| (idx, SelectFilterOp::Eq, value.clone()))
                 .collect::<Vec<_>>();
-            let Some((key_id, needle)) = self.dml_device_probe_key(table, &filters) else {
-                return false;
-            };
-            let Some(hits) =
-                self.locate_resident_pk_via_shard_index_detailed(table, key_id, needle)
-            else {
-                return false;
+            let indexed =
+                self.dml_device_probe_key(table, &filters)
+                    .and_then(|(key_id, needle)| {
+                        self.locate_resident_pk_via_shard_index_detailed(table, key_id, needle)
+                    });
+            let hits = match indexed {
+                Some(hits) if !hits.is_empty() => hits,
+                _ => {
+                    // UPDATE version churn deliberately makes a cached unique index decline once
+                    // the old and new physical slots share a key. Re-resolve the complete old row
+                    // structurally on-device, then identity/materialization-recheck below; never
+                    // route that ordinary churn through host reconstruction.
+                    let key_cols = row
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, value)| (idx, value.clone()))
+                        .collect::<Vec<_>>();
+                    let Some(predicate) =
+                        crate::engine_dml_prepare::device_structural_tuple_predicate(
+                            table, &key_cols,
+                        )
+                    else {
+                        return false;
+                    };
+                    let Some(hits) = self.locate_resident_delete_slots_detailed(table, &predicate)
+                    else {
+                        return false;
+                    };
+                    hits
+                }
             };
             let mut matched = Vec::new();
             for hit in hits {
@@ -319,66 +353,17 @@ impl Engine {
                 return false;
             }
             let (shard_id, slot) = matched[0];
-            if !self.tombstone_resident_shard_slots(table_name, shard_id, &[slot], commit_seq) {
+            if !self.tombstone_resident_shard_slots(&table.name, shard_id, &[slot], commit_seq) {
                 return false;
             }
         }
-        self.add_tombstone_churn(table_name, rows.len() as u64);
+        self.add_tombstone_churn(&table.name, rows.len() as u64);
         true
-    }
-
-    fn transaction_elided_commit_delta(
-        applied: &[AppliedRowMutation],
-        table_name: &str,
-    ) -> (BTreeMap<u64, Vec<SqlValue>>, BTreeSet<u64>) {
-        let mut upserts = BTreeMap::new();
-        let mut removals = BTreeSet::new();
-        for mutation in applied {
-            match mutation {
-                AppliedRowMutation::Insert {
-                    table,
-                    rows,
-                    row_ids,
-                    ..
-                } if table == table_name => {
-                    for (row_id, row) in row_ids.iter().copied().zip(rows.iter().cloned()) {
-                        removals.remove(&row_id);
-                        upserts.insert(row_id, row);
-                    }
-                }
-                AppliedRowMutation::Update {
-                    table,
-                    new_rows,
-                    row_ids: Some(row_ids),
-                    ..
-                } if table == table_name => {
-                    for (row_id, row) in row_ids.iter().copied().zip(new_rows.iter().cloned()) {
-                        removals.remove(&row_id);
-                        upserts.insert(row_id, row);
-                    }
-                }
-                AppliedRowMutation::Delete {
-                    table, write_set, ..
-                } if table == table_name => {
-                    let prefix = relational_key_prefix(table);
-                    for key in &write_set.rows {
-                        if let Some(row_id) =
-                            crate::engine_residency::parse_relational_row_id(&key.row_key, &prefix)
-                        {
-                            upserts.remove(&row_id);
-                            removals.insert(row_id);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        (upserts, removals)
     }
 
     pub(crate) fn apply_binary_transaction_record(
         &self,
-        entry: &LogEntry,
+        _entry: &LogEntry,
         cat: &mut DdlCatalogState,
         record: BinaryTransactionRecord,
     ) -> Result<Vec<AppliedRowMutation>, EngineError> {
@@ -471,61 +456,24 @@ impl Engine {
             }
         }
 
-        let staged_table_names = decoded
-            .iter()
-            .map(DecodedTransactionMutation::table)
-            .filter(|table| {
-                !self.table_install_elided(&table.name)
-                    && self.table_chunk_authoritative(&table.name).is_none()
-            })
-            .map(|table| table.name.clone())
-            .collect::<BTreeSet<_>>();
-        let mut staged = self
-            .read_state
-            .mvcc
-            .clone_transaction_tables(&staged_table_names);
         let mut applied = Vec::with_capacity(decoded.len());
-        let mut host_elisions = 0u64;
+        let mut device_authoritative_commits = 0u64;
         let mut class_skips = 0u64;
 
         for mutation in decoded {
             let table = mutation.table().clone();
             let table_name = table.name.clone();
             let is_class = self.table_chunk_authoritative(&table_name).is_some();
-            let is_elided = self.table_install_elided(&table_name);
+            if is_class {
+                class_skips = class_skips.saturating_add(1);
+            } else {
+                self.set_table_device_authoritative(&table_name, true);
+                device_authoritative_commits = device_authoritative_commits.saturating_add(1);
+            }
             match mutation {
                 DecodedTransactionMutation::Insert { row_id, row, .. } => {
-                    let row_key = relational_row_key(&table_name, row_id);
                     let mut write_set = WriteSet::default();
                     write_set.add_unique_slots(&table, &row);
-                    if is_class {
-                        class_skips = class_skips.saturating_add(1);
-                    } else if is_elided {
-                        host_elisions = host_elisions.saturating_add(1);
-                    } else {
-                        let tuple_id = self.read_state.mvcc.reserve_tuple_id();
-                        let data = staged
-                            .get_mut(&table_name)
-                            .expect("ordinary transaction table was staged");
-                        data.rows
-                            .tuple_insert_reserved_key_with_id(
-                                tuple_id,
-                                NewTuple {
-                                    key: row_key.clone(),
-                                    value: encode_relational_row(&row),
-                                },
-                                entry.index,
-                            )
-                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                        for (key, row_keys) in relational_value_index_entries_for_rows(
-                            &table.columns,
-                            &[(row_key, row.clone())],
-                        ) {
-                            let mut slot = data.value_index.get(&key).cloned().unwrap_or_default();
-                            slot.extend(row_keys);
-                            data.value_index.insert(key, slot);
-                        }
-                    }
                     applied.push(AppliedRowMutation::Insert {
                         table: table_name,
                         rows: vec![row],
@@ -549,55 +497,6 @@ impl Engine {
                     write_set.add_unique_slots(&table, &new_row);
                     let mut deduplicated = WriteSet::default();
                     deduplicated.extend_deduplicated(&write_set);
-                    if is_class {
-                        class_skips = class_skips.saturating_add(1);
-                    } else if is_elided {
-                        host_elisions = host_elisions.saturating_add(1);
-                    } else {
-                        let data = staged
-                            .get_mut(&table_name)
-                            .expect("ordinary transaction table was staged");
-                        let tuple = data
-                            .rows
-                            .tuple_fetch_by_key(
-                                &row_key,
-                                StorageVisibility {
-                                    read_txn_id: entry.index,
-                                },
-                            )
-                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
-                            .ok_or_else(|| {
-                                EngineError::Durability(format!(
-                                    "transaction WAL target {row_key:?} has no visible version"
-                                ))
-                            })?;
-                        let observed = decode_relational_row(&tuple.value, &table.columns)
-                            .map_err(|err| {
-                                EngineError::Durability(format!(
-                                    "transaction WAL target {row_key:?} decode failed: {err}"
-                                ))
-                            })?;
-                        if observed != old_row {
-                            return Err(EngineError::Durability(format!(
-                                "transaction WAL target {row_key:?} image mismatch: expected {old_row:?}, observed {observed:?}"
-                            )));
-                        }
-                        data.rows
-                            .tuple_update(
-                                tuple.tuple_id,
-                                encode_relational_row(&new_row),
-                                entry.index,
-                            )
-                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                        for (key, row_keys) in relational_value_index_entries_for_rows(
-                            &table.columns,
-                            &[(row_key, new_row.clone())],
-                        ) {
-                            let mut slot = data.value_index.get(&key).cloned().unwrap_or_default();
-                            slot.extend(row_keys);
-                            data.value_index.insert(key, slot);
-                        }
-                    }
                     applied.push(AppliedRowMutation::Update {
                         table: table_name,
                         old_rows: vec![old_row],
@@ -617,43 +516,6 @@ impl Engine {
                         row_key: row_key.clone(),
                     });
                     write_set.add_unique_slots(&table, &old_row);
-                    if is_class {
-                        class_skips = class_skips.saturating_add(1);
-                    } else if is_elided {
-                        host_elisions = host_elisions.saturating_add(1);
-                    } else {
-                        let data = staged
-                            .get_mut(&table_name)
-                            .expect("ordinary transaction table was staged");
-                        let tuple = data
-                            .rows
-                            .tuple_fetch_by_key(
-                                &row_key,
-                                StorageVisibility {
-                                    read_txn_id: entry.index,
-                                },
-                            )
-                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
-                            .ok_or_else(|| {
-                                EngineError::Durability(format!(
-                                    "transaction WAL target {row_key:?} has no visible version"
-                                ))
-                            })?;
-                        let observed = decode_relational_row(&tuple.value, &table.columns)
-                            .map_err(|err| {
-                                EngineError::Durability(format!(
-                                    "transaction WAL target {row_key:?} decode failed: {err}"
-                                ))
-                            })?;
-                        if observed != old_row {
-                            return Err(EngineError::Durability(format!(
-                                "transaction WAL target {row_key:?} image mismatch: expected {old_row:?}, observed {observed:?}"
-                            )));
-                        }
-                        data.rows
-                            .tuple_delete(tuple.tuple_id, entry.index)
-                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                    }
                     applied.push(AppliedRowMutation::Delete {
                         table: table_name,
                         rows: vec![old_row],
@@ -664,9 +526,8 @@ impl Engine {
             }
         }
 
-        // Nothing below can reject the record. Publish COW roots while the shared visibility cut
-        // is still old, then perform monotone/idempotent allocator and sequence assignments.
-        self.read_state.mvcc.publish_transaction_tables(staged);
+        // Nothing below can reject the record. Perform monotone/idempotent control-plane
+        // allocator and sequence assignments; the enclosing commit publishes the device changes.
         self.read_state
             .mvcc
             .advance_row_id_to_at_least(allocator_high_water);
@@ -680,11 +541,11 @@ impl Engine {
         }
         self.read_state
             .residency
-            .host_install_elisions
-            .fetch_add(host_elisions, AtomicOrdering::Relaxed);
+            .device_authoritative_commits
+            .fetch_add(device_authoritative_commits, AtomicOrdering::Relaxed);
         self.read_state
             .residency
-            .chunk_class_skipped_installs
+            .chunk_class_device_commits
             .fetch_add(class_skips, AtomicOrdering::Relaxed);
         Ok(applied)
     }

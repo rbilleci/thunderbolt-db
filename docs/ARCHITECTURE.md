@@ -16,7 +16,7 @@ The engine has three planes:
   volatile and reconstructible; it is never the sole durable copy of acknowledged data.
 
 The CPU must not become a co-equal relational execution tier. Temporary test or repair debt is named in
-**RETIRE-001**, **RETIRE-002**, and **R3-004**.
+**RETIRE-001**, **RETIRE-002**, and **RETIRE-003**.
 
 ## 2. Layering and ownership
 
@@ -183,10 +183,12 @@ The open-loop evidence gate is **BENCH-001**. Product route classes beyond PK mi
 
 - `commit_seq` is the log order and read visibility boundary.
 - Readers capture published generations; device visibility uses created/deleted boundaries and side metadata.
-- Eligible int4-PK INSERT/UPDATE/DELETE intents use FUA lanes and device apply/locate/index machinery.
-- Chunk-authoritative tables can maintain device-format state without steady-state host relational reads.
-- The host tuple store, `CachedShardPkIndex`, host write/constraint probes for uncovered shapes, and repair
-  reconstruction still exist.
+- Supported INSERT/UPDATE/DELETE shapes publish through device apply/locate/index machinery; a missing
+  authoritative device verdict fails before acknowledgement.
+- Device generations, including chunk-authoritative state, are the live relational write/MVCC authority.
+- The host tuple-store commit path, host shard-PK cache, and host DML/constraint probes are deleted. Explicit
+  reverse-gather for DDL, recovery, import, VACUUM, and the bounded hot-to-cold representation transition remains
+  isolated under **RETIRE-002**; it does not evaluate predicates, constraints, or result values on the host.
 
 ### Accepted canonical model
 
@@ -215,8 +217,7 @@ ADR-014 selects compact append/tombstone MVCC:
   authority.
 
 Dense latest-image plus undo and the retired per-wave blocking mega-fuse are rejected by ADR-014. R3-002/R3-003
-coverage and concurrency graduation is complete; **R3-004** removes host store/index/probe authority only after
-**DUR-002** passes.
+coverage and concurrency graduation, DUR-002, and host write/store authority retirement are complete.
 
 ## 8. Durability and recovery
 

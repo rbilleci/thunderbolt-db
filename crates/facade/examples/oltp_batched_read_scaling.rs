@@ -1,6 +1,6 @@
 //! OLTP batched-read scaling — the decisive test of the GPU-OLTP bet.
 //!
-//! The per-op A/B (`engine/examples/oltp_auto_admit_ab.rs`) showed a single GPU point read costs a
+//! Historical per-operation measurements showed a single GPU point read costs a
 //! FIXED ~72µs (kernel launch + context-set + stream-sync + host round-trip), independent of table
 //! size — i.e. it is amortizable launch overhead, not compute. The bet (ARCHITECTURE §9) is that
 //! BATCHING — coalescing many concurrent point lookups into one GPU submission (`PointLookupBatcher`,

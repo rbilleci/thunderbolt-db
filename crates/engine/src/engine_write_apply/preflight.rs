@@ -1005,7 +1005,10 @@ impl Engine {
             }
             Command::Insert(insert) => {
                 let snapshot = DmlReadSnapshot {
-                    commit_seq: txn_id,
+                    // The facade transaction id is an idempotency identity, not an MVCC
+                    // boundary. Serialized preflight reads the latest published generation;
+                    // the under-lock apply re-resolves at its assigned commit sequence.
+                    commit_seq: self.committed_seq(),
                     next_row_id: self.read_state.mvcc.current_row_id(),
                 };
                 self.prepare_insert(
@@ -1017,14 +1020,14 @@ impl Engine {
             }
             Command::Update(update) => {
                 let snapshot = DmlReadSnapshot {
-                    commit_seq: txn_id,
+                    commit_seq: self.committed_seq(),
                     next_row_id: self.read_state.mvcc.current_row_id(),
                 };
                 self.prepare_update(update, snapshot)?;
             }
             Command::Delete(delete) => {
                 let snapshot = DmlReadSnapshot {
-                    commit_seq: txn_id,
+                    commit_seq: self.committed_seq(),
                     next_row_id: self.read_state.mvcc.current_row_id(),
                 };
                 self.prepare_delete(delete, snapshot)?;

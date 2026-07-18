@@ -14,7 +14,7 @@
 //!   - durable WAL (GPU_DB_BENCH_DURABLE=1): honest fsync-bound numbers on this machine's disk
 //!     (group commit amortizes; the disk's fsync rate is the floor for per-commit latency).
 //!
-//! CPU + disk only — no GPU residency, no CUDA initialization.
+//! The relational generation is device-authoritative; the durable arm additionally measures disk.
 //!
 //! Run:  cargo run --release -p gpu_db_engine --example oltp_commit_slo_benchmark
 //! Env:  GPU_DB_BENCH_WRITERS (default "1,2,4,8,16,32"), GPU_DB_BENCH_SECONDS (default 3),
@@ -89,34 +89,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             Engine::new_local()
         };
-        // TYPE-COVERAGE track 1 (constrained elision): GPU_DB_BENCH_PK=1 declares the PK — the
-        // core-banking table shape. Today a unique-indexed table is elision-INELIGIBLE and its
-        // INSERT prepare pays the O(table) candidate scan (prepare_insert), so this arm is the
-        // baseline the constrained-elision slice must move.
+        // GPU_DB_BENCH_PK=1 declares the core-banking primary-key shape.
         if std::env::var("GPU_DB_BENCH_INT8").is_ok_and(|v| v == "1") {
             // TYPE-COVERAGE track 2 slice 2: the int4-keyed / i64-payload core-banking shape
-            // (BIGINT balances). Since the i64-SECTION FLIP (default ON) this shards + elides
-            // like a pure-int4 PK'd table (~83-91k); GPU_DB_BENCH_I64SHARDS=0 reproduces the
-            // pre-flip single-buffer O(table)-re-admit baseline (825 TPS).
+            // (BIGINT balances). The i64 section is device-resident by default.
             e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)")?;
         } else if std::env::var("GPU_DB_BENCH_DATE").is_ok_and(|v| v == "1") {
-            // TYPE-COVERAGE track 2: the Date/Int2 PK'd shape — every i32-section type
-            // elides + validates device-side (pair with GPU_DB_BENCH_ELIDE/CELIDE).
+            // TYPE-COVERAGE track 2: the Date/Int2 PK'd device-validation shape.
             e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, d DATE, v INT2)")?;
         } else if std::env::var("GPU_DB_BENCH_PK").is_ok_and(|v| v == "1") {
             e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")?;
         } else {
             e.execute_text(1, "CREATE TABLE t (id INT, v INT)")?;
-        }
-        // RETIREMENT A4e A/B: GPU_DB_BENCH_ADMIT=1 = the honest baseline (auto-admit ON, the
-        // dual-store commit path); GPU_DB_BENCH_ELIDE=1 = the elision arm on top of it.
-        if std::env::var("GPU_DB_BENCH_ADMIT").is_ok_and(|v| v == "1")
-            || std::env::var("GPU_DB_BENCH_ELIDE").is_ok_and(|v| v == "1")
-        {
-            e.set_auto_admit_on_commit(true);
-        }
-        if std::env::var("GPU_DB_BENCH_ELIDE").is_ok_and(|v| v == "1") {
-            e.set_host_install_elision_enabled(true);
         }
         if binary_wal {
             // W5a: covered inserts log resolved binary records (decode+install replay).
@@ -132,13 +116,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         // M1 design B: GPU_DB_BENCH_WAVEBATCH=1 = wave-time batched PK-unique validation.
         if std::env::var("GPU_DB_BENCH_WAVEBATCH").is_ok_and(|v| v == "1") {
             e.set_device_write_locate_wave_batch_enabled(true);
-        }
-        // Constrained elision is DEFAULT ON since the 2026-07-03 flip; GPU_DB_BENCH_CELIDE=0
-        // is the kill-switch A/B arm (GPU_DB_BENCH_CELIDE=1 remains accepted, now redundant).
-        match std::env::var("GPU_DB_BENCH_CELIDE").as_deref() {
-            Ok("0") => e.set_constrained_elision_enabled(false),
-            Ok("1") => e.set_constrained_elision_enabled(true),
-            _ => {}
         }
 
         let engine = Arc::new(e);
@@ -294,12 +271,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     per(hp[6]),
                 );
             }
-            // Elision/validator engagement (constrained-elision A/B): steady state = elisions
-            // GROWING, the table STILL elided at teardown, device validate answering.
+            // Device-authority and validator engagement.
             eprintln!(
-                "    [elisions: {}  still-elided: {}  device-validate-hits: {}]",
-                engine.host_install_elisions(),
-                engine.table_install_elided("t"),
+                "    [device-authoritative commits: {}  authoritative: {}  device-validate-hits: {}]",
+                engine.device_authoritative_commits(),
+                engine.table_device_authoritative("t"),
                 engine.dml_device_validate_hits(),
             );
             eprintln!(

@@ -7,7 +7,7 @@
 use super::*;
 
 mod contracts;
-pub(crate) use contracts::device_structural_tuple_predicate;
+pub(crate) use contracts::{device_structural_tuple_predicate, device_structural_tuple_predicates};
 mod device_tuple;
 mod unique_conflict;
 
@@ -157,7 +157,7 @@ impl Engine {
         // Scoped to SINGLE-ROW inserts: a multi-row insert's in-statement dup (two rows, same PK)
         // is caught by the off-lock `seen` set but NOT by a pre-wave device locate, so multi-row
         // keeps the off-lock path. The bench + common OLTP shape is single-row.
-        let wave_deferred = validation == InsertPrepareValidation::Full
+        let wave_deferred = validation == InsertPrepareValidation::WaveOffLock
             && insert.rows.len() == 1
             && self.insert_unique_wave_batchable(&catalog, table);
         // P5-2 (S-E.P5, the KEYED-CLASS lift): a CHUNK-AUTHORITATIVE keyed table validates
@@ -215,20 +215,6 @@ impl Engine {
             let row_key = relational_row_key(&insert.table, row_id);
             inserted_rows.push((row_key, values));
         }
-        // ELIDED-SKIP (lpb per-row-work cut): an elided (device-authoritative) table's apply
-        // arm discards the host value-index entirely (engine_write_apply.rs), so computing the
-        // per-row `ColumnValueKey`s here is pure waste on the sequencer's hot path — for a 64-row
-        // batch this compute is ~40% of the per-row host cost. Skip it. SAFETY across a de-elision
-        // race (elided at off-lock prepare, NOT elided by under-lock apply): both apply sites
-        // recompute from the published catalog when they see an empty map for a non-empty insert
-        // (`value_index_entries_for_deferred_apply`) — a real insert of >=1 row into a >=1-column
-        // table always yields >=1 entry, so empty-and-non-empty-rows uniquely marks the deferral.
-        let value_index_entries = if self.table_install_elided(&table.name) {
-            BTreeMap::new()
-        } else {
-            relational_value_index_entries_for_rows(&table.columns, &inserted_rows)
-        };
-
         let mut write_set = WriteSet::default();
         for (_row_key, values) in &inserted_rows {
             // An INSERT claims a FRESH, unique row id at install time (`apply_delta` reserves the
@@ -249,7 +235,6 @@ impl Engine {
             mutation: PreparedMutation::Insert {
                 table: insert.table.clone(),
                 inserted_rows,
-                value_index_entries,
                 seq_advances: seq_state,
             },
         })
@@ -1158,13 +1143,6 @@ impl Engine {
             )?;
         }
 
-        let updated_rows: Vec<(String, Vec<SqlValue>)> = updates
-            .iter()
-            .map(|(_, key, row)| (key.clone(), row.clone()))
-            .collect();
-        let value_index_entries =
-            relational_value_index_entries_for_rows(&table.columns, &updated_rows);
-
         let mut write_set = WriteSet::default();
         for (_, key, row) in &updates {
             // An UPDATE tombstones the old version and installs a new one at the SAME row key,
@@ -1190,7 +1168,6 @@ impl Engine {
             mutation: PreparedMutation::Update {
                 table: update.table.clone(),
                 installs: updates,
-                value_index_entries,
                 updated_old_rows,
                 class_epoch,
             },

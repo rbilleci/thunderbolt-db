@@ -138,12 +138,13 @@ fn active_snapshots_track_oldest_boundary() {
         41,
         Arc::new(TransactionSnapshot {
             boundary: 6,
+            statement_owned: false,
             next_row_id: 1,
             catalog: Arc::new(CatalogSnapshot::default()),
             table_versions: BTreeMap::new(),
             resident_snapshots: Arc::new(BTreeMap::new()),
             resident_shards: Arc::new(BTreeMap::new()),
-            elided_tables: Arc::new(BTreeSet::new()),
+            device_authoritative_tables: Arc::new(BTreeSet::new()),
             chunk_authoritative_tables: Arc::new(BTreeMap::new()),
             delta: std::sync::Mutex::new(TransactionDeltaState {
                 generation: 0,
@@ -305,17 +306,10 @@ fn relational_index_access_path_survives_wal_recovery() {
 
 // ---- Stage 0 (write-half MVCC): commit-seq oracle / stamp == read-boundary unification ----
 
-/// Replay-determinism: a WAL replay must reproduce **byte-identical** MVCC version stamps
-/// (`created_by`/`deleted_by`) and identical query results versus the live-applied state.
-///
-/// The façade `txn_id`s used below are deliberately sparse and out of step with commit order
-/// (100, 250, 9_999, 3, 77_000, ...) to prove the version stamp is derived from the commit
-/// `Index` (log order), NOT from the recorded façade transaction id. If the stamp still tracked
-/// the façade txn_id, the live `created_by`/`deleted_by` values would be these arbitrary numbers
-/// while a replay (which re-proposes in log order) would assign 1,2,3,... — and the byte-for-byte
-/// version comparison below would fail.
+/// Replay-determinism after R3-004: live apply and WAL replay publish identical device-visible
+/// state while neither path installs normal relational versions into the retired host store.
 #[test]
-fn stage0_wal_replay_reproduces_byte_identical_version_stamps() {
+fn stage0_wal_replay_reproduces_device_state_without_host_versions() {
     let live = Engine::new_local_cpu_oracle();
     // Mix of DDL + DML, including UPDATE and DELETE so both `created_by` and `deleted_by`
     // are exercised. Sparse, non-monotonic-relative-to-commit txn_ids on purpose.
@@ -332,43 +326,12 @@ fn stage0_wal_replay_reproduces_byte_identical_version_stamps() {
     live.execute_text(42, "INSERT INTO acct (id, bal) VALUES (4, 40)")
         .unwrap();
 
-    // Capture the full version set (ALL versions, visible or not) including stamps.
-    let live_versions = live.read_state.mvcc.all_versions();
     let live_visible_up_to = live.visible_up_to();
-
-    // The live stamps must be the commit `Index` sequence (1..=6 for our six commits), NOT the
-    // sparse façade txn_ids — proving the decoupling at the source.
-    let mut live_created: Vec<TxnId> = live_versions.iter().map(|v| v.created_by).collect();
-    live_created.sort_unstable();
-    live_created.dedup();
-    assert!(
-        live_created.iter().all(|&c| (1..=6).contains(&c)),
-        "created_by stamps must be commit-Index values (1..=6), got {live_created:?}"
-    );
-    assert!(
-        !live_created.contains(&100) && !live_created.contains(&250),
-        "stamps must NOT be the façade txn_ids; got {live_created:?}"
-    );
-    // The DELETE of id=1 (the 5th commit) must stamp deleted_by = 5.
-    let deleted_id1 = live_versions
-        .iter()
-        .find(|v| v.deleted_by.is_some())
-        .expect("the deleted row's version must carry a deleted_by stamp");
-    assert_eq!(
-        deleted_id1.deleted_by,
-        Some(5),
-        "deleted_by must be the commit Index of the DELETE statement"
-    );
+    assert!(live.read_state.mvcc.all_versions().is_empty());
 
     // Replay from the durable WAL into a fresh engine.
     let recovered = Engine::recover_from_durable_wal(&live.durable_wal_records()).unwrap();
-    let recovered_versions = recovered.read_state.mvcc.all_versions();
-
-    // The crux: byte-identical version chains, stamps and all.
-    assert_eq!(
-        recovered_versions, live_versions,
-        "WAL replay must reproduce byte-identical MVCC version stamps"
-    );
+    assert!(recovered.read_state.mvcc.all_versions().is_empty());
     assert_eq!(
         recovered.visible_up_to(),
         live_visible_up_to,
@@ -395,13 +358,10 @@ fn stage0_wal_replay_reproduces_byte_identical_version_stamps() {
     );
 }
 
-/// The read boundary and the version stamp are the SAME monotonic commit sequence: a row
-/// committed at commit-seq `N` is visible iff the read snapshot's boundary `>= N`, and a delete
-/// at commit-seq `M` hides it iff the boundary `>= M`. We assert directly against the storage
-/// visibility predicate using explicit boundaries (`read_txn_id`), which is exactly the unit
-/// reads thread through `visible_up_to`.
+/// The published read boundary and device version regions advance on the same commit sequence;
+/// no host tuple chain participates in visibility.
 #[test]
-fn stage0_read_boundary_equals_stamp_sequence() {
+fn stage0_read_boundary_tracks_device_version_publication() {
     let e = Engine::new_local_cpu_oracle();
     // commit 1: CREATE TABLE (no row versions)
     e.execute_text(500, "CREATE TABLE t (id INT)").unwrap();
@@ -409,74 +369,30 @@ fn stage0_read_boundary_equals_stamp_sequence() {
     e.execute_text(501, "INSERT INTO t (id) VALUES (1)")
         .unwrap();
 
-    let row = e
-        .read_state
-        .mvcc
-        .all_versions()
-        .into_iter()
-        .find(|v| v.deleted_by.is_none())
-        .expect("inserted row version");
-    let n = row.created_by; // the commit-seq at which the row was created
-    assert_eq!(n, 2, "row created at commit Index 2");
-
-    // Helper: how many row versions of table `t` are visible at a given boundary.
-    let table_prefix = relational_key_prefix("t");
-    let visible_at = |engine: &Engine, boundary: TxnId| -> usize {
-        let table_rows = engine.read_state.mvcc.table_rows("t");
-        let mut cursor = table_rows
-            .store()
-            .seq_scan_open(StorageVisibility {
-                read_txn_id: boundary,
-            })
-            .unwrap();
-        let mut count = 0;
-        while let Some(tuple) = cursor.next() {
-            if tuple.key.starts_with(&table_prefix) {
-                count += 1;
-            }
-        }
-        count
-    };
-
-    // Visible iff boundary >= N. (read_txn_id == 0 is the "invalid"/empty snapshot.)
-    assert_eq!(visible_at(&e, n - 1), 0, "not visible below the create seq");
-    assert_eq!(visible_at(&e, n), 1, "visible exactly at the create seq");
-    assert_eq!(visible_at(&e, n + 100), 1, "visible above the create seq");
-
-    // commit 3: DELETE id=1 -> the version's deleted_by stamped = 3
-    e.execute_text(502, "DELETE FROM t WHERE id = 1").unwrap();
-    let deleted = e
-        .read_state
-        .mvcc
-        .all_versions()
-        .into_iter()
-        .find(|v| v.created_by == n)
-        .expect("the original row version still present in the chain");
-    let m = deleted
-        .deleted_by
-        .expect("row now carries a deleted_by stamp");
-    assert_eq!(m, 3, "delete committed at commit Index 3");
-    assert!(m > n, "delete seq strictly after create seq");
-
-    // Between create and delete (n <= boundary < m): still visible.
-    assert_eq!(visible_at(&e, n), 1, "visible at create seq, before delete");
-    assert_eq!(
-        visible_at(&e, m - 1),
-        1,
-        "still visible just below the delete seq"
-    );
-    // At/after the delete seq: hidden.
-    assert_eq!(visible_at(&e, m), 0, "hidden exactly at the delete seq");
-    assert_eq!(visible_at(&e, m + 100), 0, "hidden above the delete seq");
-
-    // And the engine's own live boundary (visible_up_to) agrees: after the delete the row is gone.
-    assert!(
-        e.visible_up_to() >= m,
-        "live read boundary advanced past the delete seq"
-    );
+    assert_eq!(e.visible_up_to(), 2);
+    assert!(e.read_state.mvcc.all_versions().is_empty());
     let Command::Select(select) = parse_command("SELECT id FROM t").unwrap() else {
         panic!("expected SELECT plan");
     };
+    assert_eq!(
+        e.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Int4(1)]]
+    );
+    {
+        let shards = e.read_residency_shards();
+        assert_eq!(
+            shards["t"].iter().map(|shard| shard.max_created_by).max(),
+            Some(2)
+        );
+    }
+
+    // commit 3: DELETE id=1 -> the version's deleted_by stamped = 3
+    e.execute_text(502, "DELETE FROM t WHERE id = 1").unwrap();
+    assert_eq!(e.visible_up_to(), 3);
+    assert!(e.read_state.mvcc.all_versions().is_empty());
+    assert!(e.read_residency_shards()["t"]
+        .iter()
+        .any(|shard| shard.deleted_by_region.is_some()));
     assert!(
         e.execute_relational_select(&select)
             .unwrap()
@@ -1137,7 +1053,6 @@ fn central_commit_wedge_drains_classic_queue_and_rejects_reads_writes_and_driver
         text,
         WriteSet::default(),
         e.committed_seq(),
-        BTreeSet::new(),
         e.catalog_snapshot().commit_seq,
         None,
         None,

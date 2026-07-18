@@ -166,7 +166,7 @@ impl Engine {
         }
         // Never stream an ELIDED table: its host MVCC store is intentionally stale (device-authoritative
         // writes), so a seq-scan would read the wrong data. Its device residency is served upstream.
-        if self.table_install_elided(&select.table) {
+        if self.table_device_authoritative(&select.table) {
             return None;
         }
         // Bind + lower the WHERE to a device predicate exactly as the sharded bridge does. A bind failure
@@ -174,16 +174,24 @@ impl Engine {
         let (table, mut bound, copin_s) = self
             .bind_relational_select_at(select, statement_copin_s)
             .ok()?;
-        // P4-2b: a CLASS table's fold must NEVER scan the (frozen) store — a cold MISS (budget
-        // re-chunk, below-boundary reader, eviction) routes to the CPU-pinned path, whose guard
-        // de-authoritizes first. The probe load here is the folds' own load (a hit is reused).
+        // P4-2b: a CLASS table's fold must NEVER scan the cleared store. A budget-induced cold
+        // miss re-tiles the authoritative encoded chunks directly; failure is loud rather than a
+        // host relational fallback. The probe load here is the folds' own load (a hit is reused).
         if self.table_chunk_authoritative(&select.table).is_some() {
             let chunk_target = (budget / 2).max(1);
             if self
                 .load_streaming_cold(&select.table, &table, chunk_target, copin_s)
                 .is_none()
+                && self
+                    .rechunk_streaming_cold_class(&table, chunk_target)
+                    .is_none()
             {
-                return Some(self.execute_relational_select_cpu_pinned(select));
+                return Some(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    format!(
+                        "chunk-authoritative relation \"{}\" could not be re-tiled for the configured GPU budget",
+                        select.table
+                    ),
+                ))));
             }
         }
         let predicate = resident_predicate_from_bound_filters(&bound).ok()?;
@@ -192,7 +200,7 @@ impl Engine {
         bound.filters.clear();
         bound.filter_groups.clear();
 
-        Some(match shape {
+        let result = match shape {
             StreamShape::Reduction(agg) => self.run_streaming_reduction_fold(
                 select,
                 &table,
@@ -236,6 +244,10 @@ impl Engine {
                 gpu_id,
                 budget,
             ),
-        })
+        };
+        if result.is_ok() {
+            self.maybe_enter_chunk_class_from_cold(&select.table);
+        }
+        Some(result)
     }
 }

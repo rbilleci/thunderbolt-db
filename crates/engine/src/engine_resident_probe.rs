@@ -1676,6 +1676,10 @@ impl Engine {
         select: &Select,
         backend: &B,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        if self.table_device_authoritative(&select.table) {
+            self.rehydrate_elided_serialized(&select.table)
+                .map_err(ExecuteError::Engine)?;
+        }
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =

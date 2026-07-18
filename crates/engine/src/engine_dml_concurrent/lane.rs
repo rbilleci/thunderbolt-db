@@ -1152,7 +1152,7 @@ impl Engine {
             }
             self.read_state
                 .residency
-                .host_install_elisions
+                .device_authoritative_commits
                 .fetch_add(applied_rows, std::sync::atomic::Ordering::Relaxed);
             if let Err(panic) = outcome {
                 std::panic::resume_unwind(panic);

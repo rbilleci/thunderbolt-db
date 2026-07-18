@@ -1,9 +1,9 @@
 use super::{
     coerce_filter_literal, current_timestamp_micros, exact_device_verdict_cardinality,
     relational_key_prefix, try_encode_binary_insert, wave_device_phase_timing_enabled,
-    wave_host_phase_timing_enabled, Command, CommitWaveItem, CommitWaveTail, DmlReadSnapshot,
-    Engine, EngineError, ExecuteError, Index, Insert, InsertPrepareValidation, LogReplicator,
-    RelationalIndex, RelationalTable, SqlValue, WAVE_DEVICE_STATS, WAVE_HOST_STATS,
+    wave_host_phase_timing_enabled, CatalogSnapshot, Command, CommitWaveItem, CommitWaveTail,
+    DmlReadSnapshot, Engine, EngineError, ExecuteError, Index, Insert, InsertPrepareValidation,
+    LogReplicator, RelationalIndex, RelationalTable, SqlValue, WAVE_DEVICE_STATS, WAVE_HOST_STATS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -146,8 +146,8 @@ impl Engine {
 
     /// Commit one WAVE: the per-item (3a)-(3e) steps of the old per-commit critical section, run
     /// back-to-back under ONE commit_mutex hold in wave order. W2: the durability tail (group
-    /// fsync wait + `committed_seq` publish + acks) is RETURNED as a [`CommitWaveTail`] (plus the
-    /// sequencer-owned post-publish admit set) instead of running inline, so the caller can
+    /// fsync wait + `committed_seq` publish + acks) is RETURNED as a [`CommitWaveTail`] instead of
+    /// running inline, so the caller can
     /// pipeline it against the next wave's sequencing. `None` = every item aborted pre-durable
     /// (outcomes already set). Every item's outcome slot is set exactly once; the
     /// `CommitWaveBatchGuard` fails any still-unset outcome (and wedges the queue) if this
@@ -157,12 +157,10 @@ impl Engine {
     pub(super) fn sequence_commit_wave(
         &self,
         batch: Vec<CommitWaveItem>,
-    ) -> Option<(CommitWaveTail, BTreeSet<String>)> {
-        // AUDIT f80f2350 FINDING A/B: the entire wave (conflict-check, re-resolve, flush,
-        // apply, publish) runs inside the commit critical section — flag it so any lock-aware
-        // rehydrate seam reached from the re-resolve's validator ladder
-        // (`rehydrate_elided_serialized`) takes its DIRECT branch instead of re-locking the
-        // commit_mutex this thread already holds.
+    ) -> Option<CommitWaveTail> {
+        // The entire wave (conflict-check, device re-resolve, flush, apply, publish) runs inside
+        // one commit critical section. The internal-read marker preserves the existing lock
+        // discipline for catalog/materialized-view work without enabling a DML repair fallback.
         self.skip_leader_check_during_internal_read(|engine| {
             engine.sequence_commit_wave_inner(batch)
         })
@@ -400,10 +398,7 @@ impl Engine {
         verdicts
     }
 
-    fn sequence_commit_wave_inner(
-        &self,
-        batch: Vec<CommitWaveItem>,
-    ) -> Option<(CommitWaveTail, BTreeSet<String>)> {
+    fn sequence_commit_wave_inner(&self, batch: Vec<CommitWaveItem>) -> Option<CommitWaveTail> {
         // E2.4a VARIANT 1 — shared-WAL sharded sequencing. When the whole wave is homogeneous
         // covered-INSERT intents (the flagship OLTP shape), fan the expensive per-item prep
         // (conflict check/record, value + WAL-record clones) out to N parallel shard workers and
@@ -414,11 +409,11 @@ impl Engine {
         // that verdict and the ordered cut.
         let shards = intent_sequencer_shards();
         if shards > 1 && batch.len() >= SHARD_MIN_WAVE {
-            let wave_catalog_seq = self.catalog_snapshot().commit_seq;
+            let wave_catalog = self.catalog_snapshot();
             if self.device_write_locate_wave_batch_enabled()
                 && batch
                     .iter()
-                    .all(|item| self.item_sharded_intent_eligible(item, wave_catalog_seq))
+                    .all(|item| self.item_sharded_intent_eligible(item, &wave_catalog))
             {
                 return self.sequence_commit_wave_sharded(batch, shards);
             }
@@ -429,7 +424,7 @@ impl Engine {
         };
         let wall_clock = current_timestamp_micros();
         let mut wave_tail: Option<(Index, usize)> = None;
-        let mut committed: Vec<(usize, Index, bool, u64)> = Vec::with_capacity(batch.len());
+        let mut committed: Vec<(usize, Index, u64)> = Vec::with_capacity(batch.len());
         // The virtual row-id cursor assigns device-native INSERT identities in wave order.
         let mut next_row_id = self.read_state.mvcc.current_row_id();
 
@@ -467,10 +462,10 @@ impl Engine {
         let mut pending_appends: WavePendingAppends = BTreeMap::new();
         // E2.4a — the pending-append flush is a shared method (`flush_wave_pending_appends`) so the
         // serial and sharded sequencer paths keep ONE wave-batched open-shard append code path.
-        let flush_appends =
-            |pending: &mut WavePendingAppends, committed: &mut Vec<(usize, Index, bool, u64)>| {
-                self.flush_wave_pending_appends(pending, committed, &batch);
-            };
+        let flush_appends = |pending: &mut WavePendingAppends,
+                             committed: &mut Vec<(usize, Index, u64)>| {
+            self.flush_wave_pending_appends(pending, committed);
+        };
         // M1 design B: WAVE-TIME BATCHED PK-UNIQUE VALIDATION. Eligible INSERTs deferred their
         // unique check off-lock (`prepare_insert`); validate the whole wave here with ONE device
         // locate per (table, key-column) (the amortization win). Returns the item positions that
@@ -582,7 +577,7 @@ impl Engine {
                                     _ => None,
                                 }
                                 .is_some_and(|table| {
-                                    self.table_install_elided(table)
+                                    self.table_device_authoritative(table)
                                         || self.table_chunk_authoritative(table).is_some()
                                 });
                                 device_authoritative
@@ -608,23 +603,22 @@ impl Engine {
 
             // E2.3 — INTENT INTEGER FAST LANE. A single-row covered-INSERT intent (pre-encoded
             // binary WAL template + reuse-eligible off-lock delta + catalog generation unchanged
-            // since prepare + table still elided + auto-admit on) owes NO String row key: its row id
+            // since prepare + table still device-authoritative) owes NO String row key: its row id
             // is the wave's integer `next_row_id`, its W5a record is patched in place, and its values
             // flow straight into the batched device append. This collapses the general path's
             // `rekey_offlock_insert_delta` (row-key `format!` + write-set/value clones) AND the
             // `insert_append` value-clone + String→u64 parse — the two top host buckets (reresolve,
             // apply) for the flagship shape — into one value clone + one WAL patch. Any drift (gen
-            // bump, de-elision, auto-admit off, non-intent item) falls through to the always-correct
-            // general path below, byte-identical to before.
+            // bump or non-intent item) falls through to the general device path below.
             let intent_fast = wave_catalog_seq == batch[position].prepared_catalog_seq
                 && batch[position].binary_wal_template.is_some()
                 && matches!(&batch[position].offlock_delta, Some(d)
-                    if Self::reresolve_reuse_eligible(d)
+                    if Self::reresolve_reuse_eligible(d, &wave_catalog)
                         && matches!(&d.mutation,
                             crate::write_path::PreparedMutation::Insert { inserted_rows, .. }
                                 if inserted_rows.len() == 1))
                 && match &batch[position].cmd {
-                    Command::Insert(insert) => self.table_install_elided(&insert.table),
+                    Command::Insert(insert) => self.table_device_authoritative(&insert.table),
                     _ => false,
                 };
             if intent_fast {
@@ -698,8 +692,8 @@ impl Engine {
                 wave_unique_slots_i32
                     .extend(batch[position].write_set.unique_slots_i32.iter().copied());
                 hp!(4);
-                // Elided apply == advance the row-id allocator (host store skipped) + the elision
-                // counter, exactly `apply_delta`'s elided-insert branch for one row. Clone the row
+                // Device-authoritative apply advances the durable row-id allocator and authority
+                // counter, exactly `apply_delta`'s insert branch for one row. Clone the row
                 // image + table out of the carried delta straight into the batched append (one value
                 // clone total, vs the general path's two + the String round-trip).
                 let (table, values) = {
@@ -720,7 +714,7 @@ impl Engine {
                 self.read_state.mvcc.advance_row_id(1);
                 self.read_state
                     .residency
-                    .host_install_elisions
+                    .device_authoritative_commits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 commit.repl.mark_applied(commit_seq);
                 next_row_id = self.read_state.mvcc.current_row_id();
@@ -745,20 +739,6 @@ impl Engine {
                 commit_seq,
                 next_row_id,
             };
-            // AUDIT f80f2350 FINDING D: capture elided-ness BEFORE the re-resolve — a
-            // constrained INSERT's validator ladder can REHYDRATE on a device-probe decline
-            // (de-eliding the table mid-wave), and the rehydration gather reads only the
-            // DEVICE + the pre-elision store, so this wave's still-BUFFERED appends are
-            // invisible to it (they exist nowhere until the tail flush, whose unhandled
-            // recovery is elided-gated and would now skip). Detected below, repaired with the
-            // flush's own upsert convention.
-            let insert_table = match &item.cmd {
-                Command::Insert(insert) => Some(insert.table.clone()),
-                _ => None,
-            };
-            let was_elided = insert_table
-                .as_deref()
-                .is_some_and(|table| self.table_install_elided(table));
             // Ledger #18: FK-free INSERT re-resolves skip the redundant unique/CHECK pass —
             // the conflicts() check above IS the commit-time guard (coverage proof on
             // InsertPrepareValidation) — but ONLY while the catalog generation still matches
@@ -778,52 +758,12 @@ impl Engine {
             let prepared = match &item.offlock_delta {
                 Some(delta)
                     if insert_validation == InsertPrepareValidation::ReResolveDeviceCovered
-                        && Self::reresolve_reuse_eligible(delta) =>
+                        && Self::reresolve_reuse_eligible(delta, &wave_catalog) =>
                 {
                     Ok(Self::rekey_offlock_insert_delta(delta, install_snapshot))
                 }
                 _ => self.prepare_dml(&item.cmd, install_snapshot, insert_validation),
             };
-            if let Some(table_name) = insert_table.as_deref() {
-                if was_elided && !self.table_install_elided(table_name) {
-                    // Mid-re-resolve de-elision: reconcile the buffered same-table rows into
-                    // the freshly rehydrated store (repair runs even when the re-resolve
-                    // errored — the de-elision happened and the earlier items' hole exists
-                    // regardless). The tail flush still appends them to the device.
-                    if let Some((rows, row_ids, items_meta, _stamps)) =
-                        pending_appends.get(table_name)
-                    {
-                        if !rows.is_empty() {
-                            let first_seq = items_meta
-                                .first()
-                                .map(|(_, seq, _)| *seq)
-                                .unwrap_or_default();
-                            let last_seq = items_meta
-                                .last()
-                                .map(|(_, seq, _)| *seq)
-                                .unwrap_or_default();
-                            let upserts: std::collections::BTreeMap<u64, Vec<SqlValue>> =
-                                row_ids.iter().copied().zip(rows.iter().cloned()).collect();
-                            let catalog_table = self
-                                .relational_catalog_table(table_name)
-                                .expect("a just-rehydrated table is in the catalog");
-                            self.rehydrate_elided_table(
-                                &catalog_table,
-                                first_seq.saturating_sub(1),
-                                &upserts,
-                                &Default::default(),
-                                last_seq,
-                            )
-                            .unwrap_or_else(|err| {
-                                panic!(
-                                    "commit-path invariant violation: mid-wave de-elision \
-                                     repair on {table_name} failed: {err}"
-                                )
-                            });
-                        }
-                    }
-                }
-            }
             let delta = match prepared {
                 Ok(delta) => delta,
                 Err(err) => {
@@ -848,7 +788,7 @@ impl Engine {
             // carries the ORIGINAL row ids, and checkpoints shrink. Everything else keeps the
             // SQL-text payload unchanged.
             let wal_payload: std::sync::Arc<[u8]> = if self.binary_wal_records_enabled()
-                && Self::reresolve_reuse_eligible(&delta)
+                && Self::reresolve_reuse_eligible(&delta, &wave_catalog)
             {
                 let crate::write_path::PreparedMutation::Insert {
                     table,
@@ -966,7 +906,7 @@ impl Engine {
             // the residency append can stamp the row-identity region.
             enum DeviceMaintenance {
                 Insert(String, Vec<Vec<SqlValue>>, Vec<u64>),
-                Delete(String, Vec<Vec<SqlValue>>),
+                Delete(String, Vec<Vec<SqlValue>>, Vec<u64>),
                 Update(String, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>, Vec<u64>),
             }
             let device_maintenance = match &delta.mutation {
@@ -995,7 +935,25 @@ impl Engine {
                     table,
                     deleted_rows,
                     ..
-                } => DeviceMaintenance::Delete(table.clone(), deleted_rows.clone()),
+                } => {
+                    let prefix = relational_key_prefix(table);
+                    DeviceMaintenance::Delete(
+                        table.clone(),
+                        deleted_rows.clone(),
+                        delta
+                            .write_set
+                            .rows
+                            .iter()
+                            .map(|key| {
+                                crate::engine_residency::parse_relational_row_id(
+                                    &key.row_key,
+                                    &prefix,
+                                )
+                                .unwrap_or(u64::MAX)
+                            })
+                            .collect(),
+                    )
+                }
                 crate::write_path::PreparedMutation::Update {
                     table,
                     installs,
@@ -1044,22 +1002,23 @@ impl Engine {
                     entry.1.extend(row_ids);
                     entry.2.push((position, commit_seq, item_rows));
                 }
-                DeviceMaintenance::Delete(table, rows) => {
+                DeviceMaintenance::Delete(table, rows, row_ids) => {
                     let handled =
                         wave_catalog
                             .relational_catalog
                             .get(&table)
                             .is_some_and(|table| {
-                                self.try_tombstone_resident_delete_table(table, &rows, commit_seq)
+                                self.try_tombstone_rows_by_identity(
+                                    table, &rows, &row_ids, commit_seq,
+                                )
                             });
                     if !handled {
-                        self.invalidate_relational_residency_tables_concurrent(
-                            &item.residency_tables,
-                            item.txn_id,
-                            commit_seq,
+                        panic!(
+                            "commit-path invariant violation: durable wave DELETE for relation \"{table}\" \
+                             declined device publication — refusing acknowledgement; WAL replay is required"
                         );
                     }
-                    committed.push((position, commit_seq, handled, item_rows));
+                    committed.push((position, commit_seq, item_rows));
                 }
                 DeviceMaintenance::Update(table, old_rows, new_rows, row_ids) => {
                     let handled =
@@ -1076,13 +1035,12 @@ impl Engine {
                                 )
                             });
                     if !handled {
-                        self.invalidate_relational_residency_tables_concurrent(
-                            &item.residency_tables,
-                            item.txn_id,
-                            commit_seq,
+                        panic!(
+                            "commit-path invariant violation: durable wave UPDATE for relation \"{table}\" \
+                             declined device publication — refusing acknowledgement; WAL replay is required"
                         );
                     }
-                    committed.push((position, commit_seq, handled, item_rows));
+                    committed.push((position, commit_seq, item_rows));
                 }
             }
             hp!(6);
@@ -1120,40 +1078,25 @@ impl Engine {
         // sequencer's critical path — it is handed back as a `CommitWaveTail` for the depth-1
         // pipeline, so the NEXT wave's sequencing overlaps THIS wave's fdatasync. The batch
         // guard's responsibility transfers to the tail's own `armed` Drop.
-        // The post-publish auto_admit re-admissions stay a SEQUENCER duty (running them from an
-        // arbitrary claimer thread could interleave a stale re-admission with the next wave's
-        // apply — the internal form of ledger #26): collect the tables here; the sequencer waits
-        // for this tail and runs them before draining the next wave (rare — only !appended
-        // committed items with auto_admit ON).
-        let mut admit_tables: BTreeSet<String> = BTreeSet::new();
-        for (position, _seq, appended, _rows) in &committed {
-            if !appended {
-                admit_tables.extend(batch[*position].residency_tables.iter().cloned());
-            }
-        }
         std::mem::forget(guard);
-        Some((
-            CommitWaveTail {
-                batch,
-                committed,
-                last_seq,
-                last_position,
-                armed: true,
-            },
-            admit_tables,
-        ))
+        Some(CommitWaveTail {
+            batch,
+            committed,
+            last_seq,
+            last_position,
+            armed: true,
+        })
     }
 
     /// A4e / E2.4a — flush the wave-batched device open-shard append: ONE
     /// `try_append_resident_int4_open_shard` per (table, flush) with per-row birth stamps (the
-    /// batch spans commit seqs), the lazy elide-entry on first successful append, and the
-    /// rehydrate-on-unhandled / invalidate fallback when the device declines. Extracted from the
-    /// serial sequencer's inner closure so the sharded sequencer shares the exact same append path.
+    /// batch spans commit seqs), the lazy device-authority entry on first successful append, and the
+    /// fail-closed publication contract when the device declines. Extracted from the serial
+    /// sequencer's inner closure so the sharded sequencer shares the exact same append path.
     fn flush_wave_pending_appends(
         &self,
         pending: &mut WavePendingAppends,
-        committed: &mut Vec<(usize, Index, bool, u64)>,
-        batch: &[CommitWaveItem],
+        committed: &mut Vec<(usize, Index, u64)>,
     ) {
         if pending.is_empty() {
             return;
@@ -1168,74 +1111,49 @@ impl Engine {
                 Some(&row_ids),
             );
             if appended {
-                // A4e elide-entry (audit B1 eligibility), once per flushed table.
-                if self.host_install_elision_enabled() && !self.table_install_elided(&table) {
+                // Establish device authority once per successfully flushed eligible table.
+                if !self.table_device_authoritative(&table) {
                     let snapshot = self.catalog_snapshot();
-                    if self.table_elision_eligible(&snapshot, &table) {
-                        self.set_table_install_elided(&table, true);
+                    if self.table_device_authority_eligible(&snapshot, &table) {
+                        self.set_table_device_authoritative(&table, true);
                     }
                 }
             } else {
-                // A4e rehydrate-on-unhandled: the batch's rows were never installed (elided
-                // apply skip) NOR appended — they ride the rehydration as upserts over the
-                // gather at the batch's first seq - 1 (device state is complete through it:
-                // flushes happen in seq order).
-                if self.table_install_elided(&table) {
-                    let first_seq = items.first().map(|(_, seq, _)| *seq).unwrap_or_default();
-                    let last_seq = items.last().map(|(_, seq, _)| *seq).unwrap_or_default();
-                    let upserts: std::collections::BTreeMap<u64, Vec<SqlValue>> =
-                        row_ids.iter().copied().zip(rows.iter().cloned()).collect();
-                    let catalog_table = self
-                        .relational_catalog_table(&table)
-                        .expect("an elided table is in the catalog");
-                    self.rehydrate_elided_table(
-                        &catalog_table,
-                        first_seq.saturating_sub(1),
-                        &upserts,
-                        &Default::default(),
-                        last_seq,
-                    )
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "commit-path invariant violation: elided rehydration for the \
-                             batched append on {table} failed: {err}"
-                        )
-                    });
-                }
-                for (position, seq, _rows) in &items {
-                    self.invalidate_relational_residency_tables_concurrent(
-                        &batch[*position].residency_tables,
-                        batch[*position].txn_id,
-                        *seq,
-                    );
-                }
+                panic!(
+                    "commit-path invariant violation: durable wave DML for relation \"{table}\" \
+                     declined device publication — refusing acknowledgement; WAL replay is required"
+                );
             }
             for (position, seq, rows) in items {
-                committed.push((position, seq, appended, rows));
+                committed.push((position, seq, rows));
             }
         }
     }
 
     /// E2.4a — is `item` a covered-INSERT intent the SHARDED sequencer can fan out? The exact serial
     /// `intent_fast` gate (catalog generation unchanged since prepare, pre-encoded binary WAL
-    /// template, reuse-eligible single-row off-lock delta, table still elided) PLUS a single
+    /// template, reuse-eligible single-row off-lock delta, table still device-authoritative) PLUS a single
     /// integer unique slot and no other conflict dimension. The single-slot restriction is what
     /// makes "hash the unique slot → shard" a CORRECT same-conflict-slot-same-worker partition: a
     /// row with two unique columns could collide with a different row on its SECOND column while
     /// hashing to a different shard, so those (and every non-intent item) stay on the serial path.
-    fn item_sharded_intent_eligible(&self, item: &CommitWaveItem, wave_catalog_seq: Index) -> bool {
-        wave_catalog_seq == item.prepared_catalog_seq
+    fn item_sharded_intent_eligible(
+        &self,
+        item: &CommitWaveItem,
+        wave_catalog: &CatalogSnapshot,
+    ) -> bool {
+        wave_catalog.commit_seq == item.prepared_catalog_seq
             && item.binary_wal_template.is_some()
             && item.write_set.unique_slots_i32.len() == 1
             && item.write_set.unique_slots.is_empty()
             && item.write_set.rows.is_empty()
             && matches!(&item.offlock_delta, Some(d)
-                if Self::reresolve_reuse_eligible(d)
+                if Self::reresolve_reuse_eligible(d, wave_catalog)
                     && matches!(&d.mutation,
                         crate::write_path::PreparedMutation::Insert { inserted_rows, .. }
                             if inserted_rows.len() == 1))
             && match &item.cmd {
-                Command::Insert(insert) => self.table_install_elided(&insert.table),
+                Command::Insert(insert) => self.table_device_authoritative(&insert.table),
                 _ => false,
             }
     }
@@ -1338,7 +1256,7 @@ impl Engine {
         &self,
         batch: Vec<CommitWaveItem>,
         shards: usize,
-    ) -> Option<(CommitWaveTail, BTreeSet<String>)> {
+    ) -> Option<CommitWaveTail> {
         let guard = CommitWaveBatchGuard {
             engine: self,
             items: &batch,
@@ -1431,7 +1349,7 @@ impl Engine {
         // a propose_batch failure aborts the WHOLE wave — identical semantics to a first-item
         // propose failure, since the single-node leader either accepts all or is not leader.
         let mut wave_tail: Option<(Index, usize)> = None;
-        let mut committed: Vec<(usize, Index, bool, u64)> = Vec::with_capacity(n);
+        let mut committed: Vec<(usize, Index, u64)> = Vec::with_capacity(n);
         let mut pending_appends: WavePendingAppends = BTreeMap::new();
         let cut_started = hostphase.then(Instant::now);
         // Pass 1 — settle aborts, collect winners (position + payload parts) in wave order.
@@ -1526,12 +1444,12 @@ impl Engine {
                         // Sharded winners are single-row covered INSERTs by eligibility.
                         entry.2.push((position, commit_seq, 1));
                     }
-                    // Elided apply, batched: advance the row-id allocator + elision counter by the
-                    // whole wave (host store skipped) and mark the block applied once.
+                    // Device-authoritative batched apply: advance the row-id allocator and authority
+                    // counter by the whole wave, then mark the block applied once.
                     self.read_state.mvcc.advance_row_id(k);
                     self.read_state
                         .residency
-                        .host_install_elisions
+                        .device_authoritative_commits
                         .fetch_add(k, std::sync::atomic::Ordering::Relaxed);
                     commit.repl.mark_applied(last_seq);
                     wave_tail = Some((last_seq, commit.wal.len()));
@@ -1548,7 +1466,7 @@ impl Engine {
                 }
             }
         }
-        self.flush_wave_pending_appends(&mut pending_appends, &mut committed, &batch);
+        self.flush_wave_pending_appends(&mut pending_appends, &mut committed);
         if let Some(started) = cut_started {
             // Charge the ordered serial cut (WAL append + commit-seq + row record +
             // device buffer) to the `sequence` bucket — raw nanos; the bench divides by items.
@@ -1582,24 +1500,14 @@ impl Engine {
             return None;
         };
 
-        // Post-publish auto_admit re-admissions stay a SEQUENCER duty (identical to serial).
-        let mut admit_tables: BTreeSet<String> = BTreeSet::new();
-        for (position, _seq, appended, _rows) in &committed {
-            if !appended {
-                admit_tables.extend(batch[*position].residency_tables.iter().cloned());
-            }
-        }
         std::mem::forget(guard);
-        Some((
-            CommitWaveTail {
-                batch,
-                committed,
-                last_seq,
-                last_position,
-                armed: true,
-            },
-            admit_tables,
-        ))
+        Some(CommitWaveTail {
+            batch,
+            committed,
+            last_seq,
+            last_position,
+            armed: true,
+        })
     }
 
     /// E2.4a — the parallel shard-prep pass (Stage 2 of [`Engine::sequence_commit_wave_sharded`]).
