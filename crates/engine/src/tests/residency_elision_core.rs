@@ -218,14 +218,14 @@ fn a4e_concurrent_insert_waves_elide_and_match_twin() {
             )
             .unwrap();
         }
-        // Sample BEFORE the read: the full-projection SELECT below is a HOST-path shape, so
-        // the A4e read-side ladder legitimately rehydrates + de-elides to serve it.
+        // Sample before the read, then prove the full projection stays on the GPU without fallback.
         let elided_through_waves = e.table_device_authoritative("t");
-        let mut rows = e
+        let result = e
             .execute_relational_select_text("SELECT id, v FROM t")
-            .unwrap()
-            .rows
-            .into_boxed();
+            .unwrap();
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        let mut rows = result.rows.into_boxed();
         rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         (e, rows, elided_through_waves)
     };

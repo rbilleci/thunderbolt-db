@@ -13,7 +13,7 @@ fn gpu_resident_expr_select_evaluates_arithmetic_predicate_and_materializes_rows
     // a+b = 2*i is MONOTONE, so {i : 2*i > K} is the contiguous range [K/2+1, N); the projected a is
     // a[i]=i, so the result rows are exactly those indices. The range is distinct from "only a"
     // ({i:i>K} = [K+1,N)), so a passing assert proves the kernel evaluated the Add-then-Gt tree.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
 
     const N: i32 = 600;
@@ -92,7 +92,7 @@ fn gpu_resident_expr_simple_int4_predicate_uses_ordered_index_route() {
     // cross-block exclusive scan + intra-block prefix-sum scatter) with INTERLEAVED matches (a[i]=i%7),
     // and asserts the EXACT ascending projected `id` vector. A broken cross-block scatter, an off-by-one
     // in the index store, or a missing eq/ne fold would reorder or drop indices and fail this equality.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id INT, a INT)").unwrap();
 
     const N: i32 = 1000;
@@ -185,7 +185,7 @@ fn gpu_resident_expr_select_evaluates_deep_arithmetic_tree_via_vm() {
     // materialized on the GPU. Closed-form oracle: a[i]=b[i]=i => value = 4*i - 5 (monotone), so
     // 4i-5 > K <=> i >= (K+5+3)/4 ; with K=395, 4i > 400 <=> i >= 101. Projected a[i]=i => the
     // result rows are exactly those indices.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
 
     const N: i32 = 600;
@@ -274,7 +274,7 @@ fn gpu_resident_expr_select_evaluates_column_vs_column_predicates() {
     // through the engine's col-vs-col VM. Closed-form oracle: a[i]=i, b[i]=N-1-i (strictly decreasing,
     // never ties a). `a < b` <=> 2i < N-1 ; `a*2 > b` <=> 3i > N-1. Projected a[i]=i => result rows
     // are the matching indices.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
 
     const N: i32 = 600;
@@ -332,7 +332,7 @@ fn gpu_resident_expr_select_evaluates_boolean_and_or_ne_predicates() {
     // Boolean predicates (AND / OR / Ne) through the engine's mask-based predicate VM, evaluated and
     // materialized on the GPU. Closed-form oracle over a[i]=i: matching sets are explicit index
     // ranges.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
 
     const N: i32 = 600;

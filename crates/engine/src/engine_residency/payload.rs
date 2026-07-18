@@ -300,8 +300,8 @@ pub(crate) fn sql_value_as_int4(value: &SqlValue) -> i32 {
 /// i32-section types — the A4a materializer / A4c gather previously DECLINED any non-strictly-
 /// Int4 table because they typed every value `SqlValue::Int4` (the A4a audit-F1 mistype
 /// discipline); deriving the variant from the CATALOG column type lifts that. `None` for any
-/// non-i32-section type (the caller declines to the host path) and for an out-of-range Int2
-/// payload (corrupt section bytes must DECLINE, never silently truncate).
+/// non-i32-section type (the caller rejects the mismatched section contract) and for an out-of-range
+/// Int2 payload (corrupt section bytes must DECLINE, never silently truncate).
 pub(crate) fn sql_value_from_i32_section(ty: gpu_db_sql::SqlType, v: i32) -> Option<SqlValue> {
     match ty {
         gpu_db_sql::SqlType::Int4 => Some(SqlValue::Int4(v)),
@@ -472,10 +472,9 @@ pub(crate) fn probe_key_id_positions(table: &RelationalTable, key_id: usize) -> 
 }
 
 /// COMPOUND KEYS: fold a ROW's key-column values (catalog order in `values`) into the surrogate
-/// fingerprint needle. `None` if any key column is absent or not an i32-SECTION value (the caller then
-/// declines the device fast path and falls to the host validate ladder). NULL is not an i32-section
-/// value, so a row with a NULL key column returns `None` — its uniqueness rides the host path (which is
-/// where PK-NOT-NULL / NULL-tuple semantics live anyway).
+/// fingerprint needle. `None` if any key column is absent or not an i32-SECTION value; the caller then
+/// uses the exact typed device predicate, including structural `IS NULL`, and fails loudly if that
+/// authoritative verdict is unavailable.
 pub(crate) fn compound_index_row_fingerprint(
     table: &RelationalTable,
     index: &RelationalIndex,
@@ -498,8 +497,8 @@ pub(crate) fn compound_index_row_fingerprint(
 /// section words) agree byte-for-byte. Int4/Date -> `[v]`; Int2 -> `[widened v]`; Int8/Timestamp ->
 /// `[low32, high32]` (the i64 section stores `value.to_le_bytes()`, read as two LE i32 words); b128
 /// Numeric/Uuid -> 4 LE i32 words (the b128 section stores the i128 mantissa `to_le_bytes()` /
-/// the raw uuid bytes). `None` for NULL or an unsupported key type -> the caller declines the device
-/// fast path (host validates). NUMERIC scale: the section stores the mantissa RESCALED to the column's
+/// the raw uuid bytes). `None` for NULL or an unsupported key type makes the caller use the exact typed
+/// device predicate; there is no host validation tier. NUMERIC scale: the section stores the mantissa RESCALED to the column's
 /// scale (values are rescaled on insert), and the needle/WHERE value is coerced to the same column type
 /// before folding, so the mantissa words agree; the full-tuple recheck is the exactness backstop.
 pub(crate) fn sql_value_key_words(ty: gpu_db_sql::SqlType, value: &SqlValue) -> Option<Vec<i32>> {
@@ -628,8 +627,8 @@ pub(crate) const CREATED_BY_VISIBLE_FILL_BYTE: u8 = 0x00;
 /// RETIREMENT A1: the row-identity region's UNSTAMPED sentinel — every byte 0xFF makes the u64
 /// `u64::MAX`, which no real `row_id` reaches (ids allocate monotonically from 1). A live slot
 /// reading the sentinel (or a shard with NO region — benchmark/synthetic installs) means "identity
-/// unknown": the device resolve declines to the host path. Headroom is born-sentinel so a skipped
-/// append stamp is DETECTABLE, never a wrong identity.
+/// unknown": the device resolve declines and its caller fails loudly. Headroom is born-sentinel so
+/// a skipped append stamp is DETECTABLE, never a wrong identity.
 pub(crate) const ROW_ID_UNSTAMPED_FILL_BYTE: u8 = 0xFF;
 
 /// RETIREMENT A1: parse the `row_id` out of a relational row key (`rel/{table}/{row_id:020}`).

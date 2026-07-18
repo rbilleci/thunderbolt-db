@@ -3,7 +3,6 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_engine::{
@@ -265,11 +264,10 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     let avg_quantity = engine.execute_relational_select(&select(
         "SELECT AVG(ol_quantity) FROM order_line WHERE ol_quantity BETWEEN 10 AND 40",
     )?)?;
-    assert_single_numeric(
-        &avg_quantity,
-        &expected_quantity_between_avg(args.rows),
-        "avg_quantity_between",
-    )?;
+    match expected_quantity_between_avg(args.rows) {
+        Some(expected) => assert_single_numeric(&avg_quantity, &expected, "avg_quantity_between")?,
+        None => assert_single_null(&avg_quantity, "avg_quantity_between")?,
+    }
     let max_amount = engine.execute_relational_select(&select(
         "SELECT MAX(ol_amount) FROM order_line WHERE ol_amount >= 16",
     )?)?;
@@ -474,7 +472,8 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
     markdown.push_str(&format!("- resident_rows_materialized: {}\n", 0usize));
     markdown.push_str(&format!("- layout_elapsed_ms: {layout_elapsed_ms}\n"));
     markdown.push_str(&format!("- install_elapsed_ms: {install_elapsed_ms}\n"));
-    markdown.push_str("- expected_results: deterministic formulas, no CPU MVCC mirror\n");
+    markdown
+        .push_str("- expected_results: deterministic formulas independent of execution route\n");
     markdown.push_str("- benchmark_only_durability_boundary: generated resident chunks are not normal SQL/MVCC inserts\n\n");
 
     writeln!(
@@ -859,6 +858,17 @@ fn assert_single_numeric(
     Ok(())
 }
 
+fn assert_single_null(result: &RelationalSelectResult, label: &str) -> Result<(), Box<dyn Error>> {
+    let Some(row) = result.rows.iter().next() else {
+        return Err(format!("{label} returned no rows").into());
+    };
+    match row.first() {
+        Some(gpu_db_sql::SqlValue::Null) => Ok(()),
+        Some(value) => Err(format!("{label} returned {value:?}, expected NULL").into()),
+        None => Err(format!("{label} returned an empty row").into()),
+    }
+}
+
 fn expected_amount_sum(rows: usize) -> i64 {
     let period = 100_000usize;
     let full_periods = rows / period;
@@ -870,7 +880,7 @@ fn expected_amount_sum(rows: usize) -> i64 {
     full_periods as i64 * period_sum + remainder_sum
 }
 
-fn expected_quantity_between_avg(rows: usize) -> String {
+fn expected_quantity_between_avg(rows: usize) -> Option<String> {
     let period = 50usize;
     let full_periods = rows / period;
     let remainder = rows % period;
@@ -885,7 +895,7 @@ fn expected_quantity_between_avg(rows: usize) -> String {
             sum += value;
         }
     }
-    fixed_scale_average(sum as i128, count)
+    (count > 0).then(|| fixed_scale_average(sum as i128, count))
 }
 
 fn fixed_scale_average(sum: i128, count: usize) -> String {
@@ -948,7 +958,6 @@ fn run_probe(args: &Args) -> Result<(), Box<dyn Error>> {
     }
 
     let run_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let cpu = seed_engine(args.rows)?;
     let mut gpu = seed_engine(args.rows)?;
     let snapshot = gpu.populate_relational_residency_snapshot("order_line")?;
     let queries = query_cases(args.rows)?;
@@ -968,7 +977,7 @@ fn run_probe(args: &Args) -> Result<(), Box<dyn Error>> {
     for logical_requests in &args.concurrency {
         markdown.push_str(&format!("## logical_requests_{logical_requests}\n"));
         for case in &queries {
-            let expected = cpu.execute_relational_select(&select(&case.sql)?)?;
+            let expected = expected_result_for_case(case, args.rows)?;
             let metrics = run_query_case(
                 &mut gpu,
                 case,
@@ -1040,7 +1049,7 @@ fn run_query_case(
     gpu: &mut Engine,
     case: &QueryCase,
     logical_requests: usize,
-    expected: &RelationalSelectResult,
+    expected: &gpu_db_engine::RowBlock,
     resident_bytes: u64,
 ) -> Result<QueryMetrics, Box<dyn Error>> {
     let select = select(&case.sql)?;
@@ -1052,10 +1061,7 @@ fn run_query_case(
         let query_started = Instant::now();
         let result = gpu.execute_relational_select(&select)?;
         latencies.push(query_started.elapsed());
-        if !expected.columns.is_empty() && result.columns != expected.columns {
-            return Err(format!("{} CPU/resident results diverged", case.name).into());
-        }
-        assert_rows_match(&result.rows, &expected.rows, case.name)?;
+        assert_rows_match(&result.rows, expected, case.name)?;
         result_rows = result.rows.len();
     }
     let elapsed = started.elapsed();
@@ -1182,14 +1188,18 @@ fn query_cases(row_count: usize) -> Result<Vec<QueryCase>, Box<dyn Error>> {
 fn expected_result_for_case(
     case: &QueryCase,
     rows: usize,
-) -> Result<RelationalSelectResult, Box<dyn Error>> {
+) -> Result<gpu_db_engine::RowBlock, Box<dyn Error>> {
     let value = match case.name {
         "order_line_count_all" => gpu_db_sql::SqlValue::Int8(rows as i64),
         "order_line_sum_amount" => gpu_db_sql::SqlValue::Int8(expected_amount_sum(rows)),
-        "order_line_avg_quantity_between" => gpu_db_sql::SqlValue::Numeric(
-            gpu_db_sql::Decimal128::parse_at_scale(&expected_quantity_between_avg(rows), 16)
-                .expect("scale-16 average literal parses"),
-        ),
+        "order_line_avg_quantity_between" => expected_quantity_between_avg(rows)
+            .map(|expected| {
+                gpu_db_sql::SqlValue::Numeric(
+                    gpu_db_sql::Decimal128::parse_at_scale(&expected, 16)
+                        .expect("scale-16 average literal parses"),
+                )
+            })
+            .unwrap_or(gpu_db_sql::SqlValue::Null),
         "order_line_max_amount_filter" => {
             let lower = (rows / 4).max(1) as i32;
             // PG: MAX over an empty filtered set is SQL NULL (not the legacy empty-text sentinel).
@@ -1199,14 +1209,7 @@ fn expected_result_for_case(
         }
         other => return Err(format!("no formula-backed expected result for {other}").into()),
     };
-    Ok(RelationalSelectResult {
-        columns: Arc::new(Vec::new()),
-        rows: (vec![vec![value]]).into(),
-        planned_target: gpu_db_execution::DeviceTarget::Cpu,
-        executed_target: gpu_db_execution::DeviceTarget::Cpu,
-        fallback_reason: None,
-        access_path: Arc::new(gpu_db_engine::RelationalAccessPath::FullTableScan),
-    })
+    Ok((vec![vec![value]]).into())
 }
 
 fn assert_rows_match(
@@ -1368,4 +1371,22 @@ fn parse_csv_usize(value: &str) -> Result<Vec<usize>, Box<dyn Error>> {
 
 fn json_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formula_average_is_null_when_between_filter_has_no_rows() {
+        assert_eq!(expected_quantity_between_avg(1), None);
+        assert_eq!(expected_quantity_between_avg(8), None);
+
+        let case = QueryCase {
+            name: "order_line_avg_quantity_between",
+            sql: String::new(),
+        };
+        let expected = expected_result_for_case(&case, 8).unwrap();
+        assert_eq!(expected.row(0), &[gpu_db_sql::SqlValue::Null]);
+    }
 }

@@ -5,17 +5,17 @@
 //! size — i.e. it is amortizable launch overhead, not compute. The bet (ARCHITECTURE §9) is that
 //! BATCHING — coalescing many concurrent point lookups into one GPU submission (`PointLookupBatcher`,
 //! the embryo of the persistent-kernel wave engine) — divides that fixed cost across the batch and
-//! beats a CPU index lookup at scale.
+//! amortizes it across concurrent lookups.
 //!
 //! This harness drives `SELECT id FROM accounts WHERE id = ?` from `threads` concurrent threads
 //! (closed-loop; offered concurrency = `threads`) over a resident table, three ways:
-//!   - **host (non-resident):** lock-free snapshot read on the CPU — the baseline to beat.
+//!   - **default GPU (non-resident):** the general GPU route without a retained snapshot.
 //!   - **gpu per-query:** the unbatched resident route — pays the full ~72µs every call.
 //!   - **gpu batched:** the coalescing batcher — the contender; effective per-lookup cost should
 //!     fall toward 72µs / batch_size if amortization works.
 //!
 //! Reports p50/p99/p99.9 + aggregate throughput. The question: does `gpu batched` throughput (and
-//! p99) beat `host`?
+//! p99) beat the default non-resident GPU route?
 //!
 //! Env: GPU_DB_BENCH_ROWS (20000), GPU_DB_BENCH_THREADS (128), GPU_DB_BENCH_OPS (per-thread, 2000),
 //! GPU_DB_BENCH_BATCH (batcher max_items trigger, 128), GPU_DB_BENCH_WAIT_US (batcher linger, 500).
@@ -172,10 +172,17 @@ fn main() {
         max_items,
         Duration::from_micros(max_wait_us),
     ));
-    let host = Arc::new(SharedEngine::from_engine(build_engine(rows, false)));
+    let baseline = Arc::new(SharedEngine::from_engine(build_engine(rows, false)));
 
     println!("## SELECT id FROM accounts WHERE id = ?  @ {threads} concurrent threads");
-    run("host (non-resident)", &host, None, threads, ops, rows);
+    run(
+        "default gpu (non-resident)",
+        &baseline,
+        None,
+        threads,
+        ops,
+        rows,
+    );
     run("gpu per-query", &resident, None, threads, ops, rows);
     run("gpu batched", &resident, Some(&batcher), threads, ops, rows);
 }

@@ -1,8 +1,69 @@
 use super::*;
 
 #[test]
+fn relational_sql_specification_carries_semantics_without_execution_metadata() {
+    let e = Engine::new_local_test_engine();
+    e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+        .unwrap();
+    // Seed the explicitly host-owned specification fixture without taking the production DML
+    // route, which correctly makes the resulting relation device-authoritative.
+    e.read_state.mvcc.with_table_mut("people", |data| {
+        for (row_id, id, name) in [(1, 7, "Zed"), (2, 6, "Miss"), (3, 8, "Carl"), (4, 7, "Ada")] {
+            data.rows
+                .tuple_insert_reserved_key(
+                    NewTuple {
+                        key: relational_row_key("people", row_id),
+                        value: encode_relational_row(&[
+                            SqlValue::Int4(id),
+                            SqlValue::Text(name.to_string()),
+                        ]),
+                    },
+                    1,
+                )
+                .unwrap();
+        }
+    });
+    let Command::Select(select) =
+        parse_command("SELECT name FROM people WHERE id >= 7 ORDER BY name ASC LIMIT 2").unwrap()
+    else {
+        panic!("expected SELECT plan");
+    };
+    let fallback_before = e.metrics().snapshot().fallback_total;
+
+    let result = e.evaluate_relational_select_specification(&select).unwrap();
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty))
+            .collect::<Vec<_>>(),
+        vec![("name", SqlType::Text)]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![SqlValue::Text("Ada".to_string())],
+            vec![SqlValue::Text("Carl".to_string())],
+        ]
+    );
+    assert_eq!(
+        *result.access_path,
+        RelationalAccessPath::OrderedKeyBatch {
+            table: "people".to_string(),
+            predicate_column: Some("id".to_string()),
+            predicate_op: Some(SelectFilterOp::Gte),
+            order_column: "name".to_string(),
+            descending: false,
+            matched_keys: 3,
+        }
+    );
+    assert_eq!(e.metrics().snapshot().fallback_total, fallback_before);
+}
+
+#[test]
 fn relational_sql_create_insert_select_uses_mvcc_execution_path() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -51,7 +112,7 @@ fn relational_sql_create_insert_select_uses_mvcc_execution_path() {
 
 #[test]
 fn relational_copy_rows_commit_through_engine_wal_mvcc() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE people (id INT PRIMARY KEY, name TEXT DEFAULT 'unknown'::text)",
@@ -169,7 +230,7 @@ fn relational_copy_rows_commit_through_engine_wal_mvcc() {
 fn relational_copy_ingests_null_marker_and_selects_back_null() {
     // M3 (doc 21) Slice G: the COPY NULL marker ingests as a SQL NULL. TEXT format: the unquoted `\N`.
     // CSV format: an UNQUOTED empty field (a QUOTED empty field is the empty STRING, not NULL).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id INT, name TEXT)")
         .unwrap();
 
@@ -247,7 +308,7 @@ fn relational_copy_round_trips_all_column_types_and_null() {
     // round-trips every value AND a `\N` NULL per type through the COPY-to-engine bridge
     // (render_sql_value_literal -> re-parsed INSERT -> store). Previously the render errored on any
     // non-int4/text/Null column ("supports int4/text rows only").
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE tt (id INT, big BIGINT, amt NUMERIC(12,2), flag BOOL, d DATE, ts TIMESTAMP, u UUID)",
@@ -352,7 +413,7 @@ fn relational_copy_round_trips_all_column_types_and_null() {
 
 #[test]
 fn relational_column_defaults_fill_omitted_insert_columns_and_replay() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE default_people (id INT, name TEXT DEFAULT 'unknown'::text, bucket INT DEFAULT 7)",
@@ -427,7 +488,7 @@ fn relational_column_defaults_fill_omitted_insert_columns_and_replay() {
 
 #[test]
 fn relational_add_column_default_rewrites_rows_and_replays() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE default_people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -494,7 +555,7 @@ fn relational_add_column_default_rewrites_rows_and_replays() {
         )
         .unwrap_err();
     assert!(duplicate.to_string().contains("already exists"));
-    let no_default = Engine::new_local_cpu_oracle();
+    let no_default = Engine::new_local_test_engine();
     no_default
         .execute_text(1, "CREATE TABLE default_people (id INT)")
         .unwrap();
@@ -511,7 +572,7 @@ fn relational_add_column_default_rewrites_rows_and_replays() {
 
 #[test]
 fn relational_add_column_sequence_default_rewrites_rows_and_replays() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE default_people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -646,7 +707,7 @@ fn relational_add_column_sequence_default_rewrites_rows_and_replays() {
 
 #[test]
 fn relational_drop_column_rewrites_rows_and_replays() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE drop_column_people (id INT, name TEXT, bucket INT DEFAULT 7)",
@@ -722,7 +783,7 @@ fn relational_drop_column_rewrites_rows_and_replays() {
         .unwrap_err();
     assert!(missing_column.to_string().contains("does not exist"));
 
-    let constrained = Engine::new_local_cpu_oracle();
+    let constrained = Engine::new_local_test_engine();
     constrained
         .execute_text(
             1,
@@ -737,7 +798,7 @@ fn relational_drop_column_rewrites_rows_and_replays() {
 
 #[test]
 fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE rename_table_people (id INT PRIMARY KEY, name TEXT UNIQUE, bucket INT DEFAULT 7)",
@@ -857,7 +918,7 @@ fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
         .unwrap_err();
     assert!(duplicate.to_string().contains("already exists"));
 
-    let view_engine = Engine::new_local_cpu_oracle();
+    let view_engine = Engine::new_local_test_engine();
     view_engine
         .execute_text(1, "CREATE TABLE rename_table_base (id INT, name TEXT)")
         .unwrap();
@@ -879,7 +940,7 @@ fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
 
 #[test]
 fn relational_rename_column_updates_catalog_indexes_and_replays() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE rename_column_people (id INT PRIMARY KEY, name TEXT DEFAULT 'unknown')",
@@ -969,7 +1030,7 @@ fn relational_rename_column_updates_catalog_indexes_and_replays() {
         .unwrap_err();
     assert!(duplicate.to_string().contains("already exists"));
 
-    let view_engine = Engine::new_local_cpu_oracle();
+    let view_engine = Engine::new_local_test_engine();
     view_engine
         .execute_text(1, "CREATE TABLE rename_base (id INT, name TEXT)")
         .unwrap();
@@ -990,7 +1051,7 @@ fn relational_rename_column_updates_catalog_indexes_and_replays() {
 
 #[test]
 fn relational_rename_constraint_updates_index_comments_and_replays() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE rename_constraint_people (id INT PRIMARY KEY, name TEXT UNIQUE)",
@@ -1107,7 +1168,7 @@ fn relational_rename_constraint_updates_index_comments_and_replays() {
             .unwrap_err();
     assert!(missing_constraint.to_string().contains("does not exist"));
 
-    let view_engine = Engine::new_local_cpu_oracle();
+    let view_engine = Engine::new_local_test_engine();
     view_engine
         .execute_text(1, "CREATE TABLE rename_constraint_base (id INT, name TEXT)")
         .unwrap();
@@ -1128,7 +1189,7 @@ fn relational_rename_constraint_updates_index_comments_and_replays() {
 
 #[test]
 fn relational_sql_delete_uses_wal_before_visibility_and_rebuilds_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1174,7 +1235,7 @@ fn relational_sql_delete_uses_wal_before_visibility_and_rebuilds_from_wal() {
 
 #[test]
 fn relational_sql_update_uses_wal_before_visibility_and_rebuilds_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1238,7 +1299,7 @@ fn relational_sql_update_uses_wal_before_visibility_and_rebuilds_from_wal() {
 
 #[test]
 fn relational_sql_views_select_and_replay_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1294,7 +1355,7 @@ fn relational_sql_views_select_and_replay_from_wal() {
 
 #[test]
 fn relational_sql_create_or_replace_view_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1377,7 +1438,7 @@ fn relational_sql_create_or_replace_view_replays_from_wal() {
 
 #[test]
 fn relational_sql_layered_views_select_and_replay_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1478,7 +1539,7 @@ fn relational_sql_layered_views_select_and_replay_from_wal() {
 
 #[test]
 fn relational_sql_rename_view_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1567,7 +1628,7 @@ fn relational_sql_rename_view_replays_from_wal() {
 
 #[test]
 fn relational_sql_drop_view_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -1617,7 +1678,7 @@ fn relational_sql_drop_view_replays_from_wal() {
         .to_string()
         .contains("view \"active_people\" does not exist"));
 
-    let table_target_engine = Engine::new_local_cpu_oracle();
+    let table_target_engine = Engine::new_local_test_engine();
     table_target_engine
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1626,7 +1687,7 @@ fn relational_sql_drop_view_replays_from_wal() {
         .unwrap_err();
     assert!(table_target.to_string().contains("not a view"));
 
-    let preflight_engine = Engine::new_local_cpu_oracle();
+    let preflight_engine = Engine::new_local_test_engine();
     preflight_engine
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1665,7 +1726,7 @@ fn relational_sql_drop_view_replays_from_wal() {
 
 #[test]
 fn relational_sql_sequence_catalog_objects_replay_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE SEQUENCE public.people_seq")
@@ -1724,7 +1785,7 @@ fn relational_sql_sequence_catalog_objects_replay_from_wal() {
         .relational_catalog_sequence("people_id_seq")
         .is_none());
 
-    let boundary = Engine::new_local_cpu_oracle();
+    let boundary = Engine::new_local_test_engine();
     boundary
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1745,7 +1806,7 @@ fn relational_sql_sequence_catalog_objects_replay_from_wal() {
         .to_string()
         .contains("sequence \"missing_seq\" does not exist"));
 
-    let rename_boundary = Engine::new_local_cpu_oracle();
+    let rename_boundary = Engine::new_local_test_engine();
     rename_boundary
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -1766,7 +1827,7 @@ fn relational_sql_sequence_catalog_objects_replay_from_wal() {
 
 #[test]
 fn relational_sql_sequence_values_replay_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE SEQUENCE public.people_seq")
         .unwrap();
     let sequence = e.relational_catalog_sequence("people_seq").unwrap();
@@ -1817,7 +1878,7 @@ fn relational_sql_sequence_values_replay_from_wal() {
 
 #[test]
 fn relational_sequence_defaults_fill_omitted_columns_and_replay() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE serial_people (id SERIAL PRIMARY KEY, name TEXT)",
@@ -1934,7 +1995,7 @@ fn relational_sequence_defaults_fill_omitted_columns_and_replay() {
 
 #[test]
 fn relational_sql_materialized_view_lifecycle_replays_from_wal() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2044,7 +2105,7 @@ fn relational_sql_materialized_view_lifecycle_replays_from_wal() {
         None
     );
 
-    let boundary = Engine::new_local_cpu_oracle();
+    let boundary = Engine::new_local_test_engine();
     boundary
         .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
@@ -2079,36 +2140,53 @@ fn relational_sql_materialized_view_lifecycle_replays_from_wal() {
 }
 
 #[test]
-fn relational_sql_select_gpu_bridge_matches_cpu_results_at_sql_level() {
-    let cpu = Engine::new_local_cpu_oracle();
-    cpu.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+#[ignore = "requires CUDA driver"]
+fn relational_sql_select_gpu_bridge_matches_closed_form_results_at_sql_level() {
+    let source = Engine::new_local_test_engine();
+    source
+        .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
-    cpu.execute_text(
-        2,
-        "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
-    )
-    .unwrap();
-    let durable = cpu.durable_wal_records().to_vec();
+    source
+        .execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+    let durable = source.durable_wal_records().to_vec();
     let mut gpu = Engine::recover_from_durable_wal(&durable).unwrap();
 
     let Command::Select(select) = parse_command("SELECT * FROM people").unwrap() else {
         panic!("expected SELECT plan");
     };
-    let cpu_result = cpu.execute_relational_select(&select).unwrap();
     let gpu_result = gpu
-        .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap();
 
-    assert_eq!(gpu_result.columns, cpu_result.columns);
-    assert_eq!(gpu_result.rows, cpu_result.rows);
-    assert_eq!(gpu_result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(gpu_result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(gpu_result.fallback_reason, None);
+    assert_eq!(
+        gpu_result
+            .specification
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty))
+            .collect::<Vec<_>>(),
+        vec![("id", SqlType::Int4), ("name", SqlType::Text)]
+    );
+    assert_eq!(
+        gpu_result.specification.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+            vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+        ]
+    );
+    assert_eq!(gpu_result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(gpu_result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(gpu_result.execution.fallback_reason, None);
 }
 
 #[test]
+#[ignore = "requires CUDA driver"]
 fn relational_sql_gpu_bridge_projection_result_shaping_does_not_report_gpu_fallback() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2123,18 +2201,22 @@ fn relational_sql_gpu_bridge_projection_result_shaping_does_not_report_gpu_fallb
         panic!("expected SELECT plan");
     };
     let result = e
-        .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap();
 
-    assert_eq!(result.rows, vec![vec![SqlValue::Text("Linus".to_string())]]);
-    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.fallback_reason, None);
+    assert_eq!(
+        result.specification.rows,
+        vec![vec![SqlValue::Text("Linus".to_string())]]
+    );
+    assert_eq!(result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.fallback_reason, None);
     assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
 }
 
 #[test]
+#[ignore = "requires CUDA driver"]
 fn relational_sql_gpu_bridge_order_by_decoded_column_uses_ordered_key_batch() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2149,14 +2231,17 @@ fn relational_sql_gpu_bridge_order_by_decoded_column_uses_ordered_key_batch() {
         panic!("expected SELECT plan");
     };
     let result = e
-        .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap();
 
-    assert_eq!(result.rows, vec![vec![SqlValue::Text("Grace".to_string())]]);
-    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        *result.access_path,
+        result.specification.rows,
+        vec![vec![SqlValue::Text("Grace".to_string())]]
+    );
+    assert_eq!(result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.fallback_reason, None);
+    assert_eq!(
+        *result.specification.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("id".to_string()),
@@ -2170,8 +2255,9 @@ fn relational_sql_gpu_bridge_order_by_decoded_column_uses_ordered_key_batch() {
 }
 
 #[test]
+#[ignore = "requires CUDA driver"]
 fn relational_sql_gpu_bridge_full_scan_order_by_uses_ordered_key_batch() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2186,17 +2272,17 @@ fn relational_sql_gpu_bridge_full_scan_order_by_uses_ordered_key_batch() {
         panic!("expected SELECT plan");
     };
     let result = e
-        .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap();
 
     assert_eq!(
-        result.rows,
+        result.specification.rows,
         vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)]]
     );
-    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.fallback_reason, None);
+    assert_eq!(result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.fallback_reason, None);
     assert_eq!(
-        *result.access_path,
+        *result.specification.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: None,
@@ -2209,8 +2295,9 @@ fn relational_sql_gpu_bridge_full_scan_order_by_uses_ordered_key_batch() {
 }
 
 #[test]
+#[ignore = "requires CUDA driver"]
 fn relational_sql_gpu_bridge_ordered_limit_offset_uses_ordered_key_batch() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2225,18 +2312,18 @@ fn relational_sql_gpu_bridge_ordered_limit_offset_uses_ordered_key_batch() {
         panic!("expected SELECT plan");
     };
     let result = e
-        .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap();
 
     assert_eq!(
-        result.rows,
+        result.specification.rows,
         vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)]]
     );
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.fallback_reason, None);
+    assert_eq!(result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.fallback_reason, None);
     assert_eq!(
-        *result.access_path,
+        *result.specification.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: None,
@@ -2250,8 +2337,9 @@ fn relational_sql_gpu_bridge_ordered_limit_offset_uses_ordered_key_batch() {
 }
 
 #[test]
+#[ignore = "requires CUDA driver"]
 fn relational_sql_gpu_bridge_filtered_offset_without_limit_skips_after_order() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2266,15 +2354,15 @@ fn relational_sql_gpu_bridge_filtered_offset_without_limit_skips_after_order() {
         panic!("expected SELECT plan");
     };
     let result = e
-        .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap();
 
-    assert_eq!(result.rows, vec![vec![SqlValue::Int4(4)]]);
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.fallback_reason, None);
+    assert_eq!(result.specification.rows, vec![vec![SqlValue::Int4(4)]]);
+    assert_eq!(result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.fallback_reason, None);
     assert_eq!(
-        *result.access_path,
+        *result.specification.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("name".to_string()),
@@ -2287,8 +2375,9 @@ fn relational_sql_gpu_bridge_filtered_offset_without_limit_skips_after_order() {
 }
 
 #[test]
+#[ignore = "requires CUDA driver"]
 fn relational_sql_gpu_bridge_distinct_projection_keeps_gpu_row_fetch() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2304,21 +2393,21 @@ fn relational_sql_gpu_bridge_distinct_projection_keeps_gpu_row_fetch() {
         panic!("expected SELECT plan");
     };
     let result = e
-        .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap();
 
     assert_eq!(
-        result.rows,
+        result.specification.rows,
         vec![
             vec![SqlValue::Text("Grace".to_string())],
             vec![SqlValue::Text("Ada".to_string())],
         ]
     );
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.fallback_reason, None);
+    assert_eq!(result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.fallback_reason, None);
     assert_eq!(
-        *result.access_path,
+        *result.specification.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: None,
@@ -2331,8 +2420,9 @@ fn relational_sql_gpu_bridge_distinct_projection_keeps_gpu_row_fetch() {
 }
 
 #[test]
+#[ignore = "requires CUDA driver"]
 fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -2348,18 +2438,18 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
         panic!("expected SELECT plan");
     };
     let result = e
-        .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap();
 
     assert_eq!(
-        result.rows,
+        result.specification.rows,
         vec![vec![SqlValue::Text("Grace".to_string()), SqlValue::Int8(2)]]
     );
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.fallback_reason, None);
+    assert_eq!(result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.execution.fallback_reason, None);
     assert_eq!(
-        *result.access_path,
+        *result.specification.access_path,
         RelationalAccessPath::FilteredKeyBatch {
             table: "people".to_string(),
             predicate_column: "id".to_string(),
@@ -2374,10 +2464,15 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
         panic!("expected SELECT plan");
     };
     let count_result = e
-        .execute_relational_select_with_backend(&count_select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&count_select)
         .unwrap();
-    assert_eq!(count_result.rows, vec![vec![SqlValue::Int8(2)]]);
-    assert_eq!(count_result.fallback_reason, None);
+    assert_eq!(
+        count_result.specification.rows,
+        vec![vec![SqlValue::Int8(2)]]
+    );
+    assert_eq!(count_result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(count_result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(count_result.execution.fallback_reason, None);
 
     let Command::Select(sum_select) = parse_command(
         "SELECT name, SUM(id) FROM people WHERE id >= 2 GROUP BY name ORDER BY sum DESC LIMIT 1",
@@ -2386,15 +2481,15 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
         panic!("expected SELECT plan");
     };
     let sum_result = e
-        .execute_relational_select_with_backend(&sum_select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&sum_select)
         .unwrap();
     assert_eq!(
-        sum_result.rows,
+        sum_result.specification.rows,
         vec![vec![SqlValue::Text("Grace".to_string()), SqlValue::Int8(5)]]
     );
-    assert_eq!(sum_result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(sum_result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(sum_result.fallback_reason, None);
+    assert_eq!(sum_result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(sum_result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(sum_result.execution.fallback_reason, None);
 
     let Command::Select(avg_select) = parse_command(
         "SELECT name, AVG(id) FROM people WHERE id >= 2 GROUP BY name ORDER BY avg DESC LIMIT 1",
@@ -2403,18 +2498,18 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
         panic!("expected SELECT plan");
     };
     let avg_result = e
-        .execute_relational_select_with_backend(&avg_select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&avg_select)
         .unwrap();
     assert_eq!(
-        avg_result.rows,
+        avg_result.specification.rows,
         vec![vec![
             SqlValue::Text("Linus".to_string()),
             SqlValue::Numeric(Decimal128::parse("4.0000000000000000").unwrap())
         ]]
     );
-    assert_eq!(avg_result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(avg_result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(avg_result.fallback_reason, None);
+    assert_eq!(avg_result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(avg_result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(avg_result.execution.fallback_reason, None);
 
     let Command::Select(avg_scalar_select) =
         parse_command("SELECT AVG(id) FROM people WHERE name = 'Grace'").unwrap()
@@ -2422,15 +2517,23 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
         panic!("expected SELECT plan");
     };
     let avg_scalar_result = e
-        .execute_relational_select_with_backend(&avg_scalar_select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&avg_scalar_select)
         .unwrap();
     assert_eq!(
-        avg_scalar_result.rows,
+        avg_scalar_result.specification.rows,
         vec![vec![SqlValue::Numeric(
             Decimal128::parse("2.5000000000000000").unwrap()
         )]]
     );
-    assert_eq!(avg_scalar_result.fallback_reason, None);
+    assert_eq!(
+        avg_scalar_result.execution.planned_target,
+        DeviceTarget::Gpu(0)
+    );
+    assert_eq!(
+        avg_scalar_result.execution.executed_target,
+        DeviceTarget::Gpu(0)
+    );
+    assert_eq!(avg_scalar_result.execution.fallback_reason, None);
 
     let Command::Select(min_select) = parse_command(
         "SELECT name, MIN(id) FROM people WHERE id >= 2 GROUP BY name ORDER BY min DESC LIMIT 1",
@@ -2439,15 +2542,15 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
         panic!("expected SELECT plan");
     };
     let min_result = e
-        .execute_relational_select_with_backend(&min_select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&min_select)
         .unwrap();
     assert_eq!(
-        min_result.rows,
+        min_result.specification.rows,
         vec![vec![SqlValue::Text("Linus".to_string()), SqlValue::Int4(4)]]
     );
-    assert_eq!(min_result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(min_result.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(min_result.fallback_reason, None);
+    assert_eq!(min_result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(min_result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(min_result.execution.fallback_reason, None);
 
     let Command::Select(max_select) =
         parse_command("SELECT MAX(name) FROM people WHERE id <= 2").unwrap()
@@ -2455,13 +2558,15 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
         panic!("expected SELECT plan");
     };
     let max_result = e
-        .execute_relational_select_with_backend(&max_select, &FirstCudaSliceParityBackend)
+        .evaluate_relational_select_specification_with_cuda_driver(&max_select)
         .unwrap();
     assert_eq!(
-        max_result.rows,
+        max_result.specification.rows,
         vec![vec![SqlValue::Text("Grace".to_string())]]
     );
-    assert_eq!(max_result.fallback_reason, None);
+    assert_eq!(max_result.execution.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(max_result.execution.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(max_result.execution.fallback_reason, None);
 }
 
 #[test]
@@ -2470,7 +2575,7 @@ fn primary_key_rejects_null_on_insert_and_update() {
     // PK was validated only as a unique index whose BTreeSet collides NULLs, so exactly ONE NULL row
     // could slip in (and would then poison the resident PK index routes + the NULL-blind aggregate
     // fast paths). Both validator arms (index-driven + scan fallback) must reject it identically.
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE pk_nn (id INT PRIMARY KEY, v INT)")
         .unwrap();
 
@@ -2548,7 +2653,7 @@ fn alter_add_primary_key_rejects_null_bearing_column() {
     // PG: promoting a null-bearing column to PRIMARY KEY fails (the creation-time half of the PK
     // NOT NULL invariant the DML validators rely on). After the NULL row is gone the promotion
     // succeeds, and the promoted PK then enforces not-null on subsequent writes.
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE promote (id INT, v INT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO promote (id, v) VALUES (NULL, 1), (2, 2)")

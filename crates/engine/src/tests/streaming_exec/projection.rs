@@ -7,8 +7,8 @@ use gpu_db_sql::SqlValue;
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_streaming_projection_over_budget_filters_on_device() {
     // S-E.2: a filtered PROJECTION over an over-budget table streams — each chunk's WHERE + column gather
-    // run on the device, survivors CONCAT across chunks (scan order == the CPU pinned path's seq order).
-    let mut e = Engine::new_local_cpu_oracle();
+    // run on the device, and survivors CONCAT across chunks in deterministic scan order.
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -62,15 +62,17 @@ fn gpu_streaming_projection_over_budget_filters_on_device() {
         "SELECT * survivor row"
     );
 
-    // Differential: the CPU pinned path (budget cleared) returns the identical rows in the same order.
+    // The exact expected rows above own semantics. Disabling streaming must decline loudly.
     e.clear_relational_residency_budget_bytes(0);
-    let cpu = e
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select("SELECT a FROM big WHERE a >= 1000"))
-        .unwrap();
-    assert_eq!(
-        cpu.rows.clone().into_boxed(),
-        expected,
-        "GPU streaming projection == CPU oracle"
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "big",
+        fallback_before,
     );
 }
 
@@ -79,8 +81,8 @@ fn gpu_streaming_projection_over_budget_filters_on_device() {
 fn gpu_streaming_projection_limit_offset_windows_and_early_exits() {
     // S-E.2: LIMIT/OFFSET window the concatenated survivor stream across chunks; a satisfied LIMIT stops
     // the scan EARLY (chunks-run proves the tail was never staged). LIMIT without ORDER BY is any-N-rows
-    // per SQL; this engine's scan order is the deterministic seq order, matching the CPU pinned path.
-    let mut e = Engine::new_local_cpu_oracle();
+    // per SQL; this engine's scan order is the deterministic sequence order.
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -119,46 +121,51 @@ fn gpu_streaming_projection_limit_offset_windows_and_early_exits() {
     );
 
     // Cross-chunk OFFSET+LIMIT windowing: survivors a >= 10 in scan order are 10..1500; skip 500 ->
-    // start at 510; take 700 -> [510, 1210). The window spans several chunks.
+    // start at 510; take 300 -> [510, 810). The window spans chunks while its result stays bounded.
     let windowed = e
         .execute_relational_select(&select(
-            "SELECT a FROM big WHERE a >= 10 LIMIT 700 OFFSET 500",
+            "SELECT a FROM big WHERE a >= 10 LIMIT 300 OFFSET 500",
         ))
         .unwrap();
-    let expected_window: Vec<Vec<SqlValue>> =
-        (510..1210).map(|i| vec![SqlValue::Int4(i)]).collect();
+    let expected_window: Vec<Vec<SqlValue>> = (510..810).map(|i| vec![SqlValue::Int4(i)]).collect();
     assert_eq!(
         windowed.rows.clone().into_boxed(),
         expected_window,
         "cross-chunk OFFSET+LIMIT window"
     );
 
-    // 6c-0 coverage (audit LOW): OFFSET WITHOUT LIMIT — unbounded take, device-sliced [offset, len).
-    let offset_only = e
+    // OFFSET without LIMIT is still an unsupported unbounded streaming shape. It must decline
+    // loudly rather than obtain the tiny tail from the retired host path.
+    let hits_before_offset_decline = e.streaming_fold_hits();
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select("SELECT a FROM big OFFSET 1495"))
-        .unwrap();
-    let expected_tail: Vec<Vec<SqlValue>> = (1495..N).map(|i| vec![SqlValue::Int4(i)]).collect();
-    assert_eq!(
-        offset_only.rows.clone().into_boxed(),
-        expected_tail,
-        "OFFSET without LIMIT"
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "big",
+        fallback_before,
     );
+    assert_eq!(e.streaming_fold_hits(), hits_before_offset_decline);
     // 6c-0 coverage (audit LOW): LIMIT 0 — zero chunks, empty result, no error.
     let zero = e
         .execute_relational_select(&select("SELECT a FROM big LIMIT 0"))
         .unwrap();
     assert!(zero.rows.is_empty(), "LIMIT 0 is the empty result");
 
-    // Differential vs the CPU pinned path for the same windowed query.
+    // The exact window above owns semantics. Without streaming the route must fail loudly.
     e.clear_relational_residency_budget_bytes(0);
-    let cpu = e
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select(
-            "SELECT a FROM big WHERE a >= 10 LIMIT 700 OFFSET 500",
+            "SELECT a FROM big WHERE a >= 10 LIMIT 300 OFFSET 500",
         ))
-        .unwrap();
-    assert_eq!(
-        cpu.rows.clone().into_boxed(),
-        expected_window,
-        "GPU streaming window == CPU oracle window"
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "big",
+        fallback_before,
     );
 }

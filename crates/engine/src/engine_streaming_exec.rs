@@ -18,7 +18,7 @@
 //! device masks, coordinates, materialized runs, hash chains, rank lanes, and partial accumulators;
 //! only final result framing crosses D2H. Activation gates on a CONFIGURED per-GPU
 //! residency budget (the operator's VRAM-management signal); with no budget there is no notion of
-//! "over-VRAM" and the read stays on the interim host path — so default behavior is byte-identical.
+//! "over-VRAM", so another GPU route must accept the read or it fails loudly.
 //!
 //! **S-E.2 (here too): streaming filter/project.** A plain `All`/`Columns` projection folds by CONCAT
 //! (the ARCHITECTURE §13 projection combine): each chunk's device-filtered + device-gathered survivors
@@ -99,8 +99,8 @@ enum StreamAgg {
     Max,
 }
 
-/// A chunk's device reduction either combined cleanly, or hit a shape the streaming path should hand back
-/// to the authoritative CPU pinned path (`Defer`), or a genuine SQL error to surface (`Hard`).
+/// A chunk's device reduction either combined cleanly, hit a shape the streaming path must decline
+/// through the fail-loud GPU-required boundary (`Defer`), or produced a genuine SQL error (`Hard`).
 enum ChunkOutcome {
     Ok,
     Defer,
@@ -271,7 +271,7 @@ pub(crate) fn install_class_resolve_pin_hook() -> ClassResolvePinHook {
     (pinned, resume)
 }
 
-/// Test-only policy override for store-driven cold-cache and resident-oracle gates. Production
+/// Test-only policy override for store-driven cold-cache and resident-baseline gates. Production
 /// class entry is unconditional; ignored GPU tests run serially and restore this flag on drop.
 #[cfg(test)]
 pub(crate) static CHUNK_CLASS_ENTRY_ENABLED_TEST: std::sync::atomic::AtomicBool =
@@ -459,7 +459,8 @@ fn unlinked_spill_file() -> Result<Arc<std::fs::File>, ()> {
     let dir = std::env::temp_dir();
     // pid + monotonic seq + wall-nanos: the name exists only for the create+unlink instant, but a
     // predictable name on a SHARED temp dir would let a local nuisance pre-create it (create_new
-    // fails -> poison -> CPU fallback; O_EXCL already blocks anything worse — audit LOW).
+    // fails -> poison -> skip the incomplete cold-cache install; O_EXCL already blocks anything
+    // worse — audit LOW).
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -531,7 +532,7 @@ const STREAMING_COLD_DISK_CAP_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 /// larger writes defer to the lazy read-path patch so a bulk insert never stalls the global commit
 /// mutex on decode/build/spill work. Engine-internal, not config.
 /// A device reduction error that is a genuine arithmetic OVERFLOW (matched on the executor's stable PG
-/// overflow phrases). Such an error must surface, not defer to the CPU path (audit Finding 2).
+/// overflow phrases). Such an error must surface through the GPU-required boundary (audit Finding 2).
 fn is_overflow_error(err: &ExecuteError) -> bool {
     let message = err.to_string();
     message.contains("overflow") || message.contains("out of range")

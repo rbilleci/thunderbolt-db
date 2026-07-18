@@ -2,24 +2,21 @@ use super::{gpu_available, select};
 use crate::Engine;
 use gpu_db_sql::{SelectFilterOp, SqlValue};
 
-// ========== P4-2b-i (S-E.P4): the CHUNK-AUTHORITATIVE class — enter, freeze, stream, exit ==========
+// ========== P4-2b-i (S-E.P4): the CHUNK-AUTHORITATIVE class — enter, freeze, stream, decline ==========
 
 /// THE CLASS LIFECYCLE GATE: an over-budget, elision-INeligible (text-bearing), keyless FK-free
 /// table ENTERS the class at a commit; subsequent INSERTs skip the host store (FROZEN — proven by
 /// the store's version count) while the streamed reads see every row (the tail appends are the
-/// materialization); an unstreamable read DE-AUTHORITIZES (the post-freeze delta replays into the
-/// store) and the host path serves exactly the full data. Differential twin throughout.
+/// materialization); disabling streaming makes an unsupported read fail loudly without deauthorizing
+/// or reconstructing a host result. Closed-form COUNT and SUM assertions own row semantics.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
-    let mut e = Engine::new_local_cpu_oracle();
+fn gpu_chunk_class_enters_freezes_streams_and_fails_loudly_without_read_deauth() {
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
     }
-    let mut twin = Engine::new_local_cpu_oracle();
-    let mut twin_seq = 0u64;
-
     const N: i32 = 1200;
     let mut values = String::new();
     for i in 0..N {
@@ -28,16 +25,12 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
         }
         values.push_str(&format!("({i}, 'txt{:04}')", i % 500));
     }
-    for (engine, s) in [(&mut e, &mut seq), (&mut twin, &mut twin_seq)] {
-        *s += 1;
-        engine
-            .execute_text(*s, "CREATE TABLE facts (a INT, t TEXT)")
-            .unwrap();
-        *s += 1;
-        engine
-            .execute_text(*s, &format!("INSERT INTO facts (a, t) VALUES {values}"))
-            .unwrap();
-    }
+    seq += 1;
+    e.execute_text(seq, "CREATE TABLE facts (a INT, t TEXT)")
+        .unwrap();
+    seq += 1;
+    e.execute_text(seq, &format!("INSERT INTO facts (a, t) VALUES {values}"))
+        .unwrap();
     e.set_relational_residency_budget_bytes(0, 8192);
     let q_count = select("SELECT COUNT(*) FROM facts");
     let count = |e: &Engine| -> i64 {
@@ -52,12 +45,6 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
     seq += 1;
     e.execute_text(seq, "INSERT INTO facts (a, t) VALUES (100000, 'enter')")
         .unwrap();
-    twin_seq += 1;
-    twin.execute_text(
-        twin_seq,
-        "INSERT INTO facts (a, t) VALUES (100000, 'enter')",
-    )
-    .unwrap();
     assert_eq!(
         e.chunk_class_entries(),
         1,
@@ -79,15 +66,6 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
         seq += 1;
         e.execute_text(
             seq,
-            &format!(
-                "INSERT INTO facts (a, t) VALUES ({}, 'tail{k}')",
-                200000 + k
-            ),
-        )
-        .unwrap();
-        twin_seq += 1;
-        twin.execute_text(
-            twin_seq,
             &format!(
                 "INSERT INTO facts (a, t) VALUES ({}, 'tail{k}')",
                 200000 + k
@@ -128,67 +106,33 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
         vec![vec![SqlValue::Int8(expected_sum)]]
     );
 
-    // DE-AUTH: clear the budget — streaming deactivates, the CPU-pinned guard replays the
-    // post-freeze delta into the store, the class exits, and the host path serves EVERYTHING.
+    // Clearing the budget disables streaming. The unsupported read must fail loudly without
+    // deauthorizing the class or recreating host tuple chains.
     e.clear_relational_residency_budget_bytes(0);
     let q_rows = select("SELECT a, t FROM facts ORDER BY a");
-    let got = e
-        .execute_relational_select(&q_rows)
-        .unwrap()
-        .rows
-        .iter()
-        .map(|r| r.to_vec())
-        .collect::<Vec<_>>();
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e.execute_relational_select(&q_rows).unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "facts",
+        fallback_before,
+    );
     assert_eq!(
         e.chunk_class_deauths(),
-        1,
-        "the unstreamable read exited the class LOUDLY"
+        0,
+        "a read decline must not cross the RETIRE-002 repair boundary"
     );
-    let want = twin
-        .execute_relational_select(&q_rows)
-        .unwrap()
-        .rows
-        .iter()
-        .map(|r| r.to_vec())
-        .collect::<Vec<_>>();
-    assert_eq!(got.len(), (N + 6) as usize);
     assert_eq!(
-        got, want,
-        "post-de-auth host reads == the never-classed twin"
-    );
-    assert!(
         e.read_state
             .mvcc
             .table_rows("facts")
             .store()
             .all_versions()
-            .len()
-            > frozen_versions,
-        "the delta replayed into the store"
+            .len(),
+        frozen_versions,
+        "a read decline must not recreate host tuple chains"
     );
-
-    // Post-exit writes are plain store writes again.
-    seq += 1;
-    e.execute_text(seq, "DELETE FROM facts WHERE a = 100000")
-        .unwrap();
-    twin_seq += 1;
-    twin.execute_text(twin_seq, "DELETE FROM facts WHERE a = 100000")
-        .unwrap();
-    let got = e
-        .execute_relational_select(&q_rows)
-        .unwrap()
-        .rows
-        .iter()
-        .map(|r| r.to_vec())
-        .collect::<Vec<_>>();
-    let want = twin
-        .execute_relational_select(&q_rows)
-        .unwrap()
-        .rows
-        .iter()
-        .map(|r| r.to_vec())
-        .collect::<Vec<_>>();
-    assert_eq!(got, want);
 }
 
 /// P4-2b-ii — CLASS DML STAYS CLASSED: DELETE stamps the chunk-native coordinates (no de-auth,
@@ -198,7 +142,7 @@ fn gpu_chunk_class_enters_freezes_streams_and_deauths() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_dml_stamps_without_deauth() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -324,7 +268,7 @@ fn gpu_chunk_class_dml_stamps_without_deauth() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_born_gate_serves_old_boundaries() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -426,7 +370,7 @@ fn gpu_chunk_class_born_gate_serves_old_boundaries() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_compaction_deletes_dead_slots() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -547,7 +491,7 @@ fn gpu_chunk_class_compaction_deletes_dead_slots() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_copy_and_multi_entry_batch_stay_device_authoritative() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;

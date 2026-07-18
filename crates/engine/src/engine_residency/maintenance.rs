@@ -411,12 +411,11 @@ impl Engine {
     ) -> Option<Vec<(u64, Vec<SqlValue>)>> {
         // TYPE-COVERAGE track 2 (stage iii): every FIXED-WIDTH-section type gathers with its
         // catalog-derived variant (i32 via one u32/slot; i64 via two — the 4-mod-8 discipline).
-        // TYPE-COVERAGE #14 (bool/numeric/uuid): these also gather here — this is the DEVICE->HOST
-        // rehydration a read shape the on-device routes can't serve falls back to (a filtered bool/
-        // numeric projection, an ORDER BY on a bool key). Without it an elided table with such a column
-        // would hard-error on those shapes. Bool = 1 bit/row bitmap; Numeric/Uuid = the 16-byte b128
+        // TYPE-COVERAGE #14 (bool/numeric/uuid): these also gather in this RETIRE-002 repair-only
+        // path. Normal SELECT execution never rehydrates for an unsupported device shape; it fails
+        // loudly instead. Bool = 1 bit/row bitmap; Numeric/Uuid = the 16-byte b128
         // section (numeric = i128 mantissa LE at the catalog scale; uuid = the raw 16 bytes); Text = the
-        // offsets section + bytes blob. Every elision-eligible type now rehydrates (nothing declined by type).
+        // offsets section + bytes blob. This repair path covers every elision-eligible type.
         if table.columns.iter().any(|column| {
             !matches!(
                 column.ty,
@@ -600,7 +599,7 @@ impl Engine {
                 }
                 let row_id = u64_at(&id_halves, slot);
                 if row_id == u64::MAX {
-                    return None; // an UNSTAMPED live slot: identity hole -> host source
+                    return None; // an UNSTAMPED live slot: identity hole makes repair incomplete -> fail loudly
                 }
                 let row: Vec<SqlValue> = columns
                     .iter()

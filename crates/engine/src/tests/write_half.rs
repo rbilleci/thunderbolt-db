@@ -138,7 +138,6 @@ fn active_snapshots_track_oldest_boundary() {
         41,
         Arc::new(TransactionSnapshot {
             boundary: 6,
-            statement_owned: false,
             next_row_id: 1,
             catalog: Arc::new(CatalogSnapshot::default()),
             table_versions: BTreeMap::new(),
@@ -188,7 +187,7 @@ fn active_snapshots_track_oldest_boundary() {
 fn concurrent_dml_classification_routes_sequence_inserts_to_serialized_path() {
     // `is_concurrent_dml` gates which statements take the off-lock concurrent path vs the
     // serialized catalog-latch path (write-half MVCC, Stage 4).
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE plain (id INT, v INT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE serial_t (id SERIAL, v TEXT)")
@@ -233,7 +232,7 @@ fn execute_dml_concurrent_matches_the_serialized_path_single_threaded() {
             .collect()
     };
 
-    let concurrent = Engine::new_local_cpu_oracle();
+    let concurrent = Engine::new_local_test_engine();
     concurrent
         .execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
@@ -247,7 +246,7 @@ fn execute_dml_concurrent_matches_the_serialized_path_single_threaded() {
         .execute_dml_concurrent(4, "DELETE FROM t WHERE id = 1")
         .unwrap();
 
-    let serialized = Engine::new_local_cpu_oracle();
+    let serialized = Engine::new_local_test_engine();
     serialized
         .execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
@@ -269,7 +268,7 @@ fn execute_dml_concurrent_matches_the_serialized_path_single_threaded() {
 
 #[test]
 fn relational_index_access_path_survives_wal_recovery() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(
@@ -310,7 +309,7 @@ fn relational_index_access_path_survives_wal_recovery() {
 /// state while neither path installs normal relational versions into the retired host store.
 #[test]
 fn stage0_wal_replay_reproduces_device_state_without_host_versions() {
-    let live = Engine::new_local_cpu_oracle();
+    let live = Engine::new_local_test_engine();
     // Mix of DDL + DML, including UPDATE and DELETE so both `created_by` and `deleted_by`
     // are exercised. Sparse, non-monotonic-relative-to-commit txn_ids on purpose.
     live.execute_text(100, "CREATE TABLE acct (id INT, bal INT)")
@@ -362,7 +361,7 @@ fn stage0_wal_replay_reproduces_device_state_without_host_versions() {
 /// no host tuple chain participates in visibility.
 #[test]
 fn stage0_read_boundary_tracks_device_version_publication() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     // commit 1: CREATE TABLE (no row versions)
     e.execute_text(500, "CREATE TABLE t (id INT)").unwrap();
     // commit 2: INSERT id=1  -> row version stamped created_by = 2
@@ -981,7 +980,7 @@ fn device_dml_validators_cover_unique_check_and_foreign_keys() {
 /// granting the skip on a stamp mismatch lets the violating row COMMIT silently.
 #[test]
 fn wave_insert_prepared_before_add_check_is_revalidated() {
-    let e = std::sync::Arc::new(Engine::new_local_cpu_oracle());
+    let e = std::sync::Arc::new(Engine::new_local_test_engine());
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10)")
         .unwrap();
@@ -1029,7 +1028,7 @@ fn wave_insert_prepared_before_add_check_is_revalidated() {
 /// queued when a post-durable invariant failure wedges the process.
 #[test]
 fn central_commit_wedge_drains_classic_queue_and_rejects_reads_writes_and_drivers() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "SET live=value").unwrap();
     e.execute_text(2, "CREATE TABLE surface_gate (id INT)")
         .unwrap();
@@ -1108,7 +1107,7 @@ fn central_commit_wedge_drains_classic_queue_and_rejects_reads_writes_and_driver
         limit: None,
     };
     assert!(e
-        .execute_mvcc_query(&mvcc_query)
+        .evaluate_mvcc_query_specification(&mvcc_query)
         .unwrap_err()
         .to_string()
         .contains("restart recovery"));
@@ -1188,7 +1187,7 @@ fn central_commit_wedge_drains_classic_queue_and_rejects_reads_writes_and_driver
 
 #[test]
 fn instrumented_autocommit_dml_rejects_an_active_transaction_identity() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE accounts (id INT)").unwrap();
     e.execute_text(90, "BEGIN").unwrap();
     let wal_before = e.durable_wal_records().len();
@@ -1207,8 +1206,8 @@ fn instrumented_autocommit_dml_rejects_an_active_transaction_identity() {
 
 #[test]
 fn retained_completion_rejects_cross_engine_and_mid_completion_wedges() {
-    let origin = Engine::new_local_cpu_oracle();
-    let other = Engine::new_local_cpu_oracle();
+    let origin = Engine::new_local_test_engine();
+    let other = Engine::new_local_test_engine();
     let foreign = origin
         .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
         .unwrap();
@@ -1224,7 +1223,7 @@ fn retained_completion_rejects_cross_engine_and_mid_completion_wedges() {
         .unwrap_err();
     assert!(error.to_string().contains("different engine"), "{error}");
 
-    let engine = Arc::new(Engine::new_local_cpu_oracle());
+    let engine = Arc::new(Engine::new_local_test_engine());
     let submission = engine
         .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
         .unwrap();
@@ -1241,7 +1240,7 @@ fn retained_completion_rejects_cross_engine_and_mid_completion_wedges() {
     let error = completion.join().unwrap().unwrap_err();
     assert!(error.to_string().contains("restart recovery"), "{error}");
 
-    let engine = Arc::new(Engine::new_local_cpu_oracle());
+    let engine = Arc::new(Engine::new_local_test_engine());
     let submission = engine
         .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&[])
         .unwrap();

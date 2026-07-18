@@ -1649,15 +1649,15 @@ fn sv6_created_by_region_released_on_readmit_and_drop() {
     );
 }
 
-/// SV6 — the created_by gate on the INDEX ROUTES (3b single-flight per-hit gate + the batched gather
-/// gate + the GPU dense-emit DECLINE). The double-read shape can't reach the routes (a duplicated key
+/// SV6 — the created_by gate on the INDEX ROUTES (3b single-flight per-hit gate plus the batched
+/// device gather and dense emit). The double-read shape can't reach the routes (a duplicated key
 /// declines them to the scan), but a KEY-MOVING incremental UPDATE (`id 130 -> 999` at unpublished
 /// `C0+1`) leaves the NEW key as a SINGLE stamped hit: a C-1 reader looking up 999 must get ZERO rows
 /// (999 does not exist at its snapshot) while 130 still reads the OLD image — on the 3b route AND the
-/// batched path (whose GPU dense kernel is un-gated and MUST decline the stamped shard to the gated
-/// host gather). Post-publish, 999 is visible and 130 is gone. NON-VACUITY: `shard_index_route_hits` /
+/// batched path, whose GPU kernel applies the created_by visibility boundary directly. Post-publish,
+/// 999 is visible and 130 is gone. NON-VACUITY: `shard_index_route_hits` /
 /// `sharded_point_batch_hits` prove the routes (not the scan) served. Sabotage: drop the per-hit
-/// created_by check, the batched AND, or the dense-kernel decline — each makes 999 visible at C-1.
+/// created_by check or the batched visibility AND — either makes 999 visible at C-1.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn sv6_created_by_gate_on_index_routes_hides_moved_key_from_older_snapshot() {
@@ -1717,7 +1717,7 @@ fn sv6_created_by_gate_on_index_routes_hides_moved_key_from_older_snapshot() {
         "non-vacuity: the 3b index route (not the scan) served the C-1 point lookups"
     );
 
-    // (b) Batched gather (the GPU dense kernel MUST decline the stamped shard -> gated host path):
+    // (b) Batched gather (the GPU dense kernel applies created/deleted visibility gates to the stamped shard):
     // needle 999 -> 0 rows; needle 130 -> the old image.
     let batch_hits_before = e.sharded_point_batch_hits();
     let batch = e
@@ -1728,7 +1728,7 @@ fn sv6_created_by_gate_on_index_routes_hides_moved_key_from_older_snapshot() {
             &[0, 1],
             &[999, 130],
         )
-        .expect("the batched sharded gather must serve (gated host path)");
+        .expect("the batched sharded gather must serve the visibility-gated device path");
     assert_eq!(batch.ncols, 2);
     assert_eq!(
         batch.needle_ranges[0].1, 0,

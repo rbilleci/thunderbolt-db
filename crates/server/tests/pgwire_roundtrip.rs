@@ -7,16 +7,16 @@ use std::sync::Arc;
 use std::thread;
 
 use gpu_db_engine::Engine;
-use gpu_db_execution::CudaDriverRuntime;
-use gpu_db_facade::{execute_on_shared_engine, SharedEngine};
+use gpu_db_execution::{CudaDriverRuntime, DeviceTarget};
+use gpu_db_facade::SharedEngine;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-/// STRATA golden gate: a real pgwire client reaches the dense GPU point route for one and many shards,
-/// returns the same row values over pgwire as the host parity arm, and carries NULL data without disabling an unreferenced
+/// STRATA golden gate: a real pgwire client reaches the dense GPU point route for coarse- and fine-sharded generations,
+/// returns fixture-derived row values, and carries NULL data without disabling an unreferenced
 /// projection. The route counter makes the wire-level equality non-vacuous.
 #[tokio::test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-async fn pgwire_gpu_point_route_is_non_vacuous_across_shards_and_null_data() {
+async fn pgwire_gpu_point_route_is_non_vacuous_across_coarse_and_fine_shards() {
     let Ok(runtime) = CudaDriverRuntime::probe() else {
         return;
     };
@@ -24,52 +24,63 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_shards_and_null_data() {
     if !runtime.driver_available || runtime.device_count == 0 {
         return;
     }
-    async fn run_arm(
-        shard_target: Option<usize>,
-    ) -> (Vec<String>, Vec<Option<String>>, u64, usize, usize) {
+    async fn run_arm(shard_target: usize) -> (Vec<String>, Vec<Option<String>>, u64, usize) {
         let engine = Engine::new_local();
-        if let Some(target) = shard_target {
-            engine.set_shard_residency_enabled(true);
-            engine.set_shard_size_target(target);
-            engine.set_shard_index_probe_enabled(true);
-            engine.set_shard_batched_point_read_enabled(true);
-            engine.set_auto_admit_on_commit(true);
-        } else {
-            // Parity arm must remain host-pinned after S-F flips production admission defaults.
-            engine.set_auto_admit_on_commit(false);
-            engine.set_shard_residency_enabled(false);
-        }
-        let shared = Arc::new(SharedEngine::from_engine(engine));
-        execute_on_shared_engine(
-            &shared,
-            "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, nullable_note INT)",
-        )
-        .unwrap();
+        engine.set_shard_residency_enabled(true);
+        engine.set_shard_size_target(shard_target);
+        engine.set_shard_index_probe_enabled(true);
+        engine.set_shard_batched_point_read_enabled(true);
+        engine.set_auto_admit_on_commit(true);
+        let mut txn_id = 1u64;
+        engine
+            .execute_text(
+                txn_id,
+                "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT, nullable_note INT)",
+            )
+            .unwrap();
         let row_values = (0..130)
             .map(|id| {
                 let note = if id == 1 { "NULL" } else { "9" };
                 format!("({id}, {}, {note})", id * 7)
             })
             .collect::<Vec<_>>();
-        if shard_target == Some(32) {
+        if shard_target == 32 {
             for value in &row_values {
-                execute_on_shared_engine(
-                    &shared,
-                    &format!("INSERT INTO accounts (id, balance, nullable_note) VALUES {value}"),
-                )
-                .unwrap();
+                txn_id += 1;
+                engine
+                    .execute_text(
+                        txn_id,
+                        &format!(
+                            "INSERT INTO accounts (id, balance, nullable_note) VALUES {value}"
+                        ),
+                    )
+                    .unwrap();
             }
         } else {
             let values = row_values.join(",");
-            execute_on_shared_engine(
-                &shared,
-                &format!("INSERT INTO accounts (id, balance, nullable_note) VALUES {values}"),
-            )
-            .unwrap();
+            txn_id += 1;
+            engine
+                .execute_text(
+                    txn_id,
+                    &format!("INSERT INTO accounts (id, balance, nullable_note) VALUES {values}"),
+                )
+                .unwrap();
         }
+        let direct_payload = engine
+            .execute_relational_select_text("SELECT balance FROM accounts WHERE id = 100")
+            .unwrap();
+        assert_eq!(direct_payload.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(direct_payload.fallback_reason, None);
+        let direct_null = engine
+            .execute_relational_select_text("SELECT nullable_note FROM accounts WHERE id = 1")
+            .unwrap();
+        assert_eq!(direct_null.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(direct_null.fallback_reason, None);
+
+        let shared = Arc::new(SharedEngine::from_engine(engine));
         let before = shared.gpu_native_activity_snapshot("accounts");
-        if shard_target.is_some() && before.resident_shards == 0 {
-            return (Vec::new(), Vec::new(), 0, 0, 0);
+        if before.resident_shards == 0 {
+            return (Vec::new(), Vec::new(), 0, 0);
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -115,29 +126,21 @@ async fn pgwire_gpu_point_route_is_non_vacuous_across_shards_and_null_data() {
             nulls,
             after.sharded_gpu_probe_batches - before.sharded_gpu_probe_batches,
             before.resident_shards,
-            before.valid_resident_tables,
         )
     }
 
-    let host = run_arm(None).await;
-    let one = run_arm(Some(1024)).await;
-    let many = run_arm(Some(32)).await;
-    assert_eq!(host.0, vec!["700"]);
-    assert_eq!(host.1, vec![None]);
-    assert_eq!(host.3, 0, "host parity arm is explicitly non-resident");
-    assert_eq!(
-        host.4, 0,
-        "host parity arm has no unified resident snapshot"
-    );
-    assert_eq!(
-        (one.0.clone(), one.1.clone()),
-        (host.0.clone(), host.1.clone())
-    );
-    assert_eq!((many.0.clone(), many.1.clone()), (host.0, host.1));
-    assert_eq!(one.3, 1, "single-shard arm");
-    assert!(many.3 >= 2, "multi-shard arm");
+    let coarse = run_arm(1024).await;
+    let fine = run_arm(32).await;
+    assert_eq!(coarse.0, vec!["700"]);
+    assert_eq!(coarse.1, vec![None]);
+    assert_eq!((fine.0.clone(), fine.1.clone()), (coarse.0, coarse.1));
+    assert!(coarse.3 > 0, "coarse-sharded arm has resident shards");
     assert!(
-        one.2 > 0 && many.2 > 0,
+        fine.3 > coarse.3,
+        "fine-sharded arm has more shards than coarse arm"
+    );
+    assert!(
+        coarse.2 > 0 && fine.2 > 0,
         "wire reads fired the dense GPU route"
     );
 }

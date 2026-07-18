@@ -64,7 +64,7 @@ fn colliding_bigints() -> (i64, i64) {
 fn gpu_text_unique_key_away_history_conflicts_from_device_stamp() {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine.set_auto_admit_on_commit(true);
     engine.set_binary_wal_records_enabled(true);
     engine.set_device_write_locate_wave_batch_enabled(true);
@@ -124,11 +124,11 @@ fn gpu_text_unique_key_away_history_conflicts_from_device_stamp() {
         )
         .unwrap();
     // Scope non-vacuity to the stale writer itself. The intervening INSERT/UPDATE also run device
-    // validation, so sampling before them would let the cfg(test) CPU ledger mask a missing stale
-    // writer device verdict while this counter still advanced.
+    // validation, so sampling before them would let the host-neutral parity ledger obscure a missing
+    // stale-writer device verdict while this counter still advanced.
     assert!(
         engine.table_device_authoritative("history_t"),
-        "the stale writer must resume while the relation is still device-authoritative; otherwise the cfg(test) host oracle could mask the history verdict"
+        "the stale writer must resume while the relation is still device-authoritative"
     );
     let stale_validate_before = engine.dml_device_validate_hits();
     continue_tx.send(()).unwrap();
@@ -207,7 +207,7 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
     ];
     let mut expected_counts = std::collections::BTreeMap::<String, i64>::new();
     {
-        let mut engine = Engine::new_local_cpu_oracle();
+        let mut engine = Engine::new_local_test_engine();
         engine.commit_state_mut().wal = WalBuffer::with_durable_segment(&wal_path);
         engine.set_auto_admit_on_commit(true);
         engine.set_binary_wal_records_enabled(true);
@@ -452,7 +452,7 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
     std::fs::create_dir_all(&dir).unwrap();
     let wal_path = dir.join("db.wal");
     {
-        let mut engine = Engine::new_local_cpu_oracle();
+        let mut engine = Engine::new_local_test_engine();
         engine.commit_state_mut().wal = WalBuffer::with_durable_segment(&wal_path);
         engine.set_auto_admit_on_commit(true);
         engine.set_binary_wal_records_enabled(true);
@@ -701,8 +701,8 @@ fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
 /// R3-002 nullable mutation coverage: structural NULL equality is device-native not only for a
 /// wider compound fingerprint, but also for an all-i32 compound and every raw i32-section unique
 /// key type. UPDATE must tombstone+append without rehydrating; DELETE must tombstone without
-/// rehydrating. Continued elision is the non-vacuity proof because either locate decline would make
-/// the host store authoritative again.
+/// rehydrating. Continued elision is the non-vacuity proof because any locate decline must fail closed before
+/// the mutation is acknowledged.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_nullable_i32_unique_mutations_remain_device_authoritative() {

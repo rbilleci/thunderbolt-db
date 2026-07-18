@@ -3,15 +3,15 @@ use super::*;
 mod cuda_driver_routes;
 
 #[test]
-fn execute_mvcc_query_runs_visibility_filtered_scan_through_execution_layer() {
-    let e = Engine::new_local_cpu_oracle();
+fn mvcc_specification_covers_visibility_filter_and_projection() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=pending").unwrap();
     e.execute_text(3, "SET acct:1=closed").unwrap();
     e.execute_text(4, "DELETE acct:2").unwrap();
 
     let result = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 3 },
             filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
@@ -21,12 +21,6 @@ fn execute_mvcc_query_runs_visibility_filtered_scan_through_execution_layer() {
         })
         .unwrap();
 
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Cpu);
-    assert_eq!(
-        result.fallback_reason,
-        Some(FallbackReason::GpuMvccReadParityGap)
-    );
     assert_eq!(
         result.rows,
         vec![
@@ -41,11 +35,6 @@ fn execute_mvcc_query_runs_visibility_filtered_scan_through_execution_layer() {
                 value: Some("pending".to_string()),
             },
         ]
-    );
-    assert_eq!(
-        e.metrics()
-            .fallback_for(FallbackReason::GpuMvccReadParityGap),
-        1
     );
 }
 
@@ -696,7 +685,7 @@ fn first_cuda_slice_gap_labels_are_stable_for_docs_and_future_routing() {
 
 #[test]
 fn execute_mvcc_query_keeps_result_contract_stable_across_backend_swap() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
 
     let backend = RecordingMvccBackend {
@@ -733,7 +722,7 @@ fn execute_mvcc_query_keeps_result_contract_stable_across_backend_swap() {
 
 #[test]
 fn cuda_native_full_scan_resolution_feeds_all_versions_to_visibility_kernel() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET acct:1=closed").unwrap();
@@ -764,14 +753,14 @@ fn cuda_native_full_scan_resolution_feeds_all_versions_to_visibility_kernel() {
 }
 
 #[test]
-fn cuda_native_full_scan_fallback_re_resolves_cpu_visible_rows() {
-    let e = Engine::new_local_cpu_oracle();
+fn cuda_native_full_scan_fails_loud_when_driver_is_unavailable() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET acct:1=closed").unwrap();
     e.execute_text(4, "DELETE acct:2").unwrap();
 
-    let result = e
+    let error = e
         .execute_cuda_native_source_query_kv(
             &MvccReadQuery {
                 source: MvccReadSource::FullScan,
@@ -783,37 +772,19 @@ fn cuda_native_full_scan_fallback_re_resolves_cpu_visible_rows() {
             },
             &CudaMvccExecutionBackend::new(CudaDriverRuntime::unavailable(), 0),
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Cpu);
-    assert_eq!(result.fallback_reason, Some(FallbackReason::GpuUnavailable));
-    assert_eq!(
-        result.rows,
-        vec![
-            MvccReadRow {
-                source_key: None,
-                key: Some("acct:1".to_string()),
-                value: Some("open".to_string()),
-            },
-            MvccReadRow {
-                source_key: None,
-                key: Some("acct:2".to_string()),
-                value: Some("hold".to_string()),
-            },
-        ]
-    );
-    assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
+    assert_gpu_mvcc_execution_required(&e, error);
 }
 
 #[test]
-fn cuda_native_key_lookup_fallback_re_resolves_cpu_visible_row() {
-    let e = Engine::new_local_cpu_oracle();
+fn cuda_native_key_lookup_fails_loud_when_driver_is_unavailable() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET acct:1=closed").unwrap();
 
-    let result = e
+    let error = e
         .execute_cuda_native_source_query_kv(
             &MvccReadQuery {
                 source: MvccReadSource::KeyLookup {
@@ -827,30 +798,19 @@ fn cuda_native_key_lookup_fallback_re_resolves_cpu_visible_row() {
             },
             &CudaMvccExecutionBackend::new(CudaDriverRuntime::unavailable(), 0),
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Cpu);
-    assert_eq!(result.fallback_reason, Some(FallbackReason::GpuUnavailable));
-    assert_eq!(
-        result.rows,
-        vec![MvccReadRow {
-            source_key: None,
-            key: Some("acct:1".to_string()),
-            value: Some("open".to_string()),
-        }]
-    );
-    assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
+    assert_gpu_mvcc_execution_required(&e, error);
 }
 
 #[test]
-fn cuda_native_key_batch_fallback_preserves_request_order() {
-    let e = Engine::new_local_cpu_oracle();
+fn cuda_native_key_batch_fails_loud_when_driver_is_unavailable() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET acct:3=closed").unwrap();
 
-    let result = e
+    let error = e
         .execute_cuda_native_source_query_kv(
             &MvccReadQuery {
                 source: MvccReadSource::KeyBatchLookup {
@@ -864,38 +824,20 @@ fn cuda_native_key_batch_fallback_preserves_request_order() {
             },
             &CudaMvccExecutionBackend::new(CudaDriverRuntime::unavailable(), 0),
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Cpu);
-    assert_eq!(result.fallback_reason, Some(FallbackReason::GpuUnavailable));
-    assert_eq!(
-        result.rows,
-        vec![
-            MvccReadRow {
-                source_key: None,
-                key: Some("acct:3".to_string()),
-                value: Some("closed".to_string()),
-            },
-            MvccReadRow {
-                source_key: None,
-                key: Some("acct:1".to_string()),
-                value: Some("open".to_string()),
-            },
-        ]
-    );
-    assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
+    assert_gpu_mvcc_execution_required(&e, error);
 }
 
 #[test]
-fn cuda_native_composition_fallback_re_resolves_cpu_visible_rows() {
-    let e = Engine::new_local_cpu_oracle();
+fn cuda_native_composition_fails_loud_when_driver_is_unavailable() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
     e.execute_text(3, "SET acct:3=closed").unwrap();
     e.execute_text(4, "DELETE acct:2").unwrap();
 
-    let result = e
+    let error = e
         .execute_cuda_native_source_query_kv(
             &MvccReadQuery {
                 source: MvccReadSource::IntersectAll {
@@ -916,30 +858,19 @@ fn cuda_native_composition_fallback_re_resolves_cpu_visible_rows() {
             },
             &CudaMvccExecutionBackend::new(CudaDriverRuntime::unavailable(), 0),
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Cpu);
-    assert_eq!(result.fallback_reason, Some(FallbackReason::GpuUnavailable));
-    assert_eq!(
-        result.rows,
-        vec![MvccReadRow {
-            source_key: None,
-            key: Some("acct:2".to_string()),
-            value: None,
-        }]
-    );
-    assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
+    assert_gpu_mvcc_execution_required(&e, error);
 }
 
 #[test]
-fn cuda_native_follow_value_chain_fallback_re_resolves_cpu_visible_rows() {
-    let e = Engine::new_local_cpu_oracle();
+fn cuda_native_follow_value_chain_fails_loud_when_driver_is_unavailable() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET profile:1=team:beta").unwrap();
 
-    let result = e
+    let error = e
         .execute_cuda_native_source_query_kv(
             &MvccReadQuery {
                 source: MvccReadSource::FollowValueChain {
@@ -958,29 +889,19 @@ fn cuda_native_follow_value_chain_fallback_re_resolves_cpu_visible_rows() {
             },
             &CudaMvccExecutionBackend::new(CudaDriverRuntime::unavailable(), 0),
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Cpu);
-    assert_eq!(result.fallback_reason, Some(FallbackReason::GpuUnavailable));
-    assert_eq!(
-        result.rows,
-        vec![MvccReadRow {
-            source_key: Some("acct:1".to_string()),
-            key: Some("profile:1".to_string()),
-            value: Some("profile:1".to_string()),
-        }]
-    );
-    assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
+    assert_gpu_mvcc_execution_required(&e, error);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_runs_supported_lookup_without_fallback() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_runs_supported_lookup_without_fallback() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
 
     let result = e
-        .execute_mvcc_query_with_backend_fallback(
+        .execute_mvcc_query_with_backend(
             &MvccReadQuery {
                 source: MvccReadSource::KeyLookup {
                     key: "acct:1".to_string(),
@@ -991,7 +912,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_runs_supported_lookup_without_fal
                 projection: MvccProjection::ValueOnly,
                 limit: None,
             },
-            &FirstCudaSliceParityBackend,
+            &CudaDriverMvccBackend,
         )
         .unwrap();
 
@@ -1010,8 +931,9 @@ fn execute_mvcc_query_first_cuda_slice_backend_runs_supported_lookup_without_fal
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_runs_supported_full_scan_without_fallback() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_runs_supported_full_scan_without_fallback() {
+    let e = Engine::new_local_test_engine();
     for (txn_id, command) in include_str!("../../../../tests/fixtures/mvcc-full-scan-workload.txt")
         .lines()
         .enumerate()
@@ -1020,7 +942,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_runs_supported_full_scan_without_
     }
 
     let result = e
-        .execute_mvcc_query_with_backend_fallback(
+        .execute_mvcc_query_with_backend(
             &MvccReadQuery {
                 source: MvccReadSource::FullScan,
                 visibility: StorageVisibility { read_txn_id: 6 },
@@ -1035,7 +957,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_runs_supported_full_scan_without_
                 projection: MvccProjection::KeyValue,
                 limit: None,
             },
-            &FirstCudaSliceParityBackend,
+            &CudaDriverMvccBackend,
         )
         .unwrap();
 
@@ -1061,16 +983,16 @@ fn execute_mvcc_query_first_cuda_slice_backend_runs_supported_full_scan_without_
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_orders_cpu_resolved_rows_by_value_without_fallback()
-{
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_orders_cpu_resolved_rows_by_value_without_fallback() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
     e.execute_text(4, "SET profile:2=team:beta").unwrap();
 
     let result = e
-        .execute_mvcc_query_with_backend_fallback(
+        .execute_mvcc_query_with_backend(
             &MvccReadQuery {
                 source: MvccReadSource::FollowValueChain {
                     keys: vec!["acct:1".to_string(), "acct:2".to_string()],
@@ -1086,7 +1008,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_orders_cpu_resolved_rows_by_value
                 projection: MvccProjection::KeyValue,
                 limit: None,
             },
-            &FirstCudaSliceParityBackend,
+            &CudaDriverMvccBackend,
         )
         .unwrap();
 
@@ -1112,13 +1034,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_orders_cpu_resolved_rows_by_value
 }
 
 #[test]
-fn cuda_mvcc_backend_falls_back_when_driver_is_unavailable() {
-    let mut e = Engine::new_local_cpu_oracle();
+fn cuda_mvcc_backend_fails_loud_when_driver_is_unavailable() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     let backend = CudaMvccExecutionBackend::new(CudaDriverRuntime::unavailable(), 0);
 
-    let result = e
-        .execute_mvcc_query_with_backend_fallback(
+    let error = e
+        .execute_mvcc_query_with_backend(
             &MvccReadQuery {
                 source: MvccReadSource::KeyLookup {
                     key: "acct:1".to_string(),
@@ -1131,13 +1053,9 @@ fn cuda_mvcc_backend_falls_back_when_driver_is_unavailable() {
             },
             &backend,
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Cpu);
-    assert_eq!(result.fallback_reason, Some(FallbackReason::GpuUnavailable));
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
+    assert_gpu_mvcc_execution_required(&e, error);
 }
 
 fn seed_native_composition_rows(e: &mut Engine) {
@@ -1218,7 +1136,7 @@ fn key_only_rows(keys: &[&str]) -> Vec<MvccReadRow> {
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_native_set_composition_without_fallback() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     seed_native_composition_rows(&mut e);
 
     for (name, source, expected_keys) in native_set_composition_cases() {
@@ -1245,7 +1163,7 @@ fn execute_mvcc_query_cuda_driver_runs_native_set_composition_without_fallback()
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_nested_native_composition_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
 
@@ -1295,7 +1213,7 @@ fn execute_mvcc_query_cuda_driver_runs_nested_native_composition_without_fallbac
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_filters_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1355,7 +1273,7 @@ fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_filters_without_fallbac
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_path_filters_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1422,7 +1340,7 @@ fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_path_filters_without_fa
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_occurrence_path_filters_without_fallback()
 {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -1482,7 +1400,7 @@ fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_occurrence_path_filters
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_provenance_projection_order_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=member:1").unwrap();
@@ -1540,7 +1458,7 @@ fn execute_mvcc_query_cuda_driver_runs_provenance_projection_order_without_fallb
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_prefix_terminal_value_chain_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1599,7 +1517,7 @@ fn execute_mvcc_query_cuda_driver_runs_prefix_terminal_value_chain_without_fallb
 #[test]
 #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
 fn execute_mvcc_query_cuda_driver_runs_labeled_branch_source_resolution_without_fallback() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1672,8 +1590,9 @@ fn execute_mvcc_query_cuda_driver_runs_labeled_branch_source_resolution_without_
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_lookup_fixture() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_supported_lookup_fixture() {
+    let e = Engine::new_local_test_engine();
     for (txn_id, command) in include_str!("../../../../tests/fixtures/mvcc-read-workload.txt")
         .lines()
         .enumerate()
@@ -1692,23 +1611,26 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_lookup_f
         limit: None,
     };
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
-    let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
-        .unwrap();
+    let backend = e.execute_mvcc_query_with_cuda_driver_probe(&query).unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(
+        backend.rows,
+        vec![MvccReadRow {
+            source_key: None,
+            key: Some("acct:1".to_string()),
+            value: Some("closed".to_string()),
+        }]
+    );
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_full_scan_fixture() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_supported_full_scan_fixture() {
+    let e = Engine::new_local_test_engine();
     for (txn_id, command) in include_str!("../../../../tests/fixtures/mvcc-full-scan-workload.txt")
         .lines()
         .enumerate()
@@ -1731,23 +1653,33 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_full_sca
         limit: None,
     };
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
-    let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
-        .unwrap();
+    let backend = e.execute_mvcc_query_with_cuda_driver_probe(&query).unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(
+        backend.rows,
+        vec![
+            MvccReadRow {
+                source_key: None,
+                key: Some("acct:1".to_string()),
+                value: Some("closed".to_string()),
+            },
+            MvccReadRow {
+                source_key: None,
+                key: Some("acct:3".to_string()),
+                value: Some("archived".to_string()),
+            },
+        ]
+    );
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_key_range_filter() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_supported_key_range_filter() {
+    let e = Engine::new_local_test_engine();
     for (txn_id, command) in include_str!("../../../../tests/fixtures/mvcc-full-scan-workload.txt")
         .lines()
         .enumerate()
@@ -1769,17 +1701,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_key_rang
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -1795,12 +1723,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_key_rang
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_concat_native_sources() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_concat_native_sources() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=closed").unwrap();
     e.execute_text(3, "SET acct:3=open").unwrap();
@@ -1826,17 +1755,11 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_concat_native_sour
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
-    let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
-        .unwrap();
+    let backend = e.execute_mvcc_query_with_cuda_driver_probe(&query).unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -1857,7 +1780,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_concat_native_sour
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
@@ -1910,10 +1833,9 @@ fn first_cuda_slice_query_gap_accepts_native_set_composition() {
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_native_set_composition_variants() {
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_native_set_composition_variants() {
     for (name, source, expected_keys) in native_set_composition_cases() {
-        let mut cpu_engine = Engine::new_local_cpu_oracle();
-        seed_native_composition_rows(&mut cpu_engine);
         let query = MvccReadQuery {
             source,
             visibility: StorageVisibility { read_txn_id: 3 },
@@ -1923,19 +1845,15 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_native_set_composi
             limit: None,
         };
 
-        let cpu = cpu_engine.execute_mvcc_query(&query).unwrap();
-        assert_mvcc_query_uses_tracked_cpu_fallback(&cpu_engine, &cpu, 1);
-
-        let mut backend_engine = Engine::new_local_cpu_oracle();
+        let mut backend_engine = Engine::new_local_test_engine();
         seed_native_composition_rows(&mut backend_engine);
         let backend = backend_engine
-            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
             .unwrap();
 
         assert_eq!(backend.planned_target, DeviceTarget::Gpu(0), "{name}");
         assert_eq!(backend.executed_target, DeviceTarget::Gpu(0), "{name}");
         assert_eq!(backend.fallback_reason, None, "{name}");
-        assert_eq!(backend.rows, cpu.rows, "{name}");
         assert_eq!(backend.rows, key_only_rows(&expected_keys), "{name}");
         assert_eq!(
             backend_engine.metrics().snapshot().fallback_total,
@@ -1946,8 +1864,9 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_native_set_composi
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_distinct_cpu_resolved_sources() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_distinct_cpu_resolved_sources() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1983,17 +1902,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_distinct_cpu_resol
         limit: None,
     };
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -2009,12 +1924,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_distinct_cpu_resol
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_key_order() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_key_order() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:3=closed").unwrap();
     e.execute_text(3, "SET acct:2=pending").unwrap();
@@ -2030,17 +1946,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_key_order() {
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -2061,7 +1973,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_key_order() {
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
@@ -2079,8 +1991,9 @@ fn first_cuda_slice_query_gap_accepts_value_order_for_native_single_sources() {
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_value_order() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_value_order() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:3=closed").unwrap();
     e.execute_text(3, "SET acct:2=pending").unwrap();
@@ -2094,17 +2007,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_value_order() {
         limit: None,
     };
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -2125,7 +2034,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_value_order() {
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
@@ -2163,8 +2072,9 @@ fn first_cuda_slice_query_gap_accepts_fan_in_order_for_native_sources() {
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_fan_in_order() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_fan_in_order() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=closed").unwrap();
     e.execute_text(3, "SET acct:3=pending").unwrap();
@@ -2188,17 +2098,11 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_fan_in_order() {
         limit: Some(3),
     };
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
-    let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
-        .unwrap();
+    let backend = e.execute_mvcc_query_with_cuda_driver_probe(&query).unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -2219,12 +2123,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_fan_in_order() {
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_limit_after_order() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_limit_after_order() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:3=closed").unwrap();
     e.execute_text(3, "SET acct:2=pending").unwrap();
@@ -2240,17 +2145,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_limit_after_order(
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -2266,82 +2167,34 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_limit_after_order(
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn mvcc_benchmark_report_summarizes_gpu_coverage_and_fallback_rate() {
-    let mut e = Engine::new_local_cpu_oracle();
-    e.execute_text(1, "SET acct:1=open").unwrap();
-    e.execute_text(2, "SET acct:2=closed").unwrap();
-    e.execute_text(3, "SET acct:3=pending").unwrap();
-
-    let supported_scan = MvccReadQuery {
-        source: MvccReadSource::FullScan,
-        visibility: StorageVisibility { read_txn_id: 3 },
-        filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
-        order: Some(MvccReadOrder::KeyAsc),
-        projection: MvccProjection::KeyOnly,
-        limit: None,
+fn mvcc_benchmark_report_summarizes_gpu_only_coverage() {
+    let result = || MvccReadResult {
+        planned_target: DeviceTarget::Gpu(0),
+        executed_target: DeviceTarget::Gpu(0),
+        fallback_reason: None,
+        rows: Vec::new(),
     };
-    let supported_concat = MvccReadQuery {
-        source: MvccReadSource::Concat {
-            sources: vec![
-                MvccReadSource::KeyLookup {
-                    key: "acct:2".to_string(),
-                },
-                MvccReadSource::KeyLookup {
-                    key: "acct:1".to_string(),
-                },
-            ],
-        },
-        visibility: StorageVisibility { read_txn_id: 3 },
-        filter: None,
-        order: None,
-        projection: MvccProjection::ValueOnly,
-        limit: None,
-    };
-    let supported_nested_distinct = MvccReadQuery {
-        source: MvccReadSource::Concat {
-            sources: vec![MvccReadSource::ConcatDistinct {
-                sources: vec![
-                    MvccReadSource::KeyLookup {
-                        key: "acct:1".to_string(),
-                    },
-                    MvccReadSource::KeyLookup {
-                        key: "acct:1".to_string(),
-                    },
-                ],
-            }],
-        },
-        visibility: StorageVisibility { read_txn_id: 3 },
-        filter: None,
-        order: None,
-        projection: MvccProjection::KeyValue,
-        limit: None,
-    };
-
-    let results = vec![
-        e.execute_mvcc_query_with_backend_fallback(&supported_scan, &FirstCudaSliceParityBackend)
-            .unwrap(),
-        e.execute_mvcc_query_with_backend_fallback(&supported_concat, &FirstCudaSliceParityBackend)
-            .unwrap(),
-        e.execute_mvcc_query_with_backend_fallback(
-            &supported_nested_distinct,
-            &FirstCudaSliceParityBackend,
-        )
-        .unwrap(),
-    ];
-
-    let report = MvccBenchmarkReport::from_results(&results, &e.metrics().snapshot());
+    let results = vec![result(), result(), result()];
+    let metrics = RuntimeMetrics::default();
+    metrics.observe_h2d_bytes(128);
+    metrics.observe_d2h_bytes(64);
+    metrics.observe_kernel_exec_ms(7);
+    metrics.observe_batch_wait_ms(3);
+    let report = MvccBenchmarkReport::from_results(&results, &metrics.snapshot());
 
     assert_eq!(report.workload_count, 3);
     assert_eq!(report.gpu_executed_count, 3);
     assert_eq!(report.cpu_fallback_count, 0);
     assert_eq!(report.gpu_executed_permyriad, 10_000);
     assert_eq!(report.cpu_fallback_permyriad, 0);
-    assert!(report.d2h_bytes_total > 0);
-    assert_eq!(report.h2d_bytes_total, 0);
-    assert_eq!(report.kernel_exec_samples, 0);
-    assert_eq!(report.batch_wait_samples, 0);
+    assert_eq!(report.h2d_bytes_total, 128);
+    assert_eq!(report.d2h_bytes_total, 64);
+    assert_eq!(report.kernel_exec_samples, 1);
+    assert_eq!(report.kernel_exec_total_ms, 7);
+    assert_eq!(report.batch_wait_samples, 1);
+    assert_eq!(report.batch_wait_total_ms, 3);
 }

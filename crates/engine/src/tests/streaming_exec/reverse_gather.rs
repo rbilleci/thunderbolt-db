@@ -1,5 +1,6 @@
 use super::{gpu_available, select};
 use crate::Engine;
+use gpu_db_execution::DeviceTarget;
 use gpu_db_sql::SqlValue;
 
 // ========== P4-1 (chunk-authoritative tables): the REVERSE GATHER ==========
@@ -12,7 +13,7 @@ use gpu_db_sql::SqlValue;
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_reverse_gather_round_trips_all_types_and_sidecars() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -75,15 +76,12 @@ fn gpu_reverse_gather_round_trips_all_types_and_sidecars() {
     e.execute_text(seq, &format!("INSERT INTO mix VALUES {values}"))
         .unwrap();
 
-    // The ORACLE: the store's visible rows BEFORE streaming (host path, scan order).
+    // GPU baseline: visible rows before streaming, in scan order.
     let q = select("SELECT a, s, big, d, ts, n, flag, t, u FROM mix");
-    let oracle = e
-        .execute_relational_select(&q)
-        .unwrap()
-        .rows
-        .iter()
-        .map(|r| r.to_vec())
-        .collect::<Vec<_>>();
+    let baseline = e.execute_relational_select(&q).unwrap();
+    assert_eq!(baseline.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(baseline.fallback_reason, None);
+    let oracle = baseline.rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
     assert_eq!(oracle.len(), N as usize);
 
     // Stream -> cold chunks; reverse-gather at the current boundary.

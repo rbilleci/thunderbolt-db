@@ -3,7 +3,7 @@ use super::*;
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn text_only_point_projection_runs_on_gpu_without_numeric_projection_slots() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE labels (k INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -79,7 +79,7 @@ fn text_only_point_projection_runs_on_gpu_without_numeric_projection_slots() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn nullable_text_point_projection_keeps_null_distinct_from_empty_on_gpu() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE nullable_labels (k INT, label TEXT)")
         .unwrap();
     e.execute_text(

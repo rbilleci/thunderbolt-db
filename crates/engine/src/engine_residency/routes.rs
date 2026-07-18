@@ -460,22 +460,22 @@ impl Engine {
                 | "int4_projection_all"
                 | "int4_composite_equality_multi_column_projection"
         ) {
-            // THE FLIP audit F1: these filtered/range int4 shapes had NO sharded mapping, so the
-            // now-default sharded layout demoted them to the CPU host scan (GPU-served pre-flip).
+            // THE FLIP audit F1: before the GPU-only retirement these filtered/range int4 shapes had
+            // no sharded mapping and were demoted to the retired host scan.
             // The `sharded_` prefix routes them to the sharded BRIDGE (their unprefixed names
             // dispatch to the single-buffer enumerated kernels), whose general executor evaluates
             // the predicate + projection/aggregate on-device over the unified (or zero-copy
             // single-shard) source.
             format!("sharded_{query_shape}")
         } else if query_shape == "int4_filter_group_count" {
-            // THE FLIP (burn-in): an OR-of-int4-equalities COUNT fell to the CPU engine on a sharded
-            // table (no sharded mapping — the SUM cliff's sibling). The shape keeps its single-buffer
+            // THE FLIP (burn-in): before retirement an OR-of-int4-equalities COUNT fell to the CPU
+            // engine on a sharded table (no sharded mapping — the SUM cliff's sibling). The shape keeps its single-buffer
             // name: the dispatch arm routes it to the grouped bridge, whose `src: None` now resolves
             // the sharded unified source inside `execute_resident_expr_select_with_binding`.
             query_shape
         } else if query_shape == "int4_scalar_aggregate" {
             // FLIP slice (measured): an UNFILTERED scalar aggregate (bare SUM/AVG/MIN/MAX) had NO sharded
-            // mapping, so it fell through the dispatch to the CPU engine's host scan — MEASURED p50
+            // mapping, so before retirement it fell through to the CPU engine's host scan — MEASURED p50
             // 496,554us vs the bridge-served sharded COUNT's 460us at 524k rows (~1000x, a charter
             // violation in the hot path). The bridge's COUNT-precheck + general run computes scalar
             // aggregates on the unified device buffer, so route it there.
@@ -495,7 +495,7 @@ impl Engine {
         } else if query_shape == "int4_filtered_scalar_aggregate" {
             // THE FLIP audit F1 (residue): the filtered aggregates NOT covered by the tuned
             // avg/min/max mappings above (a filtered SUM) route to the sharded bridge's general
-            // executor instead of falling to the CPU host scan.
+            // executor rather than the retired host scan.
             "sharded_int4_filtered_scalar_aggregate".to_string()
         } else if query_shape == "int4_distinct_projection" {
             "sharded_int4_distinct_projection".to_string()

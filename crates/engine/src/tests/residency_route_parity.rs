@@ -1,5 +1,5 @@
 /// SLICE B (sharded predicate NULL 3VL — the LAST shards-default gate): every NULL-semantics
-/// predicate shape on a SHARDED-ONLY table matches the single-buffer M3 oracle (an INDEPENDENT
+/// predicate shape on a SHARDED-ONLY table matches the single-buffer M3 baseline (an INDEPENDENT
 /// engine instance with shard residency OFF — the proven 3VL path). Covers: `IS NULL` /
 /// `IS NOT NULL` (previously ERRORED on shards — the shape rides the SQL->Expr PG path, which only
 /// knew the single-buffer store), equality against a NULL-stored-0 (`col = 0` must EXCLUDE the NULL
@@ -19,7 +19,7 @@ fn sharded_predicate_null_3vl_matches_single_buffer_oracle() {
         )
         .unwrap();
     };
-    let mut o = Engine::new_local(); // explicit single-buffer read-layout oracle
+    let mut o = Engine::new_local(); // explicit single-buffer read-layout baseline
     load(&o);
     install_test_single_buffer_residency(&mut o, "nn");
     let e = Engine::new_local(); // sharded-only table (null-bearing => single shard by construction)
@@ -29,12 +29,9 @@ fn sharded_predicate_null_3vl_matches_single_buffer_oracle() {
     assert!(
         e.read_state.residency.snapshots.load().get("nn").is_none()
             && e.read_state.residency.shards.load().get("nn").is_some(),
-        "precondition: the table is SHARD-resident only (else this oracle differential is vacuous)"
+        "precondition: the table is SHARD-resident only (else this layout differential is vacuous)"
     );
-    let run = |e: &Engine, sql: &str| {
-        e.execute_relational_select_text(sql)
-            .map(|r| r.rows.into_boxed())
-    };
+    let run = |e: &Engine, sql: &str| e.execute_relational_select_text(sql);
     for sql in [
         "SELECT id, balance FROM nn WHERE balance = 0",
         "SELECT id, balance FROM nn WHERE id = 0",
@@ -47,22 +44,26 @@ fn sharded_predicate_null_3vl_matches_single_buffer_oracle() {
         "SELECT COUNT(*) FROM nn WHERE balance IS NOT NULL",
         "SELECT id, balance FROM nn ORDER BY id DESC", // GPU sort over the unified buffer (+ NULL key)
     ] {
-        let want = run(&o, sql).unwrap_or_else(|err| panic!("oracle must serve {sql}: {err}"));
+        let want = run(&o, sql).unwrap_or_else(|err| panic!("baseline must serve {sql}: {err}"));
         let got =
             run(&e, sql).unwrap_or_else(|err| panic!("the sharded path must serve {sql}: {err}"));
-        assert_eq!(got, want, "sharded == single-buffer oracle for: {sql}");
+        assert_eq!(want.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(got.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(want.fallback_reason, None, "{sql}");
+        assert_eq!(got.fallback_reason, None, "{sql}");
+        assert_eq!(got.rows, want.rows, "sharded == single-buffer GPU baseline for: {sql}");
     }
 }
 
 /// THE FLIP (audit F1 regression gate): every filtered/range int4 shape the audit found demoted to
-/// the CPU host scan under the sharded-by-default layout is now GPU-SERVED via the sharded bridge
-/// AND matches the single-buffer oracle. `executed_target == Gpu` is the non-vacuity proof (results
-/// alone can't distinguish the host scan — it is correct, just off-charter and ~1000x slower).
+/// an unsupported specialized route under the sharded-by-default layout is now GPU-SERVED via the
+/// sharded bridge AND matches the single-buffer baseline. `executed_target == Gpu` plus no fallback
+/// telemetry is the non-vacuity proof.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn flip_f1_filtered_shapes_gpu_served_and_match_single_buffer_oracle() {
     let load = |e: &Engine| {
-        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        // The same fixture feeds the explicit single-buffer and default sharded GPU layouts.
         e.set_auto_admit_on_commit(true);
         e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
             .unwrap();
@@ -77,7 +78,7 @@ fn flip_f1_filtered_shapes_gpu_served_and_match_single_buffer_oracle() {
             .unwrap();
         }
     };
-    let mut o = Engine::new_local(); // explicit single-buffer read-layout oracle
+    let mut o = Engine::new_local(); // explicit single-buffer read-layout baseline
     load(&o);
     install_test_single_buffer_residency(&mut o, "t");
     let e = Engine::new_local(); // sharded by default
@@ -98,22 +99,17 @@ fn flip_f1_filtered_shapes_gpu_served_and_match_single_buffer_oracle() {
         let got = e.execute_relational_select_text(sql).unwrap();
         assert_eq!(
             got.rows, want.rows,
-            "sharded == single-buffer oracle for: {sql}"
+            "sharded == single-buffer GPU baseline for: {sql}"
         );
-        // The F1 contract: the sharded DEFAULT never NEWLY demotes a shape to the host — it
-        // is GPU-served, or the single-buffer oracle was ALSO host-served (a pre-existing,
-        // layout-independent gap, not a flip regression).
+        // The F1 contract: both layouts execute on the GPU without fallback telemetry.
         eprintln!(
-            "[f1] {sql}: sharded={:?} oracle={:?}",
+            "[f1] {sql}: sharded={:?} baseline={:?}",
             got.executed_target, want.executed_target
         );
-        assert!(
-            got.executed_target == DeviceTarget::Gpu(0)
-                || got.executed_target == want.executed_target,
-            "F1: NEW cpu demotion under the sharded default for {sql}: sharded={:?} oracle={:?}",
-            got.executed_target,
-            want.executed_target
-        );
+        assert_eq!(want.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(got.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(want.fallback_reason, None, "{sql}");
+        assert_eq!(got.fallback_reason, None, "{sql}");
     }
 }
 

@@ -36,12 +36,37 @@ impl Engine {
         let filter_idx = filter_groups[0][0].0;
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
+        let projected_column_is_null_bearing = |name: &str| {
+            self.read_residency_shards()
+                .get(&table.name)
+                .is_some_and(|shards| {
+                    shards.iter().any(|shard| {
+                        shard
+                            .resident_device_null_columns
+                            .iter()
+                            .any(|layout| layout.name == name)
+                    })
+                })
+                || self
+                    .relational_retained_snapshot_handle(&table.name)
+                    .is_some_and(|snapshot| {
+                        snapshot
+                            .resident_device_null_columns
+                            .iter()
+                            .any(|layout| layout.name == name)
+                    })
+        };
+        let flat_i32_projection_null_free = bound
+            .selected_columns
+            .iter()
+            .all(|column| !projected_column_is_null_bearing(&column.name));
         Ok(RelationalRetainedReadTemplate {
             route_id: job.route_id,
             schema: job.schema,
             snapshot_generation: job.snapshot_generation,
             selected_indexes: bound.selected_indexes,
             result_columns: bound.selected_columns,
+            flat_i32_projection_null_free,
             filter_idx,
             access_path,
             table,

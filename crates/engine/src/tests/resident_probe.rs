@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -49,7 +49,7 @@ fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() 
 
 #[test]
 fn resident_snapshot_budget_evicts_oldest_table_before_admission() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE small_a (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO small_a (id, label) VALUES (1, 'a')")
@@ -92,7 +92,7 @@ fn resident_snapshot_budget_evicts_oldest_table_before_admission() {
 
 #[test]
 fn resident_snapshot_budget_rejects_oversized_snapshot_without_mutation() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO events (id, label) VALUES (1, 'alpha')")
@@ -136,7 +136,7 @@ fn resident_snapshot_budget_rejects_oversized_snapshot_without_mutation() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn benchmark_installers_reject_actual_bytes_without_evicting_existing_residency() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE keep_resident (id INT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO keep_resident VALUES (1)")
@@ -245,7 +245,7 @@ fn benchmark_installers_reject_actual_bytes_without_evicting_existing_residency(
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn open_shard_rollover_fail_stops_before_crossing_the_gpu_budget() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.set_shard_size_target(4);
     e.execute_text(1, "CREATE TABLE rollover_budget (id INT)")
         .unwrap();
@@ -281,7 +281,7 @@ fn open_shard_rollover_fail_stops_before_crossing_the_gpu_budget() {
 
 #[test]
 fn resident_snapshot_budget_keeps_wal_and_pressure_invalidation_semantics() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -314,7 +314,7 @@ fn resident_snapshot_budget_keeps_wal_and_pressure_invalidation_semantics() {
 
 #[test]
 fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let _ = e
         .cached_cuda_probe_runtime
         .set(CudaDriverRuntime::unavailable());
@@ -463,7 +463,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
 
 #[test]
 fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_telemetry() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
     e.execute_text(1, "CREATE TABLE events (id INT, amount INT)")
@@ -539,7 +539,7 @@ fn gpu_s10a_ordered_projection_routes_through_bridge_on_dispatch() {
     // arm through the LIVE `&Select` dispatch and now executes via the general bridge ON THE GPU, with
     // closed-form rows. Survives the probe's deletion (calls the dispatch, not the probe). Non-vacuous:
     // the literals pin the filtered + sorted + windowed result.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE p (a INT)").unwrap();
     e.execute_text(
         2,
@@ -598,7 +598,7 @@ fn gpu_s10a_ordered_projection_drops_nulls_pg_correct() {
     // path. So routing this shape is a PG-CORRECTNESS FIX, NOT byte-identical -- this test pins the
     // corrected behavior (the divergent axis the 480-shape non-null differential did not cover) and
     // cross-checks the bridge against the SQL->Expr reference on NULL data.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE p2 (a INT)").unwrap();
     e.execute_text(
         2,
@@ -660,7 +660,7 @@ fn gpu_s10b_distinct_routes_through_bridge_on_dispatch() {
     // through the LIVE `&Select` dispatch and executes via the DISTINCT bridge ON THE GPU, closed-form.
     // Survives the probes' deletion (calls the dispatch). The no-ORDER-BY case pins the deterministic
     // default order (key ASC) the grouped path produces.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE p (a INT)").unwrap();
     e.execute_text(
         2,
@@ -711,7 +711,7 @@ fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
     // column -> a NULL placeholder-0 surfaced as a phantom Int4(0)). The DISTINCT bridge groups a NULL key
     // into one group -> DISTINCT keeps exactly ONE SqlValue::Null row and NO phantom Int4(0) (PG-correct).
     // The data has NO real 0, so any Int4(0) would be the bug. Filtered DISTINCT excludes NULL via 3VL.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE p2 (a INT)").unwrap();
     e.execute_text(
         2,
@@ -806,7 +806,7 @@ fn gpu_s10a_projection_routes_through_bridge_on_dispatch() {
     // S10a keeper: the int4 projection shapes reach their route arms through the LIVE `&Select` dispatch
     // and execute via the general bridge ON THE GPU, closed-form (incl. multi-column + a mixed text+int4
     // projection). Survives the probes' deletion (calls the dispatch).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE proj (a INT, b INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -861,7 +861,7 @@ fn gpu_s10a_projection_drops_nulls_pg_correct() {
     // (placeholder 0) that passed the filter surfaced as a phantom Int4(0). The bridge filters via the 3VL
     // WHERE VM, so a NULL fails `a >= 0` / `a = 0` (UNKNOWN) and is excluded -- PG-correct. Data has real 0s
     // AND NULLs; the result must contain ONLY the real 0s.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE projn (a INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -910,7 +910,7 @@ fn gpu_s10a_filter_group_count_routes_through_bridge_on_dispatch() {
     // LIVE dispatch and executes via the bridge ON THE GPU, closed-form. NULL regression: a NULL in the
     // filter column fails the predicate via 3VL (excluded), so the bridge does NOT phantom-count it as the
     // retired probe did (NULL placeholder-0 -> matched `a = 0`).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE cnt (a INT, label TEXT)")
         .unwrap();
     e.execute_text(
@@ -940,7 +940,7 @@ fn gpu_s10a_filter_group_count_routes_through_bridge_on_dispatch() {
     );
 
     // NULL data: real 0s (x2) + a NULL (x2) + a 5; `a = 0 OR a = 5` counts the 3 real matches, NOT the NULLs.
-    let mut e2 = Engine::new_local_cpu_oracle();
+    let mut e2 = Engine::new_local_test_engine();
     e2.execute_text(1, "CREATE TABLE cntn (a INT)").unwrap();
     e2.execute_text(
         2,
@@ -964,7 +964,7 @@ fn gpu_s10a_filter_group_count_routes_through_bridge_on_dispatch() {
 
 #[test]
 fn relational_select_grouped_having_filters_engine_aggregate_rows() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
@@ -1022,7 +1022,7 @@ fn relational_select_grouped_having_filters_engine_aggregate_rows() {
 
 #[test]
 fn gpu_resident_device_memory_membership_count_probe_materializes_int4_results() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -1104,7 +1104,7 @@ fn gpu_resident_device_memory_membership_count_probe_materializes_int4_results()
 
 #[test]
 fn gpu_resident_device_memory_between_count_probe_materializes_int4_results() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -1204,7 +1204,7 @@ fn gpu_resident_device_memory_between_count_probe_materializes_int4_results() {
 // on-device LIKE filter (`expr_text_like_scalar_filter`). Closed-form GPU-native oracle, no probe reference.
 #[test]
 fn gpu_s10a_text_prefix_like_count_routes_through_bridge_on_device() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -1257,7 +1257,7 @@ fn gpu_s10a_text_prefix_like_count_routes_through_bridge_on_device() {
 // the BE-token sabotage proved the mask-VM path is load-bearing (LIKE 'alp%' -> 0 instead of 3).
 #[test]
 fn gpu_s10a_text_prefix_like_count_nullable_text_pg_correct_on_device() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -1300,7 +1300,7 @@ fn gpu_resident_empty_nonnullable_scalar_aggregate_min_max_avg_is_null() {
     // (matching the NULLABLE path's all-NULL behavior — "PG: an aggregate of no rows is NULL").
     // This corner (an EMPTY, NON-nullable, UNFILTERED resident table) was UNTESTED; this pins it so a
     // future regression to the old empty sentinels (MIN/MAX -> Text("") / AVG -> Numeric(0)) is caught.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // Plain `INT` (no inserted NULLs) routes the NON-nullable arm (`agg_null_offset.is_none()`), the
     // same arm the populated `gpu_resident_device_memory_scalar_aggregate_probe_*` test exercises.
     e.execute_text(1, "CREATE TABLE events (amount INT)")
@@ -1332,7 +1332,7 @@ fn gpu_resident_empty_nonnullable_scalar_aggregate_min_max_avg_is_null() {
 
 #[test]
 fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
@@ -1404,7 +1404,7 @@ fn gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null() {
     // column yields SQL NULL for every aggregate (PG: aggregate of no rows is NULL). Expected values are
     // closed-form construction (the non-NULL sum/count/min/max computed by hand, AVG via the engine's
     // own PG-exact finalization) — NOT a CPU-operator oracle, per the GPU-native-oracle charter.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
     e.execute_text(1, "CREATE TABLE events (amount INT, allnull INT)")
@@ -1484,7 +1484,7 @@ fn gpu_sharded_scalar_aggregate_skips_null_values_and_all_null_is_null() {
     // semantics ON-DEVICE under the DEFAULT (sharded) layout. This is the sharded-default twin of
     // `gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null` (which pins the
     // single-buffer layer); expected values are closed-form construction, NOT a CPU-operator oracle.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE events_shnull (amount INT, allnull INT, grp INT)",
@@ -1569,24 +1569,26 @@ fn gpu_sharded_scalar_aggregate_skips_null_values_and_all_null_is_null() {
     assert_eq!(between_avg.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(between_avg.fallback_reason, None);
 
-    // CROSS-COLUMN Eq-filtered MIN/SUM: a LEDGERED route gap (no sharded/single-buffer shape maps a
-    // cross-column equality-filtered MIN/SUM — the F1 audit's "Eq-filtered SUM is CPU on both
-    // layouts" sibling), so these serve from the CPU-pinned fallback. The VALUES must still be
-    // PG-exact — this pins the host finalizer's NULL-skip semantics (previously host MIN returned
-    // NULL the moment one NULL row existed, and host SUM hard-errored on a NULL input). No
-    // executed_target assert: when the shape gap closes these move on-device.
+    // CROSS-COLUMN Eq-filtered MIN/SUM use the general CUDA expression/reduction path when the
+    // specialized sharded matcher declines them. The explicit target and telemetry assertions make
+    // this a non-vacuous GPU semantics gate: NULL inputs are skipped without manufacturing a host
+    // result or fallback evidence.
     let filtered_min = run("SELECT MIN(amount) FROM events_shnull WHERE grp = 1");
     assert_eq!(
         filtered_min.rows,
         vec![vec![SqlValue::Int4(5)]],
-        "cross-column Eq-filtered MIN skips NULL inputs (host fallback), never NULL-as-smallest"
+        "cross-column Eq-filtered MIN skips NULL inputs, never NULL-as-smallest"
     );
+    assert_eq!(filtered_min.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(filtered_min.fallback_reason, None);
     let filtered_sum = run("SELECT SUM(amount) FROM events_shnull WHERE grp = 1");
     assert_eq!(
         filtered_sum.rows,
         vec![vec![SqlValue::Int8(65)]],
-        "cross-column Eq-filtered SUM skips NULL inputs (host fallback), never an error"
+        "cross-column Eq-filtered SUM skips NULL inputs, never an error"
     );
+    assert_eq!(filtered_sum.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(filtered_sum.fallback_reason, None);
 
     // Same-column filtered control (predicate 3VL + validity conjunct compose): `<= 10` is a predicate
     // the NULL placeholder 0 WOULD pass — the survivors must be {10, 5}, never the phantom 0.
@@ -1601,7 +1603,7 @@ fn gpu_sharded_count_distinct_over_nullable_column_counts_non_null() {
     // TEXT entry (the hand-rolled grammar has no COUNT(DISTINCT); libpg_query maps it), which resolves
     // the sharded unified source inside the general executor. All-NULL -> 0 (PG: COUNT over zero rows
     // is 0, not NULL). The GROUPED COUNT(DISTINCT) paths keep their nullable clean-error.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events_cd (amount INT, allnull INT)")
         .unwrap();
     // amount: {10, NULL, 30, NULL, 20, 5, 10} -> distinct non-NULL {10, 30, 20, 5} = 4.
@@ -1649,7 +1651,7 @@ fn gpu_sharded_count_distinct_over_nullable_column_counts_non_null() {
 fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
     // M3 Slice A: filtered (compare + BETWEEN) SUM/AVG/MIN/MAX over a NULLABLE int4 column skip NULL rows
     // ON THE GPU, and a no-surviving-row result is SQL NULL. Closed-form construction oracle (not CPU).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
     // configuration; sharded is the default) — pin the layout it tests.
     e.execute_text(1, "CREATE TABLE events (amount INT)")
@@ -1716,7 +1718,7 @@ fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
 
 #[test]
 fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_results() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
@@ -1837,7 +1839,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
 
 #[test]
 fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_results() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
@@ -1967,7 +1969,7 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
 
 #[test]
 fn status_and_telemetry_surface_relational_residency_state() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
@@ -2088,7 +2090,7 @@ fn gpu_d3_pinned_reader_is_hidden_an_unpublished_insert_append() {
     // sharded read route hides the slot from the pre-append boundary and serves it at the append's
     // own seq. SABOTAGE: skip the created_by stamp in the append (or drop the hwm/created_by gate on
     // any route below) and the phantom reappears -> this test FAILS.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE d3t (id INT, v INT)")
         .unwrap();
     e.execute_text(
@@ -2191,7 +2193,7 @@ fn gpu_d4_captured_generation_survives_a_readmit_purge() {
     // resources: whatever generation a reader loads, it holds THAT generation's buffer AND regions,
     // pinned. SABOTAGE: revert any consumer to a side-map `.get()` after `shards.load()` and this
     // gate's held-generation assertions become unenforceable (the resurrection window reopens).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // The incremental DELETE tombstone path is nested under auto-admit (the commit-path lever).
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE d4t (id INT, v INT)")

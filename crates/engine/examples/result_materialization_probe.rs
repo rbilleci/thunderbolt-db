@@ -1,4 +1,4 @@
-//! Result-path step-1 — decompose the engine's per-row materialization residual (CPU-only).
+//! Result-path step-1 — decompose the engine's host-side per-row materialization residual.
 //!
 //! After the Arc-share, end-to-end read is ~7.8M (127ns/row); the GPU drain is ~33ns/row (30M). The residual
 //! ~94ns/row is the COMPLETION's per-row work: convert each row's `Vec<i32>` -> `Vec<SqlValue>`, group by

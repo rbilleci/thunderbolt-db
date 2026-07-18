@@ -3,7 +3,7 @@
 //! The 3b index route made a sharded point lookup O(1) (skip the scan) but is SINGLE-FLIGHT (one SQL
 //! parse + one GPU launch + one DtoH per lookup) -> ~44k lookups/s, a throughput cap. This bench measures
 //! the batched path (`bench_sharded_point_lookup_batch` -> `gather_sharded_int4_point_lookups_batched`): one
-//! batched host locate + ONE kernel-gather + one bulk DtoH per (shard, projected column) for a whole batch
+//! one batched device-index locate + ONE kernel-gather + one bulk DtoH per (shard, projected column) for a whole batch
 //! of needles. It sweeps the batch size and reports LATENCY (p50/p99 per batch) + THROUGHPUT (lookups/s),
 //! head-to-head with the single-flight SQL route baseline, in an in-L2 (small table) and out-of-L2 (large
 //! table) regime. The batched throughput climbing toward tens of millions/s as batch grows is the win

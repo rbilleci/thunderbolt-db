@@ -26,7 +26,7 @@ impl Engine {
     /// is an unfinished M3 feature for the general path). So we first run a `COUNT(*)` over the unified
     /// buffer; if it is 0 AND the projection is an aggregate, we return the PG-correct empty value WITHOUT
     /// the hard error: SUM/AVG/MIN/MAX -> `SqlValue::Null` (an aggregate of no rows is NULL), COUNT(*) ->
-    /// `Int8(0)`. (Was the legacy empty-text/zero sentinel; PG-correctness wins -- `sql-spec-over-cpu-parity`.)
+    /// `Int8(0)`. (Was the legacy empty-text/zero sentinel; fixture-derived SQL correctness wins.)
     /// Otherwise the executor runs ONCE over the unified buffer with the real
     /// projection and its result is returned directly (it handles COUNT/SUM/MIN/MAX/AVG/projection
     /// on-device). Text columns are DEFERRED in this slice (the unified buffer is int4-only).
@@ -232,7 +232,7 @@ impl Engine {
         if matched == 0 {
             // PG: SUM/AVG/MIN/MAX over zero rows is NULL (never 0 or an empty-text sentinel); only
             // COUNT(*) is 0. The old non-NULL placeholders were legacy CPU-engine parity (interim debt,
-            // ADR-006); PG-correctness wins (see the `sql-spec-over-cpu-parity` working agreement).
+            // ADR-006); fixture-derived SQL correctness wins.
             let placeholder = match &select.projection {
                 SelectProjection::Min { .. }
                 | SelectProjection::Max { .. }
@@ -270,8 +270,8 @@ impl Engine {
     /// NULLs (M3-for-shards): the sharded SCAN is now NULL-AWARE (its recompaction rebuilds each column's
     /// validity bitmap into the unified buffer + labels the unified descriptor), but this route gathers RAW i32
     /// slots with no validity channel. So the CALLER SKIPS this route entirely for a null-bearing table (any
-    /// surviving shard with a non-empty `resident_device_null_columns`) -> the NULL-aware scan serves it. null-
-    /// bearing is single-shard by construction, so the skip never costs the many-shard route. The
+    /// surviving shard with a non-empty `resident_device_null_columns`) -> the NULL-aware scan serves it,
+    /// including for multi-shard nullable tables. The
     /// `deleted_by[slot] > read_txn_id` visibility gate mirrors the scan's SV3b filter — a tombstoned row
     /// materializes ZERO rows. (`cross_shard_pk_index_route_declines_on_null_bearing` is the tripwire that this
     /// decline keeps route == the NULL-aware scan.)
@@ -346,13 +346,10 @@ impl Engine {
             if hit.slot as usize >= hit.descriptor.row_count {
                 return None; // defensive: slot past the captured live region
             }
-            // NULL handling: the sharded read path is uniformly NULL-BLIND (NULL stored as 0). Its
-            // recompaction is int4-only with NO validity-bitmap segment, and BOTH descriptors it builds --
-            // `resident_snapshot_for_shard` AND the scan's `resident_snapshot_for_unified` -- carry
-            // `resident_device_null_columns: Vec::new()`, so the scan reads the raw i32 (a NULL reads back as
-            // 0, and `col = 0` MATCHES a NULL-stored-0 row). This raw-i32 slot gather is therefore
-            // BYTE-IDENTICAL to the scan on NULLs BY CONSTRUCTION (the `..._null_blind_matches_scan`
-            // differential proves it; it is the tripwire when M3 recompacts bitmaps through the sharded path).
+            // NULL handling: this raw-i32 slot route has no validity channel. Its caller therefore
+            // excludes every null-bearing shard set; the fallback scan reconstructs unified validity
+            // bitmaps and materializes structural NULLs. Reaching this block proves every projected slot
+            // is valid in the captured shard generation.
             //
             // SV3b visibility gate: a VERSIONED shard's `deleted_by[slot]` (dense i64 at byte `slot*8`, NO
             // header, little-endian) HIDES the row when `deleted_by <= read_txn_id`; an un-versioned shard (no

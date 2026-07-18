@@ -7,11 +7,6 @@ use std::sync::Arc;
 use libloading::Library;
 pub mod probe;
 pub use probe::Probe;
-mod reference_operators;
-pub use reference_operators::{
-    CpuNoop, FilterOperator, LimitOperator, Operator, ProjectOperator, ScanOperator, SortOperator,
-    VecOperator,
-};
 mod mvcc_batch;
 pub use mvcc_batch::CudaMvccRowBatch;
 mod routing;

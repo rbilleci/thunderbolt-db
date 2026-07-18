@@ -508,8 +508,8 @@ impl Engine {
 
     /// Catalog eligibility (design review H1: RUNTIME state does the rest). Unique keys are served
     /// by P5's exact/Bloom candidate index. CHECK is row-local. Non-self foreign keys are served by
-    /// exact device predicates over the parent/child chunks; a device decline de-authoritizes before
-    /// the host validator runs. Self-FKs remain excluded because one statement's provider/consumer
+    /// exact device predicates over the parent/child chunks; a device decline fails closed before
+    /// acknowledgement. Self-FKs remain excluded because one statement's provider/consumer
     /// images interleave. Every scalar type is chunk-encodable, so types never gate.
     pub(super) fn chunk_class_eligible(catalog: &crate::CatalogSnapshot, table_name: &str) -> bool {
         let Some(table) = catalog.relational_catalog.get(table_name) else {

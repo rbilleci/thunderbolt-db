@@ -1,5 +1,5 @@
 //! MVCC read-execution subsystem (P0 §9.6 decomposition, behavior-preserving):
-//! the CPU/CUDA execution backends + dispatch types, value-chain / provenance
+//! the CUDA execution backend + dispatch types, value-chain / provenance
 //! resolution, row projection/filter/compare, and the source-resolution read
 //! path. Operates on the mvcc_read_model types; the Engine drives it.
 
@@ -70,94 +70,31 @@ pub(crate) trait MvccExecutionBackend {
     fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendDispatch;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+/// Closed-form semantic specification for host-neutral unit fixtures.
+///
+/// This is intentionally not an execution backend: it has no target, fallback, routing, or metrics
+/// contract and cannot be installed in the product dispatch chain. Device differentials compare
+/// independently executed GPU rows with explicit fixture expectations.
 #[cfg(test)]
-pub(crate) struct CpuMvccExecutionBackend;
+pub(crate) fn evaluate_mvcc_specification(
+    query: &MvccReadQuery,
+    mut rows: Vec<ResolvedMvccRow>,
+) -> MvccSpecificationResult {
+    if let Some(filter) = &query.filter {
+        rows.retain(|row| mvcc_row_matches_filter(row, filter));
+    }
+    if let Some(order) = &query.order {
+        rows.sort_by(|left, right| mvcc_row_cmp(left, right, order));
+    }
+    if let Some(limit) = query.limit {
+        rows.truncate(limit);
+    }
 
-#[cfg(test)]
-impl MvccExecutionBackend for CpuMvccExecutionBackend {
-    fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendDispatch {
-        let projection = &query.projection;
-        let projected = match (query.filter.clone(), query.order.clone(), query.limit) {
-            (Some(filter), Some(order), Some(limit)) => {
-                collect_operator_rows(ProjectOperator::new(
-                    LimitOperator::new(
-                        SortOperator::new(
-                            FilterOperator::new(
-                                ScanOperator::new(rows),
-                                move |row: &ResolvedMvccRow| mvcc_row_matches_filter(row, &filter),
-                            ),
-                            move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                                mvcc_row_cmp(left, right, &order)
-                            },
-                        ),
-                        limit,
-                    ),
-                    move |row| project_mvcc_row(row, projection),
-                ))
-            }
-            (Some(filter), Some(order), None) => collect_operator_rows(ProjectOperator::new(
-                SortOperator::new(
-                    FilterOperator::new(ScanOperator::new(rows), move |row: &ResolvedMvccRow| {
-                        mvcc_row_matches_filter(row, &filter)
-                    }),
-                    move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                        mvcc_row_cmp(left, right, &order)
-                    },
-                ),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (Some(filter), None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
-                LimitOperator::new(
-                    FilterOperator::new(ScanOperator::new(rows), move |row: &ResolvedMvccRow| {
-                        mvcc_row_matches_filter(row, &filter)
-                    }),
-                    limit,
-                ),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (Some(filter), None, None) => collect_operator_rows(ProjectOperator::new(
-                FilterOperator::new(ScanOperator::new(rows), move |row: &ResolvedMvccRow| {
-                    mvcc_row_matches_filter(row, &filter)
-                }),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (None, Some(order), Some(limit)) => collect_operator_rows(ProjectOperator::new(
-                LimitOperator::new(
-                    SortOperator::new(
-                        ScanOperator::new(rows),
-                        move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                            mvcc_row_cmp(left, right, &order)
-                        },
-                    ),
-                    limit,
-                ),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (None, Some(order), None) => collect_operator_rows(ProjectOperator::new(
-                SortOperator::new(
-                    ScanOperator::new(rows),
-                    move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                        mvcc_row_cmp(left, right, &order)
-                    },
-                ),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (None, None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
-                LimitOperator::new(ScanOperator::new(rows), limit),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (None, None, None) => {
-                collect_operator_rows(ProjectOperator::new(ScanOperator::new(rows), move |row| {
-                    project_mvcc_row(row, projection)
-                }))
-            }
-        };
-
-        MvccBackendDispatch::Executed(MvccBackendExecution {
-            executed_target: DeviceTarget::Cpu,
-            rows: projected,
-        })
+    MvccSpecificationResult {
+        rows: rows
+            .into_iter()
+            .map(|row| project_mvcc_row(row, &query.projection))
+            .collect(),
     }
 }
 
@@ -217,32 +154,6 @@ pub(crate) struct FinalizedMvccBackendExecution {
     pub(crate) executed_target: DeviceTarget,
     pub(crate) fallback_reason: Option<FallbackReason>,
     pub(crate) rows: Vec<MvccReadRow>,
-}
-
-#[cfg(test)]
-pub(crate) fn execute_mvcc_backend_chain<B: MvccExecutionBackend, F: MvccExecutionBackend>(
-    query: &MvccReadQuery,
-    rows: Vec<ResolvedMvccRow>,
-    backend: &B,
-    cpu_fallback: &F,
-) -> FinalizedMvccBackendExecution {
-    match backend.execute(query, rows) {
-        MvccBackendDispatch::Executed(executed) => FinalizedMvccBackendExecution {
-            executed_target: executed.executed_target,
-            fallback_reason: None,
-            rows: executed.rows,
-        },
-        MvccBackendDispatch::Fallback { reason, rows } => match cpu_fallback.execute(query, rows) {
-            MvccBackendDispatch::Executed(executed) => FinalizedMvccBackendExecution {
-                executed_target: executed.executed_target,
-                fallback_reason: Some(reason),
-                rows: executed.rows,
-            },
-            MvccBackendDispatch::Fallback { .. } => {
-                unreachable!("CPU fallback backend must execute")
-            }
-        },
-    }
 }
 
 pub(crate) fn execute_cuda_native_single_source_query(
@@ -1935,18 +1846,4 @@ pub(crate) fn collect_mvcc_provenance_segments<'a>(
             MvccProvenanceSummary::KeyValuePath => format!("{}={}", tuple.key, tuple.value),
         })
         .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn collect_operator_rows<Row, Op>(mut operator: Op) -> Vec<Row>
-where
-    Op: Operator<Row>,
-{
-    operator.open();
-    let mut rows = Vec::new();
-    while let Some(row) = operator.next() {
-        rows.push(row);
-    }
-    operator.close();
-    rows
 }

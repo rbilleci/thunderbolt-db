@@ -311,7 +311,7 @@ fn only_columns_that_contain_a_null_get_a_bitmap_in_catalog_order() {
 
 #[test]
 fn insert_null_literal_stores_and_selects_back_a_null_cell() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, NULL)")
@@ -329,7 +329,7 @@ fn insert_null_literal_stores_and_selects_back_a_null_cell() {
 #[test]
 fn null_literal_is_accepted_for_every_column_type() {
     // NULL is typeless: valid for an int, text, numeric, bool, etc. column alike.
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE t (i INT, t8 BIGINT, n NUMERIC(10,2), b BOOLEAN, s TEXT)",
@@ -361,7 +361,7 @@ fn null_literal_is_accepted_for_every_column_type() {
 fn a_null_keyed_row_is_excluded_by_an_equality_filter_end_to_end() {
     // SQL three-valued logic through real SQL: a row whose filter column is NULL is excluded by
     // `col = x` (NULL = x is UNKNOWN, never TRUE).
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id INT, tag TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO t (id, tag) VALUES (1, 'x'), (NULL, 'y')")
@@ -389,7 +389,7 @@ fn a_null_keyed_row_is_excluded_by_an_equality_filter_end_to_end() {
 fn default_null_fills_an_omitted_column_with_null() {
     // A side effect (correct PG behavior) of recognizing the NULL literal: `DEFAULT NULL` now
     // parses + coerces, and an omitted column with that default inserts NULL.
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id INT, note TEXT DEFAULT NULL)")
         .unwrap();
     e.execute_text(2, "INSERT INTO t (id) VALUES (1)").unwrap();

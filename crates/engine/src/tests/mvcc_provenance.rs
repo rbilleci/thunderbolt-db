@@ -1,8 +1,9 @@
 use super::*;
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_filters() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_provenance_filters() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -38,17 +39,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_filters
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -64,12 +61,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_filters
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_filters() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_source_relative_filters() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -103,17 +101,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_fi
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![MvccReadRow {
@@ -122,12 +116,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_fi
             value: Some("Alpha Team".to_string()),
         }]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_order() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_source_relative_order() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=member:1").unwrap();
@@ -164,17 +159,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_or
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -190,12 +181,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_or
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_projection() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_source_relative_projection() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=Alpha Team").unwrap();
@@ -222,17 +214,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_pr
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![MvccReadRow {
@@ -241,12 +229,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_pr
             value: Some("profile:1".to_string()),
         }]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_concat_cpu_resolved_sources() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_concat_cpu_resolved_sources() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -282,17 +271,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_concat_cpu_resolve
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![
@@ -308,12 +293,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_concat_cpu_resolve
             },
         ]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_filters() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_provenance_bundle_filters() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -360,17 +346,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![MvccReadRow {
@@ -379,12 +361,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_
             value: Some("member:2".to_string()),
         }]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_path_filters() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_provenance_bundle_path_filters() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -433,17 +416,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![MvccReadRow {
@@ -452,13 +431,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_
             value: Some("member:2".to_string()),
         }]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_occurrence_path_filters(
-) {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_matches_spec_on_provenance_bundle_occurrence_path_filters() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -501,17 +480,13 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_
 
     assert_eq!(first_cuda_slice_query_gap(&query), None);
 
-    let cpu = e.execute_mvcc_query(&query).unwrap();
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
-
     let backend = e
-        .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+        .execute_mvcc_query_with_backend(&query, &CudaDriverMvccBackend)
         .unwrap();
 
     assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(backend.fallback_reason, None);
-    assert_eq!(backend.rows, cpu.rows);
     assert_eq!(
         backend.rows,
         vec![MvccReadRow {
@@ -520,38 +495,36 @@ fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_
             value: Some("profile:1".to_string()),
         }]
     );
-    assert_eq!(e.metrics().snapshot().fallback_total, 1);
+    assert_eq!(e.metrics().snapshot().fallback_total, 0);
 }
 
 #[test]
-fn execute_mvcc_query_first_cuda_slice_backend_runs_nested_native_composition() {
-    let mut e = Engine::new_local_cpu_oracle();
+#[ignore = "requires CUDA driver"]
+fn retire001_cuda_driver_runs_nested_native_composition() {
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=hold").unwrap();
 
     let result = e
-        .execute_mvcc_query_with_backend_fallback(
-            &MvccReadQuery {
-                source: MvccReadSource::Concat {
-                    sources: vec![MvccReadSource::ConcatDistinct {
-                        sources: vec![
-                            MvccReadSource::KeyLookup {
-                                key: "acct:1".to_string(),
-                            },
-                            MvccReadSource::KeyLookup {
-                                key: "acct:2".to_string(),
-                            },
-                        ],
-                    }],
-                },
-                visibility: StorageVisibility { read_txn_id: 2 },
-                filter: None,
-                order: None,
-                projection: MvccProjection::KeyOnly,
-                limit: None,
+        .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+            source: MvccReadSource::Concat {
+                sources: vec![MvccReadSource::ConcatDistinct {
+                    sources: vec![
+                        MvccReadSource::KeyLookup {
+                            key: "acct:1".to_string(),
+                        },
+                        MvccReadSource::KeyLookup {
+                            key: "acct:2".to_string(),
+                        },
+                    ],
+                }],
             },
-            &FirstCudaSliceParityBackend,
-        )
+            visibility: StorageVisibility { read_txn_id: 2 },
+            filter: None,
+            order: None,
+            projection: MvccProjection::KeyOnly,
+            limit: None,
+        })
         .unwrap();
 
     assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
@@ -577,7 +550,7 @@ fn execute_mvcc_query_first_cuda_slice_backend_runs_nested_native_composition() 
 
 #[test]
 fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     for (txn_id, command) in include_str!("../../../../tests/fixtures/mvcc-read-workload.txt")
         .lines()
         .enumerate()
@@ -586,7 +559,7 @@ fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() 
     }
 
     let historical = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::KeyLookup {
                 key: "acct:1".to_string(),
             },
@@ -598,8 +571,6 @@ fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() 
         })
         .unwrap();
 
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &historical, 1);
-
     assert_eq!(
         historical.rows,
         vec![MvccReadRow {
@@ -610,7 +581,7 @@ fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() 
     );
 
     let current = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::KeyLookup {
                 key: "user:1".to_string(),
             },
@@ -621,8 +592,6 @@ fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() 
             limit: None,
         })
         .unwrap();
-
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &current, 2);
 
     assert_eq!(
         current.rows,
@@ -636,7 +605,7 @@ fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() 
 
 #[test]
 fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     for (txn_id, command) in include_str!("../../../../tests/fixtures/mvcc-full-scan-workload.txt")
         .lines()
         .enumerate()
@@ -645,7 +614,7 @@ fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
     }
 
     let historical = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 2 },
             filter: Some(MvccReadFilter::All(vec![
@@ -661,7 +630,6 @@ fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
         })
         .unwrap();
 
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &historical, 1);
     assert_eq!(
         historical.rows,
         vec![
@@ -679,7 +647,7 @@ fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
     );
 
     let current = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 6 },
             filter: Some(MvccReadFilter::All(vec![
@@ -695,7 +663,6 @@ fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
         })
         .unwrap();
 
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &current, 2);
     assert_eq!(
         current.rows,
         vec![
@@ -711,18 +678,11 @@ fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
             },
         ]
     );
-
-    let status = e.status_snapshot();
-    assert_eq!(status.fallback.gpu_parity_fallback_total(), 2);
-    assert_eq!(
-        status.latest_fallback_reason(),
-        Some(FallbackReason::GpuMvccReadParityGap)
-    );
 }
 
 #[test]
 fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     for (txn_id, command) in
         include_str!("../../../../tests/fixtures/mvcc-source-composition-workload.txt")
             .lines()
@@ -732,7 +692,7 @@ fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture(
     }
 
     let multiset_overlap = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::IntersectAll {
                 sources: vec![
                     MvccReadSource::KeyBatchLookup {
@@ -755,8 +715,6 @@ fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture(
         })
         .unwrap();
 
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &multiset_overlap, 1);
-
     assert_eq!(
         multiset_overlap.rows,
         vec![MvccReadRow {
@@ -767,7 +725,7 @@ fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture(
     );
 
     let multiset_imbalance = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::SymmetricDifferenceAll {
                 sources: vec![
                     MvccReadSource::FollowValueKeyRefPrefixes {
@@ -789,8 +747,6 @@ fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture(
         })
         .unwrap();
 
-    assert_mvcc_query_uses_tracked_cpu_fallback(&e, &multiset_imbalance, 2);
-
     assert_eq!(
         multiset_imbalance.rows,
         vec![
@@ -806,25 +762,18 @@ fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture(
             },
         ]
     );
-
-    let status = e.status_snapshot();
-    assert_eq!(status.fallback.gpu_parity_fallback_total(), 2);
-    assert_eq!(
-        status.latest_fallback_reason(),
-        Some(FallbackReason::GpuMvccReadParityGap)
-    );
 }
 
 #[test]
 fn execute_mvcc_query_supports_multi_key_lookup_fan_in_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=locked").unwrap();
     e.execute_text(3, "SET user:1=active").unwrap();
     e.execute_text(4, "SET acct:1=closed").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::KeyBatchLookup {
                 keys: vec![
                     "user:1".to_string(),
@@ -863,7 +812,7 @@ fn execute_mvcc_query_supports_multi_key_lookup_fan_in_source() {
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::KeyBatchLookup {
                 keys: vec![
                     "acct:2".to_string(),
@@ -901,7 +850,7 @@ fn execute_mvcc_query_supports_multi_key_lookup_fan_in_source() {
 
 #[test]
 fn execute_mvcc_query_supports_concat_source_composition() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -913,7 +862,7 @@ fn execute_mvcc_query_supports_concat_source_composition() {
     e.execute_text(9, "SET user:1=active").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![
                     MvccReadSource::KeyLookup {
@@ -972,7 +921,7 @@ fn execute_mvcc_query_supports_concat_source_composition() {
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![
                     MvccReadSource::FollowValueKeyRefPrefixes {
@@ -1018,7 +967,7 @@ fn execute_mvcc_query_supports_concat_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_concat_distinct_source_composition() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1030,7 +979,7 @@ fn execute_mvcc_query_supports_concat_distinct_source_composition() {
     e.execute_text(9, "SET user:1=active").unwrap();
 
     let deduped = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::ConcatDistinct {
                 sources: vec![
                     MvccReadSource::KeyLookup {
@@ -1079,7 +1028,7 @@ fn execute_mvcc_query_supports_concat_distinct_source_composition() {
     );
 
     let source_distinction = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::ConcatDistinct {
                 sources: vec![
                     MvccReadSource::FollowValueKeyRefPrefixes {
@@ -1120,7 +1069,7 @@ fn execute_mvcc_query_supports_concat_distinct_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_intersect_distinct_source_composition() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -1133,7 +1082,7 @@ fn execute_mvcc_query_supports_intersect_distinct_source_composition() {
     e.execute_text(10, "SET user:1=active").unwrap();
 
     let exact_overlap = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::IntersectDistinct {
                 sources: vec![
                     MvccReadSource::Concat {
@@ -1176,7 +1125,7 @@ fn execute_mvcc_query_supports_intersect_distinct_source_composition() {
     );
 
     let source_sensitive_overlap = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::IntersectDistinct {
                 sources: vec![
                     MvccReadSource::FollowValueKeyRefPrefixes {
@@ -1207,7 +1156,7 @@ fn execute_mvcc_query_supports_intersect_distinct_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_except_distinct_source_composition() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -1221,7 +1170,7 @@ fn execute_mvcc_query_supports_except_distinct_source_composition() {
     e.execute_text(11, "SET user:2=locked").unwrap();
 
     let exact_difference = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::ExceptDistinct {
                 sources: vec![
                     MvccReadSource::Concat {
@@ -1261,7 +1210,7 @@ fn execute_mvcc_query_supports_except_distinct_source_composition() {
     );
 
     let source_sensitive_difference = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::ExceptDistinct {
                 sources: vec![
                     MvccReadSource::FollowValueKeyRefPrefixes {
@@ -1302,7 +1251,7 @@ fn execute_mvcc_query_supports_except_distinct_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_symmetric_difference_distinct_source_composition() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -1317,7 +1266,7 @@ fn execute_mvcc_query_supports_symmetric_difference_distinct_source_composition(
     e.execute_text(12, "SET user:3=standby").unwrap();
 
     let exact_uniques = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::SymmetricDifferenceDistinct {
                 sources: vec![
                     MvccReadSource::KeyBatchLookup {
@@ -1357,7 +1306,7 @@ fn execute_mvcc_query_supports_symmetric_difference_distinct_source_composition(
     );
 
     let source_sensitive_uniques = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::SymmetricDifferenceDistinct {
                 sources: vec![
                     MvccReadSource::FollowValueKeyRefPrefixes {
@@ -1398,7 +1347,7 @@ fn execute_mvcc_query_supports_symmetric_difference_distinct_source_composition(
 
 #[test]
 fn execute_mvcc_query_supports_intersect_all_source_composition() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1410,7 +1359,7 @@ fn execute_mvcc_query_supports_intersect_all_source_composition() {
     e.execute_text(9, "SET user:2=locked").unwrap();
 
     let exact_overlap = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::IntersectAll {
                 sources: vec![
                     MvccReadSource::KeyBatchLookup {
@@ -1446,7 +1395,7 @@ fn execute_mvcc_query_supports_intersect_all_source_composition() {
     );
 
     let join_overlap = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::IntersectAll {
                 sources: vec![
                     MvccReadSource::FollowValueKeyRefPrefixes {
@@ -1487,7 +1436,7 @@ fn execute_mvcc_query_supports_intersect_all_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_except_all_source_composition() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1499,7 +1448,7 @@ fn execute_mvcc_query_supports_except_all_source_composition() {
     e.execute_text(9, "SET user:2=locked").unwrap();
 
     let exact_difference = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::ExceptAll {
                 sources: vec![
                     MvccReadSource::KeyBatchLookup {
@@ -1539,7 +1488,7 @@ fn execute_mvcc_query_supports_except_all_source_composition() {
     );
 
     let join_difference = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::ExceptAll {
                 sources: vec![
                     MvccReadSource::FollowValueKeyRefPrefixes {
@@ -1580,7 +1529,7 @@ fn execute_mvcc_query_supports_except_all_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_prefixes_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -1601,7 +1550,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_prefixes_sourc
     e.execute_text(16, "SET team:alpha:v2:1=Astra").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefPrefixes {
                 keys: vec![
                     "acct:2".to_string(),
@@ -1640,7 +1589,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_prefixes_sourc
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefPrefixes {
                 keys: vec![
                     "acct:1".to_string(),
@@ -1683,7 +1632,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_prefixes_sourc
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_refs_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -1706,7 +1655,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_refs
     e.execute_text(18, "SET team-root:3=prefix:ghost:").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs {
                 keys: vec![
                     "acct:2".to_string(),
@@ -1740,7 +1689,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_refs
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs {
                 keys: vec![
                     "acct:1".to_string(),
@@ -1783,7 +1732,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_refs
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_prefixes_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -1808,7 +1757,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_pref
     e.execute_text(19, "SET team:alpha:v2:1=Astra").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyPrefixes {
                 keys: vec![
                     "acct:2".to_string(),
@@ -1847,7 +1796,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_pref
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyPrefixes {
                 keys: vec![
                     "acct:1".to_string(),
@@ -1890,7 +1839,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_pref
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_ref_prefixes_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -1923,7 +1872,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_ref_
     e.execute_text(22, "SET squad:alpha:v2:1=Astra").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes {
                 keys: vec![
                     "acct:2".to_string(),
@@ -1962,7 +1911,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_ref_
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes {
                 keys: vec![
                     "acct:1".to_string(),
@@ -2005,7 +1954,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_ref_
 
 #[test]
 fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -2042,7 +1991,7 @@ fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
     e.execute_text(26, "SET talent:2=Builder").unwrap();
 
     let specialized_prefix = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
             },
@@ -2055,7 +2004,7 @@ fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
         .unwrap();
 
     let generic_prefix = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2075,7 +2024,7 @@ fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
     assert_eq!(generic_prefix.rows, specialized_prefix.rows);
 
     let specialized_terminal = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
             },
@@ -2088,7 +2037,7 @@ fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
         .unwrap();
 
     let generic_terminal = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2110,7 +2059,7 @@ fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_chain_branches_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -2122,7 +2071,7 @@ fn execute_mvcc_query_supports_follow_value_chain_branches_source() {
     e.execute_text(9, "SET team:beta:2=Bianca").unwrap();
 
     let branch_grouped = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChainBranches {
                 keys: vec![
                     "acct:2".to_string(),
@@ -2187,7 +2136,7 @@ fn execute_mvcc_query_supports_follow_value_chain_branches_source() {
     );
 
     let branch_concat = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![
                     MvccReadSource::FollowValueChain {
@@ -2262,7 +2211,7 @@ fn execute_mvcc_query_supports_follow_value_chain_branches_source() {
     );
 
     let ordered_projection = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChainBranches {
                 keys: vec![
                     "acct:1".to_string(),
@@ -2317,7 +2266,7 @@ fn execute_mvcc_query_supports_follow_value_chain_branches_source() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_chain_branch_first_non_empty_fan_in() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -2331,7 +2280,7 @@ fn execute_mvcc_query_supports_follow_value_chain_branch_first_non_empty_fan_in(
     e.execute_text(11, "SET team:delta:1=Dora").unwrap();
 
     let first_non_empty = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChainBranches {
                 keys: vec![
                     "acct:3".to_string(),
@@ -2387,7 +2336,7 @@ fn execute_mvcc_query_supports_follow_value_chain_branch_first_non_empty_fan_in(
     );
 
     let all_branches = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChainBranches {
                 keys: vec![
                     "acct:3".to_string(),
@@ -2468,7 +2417,7 @@ fn execute_mvcc_query_supports_follow_value_chain_branch_first_non_empty_fan_in(
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_chain_terminal_input_provenance() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -2479,7 +2428,7 @@ fn execute_mvcc_query_supports_follow_value_chain_terminal_input_provenance() {
     e.execute_text(8, "SET team:beta:2=Bianca").unwrap();
 
     let query = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2515,7 +2464,7 @@ fn execute_mvcc_query_supports_follow_value_chain_terminal_input_provenance() {
 
 #[test]
 fn execute_mvcc_query_supports_branch_fan_in_with_terminal_input_provenance() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -2527,7 +2476,7 @@ fn execute_mvcc_query_supports_branch_fan_in_with_terminal_input_provenance() {
     e.execute_text(9, "SET team:beta:2=Bianca").unwrap();
 
     let query = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChainBranches {
                 keys: vec![
                     "acct:3".to_string(),

@@ -7,7 +7,7 @@ use gpu_db_sql::{parse_command, Command, Decimal128, SqlValue};
 
 #[test]
 fn p8_sharded_resident_sum_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -141,7 +141,7 @@ fn p8_sharded_resident_sum_reduces_matches_and_rejects_missing_layout() {
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
+    let mut missing_layout_engine = Engine::new_local_test_engine();
     missing_layout_engine
             .execute_text(
                 1,
@@ -175,7 +175,7 @@ fn p8_sharded_resident_sum_reduces_matches_and_rejects_missing_layout() {
 
 #[test]
 fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -325,7 +325,7 @@ fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() 
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
+    let mut missing_layout_engine = Engine::new_local_test_engine();
     missing_layout_engine
             .execute_text(
                 1,
@@ -359,7 +359,7 @@ fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() 
 
 #[test]
 fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -502,7 +502,7 @@ fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout()
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
+    let mut missing_layout_engine = Engine::new_local_test_engine();
     missing_layout_engine
             .execute_text(
                 1,
@@ -536,7 +536,7 @@ fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout()
 
 #[test]
 fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -679,7 +679,7 @@ fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout()
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
+    let mut missing_layout_engine = Engine::new_local_test_engine();
     missing_layout_engine
             .execute_text(
                 1,
@@ -713,7 +713,7 @@ fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout()
 
 #[test]
 fn p8_sharded_resident_filtered_avg_reduces_matches_and_rejects_missing_layout() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
             "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
@@ -861,7 +861,7 @@ fn p8_sharded_resident_filtered_avg_reduces_matches_and_rejects_missing_layout()
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
-    let mut missing_layout_engine = Engine::new_local_cpu_oracle();
+    let mut missing_layout_engine = Engine::new_local_test_engine();
     missing_layout_engine
             .execute_text(
                 1,

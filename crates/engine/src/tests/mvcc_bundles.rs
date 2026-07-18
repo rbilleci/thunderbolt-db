@@ -4,14 +4,14 @@ mod provenance_bundle_paths;
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
     e.execute_text(4, "SET profile:solo=team:solo").unwrap();
 
     let first_to_ordinal_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -53,7 +53,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_fi
         );
 
     let first_to_ordinal_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -90,7 +90,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_fi
     );
 
     let ordinal_to_last_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -120,7 +120,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_fi
     assert_eq!(ordinal_to_last_match.rows, first_to_ordinal_match.rows);
 
     let ordinal_to_last_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -155,7 +155,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_fi
     );
 
     let truncated_first_to_ordinal_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -184,7 +184,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_fi
     assert!(truncated_first_to_ordinal_miss.rows.is_empty());
 
     let wrong_first_to_ordinal_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -215,7 +215,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_fi
     assert!(wrong_first_to_ordinal_range_miss.rows.is_empty());
 
     let inverted_ordinal_to_last_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -244,7 +244,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_fi
     assert!(inverted_ordinal_to_last_range_miss.rows.is_empty());
 
     let wrong_ordinal_to_last_index_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -273,7 +273,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_fi
 
 #[test]
 fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -301,7 +301,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering(
     };
 
     let first_offsets = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: source.clone(),
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -338,7 +338,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering(
     );
 
     let last_offsets = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: source.clone(),
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -375,7 +375,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering(
     );
 
     let ordinal_offsets = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: source.clone(),
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -412,7 +412,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering(
     );
 
     let missing_offsets = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source,
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -451,7 +451,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering(
 
 #[test]
 fn execute_mvcc_query_supports_bundle_occurrence_distance_projection_and_ordering() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -479,7 +479,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_distance_projection_and_orderin
     };
 
     let same_subpath_distances = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: source.clone(),
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -520,7 +520,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_distance_projection_and_orderin
     );
 
     let mixed_distances = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: source.clone(),
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -561,7 +561,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_distance_projection_and_orderin
     );
 
     let missing_distances = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source,
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -604,7 +604,7 @@ fn execute_mvcc_query_supports_bundle_occurrence_distance_projection_and_orderin
 
 #[test]
 fn execute_mvcc_query_supports_bundle_mixed_occurrence_offset_pair_projection_and_ordering() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -632,7 +632,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_offset_pair_projection_an
     };
 
     let ascending_pairs = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: source.clone(),
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -680,7 +680,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_offset_pair_projection_an
     );
 
     let descending_pairs = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: source.clone(),
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -728,7 +728,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_offset_pair_projection_an
     );
 
     let missing_pairs = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source,
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: None,
@@ -778,14 +778,14 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_offset_pair_projection_an
 
 #[test]
 fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
     e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
     e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
     e.execute_text(4, "SET profile:solo=team:solo").unwrap();
 
     let ordinal_pair_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
                 plan: MvccValueChainPlan {
@@ -826,7 +826,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
         );
 
     let ordinal_pair_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -859,7 +859,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
     assert_eq!(ordinal_pair_range_match.rows, ordinal_pair_match.rows);
 
     let truncated_ordinal_pair_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -887,7 +887,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
     assert!(truncated_ordinal_pair_miss.rows.is_empty());
 
     let wrong_ordinal_pair_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -917,7 +917,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
     assert!(wrong_ordinal_pair_range_miss.rows.is_empty());
 
     let inverted_ordinal_pair_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -947,7 +947,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
     assert!(inverted_ordinal_pair_range_miss.rows.is_empty());
 
     let wrong_ordinal_pair_index_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:loop".to_string()],
                 plan: MvccValueChainPlan {
@@ -977,7 +977,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -985,7 +985,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
     e.execute_text(5, "SET profile:2=team:beta").unwrap();
 
     let mixed_occurrence_distance_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -1025,7 +1025,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
     );
 
     let mixed_occurrence_distance_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
                 plan: MvccValueChainPlan {
@@ -1062,7 +1062,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
     );
 
     let truncated_mixed_occurrence_distance_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1092,7 +1092,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
     assert!(truncated_mixed_occurrence_distance_miss.rows.is_empty());
 
     let truncated_mixed_occurrence_distance_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1125,7 +1125,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
         .is_empty());
 
     let wrong_mixed_occurrence_distance_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1155,7 +1155,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
     assert!(wrong_mixed_occurrence_distance_miss.rows.is_empty());
 
     let wrong_mixed_occurrence_distance_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1186,7 +1186,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
     assert!(wrong_mixed_occurrence_distance_range_miss.rows.is_empty());
 
     let inverted_mixed_occurrence_distance_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1219,7 +1219,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
         .is_empty());
 
     let reversed_mixed_occurrence_distance_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1249,7 +1249,7 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
     assert!(reversed_mixed_occurrence_distance_miss.rows.is_empty());
 
     let reversed_mixed_occurrence_distance_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1284,13 +1284,13 @@ fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
 
     let first_mixed_occurrence_distance_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1331,7 +1331,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filte
     );
 
     let first_mixed_occurrence_distance_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1366,7 +1366,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filte
     );
 
     let last_mixed_occurrence_distance_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1400,7 +1400,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filte
     );
 
     let last_mixed_occurrence_distance_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1435,7 +1435,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filte
     );
 
     let truncated_last_mixed_occurrence_distance_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1465,7 +1465,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filte
         .is_empty());
 
     let wrong_first_mixed_occurrence_distance_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1496,7 +1496,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filte
         .is_empty());
 
     let reversed_last_mixed_occurrence_distance_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1524,7 +1524,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filte
     assert!(reversed_last_mixed_occurrence_distance_miss.rows.is_empty());
 
     let inverted_last_mixed_occurrence_distance_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1557,13 +1557,13 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filte
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_distance_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
 
     let first_to_ordinal_mixed_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1605,7 +1605,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_dis
     );
 
     let first_to_ordinal_mixed_range_match = e
-            .execute_mvcc_query(&MvccReadQuery {
+            .evaluate_mvcc_query_specification(&MvccReadQuery {
                 source: MvccReadSource::FollowValueChain {
                     keys: vec!["acct:1".to_string()],
                     plan: MvccValueChainPlan {
@@ -1641,7 +1641,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_dis
     );
 
     let ordinal_to_last_mixed_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1676,7 +1676,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_dis
     );
 
     let ordinal_to_last_mixed_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1712,7 +1712,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_dis
     );
 
     let truncated_first_to_ordinal_mixed_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1741,7 +1741,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_dis
     assert!(truncated_first_to_ordinal_mixed_miss.rows.is_empty());
 
     let wrong_first_to_ordinal_mixed_range_miss = e
-            .execute_mvcc_query(&MvccReadQuery {
+            .evaluate_mvcc_query_specification(&MvccReadQuery {
                 source: MvccReadSource::FollowValueChain {
                     keys: vec!["acct:1".to_string()],
                     plan: MvccValueChainPlan {
@@ -1771,7 +1771,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_dis
     assert!(wrong_first_to_ordinal_mixed_range_miss.rows.is_empty());
 
     let inverted_ordinal_to_last_mixed_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1801,7 +1801,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_dis
     assert!(inverted_ordinal_to_last_mixed_range_miss.rows.is_empty());
 
     let wrong_ordinal_to_last_mixed_index_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1832,13 +1832,13 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_dis
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
 
     let first_to_ordinal_mixed_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1881,7 +1881,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_fil
     );
 
     let first_to_ordinal_mixed_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1919,7 +1919,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_fil
     );
 
     let ordinal_to_last_mixed_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1955,7 +1955,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_fil
     );
 
     let ordinal_to_last_mixed_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -1993,7 +1993,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_fil
     );
 
     let truncated_first_to_ordinal_mixed_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2023,7 +2023,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_fil
     assert!(truncated_first_to_ordinal_mixed_miss.rows.is_empty());
 
     let wrong_first_to_ordinal_mixed_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2055,7 +2055,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_fil
     assert!(wrong_first_to_ordinal_mixed_range_miss.rows.is_empty());
 
     let inverted_ordinal_to_last_mixed_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2087,7 +2087,7 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_fil
     assert!(inverted_ordinal_to_last_mixed_range_miss.rows.is_empty());
 
     let wrong_ordinal_to_last_mixed_index_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2119,13 +2119,13 @@ fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_fil
 
 #[test]
 fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
 
     let ordinal_mixed_occurrence_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2167,7 +2167,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
     );
 
     let ordinal_mixed_occurrence_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2204,7 +2204,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
     );
 
     let truncated_ordinal_mixed_occurrence_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2233,7 +2233,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
     assert!(truncated_ordinal_mixed_occurrence_miss.rows.is_empty());
 
     let wrong_ordinal_mixed_occurrence_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2264,7 +2264,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
     assert!(wrong_ordinal_mixed_occurrence_range_miss.rows.is_empty());
 
     let inverted_ordinal_mixed_occurrence_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2295,7 +2295,7 @@ fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
     assert!(inverted_ordinal_mixed_occurrence_range_miss.rows.is_empty());
 
     let wrong_ordinal_mixed_occurrence_index_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2326,13 +2326,13 @@ fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
 
 #[test]
 fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha=acct:1").unwrap();
 
     let first_mixed_occurrence_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2372,7 +2372,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_filters() {
     );
 
     let first_mixed_occurrence_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2409,7 +2409,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_filters() {
     );
 
     let last_mixed_occurrence_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2442,7 +2442,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_filters() {
     );
 
     let last_mixed_occurrence_range_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2479,7 +2479,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_filters() {
     );
 
     let truncated_last_mixed_occurrence_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2506,7 +2506,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_filters() {
     assert!(truncated_last_mixed_occurrence_miss.rows.is_empty());
 
     let wrong_first_mixed_occurrence_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {
@@ -2537,7 +2537,7 @@ fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_filters() {
     assert!(wrong_first_mixed_occurrence_range_miss.rows.is_empty());
 
     let inverted_last_mixed_occurrence_range_miss = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChain {
                 keys: vec!["acct:1".to_string()],
                 plan: MvccValueChainPlan {

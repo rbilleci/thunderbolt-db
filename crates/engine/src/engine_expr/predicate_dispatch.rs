@@ -184,9 +184,9 @@ impl Engine {
         if let Some(vis) = visibility {
             // A predicate the VM can't lower at one elem width (mixed non-int8 widths / an unsupported shape)
             // can't compose the i64 visibility conjunct, so this HARD-ERRORS rather than risk leaking
-            // tombstoned rows. NB: this is NOT the CPU fallback (that fires only on residency invalidation);
-            // it surfaces as a query error. Inert until DELETE tombstoning is wired (SV4) -- at which point
-            // extending visibility to these shapes (or routing them to the CPU-pinned path) is the follow-up.
+            // tombstoned rows. It surfaces as a query error; no host relational path may repair the
+            // decline. Inert until DELETE tombstoning is wired (SV4), at which point the GPU visibility
+            // lowering must be extended to these shapes.
             // ADR-006 (MIXED-WIDTH groups): a mixed int8/ts + i32-servable WHERE with width-safe
             // scalar i64 leaves composes with the (i64) visibility conjuncts at I32 — the same
             // LoadColumnI64-self-consumed contract the conjuncts themselves use. LOCAL fallback,

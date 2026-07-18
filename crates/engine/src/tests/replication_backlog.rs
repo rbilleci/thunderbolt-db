@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn replication_watermarks_track_commit_apply_visibility_and_durability() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
 
     let before = e.replication_watermarks();
     assert_eq!(before.role, Role::Leader);
@@ -76,7 +76,7 @@ fn replication_watermarks_track_commit_apply_visibility_and_durability() {
 
 #[test]
 fn replication_watermarks_do_not_advance_on_rejected_follower_commit() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.become_follower(2);
 
     let err = e
@@ -118,7 +118,7 @@ fn replication_watermarks_do_not_advance_on_rejected_follower_commit() {
 
 #[test]
 fn replication_watermarks_include_buffered_wal_records() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
 
     e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     e.commit_mutation(2, b"SET b=2".to_vec().into()).unwrap();
@@ -250,7 +250,7 @@ fn replication_watermarks_follower_promotion_ready_requires_no_backlog() {
 
 #[test]
 fn replication_watermarks_follower_promotion_ready_requires_zero_active_txns() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.become_follower(5);
     e.execute_text(9, "BEGIN").unwrap();
 
@@ -264,7 +264,7 @@ fn replication_watermarks_follower_promotion_ready_requires_zero_active_txns() {
 
 #[test]
 fn replication_watermarks_include_active_transaction_count() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
 
     e.execute_text(42, "BEGIN").unwrap();
 
@@ -299,7 +299,7 @@ fn backlog_blocker_enum_roundtrips_through_bits_and_labels() {
         assert_eq!(BacklogBlocker::from_bit(blocker.bit()), Some(blocker));
         assert_eq!(BacklogBlocker::from_label(blocker.as_str()), Some(blocker));
 
-        let mut marks = Engine::new_local_cpu_oracle().replication_watermarks();
+        let mut marks = Engine::new_local_test_engine().replication_watermarks();
         marks.backlog_blocker_mask = blocker.bit();
         assert!(marks.has_blocker_kind(blocker));
         assert_eq!(marks.backlog_blockers().collect::<Vec<_>>(), vec![blocker]);

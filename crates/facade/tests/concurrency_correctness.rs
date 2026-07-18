@@ -20,7 +20,7 @@
 //!   aborts with a RETRYABLE serialization error (never a panic / engine wedge).
 //! - **Residency↔data consistency (real GPU, `#[ignore]`):** a concurrent writer commits +
 //!   invalidates a table's GPU residency while a reader reads it → the reader's result is a single
-//!   consistent snapshot (no cross-snapshot rows), matching the CPU result at its snapshot.
+//!   consistent snapshot (no cross-snapshot rows), matching the fixture-derived snapshot prefix.
 //! - **Kill-mid-commit under concurrency:** after many concurrent commits, recovery from the
 //!   durable WAL loses nothing past the durable boundary and reproduces a consistent state.
 //!
@@ -820,11 +820,10 @@ fn residency_data_consistency_concurrent_writer_invalidates_while_reader_reads()
     // Warm a table to GPU residency, then run a concurrent writer (which commits + invalidates the
     // table's residency) against many readers. EVERY reader's result must be a SINGLE consistent
     // snapshot: the count it observes equals the contiguous id-prefix it observes (no cross-snapshot
-    // rows mixing the GPU-resident generation with a newer committed one), and equals the CPU result
-    // at that snapshot. This is the residency↔data snapshot-consistency property (design Risk #3) on
-    // real device memory. It also exercises BUG 3's CPU fallback: a commit invalidates residency
-    // mid-statement, and the resident-route read transparently falls back to the CPU pinned read
-    // instead of surfacing "no retained resident device memory".
+    // rows mixing the GPU-resident generation with a newer committed one). This is the
+    // residency↔data snapshot-consistency property (design Risk #3) on real device memory. A
+    // mid-statement residency tombstone is classified precisely and cannot mask a genuine CUDA
+    // error or manufacture a host result.
     with_deadline(
         TEST_DEADLINE_SECS,
         "residency_data_consistency_concurrent_writer_invalidates_while_reader_reads",
@@ -883,12 +882,11 @@ fn residency_data_consistency_concurrent_writer_invalidates_while_reader_reads()
                                 // The row set is always a single consistent committed prefix 1..=count:
                                 // a GPU-route result that mixed the stale resident generation with
                                 // newer committed rows (cross-snapshot) would break this. This also
-                                // equals the CPU result at the same snapshot (same predicate, same
-                                // boundary).
+                                // matches the fixture-derived contiguous prefix for that boundary.
                                 let expected: Vec<i64> = (1..=count).collect();
                                 assert_eq!(
                                     ids, expected,
-                                    "rep {rep}: GPU/CPU read returned cross-snapshot rows under a \
+                                    "rep {rep}: GPU read returned cross-snapshot rows under a \
                                      concurrent residency-invalidating writer"
                                 );
                             }

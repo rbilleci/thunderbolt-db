@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn execute_mvcc_query_sorts_missing_provenance_frames_deterministically() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET profile:1=team:alpha").unwrap();
     e.execute_text(3, "SET team:alpha:1=Alice").unwrap();
@@ -10,7 +10,7 @@ fn execute_mvcc_query_sorts_missing_provenance_frames_deterministically() {
     e.execute_text(5, "SET standalone:2=Leaf").unwrap();
 
     let query = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![
                     MvccReadSource::FullScan,
@@ -66,7 +66,7 @@ fn execute_mvcc_query_sorts_missing_provenance_frames_deterministically() {
 
 #[test]
 fn execute_mvcc_query_supports_labeled_branch_projection_and_ordering() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -77,7 +77,7 @@ fn execute_mvcc_query_supports_labeled_branch_projection_and_ordering() {
     e.execute_text(8, "SET team:beta:1=Bob").unwrap();
 
     let query = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChainLabeledBranches {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
                 branches: vec![
@@ -146,7 +146,7 @@ fn execute_mvcc_query_supports_labeled_branch_projection_and_ordering() {
 
 #[test]
 fn execute_mvcc_query_preserves_labeled_branch_identity_and_first_match_filtering() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -155,7 +155,7 @@ fn execute_mvcc_query_preserves_labeled_branch_identity_and_first_match_filterin
     e.execute_text(6, "SET team:beta=Shared Team").unwrap();
 
     let distinct = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::ConcatDistinct {
                 sources: vec![
                     MvccReadSource::FollowValueChainLabeledBranches {
@@ -209,7 +209,7 @@ fn execute_mvcc_query_preserves_labeled_branch_identity_and_first_match_filterin
     );
 
     let first_match = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueChainLabeledBranches {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
                 branches: vec![
@@ -258,7 +258,7 @@ fn execute_mvcc_query_preserves_labeled_branch_identity_and_first_match_filterin
 
 #[test]
 fn execute_mvcc_query_supports_symmetric_difference_all_source_composition() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -270,7 +270,7 @@ fn execute_mvcc_query_supports_symmetric_difference_all_source_composition() {
     e.execute_text(9, "SET user:2=locked").unwrap();
 
     let exact_imbalance = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::SymmetricDifferenceAll {
                 sources: vec![
                     MvccReadSource::KeyBatchLookup {
@@ -310,7 +310,7 @@ fn execute_mvcc_query_supports_symmetric_difference_all_source_composition() {
     );
 
     let join_imbalance = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::SymmetricDifferenceAll {
                 sources: vec![
                     MvccReadSource::FollowValueKeyRefPrefixes {
@@ -351,7 +351,7 @@ fn execute_mvcc_query_supports_symmetric_difference_all_source_composition() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_refs_join_adjacent_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:2").unwrap();
     e.execute_text(2, "SET acct:2=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=active").unwrap();
@@ -361,7 +361,7 @@ fn execute_mvcc_query_supports_follow_value_key_refs_join_adjacent_source() {
     e.execute_text(7, "SET profile:3=closed").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefs {
                 keys: vec![
                     "acct:2".to_string(),
@@ -395,7 +395,7 @@ fn execute_mvcc_query_supports_follow_value_key_refs_join_adjacent_source() {
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefs {
                 keys: vec![
                     "acct:1".to_string(),
@@ -433,7 +433,7 @@ fn execute_mvcc_query_supports_follow_value_key_refs_join_adjacent_source() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_prefixes_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=order:1:").unwrap();
     e.execute_text(2, "SET acct:2=order:2:").unwrap();
     e.execute_text(3, "SET order:1:a=paid").unwrap();
@@ -446,7 +446,7 @@ fn execute_mvcc_query_supports_follow_value_key_prefixes_source() {
     e.execute_text(10, "SET order:1b:b=delivered").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyPrefixes {
                 keys: vec![
                     "acct:2".to_string(),
@@ -485,7 +485,7 @@ fn execute_mvcc_query_supports_follow_value_key_prefixes_source() {
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyPrefixes {
                 keys: vec![
                     "acct:1".to_string(),
@@ -523,7 +523,7 @@ fn execute_mvcc_query_supports_follow_value_key_prefixes_source() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_prefixes_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -539,7 +539,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_prefixes_source() {
     e.execute_text(13, "SET order:1b:b=cancelled").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefPrefixes {
                 keys: vec![
                     "acct:2".to_string(),
@@ -583,7 +583,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_prefixes_source() {
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefPrefixes {
                 keys: vec![
                     "acct:1".to_string(),
@@ -626,7 +626,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_prefixes_source() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_refs_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -640,7 +640,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_refs_source() {
     e.execute_text(11, "SET profile:1=team:3").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefs {
                 keys: vec![
                     "acct:2".to_string(),
@@ -675,7 +675,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_refs_source() {
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyRefs {
                 keys: vec![
                     "acct:1".to_string(),
@@ -713,7 +713,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_refs_source() {
 
 #[test]
 fn execute_mvcc_query_supports_follow_value_key_ref_value_key_prefixes_source() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -732,7 +732,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_prefixes_source() 
     e.execute_text(16, "SET team:3=order:3:").unwrap();
 
     let request_order = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyPrefixes {
                 keys: vec![
                     "acct:2".to_string(),
@@ -772,7 +772,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_prefixes_source() 
     );
 
     let filtered_and_sorted = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyPrefixes {
                 keys: vec![
                     "acct:1".to_string(),
@@ -813,7 +813,7 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_prefixes_source() 
     );
 
     let join_side_projection = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefValueKeyPrefixes {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
             },
@@ -849,12 +849,12 @@ fn execute_mvcc_query_supports_follow_value_key_ref_value_key_prefixes_source() 
 
 #[test]
 fn execute_mvcc_query_join_side_projection_keeps_non_join_shapes_stable() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=locked").unwrap();
 
     let result = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::KeyBatchLookup {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
             },
@@ -885,7 +885,7 @@ fn execute_mvcc_query_join_side_projection_keeps_non_join_shapes_stable() {
 
 #[test]
 fn execute_mvcc_query_supports_join_side_source_filters() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=profile:1").unwrap();
     e.execute_text(2, "SET acct:2=profile:2").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -896,7 +896,7 @@ fn execute_mvcc_query_supports_join_side_source_filters() {
     e.execute_text(8, "SET team:beta:2=Bianca").unwrap();
 
     let result = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefPrefixes {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
             },
@@ -924,12 +924,12 @@ fn execute_mvcc_query_supports_join_side_source_filters() {
 
 #[test]
 fn execute_mvcc_query_source_filters_are_empty_for_non_join_shapes() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=locked").unwrap();
 
     let result = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 2 },
             filter: Some(MvccReadFilter::SourceValueEquals("open".to_string())),
@@ -944,7 +944,7 @@ fn execute_mvcc_query_source_filters_are_empty_for_non_join_shapes() {
 
 #[test]
 fn execute_mvcc_query_supports_join_side_source_ordering() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:2=profile:2").unwrap();
     e.execute_text(2, "SET acct:1=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -955,7 +955,7 @@ fn execute_mvcc_query_supports_join_side_source_ordering() {
     e.execute_text(8, "SET team:beta:2=Bianca").unwrap();
 
     let source_key_ordered = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefPrefixes {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
             },
@@ -989,7 +989,7 @@ fn execute_mvcc_query_supports_join_side_source_ordering() {
     );
 
     let source_value_ordered = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefPrefixes {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
             },
@@ -1020,12 +1020,12 @@ fn execute_mvcc_query_supports_join_side_source_ordering() {
 
 #[test]
 fn execute_mvcc_query_source_ordering_keeps_non_join_shapes_stable() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:2=locked").unwrap();
     e.execute_text(2, "SET acct:1=open").unwrap();
 
     let result = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::KeyBatchLookup {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
             },
@@ -1056,7 +1056,7 @@ fn execute_mvcc_query_source_ordering_keeps_non_join_shapes_stable() {
 
 #[test]
 fn execute_mvcc_query_supports_mixed_join_side_projection_controls() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:2=profile:2").unwrap();
     e.execute_text(2, "SET acct:1=profile:1").unwrap();
     e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -1065,7 +1065,7 @@ fn execute_mvcc_query_supports_mixed_join_side_projection_controls() {
     e.execute_text(6, "SET team:beta:1=Bob").unwrap();
 
     let source_key_target_value = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefPrefixes {
                 keys: vec!["acct:2".to_string(), "acct:1".to_string()],
             },
@@ -1094,7 +1094,7 @@ fn execute_mvcc_query_supports_mixed_join_side_projection_controls() {
     );
 
     let source_value_only = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FollowValueKeyRefPrefixes {
                 keys: vec!["acct:1".to_string(), "acct:2".to_string()],
             },
@@ -1118,11 +1118,11 @@ fn execute_mvcc_query_supports_mixed_join_side_projection_controls() {
 
 #[test]
 fn execute_mvcc_query_mixed_join_projection_keeps_non_join_shapes_stable() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
 
     let source_key_target_value = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::KeyLookup {
                 key: "acct:1".to_string(),
             },
@@ -1144,7 +1144,7 @@ fn execute_mvcc_query_mixed_join_projection_keeps_non_join_shapes_stable() {
     );
 
     let source_value_only = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::KeyLookup {
                 key: "acct:1".to_string(),
             },
@@ -1168,14 +1168,14 @@ fn execute_mvcc_query_mixed_join_projection_keeps_non_join_shapes_stable() {
 
 #[test]
 fn execute_mvcc_query_supports_composite_filter_shapes() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=locked").unwrap();
     e.execute_text(3, "SET user:1=active").unwrap();
     e.execute_text(4, "SET user:2=locked").unwrap();
 
     let all_filter = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: Some(MvccReadFilter::All(vec![
@@ -1197,7 +1197,7 @@ fn execute_mvcc_query_supports_composite_filter_shapes() {
     );
 
     let any_filter = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: Some(MvccReadFilter::Any(vec![
@@ -1233,14 +1233,14 @@ fn execute_mvcc_query_supports_composite_filter_shapes() {
 
 #[test]
 fn execute_mvcc_query_supports_key_range_filter_shapes() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=locked").unwrap();
     e.execute_text(3, "SET acct:3=closed").unwrap();
     e.execute_text(4, "SET acct:4=suspended").unwrap();
 
     let ranged = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: Some(MvccReadFilter::KeyRange {
@@ -1272,13 +1272,13 @@ fn execute_mvcc_query_supports_key_range_filter_shapes() {
 
 #[test]
 fn execute_mvcc_query_supports_limit_after_filtering() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:1=open").unwrap();
     e.execute_text(2, "SET acct:2=locked").unwrap();
     e.execute_text(3, "SET acct:3=locked").unwrap();
 
     let limited = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 3 },
             filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
@@ -1307,13 +1307,13 @@ fn execute_mvcc_query_supports_limit_after_filtering() {
 
 #[test]
 fn execute_mvcc_query_supports_key_ordering_before_limit() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:2=locked").unwrap();
     e.execute_text(2, "SET acct:1=open").unwrap();
     e.execute_text(3, "SET acct:3=closed").unwrap();
 
     let descending = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 3 },
             filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
@@ -1342,14 +1342,14 @@ fn execute_mvcc_query_supports_key_ordering_before_limit() {
 
 #[test]
 fn execute_mvcc_query_supports_value_ordering_before_limit() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET acct:2=locked").unwrap();
     e.execute_text(2, "SET acct:1=open").unwrap();
     e.execute_text(3, "SET acct:4=closed").unwrap();
     e.execute_text(4, "SET acct:3=closed").unwrap();
 
     let ascending = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
@@ -1381,7 +1381,7 @@ fn execute_mvcc_query_supports_value_ordering_before_limit() {
     );
 
     let descending = e
-        .execute_mvcc_query(&MvccReadQuery {
+        .evaluate_mvcc_query_specification(&MvccReadQuery {
             source: MvccReadSource::FullScan,
             visibility: StorageVisibility { read_txn_id: 4 },
             filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
@@ -1410,7 +1410,7 @@ fn execute_mvcc_query_supports_value_ordering_before_limit() {
 
 #[test]
 fn publish_telemetry_emits_snapshot_to_sink() {
-    let e = Engine::new_local_cpu_oracle();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET a=1").unwrap();
 
     let mut sink = InMemoryTelemetrySink::default();
@@ -1440,7 +1440,7 @@ fn publish_telemetry_emits_snapshot_to_sink() {
 
 #[test]
 fn installing_older_snapshot_is_a_status_no_op() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let committed = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     let baseline = e.status_snapshot();
 
@@ -1462,7 +1462,7 @@ fn installing_older_snapshot_is_a_status_no_op() {
 
 #[test]
 fn installing_higher_index_lower_term_snapshot_is_a_status_no_op() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let committed = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
 
     e.install_snapshot(SnapshotMeta {
@@ -1488,7 +1488,7 @@ fn installing_higher_index_lower_term_snapshot_is_a_status_no_op() {
 
 #[test]
 fn installing_advanced_snapshot_replaces_snapshot_identity_exactly() {
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let committed = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
 
     e.install_snapshot(SnapshotMeta {

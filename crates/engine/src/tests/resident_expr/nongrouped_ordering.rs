@@ -8,7 +8,7 @@ fn gpu_nongrouped_order_by_expression() {
     // ORDER BY an EXPRESSION (`a+b`, `a*2`) on the general GPU path: the device Expr interpreter
     // evaluates it into an i64 key column feeding the GPU bitonic sort -- single key, multi-key
     // (expr + column), expr + a text key (hetero), WHERE, LIMIT. executed_target==Gpu throughout.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT, name TEXT)")
         .unwrap();
     let rows: &[(i32, i32, i32, &str)] = &[
@@ -97,7 +97,7 @@ fn gpu_order_by_int8_expression_sorts_at_i64_width() {
     // ORDER BY a BIGINT expression must read the arith value buffer at i64 width. Reading it as i32
     // (the pre-fix bug) would stride the 8-byte BIGINT column by 4 bytes -> garbage keys. A value
     // beyond i32::MAX also exercises the i64 range (an i32 read could not even represent it).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a BIGINT, b BIGINT, id INT)")
         .unwrap();
     // a+b: id1->15, id2->2, id3->5000000001 (> i32::MAX), id4->7. asc by a+b: 2,7,15,5e9 -> ids 2,4,1,3.
@@ -132,7 +132,7 @@ fn gpu_order_by_numeric_b128_width() {
     // ORDER BY a NUMERIC (i128) column on the GPU: the 16-byte comparator (signed HIGH limb, unsigned
     // LOW limb). Mixed-sign values exercise both limbs -- the signed hi distinguishes sign (negatives
     // hi=-1 below positives hi=0); the unsigned lo decides within a sign (two's-complement low bits).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (v NUMERIC(10,2), label INT)")
         .unwrap();
     // labels = the sorted rank (inserted shuffled): -20 < -10 < 0 < 5 < 10 < 20. 6 rows -> npot 8.
@@ -184,7 +184,7 @@ fn gpu_order_by_b128_secondary_key_dispatch() {
     // decides. Guards the 2-bit key_plan dispatch for a b128 key that is NOT the primary -- a
     // `kind >> 31` (instead of >> 30) bug would misdispatch the secondary numeric onto the text leg
     // and misorder within each group. (The other b128 multi-key test uses a b128 PRIMARY.)
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (grp INT, v NUMERIC(10,2), label INT)")
         .unwrap();
     // ORDER BY grp ASC, v ASC: grp=1 {v=10,20,30 -> 0,1,2}, grp=2 {v=5,15,25 -> 3,4,5}. label = rank.
@@ -214,7 +214,7 @@ fn gpu_order_by_b128_secondary_key_dispatch() {
 fn gpu_order_by_uuid_big_endian_unsigned() {
     // ORDER BY a UUID column: 16 raw bytes, UNSIGNED BIG-ENDIAN (byte 0 most significant). Bytes >= 0x80
     // sort ABOVE 0x7f (unsigned). byte-15 breaks a byte-0 tie. 7 rows -> npot 8 exercises padding.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id UUID, label INT)")
         .unwrap();
     let uuid_b0 = |b: u32| format!("{b:02x}000000-0000-0000-0000-000000000000");
@@ -267,7 +267,7 @@ fn gpu_order_by_uuid_big_endian_unsigned() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_order_by_mixed_b128_keys() {
     // Multi-key ORDER BY with a b128 key as the tie-broken primary, on the heterogeneous comparator.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // (a) numeric DESC, int ASC: a numeric tie is broken by the int key.
     e.execute_text(1, "CREATE TABLE t (v NUMERIC(10,2), tb INT, label INT)")
         .unwrap();
@@ -328,7 +328,7 @@ fn gpu_order_by_mixed_b128_keys() {
 fn gpu_order_by_expression_overflow_is_pg_error() {
     // ORDER BY a+b where a+b overflows int4 -> a clean PG "integer out of range" error (checked
     // arithmetic on-device), NOT a wrapped value, NOT a CPU re-execution.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a, b) VALUES (2147483647, 1), (1, 1)")
         .unwrap();
@@ -352,7 +352,7 @@ fn gpu_nongrouped_order_by_via_gpu_sort() {
     // A non-grouped ORDER BY over an int column runs on the GENERAL GPU Expr executor + the GPU bitonic
     // sort (NOT the enumerated ordered-projection shape, NOT the CPU path). executed_target==Gpu proves
     // it took the general GPU path through the routing gate (`execute_relational_select_text`).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT, c BIGINT)")
         .unwrap();
     let rows: &[(i32, i32, i64)] = &[
@@ -448,7 +448,7 @@ fn gpu_resident_select_limit_offset_window_edges() {
     // drain/truncate. These edge cases pin the windowing math against the prior drain/truncate: OFFSET
     // past the end, LIMIT 0, OFFSET+LIMIT past the end (clamped), and a DESC window. The ORDER BY makes
     // every window deterministic.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
     e.execute_text(2, "INSERT INTO t (a) VALUES (5),(2),(8),(1),(9),(3)")
         .unwrap();
@@ -508,7 +508,7 @@ fn gpu_resident_select_limit_offset_window_edges() {
 fn gpu_nongrouped_order_by_500_rows() {
     // 500 rows (not a power of two -> padding) shuffled via a coprime stride (a permutation of 0..500),
     // sorted on the GPU. Exercises the bitonic sort at scale on the projection path.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE big (a INT)").unwrap();
     let vals = (0..500i32)
         .map(|i| format!("({})", (i * 137 + 11).rem_euclid(500)))
@@ -545,7 +545,7 @@ fn gpu_nongrouped_order_by_radix_above_crossover() {
     // 11_000 rows (> the 10_000 adaptive crossover) -> the single-int-key ORDER BY takes the GPU RADIX
     // arm (engine_expr order_by_sort_i64), end to end. A coprime-stride (137, gcd(137,11000)=1)
     // permutation of 0..11000 must sort back to 0..11000 (ASC) / its reverse (DESC), on the GPU.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE big (a INT)").unwrap();
     const N: i32 = 11_000;
     let vals = (0..N)
@@ -587,7 +587,7 @@ fn gpu_nongrouped_order_by_text() {
     // A non-grouped ORDER BY over a TEXT column sorts on the GENERAL GPU Expr executor via the byte-wise
     // text bitonic comparator (lexicographic, UNSIGNED bytes, a prefix sorts smaller) -- NOT a CPU sort.
     // executed_target==Gpu proves the general GPU path. Covers prefixes, the empty string, duplicates, DESC.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (s TEXT, id INT)")
         .unwrap();
     // Deliberate corner cases: prefixes ('a' < 'ab'), empty string (sorts first), duplicates, mixed length.
@@ -678,7 +678,7 @@ fn gpu_nongrouped_order_by_text() {
 fn gpu_nongrouped_order_by_text_300_rows() {
     // 300 rows (not a power of two -> bitonic padding), distinct zero-padded strings shuffled via a
     // coprime stride (a permutation of 0..300), GPU-sorted by the text comparator back to order.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE big (s TEXT)").unwrap();
     let vals = (0..300usize)
         .map(|i| format!("('{:04}')", (i * 137 + 11) % 300))
@@ -714,7 +714,7 @@ fn gpu_nongrouped_order_by_multikey() {
     // breaks ties for the next. executed_target==Gpu proves the general GPU path (routing gate + GPU
     // multi-key sort), NOT the CPU/enumerated path. Rows are engineered so EVERY key is the real
     // tie-breaker -- drop any key and the expected order changes.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t2 (a INT, b INT)").unwrap();
     e.execute_text(
         2,
@@ -813,7 +813,7 @@ fn gpu_nongrouped_order_by_mixed_int_text() {
     // GPU via the HETEROGENEOUS comparator -- each key dispatched to the s64 compare (int) or the byte
     // compare (text). executed_target==Gpu proves the general GPU path. Rows are engineered so EVERY key
     // is the real tie-breaker. Completes the canonical `ORDER BY last_name, age, id`.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (name TEXT, age INT, id INT)")
         .unwrap();
     e.execute_text(

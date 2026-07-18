@@ -512,7 +512,7 @@ impl Engine {
     }
 
     /// CROSS-SHARD PK INDEX (sub-slice 1): resolve `filter_idx = key` to the resident `(shard_id, LOCAL row)`
-    /// positions via a PER-SHARD host-built PK hash index. Thin projection of
+    /// positions via the per-shard device-resident PK hash index. Thin projection of
     /// [`Self::locate_resident_pk_via_shard_index_detailed`] to just `(shard_id, slot)` -- the shape the
     /// scan-locate differential + the (future) DELETE/UPDATE resolution compare against. See the detailed
     /// method for the semantics (returns the IDENTICAL physical `(shard, slot)` a scan finds; `None` to fall
@@ -1096,10 +1096,10 @@ impl Engine {
     }
 }
 
-/// Cross-shard PK index (sub-slice 1): the PURE host build of the open-addressing int4 hash table
+/// Legacy single-buffer wave-index helper: the pure host build of the open-addressing int4 hash table
 /// `(key<<32)|(row+1)` (0 = empty), Fibonacci hash `(key*0x9E37_79B1)>>hash_shift` + linear probe with the
-/// kernel's hard 256-probe cap. Extracted verbatim from `build_wave_resident_int4_index` so the per-shard
-/// index uses the IDENTICAL layout + dup/overflow rules as the R1 single-buffer index. Returns
+/// kernel's hard 256-probe cap. The production shard index is device-built using this layout; it does not call
+/// this helper. Returns
 /// `(table, table_mask, hash_shift)` or `None` when: the table would exceed 2^30 entries; or the column has
 /// DUPLICATE int4 keys / a key exceeds the 256-probe cap (a hash index holds one row per key but the scan
 /// returns every match, so a duplicate MUST decline → caller scans). `row + 1` packs into the low 32 bits.
@@ -1181,8 +1181,8 @@ pub(crate) fn build_int4_pk_hash_table_host_visible(
     Some((index, table_mask, hash_shift))
 }
 
-/// Cross-shard PK index (sub-slice 1): probe the host hash table built by `build_int4_pk_hash_table_host`
-/// for `key`, returning the LOCAL row index (0-based) or `None` (absent). Mirrors the device probe kernel:
+/// Test-only layout oracle: probe the host wave-index table built by `build_int4_pk_hash_table_host`
+/// for `key`, returning the local row index (0-based) or `None` (absent). Mirrors the device probe kernel:
 /// Fibonacci hash → linear probe up to the 256 cap, matching the high 32 bits (the key) and unpacking
 /// `row = (entry & 0xFFFF_FFFF) - 1`. An empty slot (0) terminates the probe = not found. A NULL int4 is
 /// materialized as `0`, so `key = 0` probes exactly as the build indexed it (agrees with the scan).
@@ -1403,8 +1403,8 @@ pub(crate) struct ShardPkHit {
     /// bound to an older snapshot. `None` = un-stamped shard, born-visible.
     pub(crate) created_by: Option<Arc<CudaResidentDeviceMemory>>,
     /// RETIREMENT A2: the shard's ROW-IDENTITY region (A1), captured in the SAME snapshot — the
-    /// device DML resolve reads `row_id[slot]` to derive the host key. `None` = identity-unknown
-    /// lineage (benchmark/synthetic) -> the resolve declines to the host path.
+    /// device DML resolve reads `row_id[slot]` to derive the control-plane key. `None` =
+    /// identity-unknown lineage (benchmark/synthetic), which callers reject with a loud availability error.
     pub(crate) row_id: Option<Arc<CudaResidentDeviceMemory>>,
 }
 

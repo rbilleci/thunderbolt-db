@@ -85,7 +85,7 @@ chronology or future sequencing. The full pre-unification record is archived at
 - **Reason:** GPU throughput comes from many transactions at once, while deterministic ordering simplifies
   conflicts, replication, and recovery.
 - **Consequence:** ADR-014 selects the write/MVCC/transaction/recovery model; R3-002/R3-003 completed its accepted
-  write and concurrency graduation, **DUR-002** owns the durable envelope, and **BENCH-001** remains the evidence
+  write and concurrency graduation, **DUR-002** completed the durable envelope, and **BENCH-001** remains the evidence
   gate.
 
 ## ADR-008 — Product workload bet is GPU-native OLTP
@@ -118,16 +118,17 @@ chronology or future sequencing. The full pre-unification record is archived at
 - **Status:** Accepted, 2026-06-23.
 - **Decision:** No host relational implementation may become a permanent product path. Parity ultimately uses
   GPU-native or specification-derived oracles; the engine requires a GPU.
-- **Consequence:** Production read fallback and host write/store/index authority are gone. Test oracle deletion is
-  **RETIRE-001**; repair-operator deletion is **RETIRE-002**; generic CUDA-MVCC result post-processing is
-  **RETIRE-003**.
+- **Consequence:** Production read fallback and host write/store/index authority are gone. Test-oracle deletion
+  completed under historical **RETIRE-001**; repair-operator deletion is **RETIRE-002**; generic CUDA-MVCC result
+  post-processing is **RETIRE-003**.
 
 ## ADR-006 — GPU required; no CPU steady-state fallback
 
 - **Status:** Accepted, 2026-06-26; supersedes ADR-003.
 - **Decision:** A relational decline or GPU fault fails loudly rather than executing on the CPU. Host work remains
   legitimate only for the enumerated control-plane duties and explicitly gated bootstrap/repair debt.
-- **Consequence:** Fail-loud must not replace RPO-preserving recovery repair. See **RETIRE-001/002**.
+- **Consequence:** Fail-loud must not replace RPO-preserving recovery repair. RETIRE-001 completed the test-oracle
+  boundary; see the live **RETIRE-002** repair work in `PLAN.md`.
 
 ## ADR-005 — Snapshot/install-snapshot hooks are early contracts
 

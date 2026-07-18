@@ -408,7 +408,7 @@ fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<Covered
 /// check this deterministically creates overlapping serial/lane sequence ownership.
 #[test]
 fn intent_lane_activation_rejects_prechecked_classic_writer_under_commit_lock() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine.attach_test_intent_lanes(test_wal_path("lane-activation-handoff"), 4);
     let engine = std::sync::Arc::new(engine);
     let lanes = engine
@@ -505,7 +505,7 @@ fn central_commit_wedge_drains_queued_lane_intents() {
 #[test]
 fn lane_activation_fails_locally_drained_batch_if_commit_path_wedges_while_waiting() {
     let path = test_wal_path("lane-activation-wedge-handoff");
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine.attach_test_intent_lanes(path.clone(), 4);
     let lanes = engine
         .intent_lanes
@@ -592,7 +592,7 @@ fn lane_activation_fails_locally_drained_batch_if_commit_path_wedges_while_waiti
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_lane_probe_retries_across_publication_and_bridge_removal() {
     let path = test_wal_path("lane-publication-epoch");
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine.attach_test_intent_lanes(path.clone(), 4);
     let txn_ids = AtomicU64::new(100);
     let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
@@ -698,7 +698,7 @@ fn gpu_lane_probe_retries_across_publication_and_bridge_removal() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     let txn_ids = AtomicU64::new(2);
     let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
         return; // driverless box
@@ -817,7 +817,7 @@ fn gpu_intent_sharded_wave_same_pk_single_winner() {
     if shards < 2 {
         return;
     }
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     let txn_ids = AtomicU64::new(2);
     let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
         return; // driverless box
@@ -926,7 +926,7 @@ fn gpu_sharded_validation_holds_publication_lock_against_explicit_writer() {
         return;
     }
 
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     let txn_ids = AtomicU64::new(2);
     let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
         return;
@@ -1296,11 +1296,9 @@ fn gpu_lane_delete_intents_end_to_end() {
             .any(|row| row.first() == Some(&SqlValue::Int4(50))),
         "deleted key must not be visible"
     );
-    // KNOWN CLIFF (U1 exit finding, open board): a SELECT over a delete-VERSIONED elided
-    // shard falls into the rehydrating host arm and DE-ELIDES the table (the plain-scan
-    // read path lacks the deleted_by visibility conjunct this shape needs). The covered
-    // routes' re-prepare carries the elision RE-ENTRY arm — the production contract until
-    // the read path is wired (Tier-3 mixed read+write gate work).
+    // The GPU SELECT over a delete-versioned elided shard applies deleted_by visibility and keeps
+    // relational authority on device. The covered routes are re-prepared against the current
+    // generation before the next mutation.
     let insert_route = engine.prepare_covered_insert_route("t").unwrap();
     let _delete_route = engine.prepare_covered_delete_route("t").unwrap();
 
@@ -1613,11 +1611,9 @@ fn gpu_lane_update_intents_end_to_end() {
         .load(Ordering::Relaxed);
     let entity_50 = visible_entity_id(&engine, 50);
 
-    // KNOWN CLIFF (U1/U2 exit finding, open board): a read-back over an update/delete-VERSIONED
-    // elided shard falls into the rehydrating host arm and DE-ELIDES the table (the plain scan
-    // lacks the deleted_by visibility conjunct). The covered route's re-prepare carries the elision
-    // RE-ENTRY arm — so this test re-prepares the update route after EVERY de-eliding read, exactly
-    // as the delete e2e does. (Un-versioning is VACUUM's job; the mixed read+write gate is Tier-3.)
+    // The GPU read-back over an update/delete-versioned elided shard applies deleted_by visibility
+    // and keeps relational authority on device. Refresh the covered route for the current
+    // generation after each read, exactly as the delete e2e does.
 
     // 1-ROW UPDATE (full-row replace): key 50 (id=50, v=57) -> (id=50, v=9999).
     assert_eq!(
@@ -1634,7 +1630,7 @@ fn gpu_lane_update_intents_end_to_end() {
         entity_50,
         "a covered UPDATE must preserve stable entity identity"
     );
-    let rows = select_rows_unordered_sorted(&engine); // DE-ELIDES the versioned shard
+    let rows = select_rows_unordered_sorted(&engine); // GPU visibility read-back
     let fifty: Vec<_> = rows
         .iter()
         .filter(|row| row.first() == Some(&SqlValue::Int4(50)))
@@ -1652,7 +1648,7 @@ fn gpu_lane_update_intents_end_to_end() {
     let rows_before_zero = rows.len();
 
     // 0-ROW UPDATE (missing key): the CONDITIONAL append must fire NOTHING.
-    update_route = engine.prepare_covered_update_route("t").unwrap(); // re-enter elision
+    update_route = engine.prepare_covered_update_route("t").unwrap(); // refresh the prepared generation
     assert_eq!(
         commit_update_via_submit(&engine, &txn_ids, &update_route, &[987_654, 1]).unwrap(),
         0,
@@ -1669,7 +1665,7 @@ fn gpu_lane_update_intents_end_to_end() {
     );
 
     // CHAINED UPDATE: key 50 again -> (50, 8888); the new image wins, still exactly once.
-    update_route = engine.prepare_covered_update_route("t").unwrap(); // re-enter elision
+    update_route = engine.prepare_covered_update_route("t").unwrap(); // refresh the prepared generation
     assert_eq!(
         commit_update_via_submit(&engine, &txn_ids, &update_route, &[50, 8888]).unwrap(),
         1,
@@ -1680,7 +1676,7 @@ fn gpu_lane_update_intents_end_to_end() {
         entity_50,
         "chained covered UPDATEs must retain the original entity identity"
     );
-    let rows = select_rows_unordered_sorted(&engine); // DE-ELIDES
+    let rows = select_rows_unordered_sorted(&engine); // GPU visibility read-back
     let fifty: Vec<_> = rows
         .iter()
         .filter(|row| row.first() == Some(&SqlValue::Int4(50)))
@@ -1698,7 +1694,7 @@ fn gpu_lane_update_intents_end_to_end() {
 
     // UPDATE-THEN-DELETE: update key 60, then delete it — the delete must locate the NEW version
     // through the version-aware pk index after the update appended a second physical version.
-    update_route = engine.prepare_covered_update_route("t").unwrap(); // re-enter elision
+    update_route = engine.prepare_covered_update_route("t").unwrap(); // refresh the prepared generation
     assert_eq!(
         commit_update_via_submit(&engine, &txn_ids, &update_route, &[60, 4242]).unwrap(),
         1,

@@ -747,6 +747,28 @@ pub struct MvccReadResult {
     pub rows: Vec<MvccReadRow>,
 }
 
+/// Test-only semantic outcome produced by the closed-form MVCC specification oracle.
+///
+/// Deliberately carries rows only: specification fixtures must not masquerade as an executed
+/// device/host route or manufacture production fallback telemetry.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MvccSpecificationResult {
+    pub(crate) rows: Vec<MvccReadRow>,
+}
+
+/// Test-only evidence captured from an actual MVCC execution backend.
+///
+/// Kept separate from semantic specification rows so a fixture cannot present host-finalized
+/// rows as though they were the backend's production result.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MvccExecutionEvidence {
+    pub(crate) planned_target: DeviceTarget,
+    pub(crate) executed_target: DeviceTarget,
+    pub(crate) fallback_reason: Option<FallbackReason>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MvccBenchmarkReport {
     pub workload_count: usize,

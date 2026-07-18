@@ -54,12 +54,13 @@ impl Engine {
     /// caller's query). This is the M5 J5 bridge for a SYNTHESIZED `pg_catalog`/`information_schema`
     /// relation, which has no residency snapshot: synthesize its rows -> this helper -> the existing int4
     /// inner join over the transient payload. Charter: the catalog join runs on the SAME GPU kernels as a
-    /// user-table join (no CPU relational join; only the host-rows gather crosses to the host, as for a
-    /// resident table). `&self`: the upload only needs `cuda_driver_probe_runtime` (also `&self`).
+    /// user-table join. The input `rows` are control-plane staging values encoded and uploaded once;
+    /// no host-row field is retained and the GPU join reads only the columnar device payload. `&self`:
+    /// the upload only needs `cuda_driver_probe_runtime` (also `&self`).
     ///
     /// Mirrors `populate_relational_residency_snapshot_on_gpu`'s payload + descriptor build (the column
     /// lists feed `build_relational_device_payload`, whose offsets the descriptor's resident-column lists
-    /// index), but SKIPS the MVCC tuple tail (the join reads columnar sections + host rows, never the tail)
+    /// index), but SKIPS the MVCC tuple tail (the join reads only the columnar sections)
     /// and the admission machinery. A 0-row relation is fine: the payload is still a non-empty 8-byte
     /// row-count header (the upload's empty-payload guard never trips), and the inner join then yields an
     /// empty result via the empty-survivor / empty-key short-circuits (an empty side is the join's identity).

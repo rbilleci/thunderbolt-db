@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn recovery_retries_context_loss_once_from_immutable_authority() {
-        let source = Engine::new_local_cpu_oracle();
+        let source = Engine::new_local_test_engine();
         source
             .commit_mutation(7091, Arc::from(&b"SET context_retry=durable"[..]))
             .unwrap();
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn recovery_stays_unavailable_after_the_bounded_context_retry() {
-        let source = Engine::new_local_cpu_oracle();
+        let source = Engine::new_local_test_engine();
         source
             .commit_mutation(7092, Arc::from(&b"SET context_retry=bounded"[..]))
             .unwrap();

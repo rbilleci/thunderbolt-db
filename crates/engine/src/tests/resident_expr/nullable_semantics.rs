@@ -10,7 +10,7 @@ fn gpu_resident_expr_where_excludes_null_operands_and_projection_carries_null() 
     // operand ON THE GPU (the leaf mask is AND'd with the column's validity bitmap) -> the row is NOT
     // selected; and a projected nullable column carries SqlValue::Null through the gather. Column a is
     // nullable (NULL at i%4==0), b is the constant 100 (non-null). a[i]=i for the non-null rows.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     const N: i32 = 12;
     let mut values = String::new();
@@ -104,7 +104,7 @@ fn gpu_resident_expr_projection_carries_null_past_word_boundary() {
     // with NULLs at i%7==0 scatters NULLs across validity words 0..3 at bit positions incl. 10/14/17/20/21/
     // 24/27/28/31 (e.g. idx 42->word1 bit10, 70->word2 bit6, 91->word2 bit27) -> a DIRECT check that the
     // projected nullable column carries SqlValue::Null at the right high indices through this gather.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     const N: i32 = 100;
     let is_null = |i: i32| i % 7 == 0;
@@ -161,7 +161,7 @@ fn gpu_resident_expr_where_3vl_over_nullable_bigint() {
     // operand ON THE GPU and excludes the row — routed to the i64 mask VM (elem I64), the same VM the
     // non-null int8 AND/OR path uses, with each comparison leaf AND'd with the column's validity bitmap.
     // No kernel change: the validity AND is a type-independent i32 BoolMask. v is nullable; w is non-null.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tb (id INT, v BIGINT, w BIGINT)")
         .unwrap();
     // v = [100, NULL, 300, NULL, 5000000000, 250]; w = 1000 (non-null). v=5e9 exceeds i32 -> proves the
@@ -237,7 +237,7 @@ fn gpu_resident_expr_where_nullable_mixed_type_clean_errors() {
     // M3 (doc 21): WHERE 3VL now covers EVERY nullable SCALAR type (int2/int4/int8/text/bool/date/
     // timestamp/numeric/uuid), so the remaining clean-errors are MIXED-type predicates the mono-typed VM
     // can't lower — never a silent mis-answer.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tm (a INT, big BIGINT, n NUMERIC(10,2))")
         .unwrap();
     e.execute_text(
@@ -278,7 +278,7 @@ fn gpu_resident_expr_where_3vl_over_nullable_date() {
     // and excludes the row. A date is i32 days, so it routes to the I32 mask VM (CompareScalar over the
     // days literal) with the column's validity AND'd in. The NULL placeholder is day 0 (< any real date),
     // so it would pass `d < '2024-01-20'` WITHOUT the validity AND -> the exclusions below are load-bearing.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE td (id INT, d DATE)")
         .unwrap();
     e.execute_text(
@@ -319,7 +319,7 @@ fn gpu_resident_expr_where_3vl_over_nullable_timestamp() {
     // i64 microseconds whose literal exceeds the VM's i32 CompareScalar, so it routes to the I64 VM via
     // the new CompareScalarI64 step (scalar) or CompareBuffers (col-vs-col), with the validity AND'd in.
     // The NULL placeholder is micros 0 (< any 2024 timestamp), so the exclusions are load-bearing.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tts (id INT, ts TIMESTAMP, ts2 TIMESTAMP)")
         .unwrap();
     // ts nullable; ts2 = noon (non-null) for the col-vs-col case.
@@ -397,7 +397,7 @@ fn gpu_resident_expr_mixed_width_where_3vl() {
     // int8/text") -> CPU. big values straddle i32::MAX so a 4-byte mis-read can't fake the
     // answer; the NULL-big rows pin 3VL with a PLACEHOLDER-SPANNING bound (placeholder 0
     // satisfies `big >= 0` — only the validity AND excludes them; reads have NO recheck net).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE tmw (id INT, big BIGINT, name TEXT, f BOOL)",
@@ -598,7 +598,7 @@ fn gpu_resident_expr_col_vs_col_text_uuid() {
     // ('B' < 'b'), shorter-prefix-first ('ab' < 'b'), length tiebreak ('ab' > 'a'), equal,
     // empty-vs-nonempty. 3VL: a NULL operand's placeholder (empty span / 16 zero bytes) sorts
     // below everything — only the BOTH-validity AND keeps those rows out.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE tcc (id INT, a TEXT, b TEXT, u1 UUID, u2 UUID)",
@@ -704,7 +704,7 @@ fn gpu_resident_expr_where_3vl_over_nullable_numeric() {
     // routes to the I128 VM via the new CompareScalarI128 step (scalar) or CompareBuffers (col-vs-col),
     // with the validity AND'd in. The NULL placeholder is mantissa 0 (= 0.00, < 100.00), so the
     // exclusions are load-bearing.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE tn2 (id INT, amt NUMERIC(10,2), amt2 NUMERIC(10,2))",
@@ -768,7 +768,7 @@ fn gpu_resident_expr_where_3vl_over_nullable_uuid() {
     // the column's validity mask in the launcher (compact_mask_with_validity). The NULL placeholder is 16
     // zero bytes (= uuid ...00), so `u = ...00` and `u < ...0a` would WRONGLY include NULL rows without
     // the validity AND -> the assertions are load-bearing.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tu (id INT, u UUID, u2 UUID)")
         .unwrap();
     let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");
@@ -841,7 +841,7 @@ fn gpu_resident_expr_where_3vl_over_nullable_int2() {
     // M3 (doc 21): a WHERE over a nullable SMALLINT (int2) column excludes NULL rows on the GPU. int2 is
     // stored widened to i32 in the int4 section, so it routes on the I32 mask VM exactly like int4 (incl.
     // AND/OR). The NULL placeholder is 0 (< 20), so the exclusions are load-bearing.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE ti (id INT, s SMALLINT)")
         .unwrap();
     e.execute_text(
@@ -879,7 +879,7 @@ fn gpu_resident_expr_where_3vl_over_nullable_int2() {
 fn gpu_resident_expr_where_3vl_over_nullable_numeric_compound_and_cross_scale() {
     // M3 (doc 21): a nullable NUMERIC WHERE also runs for AND/OR and a FINER cross-scale literal — these
     // route through the validity-aware compile_numeric_compare VM path (push_leaf_validity_and per leaf).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tnc (id INT, amt NUMERIC(10,2))")
         .unwrap();
     // amt nullable = [10.50, NULL, 30.25, NULL, 250.75].
@@ -929,7 +929,7 @@ fn gpu_resident_expr_order_by_places_nulls_per_pg_default() {
     // M3 (doc 21) Slice E: ORDER BY a NULLABLE int column places NULLs at PG's DEFAULT end ON THE GPU
     // sort — last under ASC, first under DESC (the i64::MAX sentinel realizes both). Without it the sort
     // would error on the NULL value. a is nullable; b = 100 (non-null) so `WHERE b >= 0` keeps every row.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     // a = [3, NULL, 1, NULL, 2]
     e.execute_text(
@@ -988,7 +988,7 @@ fn gpu_resident_expr_order_by_multikey_nullable_placement_on_device() {
     // M3 (doc 21): a MULTI-key ORDER BY with NULLs in BOTH a nullable int key and a nullable text key,
     // placed entirely ON-DEVICE — the hetero sort comparator reads each key's validity bitmap per row and
     // orders NULL as greatest (PG default: last ASC / first DESC), per key. No host partition / overwrite.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tmk (na INT, t TEXT)")
         .unwrap();
     e.execute_text(
@@ -1026,7 +1026,7 @@ fn gpu_resident_expr_order_by_nullable_text_numeric_uuid_keys_place_nulls() {
     // (last ASC, first DESC) — the on-device hetero sort comparator reads the key's validity bitmap and
     // orders the rest, then NULLs are placed. Without it the hetero comparator would mis-place NULLs (it
     // reads the placeholder, not the validity bitmap).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tonull (k TEXT, n NUMERIC(10,2), u UUID)")
         .unwrap();
     let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");

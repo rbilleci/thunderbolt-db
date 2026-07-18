@@ -18,7 +18,7 @@ fn gpu_streaming_grouped_over_budget_two_level_merge() {
     // concat, one final device merge (COUNT folds as SUM(count), SUM as SUM(sum), MIN/MAX as the
     // extreme). Groups SPAN chunks (g = i % 7 over 1500 rows, many chunks), so a broken merge
     // double-counts or drops cross-chunk groups.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -112,15 +112,18 @@ fn gpu_streaming_grouped_over_budget_two_level_merge() {
         "device-filtered grouped COUNT"
     );
 
-    // Differential: the CPU pinned path (budget cleared) agrees on the sorted row set.
+    // Closed-form group expectations above own semantics. With streaming disabled the route must
+    // fail loudly rather than manufacture a host result.
     e.clear_relational_residency_budget_bytes(0);
-    let cpu = e
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select("SELECT g, SUM(a) FROM big GROUP BY g"))
-        .unwrap();
-    assert_eq!(
-        sorted_rows(&cpu),
-        sorted_rows(&sum),
-        "GPU streaming == CPU oracle"
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "big",
+        fallback_before,
     );
 }
 
@@ -129,7 +132,7 @@ fn gpu_streaming_grouped_over_budget_two_level_merge() {
 fn gpu_streaming_distinct_over_budget_set_union() {
     // S-E.3 DISTINCT: per-chunk device distinct keys, concat, final device re-distinct = SET UNION.
     // Keys repeat across chunks (i % 13), so a broken union duplicates or drops values.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -167,12 +170,18 @@ fn gpu_streaming_distinct_over_budget_set_union() {
         e.streaming_fold_chunks()
     );
 
-    // Differential vs the CPU pinned path.
+    // The exact set above owns semantics; disabling streaming must decline loudly.
     e.clear_relational_residency_budget_bytes(0);
-    let cpu = e
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select("SELECT DISTINCT v FROM big"))
-        .unwrap();
-    assert_eq!(sorted_rows(&cpu), expected, "CPU oracle distinct set");
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "big",
+        fallback_before,
+    );
 }
 
 #[test]
@@ -182,9 +191,9 @@ fn gpu_streaming_grouped_compaction_and_over_cardinality_defer() {
     // the 6c-0(c) sizes: 4B key + 16B Numeric count, JUST under the 2KB chunk target) over ~3 chunks:
     // after chunk 2 the accumulator holds ~200 partial rows (4KB, OVER target) so it MUST compact
     // mid-scan via the device merge back to 100 — and still produce exact counts. (2) an all-unique
-    // key (1500 groups, 30KB of true partials) cannot compact below the target -> the fold DEFERS to
-    // the CPU path (correct rows, no hit counted).
-    let mut e = Engine::new_local_cpu_oracle();
+    // key (1500 groups, 30KB of true partials) cannot compact below the target -> the fold declines
+    // loudly with no hit counted.
+    let mut e = Engine::new_local_test_engine();
     let mut seq = 0u64;
     if !gpu_available(&mut e, &mut seq) {
         return;
@@ -237,13 +246,15 @@ fn gpu_streaming_grouped_compaction_and_over_cardinality_defer() {
     e.execute_text(seq, &format!("INSERT INTO uniq (g) VALUES {values}"))
         .unwrap();
     e.set_relational_residency_budget_bytes(0, budget);
-    let deferred = e
+    let fallback_before = e.metrics().snapshot().fallback_total;
+    let error = e
         .execute_relational_select(&select("SELECT g, COUNT(*) FROM uniq GROUP BY g"))
-        .unwrap();
-    assert_eq!(
-        deferred.rows.len(),
-        N as usize,
-        "over-cardinality grouped result served correctly (by the CPU defer)"
+        .unwrap_err();
+    crate::tests::common::assert_gpu_relational_execution_required(
+        &e,
+        error,
+        "uniq",
+        fallback_before,
     );
     assert_eq!(
         e.streaming_fold_hits(),
@@ -274,7 +285,7 @@ fn gpu_streaming_grouped_bigint_sum_repro() {
     crate::engine_streaming_exec::STREAMING_COLD_SPILL_THRESHOLD_TEST
         .store(1024, std::sync::atomic::Ordering::Relaxed);
     let outcome = std::panic::catch_unwind(|| {
-        let mut e = Engine::new_local_cpu_oracle();
+        let mut e = Engine::new_local_test_engine();
         let mut seq = 0u64;
         if !gpu_available(&mut e, &mut seq) {
             return;

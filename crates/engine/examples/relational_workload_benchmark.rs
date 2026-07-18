@@ -3,15 +3,16 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use gpu_db_engine::{Engine, ExecuteError, RelationalSelectResult, RelationalSqlGpuBridgeReport};
+use gpu_db_execution::DeviceTarget;
 use gpu_db_sql::{parse_command, Command, Select};
 
 #[derive(Debug)]
 struct WorkloadReport {
     name: &'static str,
     query_count: usize,
-    cpu_elapsed: Duration,
+    baseline_elapsed: Duration,
     gpu_elapsed: Duration,
-    cpu_latency_us: LatencySummary,
+    baseline_latency_us: LatencySummary,
     gpu_latency_us: LatencySummary,
     result_rows: usize,
     correctness_validated: bool,
@@ -125,19 +126,31 @@ fn print_workload(report: &WorkloadReport) {
     println!("## {}", report.name);
     println!("- queries: {}", report.query_count);
     println!("- result_rows: {}", report.result_rows);
-    println!("- cpu_total_us: {}", report.cpu_elapsed.as_micros());
+    println!(
+        "- baseline_gpu_total_us: {}",
+        report.baseline_elapsed.as_micros()
+    );
     println!("- gpu_probe_total_us: {}", report.gpu_elapsed.as_micros());
     println!(
-        "- cpu_qps: {:.2}",
-        qps(report.query_count, report.cpu_elapsed)
+        "- baseline_gpu_qps: {:.2}",
+        qps(report.query_count, report.baseline_elapsed)
     );
     println!(
         "- gpu_probe_qps: {:.2}",
         qps(report.query_count, report.gpu_elapsed)
     );
-    println!("- cpu_latency_p50_us: {}", report.cpu_latency_us.p50_us);
-    println!("- cpu_latency_p95_us: {}", report.cpu_latency_us.p95_us);
-    println!("- cpu_latency_max_us: {}", report.cpu_latency_us.max_us);
+    println!(
+        "- baseline_gpu_latency_p50_us: {}",
+        report.baseline_latency_us.p50_us
+    );
+    println!(
+        "- baseline_gpu_latency_p95_us: {}",
+        report.baseline_latency_us.p95_us
+    );
+    println!(
+        "- baseline_gpu_latency_max_us: {}",
+        report.baseline_latency_us.max_us
+    );
     println!(
         "- gpu_probe_latency_p50_us: {}",
         report.gpu_latency_us.p50_us
@@ -151,8 +164,8 @@ fn print_workload(report: &WorkloadReport) {
         report.gpu_latency_us.max_us
     );
     println!(
-        "- gpu_probe_vs_cpu_total_ratio: {:.3}",
-        elapsed_ratio(report.gpu_elapsed, report.cpu_elapsed)
+        "- gpu_probe_vs_baseline_gpu_total_ratio: {:.3}",
+        elapsed_ratio(report.gpu_elapsed, report.baseline_elapsed)
     );
     println!(
         "- gpu_executed_rate_permyriad: {}",
@@ -190,7 +203,7 @@ fn print_decision(
     disjunctive: &WorkloadReport,
     aggregate_distinct: &WorkloadReport,
 ) {
-    if analytic.bridge.gpu_executed_count > 0 && analytic.gpu_elapsed < analytic.cpu_elapsed {
+    if analytic.bridge.gpu_executed_count > 0 && analytic.gpu_elapsed < analytic.baseline_elapsed {
         println!(
             "decision: GPU probe is faster for the analytical scan in this run; aggregate/distinct SQL shapes also have correctness, routing, fallback, transfer, and timing evidence, so keep prioritizing SQL predicate/order/projection pushdown and measured workload wins before making broader performance claims."
         );
@@ -199,14 +212,14 @@ fn print_decision(
 
     if app_batched.bridge.gpu_executed_count > 0 && app_batched.gpu_elapsed < app.gpu_elapsed {
         println!(
-            "decision: batching lookup predicates into one supported OR query reduces GPU probe latency versus repeated point lookups, and aggregate/distinct SQL shapes now have correctness, routing, fallback, transfer, and timing evidence; analytical scans still do not beat CPU, so prioritize batching plus transfer layout before making broad performance claims."
+            "decision: batching lookup predicates into one supported OR query reduces GPU probe latency versus repeated point lookups, and aggregate/distinct SQL shapes now have correctness, routing, fallback, transfer, and timing evidence; analytical scans still do not beat the default GPU baseline, so prioritize batching plus transfer layout before making broad performance claims."
         );
         return;
     }
 
     if analytic.bridge.gpu_executed_count > 0 {
         println!(
-            "decision: analytical scans reach GPU execution with SQL-level transfer and timing telemetry but do not yet beat the CPU baseline in this run; aggregate/distinct SQL shapes have the same benchmark evidence boundary, so prioritize transfer layout, batching, and driver-level timing refinement before making broad performance claims."
+            "decision: analytical scans reach GPU execution with SQL-level transfer and timing telemetry but do not yet beat the default GPU baseline in this run; aggregate/distinct SQL shapes have the same benchmark evidence boundary, so prioritize transfer layout, batching, and driver-level timing refinement before making broad performance claims."
         );
         return;
     }
@@ -220,13 +233,13 @@ fn print_decision(
         || aggregate_distinct.bridge.cpu_fallback_count > 0
     {
         println!(
-            "decision: current relational workloads still fall back for important SQL shapes; prioritize SQL-to-GPU bridge expansion before claiming workload-level GPU advantage."
+            "decision: current relational workloads still decline important SQL shapes; prioritize SQL-to-GPU bridge expansion before claiming broader workload coverage."
         );
         return;
     }
 
     println!(
-        "decision: no GPU advantage was demonstrated; aggregate/distinct SQL shapes now have correctness, routing, fallback, transfer, and timing evidence, but keep broad P7 performance claims limited until a measured workload beats CPU."
+        "decision: no GPU advantage was demonstrated; aggregate/distinct SQL shapes now have correctness, routing, fallback, transfer, and timing evidence, but keep broad P7 performance claims limited until a measured workload beats the default GPU baseline."
     );
 }
 
@@ -235,13 +248,17 @@ fn run_workload(
     row_count: usize,
     queries: &[Select],
 ) -> Result<WorkloadReport, Box<dyn Error>> {
-    let cpu = seeded_engine(row_count)?;
+    let mut baseline = seeded_engine(row_count)?;
     let gpu = seeded_engine(row_count)?;
+    let baseline_snapshot = baseline.populate_relational_residency_snapshot("events")?;
+    if baseline_snapshot.device_memory_proof.is_none() {
+        return Err(format!("{name} default GPU baseline did not retain device memory").into());
+    }
 
-    let cpu_start = Instant::now();
-    let (cpu_results, cpu_latencies) =
-        execute_timed(queries, |query| cpu.execute_relational_select(query))?;
-    let cpu_elapsed = cpu_start.elapsed();
+    let baseline_start = Instant::now();
+    let (baseline_results, baseline_latencies) =
+        execute_timed(queries, |query| baseline.execute_relational_select(query))?;
+    let baseline_elapsed = baseline_start.elapsed();
 
     let gpu_start = Instant::now();
     let (gpu_results, gpu_latencies) = execute_timed(queries, |query| {
@@ -249,9 +266,18 @@ fn run_workload(
     })?;
     let gpu_elapsed = gpu_start.elapsed();
 
-    let correctness_validated = same_sql_results(&cpu_results, &gpu_results);
+    if !baseline_results.iter().all(is_gpu_result_without_fallback) {
+        return Err(format!("{name} default baseline did not execute entirely on a GPU").into());
+    }
+    if !gpu_results.iter().all(is_gpu_result_without_fallback) {
+        return Err(format!("{name} explicit probe did not execute entirely on a GPU").into());
+    }
+
+    let correctness_validated = same_sql_results(&baseline_results, &gpu_results);
     if !correctness_validated {
-        return Err(format!("{name} CPU/GPU probe results diverged").into());
+        return Err(
+            format!("{name} default GPU baseline/explicit GPU probe results diverged").into(),
+        );
     }
 
     let result_rows = gpu_results.iter().map(|result| result.rows.len()).sum();
@@ -267,9 +293,9 @@ fn run_workload(
     Ok(WorkloadReport {
         name,
         query_count: queries.len(),
-        cpu_elapsed,
+        baseline_elapsed,
         gpu_elapsed,
-        cpu_latency_us: summarize_latencies(&cpu_latencies),
+        baseline_latency_us: summarize_latencies(&baseline_latencies),
         gpu_latency_us: summarize_latencies(&gpu_latencies),
         result_rows,
         correctness_validated,
@@ -408,4 +434,10 @@ fn same_sql_results(left: &[RelationalSelectResult], right: &[RelationalSelectRe
             .iter()
             .zip(right)
             .all(|(left, right)| left.columns == right.columns && left.rows == right.rows)
+}
+
+fn is_gpu_result_without_fallback(result: &RelationalSelectResult) -> bool {
+    matches!(result.planned_target, DeviceTarget::Gpu(_))
+        && matches!(result.executed_target, DeviceTarget::Gpu(_))
+        && result.fallback_reason.is_none()
 }

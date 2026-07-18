@@ -975,10 +975,8 @@ impl Engine {
     }
 
     /// P5-2 (S-E.P5) — the KEYED-CLASS uniqueness preflight: validate a statement's NEW key
-    /// images against a chunk-authoritative table ON-DEVICE. Every host validator at the call
-    /// sites sees the RECLAIMED (empty) store and passes VACUOUSLY — and a vacuous accept is the
-    /// C2 hazard: a WAL-durable duplicate that recovery's host-path replay then REJECTS, i.e. an
-    /// unreplayable acked commit. In-batch duplicates are checked over a transient device
+    /// images against a chunk-authoritative table ON-DEVICE. This verdict is the sole relational
+    /// authority; a decline fails closed before acknowledgement. In-batch duplicates are checked over a transient device
     /// relation; existing-row conflicts probe the per-chunk indexes (ONE multi-chunk locate per
     /// unique index), then run exact key equality + visibility through the device predicate VM.
     /// A tombstoned slot is NOT a conflict, and a fingerprint collision fails exact equality.
@@ -1010,8 +1008,8 @@ impl Engine {
             if !index.unique {
                 continue;
             }
-            // The host validator SKIPS an index whose key positions do not resolve
-            // (`validate_unique_indexes_for_rows`) — mirror it exactly: parity, not strictness.
+            // Catalog construction guarantees live unique-index key positions resolve. Ignore only
+            // a torn/stale descriptor here; eligibility then declines rather than consulting a host authority.
             let Some(positions) = crate::engine_residency::index_key_column_positions(table, index)
             else {
                 continue;

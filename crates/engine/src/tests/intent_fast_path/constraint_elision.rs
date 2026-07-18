@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_check_constrained_table_elides() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,
@@ -116,7 +116,7 @@ fn gpu_check_constrained_table_elides() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_fk_referenced_parent_elides() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -231,7 +231,7 @@ fn gpu_fk_referenced_parent_elides() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_fk_child_table_elides() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -330,7 +330,7 @@ fn gpu_fk_child_table_elides() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_fk_child_date_fk_stays_elided() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE days (d DATE PRIMARY KEY, note TEXT)")
         .unwrap();
@@ -425,7 +425,7 @@ fn gpu_fk_child_date_fk_stays_elided() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_fk_child_noni32_fk_columns_stay_elided() {
     const TXN0: u64 = 1000;
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     let mut txn_id = TXN0;
     for (parent_ddl, child_ddl, fk_ddl) in [
         (
@@ -658,7 +658,7 @@ fn gpu_fk_child_noni32_fk_columns_stay_elided() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_mixed_width_dml_resolves_on_device() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,
@@ -766,9 +766,8 @@ fn gpu_mixed_width_dml_resolves_on_device() {
     // `mixed_width_i32_elem` fallback — audit note adopted): the UPDATE above tombstoned the old
     // id-5 row and appended its twin, and a VERSIONED shard FORCES the mask VM so the WHERE can
     // compose with the on-device visibility conjuncts (SV3b). Without the fallback this mixed
-    // WHERE hard-errors there -> CPU-pinned -> rehydrate/DE-ELIDE, so stays-elided + row-exact
-    // (exactly ONE id-5 version, the live 'held' twin, not the tombstoned original) prove the
-    // versioned path served it.
+    // WHERE hard-errors through the GPU-required boundary, so stays-elided + row-exact (exactly ONE
+    // id-5 version, the live 'held' twin, not the tombstoned original) prove the versioned path served it.
     let Command::Select(vsel) =
         parse_command("SELECT id FROM m WHERE flag = false AND big > 2147483647").unwrap()
     else {
@@ -838,7 +837,7 @@ fn gpu_mixed_width_dml_resolves_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_check_elided_preflight_rehydrate_no_bypass() {
-    let mut engine = Engine::new_local_cpu_oracle();
+    let mut engine = Engine::new_local_test_engine();
     engine
         .execute_text(
             1,

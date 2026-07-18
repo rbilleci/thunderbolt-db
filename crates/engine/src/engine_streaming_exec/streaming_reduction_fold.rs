@@ -57,8 +57,8 @@ impl Engine {
     /// The fold driver: scan the table's MVCC-visible rows at the pinned boundary, accumulate them into
     /// byte-bounded chunks, and reduce+combine each chunk on the device. S-E.5 may overlap one computing
     /// and one staged chunk, each targeted at half the budget; descriptor overhead and one-row threshold
-    /// overshoot remain visible in the per-descriptor peak gauge. Any executor error on a chunk defers
-    /// the WHOLE query to the CPU path.
+    /// overshoot remain visible in the per-descriptor peak gauge. Any unsupported executor error on a
+    /// chunk declines the whole query through the fail-loud boundary.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_streaming_reduction_fold(
         &self,
@@ -320,8 +320,8 @@ impl Engine {
                 budget,
             ) {
                 Ok(value) => value,
-                // An all-NULL partial set (every matched row NULL in every chunk) hard-errors the
-                // device scalar path; the CPU path serves it — honest edge coverage, never wrong.
+                // An all-NULL partial set (every matched row NULL in every chunk) that the device
+                // scalar path cannot serve declines loudly rather than returning a host answer.
                 Err(()) => return self.execute_relational_select_cpu_pinned(select),
             }
         };
@@ -435,10 +435,9 @@ impl Engine {
                 Some(cell) => cell.clone(),
                 None => return ChunkOutcome::Defer,
             },
-            // A genuine arithmetic OVERFLOW must SURFACE (PG errors on it); the CPU path cannot compute a
-            // wider-type reduction anyway, so deferring would mask it with a misleading message and make
-            // per-chunk overflow disagree with cross-chunk overflow (audit Finding 2). Any other error
-            // (an un-expressible shape) defers to the authoritative CPU path.
+            // A genuine arithmetic OVERFLOW must SURFACE (PG errors on it); converting it to a generic
+            // decline would mask it with a misleading message and make per-chunk overflow disagree with
+            // cross-chunk overflow (audit Finding 2). Any other error declines this GPU route.
             Err(err) if is_overflow_error(&err) => return ChunkOutcome::Hard(err),
             Err(_) => return ChunkOutcome::Defer,
         };
@@ -450,7 +449,7 @@ impl Engine {
 
     /// 6c-0: the final SCALAR combine — ONE device aggregate pass over the collected partials
     /// uploaded as a synthesized one-column relation (the S-E.3 merge shape; the same pre-upload
-    /// budget gate). Err(()) = the caller defers to the CPU path.
+    /// budget gate). Err(()) = the caller declines through the fail-loud boundary.
     #[allow(clippy::too_many_arguments)]
     fn combine_scalar_partials_on_device(
         &self,

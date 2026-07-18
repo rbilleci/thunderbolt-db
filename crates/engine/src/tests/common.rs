@@ -1,71 +1,65 @@
 use super::*;
 
-/// Shared test backend: a GPU MvccExecutionBackend that mirrors the CPU reference but
-/// reports a GPU target, and falls back exactly on the first-cuda-slice parity gap. Used
-/// by both the MVCC-query and relational-SQL test groups.
+/// Shared actual-CUDA backend for MVCC-query and relational-SQL tests.
+///
+/// Its consumers are CUDA-gated and keep closed-form result assertions. This backend must never
+/// relabel CPU execution as GPU work.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct FirstCudaSliceParityBackend;
+pub(crate) struct CudaDriverMvccBackend;
 
-impl MvccExecutionBackend for FirstCudaSliceParityBackend {
+impl MvccExecutionBackend for CudaDriverMvccBackend {
     fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendDispatch {
-        if let Some(_gap) = first_cuda_slice_query_gap(query) {
-            return MvccBackendDispatch::Fallback {
-                reason: FallbackReason::GpuMvccReadParityGap,
-                rows,
-            };
-        }
-
-        match CpuMvccExecutionBackend.execute(query, rows) {
-            MvccBackendDispatch::Executed(mut executed) => {
-                executed.executed_target = DeviceTarget::Gpu(0);
-                MvccBackendDispatch::Executed(executed)
-            }
-            MvccBackendDispatch::Fallback { .. } => {
-                unreachable!("CPU reference backend must execute")
-            }
-        }
+        let runtime =
+            CudaDriverRuntime::probe().unwrap_or_else(|_| CudaDriverRuntime::unavailable());
+        CudaMvccExecutionBackend::new(runtime, 0).execute(query, rows)
     }
 }
 
-pub(crate) fn assert_mvcc_query_uses_tracked_cpu_fallback(
+pub(crate) fn assert_gpu_mvcc_execution_required(engine: &Engine, error: ExecuteError) {
+    assert!(
+        error
+            .to_string()
+            .contains("GPU execution is required for MVCC reads"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(engine.metrics().snapshot().fallback_total, 0);
+}
+
+pub(crate) fn assert_gpu_relational_execution_required(
     engine: &Engine,
-    result: &MvccReadResult,
-    expected_total_fallbacks: u64,
+    error: ExecuteError,
+    table: &str,
+    fallback_before: u64,
 ) {
-    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(result.executed_target, DeviceTarget::Cpu);
-    assert_eq!(
-        result.fallback_reason,
-        Some(FallbackReason::GpuMvccReadParityGap)
+    assert!(
+        error.to_string().contains(&format!(
+            "GPU execution is required for SELECT on relation \"{table}\""
+        )),
+        "unexpected error: {error}"
     );
     assert_eq!(
-        engine
-            .metrics()
-            .fallback_for(FallbackReason::GpuMvccReadParityGap),
-        expected_total_fallbacks
+        engine.metrics().snapshot().fallback_total,
+        fallback_before,
+        "a loud GPU decline must not manufacture fallback telemetry"
     );
 }
 
-/// Recovery now bulk-admits after WAL replay (STRATA S-F). Off-GPU, the parity-oracle CPU route
-/// retains its exact index metadata; on a GPU host, the resident route is authoritative and may
-/// report its device scan framing instead. Keep ordinary recovery tests hardware-independent while
-/// still proving that a GPU result did not fall back.
+/// Recovery now bulk-admits after WAL replay (STRATA S-F). A successful relational read must be GPU
+/// executed without fallback; the resident route may report either its device scan framing or the
+/// independently expected index metadata.
 pub(crate) fn assert_recovered_relational_access_path(
     result: &RelationalSelectResult,
-    expected_cpu: RelationalAccessPath,
+    expected: RelationalAccessPath,
 ) {
-    match result.executed_target {
-        DeviceTarget::Cpu => assert_eq!(*result.access_path, expected_cpu),
-        DeviceTarget::Gpu(_) => {
-            assert!(
-                matches!(
-                    result.access_path.as_ref(),
-                    RelationalAccessPath::FullTableScan
-                ) || *result.access_path == expected_cpu
-            );
-            assert_eq!(result.fallback_reason, None);
-        }
-    }
+    assert!(matches!(result.planned_target, DeviceTarget::Gpu(_)));
+    assert!(matches!(result.executed_target, DeviceTarget::Gpu(_)));
+    assert!(
+        matches!(
+            result.access_path.as_ref(),
+            RelationalAccessPath::FullTableScan
+        ) || *result.access_path == expected
+    );
+    assert_eq!(result.fallback_reason, None);
 }
 
 pub(crate) fn test_wal_path(name: &str) -> std::path::PathBuf {
@@ -93,7 +87,7 @@ pub(crate) fn forget_test_relational_residency(engine: &Engine, table: &str) {
 }
 
 pub(crate) fn repair_test_relational_host_copy(engine: &Engine, table: &str) {
-    // A non-authoritative test generation was built from the already-complete host oracle, so
+    // A non-authoritative test generation already has a complete host tuple-store image, so
     // there is nothing to reverse-gather. This also covers the legacy single-buffer layouts used
     // by read-kernel tests: the production repair gather intentionally accepts shard generations
     // only.

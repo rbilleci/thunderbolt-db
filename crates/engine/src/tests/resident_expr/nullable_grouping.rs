@@ -9,7 +9,7 @@ fn gpu_group_by_skips_null_values_and_groups_null_keys() {
     // (the single-level kernel's value-skip) while COUNT(*) still counts the row (a dedicated total-count
     // pass), an all-NULL group's aggregate is SQL NULL, AND a NULL group KEY forms its OWN group (the
     // kernel's reserved NULL-key slot) rendered SqlValue::Null. A NULL-free nullable column is unchanged.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT, h INT)")
         .unwrap();
     // g has a NULL (row 2); v has a NULL (rows 4 and 6); h has none.
@@ -90,7 +90,7 @@ fn gpu_group_by_null_key_group_with_null_values() {
     // M3 (doc 21): the NULL-KEY group + the value-skip + the total-count pass interact correctly. Every
     // NULL-key row groups together (distinct from real key 0); COUNT(*) counts ALL of them (incl. a NULL-
     // value one); SUM skips the NULL value AMONG the null-key rows. k: 1,NULL,2,NULL,1,NULL.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tk (k INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -126,7 +126,7 @@ fn gpu_group_by_null_key_group_with_all_null_values() {
     // SUM is NULL). The reserved slot is emitted on its CLAIMED MARKER (slot_keys != EMPTY), not count,
     // so it appears CONSISTENTLY in every pass and the by-index merge stays aligned (else: panic / the
     // null row silently vanishes).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tp (k INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -171,7 +171,7 @@ fn gpu_group_by_skips_null_int8_values() {
     // M3 (doc 21): the value-skip is type-agnostic (it gates the accumulate before the per-type sum), so
     // a nullable BIGINT value also skips NULLs on the GPU (the i64 value / i128-carry sum path). MIN(v)
     // returns int8; an all-NULL group is NULL.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t8 (g INT, v BIGINT)")
         .unwrap();
     e.execute_text(
@@ -219,7 +219,7 @@ fn gpu_group_by_nullable_key_with_count_distinct_clean_errors() {
     // rows into the placeholder group -> fewer groups than the reference pass -> by-index merge panic.
     // Reject cleanly rather than panic / mis-answer. (Pre-existing for int keys; this guard fixes that
     // too.) A NON-nullable key with COUNT(DISTINCT) is unaffected.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tcd (g INT, v INT)")
         .unwrap();
     e.execute_text(
@@ -247,7 +247,7 @@ fn gpu_group_by_nullable_text_key_forms_null_group() {
     // M3 (doc 21): GROUP BY a nullable TEXT key — a NULL key forms its OWN group (rendered SqlValue::Null,
     // sorts first), distinct from real keys, via the kernel's hoisted NULL-key check routing to the
     // reserved slot BEFORE the text claim. A NULL text key is NOT folded into the empty-string group.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tgt (k TEXT, v INT)")
         .unwrap();
     e.execute_text(
@@ -280,7 +280,7 @@ fn gpu_group_by_nullable_text_key_forms_null_group() {
 fn gpu_group_by_nullable_numeric_key_forms_null_group() {
     // M3 (doc 21): GROUP BY a nullable NUMERIC key — a NULL key forms its own group (the i128 claim path
     // now sees only non-NULL keys; NULLs route to the reserved slot). A NULL is NOT folded into 0.00.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tgn (k NUMERIC(10,2), v INT)")
         .unwrap();
     e.execute_text(
@@ -321,7 +321,7 @@ fn gpu_group_by_nullable_numeric_key_forms_null_group() {
 fn gpu_group_by_nullable_uuid_key_forms_null_group() {
     // M3 (doc 21): GROUP BY a nullable UUID key — a NULL key forms its own group (the i128/b128 claim sees
     // only non-NULL keys). A NULL is NOT folded into the all-zero uuid.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE tgu (k UUID, v INT)")
         .unwrap();
     let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");
@@ -366,7 +366,7 @@ fn gpu_group_by_nullable_numeric_value_skips_nulls() {
     // the LOW limb. BOTH passes now read the value validity bitmap and skip NULL rows — so a NULL row's
     // STALE pooled row_slots slot is never folded (the prior 700/OOB hazard). SUM/MIN/MAX skip NULLs;
     // COUNT(*) counts every row; an all-NULL group's aggregate is SQL NULL.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE tn (g INT, v NUMERIC(10,2), w NUMERIC(10,2))",

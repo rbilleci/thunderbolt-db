@@ -450,14 +450,14 @@ impl Engine {
         // unified buffer (which caps at ~536M rows and re-admits O(table)). The single dense shard reuses
         // the SAME columnar payload + layout the single buffer uses (header at offset 0, dense columns), so
         // the (already tested) sharded read path reads it identically. Requires GPU device memory; without
-        // it (no GPU) we fall through to the single-buffer/host path.
+        // it (no GPU) admission fails through the GPU-required boundary.
         //
         // THE FLIP scopes sharded admission to PURELY-int4-section tables (int4/int2/date — `purely_int4`
         // above): the shard read stack (unified exec source, index routes, dense kernels) is int4-only
         // today, so sharding a MIXED-type table would DEMOTE its text/int8/numeric shapes from the proven
-        // single-buffer GPU paths to the CPU fallback — the opposite of the flip's goal (caught by the
-        // burn-in: the single-buffer text-probe suite). Mixed-type tables keep the single-buffer layout
-        // until shards carry every section (type-coverage ledger item).
+        // single-buffer GPU paths to unsupported-route failures — the opposite of the flip's goal
+        // (caught by the single-buffer text-probe suite). Mixed-type tables keep the single-buffer
+        // layout until shards carry every section (type-coverage ledger item).
         let shard_device_memory = if self.shard_residency_enabled()
             && (purely_int4 || fixed_width_sections || text_sectioned)
         {

@@ -11,8 +11,8 @@ impl Engine {
     /// stages type-stable partials. PG-bigint aggregates remain Numeric(38,0) across merge rounds and
     /// narrow once at final result materialization. If the accumulator outgrows the chunk budget mid-scan,
     /// it is COMPACTED by the same device merge (the "persistent accumulator" realized as periodic
-    /// re-merge); if even the compacted (true-cardinality) partials exceed the budget, the query defers
-    /// to the CPU path — honest coverage.
+    /// re-merge); if even the compacted (true-cardinality) partials exceed the budget, the query declines
+    /// through the fail-loud GPU-required boundary.
     /// DISTINCT rides this fold via the distinct bridge's own synthesis (GROUP BY col + COUNT dropped).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_streaming_grouped_fold(
@@ -52,7 +52,7 @@ impl Engine {
         // The synthesized PARTIALS relation: `(key, __p0..__pN)` with each partial column typed by its
         // aggregate — Count and Sum(int2/int4/int8) -> Numeric(38,0), Sum(numeric) -> the column's
         // numeric type; Min/Max -> the value column's own type. An unsupported combination
-        // (e.g. SUM over text) declines to the CPU path, which raises the proper SQL error.
+        // (e.g. SUM over text) declines through the common fail-loud boundary.
         let key_type = match table
             .columns
             .iter()
@@ -154,7 +154,7 @@ impl Engine {
         // 6c-0(c): which agg columns are PG-bigint results carried as Numeric{38,0} partials — their
         // chunk cells (the executor emits Int8 for COUNT / SUM(int2/4)) WRAP to Numeric at the staging
         // encode, and the merged cells NARROW back to Int8 exactly once, at result materialization
-        // (the readback carve-out; a narrow overflow defers to the CPU path). TYPE-CONSISTENT by
+        // (the readback carve-out; a narrow overflow declines loudly). TYPE-CONSISTENT by
         // construction: keyed off the DECLARED partial column type.
         let bigint_as_numeric: Vec<bool> = aggregates
             .iter()
@@ -530,8 +530,8 @@ impl Engine {
         let mut rows_out = std::mem::take(&mut partials_acc);
         // 6c-0(c) readback boundary: the PG-bigint aggregates (COUNT / SUM(int2/4)) rode as
         // Numeric{38,0} partials; narrow each merged cell to Int8 exactly ONCE, at result
-        // materialization (a narrow overflow defers to the authoritative CPU path — PG's own
-        // "bigint out of range" surface).
+        // materialization (a narrow overflow declines loudly at PG's own "bigint out of range"
+        // surface).
         if !distinct_key_only {
             for row in &mut rows_out {
                 for (agg_idx, narrow) in bigint_as_numeric.iter().enumerate() {
@@ -648,7 +648,7 @@ impl Engine {
     /// key + an 8-byte count = 12B partials from 4B rows), so a near-unique-key chunk can inflate the
     /// accumulator past the budget before the over-cardinality defer triggers. The merge must never be
     /// the thing that busts the budget it exists to honor — defer WITHOUT uploading when the accumulator
-    /// exceeds it (the CPU path serves the query; the peak-bytes gauge invariant stays <= budget).
+    /// exceeds it (the query declines loudly; the peak-bytes gauge invariant stays <= budget).
     #[allow(clippy::too_many_arguments)]
     fn merge_streaming_partials(
         &self,

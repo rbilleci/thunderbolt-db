@@ -9,7 +9,7 @@ fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
     // 2-relation LEFT OUTER join (M3 -- doc 21): every LEFT row appears; an unmatched left row -- the
     // CHILDLESS parent 3, AND the NULL-key left row 'nokey' (which matches nothing, 3VL) -- is kept with
     // the right relation's columns NULL-padded.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE lp (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE lc (pid INT, label TEXT)")
@@ -149,7 +149,7 @@ fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
 fn gpu_right_and_full_outer_join_null_pad_the_correct_side() {
     // RIGHT keeps every RIGHT (new) row (unmatched -> the left columns NULL-padded); FULL keeps both
     // sides' unmatched rows (M3 -- doc 21). rl 2 'b' is left-only; rr 3 'z' is right-only.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE rl (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE rr (rid INT, label TEXT)")
@@ -216,7 +216,7 @@ fn gpu_nway_outer_join_null_pads_through_the_pipeline() {
     // treating the sentinel as a device row index. Two cases: (1) the carried NULL is in a relation NOT used as the next key (the
     // tuple still participates via a non-padded key); (2) the carried NULL IS the next key (the tuple is
     // re-padded). All on the GPU join pipeline.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     // Case 1: A LEFT JOIN B (on A.id) LEFT JOIN C (on A.id). A=3 has no B (B NULL-padded) but matches C=3.
     e.execute_text(1, "CREATE TABLE a3 (id INT, name TEXT)")
         .unwrap();
@@ -370,7 +370,7 @@ fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
     // M3 (doc 21): explicit NULLS FIRST / NULLS LAST OVERRIDES PG's default placement, honored ON-DEVICE
     // in the GPU sort comparator (the per-key nulls_first bitmask), DECOUPLED from ASC/DESC. Without an
     // override ASC = NULLS LAST and DESC = NULLS FIRST (the default, covered elsewhere).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(
         2,
@@ -442,7 +442,7 @@ fn gpu_group_by_nullable_composite_key_per_member_null_on_device() {
     // (1,5), (NULL,6), (NULL,NULL), (1,NULL) are all DISTINCT groups, each member rendered SqlValue::Null
     // from the representative row. A nullable composite routes to the wide-key path (the i64 pack has no
     // room for validity).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(
         2,
@@ -507,7 +507,7 @@ fn gpu_count_distinct_over_a_nullable_value_clean_errors() {
     // the distinct pass sees no NULLs — the former clean-error is resolved); the GROUPED paths still
     // have no value validity in the sort-based reps pass, so they keep the clean error rather than
     // silently over-count. (A non-null COUNT(DISTINCT) is unaffected -- the count_distinct suite.)
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -542,7 +542,7 @@ fn gpu_group_by_nullable_expression_key_forms_a_null_group_on_device() {
     // M3 (doc 21): GROUP BY a NULLABLE int4 EXPRESSION (`a + b`, b non-null) -- the rows where a is NULL
     // (so a+b is NULL) form their OWN group, rendered SqlValue::Null. Reuses the single-column NULL-key
     // reserved slot via the one nullable operand's validity bitmap (ZERO kernel change).
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute_text(
         2,
@@ -608,7 +608,7 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
     // M3 (doc 21): ORDER BY a NULLABLE int4 EXPRESSION (`a + b`). A NULL result (any operand NULL) becomes
     // the i64::MAX default-end sentinel, blended ON-DEVICE (a validity-mask VM run + the blend kernel), so
     // NULL-expression rows sort to PG's default end. No host NULL decision.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id INT, a INT, b INT)")
         .unwrap();
     e.execute_text(
@@ -670,7 +670,7 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
 fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
     // M3 (doc 21): explicit NULLS FIRST/LAST on a GROUP BY result ORDER BY is honored ON-DEVICE by
     // `gpu_sort_permutation`; the validity bitmap and per-key nulls-first mask place the NULL group.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
         2,
@@ -763,7 +763,7 @@ fn gpu_join_order_by_explicit_nulls_first_last_on_device() {
     // M3 (doc 21): explicit NULLS FIRST/LAST on a JOIN-result ORDER BY is honored ON-DEVICE by
     // `sort_join_coordinates` (the override is threaded through `JoinPlan::order_by_nulls_first`). A LEFT
     // join pads the unmatched row's x to NULL; the override places it.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, n TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, x INT)")
@@ -837,7 +837,7 @@ fn gpu_outer_join_with_where_filters_the_result_not_the_inputs() {
     // pushdown (which is not filter-commutative for an outer join). The predicate runs on the GPU
     // (lower_resident_predicate); its survivor set post-filters the padded result: a JOIN_NULL_ROW pad
     // means the relation's columns are NULL -> the predicate is UNKNOWN -> the tuple is dropped.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, x INT)")
@@ -925,7 +925,7 @@ fn gpu_outer_join_pad_where_3vl_on_device_v2() {
     // `predicate_truth_on_null_pad`. Covers pad-SURVIVES (IS NULL, IS NULL OR cmp, IS NULL AND IS NULL) and
     // pad-DROPS (IS NOT NULL, comparison compound) across the SAME query so a wrong pad decision shows up as
     // a missing/extra row. l=3 ('c') is the unmatched (padded) left row; r1.x small, r2.x large.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, x INT, y INT)")
@@ -1001,7 +1001,7 @@ fn gpu_outer_join_pad_where_3vl_types_and_full_join_v2() {
     // S6/V2: the on-device pad eval works for a NON-int pad column (numeric / text IS NULL) and for a FULL
     // join (both sides can be padded). A numeric/text `IS NULL` on the all-NULL pad must read the validity
     // bit on-device (0 -> NULL -> IS NULL TRUE), not depend on a host Kleene.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, amt NUMERIC(10,2), tag TEXT)")
@@ -1083,7 +1083,7 @@ fn audit_s6_outer_where_real_null_mixed_with_pad() {
     // A real-NULL matched row AND the synthetic pad both satisfy `IS NULL` (the survivor pass evaluates the
     // real NULL on-device; the pad eval evaluates the synthetic NULL on-device -- both must agree). An N-way
     // OUTER then carries a JOIN_NULL_ROW into a SECOND pad.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "CREATE TABLE r (rid INT, x INT)")
@@ -1164,7 +1164,7 @@ fn audit_s6_outer_where_real_null_mixed_with_pad() {
 fn audit_s6_pad_where_kleene_corners() {
     // Kleene corners on the all-NULL pad (real data fully non-null so the survivor pass uses the
     // non-nullable peephole -> the pad eval is the only 3VL difference). Each fold is checked against PG.
-    let mut e = Engine::new_local_cpu_oracle();
+    let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
     e.execute_text(

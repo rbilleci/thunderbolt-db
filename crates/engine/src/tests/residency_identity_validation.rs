@@ -146,7 +146,7 @@ fn a3_device_validator_serves_constraint_ladder() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn a2_same_key_update_chain_stays_on_incremental_path() {
     let e = Engine::new_local();
-    // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+    // Explicit single-buffer GPU layout control for the incremental update chain.
     e.set_auto_admit_on_commit(true);
     e.set_shard_size_target(64);
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")

@@ -595,22 +595,24 @@ fn run_group(
         distribute_results_batched(group, request_result_index, batched);
         return;
     }
+    // A shard-resident gather decline must take the byte-identical per-query GPU route directly.
+    // Do not attempt the single-buffer template: a compatibility snapshot may produce a `Ready`
+    // result containing structural NULLs, while the flat retained-batch ABI is intentionally
+    // non-null i32-only.
+    if engine.resident_shard_count(&group[0].select.table) > 0 {
+        activity
+            .sharded_per_query_fallback_groups
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        run_group_per_query(engine, group);
+        return;
+    }
     // Prepare the shared single-buffer template once for the whole group (group is non-empty by construction).
     let template = match engine.prepare_relational_retained_read_template(&group[0].select) {
         Ok(template) => template,
         Err(err) => {
-            // No single-buffer snapshot. A SHARD-resident group reaches here only when the batched gather
-            // DECLINED (e.g. a duplicate key in the int4 filter column) -> serve it PER-QUERY (byte-identical
-            // to the unbatched path) rather than failing valid queries. A truly non-resident table (the
-            // snapshot went away since classify) still fails the group uniformly.
-            if engine.resident_shard_count(&group[0].select.table) > 0 {
-                activity
-                    .sharded_per_query_fallback_groups
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                run_group_per_query(engine, group);
-            } else {
-                fail_group(group, err);
-            }
+            // A truly non-resident table (the snapshot went away since classification) fails the
+            // group uniformly.
+            fail_group(group, err);
             return;
         }
     };
@@ -628,6 +630,10 @@ fn run_group(
         for request in group {
             let _ = request.respond.send(Err(mapped.clone()));
         }
+        return;
+    }
+    if !template.is_flat_i32_batch_safe() {
+        run_group_per_query(engine, group);
         return;
     }
     let batched = match submit_and_complete_template_batched(engine, &template, &distinct_needles) {
