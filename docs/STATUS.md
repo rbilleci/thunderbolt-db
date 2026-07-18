@@ -4079,6 +4079,7 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Boundary | Work ID |
 |---|---|
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
+| Insert-published authoritative-shard point reads remain roughly 3x slower in-L2 and 84–86x slower out-of-L2 than the pre-R3-004 late-converted evidence | **PERF-001** |
 | Non-int4 O(1) point-lookup breadth | **READ-002** |
 | Reverse-gather/deauthorization/scan-build DDL and recovery repair | **RETIRE-002** |
 | Generic CUDA-MVCC host compaction, ordering, projection, and result assembly | **RETIRE-003** |
