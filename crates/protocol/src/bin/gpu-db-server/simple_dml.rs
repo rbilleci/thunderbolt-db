@@ -17,6 +17,16 @@ pub(super) fn execute_simple_dml(
 ) -> io::Result<()> {
     match command {
         Command::Insert(insert) => {
+            if !insert.returning.is_empty() {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "0A000",
+                        message: "DML RETURNING requires GPU engine execution",
+                        position: None,
+                    },
+                );
+            }
             let table_name = insert.table;
             let catalog_indexes = session.indexes.clone();
             let Some(table) = session.tables.get(&table_name).cloned() else {
@@ -127,6 +137,16 @@ pub(super) fn execute_simple_dml(
             write_command_complete(stream, &format!("INSERT 0 {inserted_count}"))
         }
         Command::Delete(delete) => {
+            if !delete.returning.is_empty() {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "0A000",
+                        message: "DML RETURNING requires GPU engine execution",
+                        position: None,
+                    },
+                );
+            }
             let table_name = delete.table.clone();
             let Some(table) = session.tables.get(&table_name).cloned() else {
                 return write_error(
@@ -171,6 +191,22 @@ pub(super) fn execute_simple_dml(
             write_command_complete(stream, &format!("DELETE {deleted_count}"))
         }
         Command::Update(update) => {
+            if !update.returning.is_empty()
+                || update
+                    .assignments
+                    .iter()
+                    .any(|assignment| assignment.source_column.is_some())
+            {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "0A000",
+                        message:
+                            "UPDATE expressions and DML RETURNING require GPU engine execution",
+                        position: None,
+                    },
+                );
+            }
             let table_name = update.table.clone();
             let catalog_indexes = session.indexes.clone();
             let Some(table) = session.tables.get(&table_name).cloned() else {
@@ -232,6 +268,7 @@ pub(super) fn execute_simple_dml(
                 filter: update.filter.clone(),
                 filters: update.filters.clone(),
                 filter_groups: update.filter_groups.clone(),
+                returning: Vec::new(),
             };
             let mut update_mask = Vec::with_capacity(table.rows.len());
             for row in &table.rows {

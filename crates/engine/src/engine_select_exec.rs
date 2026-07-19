@@ -447,7 +447,7 @@ impl Engine {
                 .is_some_and(|shards| !shards.is_empty())
     }
 
-    fn execute_transient_rows_via_general(
+    pub(crate) fn execute_transient_rows_via_general(
         &self,
         select: &Select,
         table: RelationalTable,
@@ -470,6 +470,75 @@ impl Engine {
             Some(&source),
             None,
         )
+    }
+
+    /// Project a DML statement's final resolved row images through the general GPU result path.
+    /// Callers invoke this before any durable side effect; concurrent autocommit passes the
+    /// under-lock re-resolved delta, so returned rows cannot describe a stale off-lock prepare.
+    pub(crate) fn project_dml_returning(
+        &self,
+        command: &Command,
+        delta: &WriteDelta,
+        boundary: Index,
+    ) -> Result<Option<RelationalSelectResult>, ExecuteError> {
+        let (table_name, returning) = match command {
+            Command::Insert(insert) => (&insert.table, &insert.returning),
+            Command::Update(update) => (&update.table, &update.returning),
+            Command::Delete(delete) => (&delete.table, &delete.returning),
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "DML RETURNING projection received a non-DML command".to_string(),
+                )))
+            }
+        };
+        if returning.is_empty() {
+            return Ok(None);
+        }
+        let table = self
+            .catalog_snapshot()
+            .relational_catalog
+            .get(table_name)
+            .cloned()
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{table_name}\" does not exist for RETURNING"
+                )))
+            })?;
+        let rows = match &delta.mutation {
+            PreparedMutation::Insert {
+                table,
+                inserted_rows,
+                ..
+            } if table == table_name => inserted_rows.iter().map(|(_, row)| row.clone()).collect(),
+            PreparedMutation::Update {
+                table, installs, ..
+            } if table == table_name => installs.iter().map(|(_, _, row)| row.clone()).collect(),
+            PreparedMutation::Delete {
+                table,
+                deleted_rows,
+                ..
+            } if table == table_name => deleted_rows.clone(),
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "DML RETURNING command/delta shape mismatch".to_string(),
+                )))
+            }
+        };
+        let select = Select {
+            table: table_name.clone(),
+            distinct: false,
+            projection: SelectProjection::Columns(returning.clone()),
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        self.execute_transient_rows_via_general(&select, table, rows, boundary)
+            .map(Some)
     }
 
     /// Evaluate a non-resident relational fixture without claiming an execution route.

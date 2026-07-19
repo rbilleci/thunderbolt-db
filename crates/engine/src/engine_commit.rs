@@ -51,9 +51,21 @@ impl Engine {
         txn_id: u64,
         payload: std::sync::Arc<[u8]>,
     ) -> Result<CommitToken, EngineError> {
+        Self::reject_discarded_returning_payload(&payload)?;
         self.ensure_commit_path_available()?;
         let timestamp_micros = self.next_commit_timestamp_micros();
         self.commit_mutation_at(txn_id, payload, timestamp_micros)
+    }
+
+    fn reject_discarded_returning_payload(payload: &[u8]) -> Result<(), EngineError> {
+        if matches!(
+            Self::decode_engine_command(payload),
+            Ok(Some(command))
+                if crate::engine_dml_concurrent::command_has_returning(&command)
+        ) {
+            return Err(crate::engine_dml_concurrent::discarded_returning_engine_error());
+        }
+        Ok(())
     }
 
     pub(crate) fn next_commit_timestamp_micros(&self) -> u64 {
@@ -73,6 +85,7 @@ impl Engine {
         payload: std::sync::Arc<[u8]>,
         timestamp_micros: u64,
     ) -> Result<CommitToken, EngineError> {
+        Self::reject_discarded_returning_payload(&payload)?;
         self.ensure_commit_path_available()?;
         self.intent_lanes_write_guard()?;
         if self.repl_role() != Role::Leader {
@@ -1286,6 +1299,7 @@ impl Engine {
                         value: SqlValue::Int4(record.pk_value),
                     }],
                     filter_groups: Vec::new(),
+                    returning: Vec::new(),
                 };
                 let applied = self.apply_delete(cat, delete, entry.index)?;
                 // WAL-FIRST: a W5b record is claimed + fenced BEFORE the visible target is
@@ -1354,6 +1368,7 @@ impl Engine {
                         value: SqlValue::Int4(record.pk_value),
                     }],
                     filter_groups: Vec::new(),
+                    returning: Vec::new(),
                 };
                 // Capture the old version's stable entity identity from the delete's write-set.
                 // Replay reuses it for the replacement version, migrating pre-ADR-014 lane WAL

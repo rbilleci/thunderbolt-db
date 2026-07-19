@@ -11,6 +11,13 @@ pub(super) fn execute_extended_insert(
     session: &mut Session,
     insert: gpu_db_protocol::Insert,
 ) -> Result<String, ErrorField> {
+    if !insert.returning.is_empty() {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "DML RETURNING requires GPU engine execution",
+            position: None,
+        });
+    }
     let table_name = insert.table;
     if !session.tables.contains_key(&table_name) {
         return Err(ErrorField {
@@ -91,6 +98,13 @@ pub(super) fn execute_extended_delete(
     session: &mut Session,
     delete: gpu_db_protocol::Delete,
 ) -> Result<String, ErrorField> {
+    if !delete.returning.is_empty() {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "DML RETURNING requires GPU engine execution",
+            position: None,
+        });
+    }
     let table_name = delete.table.clone();
     if !session.tables.contains_key(&table_name) {
         return Err(ErrorField {
@@ -131,6 +145,18 @@ pub(super) fn execute_extended_update(
     session: &mut Session,
     update: gpu_db_protocol::Update,
 ) -> Result<String, ErrorField> {
+    if !update.returning.is_empty()
+        || update
+            .assignments
+            .iter()
+            .any(|assignment| assignment.source_column.is_some())
+    {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "UPDATE expressions and DML RETURNING require GPU engine execution",
+            position: None,
+        });
+    }
     let table_name = update.table.clone();
     if !session.tables.contains_key(&table_name) {
         return Err(ErrorField {
@@ -186,6 +212,7 @@ pub(super) fn execute_extended_update(
         filter: update.filter.clone(),
         filters: update.filters.clone(),
         filter_groups: update.filter_groups.clone(),
+        returning: Vec::new(),
     };
     let mut update_mask = Vec::with_capacity(table.rows.len());
     for row in &table.rows {

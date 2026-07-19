@@ -1513,6 +1513,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                 vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
             ],
+            returning: Vec::new(),
         })
     );
 
@@ -1525,6 +1526,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 SqlValue::Int4(1),
                 SqlValue::Text("O'Brien".to_string())
             ]],
+            returning: Vec::new(),
         })
     );
 
@@ -1537,6 +1539,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 vec![SqlValue::Int4(-1), SqlValue::Text("Minus".to_string())],
                 vec![SqlValue::Int4(0), SqlValue::Text("Zero".to_string())],
             ],
+            returning: Vec::new(),
         })
     );
 
@@ -1546,6 +1549,7 @@ default: Some(ColumnDefault::SequenceNextVal {
             table: "people".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
             rows: vec![vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())]],
+            returning: Vec::new(),
         })
     );
 
@@ -1558,6 +1562,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 vec![SqlValue::Int4(4), SqlValue::Text("Katherine".to_string())],
                 vec![SqlValue::Int4(5), SqlValue::Text("Mary".to_string())],
             ],
+            returning: Vec::new(),
         })
     );
 
@@ -1587,6 +1592,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                     value: SqlValue::Text("Ada".to_string()),
                 }],
             ],
+            returning: Vec::new(),
         })
     );
     assert_eq!(
@@ -1599,10 +1605,12 @@ default: Some(ColumnDefault::SequenceNextVal {
             assignments: vec![
                 UpdateAssignment {
                     column: "name".to_string(),
+                    source_column: None,
                     value: SqlValue::Text("Updated".to_string()),
                 },
                 UpdateAssignment {
                     column: "id".to_string(),
+                    source_column: None,
                     value: SqlValue::Int4(10),
                 },
             ],
@@ -1628,6 +1636,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                     value: SqlValue::Text("Ada".to_string()),
                 }],
             ],
+            returning: Vec::new(),
         })
     );
     assert!(matches!(

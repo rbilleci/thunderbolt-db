@@ -34,6 +34,13 @@ pub enum ExprStep {
         scalar: i32,
         scalar_on_left: bool,
     },
+    /// Full-width int8 immediate arithmetic. Valid only in an I64 program; unlike
+    /// `ScalarBinary`, this preserves an int8 parameter outside the int4 range.
+    ScalarBinaryI64 {
+        op: u32,
+        scalar: i64,
+        scalar_on_left: bool,
+    },
     /// Pop a (value), push the mask `(scalar_on_left ? scalar <cmp> a : a <cmp> scalar) ? 1 : 0`.
     CompareScalar {
         cmp: u32,
@@ -256,6 +263,13 @@ fn validate_resident_arith_program(
                 pop_value(&mut stack, elem, step_index)?;
                 stack.push(PreflightValue::Value(elem));
             }
+            ExprStep::ScalarBinaryI64 { op, .. } => {
+                if op > 2 || elem != ResidentElemType::I64 {
+                    return Err(invalid_step(step_index));
+                }
+                pop_value(&mut stack, ResidentElemType::I64, step_index)?;
+                stack.push(PreflightValue::Value(ResidentElemType::I64));
+            }
             ExprStep::CompareScalar { cmp, .. } => {
                 if cmp > 5 {
                     return Err(invalid_step(step_index));
@@ -468,6 +482,7 @@ pub(super) fn run_resident_arith_program_at_indices<'r>(
                     | ExprStep::LoadColumnI64 { .. }
                     | ExprStep::BufferBinary { .. }
                     | ExprStep::ScalarBinary { .. }
+                    | ExprStep::ScalarBinaryI64 { .. }
             )
         })
     {
@@ -949,6 +964,34 @@ fn run_resident_arith_program_impl<'r>(
                         launch(function, &mut args)?;
                     }
                 }
+                stack.push(out);
+            }
+            ExprStep::ScalarBinaryI64 {
+                op,
+                scalar,
+                scalar_on_left,
+            } => {
+                let lhs = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = lhs.ptr;
+                let mut a1 = scalar;
+                let mut a2 = op;
+                let mut a3 = u32::from(scalar_on_left);
+                let mut a4 = n;
+                let mut a5 = out.ptr;
+                let mut a6 = overflow_buf.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut i64).cast::<c_void>(),
+                    (&mut a2 as *mut u32).cast::<c_void>(),
+                    (&mut a3 as *mut u32).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
+                    (&mut a6 as *mut u64).cast::<c_void>(),
+                ];
+                launch(scalar_binary_fn, &mut args)?;
                 stack.push(out);
             }
             ExprStep::CompareScalar {

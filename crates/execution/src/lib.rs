@@ -96,8 +96,8 @@ pub use expression_vm::{ExprStep, ResidentElemType};
 mod expression_filter;
 use expression_filter::{
     launch_cuda_arith_value_column_at_indices, launch_cuda_arith_value_column_at_indices_nullable,
-    launch_cuda_resident_expr_arith_filter, launch_cuda_resident_expr_compare_buffers_filter,
-    launch_cuda_resident_expr_two_col_filter,
+    launch_cuda_arith_value_column_at_selected_indices, launch_cuda_resident_expr_arith_filter,
+    launch_cuda_resident_expr_compare_buffers_filter, launch_cuda_resident_expr_two_col_filter,
 };
 mod derived_column;
 use derived_column::{
@@ -513,6 +513,24 @@ impl CudaResidentDeviceMemory {
         elem: ResidentElemType,
     ) -> Result<Vec<i64>, CudaRuntimeProbeError> {
         launch_cuda_arith_value_column_at_indices(self, program, n_rows, indices, elem)
+    }
+
+    /// Checked arithmetic over only the selected source coordinates. Unlike the legacy
+    /// ORDER-BY helper, this does not evaluate or transfer the full source column.
+    pub fn arith_value_column_at_selected_indices(
+        &self,
+        program: &[ExprStep],
+        source_row_count: u64,
+        indices: &[u32],
+        elem: ResidentElemType,
+    ) -> Result<Vec<i64>, CudaRuntimeProbeError> {
+        launch_cuda_arith_value_column_at_selected_indices(
+            self,
+            program,
+            source_row_count,
+            indices,
+            elem,
+        )
     }
 
     /// Like [`Self::arith_value_column_at_indices`] (I32 arith only) but the expression is NULLABLE: an

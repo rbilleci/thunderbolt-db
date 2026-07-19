@@ -97,6 +97,7 @@ mod engine_ddl_objects;
 mod engine_ddl_pubsub_role;
 mod engine_ddl_table;
 mod engine_dml_concurrent;
+pub use engine_dml_concurrent::DmlExecutionResult;
 mod engine_dml_intent;
 mod engine_durability;
 mod engine_intent_lanes;

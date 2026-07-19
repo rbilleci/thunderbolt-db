@@ -340,6 +340,9 @@ impl Engine {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
         let cmd = parse_command(text)?;
+        if crate::engine_dml_concurrent::command_has_returning(&cmd) {
+            return Err(crate::engine_dml_concurrent::discarded_returning_error());
+        }
         if self.transaction_snapshot_handle(txn_id).is_some() {
             match &cmd {
                 Command::Insert(_) | Command::Update(_) | Command::Delete(_) => {

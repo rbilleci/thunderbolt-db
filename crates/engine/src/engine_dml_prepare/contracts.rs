@@ -4,6 +4,7 @@ use crate::{RelationalTable, WriteSet};
 
 /// One device-resolved DML match: stable entity id, derived entity key, and bounded row image.
 pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
+pub(crate) type DmlResolvedUpdate = (Vec<DmlResolvedMatch>, Vec<Vec<SqlValue>>);
 
 /// Applied INSERT data surfaced to residency publication: table, stored row images, conflict
 /// write-set, and stable row identities.

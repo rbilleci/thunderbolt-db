@@ -119,6 +119,28 @@ fn expression_preflight_checks_typed_stack_and_fixed_windows() {
 }
 
 #[test]
+fn indexed_load_preflight_must_cover_the_full_source_extent() {
+    let program = [ExprStep::LoadColumn { byte_offset: 12 }];
+
+    assert!(validate(
+        16,
+        &program,
+        &[],
+        1,
+        ResidentElemType::I32,
+        ExprTerminal::Value,
+    ));
+    assert!(!validate(
+        16,
+        &program,
+        &[],
+        2,
+        ResidentElemType::I32,
+        ExprTerminal::Value,
+    ));
+}
+
+#[test]
 fn expression_preflight_checks_bitmap_uuid_and_opcode_contracts() {
     let bool_mask = [ExprStep::BoolMask {
         bitmap_byte_offset: 8,

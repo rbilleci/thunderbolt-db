@@ -186,6 +186,8 @@ pub(crate) struct ColdTableChunks {
 
 /// P4-2b-ii: a class DML resolve's matches — the standard (pseudo_id, row_key, image) triples.
 pub(crate) type ClassDmlMatches = Vec<(u64, String, Vec<SqlValue>)>;
+pub(crate) type ClassDmlUpdate = (ClassDmlMatches, Vec<Vec<SqlValue>>);
+pub(crate) type ClassDmlUpdateWithEpoch = (ClassDmlMatches, Vec<Vec<SqlValue>>, u64);
 
 /// P5-1: one chunk's retained device key index (fingerprint hash table).
 // Production callers arrive with P5-2 (the uniqueness probe); the gate exercises it now.

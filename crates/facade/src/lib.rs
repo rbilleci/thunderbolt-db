@@ -111,6 +111,12 @@ pub enum QueryOutcome {
         columns: Vec<ColumnMeta>,
         rows: Vec<Vec<DbValue>>,
     },
+    Returning {
+        tag: CommandTag,
+        columns: Vec<ColumnMeta>,
+        rows: Vec<Vec<DbValue>>,
+        rows_affected: u64,
+    },
     Command {
         tag: CommandTag,
         rows_affected: Option<u64>,
@@ -395,9 +401,10 @@ fn execute_on_engine_with_transaction(
                     other,
                     Command::Insert(_) | Command::Update(_) | Command::Delete(_)
                 ) {
-                    engine
-                        .execute_dml_in_transaction(txn_id, sql)
+                    let result = engine
+                        .execute_dml_in_transaction_with_result(txn_id, sql)
                         .map_err(map_execute_error)?;
+                    return Ok(map_dml_result(tag, result));
                 } else {
                     return Err(DbError {
                         category: ErrorCategory::Unsupported,
@@ -405,7 +412,29 @@ fn execute_on_engine_with_transaction(
                             .to_string(),
                     });
                 }
+            } else if matches!(
+                other,
+                Command::Insert(_) | Command::Update(_) | Command::Delete(_)
+            ) && engine.is_concurrent_dml(sql)
+            {
+                let result = engine
+                    .execute_dml_concurrent_with_result(statement_txn_id, sql)
+                    .map_err(map_execute_error)?;
+                return Ok(map_dml_result(tag, result));
             } else {
+                let has_returning = match &other {
+                    Command::Insert(insert) => !insert.returning.is_empty(),
+                    Command::Update(update) => !update.returning.is_empty(),
+                    Command::Delete(delete) => !delete.returning.is_empty(),
+                    _ => false,
+                };
+                if has_returning {
+                    return Err(DbError {
+                        category: ErrorCategory::Unsupported,
+                        message: "DML RETURNING requires the GPU-native concurrent mutation path"
+                            .to_string(),
+                    });
+                }
                 engine
                     .execute_text(statement_txn_id, sql)
                     .map_err(map_execute_error)?;
@@ -645,12 +674,22 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
                 return Err(poisoned_engine_error());
             }
             if engine.is_concurrent_dml(sql) {
-                engine
-                    .execute_dml_concurrent(txn_id, sql)
+                let result = engine
+                    .execute_dml_concurrent_with_result(txn_id, sql)
                     .map_err(map_execute_error)?;
-                return Ok(QueryOutcome::Command {
-                    tag,
-                    rows_affected: None,
+                return Ok(map_dml_result(tag, result));
+            }
+            let has_returning = match &other {
+                Command::Insert(insert) => !insert.returning.is_empty(),
+                Command::Update(update) => !update.returning.is_empty(),
+                Command::Delete(delete) => !delete.returning.is_empty(),
+                _ => false,
+            };
+            if has_returning {
+                return Err(DbError {
+                    category: ErrorCategory::Unsupported,
+                    message: "DML RETURNING requires the GPU-native concurrent mutation path"
+                        .to_string(),
                 });
             }
             // DDL / sequence-default INSERT / KV / other: the engine's catalog latch is the serializer.
@@ -779,14 +818,11 @@ pub fn execute_on_shared_engine_session(
                 .expect("guarded by transaction-active match arm");
             let command = parse_command(sql).expect("matched parsed DML");
             let tag = command_tag(&command);
-            shared
+            let result = shared
                 .engine
-                .execute_dml_in_transaction(txn_id, sql)
+                .execute_dml_in_transaction_with_result(txn_id, sql)
                 .map_err(map_execute_error)?;
-            Ok(QueryOutcome::Command {
-                tag,
-                rows_affected: None,
-            })
+            Ok(map_dml_result(tag, result))
         }
         Ok(_) if session.active_txn_id.is_some() => Err(DbError {
             category: ErrorCategory::Unsupported,
@@ -1023,6 +1059,25 @@ fn map_column(column: &RelationalColumn) -> ColumnMeta {
     }
 }
 
+fn map_dml_result(tag: CommandTag, result: gpu_db_engine::DmlExecutionResult) -> QueryOutcome {
+    match result.returning {
+        Some(returning) => QueryOutcome::Returning {
+            tag,
+            columns: returning.columns.iter().map(map_column).collect(),
+            rows: returning
+                .rows
+                .iter()
+                .map(|row| row.iter().cloned().map(map_value).collect())
+                .collect(),
+            rows_affected: result.rows_affected,
+        },
+        None => QueryOutcome::Command {
+            tag,
+            rows_affected: Some(result.rows_affected),
+        },
+    }
+}
+
 fn map_value(value: SqlValue) -> DbValue {
     match value {
         SqlValue::Null => DbValue::Null,
@@ -1089,6 +1144,61 @@ mod tests {
             .unwrap_err();
         assert_eq!(unknown.category, ErrorCategory::Internal);
         assert!(unknown.message.contains("unknown session"));
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn parameterized_w1_update_preserves_types_and_returning_rows() {
+        let mut facade = EngineFacade::new();
+        facade.engine.set_auto_admit_on_commit(true);
+        let session = facade.open_session();
+        facade
+            .execute(
+                session,
+                "CREATE TABLE accounts (tenant_id int4, account_id int8, balance_cents int8, \
+                 version int8, status int2, PRIMARY KEY (tenant_id, account_id))",
+            )
+            .unwrap();
+        facade
+            .execute_parameterized(
+                session,
+                "INSERT INTO accounts VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    DbValue::Int4(7),
+                    DbValue::Int8(70_001),
+                    DbValue::Int8(1_000),
+                    DbValue::Int8(0),
+                    DbValue::Int2(1),
+                ],
+            )
+            .unwrap();
+        let outcome = facade
+            .execute_parameterized(
+                session,
+                "UPDATE accounts SET balance_cents = balance_cents + $3, version = version + 1 \
+                 WHERE tenant_id = $1 AND account_id = $2 RETURNING balance_cents, version",
+                &[DbValue::Int4(7), DbValue::Int8(70_001), DbValue::Int8(-25)],
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            QueryOutcome::Returning {
+                tag: CommandTag::Update,
+                columns: vec![
+                    ColumnMeta {
+                        name: "balance_cents".to_string(),
+                        logical_type: LogicalType::Int8,
+                    },
+                    ColumnMeta {
+                        name: "version".to_string(),
+                        logical_type: LogicalType::Int8,
+                    },
+                ],
+                rows: vec![vec![DbValue::Int8(975), DbValue::Int8(1)]],
+                rows_affected: 1,
+            }
+        );
+        assert_eq!(pg_adapter::command_complete_tag(&outcome), "UPDATE 1");
     }
 
     #[test]

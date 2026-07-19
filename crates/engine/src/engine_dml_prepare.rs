@@ -13,7 +13,8 @@ mod unique_conflict;
 
 use contracts::device_eq_scan_literal;
 pub(crate) use contracts::{
-    dml_filter_groups_to_device_predicate, AppliedInsert, DmlResolvedMatch, InsertPrepareValidation,
+    dml_filter_groups_to_device_predicate, AppliedInsert, DmlResolvedMatch, DmlResolvedUpdate,
+    InsertPrepareValidation,
 };
 
 impl Engine {
@@ -418,7 +419,21 @@ impl Engine {
         if self.current_transaction_read_snapshot().is_none() {
             visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
         }
-        self.try_resolve_dml_via_predicate_scan(table, filter_groups, visibility)
+        self.try_resolve_dml_via_predicate_scan(table, filter_groups, visibility, None)
+            .map(|resolved| resolved.map(|(matches, _)| matches))
+    }
+
+    pub(crate) fn resolve_update_matches_via_device(
+        &self,
+        table: &RelationalTable,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        mut visibility: StorageVisibility,
+        assignments: &[BoundUpdateAssignment],
+    ) -> Result<Option<DmlResolvedUpdate>, EngineError> {
+        if self.current_transaction_read_snapshot().is_none() {
+            visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
+        }
+        self.try_resolve_dml_via_predicate_scan(table, filter_groups, visibility, Some(assignments))
     }
 
     /// Resolve DELETE/UPDATE matches with the exact typed predicate on every resident shard. Matching
@@ -430,7 +445,8 @@ impl Engine {
         table: &RelationalTable,
         filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
         visibility: StorageVisibility,
-    ) -> Result<Option<Vec<DmlResolvedMatch>>, EngineError> {
+        assignments: Option<&[BoundUpdateAssignment]>,
+    ) -> Result<Option<DmlResolvedUpdate>, EngineError> {
         // Lower the WHERE to the typed ResidentExpr DNF. Predicate-free DML uses a device-generated
         // all-slots range; it never constructs an O(rows) host identity vector.
         let predicate = if filter_groups.is_empty() {
@@ -457,6 +473,7 @@ impl Engine {
             return Ok(None);
         };
         let mut matches: Vec<DmlResolvedMatch> = Vec::new();
+        let mut old_rows: Vec<(u64, Vec<SqlValue>)> = Vec::new();
         for hit in &hits {
             // The stable entity key derives from the row-identity region at the local slot.
             let Some(region) = &hit.row_id else {
@@ -473,7 +490,18 @@ impl Engine {
                 return Ok(None); // unstamped slot: identity unknown
             }
             match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
-                Some(Some(row)) => {
+                Some(Some(mut row)) => {
+                    if let Some(assignments) = assignments {
+                        old_rows.push((row_id, row.clone()));
+                        self.apply_update_assignments_on_device(
+                            table,
+                            assignments,
+                            &hit.descriptor,
+                            &hit.device_memory,
+                            &[hit.slot],
+                            std::slice::from_mut(&mut row),
+                        )?;
+                    }
                     matches.push((row_id, relational_row_key(&table.name, row_id), row))
                 }
                 Some(None) => continue, // not visible at this snapshot (tombstoned / too-new version)
@@ -484,11 +512,133 @@ impl Engine {
         // slot), same row_id -> one match (parity with the point path's dedup).
         matches.sort_by_key(|(row_id, _, _)| *row_id);
         matches.dedup_by_key(|(row_id, _, _)| *row_id);
+        old_rows.sort_by_key(|(row_id, _)| *row_id);
+        old_rows.dedup_by_key(|(row_id, _)| *row_id);
         self.read_state
             .residency
             .dml_device_resolve_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Some(matches))
+        Ok(Some((
+            matches,
+            old_rows.into_iter().map(|(_, row)| row).collect(),
+        )))
+    }
+
+    /// Apply a bound UPDATE assignment set against one pinned device source. Literal assignment
+    /// remains control-plane row construction; same-column addition is evaluated by the checked
+    /// arithmetic VM only at the device-approved coordinates. SQL assignments read the original
+    /// row image simultaneously, so every expression is launched before its output is installed.
+    pub(crate) fn apply_update_assignments_on_device(
+        &self,
+        table: &RelationalTable,
+        assignments: &[BoundUpdateAssignment],
+        descriptor: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        slots: &[u32],
+        rows: &mut [Vec<SqlValue>],
+    ) -> Result<(), EngineError> {
+        if slots.len() != rows.len() {
+            return Err(EngineError::ApplyFailed(
+                "device UPDATE coordinate/image cardinality mismatch".to_string(),
+            ));
+        }
+        let mut pending: Vec<(usize, Vec<SqlValue>)> = Vec::with_capacity(assignments.len());
+        for assignment in assignments {
+            let column = table.columns.get(assignment.column_idx).ok_or_else(|| {
+                EngineError::ApplyFailed(
+                    "UPDATE assignment column is outside the table".to_string(),
+                )
+            })?;
+            match &assignment.value {
+                BoundUpdateValue::Literal(value) => {
+                    pending.push((assignment.column_idx, vec![value.clone(); rows.len()]));
+                }
+                BoundUpdateValue::AddSameColumn(delta) => {
+                    if matches!(delta, SqlValue::Null) {
+                        pending.push((assignment.column_idx, vec![SqlValue::Null; rows.len()]));
+                        continue;
+                    }
+                    let mut active_slots = Vec::new();
+                    let mut active_rows = Vec::new();
+                    for (row_idx, (slot, row)) in slots.iter().zip(rows.iter()).enumerate() {
+                        if !matches!(row.get(assignment.column_idx), Some(SqlValue::Null)) {
+                            active_slots.push(*slot);
+                            active_rows.push(row_idx);
+                        }
+                    }
+                    let mut values = vec![SqlValue::Null; rows.len()];
+                    if !active_slots.is_empty() {
+                        let offset = crate::relational_model::resident_device_int_column_offset(
+                            descriptor,
+                            table,
+                            assignment.column_idx,
+                        )
+                        .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+                        let (program, elem) = match (column.ty, delta) {
+                            (SqlType::Int4, SqlValue::Int4(delta)) => (
+                                vec![
+                                    gpu_db_execution::ExprStep::LoadColumn {
+                                        byte_offset: offset,
+                                    },
+                                    gpu_db_execution::ExprStep::ScalarBinary {
+                                        op: 0,
+                                        scalar: *delta,
+                                        scalar_on_left: false,
+                                    },
+                                ],
+                                ResidentElemType::I32,
+                            ),
+                            (SqlType::Int8, SqlValue::Int8(delta)) => (
+                                vec![
+                                    gpu_db_execution::ExprStep::LoadColumnI64 {
+                                        byte_offset: offset,
+                                    },
+                                    gpu_db_execution::ExprStep::ScalarBinaryI64 {
+                                        op: 0,
+                                        scalar: *delta,
+                                        scalar_on_left: false,
+                                    },
+                                ],
+                                ResidentElemType::I64,
+                            ),
+                            _ => {
+                                return Err(EngineError::ApplyFailed(format!(
+                                    "checked UPDATE addition type mismatch for column \"{}\"",
+                                    column.name
+                                )));
+                            }
+                        };
+                        let computed = device_memory
+                            .arith_value_column_at_selected_indices(
+                                &program,
+                                descriptor.row_count as u64,
+                                &active_slots,
+                                elem,
+                            )
+                            .map_err(|error| EngineError::ApplyFailed(error.to_string()))?;
+                        if computed.len() != active_rows.len() {
+                            return Err(EngineError::ApplyFailed(
+                                "device UPDATE arithmetic cardinality mismatch".to_string(),
+                            ));
+                        }
+                        for (row_idx, value) in active_rows.into_iter().zip(computed) {
+                            values[row_idx] = match column.ty {
+                                SqlType::Int4 => SqlValue::Int4(value as i32),
+                                SqlType::Int8 => SqlValue::Int8(value),
+                                _ => unreachable!("bound UPDATE arithmetic is int4/int8 only"),
+                            };
+                        }
+                    }
+                    pending.push((assignment.column_idx, values));
+                }
+            }
+        }
+        for (column_idx, values) in pending {
+            for (row, value) in rows.iter_mut().zip(values) {
+                row[column_idx] = value;
+            }
+        }
+        Ok(())
     }
 
     /// RETIREMENT A4a: materialize a located row ENTIRELY FROM THE DEVICE — values gathered from
@@ -1050,6 +1200,7 @@ impl Engine {
                 filter: update.filter.clone(),
                 filters: update.filters.clone(),
                 filter_groups: update.filter_groups.clone(),
+                returning: Vec::new(),
             },
         )
         .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
@@ -1079,9 +1230,12 @@ impl Engine {
             });
         // Resolve from the authoritative device generation. Cold keyed classes stay on their
         // device-native coordinate/index path; resident tables use typed predicate scan/compaction.
-        let (matches, class_epoch) = if self.table_chunk_authoritative(&table.name).is_some() {
-            let (matches, epoch) = self
-                .resolve_class_dml_matches(table, &filter_groups, visibility)
+        let (matches, resolved_old_rows, class_epoch) = if self
+            .table_chunk_authoritative(&table.name)
+            .is_some()
+        {
+            let (matches, old_rows, epoch) = self
+                .resolve_class_update_matches(table, &filter_groups, visibility, &assignments)?
                 .ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
                         "device DML verdict unavailable for cold relation \"{}\"",
@@ -1091,11 +1245,7 @@ impl Engine {
             if table.indexes.iter().any(|index| index.unique) {
                 let mut new_images: Vec<Vec<SqlValue>> = Vec::with_capacity(matches.len());
                 for (_, _, row) in &matches {
-                    let mut image = row.clone();
-                    for (idx, value) in &assignments {
-                        image[*idx] = value.clone();
-                    }
-                    new_images.push(image);
+                    new_images.push(row.clone());
                 }
                 let own: BTreeSet<u64> = matches.iter().map(|(id, _, _)| *id).collect();
                 self.validate_class_insert_uniqueness(
@@ -1111,26 +1261,30 @@ impl Engine {
                     ))
                 })??;
             }
-            (matches, Some(epoch))
+            (matches, old_rows, Some(epoch))
         } else {
-            let matches = self
-                .resolve_dml_matches_via_device(table, &filter_groups, visibility)?
+            let (matches, old_rows) = self
+                .resolve_update_matches_via_device(table, &filter_groups, visibility, &assignments)?
                 .ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
                         "device DML verdict unavailable for relation \"{}\"",
                         table.name
                     ))
                 })?;
-            (matches, None)
+            (matches, old_rows, None)
         };
-        for (tuple_id, key, mut row) in matches {
+        if matches.len() != resolved_old_rows.len() {
+            return Err(EngineError::ApplyFailed(
+                "device UPDATE old/new image cardinality mismatch".to_string(),
+            ));
+        }
+        for ((tuple_id, key, row), old_row) in
+            matches.into_iter().zip(resolved_old_rows.into_iter())
+        {
             let mut old_slots = WriteSet::default();
-            old_slots.add_unique_slots(table, &row);
+            old_slots.add_unique_slots(table, &old_row);
             released_unique_slots.append(&mut old_slots.unique_slots);
-            updated_old_rows.push(row.clone());
-            for (idx, value) in &assignments {
-                row[*idx] = value.clone();
-            }
+            updated_old_rows.push(old_row);
             updates.push((tuple_id, key, row));
         }
 

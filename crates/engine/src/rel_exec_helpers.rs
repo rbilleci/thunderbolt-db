@@ -1485,7 +1485,17 @@ pub(crate) fn bind_relational_select(
 
 pub(crate) type BoundDeleteFilter = (usize, SelectFilterOp, SqlValue);
 pub(crate) type BoundDeleteFilterGroup = Vec<BoundDeleteFilter>;
-pub(crate) type BoundUpdateAssignment = (usize, SqlValue);
+#[derive(Debug, Clone)]
+pub(crate) struct BoundUpdateAssignment {
+    pub(crate) column_idx: usize,
+    pub(crate) value: BoundUpdateValue,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum BoundUpdateValue {
+    Literal(SqlValue),
+    AddSameColumn(SqlValue),
+}
 
 pub(crate) fn bind_delete_filter_groups(
     table: &RelationalTable,
@@ -1552,7 +1562,28 @@ pub(crate) fn bind_update_assignments(
                 &assignment.column,
             )
             .map_err(ExecuteError::Engine)?;
-            Ok((idx, value))
+            let value = match &assignment.source_column {
+                None => BoundUpdateValue::Literal(value),
+                Some(source) if source == &assignment.column => {
+                    if !matches!(table.columns[idx].ty, SqlType::Int4 | SqlType::Int8) {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "checked same-column addition is supported only for int4/int8 column \"{}\"",
+                            assignment.column
+                        ))));
+                    }
+                    BoundUpdateValue::AddSameColumn(value)
+                }
+                Some(_) => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "UPDATE expression for \"{}\" must read the same column",
+                        assignment.column
+                    ))));
+                }
+            };
+            Ok(BoundUpdateAssignment {
+                column_idx: idx,
+                value,
+            })
         })
         .collect()
 }

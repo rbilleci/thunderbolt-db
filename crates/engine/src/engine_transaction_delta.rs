@@ -79,6 +79,20 @@ impl Engine {
         txn_id: TxnId,
         text: &str,
     ) -> Result<(), ExecuteError> {
+        if parse_command(text)
+            .is_ok_and(|command| crate::engine_dml_concurrent::command_has_returning(&command))
+        {
+            return Err(crate::engine_dml_concurrent::discarded_returning_error());
+        }
+        self.execute_dml_in_transaction_with_result(txn_id, text)
+            .map(|_| ())
+    }
+
+    pub fn execute_dml_in_transaction_with_result(
+        &self,
+        txn_id: TxnId,
+        text: &str,
+    ) -> Result<DmlExecutionResult, ExecuteError> {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
         self.intent_lanes_write_guard()
@@ -142,6 +156,8 @@ impl Engine {
             PreparedMutation::Insert { seq_advances, .. } => seq_advances.clone(),
             PreparedMutation::Update { .. } | PreparedMutation::Delete { .. } => BTreeMap::new(),
         };
+        let rows_affected = prepared.rows_affected();
+        let returning = self.project_dml_returning(&command, &prepared, snapshot.boundary)?;
 
         self.validate_transaction_delta_residency(&table)?;
 
@@ -190,7 +206,10 @@ impl Engine {
         drop(current_shards);
         gpu_reservation
             .replace_charges(&mut delta.private_gpu_bytes_by_gpu, next_private_gpu_bytes);
-        Ok(())
+        Ok(DmlExecutionResult {
+            rows_affected,
+            returning,
+        })
     }
 
     /// Durably publish all staged statements as ONE resolved WAL record and ONE MVCC generation.

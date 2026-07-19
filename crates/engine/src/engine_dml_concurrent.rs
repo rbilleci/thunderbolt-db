@@ -9,6 +9,7 @@ use super::*;
 
 mod lane;
 mod lane_apply;
+mod request;
 mod state;
 mod wave;
 
@@ -18,6 +19,12 @@ pub(crate) use state::{
 #[cfg(test)]
 use state::{wave_tail_failure_publish_hook, wave_tail_handoff_hook};
 use state::{CommitWaveDone, CommitWaveQueue, CommitWaveTail};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmlExecutionResult {
+    pub rows_affected: u64,
+    pub returning: Option<RelationalSelectResult>,
+}
 
 /// Upper bound on items per wave drain (keeps a single wave's worst-case commit latency bounded;
 /// under saturation the NEXT wave picks the rest up immediately).
@@ -39,6 +46,23 @@ fn is_device_prepare_verdict_unavailable(error: &ExecuteError) -> bool {
                 || message.starts_with("device constraint verdict unavailable")
                 || message.starts_with("device tuple-constraint verdict unavailable")
     )
+}
+
+pub(crate) fn command_has_returning(command: &Command) -> bool {
+    match command {
+        Command::Insert(insert) => !insert.returning.is_empty(),
+        Command::Update(update) => !update.returning.is_empty(),
+        Command::Delete(delete) => !delete.returning.is_empty(),
+        _ => false,
+    }
+}
+
+pub(crate) fn discarded_returning_error() -> ExecuteError {
+    ExecuteError::Engine(discarded_returning_engine_error())
+}
+
+pub(crate) fn discarded_returning_engine_error() -> EngineError {
+    EngineError::ApplyFailed("DML RETURNING requires a result-bearing execution API".to_string())
 }
 
 /// E2.2(d) — the wave-size / pipeline-depth knobs are env-overridable for the latency-knee sweep
@@ -493,153 +517,6 @@ impl Engine {
         Ok(successor_id)
     }
 
-    /// Execute one autocommit DML statement (`INSERT`/`UPDATE`/`DELETE`) on the CONCURRENT commit
-    /// path under Snapshot Isolation (write-half MVCC, Stage 4 — the concurrency flip):
-    ///
-    /// 1. **Begin (off-lock):** pin a read snapshot `S = committed_seq` and register it.
-    /// 2. **Prepare (off-lock, no commit_mutex):** parse, constraint-preflight against `S`, and
-    ///    compute the conflict write-set (`prepare_*` at `S`). Many writers run this concurrently,
-    ///    and concurrently with lock-free readers.
-    /// 3. **Commit (short critical section under the commit_mutex):** validate row identities
-    ///    against the recent-commits map and unique keys against device version history plus
-    ///    wave-local arbitration (overlap since `S` ⇒ retryable [`ExecuteError::Serialization`],
-    ///    first-committer-wins) → assign `commit_seq` (the commit `Index`) → WAL append + group-commit
-    ///    fsync → install the delta RE-RESOLVED at `commit_seq` (so the live apply is byte-identical
-    ///    to a WAL replay) + publish the table generation → record row identities → bump
-    ///    `committed_seq` LAST (release-store: the publish point).
-    /// 4. **Abort/retry:** a conflict (or any prepare error) publishes nothing and is returned; a
-    ///    serialization conflict is retryable with a fresh snapshot.
-    ///
-    /// `&self`: the whole path runs without an engine write lock, so writers overlap on prepare and
-    /// serialize only briefly on the commit_mutex, and a writer never blocks a reader.
-    pub fn execute_dml_concurrent(&self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
-        self.intent_lanes_write_guard()
-            .map_err(ExecuteError::Engine)?;
-        if self.transaction_snapshot_handle(txn_id).is_some() {
-            return self.execute_dml_in_transaction(txn_id, text);
-        }
-        self.execute_dml_concurrent_instrumented(txn_id, text, || {})
-    }
-
-    /// [`Engine::execute_dml_concurrent`] with a hook invoked AFTER the off-lock snapshot capture +
-    /// prepare but BEFORE the commit critical section. The concurrency-correctness suite uses this to
-    /// rendezvous two writers at a barrier between snapshot and commit, deterministically forcing the
-    /// SI write-write conflict window (both read the same snapshot, then both try to commit) — the
-    /// lost-update exit criterion. The production entry point passes an empty hook, so this is a
-    /// zero-overhead extraction of the real path, not a separate code path.
-    pub fn execute_dml_concurrent_instrumented(
-        &self,
-        txn_id: u64,
-        text: &str,
-        on_prepared: impl FnOnce(),
-    ) -> Result<(), ExecuteError> {
-        if self.is_commit_path_poisoned() {
-            return Err(ExecuteError::Engine(EngineError::Durability(
-                "commit path is wedged; restart recovery required".to_string(),
-            )));
-        }
-        if self.transaction_snapshot_handle(txn_id).is_some() {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "instrumented concurrent DML is autocommit-only; an active transaction must use the serialized private-generation entry"
-                    .to_string(),
-            )));
-        }
-        let cmd = parse_command(text)?;
-        if self.repl_role() != Role::Leader {
-            return Err(ExecuteError::Engine(EngineError::NotLeader));
-        }
-        // A table's very first write may precede any data-triggered admission. Build its
-        // empty/current device generation under the same publication cut before the off-lock
-        // prepare; thereafter every authoritative DML and constraint verdict remains device-current.
-        self.ensure_dml_device_generation(&cmd)?;
-        // (1) Begin: an explicit transaction reuses its lifetime generation and registry hold;
-        // an autocommit statement captures and temporarily registers the newest scalar boundary.
-        // The retained scope is entered ONLY around prepare below. Letting it leak into the wave
-        // sequencer's commit-time re-resolve would make a publisher mutate against old resources.
-        let transaction_snapshot = self.transaction_snapshot_handle(txn_id);
-        let read_snapshot = transaction_snapshot
-            .as_ref()
-            .map_or_else(|| self.committed_seq(), |snapshot| snapshot.boundary);
-        let _snapshot_guard = transaction_snapshot
-            .is_none()
-            .then(|| self.register_active_snapshot(read_snapshot));
-
-        // (2) Prepare OFF-LOCK at the read snapshot: validate constraints + compute the conflict
-        // write-set. (The delta itself is recomputed at commit_seq under the lock so the live apply
-        // matches a WAL replay; this off-lock pass is the expensive validation + the write-set.)
-        // P2 (write-path assessment): the separate `preflight_unique_index_constraints` pass this
-        // path used to run first was a full duplicate of the validation `prepare_dml` performs —
-        // same validator fns, same error messages — but at a WORSE visibility boundary (the facade
-        // txn id rather than the pinned read snapshot), and it cost an extra O(table)
-        // materialization per statement. The prepare below is the authoritative off-lock
-        // validation; the serialized `execute_text` path keeps its preflight, where it is the gate
-        // that stops a constraint-violating statement from ever reaching the WAL.
-        // Ledger #18 audit fix: capture the catalog generation BEFORE the prepare — the
-        // prepare's own catalog bind is at least this fresh, so a stamp match at re-resolve
-        // proves no constraint-adding DDL landed since the off-lock validation (a capture
-        // AFTER prepare could miss a DDL slipping between the bind and the capture).
-        let prepared_catalog_seq = transaction_snapshot.as_ref().map_or_else(
-            || self.catalog_snapshot().commit_seq,
-            |snapshot| snapshot.catalog.commit_seq,
-        );
-        let snapshot = transaction_snapshot.as_ref().map_or_else(
-            || self.dml_read_snapshot(read_snapshot),
-            |generation| DmlReadSnapshot {
-                commit_seq: generation.boundary,
-                next_row_id: generation.next_row_id,
-            },
-        );
-        let prepared = {
-            const GENERATION_RETRIES: usize = 64;
-            let mut attempts = 0;
-            loop {
-                let result = if let Some(generation) = transaction_snapshot.as_ref() {
-                    let _scope = self.enter_transaction_read(Arc::clone(generation));
-                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
-                } else {
-                    self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::WaveOffLock)
-                };
-                match result {
-                    Ok(prepared) => break prepared,
-                    Err(error)
-                        if attempts < GENERATION_RETRIES
-                            && is_device_prepare_verdict_unavailable(&error) =>
-                    {
-                        attempts += 1;
-                        // A classic commit can replace/invalidate a generation between the
-                        // pre-prepare admission and this off-lock probe. Re-enter the same
-                        // device-only admission barrier and retry at the already-pinned snapshot;
-                        // unsupported predicates still exhaust the bound and fail loud.
-                        self.ensure_dml_device_generation(&cmd)?;
-                        std::thread::yield_now();
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        };
-        // The snapshot is now pinned and prepare is done; the commit critical section has not started.
-        // (Tests barrier here to align two writers' snapshots before their commits race.)
-        on_prepared();
-
-        // Carry the off-lock delta forward for device unique-history validation. Reuse-eligible
-        // inserts may additionally re-key this delta under the catalog-generation gate; every
-        // other shape still takes the normal authoritative re-prepare after conflict validation.
-        let write_set = prepared.write_set.clone();
-        let offlock_delta = Some(prepared);
-
-        // (3) Commit: enqueue into the deterministic commit WAVE (ledger #6) and wait for the
-        // sequencer to durably commit + publish it (or abort it with a retryable conflict).
-        self.commit_dml_concurrent(
-            txn_id,
-            cmd,
-            text,
-            write_set,
-            read_snapshot,
-            prepared_catalog_seq,
-            offlock_delta,
-        )
-    }
-
     /// Off-lock prepare dispatch: run the pure `prepare_*` for a DML command against `snapshot`.
     /// `insert_validation` = `Full` off-lock (the authoritative validation);
     /// `ReResolveDeviceCovered` only from the sequencer's under-lock re-resolve (device history +
@@ -757,7 +634,7 @@ impl Engine {
         read_snapshot: Index,
         prepared_catalog_seq: Index,
         offlock_delta: Option<crate::write_path::WriteDelta>,
-    ) -> Result<(), ExecuteError> {
+    ) -> Result<DmlExecutionResult, ExecuteError> {
         let item = CommitWaveItem {
             txn_id,
             cmd,
@@ -774,10 +651,15 @@ impl Engine {
         // pipeline's pending tails as a fallback claimer (the classic per-statement blocking arm).
         // (U1: the classic blocking APIs keep their `()` signature — rows-affected surfaces via
         // the intent path; the count is dropped here, not fabricated.)
-        if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
-            return result.map(|_| ());
-        }
-        self.await_commit_wave_outcome(&outcome).map(|_| ())
+        let rows_affected = if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
+            result?
+        } else {
+            self.await_commit_wave_outcome(&outcome)?
+        };
+        Ok(DmlExecutionResult {
+            rows_affected,
+            returning: outcome.take_returning(),
+        })
     }
 
     /// E2.2(c) — build a covered-INSERT wave item (the intent fast path's per-statement item),
@@ -1643,6 +1525,9 @@ impl Engine {
             )));
         }
         let cmd = parse_command(text)?;
+        if command_has_returning(&cmd) {
+            return Err(discarded_returning_error());
+        }
         if self.transaction_snapshot_handle(txn_id).is_some() {
             if matches!(
                 &cmd,

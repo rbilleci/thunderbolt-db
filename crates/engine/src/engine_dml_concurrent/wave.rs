@@ -779,6 +779,14 @@ impl Engine {
                 }
             };
             let item_rows = delta.rows_affected();
+            let returning = match self.project_dml_returning(&item.cmd, &delta, commit_seq) {
+                Ok(returning) => returning,
+                Err(error) => {
+                    item.set_outcome(Err(error));
+                    continue;
+                }
+            };
+            item.outcome.set_returning(returning);
             hp!(2);
 
             // (3c) Assign the seq for real: WAL append + propose (the sequencer is the single

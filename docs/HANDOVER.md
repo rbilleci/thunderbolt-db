@@ -17,8 +17,11 @@ This file records only the current boundary and where the next agent resumes. `P
 - READ-002's BENCH prerequisite milestone is complete: a typed, exact-generation `(int4, int8)` GPU equality
   directory provides O(1) lookup, on-device exact-key/MVCC checks, fixed-width gathering, nonzero index/cache
   evidence, and zero cold access. Its broader type breadth remains deferred under READ-002 after BENCH evidence.
-- The active BENCH prerequisite sequence now starts at **PRODUCT-002** canonical SQL/type support, then
-  **PRODUCT-001** prepared engine-backed serving. No PRODUCT-002 implementation has been entered yet.
+- PRODUCT-002's canonical SQL/type milestone is complete: the immutable schema and W1 DML parse unchanged, required
+  typed parameters/codecs are available, named resident indexes mutate incrementally, and checked UPDATE plus DML
+  `RETURNING` stay on GPU execution/result paths. Broader catalog/type breadth remains blocked under PRODUCT-002
+  until BENCH evidence.
+- The active BENCH prerequisite is now **PRODUCT-001** prepared engine-backed serving.
 - Physical multi-GPU work remains user-parked under **MULTI-001/002/003**.
 
 ## Integrated baseline — preserve it
@@ -30,46 +33,40 @@ This file records only the current boundary and where the next agent resumes. `P
   the host may decode the single bounded frame only for final protocol values.
 - Empty results do not bypass type, width, ORDER, timestamp, bool, or aggregate-shape validation. Launched errors
   drain before pool reuse, and nullable or filtered-out rows cannot manufacture overflow.
-- The canonical report card is the result-path regression gate. The accepted RETIRE-003 card reached
-  **232.466M/s at p50 156us** in-L2 and **197.040M/s at p50 206us** out-of-L2 at batch 65,536. Layer-1 rooflines were
-  **1,478.8/1,441.1 GB/s**; the 48M-row fixture built in **1,683.3s** with zero late residency work.
+- The canonical report card is the result-path regression gate. PRODUCT-002's final card reached
+  **231.634M/s at p50 156us** in-L2 and **200.515M/s at p50 203us** out-of-L2 at batch 65,536. Layer-1 rooflines were
+  **1,443.1/1,449.9 GB/s**; the 48M-row fixture built in **1,707.7s** with zero late residency work.
 
 ## Resume here
 
-1. Start the **PRODUCT-002** BENCH milestone: exact schema, SQL-placeholder and wire/OID type handling,
-   compound secondary indexes, resident publication plus live mutation maintenance of every named index,
-   `RETURNING`, and expression UPDATE. READ-002's completed directory is generation-scoped and O(rows) to build;
-   PRODUCT-002 must maintain or replace it without rebuilding the full 10M-row accounts directory per mutation.
-   Do not treat the current reprepare-on-INSERT/UPDATE behavior as BENCH-ready mutation evidence.
-2. Follow with the **PRODUCT-001** BENCH milestone: engine-backed
+1. Start the **PRODUCT-001** BENCH milestone: engine-backed
    Parse/Bind/Execute, prepared R1/W1, atomic T8/T32, durable synchronous acknowledgement, and pre-WAL enforcement
    of every manifest numeric route envelope. Do not add workload behavior to the legacy host-relational endpoint.
-3. Resume **BENCH-001** for its remaining seed/open-loop driver, tuned PostgreSQL profile, artifacts, quiet-window
+2. Resume **BENCH-001** for its remaining seed/open-loop driver, tuned PostgreSQL profile, artifacts, quiet-window
    qualification, and sustained plus `B01`–`B10` execution. The mutation wrapper is already repaired and audited;
    do not redo it or substitute P8 microbenchmarks.
-4. Take **DUR-001** only after preserving the accepted pre-DUR BENCH artifact, then rerun the affected cohorts for
+3. Take **DUR-001** only after preserving the accepted pre-DUR BENCH artifact, then rerun the affected cohorts for
    checkpoint-policy overhead. **ROUTE-001** and **SCALE-001** remain downstream of BENCH evidence.
-5. Keep **RETIRE-002** outside these slices unless its device-native repair prerequisites are satisfied and PLAN
+4. Keep **RETIRE-002** outside these slices unless its device-native repair prerequisites are satisfied and PLAN
    explicitly promotes it.
 
 ## Last green evidence — 2026-07-19
 
-- Engine library: **952/952** including ignored GPU tests on the exact candidate (**265.33s**). Execution library:
-  **121/121** (**16.50s**). Ordinary and release suites pass **461/461** engine plus **50/50** execution; workspace
-  all-target/all-feature check, strict execution/engine Clippy, rustfmt, and diff whitespace are clean.
-- The canonical compound READ route passed three sequential plus two simultaneous HAZARD runs with zero CUDA
-  700/716/717. Independent engine, kernel/accounting, and evidence audits are clean; every concrete finding was
-  adopted.
-- The canonical two-layer/two-cache report card completed with exit 0. Production compact reached
-  **230.621M/s at p50 158us** in-L2 and **201.845M/s at p50 199us** out-of-L2; raw rooflines were
-  **1,481.4/1,440.6 GB/s**, isolated gather **349.5/155.3 GB/s**, and GROUP BY **1,674.9M elements/s**. The 48M-row
-  fixture built in **1,623.9s** with zero late residency work. An initial legacy-cache regression was independently
-  reproduced against clean HEAD and removed by separating the compound route cache; the final branch shape and card
-  are back inside the accepted RETIRE-003 envelope.
+- Workspace tests pass, including engine **466 passed/501 GPU-ignored**, execution **52/75**, SQL **33/0**, facade
+  **41/9**, protocol **71 plus 127 binary tests**, integration suites, and doc tests. Workspace all-target check,
+  strict affected Clippy, scoped rustfmt, source-size, and diff-whitespace gates are clean.
+- PRODUCT-002's final candidate passed three sequential plus two simultaneous HAZARD runs at 2/2 each with zero
+  CUDA 700/716/717. Independent per-slice and final adversarial audits are clean after every concrete finding was
+  adopted, including API result-discard, NULL arithmetic, and old typed-WAL compatibility seams.
+- The canonical two-layer/two-cache report card completed with exit 0. Production compact reached the best
+  PRODUCT-002 result of **231.634M/s at p50 156us** in-L2 and **200.515M/s at p50 203us** out-of-L2; raw rooflines were
+  **1,443.1/1,449.9 GB/s**, isolated gather **349.5/155.3 GB/s**, and GROUP BY **1,674.2M elements/s**. The out-of-L2
+  point path is 0.8% above the immediately preceding slice and within 0.7% of the historical best. The 48M-row
+  fixture built in **1,707.7s** with zero late residency work.
 - Tokio-postgres, SQLx, and node-postgres smokes pass. Full psql/application-driver harnesses were locally
   prerequisite-limited by absent libpq connection variables and missing Python 3.14 `pip`, not by product failures.
 - BENCH-001's stale mutation boundary is repaired and sabotage-gated, but no sustained/peak result exists yet.
-  READ-002's canonical milestone is complete; PLAN now promotes PRODUCT-002 → PRODUCT-001 before the remaining
+  READ-002 and PRODUCT-002 canonical milestones are complete; PLAN now promotes PRODUCT-001 before the remaining
   runner and campaign work. DUR-001 remains blocked until the pre-DUR result is preserved.
 
 ## Required operations

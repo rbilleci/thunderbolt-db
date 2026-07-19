@@ -54,6 +54,68 @@ fn execute_set_updates_state_machine() {
 }
 
 #[test]
+fn enqueue_dml_rejects_returning_before_queue_or_mutation() {
+    let mut e = Engine::new_local_test_engine();
+    e.execute_text(1, "CREATE TABLE returning_t (id INT PRIMARY KEY)")
+        .unwrap();
+    let pending_before = e.batcher().len();
+    let commits_before = e.metrics().snapshot().commits_total;
+
+    let error = e
+        .enqueue_set_text(
+            2,
+            "INSERT INTO returning_t VALUES (1) RETURNING id",
+            Instant::now(),
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("requires a result-bearing execution API"),
+        "{error}"
+    );
+    assert_eq!(e.batcher().len(), pending_before);
+    assert_eq!(e.metrics().snapshot().commits_total, commits_before);
+    assert!(e
+        .execute_relational_select_text("SELECT id FROM returning_t")
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[test]
+fn serialized_commit_apis_reject_returning_before_mutation() {
+    let e = Engine::new_local_test_engine();
+    e.execute_text(
+        1,
+        "CREATE TABLE serialized_returning_t (id INT PRIMARY KEY)",
+    )
+    .unwrap();
+    let commits_before = e.metrics().snapshot().commits_total;
+    let sql: Arc<[u8]> =
+        Arc::from(&b"INSERT INTO serialized_returning_t VALUES (1) RETURNING id"[..]);
+
+    for error in [
+        e.commit_mutation(2, Arc::clone(&sql)).unwrap_err(),
+        e.commit_mutation_at(3, Arc::clone(&sql), 123).unwrap_err(),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("requires a result-bearing execution API"),
+            "{error}"
+        );
+    }
+    assert_eq!(e.metrics().snapshot().commits_total, commits_before);
+    assert!(e
+        .execute_relational_select_text("SELECT id FROM serialized_returning_t")
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[test]
 fn execute_set_accepts_session_and_local_scope_aliases() {
     let e = Engine::new_local_test_engine();
     e.execute_text(1, "SET SESSION balance=100").unwrap();

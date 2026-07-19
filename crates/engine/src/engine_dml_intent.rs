@@ -1057,6 +1057,7 @@ impl Engine {
             table: route.table.clone(),
             columns: Vec::new(),
             rows: vec![values.clone()],
+            returning: Vec::new(),
         });
         // E2.2(b): pre-encode the W5a binary record with a PLACEHOLDER row id (0). The sequencer
         // patches the real id at `binary_row_id_offset`. Encoding is a pure function of the row

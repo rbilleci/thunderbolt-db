@@ -997,6 +997,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pre_product_002_typed_dml_bodies_remain_canonical() {
+        const OLD_BODIES: [&[u8]; 3] = [
+            br#"{"Insert":{"table":"t","columns":["id"],"rows":[[{"Int4":1}]]}}"#,
+            br#"{"Update":{"table":"t","assignments":[{"column":"v","value":{"Int8":1}}],"filter":null,"filters":[],"filter_groups":[]}}"#,
+            br#"{"Delete":{"table":"t","filter":null,"filters":[],"filter_groups":[]}}"#,
+        ];
+
+        for old_body in OLD_BODIES {
+            let mut operation =
+                Vec::with_capacity(ENGINE_OPERATION_MAGIC.len() + 12 + old_body.len());
+            operation.extend_from_slice(ENGINE_OPERATION_MAGIC);
+            operation.push(ENGINE_OPERATION_CODEC_TYPED_COMMAND);
+            operation.extend_from_slice(&[0; 3]);
+            operation.extend_from_slice(&(old_body.len() as u64).to_le_bytes());
+            operation.extend_from_slice(old_body);
+
+            let replay = Engine::decode_engine_operation(&operation)
+                .expect("pre-PRODUCT-002 canonical body must remain replayable");
+            let command = Engine::decode_engine_command(&replay)
+                .expect("typed replay body")
+                .expect("typed command");
+            assert_eq!(serde_json::to_vec(&command).unwrap(), old_body);
+        }
+    }
+
+    #[test]
     fn canonical_record_is_active_and_same_id_retry_resolves_exactly() {
         let engine = Engine::new_local();
         let payload: Arc<[u8]> = Arc::from(&b"SET canonical=value"[..]);

@@ -1339,10 +1339,38 @@ impl Engine {
         filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
         visibility: StorageVisibility,
     ) -> Option<(ClassDmlMatches, u64)> {
-        let entry = self
-            .read_streaming_cold_chunks()
-            .get(&table.name)
-            .cloned()?;
+        self.resolve_class_dml_matches_inner(table, filter_groups, visibility, None)
+            .ok()
+            .flatten()
+            .map(|(matches, _, epoch)| (matches, epoch))
+    }
+
+    pub(crate) fn resolve_class_update_matches(
+        &self,
+        table: &RelationalTable,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        visibility: StorageVisibility,
+        assignments: &[BoundUpdateAssignment],
+    ) -> Result<Option<ClassDmlUpdateWithEpoch>, EngineError> {
+        self.resolve_class_dml_matches_inner(table, filter_groups, visibility, Some(assignments))
+    }
+
+    fn resolve_class_dml_matches_inner(
+        &self,
+        table: &RelationalTable,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        visibility: StorageVisibility,
+        assignments: Option<&[BoundUpdateAssignment]>,
+    ) -> Result<Option<ClassDmlUpdateWithEpoch>, EngineError> {
+        macro_rules! some_or_decline {
+            ($value:expr) => {
+                match $value {
+                    Some(value) => value,
+                    None => return Ok(None),
+                }
+            };
+        }
+        let entry = some_or_decline!(self.read_streaming_cold_chunks().get(&table.name).cloned());
         #[cfg(test)]
         let resolve_pin_hook = {
             class_resolve_pin_hook()
@@ -1361,47 +1389,70 @@ impl Engine {
         // its matches materialize from the RECHECKED slots (the reverse-gather decoder stays
         // off the point-DML hot path). Anything else (range/OR/NULL/no covering key/any probe
         // failure) falls to the fold path below — never a decline.
-        if let Some(matches) = self.resolve_class_dml_via_key_probe(
+        if let Some((matches, old_rows)) = self.resolve_class_dml_via_key_probe(
             table,
             filter_groups,
             visibility.read_txn_id,
             &entry,
-        ) {
+            assignments,
+        )? {
             self.read_state
                 .residency
                 .chunk_class_dml_key_locates
                 .fetch_add(1, Ordering::Relaxed);
-            return Some((matches, epoch));
+            return Ok(Some((matches, old_rows, epoch)));
         }
-        let predicate =
-            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)?;
+        let predicate = some_or_decline!(
+            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)
+        );
         // Keep coordinates, row images, and the returned epoch on ONE pinned entry Arc. This
         // resolver can run off-lock; reloading inside locate would let a concurrent tail/stamp/
         // compaction publish E2, then interpret E2 coordinates against E1 below and poison the
         // prepare-time write-set used by SI conflict detection.
-        let located = self.locate_streaming_cold_slots_in_entry(
+        let located = some_or_decline!(self.locate_streaming_cold_slots_in_entry(
             table,
             &predicate,
             visibility.read_txn_id,
             &entry,
             None,
-        )?;
+        ));
         let mut matches: ClassDmlMatches = Vec::new();
+        let mut old_rows = Vec::new();
         for (chunk_idx, slots) in &located {
-            let chunk = entry.chunks.get(*chunk_idx)?;
-            let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
-            let (src, _vis) = staged.ready().ok()?;
+            let chunk = some_or_decline!(entry.chunks.get(*chunk_idx));
+            let staged = some_or_decline!(self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok());
+            let (src, _vis) = some_or_decline!(staged.ready().ok());
+            let mut images = Vec::with_capacity(slots.len());
             for slot in slots {
                 // The device locate already decided the exact predicate + visibility. Read
                 // back only the approved row image; never decode the host cold payload here.
-                let image = self.read_cold_chunk_slot_values(table, chunk, &src, *slot as usize)?;
+                let image = some_or_decline!(self.read_cold_chunk_slot_values(
+                    table,
+                    chunk,
+                    &src,
+                    *slot as usize
+                ));
+                images.push(image);
+            }
+            if let Some(assignments) = assignments {
+                old_rows.extend(images.iter().cloned());
+                self.apply_update_assignments_on_device(
+                    table,
+                    assignments,
+                    &src.descriptor,
+                    &src.device_memory,
+                    slots,
+                    &mut images,
+                )?;
+            }
+            for (slot, image) in slots.iter().zip(images) {
                 let pseudo_id = ((*chunk_idx as u64) << 32) | u64::from(*slot);
-                let entity_id = *chunk.entity_ids.get(*slot as usize)?;
+                let entity_id = *some_or_decline!(chunk.entity_ids.get(*slot as usize));
                 let key = crate::rel_exec_helpers::relational_row_key(&table.name, entity_id);
                 matches.push((pseudo_id, key, image));
             }
         }
-        Some((matches, epoch))
+        Ok(Some((matches, old_rows, epoch)))
     }
 
     /// P5-3 — the by-key DML locate: serve a single-group ALL-Eq WHERE that covers some unique
@@ -1416,31 +1467,40 @@ impl Engine {
         filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
         rtx: Index,
         entry: &Arc<ColdTableChunks>,
-    ) -> Option<ClassDmlMatches> {
+        assignments: Option<&[BoundUpdateAssignment]>,
+    ) -> Result<Option<ClassDmlUpdate>, EngineError> {
+        macro_rules! some_or_decline {
+            ($value:expr) => {
+                match $value {
+                    Some(value) => value,
+                    None => return Ok(None),
+                }
+            };
+        }
         // Audit MEDIUM (P5-3): mirror the fold locate's `rtx < freeze` DECLINE exactly — a
         // sub-freeze reader boundary must drive the caller's DE-AUTH (the frozen chains serve
         // it), never a silent 0-row DML (every class chunk is born at-or-above the freeze, so
         // the recheck's born gate would mask ALL hits and quietly bypass the safety valve).
         if let Some(freeze) = self.table_chunk_authoritative(&table.name) {
             if rtx < freeze {
-                return None;
+                return Ok(None);
             }
         }
         let [group] = filter_groups else {
-            return None; // OR groups keep the fold
+            return Ok(None); // OR groups keep the fold
         };
         if group.is_empty()
             || group
                 .iter()
                 .any(|(_, op, value)| *op != SelectFilterOp::Eq || matches!(value, SqlValue::Null))
         {
-            return None; // range / NULL-Eq keep the fold (host WHERE-NULL semantics ride it)
+            return Ok(None); // range / NULL-Eq keep the fold (host WHERE-NULL semantics ride it)
         }
         let eq_positions: std::collections::BTreeMap<usize, &SqlValue> =
             group.iter().map(|(idx, _, value)| (*idx, value)).collect();
         // The FIRST unique index fully covered by the Eq columns carries the probe.
         let (key_id, positions) =
-            table
+            some_or_decline!(table
                 .indexes
                 .iter()
                 .enumerate()
@@ -1454,46 +1514,72 @@ impl Engine {
                         .iter()
                         .all(|position| eq_positions.contains_key(position))
                         .then_some((key_id, positions))
-                })?;
+                }));
         // Synthesize the needle row: key positions carry the Eq values (chunk_key_needle reads
         // ONLY the key positions).
         let mut needle_row: Vec<SqlValue> = vec![SqlValue::Null; table.columns.len()];
         for &position in &positions {
-            needle_row[position] = (*eq_positions.get(&position)?).clone();
+            needle_row[position] = (*some_or_decline!(eq_positions.get(&position))).clone();
         }
-        let needle = Self::chunk_key_needle(table, &positions, &needle_row)?;
-        let (hits, _) =
-            self.chunk_key_candidate_positions(table, entry, &positions, key_id, &[needle])?;
+        let needle = some_or_decline!(Self::chunk_key_needle(table, &positions, &needle_row));
+        let (hits, _) = some_or_decline!(self.chunk_key_candidate_positions(
+            table,
+            entry,
+            &positions,
+            key_id,
+            &[needle]
+        ));
         let candidate_positions: std::collections::BTreeSet<usize> =
-            hits.first()?.iter().copied().collect();
+            some_or_decline!(hits.first()).iter().copied().collect();
         if candidate_positions.is_empty() {
-            return Some(Vec::new());
+            return Ok(Some((Vec::new(), Vec::new())));
         }
-        let exact_predicate =
-            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)?;
-        let exact = self.locate_streaming_cold_slots_in_entry(
+        let exact_predicate = some_or_decline!(
+            crate::engine_dml_prepare::dml_filter_groups_to_device_predicate(table, filter_groups)
+        );
+        let exact = some_or_decline!(self.locate_streaming_cold_slots_in_entry(
             table,
             &exact_predicate,
             rtx,
             entry,
             Some(&candidate_positions),
-        )?;
+        ));
         let mut matches: ClassDmlMatches = Vec::new();
+        let mut old_rows = Vec::new();
         for (position, slots) in exact {
-            let chunk = entry.chunks.get(position)?;
-            let staged = self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok()?;
-            let (src, _vis) = staged.ready().ok()?;
-            for slot in slots {
+            let chunk = some_or_decline!(entry.chunks.get(position));
+            let staged = some_or_decline!(self.stage_cold_chunk(chunk, chunk.payload_copin_s).ok());
+            let (src, _vis) = some_or_decline!(staged.ready().ok());
+            let mut images = Vec::with_capacity(slots.len());
+            for slot in &slots {
                 // The exact device pass above already decided visibility + the complete
                 // predicate. This is the one final value readback needed to stage the DML image.
-                let row = self.read_cold_chunk_slot_values(table, chunk, &src, slot as usize)?;
+                images.push(some_or_decline!(self.read_cold_chunk_slot_values(
+                    table,
+                    chunk,
+                    &src,
+                    *slot as usize,
+                )));
+            }
+            if let Some(assignments) = assignments {
+                old_rows.extend(images.iter().cloned());
+                self.apply_update_assignments_on_device(
+                    table,
+                    assignments,
+                    &src.descriptor,
+                    &src.device_memory,
+                    &slots,
+                    &mut images,
+                )?;
+            }
+            for (slot, row) in slots.into_iter().zip(images) {
                 let pseudo_id = ((position as u64) << 32) | u64::from(slot);
-                let entity_id = *chunk.entity_ids.get(slot as usize)?;
+                let entity_id = *some_or_decline!(chunk.entity_ids.get(slot as usize));
                 let key = crate::rel_exec_helpers::relational_row_key(&table.name, entity_id);
                 matches.push((pseudo_id, key, row));
             }
         }
-        Some(matches)
+        Ok(Some((matches, old_rows)))
     }
 
     /// P4-2b-ii — the commit hook's STAMP arm: verify the COORDINATE TOKEN (the entry installed

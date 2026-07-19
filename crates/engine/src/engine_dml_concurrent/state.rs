@@ -1,8 +1,8 @@
 //! Commit-wave and lane item ownership shared by the concurrent DML subpaths.
 
 use super::{
-    AtomicOrdering, AtomicU64, Command, Engine, EngineError, ExecuteError, Index, Mutex, SqlValue,
-    WriteSet,
+    AtomicOrdering, AtomicU64, Command, Engine, EngineError, ExecuteError, Index, Mutex,
+    RelationalSelectResult, SqlValue, WriteSet,
 };
 use std::sync::Arc;
 
@@ -71,6 +71,7 @@ pub(crate) type CommitWaveOutcome = Arc<CommitWaveDone>;
 pub(crate) struct CommitWaveDone {
     pub(super) done: std::sync::atomic::AtomicBool,
     result: Mutex<Option<Result<u64, ExecuteError>>>,
+    returning: Mutex<Option<RelationalSelectResult>>,
 }
 
 impl CommitWaveDone {
@@ -83,6 +84,20 @@ impl CommitWaveDone {
             return None;
         }
         self.result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    pub(crate) fn set_returning(&self, returning: Option<RelationalSelectResult>) {
+        *self
+            .returning
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = returning;
+    }
+
+    pub(crate) fn take_returning(&self) -> Option<RelationalSelectResult> {
+        self.returning
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
@@ -216,6 +231,7 @@ pub(crate) fn new_pending_outcome() -> CommitWaveOutcome {
     Arc::new(CommitWaveDone {
         done: std::sync::atomic::AtomicBool::new(false),
         result: Mutex::new(None),
+        returning: Mutex::new(None),
     })
 }
 

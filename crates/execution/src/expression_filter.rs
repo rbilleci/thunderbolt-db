@@ -7,7 +7,10 @@
 use std::os::raw::c_void;
 
 use crate::cuda_context::{check_cuda, PooledBufferLease};
-use crate::expression_vm::{run_resident_arith_program, ExprStep, ExprTerminal, ResidentElemType};
+use crate::expression_vm::{
+    run_resident_arith_program, run_resident_arith_program_at_indices, ExprStep, ExprTerminal,
+    ResidentElemType,
+};
 use crate::resident_compare_ordered::{
     launch_cuda_buffer_i32_compare_indices_ordered,
     launch_cuda_resident_i32_compare_buffers_indices_ordered, validate_ordered_i32_comparison,
@@ -220,6 +223,104 @@ pub(super) fn launch_cuda_arith_value_column_at_indices(
         // i128 (numeric) sort expressions are not yet supported here.
         ResidentElemType::I128 => {
             drop(value);
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+    }
+    Ok(out)
+}
+
+/// Evaluate checked arithmetic only at a bounded host-provided coordinate list. The coordinates
+/// are validated before CUDA, uploaded once, and dereferenced by the indexed VM load; the compact
+/// result is the only value data copied back. This is the mutation twin of the read-path survivor
+/// evaluator: rows rejected by UPDATE's WHERE cannot trigger an overflow or be read as operands.
+pub(super) fn launch_cuda_arith_value_column_at_selected_indices(
+    resident: &CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    source_row_count: u64,
+    indices: &[u32],
+    elem: ResidentElemType,
+) -> Result<Vec<i64>, CudaRuntimeProbeError> {
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    if source_row_count == 0
+        || indices
+            .iter()
+            .any(|index| u64::from(*index) >= source_row_count)
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(indices.len()));
+    }
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let index_bytes = indices
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(indices.len()))?;
+    let index_device = primary.lease_device_buffer(index_bytes)?;
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            index_device.ptr,
+            indices.as_ptr().cast::<c_void>(),
+            index_bytes,
+        )
+    })?;
+    let survivor_count = indices.len() as u64;
+    let mut stack = run_resident_arith_program_at_indices(
+        resident,
+        program,
+        index_device.ptr,
+        survivor_count,
+        source_row_count,
+        elem,
+    )?;
+    let value = stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !stack.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    let mut out = Vec::with_capacity(indices.len());
+    match elem {
+        ResidentElemType::I32 => {
+            let mut host = vec![0i32; indices.len()];
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(
+                    host.as_mut_ptr().cast::<c_void>(),
+                    value.ptr,
+                    indices.len() * std::mem::size_of::<i32>(),
+                )
+            })?;
+            out.extend(host.into_iter().map(i64::from));
+        }
+        ResidentElemType::I64 => {
+            let mut host = vec![0i64; indices.len()];
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(
+                    host.as_mut_ptr().cast::<c_void>(),
+                    value.ptr,
+                    indices.len() * std::mem::size_of::<i64>(),
+                )
+            })?;
+            out = host;
+        }
+        ResidentElemType::I128 => {
             return Err(CudaRuntimeProbeError::InvalidInputLength(0));
         }
     }

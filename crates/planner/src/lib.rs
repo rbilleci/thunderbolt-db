@@ -294,11 +294,13 @@ mod tests {
                     op: gpu_db_sql::SelectFilterOp::Eq,
                     value: gpu_db_sql::SqlValue::Int4(1),
                 }]],
+                returning: Vec::new(),
             }),
             Command::Update(gpu_db_sql::Update {
                 table: "t".to_string(),
                 assignments: vec![gpu_db_sql::UpdateAssignment {
                     column: "name".to_string(),
+                    source_column: None,
                     value: gpu_db_sql::SqlValue::Text("updated".to_string()),
                 }],
                 filter: None,
@@ -312,6 +314,7 @@ mod tests {
                     op: gpu_db_sql::SelectFilterOp::Eq,
                     value: gpu_db_sql::SqlValue::Int4(1),
                 }]],
+                returning: Vec::new(),
             }),
             Command::Begin,
             Command::Commit { chain: false },

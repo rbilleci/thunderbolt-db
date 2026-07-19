@@ -7,6 +7,171 @@ mod constraint_elision;
 mod lane_lifecycle;
 mod wide_unique_index;
 
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn product_002_w1_checked_updates_and_returning_are_device_native() {
+    let engine = Engine::new_local_test_engine();
+    engine.set_auto_admit_on_commit(true);
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE accounts (tenant_id int4, account_id int8, balance_cents int8, \
+             version int8, status int2, PRIMARY KEY (tenant_id, account_id))",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            2,
+            "CREATE TABLE ledger_entries (entry_id int8 PRIMARY KEY, tenant_id int4, \
+             account_id int8, transfer_id uuid, amount_cents int8, direction int2, \
+             created_seq int8)",
+        )
+        .unwrap();
+    engine
+        .execute_text(
+            3,
+            "CREATE TABLE pending_entries (tenant_id int4, pending_id int8, account_id int8, \
+             payload int8, PRIMARY KEY (tenant_id, pending_id))",
+        )
+        .unwrap();
+    engine
+        .execute_dml_concurrent(
+            4,
+            "INSERT INTO accounts VALUES (7, 70001::int8, 1000::int8, 0::int8, 1::int2)",
+        )
+        .unwrap();
+    engine
+        .execute_dml_concurrent(
+            5,
+            "INSERT INTO pending_entries VALUES (7, 55::int8, 70001::int8, 9::int8)",
+        )
+        .unwrap();
+
+    let inserted = engine
+        .execute_dml_concurrent_with_result(
+            6,
+            "INSERT INTO ledger_entries \
+             (entry_id, tenant_id, account_id, transfer_id, amount_cents, direction, created_seq) \
+             VALUES (10000000::int8, 7, 70001::int8, \
+             '00112233-4455-6677-8899-aabbccddeeff'::uuid, 25::int8, 1::int2, 6::int8) \
+             RETURNING entry_id",
+        )
+        .unwrap();
+    assert_eq!(inserted.rows_affected, 1);
+    let inserted = inserted.returning.expect("INSERT RETURNING result");
+    assert_eq!(inserted.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(inserted.rows.row(0), &[SqlValue::Int8(10_000_000)]);
+
+    let updated = engine
+        .execute_dml_concurrent_with_result(
+            7,
+            "UPDATE accounts SET balance_cents = balance_cents + -25::int8, \
+             version = version + 1::int8 WHERE tenant_id = 7 AND account_id = 70001::int8 \
+             RETURNING balance_cents, version",
+        )
+        .unwrap();
+    assert_eq!(updated.rows_affected, 1);
+    let updated = updated.returning.expect("UPDATE RETURNING result");
+    assert_eq!(updated.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        updated.rows.row(0),
+        &[SqlValue::Int8(975), SqlValue::Int8(1)]
+    );
+
+    let deleted = engine
+        .execute_dml_concurrent_with_result(
+            8,
+            "DELETE FROM pending_entries WHERE tenant_id = 7 AND pending_id = 55::int8 \
+             RETURNING pending_id",
+        )
+        .unwrap();
+    assert_eq!(deleted.rows_affected, 1);
+    let deleted = deleted.returning.expect("DELETE RETURNING result");
+    assert_eq!(deleted.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(deleted.rows.row(0), &[SqlValue::Int8(55)]);
+
+    engine.execute_text(9, "BEGIN").unwrap();
+    let staged = engine
+        .execute_dml_in_transaction_with_result(
+            9,
+            "UPDATE accounts SET balance_cents = balance_cents + 5::int8, \
+             version = version + 1::int8 WHERE tenant_id = 7 AND account_id = 70001::int8 \
+             RETURNING balance_cents, version",
+        )
+        .unwrap();
+    assert_eq!(
+        staged.returning.unwrap().rows.row(0),
+        &[SqlValue::Int8(980), SqlValue::Int8(2)]
+    );
+    engine.commit_explicit_transaction(9, false).unwrap();
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn product_002_update_arithmetic_scopes_overflow_and_preserves_null() {
+    let engine = Engine::new_local_test_engine();
+    engine.set_auto_admit_on_commit(true);
+    engine
+        .execute_text(1, "CREATE TABLE values_t (id int4 PRIMARY KEY, v int8)")
+        .unwrap();
+    engine
+        .execute_dml_concurrent(
+            2,
+            "INSERT INTO values_t VALUES (1, 10::int8), (2, 9223372036854775807::int8), \
+             (3, NULL)",
+        )
+        .unwrap();
+
+    let selected = engine
+        .execute_dml_concurrent_with_result(
+            3,
+            "UPDATE values_t SET v = v + 1::int8 WHERE id = 1 RETURNING v",
+        )
+        .unwrap();
+    assert_eq!(
+        selected.returning.unwrap().rows.row(0),
+        &[SqlValue::Int8(11)]
+    );
+
+    let overflow = engine
+        .execute_dml_concurrent_with_result(
+            4,
+            "UPDATE values_t SET v = v + 1::int8 WHERE id = 2 RETURNING v",
+        )
+        .unwrap_err();
+    assert!(
+        overflow.to_string().contains("bigint out of range"),
+        "{overflow}"
+    );
+
+    let null = engine
+        .execute_dml_concurrent_with_result(
+            5,
+            "UPDATE values_t SET v = v + 1::int8 WHERE id = 3 RETURNING v",
+        )
+        .unwrap();
+    assert_eq!(null.returning.unwrap().rows.row(0), &[SqlValue::Null]);
+
+    let null_delta = engine
+        .execute_dml_concurrent_with_result(
+            6,
+            "UPDATE values_t SET v = v + NULL WHERE id = 1 RETURNING v",
+        )
+        .unwrap();
+    assert_eq!(null_delta.returning.unwrap().rows.row(0), &[SqlValue::Null]);
+
+    let no_match = engine
+        .execute_dml_concurrent_with_result(
+            7,
+            "UPDATE values_t SET v = v + 1::int8 WHERE id = 99 RETURNING v",
+        )
+        .unwrap();
+    assert_eq!(no_match.rows_affected, 0);
+    let no_match = no_match.returning.expect("zero-row RETURNING keeps schema");
+    assert_eq!(no_match.columns[0].name, "v");
+    assert!(no_match.rows.is_empty());
+}
+
 /// Route preparation is a SHAPE PROOF: a table that is not yet elided
 /// (device-authoritative), or that has no unique index, must be refused with a
 /// clear error instead of silently taking an unvalidated fast path.

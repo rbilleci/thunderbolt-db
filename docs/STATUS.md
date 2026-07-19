@@ -14,6 +14,40 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-002 canonical SQL/type milestone — complete 2026-07-19
+
+- Compound primary and secondary index DDL now accepts the immutable workload schema. Every declared named index is
+  encoded into the resident GPU generation, participates in exact device lookup/constraint decisions, and is
+  maintained through insert, update, delete, shard rollover, rename, and generation publication without rebuilding
+  the full table directory per mutation. Publication is generation- and budget-fenced; indexed NULLs fail before a
+  partial install.
+- SQL placeholder lowering is quote/comment/dollar-quote aware, exact in parameter count, total over UTF-8, and
+  renders required values with explicit int2/int4/int8/numeric/bool/text/date/timestamp/UUID casts while leaving
+  NULL contextual. The facade exposes parameterized execution, and pgwire OID plus text/binary codecs cover the
+  immutable workload's int2/int4/int8/UUID parameters and results.
+- The exact W1 INSERT, UPDATE, and DELETE statements parse unchanged. Checked same-column int4/int8 addition runs
+  only over device-selected coordinates, so rejected rows cannot manufacture overflow; NULL source or delta follows
+  SQL NULL propagation. INSERT/UPDATE/DELETE `RETURNING` projects the committed or transaction-private delta through
+  the general GPU result path, including typed zero-row results. Resultless public APIs and the legacy CPU protocol
+  executors reject these forms before mutation rather than discarding or misexecuting them.
+- Canonical typed-command WAL remains backward byte-compatible: empty `returning` and absent expression-source
+  fields are omitted during serialization, and captured pre-PRODUCT-002 INSERT/UPDATE/DELETE bodies replay
+  canonically. Concurrent commit waves bind returned rows to the final re-resolved delta and acknowledge only after
+  WAL durability and generation publication.
+- Independent adversarial audits covered named-index publication/maintenance, SQL lowering/codecs, DML result
+  lifetime, overflow/NULL/zero-row behavior, class/cold paths, API discard seams, recovery compatibility, CUDA
+  bounds, and legacy fail-loud boundaries. Every finding was adopted; final and post-adjustment re-audits are clean.
+  The final three sequential plus two simultaneous PRODUCT-002 GPU HAZARD runs each pass 2/2 with no CUDA
+  700/716/717. Workspace all-target check, strict affected Clippy, all workspace tests, scoped rustfmt, source-size,
+  and diff-whitespace gates pass.
+- The canonical two-layer/two-cache report card completed with exit 0. Layer-1 `sum_i32` reached
+  **1,443.1/1,449.9 GB/s** in-L2/out-of-L2, isolated gather **349.5/155.3 GB/s**, constant-mask fill
+  **1,159.0/1,463.4 GB/s**, and GROUP BY **1,674.2M elements/s**. Production compact point reads reached the best
+  PRODUCT-002 result of **231.634M/s at p50 156us** in-L2 and **200.515M/s at p50 203us** out-of-L2; the latter is 0.8%
+  above the immediately preceding slice and within 0.7% of the historical best. The 48M-row fixture built in
+  **1,707.7s** with zero late residency work. PRODUCT-001 is now the active BENCH prerequisite; broader persistent
+  GPU catalogs and unrelated type breadth remain blocked under PRODUCT-002 until accepted BENCH evidence.
+
 ## READ-002 canonical compound-key milestone — complete 2026-07-19
 
 - A typed engine-internal prepared route now serves exact unique `(tenant_id int4, account_id int8)` equality from
@@ -34,10 +68,9 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   reprepare, while an in-place DELETE reuses the route and is hidden by its device sidecar. Deterministic tests also
   cover one-plan-budget concurrent preparation, stale-build publication rejection, and retired-plan last-owner
   budget accounting.
-- This milestone intentionally stops at the typed engine API. SQL placeholder lowering, wire/OID codecs, compound
-  secondary-index DDL, `RETURNING`, expression UPDATE, and mutation-stable named-index maintenance remain
-  **PRODUCT-002**. The current directory is O(rows) to build; PRODUCT-002 must maintain or replace it without a full
-  10M-row accounts-directory rebuild per mutation before BENCH-001 can accept the workload route.
+- This milestone intentionally stopped at the typed engine API. PRODUCT-002 subsequently closed its canonical SQL
+  placeholder, wire/OID, compound secondary-index, `RETURNING`, expression UPDATE, and mutation-stable named-index
+  gaps without adding a host relational fallback.
 - Final candidate gates pass: execution **121/121** and engine **952/952** including ignored GPU tests; ordinary and
   release suites pass **50/50** execution plus **461/461** engine; workspace all-target/all-feature check, strict
   execution/engine Clippy, rustfmt, and diff whitespace are clean. The canonical compound route passed three
@@ -50,17 +83,16 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   **230.621M/s at p50 158us** in-L2 and **201.845M/s at p50 199us** out-of-L2. The 48M-row fixture built in
   **1,623.9s** with zero late residency work. These retain the accepted RETIRE-003 performance envelope.
 
-## BENCH-001 execution preflight — blocked 2026-07-19
+## BENCH-001 execution preflight — initial blockers recorded 2026-07-19
 
 - No valid BENCH-001 sustained or `B01`–`B10` result was produced. An exhaustive non-document source search found
   no implementation of the immutable workload's seed, 3.3M+66M open-loop schedule, or fixed peak cohorts; the
   manifest explicitly describes itself as a contract rather than an implementation. Running an older P8 workload
   would not be architecture evidence for ADR-008.
-- The exact schema and SQL cannot currently be loaded/executed unchanged: textual compound secondary indexes are
-  rejected; INSERT/DELETE/UPDATE ASTs have no `RETURNING`; UPDATE assignments accept literals rather than
-  `balance_cents + $3`; the production engine-backed server supports simple query rather than Parse/Bind/Execute;
-  and retained prepared jobs require one int4 equality predicate. The manifest requires compound int4+int8 keys,
-  typed prepared parameters, expression mutations, and atomic T8/T32 routes.
+- At preflight, the exact schema and SQL could not be loaded/executed unchanged. PRODUCT-002 has since closed the
+  compound secondary-index, typed placeholder/codec, `RETURNING`, checked expression UPDATE, and live named-index
+  maintenance gaps. PRODUCT-001 still owns the engine-backed Parse/Bind/Execute serving path, prepared R1/W1,
+  atomic T8/T32 sessions, and manifest route-envelope enforcement required before BENCH-001 can run.
 - The available P8 helper is not a substitute baseline. It generates an unrelated five-column `order_line` table,
   defaults to `postgres:16`, and records selected settings/indexes rather than owning a reproducible tuned
   synchronous-commit/checkpoint profile for the canonical banking workload. Its benchmark endpoint constructs
@@ -78,9 +110,8 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   the ignored NVIDIA in-place append test. Independent adversarial audit findings were adopted. The full legacy P8
   self-check still has an inherited, unrelated `chunked-install-self-check` failure (`count_all returned 0, expected
   16`); BENCH-001 does not treat that suite as its campaign runner.
-- BENCH-001 produced no evidence with which to reorder the broader READ-002, ROUTE-001, or SCALE-001 outcomes. At
-  preflight, the manifest nevertheless proved the compound int4+int8 READ-002 subset was a prerequisite, so PLAN
-  promoted that milestone plus bounded PRODUCT-002/PRODUCT-001 integration. The READ-002 milestone is now complete;
+- BENCH-001 has still produced no evidence with which to reorder broader READ-002, PRODUCT-002, ROUTE-001, or
+  SCALE-001 outcomes. The canonical READ-002 and PRODUCT-002 milestones are now complete, PRODUCT-001 is active,
   ROUTE-001 and SCALE-001 remain downstream, and no checkpoint-overhead baseline exists for DUR-001. DUR-001 was
   not started.
 

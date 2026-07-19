@@ -1,26 +1,26 @@
 //! Relational dispatch and schema, table, index, and DML parsing.
 
 use super::{
-    acl, find_keyword_outside_quotes, find_matching_paren, normalize_identifier,
-    normalize_relation_identifier, parse_comment_on, parse_create_database, parse_create_domain,
-    parse_create_extension, parse_create_function, parse_create_materialized_view,
-    parse_create_publication, parse_create_role, parse_create_sequence, parse_create_subscription,
-    parse_create_tablespace, parse_create_view, parse_drop_database, parse_drop_domain,
-    parse_drop_extension, parse_drop_function, parse_drop_materialized_view,
-    parse_drop_publication, parse_drop_role, parse_drop_sequence, parse_drop_subscription,
-    parse_drop_tablespace, parse_drop_view, parse_refresh_materialized_view, parse_rename_database,
-    parse_rename_function, parse_rename_materialized_view, parse_rename_role,
-    parse_rename_sequence, parse_rename_tablespace, parse_rename_view, parse_select,
-    parse_select_filter, parse_select_filter_groups, parse_select_function,
-    parse_sequence_regclass_arg, parse_sequence_value_function, parse_sql_value,
-    parse_supported_sql_type_name, parse_typed_value_from_str, split_csv,
-    strip_keyword_prefix_case_insensitive, strip_keyword_suffix_case_insensitive,
-    AddCheckConstraint, AddColumn, AddForeignKey, AddPrimaryKey, AddUniqueConstraint,
-    AlterColumnDefault, CheckConstraint, ColumnDef, ColumnDefault, Command, CreateIndex,
-    CreateSchema, CreateTable, Delete, DropColumn, DropConstraint, DropIndex, DropSchema,
-    DropTable, Insert, ParseError, PrimaryKey, RenameColumn, RenameConstraint, RenameIndex,
-    RenameTable, SelectFilter, SelectFilterOp, SqlType, SqlValue, TruncateTable, UniqueConstraint,
-    Update, UpdateAssignment,
+    acl, find_char_outside_quotes, find_keyword_outside_quotes, find_matching_paren,
+    normalize_identifier, normalize_relation_identifier, parse_comment_on, parse_create_database,
+    parse_create_domain, parse_create_extension, parse_create_function,
+    parse_create_materialized_view, parse_create_publication, parse_create_role,
+    parse_create_sequence, parse_create_subscription, parse_create_tablespace, parse_create_view,
+    parse_drop_database, parse_drop_domain, parse_drop_extension, parse_drop_function,
+    parse_drop_materialized_view, parse_drop_publication, parse_drop_role, parse_drop_sequence,
+    parse_drop_subscription, parse_drop_tablespace, parse_drop_view,
+    parse_refresh_materialized_view, parse_rename_database, parse_rename_function,
+    parse_rename_materialized_view, parse_rename_role, parse_rename_sequence,
+    parse_rename_tablespace, parse_rename_view, parse_select, parse_select_filter,
+    parse_select_filter_groups, parse_select_function, parse_sequence_regclass_arg,
+    parse_sequence_value_function, parse_sql_value, parse_supported_sql_type_name,
+    parse_typed_value_from_str, split_csv, strip_keyword_prefix_case_insensitive,
+    strip_keyword_suffix_case_insensitive, AddCheckConstraint, AddColumn, AddForeignKey,
+    AddPrimaryKey, AddUniqueConstraint, AlterColumnDefault, CheckConstraint, ColumnDef,
+    ColumnDefault, Command, CreateIndex, CreateSchema, CreateTable, Delete, DropColumn,
+    DropConstraint, DropIndex, DropSchema, DropTable, Insert, ParseError, PrimaryKey, RenameColumn,
+    RenameConstraint, RenameIndex, RenameTable, SelectFilter, SelectFilterOp, SqlType, SqlValue,
+    TruncateTable, UniqueConstraint, Update, UpdateAssignment,
 };
 
 pub(super) fn parse_relational_command(
@@ -1301,7 +1301,8 @@ fn parse_insert(input: &str) -> Result<Insert, ParseError> {
     let values_pos =
         find_keyword_outside_quotes(rest, "VALUES").ok_or(ParseError::InvalidRelationalSql)?;
     let target = rest[..values_pos].trim();
-    let values = rest[values_pos + "VALUES".len()..].trim_start();
+    let values_and_returning = rest[values_pos + "VALUES".len()..].trim_start();
+    let (values, returning) = split_returning_clause(values_and_returning)?;
     let (table, columns) = if let Some(open) = target.find('(') {
         let close = find_matching_paren(target, open).ok_or(ParseError::InvalidRelationalSql)?;
         if !target[close + 1..].trim().is_empty() {
@@ -1350,6 +1351,7 @@ fn parse_insert(input: &str) -> Result<Insert, ParseError> {
         table,
         columns,
         rows,
+        returning,
     })
 }
 
@@ -1361,7 +1363,8 @@ fn parse_delete(input: &str) -> Result<Delete, ParseError> {
     let where_pos =
         find_keyword_outside_quotes(rest, "WHERE").ok_or(ParseError::InvalidRelationalSql)?;
     let table = normalize_relation_identifier(rest[..where_pos].trim())?;
-    let filter_input = rest[where_pos + "WHERE".len()..].trim();
+    let (filter_input, returning) =
+        split_returning_clause(rest[where_pos + "WHERE".len()..].trim())?;
     if filter_input.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
@@ -1372,6 +1375,7 @@ fn parse_delete(input: &str) -> Result<Delete, ParseError> {
         filter: filters.first().cloned(),
         filters,
         filter_groups,
+        returning,
     })
 }
 
@@ -1386,7 +1390,8 @@ fn parse_update(input: &str) -> Result<Update, ParseError> {
     let where_pos =
         find_keyword_outside_quotes(after_set, "WHERE").ok_or(ParseError::InvalidRelationalSql)?;
     let assignment_input = after_set[..where_pos].trim();
-    let filter_input = after_set[where_pos + "WHERE".len()..].trim();
+    let (filter_input, returning) =
+        split_returning_clause(after_set[where_pos + "WHERE".len()..].trim())?;
     if assignment_input.is_empty() || filter_input.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
@@ -1405,6 +1410,7 @@ fn parse_update(input: &str) -> Result<Update, ParseError> {
         filter: filters.first().cloned(),
         filters,
         filter_groups,
+        returning,
     })
 }
 
@@ -1413,6 +1419,100 @@ fn parse_update_assignment(input: &str) -> Result<UpdateAssignment, ParseError> 
         .split_once('=')
         .ok_or(ParseError::InvalidRelationalSql)?;
     let column = normalize_identifier(column.trim())?;
-    let value = parse_sql_value(value.trim())?;
-    Ok(UpdateAssignment { column, value })
+    let value = value.trim();
+    if let Some(plus) = find_char_outside_quotes(value, '+') {
+        let source_column = normalize_identifier(value[..plus].trim())?;
+        if source_column != column || find_char_outside_quotes(&value[plus + 1..], '+').is_some() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        let value = parse_sql_value(value[plus + 1..].trim())?;
+        return Ok(UpdateAssignment {
+            column,
+            source_column: Some(source_column),
+            value,
+        });
+    }
+    let value = parse_sql_value(value)?;
+    Ok(UpdateAssignment {
+        column,
+        source_column: None,
+        value,
+    })
+}
+
+fn split_returning_clause(input: &str) -> Result<(&str, Vec<String>), ParseError> {
+    let Some(position) = find_keyword_outside_quotes(input, "RETURNING") else {
+        return Ok((input.trim(), Vec::new()));
+    };
+    let body = input[..position].trim();
+    let projection = input[position + "RETURNING".len()..].trim();
+    if body.is_empty() || projection.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let returning = split_csv(projection)?
+        .into_iter()
+        .map(|column| normalize_identifier(column.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if returning.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok((body, returning))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_frozen_w1_returning_and_checked_update_shape() {
+        let insert = parse_insert(
+            "INSERT INTO ledger_entries (entry_id, tenant_id) VALUES (7::int8, 2::int8) \
+             RETURNING entry_id",
+        )
+        .unwrap();
+        assert_eq!(insert.returning, vec!["entry_id"]);
+
+        let update = parse_update(
+            "UPDATE accounts SET balance_cents = balance_cents + 9::int8, \
+             version = version + 1::int8 WHERE tenant_id = 2::int8 AND account_id = 3::int8 \
+             RETURNING balance_cents, version",
+        )
+        .unwrap();
+        assert_eq!(update.returning, vec!["balance_cents", "version"]);
+        assert_eq!(
+            update.assignments[0].source_column.as_deref(),
+            Some("balance_cents")
+        );
+        assert_eq!(update.assignments[0].value, SqlValue::Int8(9));
+
+        let delete = parse_delete(
+            "DELETE FROM pending_entries WHERE tenant_id = 2::int8 AND pending_id = 3::int8 \
+             RETURNING pending_id",
+        )
+        .unwrap();
+        assert_eq!(delete.returning, vec!["pending_id"]);
+    }
+
+    #[test]
+    fn returning_and_update_expression_boundaries_fail_closed() {
+        let update = parse_update(
+            "UPDATE notes SET body = 'RETURNING + literal' WHERE id = 1 RETURNING body",
+        )
+        .unwrap();
+        assert_eq!(update.assignments[0].source_column, None);
+        assert_eq!(update.returning, vec!["body"]);
+
+        assert!(matches!(
+            parse_update("UPDATE t SET a = b + 1 WHERE id = 1 RETURNING a"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_update("UPDATE t SET a = a + 1 + 2 WHERE id = 1 RETURNING a"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_delete("DELETE FROM t WHERE id = 1 RETURNING"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
 }

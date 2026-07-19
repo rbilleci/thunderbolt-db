@@ -70,6 +70,7 @@ impl Engine {
             table: copy.table.clone(),
             columns,
             rows,
+            returning: Vec::new(),
         };
         let mut profile = RelationalCopyAdmissionProfile {
             rows: row_count,

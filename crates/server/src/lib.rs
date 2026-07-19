@@ -272,7 +272,12 @@ fn encode_outcome(outcome: Result<QueryOutcome, DbError>) -> io::Result<Vec<u8>>
             }
             Ok(outcome) => {
                 let tag = pg_adapter::command_complete_tag(&outcome);
-                if let QueryOutcome::Rows { columns, rows } = &outcome {
+                let returned_rows = match &outcome {
+                    QueryOutcome::Rows { columns, rows }
+                    | QueryOutcome::Returning { columns, rows, .. } => Some((columns, rows)),
+                    _ => None,
+                };
+                if let Some((columns, rows)) = returned_rows {
                     let backend_columns: Vec<BackendColumn> = columns
                         .iter()
                         .map(|column| {

@@ -362,6 +362,14 @@ pub fn command_complete_tag(outcome: &QueryOutcome) -> String {
         // the empty string here is a defensive fallback.
         QueryOutcome::Empty => String::new(),
         QueryOutcome::Rows { rows, .. } => format!("SELECT {}", rows.len()),
+        QueryOutcome::Returning {
+            tag, rows_affected, ..
+        } => match tag {
+            CommandTag::Insert => format!("INSERT 0 {rows_affected}"),
+            CommandTag::Update => format!("UPDATE {rows_affected}"),
+            CommandTag::Delete => format!("DELETE {rows_affected}"),
+            _ => format!("{} {rows_affected}", command_tag_label(tag)),
+        },
         QueryOutcome::Command { tag, rows_affected } => match tag {
             CommandTag::Begin => "BEGIN".to_string(),
             CommandTag::Commit => "COMMIT".to_string(),
@@ -373,6 +381,20 @@ pub fn command_complete_tag(outcome: &QueryOutcome) -> String {
             CommandTag::Delete => format!("DELETE {}", rows_affected.unwrap_or(0)),
             CommandTag::Other(label) => label.clone(),
         },
+    }
+}
+
+fn command_tag_label(tag: &CommandTag) -> &str {
+    match tag {
+        CommandTag::Begin => "BEGIN",
+        CommandTag::Commit => "COMMIT",
+        CommandTag::Rollback => "ROLLBACK",
+        CommandTag::CreateTable => "CREATE TABLE",
+        CommandTag::CreateIndex => "CREATE INDEX",
+        CommandTag::Insert => "INSERT",
+        CommandTag::Update => "UPDATE",
+        CommandTag::Delete => "DELETE",
+        CommandTag::Other(label) => label,
     }
 }
 

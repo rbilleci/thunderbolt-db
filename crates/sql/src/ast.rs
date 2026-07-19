@@ -514,6 +514,8 @@ pub struct Insert {
     pub table: String,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<SqlValue>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -522,6 +524,8 @@ pub struct Delete {
     pub filter: Option<SelectFilter>,
     pub filters: Vec<SelectFilter>,
     pub filter_groups: Vec<Vec<SelectFilter>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -531,10 +535,16 @@ pub struct Update {
     pub filter: Option<SelectFilter>,
     pub filters: Vec<SelectFilter>,
     pub filter_groups: Vec<Vec<SelectFilter>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct UpdateAssignment {
     pub column: String,
+    /// `Some(column)` lowers the bounded checked form `target = column + value`.
+    /// PRODUCT-002 accepts only `target == column`; all other expression shapes fail parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_column: Option<String>,
     pub value: SqlValue,
 }
