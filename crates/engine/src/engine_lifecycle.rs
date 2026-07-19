@@ -1325,6 +1325,7 @@ impl Engine {
             .filter(|route| route.gpu_id == gpu_id)
             .map(|route| route.plan.descriptor_allocated_bytes())
             .sum::<u64>();
+        let live_compound_routes = self.live_compound_point_route_bytes_for_gpu(gpu_id);
         let private_bytes = self
             .transaction_private_gpu_bytes
             .lock()
@@ -1338,6 +1339,7 @@ impl Engine {
             .saturating_add(single_indexes)
             .saturating_add(shard_indexes)
             .saturating_add(route_descriptors)
+            .saturating_add(live_compound_routes)
             .saturating_add(private_bytes)
     }
 

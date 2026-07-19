@@ -14,6 +14,76 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## READ-002 canonical compound-key milestone — complete 2026-07-19
+
+- A typed engine-internal prepared route now serves exact unique `(tenant_id int4, account_id int8)` equality from
+  one generation-owned GPU hash directory. Build reads resident key columns on-device; probe exact-rechecks all
+  three key words after the fingerprint, applies captured `created_by`/`deleted_by` MVCC visibility, detects
+  duplicate visible matches, and gathers one to four non-NULL int2/int4/int8 projections before bounded values-and-
+  status readbacks in one terminal phase. Planned and executed targets are GPU, and unsupported/stale/pressured
+  shapes fail without a cold or host relational fallback.
+- Compound routes use a separate concrete ArcSwap cache, so the established int4 production route retains its
+  original `Arc<CudaI32MultiShardProbePlan>` cache-hit type and branch shape. The compound directory uses dedicated
+  exact-size device allocations rather than the scratch pool. Its charge is created before publication and remains
+  in hard-budget accounting until the last current, retired-map, or in-flight owner drains; physical buffers drop
+  before the charge is released, and eviction never promises still-pinned bytes as reclaimable.
+- The canonical GPU test proves full-scan result parity; present, absent, repeated, same-second-key/different-tenant,
+  and real fingerprint-collision cases; signed/asymmetric values beyond 32-bit; unreferenced-NULL acceptance and
+  referenced-NULL rejection; concurrent readers; exact pressure refusal; nonzero GPU/index/cache hits; and absolute
+  zero cold accesses beginning before preparation. UPDATE/INSERT rotate the exact table generation and require
+  reprepare, while an in-place DELETE reuses the route and is hidden by its device sidecar. Deterministic tests also
+  cover one-plan-budget concurrent preparation, stale-build publication rejection, and retired-plan last-owner
+  budget accounting.
+- This milestone intentionally stops at the typed engine API. SQL placeholder lowering, wire/OID codecs, compound
+  secondary-index DDL, `RETURNING`, expression UPDATE, and mutation-stable named-index maintenance remain
+  **PRODUCT-002**. The current directory is O(rows) to build; PRODUCT-002 must maintain or replace it without a full
+  10M-row accounts-directory rebuild per mutation before BENCH-001 can accept the workload route.
+- Final candidate gates pass: execution **121/121** and engine **952/952** including ignored GPU tests; ordinary and
+  release suites pass **50/50** execution plus **461/461** engine; workspace all-target/all-feature check, strict
+  execution/engine Clippy, rustfmt, and diff whitespace are clean. The canonical compound route passed three
+  sequential plus two simultaneous HAZARD executions. Independent engine, kernel/accounting, and evidence audits
+  are clean; every concrete finding was adopted.
+- The first full report card exposed a real legacy int4 cache-hit regression against a clean HEAD worktree
+  (**174us** versus **156us** in-L2). Separating compound and legacy route caches restored the original concrete hot
+  branch. The final two-layer/two-cache card completed with exit 0: Layer-1 `sum_i32` was **1,481.4/1,440.6 GB/s**,
+  isolated gather **349.5/155.3 GB/s**, and GROUP BY **1,674.9M elements/s**; production compact point reads reached
+  **230.621M/s at p50 158us** in-L2 and **201.845M/s at p50 199us** out-of-L2. The 48M-row fixture built in
+  **1,623.9s** with zero late residency work. These retain the accepted RETIRE-003 performance envelope.
+
+## BENCH-001 execution preflight — blocked 2026-07-19
+
+- No valid BENCH-001 sustained or `B01`–`B10` result was produced. An exhaustive non-document source search found
+  no implementation of the immutable workload's seed, 3.3M+66M open-loop schedule, or fixed peak cohorts; the
+  manifest explicitly describes itself as a contract rather than an implementation. Running an older P8 workload
+  would not be architecture evidence for ADR-008.
+- The exact schema and SQL cannot currently be loaded/executed unchanged: textual compound secondary indexes are
+  rejected; INSERT/DELETE/UPDATE ASTs have no `RETURNING`; UPDATE assignments accept literals rather than
+  `balance_cents + $3`; the production engine-backed server supports simple query rather than Parse/Bind/Execute;
+  and retained prepared jobs require one int4 equality predicate. The manifest requires compound int4+int8 keys,
+  typed prepared parameters, expression mutations, and atomic T8/T32 routes.
+- The available P8 helper is not a substitute baseline. It generates an unrelated five-column `order_line` table,
+  defaults to `postgres:16`, and records selected settings/indexes rather than owning a reproducible tuned
+  synchronous-commit/checkpoint profile for the canonical banking workload. Its benchmark endpoint constructs
+  `Engine::new_local()`, so it does not establish crash-durable acknowledgement for the manifest.
+- The local host also was not a qualified quiet window: the CPU governor was `schedutil`; GPU persistence was off;
+  desktop plus Node contexts were resident; and PostgreSQL was inactive. These environmental issues are secondary
+  to the missing executable and product routes, not the reason a partial result was withheld.
+- The stale mutation-boundary wrapper itself is repaired. It now honors/validates row cardinality, parses an exact
+  fact schema, decodes the client-visible DataRow COUNT, clears stale derived artifacts before rerun, and requires
+  a real post-INSERT COUNT, exact five-column row projection, accepted expected sharded route, zero-H2D telemetry,
+  one append hit, and the expected shard rollover. COUNT is truthfully labeled resident-shard metadata, not a GPU
+  kernel, and the report says the device-route witness is not BENCH-001 kernel/event evidence.
+- Focused validation passed: direct 16-row NVIDIA probe; JSONL validation; malformed/unknown/duplicate/missing/false
+  fact sabotage; stale-success rerun sabotage; row-value injection/bounds attacks; the sharded COUNT route test; and
+  the ignored NVIDIA in-place append test. Independent adversarial audit findings were adopted. The full legacy P8
+  self-check still has an inherited, unrelated `chunked-install-self-check` failure (`count_all returned 0, expected
+  16`); BENCH-001 does not treat that suite as its campaign runner.
+- BENCH-001 produced no evidence with which to reorder the broader READ-002, ROUTE-001, or SCALE-001 outcomes. At
+  preflight, the manifest nevertheless proved the compound int4+int8 READ-002 subset was a prerequisite, so PLAN
+  promoted that milestone plus bounded PRODUCT-002/PRODUCT-001 integration. The READ-002 milestone is now complete;
+  ROUTE-001 and SCALE-001 remain downstream, and no checkpoint-overhead baseline exists for DUR-001. DUR-001 was
+  not started.
+
 ## RETIRE-003 generic result-postprocessing retirement — complete 2026-07-19
 
 - The generic KV/MVCC CUDA entry no longer resolves a source, launches a fabricated execution path, or performs

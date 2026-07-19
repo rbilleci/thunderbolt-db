@@ -732,7 +732,12 @@ impl Engine {
             if projected_bytes.saturating_add(resident_bytes) <= budget_bytes {
                 break;
             }
-            let candidate_bytes = self.relational_resident_table_bytes_for_gpu(&map_key, gpu_id);
+            // Retired compound point plans may still be pinned by an in-flight execution or a
+            // previously loaded route snapshot. They remain charged until their last owner
+            // drains, so table eviction cannot promise those bytes as immediately reclaimable.
+            let candidate_bytes = self
+                .relational_resident_table_bytes_for_gpu(&map_key, gpu_id)
+                .saturating_sub(self.live_compound_point_route_bytes_for_table(gpu_id, &map_key));
             if candidate_bytes == 0 {
                 continue;
             }

@@ -415,6 +415,34 @@ impl GpuPrimaryContext {
         })
     }
 
+    /// Allocate exact-size, engine-retained device state that is freed on owner drop rather than
+    /// entering the scratch-output pool. Prepared route directories can be hundreds of MiB;
+    /// returning them to the idle pool would retain physical VRAM after route accounting ends.
+    pub(super) fn allocate_retained_device_buffer_owned(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<RetainedDeviceBufferOwned, CudaRuntimeProbeError> {
+        if bytes == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let tracker = CUDA_ALLOCATION_TRACKER
+            .with(|slot| slot.borrow().as_ref().map(|tracker| tracker.reserve(bytes)))
+            .transpose()?;
+        let mut ptr = 0_u64;
+        if let Err(error) = check_cuda(unsafe { (self.cu_mem_alloc)(&mut ptr, bytes) }) {
+            if let Some(tracker) = &tracker {
+                tracker.release(bytes);
+            }
+            return Err(error);
+        }
+        Ok(RetainedDeviceBufferOwned {
+            primary: Arc::clone(self),
+            ptr,
+            capacity: bytes,
+            tracker,
+        })
+    }
+
     /// Return a leased buffer to the pool, or free it if the idle cap is reached.
     fn release_device_buffer(&self, ptr: u64, capacity: usize) {
         let mut pool = self
@@ -751,6 +779,27 @@ pub(super) struct PooledDeviceBufferOwned {
 impl Drop for PooledDeviceBufferOwned {
     fn drop(&mut self) {
         self.primary.release_device_buffer(self.ptr, self.capacity);
+        if let Some(tracker) = &self.tracker {
+            tracker.release(self.capacity);
+        }
+    }
+}
+
+/// Exact-size device allocation for long-lived prepared-route state. Dropping this owner releases
+/// physical VRAM immediately, keeping route residency accounting aligned with retained allocation.
+pub(super) struct RetainedDeviceBufferOwned {
+    pub(super) primary: Arc<GpuPrimaryContext>,
+    pub(super) ptr: u64,
+    pub(super) capacity: usize,
+    pub(super) tracker: Option<Arc<CudaAllocationTracker>>,
+}
+
+impl Drop for RetainedDeviceBufferOwned {
+    fn drop(&mut self) {
+        let _ = self.primary.set_current();
+        unsafe {
+            (self.primary.cu_mem_free)(self.ptr);
+        }
         if let Some(tracker) = &self.tracker {
             tracker.release(self.capacity);
         }

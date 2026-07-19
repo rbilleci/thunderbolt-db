@@ -162,6 +162,8 @@ mod capacity_payload_tests {
 
     include!("tests/residency_sharded_point_reads.rs");
 
+    include!("tests/residency_compound_point_reads.rs");
+
     include!("tests/residency_capacity_budget.rs");
 }
 
@@ -367,6 +369,33 @@ impl Engine {
         Ok(row_count)
     }
 
+    pub(crate) fn live_compound_point_route_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
+        self.read_state
+            .residency
+            .live_compound_point_route_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|((charged_gpu, _), _)| *charged_gpu == gpu_id)
+            .map(|(_, bytes)| *bytes)
+            .sum()
+    }
+
+    pub(crate) fn live_compound_point_route_bytes_for_table(
+        &self,
+        gpu_id: u16,
+        table: &str,
+    ) -> u64 {
+        self.read_state
+            .residency
+            .live_compound_point_route_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(gpu_id, table.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn relational_resident_bytes_for_gpu_excluding(&self, gpu_id: u16, table: &str) -> u64 {
         let snapshots = self.read_state.residency.snapshots.load();
         let snapshot_bytes: u64 = snapshots
@@ -450,6 +479,9 @@ impl Engine {
             .filter(|((name, _, _), route)| name.as_str() != table && route.gpu_id == gpu_id)
             .map(|(_, route)| route.plan.descriptor_allocated_bytes())
             .sum::<u64>();
+        // Compound directories are free only after every retired/in-flight plan owner drains, so
+        // none of their live charge is treated as immediately reclaimable by table replacement.
+        let live_compound_routes = self.live_compound_point_route_bytes_for_gpu(gpu_id);
         // Transaction-private device generations are not attributable to an evictable global
         // table. Keep their retained charge in every "excluding table" admission projection.
         let private_bytes = self
@@ -465,13 +497,14 @@ impl Engine {
             .saturating_add(single_indexes)
             .saturating_add(shard_indexes)
             .saturating_add(route_descriptors)
+            .saturating_add(live_compound_routes)
             .saturating_add(private_bytes)
     }
 
-    /// Actual retained allocation bytes attributable to one table on one GPU. This is the exact
-    /// inverse unit used by two-phase admission: candidate selection subtracts these bytes from the
-    /// same payload/region/index categories counted by `relational_resident_bytes_for_gpu_excluding`,
-    /// so the chosen prefix is known to fit before any descriptor is retired.
+    /// Actual retained allocation bytes attributable to one table on one GPU. Two-phase admission
+    /// subtracts the immediately reclaimable portion of these bytes from the same categories counted
+    /// by `relational_resident_bytes_for_gpu_excluding`; live compound-route charges are deliberately
+    /// excluded from that subtraction until their final retired/in-flight owner drains.
     fn relational_resident_table_bytes_for_gpu(&self, table: &str, gpu_id: u16) -> u64 {
         let (payload_and_regions, indexes) =
             self.relational_resident_table_byte_components_for_gpu(table, gpu_id);
@@ -557,13 +590,15 @@ impl Engine {
             .filter(|((name, _, _), route)| name == table && route.gpu_id == gpu_id)
             .map(|(_, route)| route.plan.descriptor_allocated_bytes())
             .sum::<u64>();
+        let compound_route_bytes = self.live_compound_point_route_bytes_for_table(gpu_id, table);
         (
             snapshot_bytes
                 .saturating_add(snapshot_sidecar_bytes)
                 .saturating_add(shard_bytes),
             single_index_bytes
                 .saturating_add(shard_index_bytes)
-                .saturating_add(route_descriptor_bytes),
+                .saturating_add(route_descriptor_bytes)
+                .saturating_add(compound_route_bytes),
         )
     }
 

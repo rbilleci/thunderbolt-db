@@ -9,11 +9,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    CudaCompoundFoldColumn, CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime,
+    CompoundI32I64ProbeShard, CudaCompoundFoldColumn, CudaDeviceMemoryChunk, CudaDeviceMemoryProof,
+    CudaDriverRuntime, CudaFixedPointProjection, CudaFixedPointProjectionKind,
     CudaI32BatchProjectionColumns, CudaI32Comparison, CudaI32EqualAnyProjectSubmission,
-    CudaI32IndexProbeDenseSubmission, CudaI32Stats, CudaOwnedDeviceMemoryChunk,
-    CudaResidentDeviceMemory, CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget,
-    MockGpuRuntime, ResidentElemType, RouteDecision, VisibleLocateShard, WriteLocateShard,
+    CudaI32I64MultiShardProbePlan, CudaI32I64PointKey, CudaI32IndexProbeDenseSubmission,
+    CudaI32Stats, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory,
+    CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, MockGpuRuntime, ResidentElemType,
+    RouteDecision, VisibleLocateShard, WriteLocateShard,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -114,6 +116,9 @@ mod engine_resident_probe;
 mod engine_result_frame;
 mod engine_result_sort;
 mod engine_retained_read;
+pub use engine_retained_read::{
+    RelationalCompoundI32I64PointReadParam, RelationalCompoundI32I64PointReadTemplate,
+};
 mod engine_select_bind;
 mod engine_select_exec;
 mod engine_sql_pg;

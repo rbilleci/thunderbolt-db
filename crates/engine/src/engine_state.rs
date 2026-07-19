@@ -545,6 +545,13 @@ pub(crate) struct ResidencyReadState {
     /// Exact Arc publication identity makes a route reusable without re-enumerating every shard per batch;
     /// a new publication misses and replaces it while in-flight readers keep the old plan pinned.
     pub(crate) sharded_point_routes: ArcSwap<ShardedPointRouteMap>,
+    /// READ-002's compound generation routes are isolated from the established int4 latency cache so
+    /// adding a route family cannot change the production cache-hit plan type or branch shape.
+    pub(crate) compound_point_routes: ArcSwap<CompoundPointRouteMap>,
+    /// Dedicated compound-route bytes remain charged until the last plan owner drains, including
+    /// readers and old ArcSwap map guards that outlive cache retirement. Current-map accounting alone
+    /// would otherwise admit a replacement while the retired table-scale directory is still live.
+    pub(crate) live_compound_point_route_bytes: Arc<Mutex<BTreeMap<(u16, String), u64>>>,
     /// Serializes rare route-cache COW publications and retirement purges; cache-hit reads stay lock-free.
     pub(crate) sharded_point_route_publish_lock: Mutex<()>,
     /// PERF-001: count of batches that reused an exact-generation GPU-resident shard descriptor plan.
@@ -810,6 +817,17 @@ impl ResidencyReadState {
                 self.sharded_point_routes.store(Arc::new(next));
             }
         }
+        {
+            let current = self.compound_point_routes.load();
+            if current
+                .keys()
+                .any(|(cached_table, _, _)| cached_table == table)
+            {
+                let mut next = (**current).clone();
+                next.retain(|(cached_table, _, _), _| cached_table != table);
+                self.compound_point_routes.store(Arc::new(next));
+            }
+        }
         self.shard_pk_device_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -837,6 +855,15 @@ impl ResidencyReadState {
             let mut next = (**current).clone();
             next.retain(|(cached_table, _, _), _| !tables.contains(cached_table.as_str()));
             self.sharded_point_routes.store(Arc::new(next));
+        }
+        let current = self.compound_point_routes.load();
+        if current
+            .keys()
+            .any(|(cached_table, _, _)| tables.contains(cached_table.as_str()))
+        {
+            let mut next = (**current).clone();
+            next.retain(|(cached_table, _, _), _| !tables.contains(cached_table.as_str()));
+            self.compound_point_routes.store(Arc::new(next));
         }
     }
 

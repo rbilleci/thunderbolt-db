@@ -190,6 +190,15 @@ pub use point_read_dense::{
     CudaI32DenseBatchProjection, CudaI32IndexProbeDenseSubmission, CudaI32MultiShardProbePlan,
     MultiShardProbeShard,
 };
+mod point_read_compound;
+use point_read_compound::{
+    execute_cuda_compound_i32_i64_multi_shard_probe,
+    prepare_cuda_compound_i32_i64_multi_shard_probe,
+};
+pub use point_read_compound::{
+    CompoundI32I64ProbeShard, CudaFixedPointProjection, CudaFixedPointProjectionKind,
+    CudaI32I64MultiShardProbePlan, CudaI32I64PointBatchProjection, CudaI32I64PointKey,
+};
 mod point_read_bloom;
 use point_read_bloom::probe_cuda_chunk_blooms;
 pub use point_read_bloom::ChunkBloomProbeShard;
@@ -1360,6 +1369,33 @@ impl CudaResidentDeviceMemory {
             needles,
             read_snapshot,
         )
+    }
+
+    /// Prepare one immutable table-level `(int4, int8)` compound point route. Index construction,
+    /// fingerprint derivation, and descriptor publication stay on the GPU; the returned owner pins
+    /// every exact shard generation and visibility sidecar it names.
+    pub fn prepare_compound_i32_i64_multi_shard_probe(
+        &self,
+        shards: &[CompoundI32I64ProbeShard],
+        gc_boundary: u64,
+    ) -> Result<Arc<CudaI32I64MultiShardProbePlan>, CudaRuntimeProbeError> {
+        Ok(Arc::new(prepare_cuda_compound_i32_i64_multi_shard_probe(
+            self,
+            shards,
+            gc_boundary,
+        )?))
+    }
+
+    /// Execute typed keys through a previously prepared compound point route. The candidate hash,
+    /// exact tuple verification, MVCC visibility, and fixed-width gather all execute in one GPU
+    /// probe kernel before the bounded terminal result readback.
+    pub fn execute_prepared_compound_i32_i64_multi_shard_probe(
+        &self,
+        plan: &Arc<CudaI32I64MultiShardProbePlan>,
+        keys: &[CudaI32I64PointKey],
+        read_snapshot: u64,
+    ) -> Result<CudaI32I64PointBatchProjection, CudaRuntimeProbeError> {
+        execute_cuda_compound_i32_i64_multi_shard_probe(self, plan, keys, read_snapshot)
     }
 
     /// P5-later: probe compact per-chunk Bloom filters on-device and return candidate chunk indexes per needle.

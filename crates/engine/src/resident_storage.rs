@@ -48,6 +48,78 @@ pub(crate) struct CachedShardPkDeviceIndex {
     pub(crate) hash_shift: u32,
 }
 
+#[derive(Debug)]
+pub(crate) struct CompoundPointRouteCharge {
+    gpu_id: u16,
+    table: String,
+    bytes: u64,
+    live_bytes: Arc<Mutex<BTreeMap<(u16, String), u64>>>,
+}
+
+impl CompoundPointRouteCharge {
+    pub(crate) fn new(
+        gpu_id: u16,
+        table: String,
+        bytes: u64,
+        live_bytes: Arc<Mutex<BTreeMap<(u16, String), u64>>>,
+    ) -> Self {
+        let mut live = live_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = live.entry((gpu_id, table.clone())).or_default();
+        *entry = entry
+            .checked_add(bytes)
+            .expect("compound route live-byte accounting overflowed");
+        drop(live);
+        Self {
+            gpu_id,
+            table,
+            bytes,
+            live_bytes,
+        }
+    }
+}
+
+impl Drop for CompoundPointRouteCharge {
+    fn drop(&mut self) {
+        let mut live = self
+            .live_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (self.gpu_id, self.table.clone());
+        let entry = live
+            .get_mut(&key)
+            .expect("compound route charge disappeared before its owner");
+        *entry = entry
+            .checked_sub(self.bytes)
+            .expect("compound route live-byte accounting underflowed");
+        if *entry == 0 {
+            live.remove(&key);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CachedCompoundI32I64PointPlan {
+    pub(crate) plan: Arc<gpu_db_execution::CudaI32I64MultiShardProbePlan>,
+    pub(crate) _charge: CompoundPointRouteCharge,
+}
+
+/// READ-002 compound routes use a separate cache from the established int4 production route. This
+/// keeps the existing latency path's concrete plan type and lookup shape unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedCompoundI32I64PointRoute {
+    pub(crate) table_generation: Arc<()>,
+    pub(crate) read_boundary: Index,
+    pub(crate) gpu_id: u16,
+    pub(crate) launch_resident: Arc<CudaResidentDeviceMemory>,
+    pub(crate) plan: Arc<CachedCompoundI32I64PointPlan>,
+}
+
+pub(crate) type CompoundPointRouteKey = (String, usize, Vec<usize>);
+pub(crate) type CompoundPointRouteMap =
+    BTreeMap<CompoundPointRouteKey, CachedCompoundI32I64PointRoute>;
+
 /// Prepared GPU-native point route for one exact published shard generation and projection shape.
 /// `table_generation` is the immutable per-table publication identity; `plan` owns the device descriptor
 /// table and pins the exact payload/index/MVCC resources it names. Unrelated tables do not invalidate it.

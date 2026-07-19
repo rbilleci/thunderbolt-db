@@ -5,14 +5,9 @@ use super::{
     shard_key_column_blob_offset, Arc, BatchedShardProjection, CachedShardPkDeviceIndex,
     CachedShardedPointRoute, CudaCompoundFoldColumn, CudaResidentDeviceMemory, Engine, EngineError,
     ExecuteError, Index, RelationalResidencySnapshot, RelationalTable, ShardDeviceIndexKey,
-    ShardPkHit, SqlType, WriteLocateShard,
+    ShardPkHit, SqlType, WriteLocateShard, MAX_CACHED_SHARDED_POINT_ROUTES,
 };
 use crate::RelationalResidentShard;
-
-/// Prepared routes are a latency cache, not a second residency tier. One shape per table and a fixed
-/// global ceiling make retained descriptor ownership deterministic; admission accounting below charges
-/// every live descriptor byte. Eviction is safe because in-flight submissions own their plan Arc.
-const MAX_CACHED_SHARDED_POINT_ROUTES: usize = 64;
 
 type ShardPkDeviceIndex = (Arc<CudaResidentDeviceMemory>, u32, u32, usize);
 type ShardPkDeviceIndexResult =
@@ -41,7 +36,7 @@ impl Engine {
     }
 
     #[cfg(test)]
-    fn run_sharded_point_route_pre_publish_hook(&self) {
+    pub(super) fn run_sharded_point_route_pre_publish_hook(&self) {
         let hook = self
             .read_state
             .residency

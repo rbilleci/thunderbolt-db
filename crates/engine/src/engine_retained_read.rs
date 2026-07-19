@@ -6,12 +6,21 @@
 
 use super::*;
 
+mod compound_point;
 mod device_index_append;
 mod shard_point_lookup;
 mod submission;
 mod template;
 mod wave_index;
 mod wave_locate;
+
+pub use compound_point::{
+    RelationalCompoundI32I64PointReadParam, RelationalCompoundI32I64PointReadTemplate,
+};
+
+/// Prepared routes are latency hints, not another residency tier. One shape per table and this
+/// per-family ceiling bound every generation-owned plan retained by the engine.
+const MAX_CACHED_SHARDED_POINT_ROUTES: usize = 64;
 
 #[cfg(test)]
 type RetainedCompletionPostHook = (
