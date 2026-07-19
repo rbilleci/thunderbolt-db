@@ -9,15 +9,21 @@ use super::{
 };
 use crate::RelationalResidentShard;
 
-type ShardPkDeviceIndex = (Arc<CudaResidentDeviceMemory>, u32, u32, usize);
+type ShardPkDeviceIndex = (Arc<CudaResidentDeviceMemory>, u32, u32, usize, bool);
 type ShardPkDeviceIndexResult =
     Result<Option<ShardPkDeviceIndex>, gpu_db_execution::CudaRuntimeProbeError>;
 
 pub(super) struct ShardDeviceIndexBuild<'a> {
     pub(super) key: ShardDeviceIndexKey<'a>,
     pub(super) row_count: usize,
+    /// Optional full shard capacity used by explicit named-index publication. Lazy compatibility
+    /// builds pass zero; mandatory publication sizes once for the append horizon.
+    pub(super) capacity_rows: u64,
     pub(super) gc_boundary: Index,
     pub(super) deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
+    pub(super) duplicate_tolerant: bool,
+    pub(super) apply_already_locked: bool,
+    pub(super) budget_already_locked: bool,
 }
 
 impl Engine {
@@ -213,7 +219,7 @@ impl Engine {
             }
             // Build/reuse the shard's DEVICE hash index, validated by `(ptr,row_count)`.
             // A declined build sends the caller to the GPU scan route.
-            let (device_index, table_mask, hash_shift, index_row_count) = self
+            let (device_index, table_mask, hash_shift, index_row_count, _has_postings) = self
                 .ensure_shard_pk_device_index(
                     table,
                     &table.name,
@@ -228,8 +234,12 @@ impl Engine {
                             blob_lens: &blob_lens,
                         },
                         row_count: shard.row_count,
+                        capacity_rows: shard.capacity as u64,
                         gc_boundary,
                         deleted_by: shard.deleted_by_region.clone(),
+                        duplicate_tolerant: false,
+                        apply_already_locked: false,
+                        budget_already_locked: false,
                     },
                 )
                 .ok()
@@ -383,8 +393,12 @@ impl Engine {
         let ShardDeviceIndexBuild {
             key,
             row_count,
+            capacity_rows,
             gc_boundary,
             deleted_by,
+            duplicate_tolerant,
+            apply_already_locked,
+            budget_already_locked,
         } = build;
         let ShardDeviceIndexKey {
             key_id,
@@ -421,11 +435,19 @@ impl Engine {
                 if entry.resident_device_ptr == device_ptr
                     && entry.row_count >= row_count
                     && entry.gc_boundary <= gc_boundary
+                    && (entry.device_index.is_some()
+                        || entry.duplicate_tolerant
+                        || !duplicate_tolerant)
                 {
-                    return Ok(entry
-                        .device_index
-                        .clone()
-                        .map(|di| (di, entry.table_mask, entry.hash_shift, entry.row_count)));
+                    return Ok(entry.device_index.clone().map(|di| {
+                        (
+                            di,
+                            entry.table_mask,
+                            entry.hash_shift,
+                            entry.row_count,
+                            entry.has_postings,
+                        )
+                    }));
                 }
             }
         }
@@ -441,7 +463,7 @@ impl Engine {
         // guard when the leader thread-local is set; the leader's exclusivity already gives the
         // rebuild what the guard provides.
         let apply_leader = crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(|f| f.get());
-        let _lane_rebuild_guard = if apply_leader {
+        let _lane_rebuild_guard = if apply_leader || apply_already_locked {
             None
         } else {
             self.intent_lanes.as_ref().map(|lanes| {
@@ -472,11 +494,19 @@ impl Engine {
                     if entry.resident_device_ptr == device_ptr
                         && entry.row_count >= row_count
                         && entry.gc_boundary <= gc_boundary
+                        && (entry.device_index.is_some()
+                            || entry.duplicate_tolerant
+                            || !duplicate_tolerant)
                     {
-                        return Ok(entry
-                            .device_index
-                            .clone()
-                            .map(|di| (di, entry.table_mask, entry.hash_shift, entry.row_count)));
+                        return Ok(entry.device_index.clone().map(|di| {
+                            (
+                                di,
+                                entry.table_mask,
+                                entry.hash_shift,
+                                entry.row_count,
+                                entry.has_postings,
+                            )
+                        }));
                     }
                 }
             }
@@ -529,7 +559,7 @@ impl Engine {
                 blob_offsets.to_vec(),
                 blob_lens.to_vec(),
                 row_count,
-                0_u64,
+                capacity_rows,
                 deleted_by,
             )
         };
@@ -593,7 +623,10 @@ impl Engine {
                 .max(build_capacity_rows.saturating_mul(2))
                 .min(1_u64 << 29)
         } else {
-            row_count_u64.saturating_mul(2)
+            row_count_u64
+                .saturating_mul(2)
+                .max(build_capacity_rows.saturating_mul(2))
+                .min(1_u64 << 29)
         };
         let table_size = some_or_decline!(sizing_rows
             .checked_mul(2)
@@ -603,16 +636,19 @@ impl Engine {
         }
         let table_mask = (table_size - 1) as u32;
         let hash_shift = 32 - table_size.trailing_zeros();
-        let index_bytes =
-            some_or_decline!(table_size.checked_mul(std::mem::size_of::<u64>() as u64));
+        let index_bytes = some_or_decline!(gpu_db_execution::resident_index_allocated_bytes(
+            table_mask,
+            build_capacity_rows.max(row_count_u64),
+        ));
         // Only the retained zeroed table affects the residency cap, so serialize allocation, build,
         // and publication. `cuMemsetD8` initializes it without an O(table) host zero vector/H2D.
-        let _budget_allocation = self
-            .read_state
-            .residency
-            .budget_allocation_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _budget_allocation = (!budget_already_locked).then(|| {
+            self.read_state
+                .residency
+                .budget_allocation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let runtime = self.cuda_driver_probe_runtime();
         let gpu_id = build_memory.metadata().gpu_id;
         if self
@@ -626,7 +662,7 @@ impl Engine {
             return Ok(None);
         }
         let mem = runtime.retain_device_memory_zeroed(gpu_id, index_bytes)?;
-        let declined = build_memory.submit_resident_typed_index_build(
+        let index_status = build_memory.submit_resident_typed_index_build_status(
             &mem,
             table_mask,
             hash_shift,
@@ -634,16 +670,26 @@ impl Engine {
             row_count,
             deleted_by.as_deref(),
             gc_boundary,
-            deleted_by.is_some() || key_id & crate::engine_residency::COMPOUND_KEY_ID_FLAG != 0,
+            duplicate_tolerant
+                || deleted_by.is_some()
+                || key_id & crate::engine_residency::COMPOUND_KEY_ID_FLAG != 0,
         )?;
-        let device_index = (!declined).then(|| Arc::new(mem));
-        let result = device_index
-            .clone()
-            .map(|di| (di, table_mask, hash_shift, row_count));
+        let device_index = (!index_status.declined).then(|| Arc::new(mem));
+        let result = device_index.clone().map(|di| {
+            (
+                di,
+                table_mask,
+                hash_shift,
+                row_count,
+                index_status.created_posting,
+            )
+        });
         let entry = CachedShardPkDeviceIndex {
             resident_device_ptr: device_ptr,
             row_count,
             gc_boundary,
+            duplicate_tolerant,
+            has_postings: index_status.created_posting,
             _resident_guard: Arc::clone(&build_memory),
             device_index,
             table_mask,
@@ -688,6 +734,9 @@ impl Engine {
                 existing.resident_device_ptr == device_ptr
                     && existing.row_count >= row_count
                     && existing.gc_boundary <= gc_boundary
+                    && (existing.device_index.is_some()
+                        || existing.duplicate_tolerant
+                        || !duplicate_tolerant)
             }) {
                 return Ok(existing.device_index.clone().map(|index| {
                     (
@@ -695,6 +744,7 @@ impl Engine {
                         existing.table_mask,
                         existing.hash_shift,
                         existing.row_count,
+                        existing.has_postings,
                     )
                 }));
             }
@@ -797,11 +847,13 @@ impl Engine {
                             entry.gpu_id,
                             Arc::clone(&entry.launch_resident),
                             Arc::clone(&entry.plan),
+                            Arc::clone(&entry.index_mutation_epoch),
+                            entry.prepared_index_epoch,
                         )
                     })
             })
         };
-        if cached_route.as_ref().is_some_and(|(gpu_id, _, _)| {
+        if cached_route.as_ref().is_some_and(|(gpu_id, _, _, _, _)| {
             runtime_snapshot.memory_pressured_gpu_ids.contains(gpu_id)
         }) {
             return Ok(None);
@@ -813,9 +865,19 @@ impl Engine {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         probe.lap("point_shard_route_prepare");
-        let prepared_route = if let Some((_, launch_resident, plan)) = cached_route {
-            Some((launch_resident, plan))
+        let prepared_route = if let Some((_, launch_resident, plan, epoch, prepared_epoch)) =
+            cached_route
+        {
+            Some((launch_resident, plan, epoch, prepared_epoch))
         } else {
+            // Sample before reading any cached index basis. If a writer overlaps descriptor assembly, its
+            // odd/advanced epoch forces the capacity-bounded posting path for this one captured plan.
+            let index_mutation_epoch = self
+                .read_state
+                .residency
+                .point_index_mutation_epoch(&table.name);
+            let prepared_index_epoch =
+                index_mutation_epoch.load(std::sync::atomic::Ordering::Acquire);
             // A cache miss prepares the exact immutable shard generation once: validate every descriptor,
             // ensure its GPU index, encode one device descriptor table, and pin every referenced resource.
             let mut probe_shards = Vec::new();
@@ -861,8 +923,12 @@ impl Engine {
                                 blob_lens: &[0],
                             },
                             row_count: shard.row_count,
+                            capacity_rows: shard.capacity as u64,
                             gc_boundary: read_boundary,
                             deleted_by: shard.deleted_by_region.clone(),
+                            duplicate_tolerant: false,
+                            apply_already_locked: false,
+                            budget_already_locked: false,
                         },
                     )
                     .map_err(|err| {
@@ -870,7 +936,7 @@ impl Engine {
                             "GPU prepared shard point-route index construction failed: {err}"
                         )))
                     })?;
-                let (device_index, table_mask, hash_shift, _index_row_count) =
+                let (device_index, table_mask, hash_shift, _index_row_count, has_postings) =
                     some_or_decline!(index);
                 prepared_indexes.push((shard.shard_id, Arc::clone(&device_index)));
                 if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
@@ -899,8 +965,10 @@ impl Engine {
                     hash_shift,
                     projection_offsets,
                     row_count: shard.row_count as u64,
+                    row_capacity: shard.capacity as u64,
                     created_by: shard.created_by_region.clone(),
                     deleted_by: shard.deleted_by_region.clone(),
+                    has_postings,
                     min,
                     max,
                 });
@@ -1018,6 +1086,8 @@ impl Engine {
                             gpu_id,
                             launch_resident: Arc::clone(&launch_resident),
                             plan: Arc::clone(&plan),
+                            index_mutation_epoch: Arc::clone(&index_mutation_epoch),
+                            prepared_index_epoch,
                         },
                     );
                     let route_bytes_on_gpu = next
@@ -1045,14 +1115,25 @@ impl Engine {
                             .store(Arc::new(next));
                     }
                 }
-                Some((launch_resident, plan))
+                Some((
+                    launch_resident,
+                    plan,
+                    index_mutation_epoch,
+                    prepared_index_epoch,
+                ))
             }
         };
         probe.lap("point_shard_descriptor_enumeration");
         // Compact a needle-indexed dense output (status[i]==1 -> 1 row, else 0) in ONE pass -- the SAME
         // compaction the single-buffer dense path uses; the kernel already wrote needle order, so there is NO
         // cross-shard host merge. Empty output (no non-empty shards) -> all needles absent.
-        let (values, needle_ranges) = if let Some((launch_resident, plan)) = prepared_route {
+        let (values, needle_ranges) = if let Some((
+            launch_resident,
+            plan,
+            index_mutation_epoch,
+            prepared_index_epoch,
+        )) = prepared_route
+        {
             #[cfg(test)]
             if self
                 .read_state
@@ -1070,13 +1151,26 @@ impl Engine {
                     "injected GPU prepared shard point-route submission failure".to_string(),
                 )));
             }
-            let submission = launch_resident
-                .submit_prepared_multi_shard_i32_index_probe_dense(&plan, needles, read_boundary)
-                .map_err(|err| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "GPU prepared shard point-route submission failed: {err}"
-                    )))
-                })?;
+            let launch_epoch = index_mutation_epoch.load(std::sync::atomic::Ordering::Acquire);
+            let force_posting = launch_epoch & 1 != 0 || launch_epoch != prepared_index_epoch;
+            let submission = if force_posting {
+                launch_resident.submit_prepared_multi_shard_i32_index_probe_dense_posting_retry(
+                    &plan,
+                    needles,
+                    read_boundary,
+                )
+            } else {
+                launch_resident.submit_prepared_multi_shard_i32_index_probe_dense(
+                    &plan,
+                    needles,
+                    read_boundary,
+                )
+            }
+            .map_err(|err| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "GPU prepared shard point-route submission failed: {err}"
+                )))
+            })?;
             probe.lap("point_shard_submission");
             let binary_mode = submission.multi_shard_binary_mode;
             #[cfg(test)]
@@ -1097,7 +1191,7 @@ impl Engine {
                     "injected GPU prepared shard point-route completion failure".to_string(),
                 )));
             }
-            let (cols, _elapsed) =
+            let (mut cols, _elapsed) =
                 submission
                     .complete_detached_columnar_compact()
                     .map_err(|err| {
@@ -1105,6 +1199,28 @@ impl Engine {
                             "GPU prepared shard point-route completion failed: {err}"
                         )))
                     })?;
+            let completed_epoch = index_mutation_epoch.load(std::sync::atomic::Ordering::Acquire);
+            if !force_posting && (completed_epoch & 1 != 0 || completed_epoch != launch_epoch) {
+                // A writer overlapped the singleton launch. Discard its result and retry the same captured
+                // descriptor through the capacity-bounded posting walker: future rows are traversable but
+                // never projected above this plan's captured row_count.
+                let retry = launch_resident
+                    .submit_prepared_multi_shard_i32_index_probe_dense_posting_retry(
+                        &plan,
+                        needles,
+                        read_boundary,
+                    )
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "GPU prepared shard point-route posting retry failed: {err}"
+                        )))
+                    })?;
+                (cols, _) = retry.complete_detached_columnar_compact().map_err(|err| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "GPU prepared shard point-route posting retry completion failed: {err}"
+                    )))
+                })?;
+            }
             probe.lap("point_shard_completion");
             if cols.status().len() != n {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(

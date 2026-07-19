@@ -101,7 +101,8 @@ impl Engine {
         }
         let table_mask = (table_size - 1) as u32;
         let hash_shift = 32 - table_size.trailing_zeros();
-        let index_bytes = table_size.checked_mul(std::mem::size_of::<u64>() as u64)?;
+        let index_bytes =
+            gpu_db_execution::resident_index_allocated_bytes(table_mask, chunk.row_count)?;
         let runtime = self.cuda_driver_probe_runtime();
         let device = runtime
             .retain_device_memory_zeroed(d.gpu_id, index_bytes)
@@ -876,9 +877,9 @@ impl Engine {
     }
 
     /// Build the exact equality predicate for one unique-key tuple. The statement values are
-    /// already type-coerced by bind. This engine's current unique semantics are structural
-    /// (`NULL == NULL`), so NULL key components lower to the device validity-mask `IS NULL`
-    /// leaf rather than SQL `=` (which would be UNKNOWN).
+    /// already type-coerced by bind. NULL key components lower to the device validity-mask `IS NULL`
+    /// leaf rather than SQL `=` (which would be UNKNOWN). PostgreSQL UNIQUE validation skips every
+    /// NULL-bearing tuple before calling this helper; other exact tuple users retain structural matching.
     pub(crate) fn class_exact_key_predicate(
         table: &RelationalTable,
         positions: &[usize],
@@ -912,10 +913,10 @@ impl Engine {
     }
 
     /// Exact within-statement unique validation over a transient DEVICE relation. Every bound
-    /// key tuple runs as a complete device predicate; there is no host grouping, NULL branch, or
-    /// value comparison. Survivor coordinates feed the device threshold kernel, whose status bit
-    /// is the final verdict readback. This is deliberately bounded until the device exact
-    /// tuple-hash/group operator replaces it.
+    /// non-NULL key tuple runs as a complete device predicate; there is no host grouping or value
+    /// comparison. PostgreSQL-distinct NULL-bearing tuples require no comparison and are omitted.
+    /// Survivor coordinates feed the device threshold kernel, whose status bit is the final verdict
+    /// readback. This is deliberately bounded until the device exact tuple-hash/group operator replaces it.
     fn validate_class_new_rows_unique_on_device(
         &self,
         table: &RelationalTable,
@@ -943,6 +944,12 @@ impl Engine {
                 continue;
             };
             for row in new_rows {
+                if positions
+                    .iter()
+                    .any(|&position| matches!(row[position], SqlValue::Null))
+                {
+                    continue;
+                }
                 let predicate = Self::class_exact_key_predicate(table, &positions, row)?;
                 let slots = self
                     .lower_resident_predicate(
@@ -989,9 +996,8 @@ impl Engine {
     /// `Some(Ok)` = validated; `Some(Err)` = duplicate (a statement error — the class stays);
     /// `None` = device execution declined, so the caller must fail closed rather than transfer
     /// relational authority to the host.
-    /// NULL keys use the raw-payload placeholder fingerprint only to choose candidate chunks,
-    /// then run an exact device `IS NULL` predicate, preserving structural NULL uniqueness
-    /// without de-authorizing. Declines: an unfoldable needle, epoch drift, or a
+    /// PostgreSQL-distinct NULL-bearing keys are omitted from unique probing without de-authorizing.
+    /// Declines: an unfoldable non-NULL needle, epoch drift, or a
     /// build/probe/stage/device error.
     pub(crate) fn validate_class_insert_uniqueness(
         &self,
@@ -1037,20 +1043,31 @@ impl Engine {
             .map(|(set, _)| set.iter().copied().collect())
             .unwrap_or_default();
         for (key_id, index_name, positions) in &keyed {
-            let needles: Vec<i32> = new_rows
+            let probe_rows = new_rows
                 .iter()
-                .map(|row| Self::chunk_key_candidate_needle(table, positions, row))
+                .enumerate()
+                .filter(|(_, row)| {
+                    !positions
+                        .iter()
+                        .any(|&position| matches!(row[position], SqlValue::Null))
+                })
+                .collect::<Vec<_>>();
+            if probe_rows.is_empty() {
+                continue;
+            }
+            let needles: Vec<i32> = probe_rows
+                .iter()
+                .map(|(_, row)| Self::chunk_key_candidate_needle(table, positions, row))
                 .collect::<Option<Vec<_>>>()?;
             let (hits, verdict_device) =
                 self.chunk_key_candidate_positions(table, &entry, positions, *key_id, &needles)?;
-            for (needle_idx, needle_hits) in hits.iter().enumerate() {
+            for ((_, row), needle_hits) in probe_rows.iter().zip(&hits) {
                 let candidate_positions: std::collections::BTreeSet<usize> =
                     needle_hits.iter().copied().collect();
                 if candidate_positions.is_empty() {
                     continue;
                 }
-                let predicate =
-                    Self::class_exact_key_predicate(table, positions, new_rows.get(needle_idx)?)?;
+                let predicate = Self::class_exact_key_predicate(table, positions, row)?;
                 let exact = self.locate_streaming_cold_slots_in_entry(
                     table,
                     &predicate,

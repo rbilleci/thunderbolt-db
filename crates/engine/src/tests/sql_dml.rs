@@ -2641,8 +2641,9 @@ fn primary_key_rejects_null_on_insert_and_update() {
     e.execute_text(txn, "UPDATE pk_nn SET id = 3 WHERE v = 1")
         .unwrap();
 
-    // Control: a plain (non-PK) UNIQUE column keeps this engine's existing NULL semantics unchanged
-    // (one NULL admitted; a second collides) — the not-null check is scoped to the PK.
+    // Control: a plain (non-PK) UNIQUE column follows PostgreSQL NULL-distinct semantics: multiple
+    // NULLs are admitted, while repeated non-NULL values still collide. The not-null check is scoped
+    // to the PK.
     e.execute_text(
         txn + 1,
         "CREATE TABLE uq_ctl (id INT PRIMARY KEY, u INT UNIQUE)",
@@ -2650,8 +2651,12 @@ fn primary_key_rejects_null_on_insert_and_update() {
     .unwrap();
     e.execute_text(txn + 2, "INSERT INTO uq_ctl (id, u) VALUES (1, NULL)")
         .unwrap();
+    e.execute_text(txn + 3, "INSERT INTO uq_ctl (id, u) VALUES (2, NULL)")
+        .unwrap();
+    e.execute_text(txn + 4, "INSERT INTO uq_ctl (id, u) VALUES (3, 7)")
+        .unwrap();
     let err = e
-        .execute_text(txn + 3, "INSERT INTO uq_ctl (id, u) VALUES (2, NULL)")
+        .execute_text(txn + 5, "INSERT INTO uq_ctl (id, u) VALUES (4, 7)")
         .unwrap_err()
         .to_string();
     assert!(err.contains("duplicate key value"), "{err}");

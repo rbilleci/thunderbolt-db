@@ -1,7 +1,16 @@
+fn posting_index_bytes(words: &[u64], row_capacity: usize) -> Vec<u8> {
+    let mut bytes = words
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    bytes.resize(bytes.len() + row_capacity * std::mem::size_of::<u32>(), 0);
+    bytes
+}
+
 /// M1 (ledger #24): the INCREMENTAL index-insert kernel == a full rebuild. Build an index for
 /// a prefix of keys, INSERT the appended tail via the kernel, and verify the extended index
 /// probes IDENTICALLY to a from-scratch build over all keys (via the write-locate kernel).
-/// Also verifies same-key MVCC twins advance to distinct slots without declining the index.
+/// Also verifies same-key MVCC twins prepend one posting chain without declining the index.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn index_insert_kernel_extends_like_a_rebuild() {
@@ -31,17 +40,21 @@ fn index_insert_kernel_extends_like_a_rebuild() {
             slot = (slot + 1) & table_mask;
         }
     }
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let bytes = posting_index_bytes(&words, 12);
     let Ok(mem) = runtime.retain_device_memory_copy(0, &bytes) else {
         return;
     };
     let index = std::sync::Arc::new(mem);
     // INSERT the tail (rows 6..10) via the kernel.
     let tail = &all[6..];
-    let dup = index
-        .submit_i32_index_insert(table_mask, hash_shift, tail, 6)
+    let insert_status = index
+        .submit_i32_index_insert_status(table_mask, hash_shift, tail, 6)
         .expect("index insert");
-    assert!(!dup, "no dup inserting fresh keys");
+    assert!(!insert_status.declined, "fresh keys do not decline");
+    assert!(
+        !insert_status.created_posting,
+        "fresh keys remain singleton heads"
+    );
     // Probe ALL keys via the write-locate kernel: each must resolve to its row.
     let shards = [WriteLocateShard {
         index: std::sync::Arc::clone(&index),
@@ -61,11 +74,15 @@ fn index_insert_kernel_extends_like_a_rebuild() {
         assert_eq!(slot as usize, i, "key {key}: row {i} preserved");
     }
     // Same-key MVCC twin: insert a newer physical version in the next logical row. It must
-    // advance beyond the old key, remain indexed, and expose both candidate coordinates.
-    let dup2 = index
-        .submit_i32_index_insert(table_mask, hash_shift, &[30], 10)
+    // prepend the old row to one posting chain and expose both candidate coordinates.
+    let version_status = index
+        .submit_i32_index_insert_status(table_mask, hash_shift, &[30], 10)
         .expect("version-twin insert");
-    assert!(!dup2, "same-key version twin must not decline the index");
+    assert!(!version_status.declined, "same-key version twin must not decline");
+    assert!(
+        version_status.created_posting,
+        "same-key insert reports its posting"
+    );
     let twin_shards = [WriteLocateShard {
         index: std::sync::Arc::clone(&index),
         table_mask,
@@ -76,7 +93,14 @@ fn index_insert_kernel_extends_like_a_rebuild() {
         .submit_multi_shard_i32_write_locate(&twin_shards, &[30], 2)
         .expect("locate version twins");
     assert_eq!(twin.count, vec![2]);
-    assert_eq!(twin.slot, vec![2, 10]);
+    assert_eq!(twin.slot, vec![10, 2]);
+    let fresh_after_posting = index
+        .submit_i32_index_insert_status(table_mask, hash_shift, &[110], 11)
+        .expect("fresh key after an existing posting");
+    assert!(
+        !fresh_after_posting.created_posting,
+        "status is operation-scoped; retained owners monotonically OR it"
+    );
 }
 
 /// R3-002: the initial hash build consumes resident keys/stamps directly. Prove raw-key placement,
@@ -115,11 +139,11 @@ fn resident_typed_index_build_handles_duplicates_and_gc_boundary() {
         .expect("resident keys");
     let index = std::sync::Arc::new(
         runtime
-            .retain_device_memory_zeroed(0, 8 * 8)
+            .retain_device_memory_zeroed(0, resident_index_allocated_bytes(7, 3).unwrap())
             .expect("zeroed index"),
     );
-    assert!(!source
-        .submit_resident_typed_index_build(
+    let unique_status = source
+        .submit_resident_typed_index_build_status(
             &index,
             7,
             29,
@@ -132,7 +156,14 @@ fn resident_typed_index_build_handles_duplicates_and_gc_boundary() {
             0,
             false,
         )
-        .expect("raw resident build"));
+        .expect("raw resident build");
+    assert_eq!(
+        unique_status,
+        CudaResidentIndexStatus {
+            declined: false,
+            created_posting: false,
+        }
+    );
     let built = locate(index, keys.len() as u32, &keys);
     assert_eq!(built.count, vec![1, 1, 1]);
     assert_eq!([built.slot[0], built.slot[2], built.slot[4]], [0, 1, 2]);
@@ -146,10 +177,10 @@ fn resident_typed_index_build_handles_duplicates_and_gc_boundary() {
         .retain_device_memory_copy(0, &twin_bytes)
         .expect("duplicate resident keys");
     let duplicate_index = runtime
-        .retain_device_memory_zeroed(0, 8 * 8)
+        .retain_device_memory_zeroed(0, resident_index_allocated_bytes(7, 2).unwrap())
         .expect("duplicate index");
-    assert!(twin_source
-        .submit_resident_typed_index_build(
+    let strict_duplicate = twin_source
+        .submit_resident_typed_index_build_status(
             &duplicate_index,
             7,
             29,
@@ -162,7 +193,9 @@ fn resident_typed_index_build_handles_duplicates_and_gc_boundary() {
             0,
             false,
         )
-        .expect("non-tolerant duplicate build"));
+        .expect("non-tolerant duplicate build");
+    assert!(strict_duplicate.declined);
+    assert!(!strict_duplicate.created_posting);
 
     let live_stamp = 0x7f7f_7f7f_7f7f_7f7f_u64;
     let stamps = [5_u64, live_stamp];
@@ -175,7 +208,7 @@ fn resident_typed_index_build_handles_duplicates_and_gc_boundary() {
         .expect("resident deleted stamps");
     let gc_index = std::sync::Arc::new(
         runtime
-            .retain_device_memory_zeroed(0, 8 * 8)
+            .retain_device_memory_zeroed(0, resident_index_allocated_bytes(7, 2).unwrap())
             .expect("gc index"),
     );
     assert!(!twin_source
@@ -196,6 +229,310 @@ fn resident_typed_index_build_handles_duplicates_and_gc_boundary() {
     let after_gc = locate(gc_index, twins.len() as u32, &[30]);
     assert_eq!(after_gc.count, vec![1]);
     assert_eq!(after_gc.slot[0], 1);
+}
+
+/// PRODUCT-002 adversarial boundary: a hot non-unique key and its MVCC versions are posting-chain
+/// entries, not open-addressing collisions. Counts well beyond the 256 distinct-key probe bound
+/// must build, incrementally extend, and enumerate without decline.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn resident_index_posting_chain_exceeds_256_versions() {
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    const ROWS: usize = 600;
+    const PREFIX: usize = 300;
+    let keys = vec![77_i32; ROWS];
+    let key_bytes = keys
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    let source = runtime
+        .retain_device_memory_copy(0, &key_bytes)
+        .expect("resident duplicate keys");
+    let table_size = (ROWS as u64 * 2).next_power_of_two();
+    let table_mask = (table_size - 1) as u32;
+    let hash_shift = 32 - table_size.trailing_zeros();
+    let columns = [CudaCompoundFoldColumn::Fixed {
+        byte_offset: 0,
+        width_words: 1,
+    }];
+
+    let rebuilt = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_zeroed(
+                0,
+                resident_index_allocated_bytes(table_mask, ROWS as u64).unwrap(),
+            )
+            .expect("posting index"),
+    );
+    let rebuilt_status = source
+        .submit_resident_typed_index_build_status(
+            &rebuilt,
+            table_mask,
+            hash_shift,
+            &columns,
+            ROWS,
+            None,
+            0,
+            true,
+        )
+        .expect("duplicate-tolerant build");
+    assert!(!rebuilt_status.declined);
+    assert!(rebuilt_status.created_posting);
+    let rebuilt_hits = rebuilt
+        .submit_multi_shard_i32_write_locate(
+            &[WriteLocateShard {
+                index: std::sync::Arc::clone(&rebuilt),
+                table_mask,
+                hash_shift,
+                row_count: ROWS as u32,
+            }],
+            &[77],
+            ROWS as u32,
+        )
+        .expect("enumerate rebuilt posting chain");
+    assert_eq!(rebuilt_hits.count, vec![ROWS as u32]);
+
+    let extended = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_zeroed(
+                0,
+                resident_index_allocated_bytes(table_mask, ROWS as u64).unwrap(),
+            )
+            .expect("incremental posting index"),
+    );
+    let extended_twin = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_zeroed(
+                0,
+                resident_index_allocated_bytes(table_mask, ROWS as u64).unwrap(),
+            )
+            .expect("second incremental posting index"),
+    );
+    for index in [&extended, &extended_twin] {
+        assert!(!source
+            .submit_resident_typed_index_build(
+                index,
+                table_mask,
+                hash_shift,
+                &columns,
+                PREFIX,
+                None,
+                0,
+                true,
+            )
+            .expect("posting prefix build"));
+    }
+    let extended_status = source
+        .submit_resident_typed_indexes_insert_status(
+            &[
+                CudaResidentTypedIndexInsert {
+                    index: std::sync::Arc::clone(&extended),
+                    table_mask,
+                    hash_shift,
+                    columns: columns.to_vec(),
+                },
+                CudaResidentTypedIndexInsert {
+                    index: std::sync::Arc::clone(&extended_twin),
+                    table_mask,
+                    hash_shift,
+                    columns: columns.to_vec(),
+                },
+            ],
+            PREFIX,
+            ROWS - PREFIX,
+        )
+        .expect("resident multi-index posting tail insert");
+    assert!(!extended_status.declined);
+    assert!(extended_status.created_posting);
+    for index in [extended, extended_twin] {
+        let extended_hits = index
+            .submit_multi_shard_i32_write_locate(
+                &[WriteLocateShard {
+                    index: std::sync::Arc::clone(&index),
+                    table_mask,
+                    hash_shift,
+                    row_count: ROWS as u32,
+                }],
+                &[77],
+                ROWS as u32,
+        )
+            .expect("enumerate extended posting chain");
+        assert_eq!(extended_hits.count, vec![ROWS as u32]);
+        let mut slots = extended_hits.slot;
+        slots.sort_unstable();
+        assert_eq!(slots, (0..ROWS as u32).collect::<Vec<_>>());
+    }
+}
+
+/// A posting retry for an immutable plan must keep its captured row ceiling authoritative while
+/// the physical index capacity permits following a future head back to the old visible version.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn prepared_plan_posting_retry_follows_future_head_for_old_snapshot() {
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    let keys = [77_i32, 77];
+    let payload = [700_i32, 701];
+    let mut resident_bytes = Vec::new();
+    resident_bytes.extend(keys.iter().flat_map(|value| value.to_le_bytes()));
+    resident_bytes.extend(payload.iter().flat_map(|value| value.to_le_bytes()));
+    let resident = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_copy(0, &resident_bytes)
+            .expect("two-row resident capacity"),
+    );
+    let table_mask = 3;
+    let hash_shift = 30;
+    let index = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_zeroed(
+                0,
+                resident_index_allocated_bytes(table_mask, 2).unwrap(),
+            )
+            .expect("two-row posting index"),
+    );
+    let columns = [CudaCompoundFoldColumn::Fixed {
+        byte_offset: 0,
+        width_words: 1,
+    }];
+    let initial = resident
+        .submit_resident_typed_index_build_status(
+            &index,
+            table_mask,
+            hash_shift,
+            &columns,
+            1,
+            None,
+            0,
+            true,
+        )
+        .expect("build singleton prefix");
+    assert_eq!(
+        initial,
+        CudaResidentIndexStatus {
+            declined: false,
+            created_posting: false,
+        }
+    );
+    let plan = resident
+        .prepare_multi_shard_i32_index_probe_dense(&[MultiShardProbeShard {
+            resident: std::sync::Arc::clone(&resident),
+            index: std::sync::Arc::clone(&index),
+            table_mask,
+            hash_shift,
+            projection_offsets: vec![0, 8],
+            row_count: 1,
+            row_capacity: 2,
+            created_by: None,
+            deleted_by: None,
+            has_postings: false,
+            min: 77,
+            max: 77,
+        }])
+        .expect("prepare singleton plan");
+
+    let appended = resident
+        .submit_resident_typed_index_insert_status(
+            &index,
+            table_mask,
+            hash_shift,
+            &columns,
+            1,
+            1,
+            true,
+        )
+        .expect("publish future same-key posting");
+    assert!(appended.created_posting);
+
+    let (retried, _) = resident
+        .submit_prepared_multi_shard_i32_index_probe_dense_posting_retry(&plan, &[77], 1)
+        .expect("submit posting retry")
+        .complete_detached_columnar()
+        .expect("complete posting retry");
+    assert_eq!(retried.status, vec![1]);
+    assert_eq!(retried.values, vec![77, 700]);
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn dense_point_probe_finds_visible_version_beyond_256_postings() {
+    let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+    const ROWS: usize = 300;
+    let keys = vec![77_i32; ROWS];
+    let payload = (0..ROWS as i32).collect::<Vec<_>>();
+    let mut source_bytes = Vec::with_capacity(ROWS * 8);
+    source_bytes.extend(keys.iter().flat_map(|value| value.to_le_bytes()));
+    source_bytes.extend(payload.iter().flat_map(|value| value.to_le_bytes()));
+    let resident = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_copy(0, &source_bytes)
+            .expect("resident version payload"),
+    );
+    let table_size = (ROWS as u64 * 2).next_power_of_two();
+    let table_mask = (table_size - 1) as u32;
+    let hash_shift = 32 - table_size.trailing_zeros();
+    let index = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_zeroed(
+                0,
+                resident_index_allocated_bytes(table_mask, ROWS as u64).unwrap(),
+            )
+            .expect("posting index"),
+    );
+    assert!(!resident
+        .submit_resident_typed_index_build(
+            &index,
+            table_mask,
+            hash_shift,
+            &[CudaCompoundFoldColumn::Fixed {
+                byte_offset: 0,
+                width_words: 1,
+            }],
+            ROWS,
+            None,
+            0,
+            true,
+        )
+        .expect("build version postings"));
+    let created = (1..=ROWS as u64).collect::<Vec<_>>();
+    let mut deleted = (2..=ROWS as u64 + 1).collect::<Vec<_>>();
+    *deleted.last_mut().unwrap() = u64::MAX;
+    let created_bytes = created
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    let deleted_bytes = deleted
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    let shard = MultiShardProbeShard {
+        resident: std::sync::Arc::clone(&resident),
+        index,
+        table_mask,
+        hash_shift,
+        projection_offsets: vec![0, (ROWS * 4) as u64],
+        row_count: ROWS as u64,
+        row_capacity: ROWS as u64,
+        created_by: Some(std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &created_bytes)
+                .expect("created versions"),
+        )),
+        deleted_by: Some(std::sync::Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &deleted_bytes)
+                .expect("deleted versions"),
+        )),
+        has_postings: true,
+        min: 77,
+        max: 77,
+    };
+    let (columns, _) = resident
+        .submit_multi_shard_i32_index_probe_dense(&[shard], &[77], 257)
+        .expect("submit posting-chain point read")
+        .complete_detached_columnar()
+        .expect("complete posting-chain point read");
+    assert_eq!(columns.status, vec![1]);
+    assert_eq!(columns.values, vec![77, 256]);
 }
 
 /// M1 BAKEOFF micro-bench: the write-locate kernel's AMORTIZATION curve — us/needle at batch
@@ -222,7 +559,7 @@ fn write_locate_kernel_amortization_curve() {
         let keys: Vec<i32> = (0..PER_SHARD).map(|i| (s * PER_SHARD + i) as i32).collect();
         all_keys.extend_from_slice(&keys);
         let (index_words, table_mask, hash_shift) = build_pk_hash(&keys);
-        let bytes: Vec<u8> = index_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let bytes = posting_index_bytes(&index_words, keys.len());
         let Ok(mem) = runtime.retain_device_memory_copy(0, &bytes) else {
             return;
         };
@@ -285,7 +622,7 @@ fn write_locate_kernel_matches_host_scan() {
     let mut shards = Vec::new();
     for keys in &shard_keys {
         let (index_words, table_mask, hash_shift) = build_pk_hash(keys);
-        let bytes: Vec<u8> = index_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let bytes = posting_index_bytes(&index_words, keys.len());
         let Ok(mem) = runtime.retain_device_memory_copy(0, &bytes) else {
             return; // no device -> skip
         };
@@ -336,10 +673,7 @@ fn write_locate_kernel_matches_host_scan() {
 fn write_locate_inputs_fail_closed_and_leave_context_reusable() {
     let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
     let (valid_words, table_mask, hash_shift) = build_pk_hash(&[10]);
-    let valid_bytes: Vec<u8> = valid_words
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .collect();
+    let valid_bytes = posting_index_bytes(&valid_words, 1);
     let valid_index = std::sync::Arc::new(
         runtime
             .retain_device_memory_copy(0, &valid_bytes)
@@ -360,10 +694,7 @@ fn write_locate_inputs_fail_closed_and_leave_context_reusable() {
     let mut corrupt_words = valid_words.clone();
     let packed = corrupt_words.iter_mut().find(|word| **word != 0).unwrap();
     *packed = (*packed & 0xffff_ffff_0000_0000) | 100;
-    let corrupt_bytes: Vec<u8> = corrupt_words
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .collect();
+    let corrupt_bytes = posting_index_bytes(&corrupt_words, 1);
     let corrupt_index = std::sync::Arc::new(
         runtime
             .retain_device_memory_copy(0, &corrupt_bytes)
@@ -411,6 +742,40 @@ fn write_locate_inputs_fail_closed_and_leave_context_reusable() {
     assert!(ctx
         .submit_multi_shard_i32_visible_locate(&corrupt_visible, &[10], &[1])
         .is_err());
+
+    let mut cyclic_bytes = valid_bytes.clone();
+    let next_offset = valid_words.len() * std::mem::size_of::<u64>();
+    cyclic_bytes[next_offset..next_offset + 4].copy_from_slice(&1_u32.to_le_bytes());
+    let cyclic_index = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_copy(0, &cyclic_bytes)
+            .expect("self-linked posting index"),
+    );
+    let cyclic = [WriteLocateShard {
+        index: std::sync::Arc::clone(&cyclic_index),
+        table_mask,
+        hash_shift,
+        row_count: 1,
+    }];
+    assert!(
+        ctx.submit_multi_shard_i32_write_locate(&cyclic, &[10], 1)
+            .is_err(),
+        "a self-linked posting must terminate and fail closed in write-locate"
+    );
+    let cyclic_visible = [VisibleLocateShard {
+        index: cyclic_index,
+        table_mask,
+        hash_shift,
+        row_count: 1,
+        created_by: None,
+        deleted_by: None,
+        row_id: None,
+    }];
+    assert!(
+        ctx.submit_multi_shard_i32_visible_locate(&cyclic_visible, &[10], &[1])
+            .is_err(),
+        "a self-linked posting must terminate and fail closed in visible-locate"
+    );
 
     if runtime.snapshot().device_count > 1 {
         let foreign = std::sync::Arc::new(
@@ -621,9 +986,63 @@ fn write_apply_inputs_fail_closed_and_leave_context_reusable() {
             byte_offset: 0,
         },
     };
-    assert!(!owner
-        .submit_i32_fused_apply(&valid_request)
-        .expect("valid fused apply after rejected inputs"));
+    let unindexed_status = owner
+        .submit_i32_fused_apply_status(&valid_request)
+        .expect("valid fused apply after rejected inputs");
+    assert_eq!(
+        unindexed_status,
+        CudaResidentIndexStatus {
+            declined: false,
+            created_posting: false,
+        }
+    );
+
+    let (index_words, table_mask, hash_shift) = build_pk_hash(&[7]);
+    let version_index = std::sync::Arc::new(
+        runtime
+            .retain_device_memory_copy(0, &posting_index_bytes(&index_words, 2))
+            .expect("version posting index"),
+    );
+    let indexed_request = FusedApplyRequest {
+        columns: &valid_column,
+        values: &[7],
+        stamps: &[2],
+        created_by: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 32,
+        },
+        row_ids: None,
+        index: Some(CudaWriteIndex {
+            memory: std::sync::Arc::clone(&version_index),
+            table_mask,
+            hash_shift,
+            key_column: 0,
+        }),
+        base_row: 1,
+        header: CudaWriteDestination {
+            memory: std::sync::Arc::clone(&owner),
+            byte_offset: 0,
+        },
+    };
+    let fused_status = owner
+        .submit_i32_fused_apply_status(&indexed_request)
+        .expect("same-key fused append prepends a posting");
+    assert!(!fused_status.declined);
+    assert!(fused_status.created_posting);
+    let versions = version_index
+        .submit_multi_shard_i32_write_locate(
+            &[WriteLocateShard {
+                index: std::sync::Arc::clone(&version_index),
+                table_mask,
+                hash_shift,
+                row_count: 2,
+            }],
+            &[7],
+            2,
+        )
+        .expect("locate fused version postings");
+    assert_eq!(versions.count, vec![2]);
+    assert_eq!(versions.slot, vec![1, 0]);
 
     let valid = [CudaCompoundFoldColumn::Fixed {
         byte_offset: 0,

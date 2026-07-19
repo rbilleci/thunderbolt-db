@@ -279,7 +279,7 @@ pub(crate) enum InsertPrepareValidation {
     WaveOffLock,
     /// Wave-time fallback after a batched device needle could not bind or a locate declined. This
     /// performs the full validator ladder but MUST NOT re-enter wave deferral, which would turn the
-    /// fallback into a no-op (notably for structural NULL unique keys).
+    /// fallback into a no-op (notably for nullable UNIQUE inputs).
     WaveFallbackFull,
     ReResolveDeviceCovered,
 }

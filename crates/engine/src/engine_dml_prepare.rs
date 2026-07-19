@@ -884,6 +884,12 @@ impl Engine {
             let mut seen: BTreeSet<Vec<SqlValue>> = BTreeSet::new();
             for row in new_images {
                 let tuple_key: Vec<SqlValue> = positions.iter().map(|&i| row[i].clone()).collect();
+                if tuple_key
+                    .iter()
+                    .any(|value| matches!(value, SqlValue::Null))
+                {
+                    continue;
+                }
                 let conflict = !seen.insert(tuple_key) || {
                     if fingerprint_backed {
                         let key_cols: Vec<(usize, SqlValue)> =

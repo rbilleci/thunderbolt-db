@@ -27,6 +27,18 @@ impl Engine {
         created_by: AppendCreatedBy<'_>,
         row_ids: Option<&[u64]>,
     ) -> bool {
+        let apply_leader =
+            crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(std::cell::Cell::get);
+        let _apply = if apply_leader {
+            None
+        } else {
+            self.intent_lanes.as_ref().map(|lanes| {
+                lanes
+                    .device_apply_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+        };
         if new_rows.is_empty() {
             return false;
         }
@@ -451,14 +463,45 @@ impl Engine {
             if !fused {
                 let idx_started = crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
                     .then(std::time::Instant::now);
-                self.extend_shard_pk_device_index_on_append(
+                if !self.extend_shard_pk_device_index_on_append(
                     table,
                     shard_id,
                     shard_device_memory.device_ptr(),
                     row_count,
                     &column_values,
                     new_rows,
-                );
+                ) {
+                    return false;
+                }
+                if let Some(started) = idx_started {
+                    crate::engine_dml_concurrent::WAVE_DEVICE_STATS[2].fetch_add(
+                        started.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            } else {
+                // The fused pass owns the raw primary-key insert. PRODUCT-002 named compound
+                // secondaries still require their fingerprint candidates before row-count publication.
+                let idx_started = crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
+                    .then(std::time::Instant::now);
+                if !self.extend_shard_fingerprint_device_indexes_on_append(
+                    table,
+                    shard_id,
+                    shard_device_memory.device_ptr(),
+                    row_count,
+                    new_rows,
+                ) {
+                    return false;
+                }
+                if !self.named_indexes_cover_after_fused_append(
+                    table,
+                    shard_id,
+                    shard_device_memory.device_ptr(),
+                    row_count,
+                    row_count + k,
+                ) {
+                    return false;
+                }
                 if let Some(started) = idx_started {
                     crate::engine_dml_concurrent::WAVE_DEVICE_STATS[2].fetch_add(
                         started.elapsed().as_nanos() as u64,
@@ -536,13 +579,26 @@ impl Engine {
         // them. If it would cross the configured/default GPU budget, decline atomically; the
         // caller invalidates this table and the normal admission path may evict an older table or
         // leave this relation to the bounded streaming executor. The commit remains durable.
+        let named_indexes_required =
+            self.relational_named_index_publication_required(&catalog_table);
+        let named_index_bytes = if named_indexes_required {
+            let Some(bytes) =
+                estimated_named_index_bytes_for_shard(&catalog_table, k, new_capacity)
+            else {
+                return false;
+            };
+            bytes
+        } else {
+            0
+        };
         let rollover_bytes = (device_payload.len() as u64)
             .saturating_add((new_capacity as u64).saturating_mul(8))
             .saturating_add(if row_ids.is_some() {
                 (new_capacity as u64).saturating_mul(8)
             } else {
                 0
-            });
+            })
+            .saturating_add(named_index_bytes);
         let _budget_allocation = self
             .read_state
             .residency
@@ -719,6 +775,54 @@ impl Engine {
                     table_shards.push(new_shard);
                 }
             });
+        // PRODUCT-002: a rollover is a new resident generation, so every declared index must cover
+        // the new shard before the commit can publish visibility. Existing shards are cache hits;
+        // only this k-row shard builds. The surrounding admission budget guard remains the single
+        // allocation transaction, and a failure returns false so the caller invalidates/re-admits.
+        if named_indexes_required {
+            let current_shards = self.read_state.residency.shards.load_full();
+            let Some(table_shards) = current_shards.get(table) else {
+                return false;
+            };
+            let incremental = self
+                .read_state
+                .residency
+                .named_index_coverage_complete
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(table)
+                .is_some_and(|(oid, indexes)| {
+                    *oid == catalog_table.oid && indexes == &catalog_table.indexes
+                });
+            let publish_shards = if incremental {
+                let Some(new_shard) = table_shards.last() else {
+                    return false;
+                };
+                std::slice::from_ref(new_shard)
+            } else {
+                table_shards.as_slice()
+            };
+            if self
+                .publish_relational_resident_indexes_for_generation(
+                    &catalog_table,
+                    publish_shards,
+                    self.committed_seq(),
+                    true,
+                    true,
+                    !incremental,
+                )
+                .is_err()
+            {
+                self.read_state
+                    .residency
+                    .purge_shard_pk_index_for_table(table);
+                let boundary = self.committed_seq();
+                self.read_state
+                    .residency
+                    .flag_table_descriptors_invalidated(table, boundary, boundary);
+                return false;
+            }
+        }
         self.read_state
             .residency
             .open_shard_append_hits
@@ -1109,17 +1213,20 @@ impl Engine {
                 byte_offset: 0,
             },
         };
-        let apply_result = shard_device_memory.submit_i32_fused_apply(&request);
+        let _index_mutation = index_col
+            .is_some()
+            .then(|| self.read_state.residency.begin_point_index_mutation(table));
+        let apply_result = shard_device_memory.submit_i32_fused_apply_status(&request);
         #[cfg(test)]
-        if matches!(&apply_result, Ok(false)) {
+        if matches!(&apply_result, Ok(status) if !status.declined) {
             self.read_state
                 .residency
                 .run_shard_pk_index_append_post_launch_hook();
         }
         match apply_result {
-            Ok(dup) => {
+            Ok(status) => {
                 if let Some(col_idx) = index_col {
-                    if dup {
+                    if status.declined {
                         // The fused insert overflowed its bounded probe. Retire prepared routes before the
                         // unusable index leaves the accounted map; a later probe rebuilds safely.
                         self.read_state
@@ -1145,6 +1252,7 @@ impl Engine {
                                 })
                             {
                                 entry.row_count = row_count + k;
+                                entry.has_postings |= status.created_posting;
                             }
                         }
                     }

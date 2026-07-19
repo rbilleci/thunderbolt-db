@@ -118,6 +118,7 @@ mod engine_result_sort;
 mod engine_retained_read;
 pub use engine_retained_read::{
     RelationalCompoundI32I64PointReadParam, RelationalCompoundI32I64PointReadTemplate,
+    RelationalResidentIndexPublication, RelationalResidentIndexPublicationEntry,
 };
 mod engine_select_bind;
 mod engine_select_exec;

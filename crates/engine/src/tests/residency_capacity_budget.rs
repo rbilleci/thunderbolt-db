@@ -36,6 +36,40 @@ fn open_payload_rejects_text_and_undersize() {
     assert!(build_relational_device_payload_with_capacity(&names, &types, &rows, 3).is_err());
 }
 
+#[test]
+fn named_index_budget_estimate_charges_distinct_device_keys_once() {
+    let engine = Engine::new_local_test_engine();
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE estimate_idx (id INT PRIMARY KEY, tenant_id INT, status INT)",
+        )
+        .unwrap();
+    engine
+        .execute_text(2, "CREATE INDEX estimate_idx_id_copy ON estimate_idx (id)")
+        .unwrap();
+    engine
+        .execute_text(
+            3,
+            "CREATE INDEX estimate_idx_status ON estimate_idx (tenant_id, status)",
+        )
+        .unwrap();
+    let table = engine.relational_catalog_table("estimate_idx").unwrap();
+    let row_count = 3usize;
+    let capacity = 8usize;
+    let table_size = 32u64;
+    let per_distinct_key = gpu_db_execution::resident_index_allocated_bytes(
+        (table_size - 1) as u32,
+        capacity as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        estimated_named_index_bytes_for_shard(&table, row_count, capacity),
+        Some(per_distinct_key * 2),
+        "the PK and duplicate id index share one raw key allocation; the compound index owns one fingerprint allocation"
+    );
+}
+
 /// S-F/R-1: the per-shard device hash index obeys the same hard cap as base payloads.
 /// At a cap equal to the admitted shard+identity bytes, the optional index declines and the
 /// sharded point path still returns the correct row through its GPU scan fallback.

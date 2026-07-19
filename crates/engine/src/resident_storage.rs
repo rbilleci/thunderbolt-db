@@ -42,6 +42,13 @@ pub(crate) struct CachedShardPkDeviceIndex {
     /// Rows deleted at or below this boundary were omitted when the index was built. A cached index
     /// can serve a reader only when this boundary is no newer than the reader's pinned snapshot.
     pub(crate) gc_boundary: Index,
+    /// A declined strict build cannot satisfy a later non-unique publication request: retrying with
+    /// duplicate tolerance may produce a usable candidate index. A successful build is valid for
+    /// either policy because exactness comes from the typed/MVCC recheck, not this flag.
+    pub(crate) duplicate_tolerant: bool,
+    /// Monotone device verdict: this allocation contains at least one multi-row posting chain.
+    /// Certified-false indexes may use the original low-register singleton read kernel.
+    pub(crate) has_postings: bool,
     pub(crate) _resident_guard: Arc<CudaResidentDeviceMemory>,
     pub(crate) device_index: Option<Arc<CudaResidentDeviceMemory>>,
     pub(crate) table_mask: u32,
@@ -130,6 +137,8 @@ pub(crate) struct CachedShardedPointRoute {
     pub(crate) gpu_id: u16,
     pub(crate) launch_resident: Arc<CudaResidentDeviceMemory>,
     pub(crate) plan: Arc<gpu_db_execution::CudaI32MultiShardProbePlan>,
+    pub(crate) index_mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) prepared_index_epoch: u64,
 }
 
 pub(crate) type ShardedPointRouteKey = (String, usize, Vec<usize>);

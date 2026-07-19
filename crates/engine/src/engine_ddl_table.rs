@@ -639,25 +639,22 @@ impl Engine {
         table: &RelationalTable,
         rows: impl IntoIterator<Item = &'a [SqlValue]>,
     ) -> Result<(), EngineError> {
-        let Some(column_idx) = table
+        let Some(column_idxs) = table
             .indexes
             .iter()
             .find(|index| index.primary_key)
-            .and_then(|index| {
-                table
-                    .columns
-                    .iter()
-                    .position(|column| column.name == index.column)
-            })
+            .and_then(|index| crate::engine_residency::index_key_column_positions(table, index))
         else {
             return Ok(());
         };
         for row in rows {
-            if matches!(row[column_idx], SqlValue::Null) {
-                return Err(EngineError::ApplyFailed(format!(
-                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
-                    table.columns[column_idx].name, table.name
-                )));
+            for &column_idx in &column_idxs {
+                if matches!(row[column_idx], SqlValue::Null) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                        table.columns[column_idx].name, table.name
+                    )));
+                }
             }
         }
         Ok(())
@@ -665,7 +662,8 @@ impl Engine {
 
     /// COMPOUND KEYS (TYPE-COVERAGE #14 Track 3): a duplicate is a repeated ORDERED TUPLE of the key
     /// columns (`column_idxs.len() == 1` reproduces the single-column unique check exactly).
-    /// STRUCTURAL equality (NULL == NULL, via `BTreeSet`), matching the scan validators' semantics.
+    /// PostgreSQL unique semantics: any tuple containing NULL is not comparable for uniqueness, so
+    /// multiple such rows are accepted. PRIMARY KEY nullability is rejected separately above.
     pub(crate) fn validate_unique_values_tuple(
         rows: &[Vec<SqlValue>],
         column_idxs: &[usize],
@@ -674,6 +672,9 @@ impl Engine {
         let mut seen: BTreeSet<Vec<SqlValue>> = BTreeSet::new();
         for row in rows {
             let key: Vec<SqlValue> = column_idxs.iter().map(|&i| row[i].clone()).collect();
+            if key.iter().any(|value| matches!(value, SqlValue::Null)) {
+                continue;
+            }
             if !seen.insert(key) {
                 return Err(EngineError::ApplyFailed(format!(
                     "duplicate key value violates unique index \"{}\"",

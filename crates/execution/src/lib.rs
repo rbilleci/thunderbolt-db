@@ -43,6 +43,10 @@ pub use resident_memory::{
 mod resident_header;
 use resident_header::launch_cuda_resident_row_count;
 mod resident_index_build;
+pub use resident_index_build::{
+    resident_index_allocated_bytes, resident_index_hash_bytes, CudaResidentIndexStatus,
+    CudaResidentTypedIndexInsert,
+};
 mod resident_sort;
 use resident_sort::{
     launch_cuda_bitonic_sort_hetero, launch_cuda_bitonic_sort_i64,
@@ -205,7 +209,9 @@ pub use point_read_bloom::ChunkBloomProbeShard;
 mod point_read_text;
 use point_read_text::launch_cuda_resident_i32_equal_any_project_text;
 mod point_read_submission;
-use point_read_submission::{validate_i32_index_geometry, I32NeedlesHostGuard};
+use point_read_submission::{
+    validate_i32_index_geometry, validate_i32_posting_index_geometry, I32NeedlesHostGuard,
+};
 pub use point_read_submission::{
     CudaI32BatchProjectionColumns, CudaI32BatchProjectionRow, CudaI32EqualAnyProjectSubmission,
     CudaI32TextBatchProjectionRow,
@@ -1368,6 +1374,25 @@ impl CudaResidentDeviceMemory {
             Arc::clone(plan),
             needles,
             read_snapshot,
+            false,
+        )
+    }
+
+    /// Submit a prepared singleton route through the capacity-bounded posting kernel. A host coordinator
+    /// uses this after observing an overlapping or completed in-place index mutation; the captured row count
+    /// remains the visibility ceiling while the physical capacity bounds traversal.
+    pub fn submit_prepared_multi_shard_i32_index_probe_dense_posting_retry(
+        &self,
+        plan: &Arc<CudaI32MultiShardProbePlan>,
+        needles: &[i32],
+        read_snapshot: u64,
+    ) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
+        submit_cuda_resident_i32_multi_shard_index_probe_dense_prepared(
+            self,
+            Arc::clone(plan),
+            needles,
+            read_snapshot,
+            true,
         )
     }
 

@@ -7,6 +7,39 @@
 
 use super::*;
 
+/// Exact retained bytes for every distinct named-index key id on one shard. The sizing mirrors
+/// `ensure_shard_pk_device_index`: capacity-sized directory headroom plus one posting link per row
+/// of shard capacity. Shared key ids are charged once because publication reuses their allocation.
+fn estimated_named_index_bytes_for_shard(
+    table: &RelationalTable,
+    row_count: usize,
+    capacity: usize,
+) -> Option<u64> {
+    let mut key_ids = std::collections::BTreeSet::new();
+    for (ordinal, index) in table.indexes.iter().enumerate() {
+        if !index_all_key_columns_foldable(table, index) {
+            return None;
+        }
+        key_ids.insert(index_probe_key_id(table, index, ordinal)?);
+    }
+    if key_ids.is_empty() || row_count == 0 {
+        return Some(0);
+    }
+    let sizing_rows = (row_count as u64)
+        .saturating_mul(2)
+        .max((capacity as u64).saturating_mul(2))
+        .min(1_u64 << 29);
+    let table_size = sizing_rows.checked_mul(2)?.checked_next_power_of_two()?;
+    if table_size > (1_u64 << 30) {
+        return None;
+    }
+    let bytes = gpu_db_execution::resident_index_allocated_bytes(
+        (table_size - 1) as u32,
+        capacity.max(row_count) as u64,
+    )?;
+    bytes.checked_mul(key_ids.len() as u64)
+}
+
 /// Snapshot construction, admission, and publication ownership.
 mod admission;
 /// Vacuum, serialized rehydration, and device-gather ownership.
@@ -163,6 +196,8 @@ mod capacity_payload_tests {
     include!("tests/residency_sharded_point_reads.rs");
 
     include!("tests/residency_compound_point_reads.rs");
+
+    include!("tests/residency_named_index_publication.rs");
 
     include!("tests/residency_capacity_budget.rs");
 }

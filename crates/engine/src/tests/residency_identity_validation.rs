@@ -1,8 +1,8 @@
 /// RETIREMENT A3 — the mandatory device validator ladder. Covers unique violation + PASS (the FALSE answer is the
 /// load-bearing one — a device miss would wrongly ADMIT a duplicate), unique-through-SV5-churn
 /// (the version-split physical hit must be neutralized by fetch-at-visibility), unique
-/// key-move, outbound-FK present/absent, inbound-FK blocked/allowed DELETE, and NULL-on-unique
-/// with structural NULL==NULL semantics. NON-VACUITY: `dml_device_validate_hits`
+/// key-move, outbound-FK present/absent, inbound-FK blocked/allowed DELETE, and PostgreSQL's
+/// NULL-distinct UNIQUE semantics. NON-VACUITY: `dml_device_validate_hits`
 /// must ADVANCE. Sabotage: make the
 /// device probe skip `answer = true` and the violation statements wrongly SUCCEED -> outcome
 /// vectors diverge -> FAIL.
@@ -48,8 +48,8 @@ fn a3_device_validator_serves_constraint_ladder() {
             "INSERT INTO c (id, tid) VALUES (3, 9999)", // outbound FK: no provider -> violation
             "DELETE FROM t WHERE id = 42",          // inbound FK: a child still references 42
             "DELETE FROM t WHERE id = 43",          // no child -> success
-            "INSERT INTO t (id, v) VALUES (NULL, 1)", // NULL on unique: host semantics serve
-            "INSERT INTO t (id, v) VALUES (NULL, 2)", // second NULL: MUST match host outcome
+            "INSERT INTO t (id, v) VALUES (NULL, 1)", // NULL on unique: distinct
+            "INSERT INTO t (id, v) VALUES (NULL, 2)", // second NULL: distinct too
         ];
         let hits_before = e.dml_device_validate_hits();
         let outcomes: Vec<Result<(), String>> = statements
@@ -113,6 +113,11 @@ fn a3_device_validator_serves_constraint_ladder() {
             .is_err_and(|err| err.contains("foreign key")),
         "referenced-provider delete must violate the FK: {:?}",
         dev_out[8]
+    );
+    assert!(
+        dev_out[10].is_ok() && dev_out[11].is_ok(),
+        "PostgreSQL UNIQUE treats both NULL keys as distinct: {:?}",
+        &dev_out[10..=11]
     );
     assert!(
         dev_t

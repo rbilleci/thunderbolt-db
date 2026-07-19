@@ -200,7 +200,7 @@ impl Engine {
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
             }
-            let (device_index, table_mask, hash_shift, index_row_count) = self
+            let (device_index, table_mask, hash_shift, index_row_count, _has_postings) = self
                 .ensure_shard_pk_device_index(
                     table,
                     &table.name,
@@ -215,8 +215,12 @@ impl Engine {
                             blob_lens: &blob_lens,
                         },
                         row_count: shard.row_count,
+                        capacity_rows: shard.capacity as u64,
                         gc_boundary,
                         deleted_by: shard.deleted_by_region.clone(),
+                        duplicate_tolerant: false,
+                        apply_already_locked: false,
+                        budget_already_locked: false,
                     },
                 )
                 .ok()
@@ -315,7 +319,7 @@ impl Engine {
             if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
                 return None;
             }
-            let (device_index, table_mask, hash_shift, index_row_count) = self
+            let (device_index, table_mask, hash_shift, index_row_count, _has_postings) = self
                 .ensure_shard_pk_device_index(
                     table,
                     &table.name,
@@ -330,8 +334,12 @@ impl Engine {
                             blob_lens: &blob_lens,
                         },
                         row_count: shard.row_count,
+                        capacity_rows: shard.capacity as u64,
                         gc_boundary,
                         deleted_by: shard.deleted_by_region.clone(),
+                        duplicate_tolerant: false,
+                        apply_already_locked: false,
+                        budget_already_locked: false,
                     },
                 )
                 .ok()

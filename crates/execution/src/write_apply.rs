@@ -124,13 +124,11 @@ fn validate_index_append(
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(
                 key_count as usize,
             ))?;
-    let required_slots =
-        u64::from(row_count)
-            .checked_mul(2)
-            .ok_or(CudaRuntimeProbeError::InvalidInputLength(
-                row_count as usize,
-            ))?;
-    if required_slots > u64::from(table_mask) + 1 {
+    let required_bytes = crate::resident_index_allocated_bytes(table_mask, u64::from(row_count))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(
+            row_count as usize,
+        ))?;
+    if required_bytes > index.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             row_count as usize,
         ));
@@ -185,9 +183,9 @@ const FUSED_APPLY_PTX: &[u8] = br#"
     .param .u64 staging_ptr
 )
 {
-    .reg .pred %p<6>;
-    .reg .b32 %r<24>;
-    .reg .b64 %rd<28>;
+    .reg .pred %p<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<36>;
 
     ld.param.u64 %rd1, [staging_ptr];
     ld.global.u32 %r1, [%rd1+0];      // k
@@ -264,11 +262,12 @@ RIDONE:
     mul.wide.u32 %rd25, %r15, 4;
     add.u64 %rd26, %rd5, %rd25;
     ld.global.s32 %r16, [%rd26];
-    // packed = (key << 32) | (base_row + j + 1)
+    // packed = (key << 32) | singleton-marked(base_row + j + 1)
     ld.global.u32 %r17, [%rd1+12];    // base_row
     add.u32 %r17, %r17, %r8;
     add.u32 %r17, %r17, 1;
-    cvt.u64.u32 %rd6, %r17;
+    or.b32 %r28, %r17, 2147483648;
+    cvt.u64.u32 %rd6, %r28;
     cvt.u64.u32 %rd7, %r16;
     shl.b64 %rd8, %rd7, 32;
     or.b64 %rd9, %rd8, %rd6;
@@ -287,9 +286,36 @@ INSLOOP:
     atom.global.cas.b64 %rd27, [%rd12], %rd13, %rd9;
     setp.eq.u64 %p5, %rd27, 0;
     @%p5 bra DONE;
-    // F3/U4: occupied slot (ANY key, incl. our own = a version twin) -> probe onward, place the
-    // twin at the next empty slot (dup-tolerant visible-locate resolves versions at probe time).
-    // Only a 256-probe overflow declines.
+    shr.u64 %rd28, %rd27, 32;
+    cvt.u32.u64 %r24, %rd28;
+    setp.ne.u32 %p6, %r24, %r16;
+    @%p6 bra ADVANCE;
+    // Same key: prepend this physical version to the row-addressed posting chain. The directory
+    // keeps one slot per distinct key, so hot-key version counts do not consume probe slots.
+    cvt.u32.u64 %r25, %rd27;
+    and.b32 %r25, %r25, 2147483647;
+    add.u32 %r26, %r18, 1;
+    cvt.u64.u32 %rd29, %r26;
+    shl.b64 %rd29, %rd29, 3;
+    add.u64 %rd30, %rd10, %rd29;
+    sub.u32 %r27, %r17, 1;
+    mul.wide.u32 %rd31, %r27, 4;
+    add.u64 %rd31, %rd30, %rd31;
+    st.global.u32 [%rd31], %r25;
+    membar.gl;
+    cvt.u64.u32 %rd6, %r17;
+    cvt.u64.u32 %rd7, %r16;
+    shl.b64 %rd8, %rd7, 32;
+    or.b64 %rd9, %rd8, %rd6;
+    atom.global.cas.b64 %rd32, [%rd12], %rd27, %rd9;
+    setp.eq.u64 %p7, %rd32, %rd27;
+    @%p7 bra POSTED;
+    bra INSLOOP;
+POSTED:
+    mov.u32 %r29, 2;
+    atom.global.or.b32 %r30, [%rd1+28], %r29;
+    bra DONE;
+ADVANCE:
     add.u32 %r21, %r21, 1;
     and.b32 %r21, %r21, %r18;
     add.u32 %r22, %r22, 1;
@@ -298,7 +324,7 @@ INSLOOP:
     bra INSLOOP;
 DUP:
     mov.u32 %r23, 1;
-    st.global.u32 [%rd1+28], %r23;    // decline flag lives in the header
+    atom.global.or.b32 %r24, [%rd1+28], %r23; // status word lives in the header
 
 DONE:
     ret;
@@ -331,9 +357,9 @@ const INDEX_INSERT_PTX: &[u8] = br#"
     .param .u64 decline_ptr
 )
 {
-    .reg .pred %p<4>;
-    .reg .b32 %r<20>;
-    .reg .b64 %rd<20>;
+    .reg .pred %p<6>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<28>;
 
     ld.param.u64 %rd1, [index_ptr];
     ld.param.u32 %r1, [table_mask];
@@ -354,10 +380,11 @@ const INDEX_INSERT_PTX: &[u8] = br#"
     add.u64 %rd5, %rd2, %rd4;
     ld.global.s32 %r9, [%rd5];
 
-    // packed = ((u64)key_bits << 32) | (base_row + tid + 1)
+    // packed = ((u64)key_bits << 32) | singleton-marked(base_row + tid + 1)
     add.u32 %r10, %r4, %r8;
     add.u32 %r10, %r10, 1;
-    cvt.u64.u32 %rd6, %r10;
+    or.b32 %r20, %r10, 2147483648;
+    cvt.u64.u32 %rd6, %r20;
     cvt.u64.u32 %rd7, %r9;
     shl.b64 %rd8, %rd7, 32;
     or.b64 %rd9, %rd8, %rd6;
@@ -376,11 +403,36 @@ INSLOOP:
     atom.global.cas.b64 %rd13, [%rd11], %rd12, %rd9;
     setp.eq.u64 %p2, %rd13, 0;
     @%p2 bra DONE;
-    // F3/U4: an occupied slot (ANY key, INCLUDING our own = an MVCC version twin) is a collision
-    // -> probe onward to the next empty slot and place the twin there. The dup-tolerant
-    // visible-locate walks the whole chain and resolves the snapshot-visible version at probe time,
-    // so a key legitimately holds >1 physical slot (old + new) until the old drops below the GC
-    // boundary and a rebuild reclaims it. Only a 256-probe overflow declines (rebuild at grown size).
+    shr.u64 %rd14, %rd13, 32;
+    cvt.u32.u64 %r14, %rd14;
+    setp.ne.u32 %p4, %r14, %r9;
+    @%p4 bra ADVANCE;
+    cvt.u32.u64 %r15, %rd13;
+    and.b32 %r15, %r15, 2147483647;
+    add.u32 %r16, %r1, 1;
+    cvt.u64.u32 %rd15, %r16;
+    shl.b64 %rd15, %rd15, 3;
+    add.u64 %rd16, %rd1, %rd15;
+    sub.u32 %r17, %r10, 1;
+    mul.wide.u32 %rd17, %r17, 4;
+    add.u64 %rd17, %rd16, %rd17;
+    st.global.u32 [%rd17], %r15;
+    membar.gl;
+    cvt.u64.u32 %rd6, %r10;
+    cvt.u64.u32 %rd7, %r9;
+    shl.b64 %rd8, %rd7, 32;
+    or.b64 %rd9, %rd8, %rd6;
+    atom.global.cas.b64 %rd18, [%rd11], %rd13, %rd9;
+    setp.eq.u64 %p5, %rd18, %rd13;
+    @%p5 bra POSTED;
+    bra INSLOOP;
+
+POSTED:
+    mov.u32 %r21, 2;
+    atom.global.or.b32 %r22, [%rd3], %r21;
+    bra DONE;
+
+ADVANCE:
     add.u32 %r12, %r12, 1;
     and.b32 %r12, %r12, %r1;
     add.u32 %r13, %r13, 1;
@@ -389,8 +441,8 @@ INSLOOP:
     bra INSLOOP;
 
 DUP:
-    mov.u32 %r15, 1;
-    st.global.u32 [%rd3], %r15;
+    mov.u32 %r19, 1;
+    atom.global.or.b32 %r20, [%rd3], %r19;
 
 DONE:
     ret;
@@ -597,6 +649,14 @@ impl CudaResidentDeviceMemory {
         &self,
         request: &FusedApplyRequest<'_>,
     ) -> Result<bool, CudaRuntimeProbeError> {
+        Ok(self.submit_i32_fused_apply_status(request)?.declined)
+    }
+
+    /// Status-bearing fused apply using the same four-byte completion readback.
+    pub fn submit_i32_fused_apply_status(
+        &self,
+        request: &FusedApplyRequest<'_>,
+    ) -> Result<crate::CudaResidentIndexStatus, CudaRuntimeProbeError> {
         type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
         type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
         #[allow(clippy::type_complexity)]
@@ -617,7 +677,7 @@ impl CudaResidentDeviceMemory {
         let num_cols = request.columns.len();
         let k = request.stamps.len();
         if k == 0 || num_cols == 0 {
-            return Ok(false);
+            return Ok(crate::CudaResidentIndexStatus::from_bits(0));
         }
         let expected_values = num_cols
             .checked_mul(k)
@@ -851,14 +911,14 @@ impl CudaResidentDeviceMemory {
             )
         })?;
         stream_drain.armed = false;
-        Ok(decline != 0)
+        Ok(crate::CudaResidentIndexStatus::from_bits(decline))
     }
 
     /// M1 (ledger #24): insert `keys` (the APPENDED tail, at device rows `base_row..`) INTO this
     /// device hash index IN PLACE via the lock-free `index_insert` kernel. Same-key MVCC versions
-    /// occupy distinct probe slots; `true` means the 256-probe bound was exhausted, so the caller
-    /// transitions the cache to the DECLINED
-    /// state (monotone, like the host path). The caller MUST enforce the load rule
+    /// share one fingerprint directory slot and prepend row-addressed posting links; `true` means
+    /// the 256-slot distinct-fingerprint probe bound was exhausted, so the caller transitions the
+    /// cache to the DECLINED state (monotone, like the host path). The caller MUST enforce the load rule
     /// (`2*(base_row+keys.len()) <= table_size`) BEFORE calling (else drop + rebuild). Synchronous.
     pub fn submit_i32_index_insert(
         &self,
@@ -867,6 +927,19 @@ impl CudaResidentDeviceMemory {
         keys: &[i32],
         base_row: u32,
     ) -> Result<bool, CudaRuntimeProbeError> {
+        Ok(self
+            .submit_i32_index_insert_status(table_mask, hash_shift, keys, base_row)?
+            .declined)
+    }
+
+    /// Status-bearing incremental insert using the same four-byte completion readback.
+    pub fn submit_i32_index_insert_status(
+        &self,
+        table_mask: u32,
+        hash_shift: u32,
+        keys: &[i32],
+        base_row: u32,
+    ) -> Result<crate::CudaResidentIndexStatus, CudaRuntimeProbeError> {
         type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
         type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
         type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
@@ -886,7 +959,7 @@ impl CudaResidentDeviceMemory {
         ) -> i32;
 
         if keys.is_empty() {
-            return Ok(false);
+            return Ok(crate::CudaResidentIndexStatus::from_bits(0));
         }
         let key_count = u32::try_from(keys.len())
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(keys.len()))?;
@@ -998,7 +1071,7 @@ impl CudaResidentDeviceMemory {
             )
         })?;
         stream_drain.armed = false;
-        Ok(decline[0] != 0)
+        Ok(crate::CudaResidentIndexStatus::from_bits(decline[0]))
     }
 
     /// Fold typed fixed/text columns owned by `self` into per-row 32-bit fingerprints on-device.

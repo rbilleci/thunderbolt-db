@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use super::cuda_context::{PooledStreamOwned, RetainedDeviceBufferOwned};
 use super::{
-    check_cuda, validate_i32_index_geometry, CudaResidentDeviceMemory, CudaResidentReadSource,
-    CudaRuntimeProbeError, GpuPrimaryContext,
+    check_cuda, validate_i32_posting_index_geometry, CudaResidentDeviceMemory,
+    CudaResidentReadSource, CudaRuntimeProbeError, GpuPrimaryContext,
 };
 
 const MAX_PROJECTIONS: usize = 4;
@@ -186,8 +186,7 @@ fn index_geometry(total_rows: u64) -> Result<(u32, u32, usize), CudaRuntimeProbe
     let table_mask = (slots - 1) as u32;
     let hash_shift = 32 - slots.trailing_zeros();
     let bytes = usize::try_from(
-        slots
-            .checked_mul(std::mem::size_of::<u64>() as u64)
+        crate::resident_index_allocated_bytes(table_mask, total_rows)
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
     )
     .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
@@ -224,6 +223,10 @@ const BUILD_PTX: &[u8] = br#"
     ld.param.u32 %r4, [hash_shift];
     ld.param.u64 %rd4, [gc_boundary];
     ld.param.u64 %rd5, [decline_ptr];
+    add.u32 %r32, %r3, 1;
+    cvt.u64.u32 %rd40, %r32;
+    shl.b64 %rd40, %rd40, 3;
+    add.u64 %rd40, %rd2, %rd40;
 
     mov.u32 %r5, %tid.x;
     mov.u32 %r6, %ctaid.x;
@@ -316,26 +319,43 @@ LOADKEY:
     add.u32 %r25, %r8, 1;
     cvt.u64.u32 %rd21, %r19;
     shl.b64 %rd21, %rd21, 32;
-    cvt.u64.u32 %rd22, %r25;
+    or.b32 %r32, %r25, 2147483648;
+    cvt.u64.u32 %rd22, %r32;
     or.b64 %rd23, %rd21, %rd22;
+    mul.wide.u32 %rd27, %r8, 4;
+    add.u64 %rd28, %rd3, %rd27;
+    st.global.u32 [%rd28], %r13;
 INSERT:
     and.b32 %r23, %r23, %r3;
     mul.wide.u32 %rd24, %r23, 8;
     add.u64 %rd25, %rd2, %rd24;
     atom.global.cas.b64 %rd26, [%rd25], 0, %rd23;
     setp.eq.u64 %p4, %rd26, 0;
-    @%p4 bra STORESHARD;
+    @%p4 bra DONE;
+    shr.u64 %rd29, %rd26, 32;
+    cvt.u32.u64 %r26, %rd29;
+    setp.ne.u32 %p5, %r26, %r19;
+    @%p5 bra ADVANCE;
+    cvt.u32.u64 %r27, %rd26;
+    and.b32 %r27, %r27, 2147483647;
+    mul.wide.u32 %rd30, %r8, 4;
+    add.u64 %rd31, %rd40, %rd30;
+    st.global.u32 [%rd31], %r27;
+    membar.gl;
+    cvt.u64.u32 %rd21, %r19;
+    shl.b64 %rd21, %rd21, 32;
+    cvt.u64.u32 %rd22, %r25;
+    or.b64 %rd23, %rd21, %rd22;
+    atom.global.cas.b64 %rd32, [%rd25], %rd26, %rd23;
+    setp.eq.u64 %p6, %rd32, %rd26;
+    @%p6 bra DONE;
+    bra INSERT;
+ADVANCE:
     add.u32 %r23, %r23, 1;
     add.u32 %r24, %r24, 1;
     setp.ge.u32 %p4, %r24, 256;
     @%p4 bra DECLINE;
     bra INSERT;
-
-STORESHARD:
-    mul.wide.u32 %rd27, %r8, 4;
-    add.u64 %rd28, %rd3, %rd27;
-    st.global.u32 [%rd28], %r13;
-    bra DONE;
 
 DECLINE:
     mov.u32 %r30, 1;
@@ -385,6 +405,10 @@ const PROBE_PTX: &[u8] = br#"
     ld.param.u64 %rd5, [read_snapshot];
     ld.param.u64 %rd6, [out_values_ptr];
     ld.param.u64 %rd7, [out_status_ptr];
+    add.u32 %r60, %r3, 1;
+    cvt.u64.u32 %rd68, %r60;
+    shl.b64 %rd68, %rd68, 3;
+    add.u64 %rd68, %rd2, %rd68;
 
     mov.u32 %r8, %tid.x;
     mov.u32 %r9, %ctaid.x;
@@ -438,16 +462,26 @@ PROBE:
     setp.ne.u32 %p2, %r24, %r15;
     @%p2 bra ADVANCE;
     cvt.u32.u64 %r25, %rd12;
+    // Bit 31 marks a singleton directory head: validate/gather it, then skip the dependent link load.
+    setp.lt.s32 %p15, %r25, 0;
+    and.b32 %r25, %r25, 2147483647;
     setp.eq.u32 %p2, %r25, 0;
-    @%p2 bra ADVANCE;
+    @%p2 bra BADINDEX;
+    mov.u32 %r61, 0;
+CHAIN:
+    setp.eq.u32 %p2, %r25, 0;
+    @%p2 bra PROBEDONE;
+    setp.ge.u32 %p2, %r61, %r2;
+    @%p2 bra BADINDEX;
+    add.u32 %r61, %r61, 1;
     sub.u32 %r26, %r25, 1;
     setp.ge.u32 %p2, %r26, %r2;
-    @%p2 bra ADVANCE;
+    @%p2 bra BADINDEX;
     mul.wide.u32 %rd14, %r26, 4;
     add.u64 %rd15, %rd3, %rd14;
     ld.global.u32 %r27, [%rd15];
     setp.ge.u32 %p2, %r27, %r1;
-    @%p2 bra ADVANCE;
+    @%p2 bra BADINDEX;
     mul.wide.u32 %rd16, %r27, 88;
     add.u64 %rd17, %rd1, %rd16;
     ld.global.u64 %rd18, [%rd17+80];
@@ -456,7 +490,7 @@ PROBE:
     ld.global.u64 %rd19, [%rd17+72];
     cvt.u32.u64 %r30, %rd19;
     setp.ge.u32 %p2, %r29, %r30;
-    @%p2 bra ADVANCE;
+    @%p2 bra BADINDEX;
 
     // Full typed collision recheck. The i64 component is always read as two aligned words.
     ld.global.u64 %rd20, [%rd17];
@@ -467,16 +501,16 @@ PROBE:
     add.u64 %rd24, %rd24, %rd23;
     ld.global.u32 %r31, [%rd24];
     setp.ne.u32 %p3, %r31, %r12;
-    @%p3 bra ADVANCE;
+    @%p3 bra CHAINNEXT;
     mul.wide.u32 %rd25, %r29, 8;
     add.u64 %rd26, %rd20, %rd22;
     add.u64 %rd26, %rd26, %rd25;
     ld.global.u32 %r32, [%rd26];
     ld.global.u32 %r33, [%rd26+4];
     setp.ne.u32 %p3, %r32, %r13;
-    @%p3 bra ADVANCE;
+    @%p3 bra CHAINNEXT;
     setp.ne.u32 %p3, %r33, %r14;
-    @%p3 bra ADVANCE;
+    @%p3 bra CHAINNEXT;
 
     // MVCC visibility against the exact descriptor generation.
     ld.global.u64 %rd27, [%rd17+56];
@@ -486,7 +520,7 @@ PROBE:
     add.u64 %rd29, %rd27, %rd28;
     ld.global.u64 %rd30, [%rd29];
     setp.gt.u64 %p4, %rd30, %rd5;
-    @%p4 bra ADVANCE;
+    @%p4 bra CHAINNEXT;
 CREATEDOK:
     ld.global.u64 %rd31, [%rd17+64];
     setp.eq.u64 %p5, %rd31, 0;
@@ -495,14 +529,14 @@ CREATEDOK:
     add.u64 %rd33, %rd31, %rd32;
     ld.global.u64 %rd34, [%rd33];
     setp.le.u64 %p5, %rd34, %rd5;
-    @%p5 bra ADVANCE;
+    @%p5 bra CHAINNEXT;
 VISIBLE:
     setp.ne.u32 %p6, %r21, 0;
     @%p6 bra DUP;
     mov.u32 %r21, 1;
     mov.u32 %r22, %r27;
     mov.u32 %r23, %r29;
-    bra ADVANCE;
+    bra CHAINNEXT;
 
 DUP:
     cvt.u64.u32 %rd35, %r11;
@@ -510,6 +544,20 @@ DUP:
     mov.u32 %r34, 3;
     st.global.u8 [%rd36], %r34;
     bra DONE;
+
+BADINDEX:
+    cvt.u64.u32 %rd35, %r11;
+    add.u64 %rd36, %rd7, %rd35;
+    mov.u32 %r34, 4;
+    st.global.u8 [%rd36], %r34;
+    bra DONE;
+
+CHAINNEXT:
+    @%p15 bra PROBEDONE;
+    mul.wide.u32 %rd69, %r26, 4;
+    add.u64 %rd70, %rd68, %rd69;
+    ld.global.u32 %r25, [%rd70];
+    bra CHAIN;
 
 ADVANCE:
     add.u32 %r19, %r19, 1;
@@ -904,7 +952,12 @@ pub(super) fn prepare_cuda_compound_i32_i64_multi_shard_probe(
             total_rows as usize,
         ));
     }
-    validate_i32_index_geometry(index_guard.capacity as u64, table_mask, hash_shift)?;
+    validate_i32_posting_index_geometry(
+        index_guard.capacity as u64,
+        table_mask,
+        hash_shift,
+        total_rows,
+    )?;
     Ok(CudaI32I64MultiShardProbePlan {
         primary,
         projection_kinds,
@@ -1096,12 +1149,261 @@ mod tests {
         assert_eq!(key.words, [-7, 0x5566_7788, 0x1122_3344]);
         assert_eq!(
             CudaI32I64MultiShardProbePlan::estimated_allocated_bytes(4, 200).unwrap(),
-            5_248
+            6_048
         );
         assert!(CudaI32I64MultiShardProbePlan::estimated_allocated_bytes(0, 0).is_err());
         assert!(CudaI32I64MultiShardProbePlan::estimated_allocated_bytes(0, 1).is_err());
         assert!(validate_plan_read_snapshot(12, 11).is_err());
         validate_plan_read_snapshot(12, 12).unwrap();
         validate_plan_read_snapshot(12, 13).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn compound_posting_chain_finds_visible_version_after_256_twins() {
+        let runtime = crate::CudaDriverRuntime::probe().expect("GPU runtime");
+        const ROWS: usize = 300;
+        let first = vec![7_i32; ROWS];
+        let second = vec![9_i64; ROWS];
+        let mut payload = Vec::with_capacity(ROWS * 12);
+        payload.extend(first.iter().flat_map(|value| value.to_le_bytes()));
+        payload.extend(second.iter().flat_map(|value| value.to_le_bytes()));
+        let resident = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &payload)
+                .expect("compound payload"),
+        );
+        let created = (1..=ROWS as u64).collect::<Vec<_>>();
+        let mut deleted = (2..=ROWS as u64 + 1).collect::<Vec<_>>();
+        *deleted.last_mut().unwrap() = u64::MAX;
+        let created_bytes = created
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let deleted_bytes = deleted
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let shard = CompoundI32I64ProbeShard {
+            resident: Arc::clone(&resident),
+            key_i32_offset: 0,
+            key_i64_offset: (ROWS * 4) as u64,
+            projections: vec![CudaFixedPointProjection {
+                byte_offset: (ROWS * 4) as u64,
+                kind: CudaFixedPointProjectionKind::I64,
+            }],
+            row_count: ROWS as u64,
+            created_by: Some(Arc::new(
+                runtime
+                    .retain_device_memory_copy(0, &created_bytes)
+                    .expect("created versions"),
+            )),
+            deleted_by: Some(Arc::new(
+                runtime
+                    .retain_device_memory_copy(0, &deleted_bytes)
+                    .expect("deleted versions"),
+            )),
+        };
+        let plan = Arc::new(
+            prepare_cuda_compound_i32_i64_multi_shard_probe(&resident, &[shard], 0)
+                .expect("compound posting plan"),
+        );
+        let result = execute_cuda_compound_i32_i64_multi_shard_probe(
+            &resident,
+            &plan,
+            &[CudaI32I64PointKey::new(7, 9)],
+            257,
+        )
+        .expect("compound posting probe");
+        assert_eq!(result.status(), &[1]);
+        assert_eq!(result.values(), &[9]);
+
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        let (cu_memcpy_htod, cu_memcpy_dtoh) = unsafe {
+            (
+                *resident
+                    .lib()
+                    .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                    .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                    .expect("CUDA HtoD symbol"),
+                *resident
+                    .lib()
+                    .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                    .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                    .expect("CUDA DtoH symbol"),
+            )
+        };
+        let directory_words = plan.table_mask as usize + 1;
+        let mut directory = vec![0_u64; directory_words];
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                directory.as_mut_ptr().cast::<c_void>(),
+                plan.index_guard.ptr,
+                directory_words * std::mem::size_of::<u64>(),
+            )
+        })
+        .unwrap();
+        let (directory_slot, original_head) = directory
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, word)| *word != 0)
+            .expect("one compound fingerprint directory entry");
+        let directory_offset = (directory_slot * std::mem::size_of::<u64>()) as u64;
+        for malformed_head in [
+            original_head & 0xffff_ffff_0000_0000,
+            (original_head & 0xffff_ffff_0000_0000) | (ROWS as u64 + 1),
+        ] {
+            check_cuda(unsafe {
+                cu_memcpy_htod(
+                    plan.index_guard.ptr + directory_offset,
+                    (&malformed_head as *const u64).cast::<c_void>(),
+                    std::mem::size_of::<u64>(),
+                )
+            })
+            .unwrap();
+            assert!(
+                execute_cuda_compound_i32_i64_multi_shard_probe(
+                    &resident,
+                    &plan,
+                    &[CudaI32I64PointKey::new(7, 9)],
+                    257,
+                )
+                .is_err(),
+                "compound matching zero/out-of-range directory head fails loudly"
+            );
+        }
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                plan.index_guard.ptr + directory_offset,
+                (&original_head as *const u64).cast::<c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        })
+        .unwrap();
+        let newest_row_map_offset = ((ROWS - 1) * std::mem::size_of::<u32>()) as u64;
+        let invalid_shard = plan.shard_count;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                plan.row_to_shard_guard.ptr + newest_row_map_offset,
+                (&invalid_shard as *const u32).cast::<c_void>(),
+                std::mem::size_of::<u32>(),
+            )
+        })
+        .unwrap();
+        assert!(
+            execute_cuda_compound_i32_i64_multi_shard_probe(
+                &resident,
+                &plan,
+                &[CudaI32I64PointKey::new(7, 9)],
+                257,
+            )
+            .is_err(),
+            "compound out-of-range row-to-shard coordinate fails loudly"
+        );
+        let valid_shard = 0_u32;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                plan.row_to_shard_guard.ptr + newest_row_map_offset,
+                (&valid_shard as *const u32).cast::<c_void>(),
+                std::mem::size_of::<u32>(),
+            )
+        })
+        .unwrap();
+        let descriptor_row_count_offset = 9 * std::mem::size_of::<u64>() as u64;
+        let short_row_count = ROWS as u64 - 1;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                plan.descriptor_guard.ptr + descriptor_row_count_offset,
+                (&short_row_count as *const u64).cast::<c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        })
+        .unwrap();
+        assert!(
+            execute_cuda_compound_i32_i64_multi_shard_probe(
+                &resident,
+                &plan,
+                &[CudaI32I64PointKey::new(7, 9)],
+                257,
+            )
+            .is_err(),
+            "compound global/local row mismatch fails loudly"
+        );
+        let full_row_count = ROWS as u64;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                plan.descriptor_guard.ptr + descriptor_row_count_offset,
+                (&full_row_count as *const u64).cast::<c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        })
+        .unwrap();
+        let link_offset = crate::resident_index_hash_bytes(plan.table_mask).unwrap()
+            + ((ROWS - 1) * std::mem::size_of::<u32>()) as u64;
+        let mut prior_link = 0_u32;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                (&mut prior_link as *mut u32).cast::<c_void>(),
+                plan.index_guard.ptr + link_offset,
+                std::mem::size_of::<u32>(),
+            )
+        })
+        .unwrap();
+        let out_of_range_link = ROWS as u32 + 1;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                plan.index_guard.ptr + link_offset,
+                (&out_of_range_link as *const u32).cast::<c_void>(),
+                std::mem::size_of::<u32>(),
+            )
+        })
+        .unwrap();
+        assert!(
+            execute_cuda_compound_i32_i64_multi_shard_probe(
+                &resident,
+                &plan,
+                &[CudaI32I64PointKey::new(7, 9)],
+                257,
+            )
+            .is_err(),
+            "compound out-of-capacity posting link fails loudly"
+        );
+        let self_link = ROWS as u32;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                plan.index_guard.ptr + link_offset,
+                (&self_link as *const u32).cast::<c_void>(),
+                std::mem::size_of::<u32>(),
+            )
+        })
+        .unwrap();
+        assert!(
+            execute_cuda_compound_i32_i64_multi_shard_probe(
+                &resident,
+                &plan,
+                &[CudaI32I64PointKey::new(7, 9)],
+                257,
+            )
+            .is_err(),
+            "compound probe must terminate and reject a self-linked posting"
+        );
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                plan.index_guard.ptr + link_offset,
+                (&prior_link as *const u32).cast::<c_void>(),
+                std::mem::size_of::<u32>(),
+            )
+        })
+        .unwrap();
+        let repaired = execute_cuda_compound_i32_i64_multi_shard_probe(
+            &resident,
+            &plan,
+            &[CudaI32I64PointKey::new(7, 9)],
+            257,
+        )
+        .expect("compound posting probe after cycle repair");
+        assert_eq!(repaired.status(), &[1]);
     }
 }

@@ -265,6 +265,23 @@ pub(super) fn validate_i32_index_geometry(
     Ok(())
 }
 
+pub(super) fn validate_i32_posting_index_geometry(
+    allocated_bytes: u64,
+    table_mask: u32,
+    hash_shift: u32,
+    row_count: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    validate_i32_index_geometry(allocated_bytes, table_mask, hash_shift)?;
+    let required_bytes = crate::resident_index_allocated_bytes(table_mask, row_count)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if required_bytes > allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(required_bytes).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
+}
+
 pub struct CudaI32EqualAnyProjectSubmission {
     pub(super) projection_count: usize,
     pub(super) needles_len: usize,

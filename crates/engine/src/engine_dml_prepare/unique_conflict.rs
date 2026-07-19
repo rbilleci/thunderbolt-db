@@ -247,6 +247,9 @@ impl Engine {
                     .iter()
                     .map(|position| row.get(*position).cloned())
                     .collect::<Option<Vec<_>>>()?;
+                if key.iter().any(|value| matches!(value, SqlValue::Null)) {
+                    continue;
+                }
                 if !distinct.insert(key.clone()) {
                     continue;
                 }

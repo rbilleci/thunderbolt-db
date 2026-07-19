@@ -433,9 +433,9 @@ fn gpu_single_wide_unique_indexes_elide_validate_collisions_and_recover() {
 
 /// R3-002 BOOL key graduation: the index rebuild extracts 0/1 directly from the resident bit-packed
 /// bitmap, while host needles use the same canonical word. The PRIMARY KEY path proves true/false
-/// uniqueness and device DML locate. The nullable UNIQUE path proves structural NULL semantics through
-/// an on-device `IS NULL` validity scan rather than rehydrating to a host value-index probe. Recovery
-/// preserves both accepted histories.
+/// uniqueness and device DML locate. The nullable UNIQUE path proves PostgreSQL NULL-distinct
+/// semantics without rehydrating to a host value-index probe. Recovery preserves both accepted
+/// histories.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
@@ -505,6 +505,13 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
         assert!(snapshot.device_memory_proof.is_some());
         sql!("INSERT INTO bool_nullable VALUES (2, true, 20)").unwrap();
         assert!(engine.table_device_authoritative("bool_nullable"));
+        let nonnull_validate_before = engine.dml_device_validate_hits();
+        let duplicate = sql!("INSERT INTO bool_nullable VALUES (9, false, 90)")
+            .expect_err("ordinary non-NULL BOOL uniqueness remains enforced")
+            .to_string();
+        assert!(duplicate.contains("duplicate key value"), "{duplicate}");
+        assert!(engine.dml_device_validate_hits() > nonnull_validate_before);
+        assert!(engine.table_device_authoritative("bool_nullable"));
         let validate_before = engine.dml_device_validate_hits();
         sql!("INSERT INTO bool_nullable VALUES (3, NULL, 30)").unwrap();
         assert!(
@@ -550,19 +557,19 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
             None,
             InsertPrepareValidation::WaveFallbackFull,
         );
-        assert!(prepared.is_err());
+        assert!(
+            prepared.is_ok(),
+            "a second NULL remains distinct for PostgreSQL UNIQUE semantics"
+        );
         assert!(
             engine.table_device_authoritative("bool_nullable"),
             "non-deferrable full validation must stay device-native"
         );
-        let duplicate = sql!("INSERT INTO bool_nullable VALUES (4, NULL, 40)")
-            .unwrap_err()
-            .to_string();
-        assert!(duplicate.contains("duplicate key value"), "{duplicate}");
+        sql!("INSERT INTO bool_nullable VALUES (4, NULL, 40)").unwrap();
         assert!(engine.dml_device_validate_hits() > validate_before);
         assert!(
             engine.table_device_authoritative("bool_nullable"),
-            "the duplicate NULL check must not rehydrate"
+            "the second NULL must not rehydrate"
         );
 
         let Command::Select(select) =
@@ -577,7 +584,7 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
     }
 
     let recovered = Engine::open_durable_wal_segment(&wal_path).expect("bool-key WAL recovery");
-    for (table, expected) in [("bool_pk", 2_i64), ("bool_nullable", 3_i64)] {
+    for (table, expected) in [("bool_pk", 2_i64), ("bool_nullable", 4_i64)] {
         let Command::Select(select) =
             parse_command(&format!("SELECT COUNT(*) FROM {table}")).unwrap()
         else {
@@ -602,8 +609,9 @@ fn gpu_bool_unique_index_elides_validates_null_and_recovers() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// R3-002 decline ladder: a compound key containing NULL has no complete fingerprint, so exact
-/// structural uniqueness must use an AND-of-typed-predicates resident scan and remain elided.
+/// R3-002 decline ladder: a compound key containing NULL has no complete fingerprint and is distinct
+/// from every other PostgreSQL UNIQUE tuple. The device-authoritative table must remain elided while
+/// accepting repeated partial-NULL tuples and preserving ordinary non-NULL uniqueness.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
@@ -658,44 +666,40 @@ fn gpu_compound_partial_null_unique_scans_exact_tuple_on_device() {
     assert!(engine.dml_device_validate_hits() > validate_before);
     assert!(engine.table_device_authoritative("nullable_tuple"));
 
-    let duplicate = engine
+    engine
         .execute_dml_concurrent(4, "INSERT INTO nullable_tuple VALUES (3, 1, NULL)")
-        .unwrap_err()
-        .to_string();
-    assert!(duplicate.contains("duplicate key value"), "{duplicate}");
+        .expect("a repeated partial-NULL UNIQUE tuple remains distinct");
     assert!(engine.table_device_authoritative("nullable_tuple"));
     engine
-        .execute_dml_concurrent(5, "INSERT INTO nullable_tuple VALUES (3, 2, NULL)")
+        .execute_dml_concurrent(5, "INSERT INTO nullable_tuple VALUES (4, 2, NULL)")
         .unwrap();
+    let duplicate = engine
+        .execute_dml_concurrent(6, "INSERT INTO nullable_tuple VALUES (7, 0, 'warm')")
+        .expect_err("ordinary non-NULL compound uniqueness remains enforced")
+        .to_string();
+    assert!(duplicate.contains("duplicate key value"), "{duplicate}");
 
-    // Partial-NULL claim/release history uses the same exact typed mask, followed by the fixed
-    // device stamp verdict. A SQL `=` leaf would turn NULL into UNKNOWN and miss this conflict;
-    // the structural-unique `IS NULL` leaf must remain non-vacuous.
+    // Partial-NULL claim/release history is never a unique-key conflict under PostgreSQL semantics,
+    // even when another transaction inserts and removes the same visible non-NULL members.
     const STALE_TXN: u64 = 90;
     engine.execute_text(STALE_TXN, "BEGIN").unwrap();
     engine
-        .execute_dml_concurrent(STALE_TXN, "INSERT INTO nullable_tuple VALUES (4, 3, NULL)")
+        .execute_dml_concurrent(STALE_TXN, "INSERT INTO nullable_tuple VALUES (5, 3, NULL)")
         .unwrap();
     engine
-        .execute_dml_concurrent(91, "INSERT INTO nullable_tuple VALUES (5, 3, NULL)")
+        .execute_dml_concurrent(91, "INSERT INTO nullable_tuple VALUES (6, 3, NULL)")
         .unwrap();
     engine
-        .execute_dml_concurrent(92, "DELETE FROM nullable_tuple WHERE id = 5")
+        .execute_dml_concurrent(92, "DELETE FROM nullable_tuple WHERE id = 6")
         .unwrap();
     assert!(
         engine.table_device_authoritative("nullable_tuple"),
         "the partial-NULL stale commit must remain device-authoritative"
     );
-    let history_before = engine.dml_device_validate_hits();
-    let conflict = engine.execute_text(STALE_TXN, "COMMIT").unwrap_err();
-    assert!(
-        matches!(&conflict, ExecuteError::Serialization(message)
-            if message.contains("device unique conflict") && message.contains("write history")),
-        "partial-NULL key-away must conflict from the device verdict: {conflict:?}"
-    );
-    assert!(engine.dml_device_validate_hits() > history_before);
+    engine
+        .execute_text(STALE_TXN, "COMMIT")
+        .expect("partial-NULL history cannot manufacture a unique conflict");
     assert!(engine.table_device_authoritative("nullable_tuple"));
-    engine.execute_text(STALE_TXN, "ROLLBACK").unwrap();
 }
 
 /// R3-002 nullable mutation coverage: structural NULL equality is device-native not only for a

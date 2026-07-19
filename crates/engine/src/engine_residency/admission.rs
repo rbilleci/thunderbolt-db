@@ -61,6 +61,18 @@ impl Engine {
         table: &str,
         gpu_id: u16,
     ) -> Result<RelationalResidencySnapshot, ExecuteError> {
+        let apply_leader =
+            crate::resident_storage::LANE_APPLY_LEADER_ACTIVE.with(std::cell::Cell::get);
+        let _apply = if apply_leader {
+            None
+        } else {
+            self.intent_lanes.as_ref().map(|lanes| {
+                lanes
+                    .device_apply_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+        };
         // R3-004: normal DML no longer keeps a host tuple-store shadow. An explicit warmup of an
         // already authoritative table therefore means "retain the current device generation", not
         // "scan the host store and overwrite it". If that generation is unavailable, fail closed;
@@ -90,6 +102,9 @@ impl Engine {
                 )))
             })?
             .clone();
+        let named_index_publication_table = self
+            .relational_named_index_publication_required(&catalog_table)
+            .then(|| catalog_table.clone());
         // During a grouped committed-entry apply, `with_apply_catalog` exposes the evolving working
         // catalog at `entry.index - 1` while the public `committed_seq` intentionally remains at the
         // pre-batch boundary. Build the device generation at that working boundary so an earlier
@@ -388,9 +403,21 @@ impl Engine {
         let allocated_created_by_bytes = admitted_created_by_region
             .as_ref()
             .map_or(0, |memory| memory.metadata().allocated_bytes);
+        let named_index_bytes = if named_index_publication_table.is_some() {
+            estimated_named_index_bytes_for_shard(&catalog_table, row_count, capacity).ok_or_else(
+                || {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{table}\" named-index allocation geometry is unsupported"
+                    )))
+                },
+            )?
+        } else {
+            0
+        };
         let admitted_allocated_bytes = allocated_payload_bytes
             .saturating_add(allocated_row_id_bytes)
-            .saturating_add(allocated_created_by_bytes);
+            .saturating_add(allocated_created_by_bytes)
+            .saturating_add(named_index_bytes);
         let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
         let (evicted_tables_on_admission, resident_bytes_after_admission) = self
             .admit_relational_residency_snapshot_inner(
@@ -580,11 +607,42 @@ impl Engine {
             let mut shard_memory = BTreeMap::new();
             shard_memory.insert(0_u32, dm);
             cat.relational_resident_cache.install_shards(
-                catalog_table.name,
+                catalog_table.name.clone(),
                 vec![shard],
                 shard_memory,
                 &read_state.residency,
             );
+            // PRODUCT-002: once a catalog shape has declared named indexes mandatory, an ordinary
+            // repair/re-admission cannot publish a replacement payload without republishing the full
+            // device-index set in the same budget transaction. On a CUDA/semantic failure, mark the
+            // replacement invalid before returning the explicit error; no reader may bind a partial set.
+            if let Some(named_index_table) = named_index_publication_table
+                .as_ref()
+                .filter(|_| row_count != 0)
+            {
+                let current_shards = read_state.residency.shards.load_full();
+                let table_shards = current_shards.get(table).ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "resident index re-publication lost relation \"{table}\""
+                    )))
+                })?;
+                if let Err(error) = self.publish_relational_resident_indexes_for_generation(
+                    named_index_table,
+                    table_shards,
+                    residency_boundary,
+                    true,
+                    true,
+                    true,
+                ) {
+                    read_state.residency.purge_shard_pk_index_for_table(table);
+                    read_state.residency.flag_table_descriptors_invalidated(
+                        table,
+                        residency_boundary,
+                        residency_boundary,
+                    );
+                    return Err(error);
+                }
+            }
             return Ok(snapshot);
         }
         // Audit (S-d1) fix: the single-buffer path is authoritative here — clear any prior SHARD cell for

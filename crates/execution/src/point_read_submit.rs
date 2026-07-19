@@ -572,6 +572,7 @@ PROBE:
 
 FOUND:
     cvt.u32.u64 %r14, %rd16;
+    and.b32 %r14, %r14, 2147483647;
     sub.u32 %r14, %r14, 1;
     setp.ge.u32 %p2, %r14, %r18;
     @%p2 bra DONE;
@@ -640,7 +641,7 @@ DONE:
             projection_offsets.len(),
         ));
     }
-    if row_count == 0 || row_count >= u32::MAX as u64 || index_ptr == 0 {
+    if row_count == 0 || row_count >= (1_u64 << 31) || index_ptr == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
     if !Arc::ptr_eq(&resident.primary_arc(), &index.primary_arc()) {

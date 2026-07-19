@@ -492,6 +492,24 @@ pub(crate) struct CatalogSnapshot {
     pub(crate) relational_comments: BTreeMap<RelationalCommentTarget, String>,
 }
 
+pub(crate) type NamedIndexCoverage = BTreeMap<(String, u32, usize), (u64, usize)>;
+
+/// Host seqlock bracketing in-place device-index mutation. Point readers sample the shared epoch
+/// once before and once after a singleton launch; overlap or an older prepared epoch retries through
+/// the capacity-bounded posting kernel. Writers are serialized per table by the odd epoch.
+pub(crate) struct PointIndexMutationGuard {
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Drop for PointIndexMutationGuard {
+    fn drop(&mut self) {
+        let prior = self
+            .epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        debug_assert_eq!(prior & 1, 1, "point-index writer epoch must be odd");
+    }
+}
+
 /// The GPU-resident read-route metadata reached by the lock-free read path. The device-memory maps
 /// are the authoritative residency tombstone gate the concurrent commit path flips via `&self`; the
 /// snapshot/shard metadata (Stage 3 — blocker #2) is published behind `ArcSwap` so the resident
@@ -541,10 +559,32 @@ pub(crate) struct ResidencyReadState {
     /// residency-retire site.
     pub(crate) shard_pk_device_index:
         Mutex<BTreeMap<(String, u32, usize), CachedShardPkDeviceIndex>>,
+    /// Stable catalog OIDs for which every named index passed explicit device publication. Enrollment
+    /// survives cache purge, table rename, and shape-changing DDL so a later mutation cannot silently
+    /// downgrade mandatory indexes to legacy best-effort lazy-cache behavior. A dropped/recreated table
+    /// receives a new OID and therefore cannot inherit the stale requirement.
+    pub(crate) named_index_publications: Mutex<BTreeMap<u32, Vec<RelationalIndex>>>,
+    /// O(indexes) coverage manifest for mandatory named indexes. It mirrors only successfully
+    /// linearized cache entries and is cleared with cache retirement, letting rollover publication
+    /// add one shard without re-enumerating every historical shard.
+    pub(crate) named_index_coverage: Mutex<NamedIndexCoverage>,
+    /// O(1) proof that `named_index_coverage` is complete for the current table/index shape. Cache
+    /// retirement clears this marker while preserving mandatory enrollment by OID.
+    pub(crate) named_index_coverage_complete: Mutex<BTreeMap<String, (u32, Vec<RelationalIndex>)>>,
+    /// Test-only proof that incremental rollover publication visits only the new shard per index.
+    #[cfg(test)]
+    pub(crate) named_index_publication_shard_visits: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) named_index_publication_pre_linearize_hook:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     /// Generation-owned, GPU-resident multi-shard point route keyed by table/filter/projection shape.
     /// Exact Arc publication identity makes a route reusable without re-enumerating every shard per batch;
     /// a new publication misses and replaces it while in-flight readers keep the old plan pinned.
     pub(crate) sharded_point_routes: ArcSwap<ShardedPointRouteMap>,
+    /// Per-table seqlock for in-place device-index mutation versus retained singleton plans. The
+    /// map is touched only on route preparation or mutation; cache-hit reads retain the entry Arc.
+    pub(crate) point_index_mutation_epochs:
+        Mutex<BTreeMap<String, Arc<std::sync::atomic::AtomicU64>>>,
     /// READ-002's compound generation routes are isolated from the established int4 latency cache so
     /// adding a route family cannot change the production cache-hit plan type or branch shape.
     pub(crate) compound_point_routes: ArcSwap<CompoundPointRouteMap>,
@@ -782,6 +822,43 @@ pub(crate) struct ResidencyReadState {
 }
 
 impl ResidencyReadState {
+    pub(crate) fn point_index_mutation_epoch(
+        &self,
+        table: &str,
+    ) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(
+            self.point_index_mutation_epochs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(table.to_string())
+                .or_default(),
+        )
+    }
+
+    pub(crate) fn begin_point_index_mutation(&self, table: &str) -> PointIndexMutationGuard {
+        let epoch = self.point_index_mutation_epoch(table);
+        loop {
+            let current = epoch.load(std::sync::atomic::Ordering::Acquire);
+            if current & 1 == 0 {
+                let writing = current
+                    .checked_add(1)
+                    .expect("point-index mutation epoch exhausted");
+                if epoch
+                    .compare_exchange_weak(
+                        current,
+                        writing,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return PointIndexMutationGuard { epoch };
+                }
+            }
+            std::thread::yield_now();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn run_shard_pk_index_append_post_launch_hook(&self) {
         let hook = self
@@ -832,6 +909,14 @@ impl ResidencyReadState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|(cached_table, _, _), _| cached_table != table);
+        self.named_index_coverage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(cached_table, _, _), _| cached_table != table);
+        self.named_index_coverage_complete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(table);
     }
 
     /// Retire cached prepared routes for the named tables. An already-submitted reader retains its

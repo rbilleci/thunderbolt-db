@@ -8,6 +8,7 @@ use super::*;
 
 mod compound_point;
 mod device_index_append;
+mod index_publication;
 mod shard_point_lookup;
 mod submission;
 mod template;
@@ -16,6 +17,9 @@ mod wave_locate;
 
 pub use compound_point::{
     RelationalCompoundI32I64PointReadParam, RelationalCompoundI32I64PointReadTemplate,
+};
+pub use index_publication::{
+    RelationalResidentIndexPublication, RelationalResidentIndexPublicationEntry,
 };
 
 /// Prepared routes are latency hints, not another residency tier. One shape per table and this

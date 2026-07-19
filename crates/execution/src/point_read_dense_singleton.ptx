@@ -1,0 +1,257 @@
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_multi_shard_i32_index_probe_dense_singleton(
+    .param .u64 desc_array_ptr,
+    .param .u32 shard_count,
+    .param .u32 needle_count,
+    .param .u32 projection_count,
+    .param .u64 needles_ptr,
+    .param .u64 out_values_ptr,
+    .param .u64 out_status_ptr,
+    .param .u32 binary_mode,
+    .param .u64 read_snapshot
+)
+{
+    .reg .pred %p<9>;
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<48>;
+
+    ld.param.u64 %rd1, [desc_array_ptr];
+    ld.param.u32 %r1, [shard_count];
+    ld.param.u32 %r2, [needle_count];
+    ld.param.u32 %r3, [projection_count];
+    ld.param.u64 %rd2, [needles_ptr];
+    ld.param.u64 %rd3, [out_values_ptr];
+    ld.param.u64 %rd4, [out_status_ptr];
+    ld.param.u32 %r26, [binary_mode];
+    ld.param.u64 %rd36, [read_snapshot];
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mad.lo.u32 %r7, %r5, %r6, %r4;
+    setp.ge.u32 %p1, %r7, %r2;
+    @%p1 bra DONE;
+    setp.eq.u32 %p1, %r3, 0;
+    @%p1 bra DONE;
+
+    mul.wide.u32 %rd5, %r7, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.s32 %r8, [%rd6];
+
+    // BINARY MODE (set by the host ONLY when it proves the shards are ascending-disjoint: max[i-1] < min[i]).
+    // Then a needle maps to EXACTLY ONE shard, so binary-search the min-sorted (== table-order) descriptors for
+    // the containing shard in O(log shards) instead of scanning all. Reuses the linear PROBE/FOUND/emit path by
+    // jumping into SHARD with the candidate index k, bound=k+1, force=1. A gap / out-of-all-ranges falls to
+    // keep-shard-0 (descriptor[0] == table_shards[0]) exactly like the linear ALLDONE fallback.
+    setp.eq.u32 %p1, %r26, 0;
+    @%p1 bra LINEARINIT;
+    mov.u32 %r27, 0;
+    mov.u32 %r28, %r1;
+BSEARCH:
+    setp.ge.u32 %p1, %r27, %r28;
+    @%p1 bra BDONE;
+    add.u32 %r29, %r27, %r28;
+    shr.u32 %r29, %r29, 1;
+    mul.wide.u32 %rd32, %r29, 88;
+    add.u64 %rd33, %rd1, %rd32;
+    ld.global.u64 %rd34, [%rd33+56];
+    cvt.u32.u64 %r30, %rd34;
+    setp.le.s32 %p1, %r30, %r8;
+    @%p1 bra BLO;
+    mov.u32 %r28, %r29;
+    bra BSEARCH;
+BLO:
+    add.u32 %r27, %r29, 1;
+    bra BSEARCH;
+BDONE:
+    setp.eq.u32 %p1, %r27, 0;
+    @%p1 bra BKEEP0;
+    sub.u32 %r9, %r27, 1;
+    mul.wide.u32 %rd32, %r9, 88;
+    add.u64 %rd33, %rd1, %rd32;
+    ld.global.u64 %rd34, [%rd33+56];
+    shr.u64 %rd35, %rd34, 32;
+    cvt.u32.u64 %r21, %rd35;
+    setp.gt.s32 %p1, %r8, %r21;
+    @%p1 bra BKEEP0;
+    add.u32 %r23, %r9, 1;
+    mov.u32 %r24, 1;
+    mov.u32 %r25, 0;
+    mov.u32 %r19, 0;
+    mov.u32 %r22, 1;
+    bra SHARD;
+BKEEP0:
+    mov.u32 %r9, 0;
+    mov.u32 %r23, 1;
+    mov.u32 %r24, 1;
+    mov.u32 %r25, 1;
+    mov.u32 %r19, 0;
+    mov.u32 %r22, 0;
+    bra SHARD;
+
+LINEARINIT:
+    mov.u32 %r9, 0;
+    mov.u32 %r19, 0;
+    mov.u32 %r22, 0;
+    mov.u32 %r23, %r1;
+    mov.u32 %r24, 0;
+    mov.u32 %r25, 0;
+
+SHARD:
+    setp.ge.u32 %p1, %r9, %r23;
+    @%p1 bra ALLDONE;
+    mul.wide.u32 %rd7, %r9, 88;
+    add.u64 %rd8, %rd1, %rd7;
+    ld.global.u64 %rd9, [%rd8];
+    ld.global.u64 %rd10, [%rd8+8];
+    ld.global.u64 %rd11, [%rd8+16];
+    ld.global.u64 %rd30, [%rd8+56];
+    ld.global.u64 %rd37, [%rd8+64];
+    ld.global.u64 %rd38, [%rd8+72];
+    ld.global.u64 %rd44, [%rd8+80];
+    cvt.u32.u64 %r31, %rd44;
+    cvt.u32.u64 %r20, %rd30;
+    shr.u64 %rd31, %rd30, 32;
+    cvt.u32.u64 %r21, %rd31;
+    setp.ne.u32 %p1, %r24, 0;
+    @%p1 bra INRANGE;
+    setp.lt.s32 %p1, %r8, %r20;
+    @%p1 bra NEXTSHARD;
+    setp.gt.s32 %p1, %r8, %r21;
+    @%p1 bra NEXTSHARD;
+INRANGE:
+    mov.u32 %r22, 1;
+    cvt.u32.u64 %r10, %rd11;
+    shr.u64 %rd12, %rd11, 32;
+    cvt.u32.u64 %r11, %rd12;
+    mul.lo.u32 %r12, %r8, 2654435761;
+    shr.u32 %r13, %r12, %r11;
+    mov.u32 %r14, 0;
+
+PROBE:
+    and.b32 %r13, %r13, %r10;
+    mul.wide.u32 %rd13, %r13, 8;
+    add.u64 %rd14, %rd10, %rd13;
+    ld.global.u64 %rd15, [%rd14];
+    setp.eq.u64 %p2, %rd15, 0;
+    @%p2 bra NEXTSHARD;
+    shr.u64 %rd16, %rd15, 32;
+    cvt.u32.u64 %r15, %rd16;
+    setp.eq.s32 %p2, %r15, %r8;
+    @%p2 bra FOUND;
+    bra ADVANCEPROBE;
+
+NEXTSHARD:
+    add.u32 %r9, %r9, 1;
+    bra SHARD;
+
+FOUND:
+    cvt.u32.u64 %r16, %rd15;
+    and.b32 %r16, %r16, 2147483647;
+    sub.u32 %r16, %r16, 1;
+    setp.ge.u32 %p8, %r16, %r31;
+    @%p8 bra ADVANCEPROBE;
+    cvt.u64.u32 %rd17, %r16;
+    mul.lo.u64 %rd39, %rd17, 8;
+    setp.eq.u64 %p6, %rd37, 0;
+    @%p6 bra CREATEDOK;
+    add.u64 %rd40, %rd37, %rd39;
+    ld.global.u64 %rd41, [%rd40];
+    setp.gt.u64 %p6, %rd41, %rd36;
+    @%p6 bra ADVANCEPROBE;
+CREATEDOK:
+    setp.eq.u64 %p7, %rd38, 0;
+    @%p7 bra VISIBLE;
+    add.u64 %rd42, %rd38, %rd39;
+    ld.global.u64 %rd43, [%rd42];
+    setp.le.u64 %p7, %rd43, %rd36;
+    @%p7 bra ADVANCEPROBE;
+VISIBLE:
+    setp.eq.u32 %p5, %r19, 1;
+    @%p5 bra DUP;
+    mov.u32 %r19, 1;
+    mul.lo.u64 %rd24, %rd17, 4;
+
+    cvt.u64.u32 %rd18, %r7;
+    add.u64 %rd20, %rd4, %rd18;
+    mov.u32 %r17, 1;
+    st.global.u8 [%rd20], %r17;
+
+    cvt.u64.u32 %rd21, %r3;
+    mul.lo.u64 %rd22, %rd18, %rd21;
+    mul.lo.u64 %rd22, %rd22, 4;
+    add.u64 %rd23, %rd3, %rd22;
+
+    ld.global.u64 %rd25, [%rd8+24];
+    add.u64 %rd26, %rd9, %rd25;
+    add.u64 %rd26, %rd26, %rd24;
+    ld.global.s32 %r18, [%rd26];
+    st.global.s32 [%rd23], %r18;
+
+    setp.le.u32 %p4, %r3, 1;
+    @%p4 bra AFTEREMIT;
+    ld.global.u64 %rd25, [%rd8+32];
+    add.u64 %rd26, %rd9, %rd25;
+    add.u64 %rd26, %rd26, %rd24;
+    ld.global.s32 %r18, [%rd26];
+    add.u64 %rd27, %rd23, 4;
+    st.global.s32 [%rd27], %r18;
+
+    setp.le.u32 %p4, %r3, 2;
+    @%p4 bra AFTEREMIT;
+    ld.global.u64 %rd25, [%rd8+40];
+    add.u64 %rd26, %rd9, %rd25;
+    add.u64 %rd26, %rd26, %rd24;
+    ld.global.s32 %r18, [%rd26];
+    add.u64 %rd27, %rd23, 8;
+    st.global.s32 [%rd27], %r18;
+
+    setp.le.u32 %p4, %r3, 3;
+    @%p4 bra AFTEREMIT;
+    ld.global.u64 %rd25, [%rd8+48];
+    add.u64 %rd26, %rd9, %rd25;
+    add.u64 %rd26, %rd26, %rd24;
+    ld.global.s32 %r18, [%rd26];
+    add.u64 %rd27, %rd23, 12;
+    st.global.s32 [%rd27], %r18;
+
+AFTEREMIT:
+ADVANCEPROBE:
+    add.u32 %r13, %r13, 1;
+    add.u32 %r14, %r14, 1;
+    setp.ge.u32 %p3, %r14, 256;
+    @%p3 bra NEXTSHARD;
+    bra PROBE;
+
+DUP:
+    cvt.u64.u32 %rd18, %r7;
+    add.u64 %rd20, %rd4, %rd18;
+    mov.u32 %r17, 3;
+    st.global.u8 [%rd20], %r17;
+    bra DONE;
+
+ALLDONE:
+    setp.eq.u32 %p5, %r19, 1;
+    @%p5 bra DONE;
+    setp.eq.u32 %p5, %r25, 1;
+    @%p5 bra WRITEABSENT;
+    setp.eq.u32 %p5, %r22, 1;
+    @%p5 bra WRITEABSENT;
+    mov.u32 %r9, 0;
+    mov.u32 %r23, 1;
+    mov.u32 %r24, 1;
+    mov.u32 %r25, 1;
+    bra SHARD;
+
+WRITEABSENT:
+    cvt.u64.u32 %rd18, %r7;
+    add.u64 %rd20, %rd4, %rd18;
+    mov.u32 %r17, 2;
+    st.global.u8 [%rd20], %r17;
+
+DONE:
+    ret;
+}

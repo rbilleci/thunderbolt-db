@@ -1363,17 +1363,14 @@ fn gpu_chunk_class_over_cap_bloom_candidates_stay_exact() {
     assert!(format!("{err:?}").contains("duplicate key value"));
     assert!(e.chunk_key_bloom_probes() > bloom_1);
 
-    // Structural NULL uniqueness also uses the Bloom candidate set and exact IS NULL predicate.
+    // PostgreSQL UNIQUE treats every NULL-bearing key as distinct, including in the chunk class.
     seq += 1;
     e.execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (200000, NULL, 3)")
         .unwrap();
-    let exact_2 = e.chunk_class_device_exact_rechecks();
     seq += 1;
-    let err = e
-        .execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (200001, NULL, 4)")
-        .expect_err("second NULL unique key must reject");
-    assert!(format!("{err:?}").contains("duplicate key value"));
-    assert!(e.chunk_class_device_exact_rechecks() > exact_2);
+    e.execute_text(seq, "INSERT INTO kb (a, u, v) VALUES (200001, NULL, 4)")
+        .expect("a second NULL unique key remains distinct");
+    assert_eq!(e.chunk_class_deauths(), 0);
 
     // Every test Bloom is deliberately ALL-POSITIVE, so the absent key is a guaranteed false
     // positive in every chunk. Point UPDATE and the miss must still resolve exactly on-device;
@@ -1866,10 +1863,9 @@ fn gpu_chunk_class_keyed_compound_fold_parity_and_collision() {
     assert_eq!(e.chunk_class_deauths(), 0, "the whole arc stayed classed");
 }
 
-/// P5 charter closure — NULL KEY: unique semantics are STRUCTURAL (NULL == NULL conflicts).
-/// Fingerprints do not encode validity, so a NULL tuple bypasses the candidate index and runs
-/// an exact `IS NULL` predicate over the chunks on-device. The first NULL succeeds while the
-/// class stays authoritative; the second rejects from the device result.
+/// P5 charter closure — NULL KEY: PostgreSQL UNIQUE treats every NULL-bearing tuple as distinct.
+/// Both NULL inserts succeed while the class stays device-authoritative; the adjacent non-NULL
+/// duplicate proves that ordinary unique conflicts still use the device probe.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_keyed_null_unique_stays_device_native() {
@@ -1912,7 +1908,7 @@ fn gpu_chunk_class_keyed_null_unique_stays_device_native() {
     assert!(format!("{err:?}").contains("duplicate key value"));
     assert_eq!(e.chunk_class_deauths(), 0);
 
-    // A NULL key uses the raw-placeholder candidate fingerprint; a single NULL misses and passes.
+    // NULL-bearing keys are distinct under PostgreSQL UNIQUE semantics and remain class-authoritative.
     let probes_before = e.chunk_class_unique_probes();
     seq += 1;
     e.execute_text(
@@ -1927,34 +1923,26 @@ fn gpu_chunk_class_keyed_null_unique_stays_device_native() {
     );
     assert!(
         e.chunk_class_unique_probes() > probes_before,
-        "the structural NULL miss came from the device candidate probe"
+        "the first NULL insert still traversed the device-native class validation path"
     );
-    // The SECOND NULL: the same exact device predicate sees the live NULL and rejects.
-    let exact_before = e.chunk_class_device_exact_rechecks();
+    // The second NULL is distinct too; accepting it must not deauthorize the class.
     seq += 1;
-    let err = e
-        .execute_text(
-            seq,
-            "INSERT INTO kn (a, u, t) VALUES (2000001, NULL, 'null2')",
-        )
-        .expect_err("the second NULL is a device-detected structural dup");
-    assert!(format!("{err:?}").contains("duplicate key value"));
+    e.execute_text(
+        seq,
+        "INSERT INTO kn (a, u, t) VALUES (2000001, NULL, 'null2')",
+    )
+    .expect("the second NULL unique key remains distinct");
     assert_eq!(
         e.chunk_class_deauths(),
         0,
         "the class remains authoritative"
     );
-    assert!(
-        e.chunk_class_device_exact_rechecks() > exact_before,
-        "the matching NULL tuple was confirmed by an exact device predicate"
-    );
 }
 
-/// Audit M1 — compound partial-NULL uniqueness through every class seam: distinct tuples in one
-/// batch pass, an in-batch duplicate rejects on the transient device relation, an existing-row
-/// duplicate rejects through the placeholder-fingerprint candidate probe + exact `IS NULL`, a
-/// key-preserving UPDATE self-excludes, tombstone/reinsert succeeds, and WAL replay lands the
-/// identical accepted history.
+/// Audit M1 — compound partial-NULL uniqueness through every class seam: all NULL-bearing tuples
+/// remain distinct within a batch and against existing rows, a key-preserving UPDATE remains
+/// device-authoritative, tombstone/reinsert succeeds, and WAL replay lands the identical accepted
+/// history.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_chunk_class_compound_partial_null_unique_device_and_replay() {
@@ -1997,6 +1985,17 @@ fn gpu_chunk_class_compound_partial_null_unique_device_and_replay() {
             .unwrap();
         assert_eq!(e.chunk_class_entries(), 1, "premise: compound classed");
 
+        let conflicts_before = e.chunk_class_unique_probe_conflicts();
+        let exact_before = e.chunk_class_device_exact_rechecks();
+        seq += 1;
+        let duplicate = e
+            .execute_text(seq, "INSERT INTO null_k VALUES (90001, 1000, 2000, 0)")
+            .expect_err("ordinary non-NULL compound uniqueness remains enforced");
+        assert!(format!("{duplicate:?}").contains("duplicate key value"));
+        assert!(e.chunk_class_unique_probe_conflicts() > conflicts_before);
+        assert!(e.chunk_class_device_exact_rechecks() > exact_before);
+        assert_eq!(e.chunk_class_deauths(), 0);
+
         // Same NULL component, distinct second key: legal and device-validated in one batch.
         seq += 1;
         e.execute_text(
@@ -2004,24 +2003,18 @@ fn gpu_chunk_class_compound_partial_null_unique_device_and_replay() {
             "INSERT INTO null_k VALUES (10000, NULL, 7, 1), (10001, NULL, 8, 2)",
         )
         .unwrap();
-        // Exact duplicate inside one statement: transient device relation must reject it.
-        let exact_before = e.chunk_class_device_exact_rechecks();
+        // Even equal non-NULL members remain distinct when one UNIQUE member is NULL.
         seq += 1;
-        let err = e
-            .execute_text(
-                seq,
-                "INSERT INTO null_k VALUES (10002, NULL, 9, 3), (10003, NULL, 9, 4)",
-            )
-            .expect_err("partial-NULL in-batch duplicate");
-        assert!(format!("{err:?}").contains("duplicate key value"));
-        assert!(e.chunk_class_device_exact_rechecks() > exact_before);
+        e.execute_text(
+            seq,
+            "INSERT INTO null_k VALUES (10002, NULL, 9, 3), (10003, NULL, 9, 4)",
+        )
+        .expect("partial-NULL tuples are distinct within one batch");
 
-        // Existing partial-NULL duplicate: candidate index + exact IS NULL rejects.
+        // A tuple equal to an existing partial-NULL tuple is also distinct.
         seq += 1;
-        let err = e
-            .execute_text(seq, "INSERT INTO null_k VALUES (10004, NULL, 7, 5)")
-            .expect_err("existing partial-NULL duplicate");
-        assert!(format!("{err:?}").contains("duplicate key value"));
+        e.execute_text(seq, "INSERT INTO null_k VALUES (10004, NULL, 7, 5)")
+            .expect("existing partial-NULL tuple remains distinct");
 
         // Key-preserving UPDATE: its own NULL-key coordinate is self, not a conflict.
         seq += 1;

@@ -362,6 +362,95 @@ fn cross_shard_pk_index_append_success_requires_exact_index_owner() {
     run(true);
 }
 
+/// A cached singleton point plan is immutable, while an open-shard index is maintained in place.
+/// Pause a same-key UPDATE after its posting CAS but before row-count/generation publication: the old
+/// reader must retry through the capacity-bounded posting walker and still return its old visible row.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn prepared_singleton_reader_survives_in_place_posting_publication() {
+    let e = std::sync::Arc::new(Engine::new_local());
+    e.set_shard_residency_enabled(true);
+    e.set_auto_admit_on_commit(true);
+    e.set_shard_size_target(64);
+    e.execute_text(
+        1,
+        "CREATE TABLE posting_race (id INT PRIMARY KEY, balance INT)",
+    )
+    .unwrap();
+    for id in 0..16_i64 {
+        e.execute_text(
+            id as u64 + 2,
+            &format!(
+                "INSERT INTO posting_race (id, balance) VALUES ({id}, {})",
+                id * 10
+            ),
+        )
+        .unwrap();
+    }
+    let table = e.relational_catalog_table("posting_race").unwrap();
+    let id = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+    let balance =
+        crate::rel_exec_helpers::relational_column_index(&table, "balance").unwrap();
+    let old_boundary = e.committed_seq();
+    let warm = e
+        .gather_sharded_int4_point_lookups_batched(
+            old_boundary,
+            &table,
+            id,
+            &[id, balance],
+            &[5],
+        )
+        .unwrap()
+        .expect("singleton route is eligible");
+    assert_eq!(warm.values, vec![5, 50]);
+
+    let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    e.set_shard_pk_index_append_post_launch_hook(
+        std::sync::Arc::clone(&reached),
+        std::sync::Arc::clone(&resume),
+    );
+    let writer_engine = std::sync::Arc::clone(&e);
+    let writer = std::thread::spawn(move || {
+        writer_engine.execute_text(
+            10_000,
+            "UPDATE posting_race SET balance = 999 WHERE id = 5",
+        )
+    });
+    reached.wait();
+
+    let retained = e
+        .gather_sharded_int4_point_lookups_batched(
+            old_boundary,
+            &table,
+            id,
+            &[id, balance],
+            &[5],
+        )
+        .unwrap()
+        .expect("retained old plan remains eligible");
+    assert_eq!(
+        retained.values,
+        vec![5, 50],
+        "future posting head must lead back to the old snapshot row"
+    );
+
+    resume.wait();
+    writer.join().unwrap().unwrap();
+    let current_table = e.relational_catalog_table("posting_race").unwrap();
+    let current = e
+        .gather_sharded_int4_point_lookups_batched(
+            e.committed_seq(),
+            &current_table,
+            id,
+            &[id, balance],
+            &[5],
+        )
+        .unwrap()
+        .expect("current posting route is eligible");
+    assert_eq!(current.values, vec![5, 999]);
+}
+
 /// Reinstalling benchmark-owned shards is a full payload-generation replacement. The common shard
 /// publication enforcement point must retire the old PK index before returning, or its resident guard
 /// pins the replaced payload outside current-residency accounting until an unrelated future lookup.

@@ -4,9 +4,9 @@ use std::sync::Arc;
 use super::resident_memory::CudaResidentDeviceAllocation;
 use super::{
     check_cuda, copy_pinned_into, stage_result_dtoh_async, validate_i32_index_geometry,
-    CudaI32BatchProjectionColumns, CudaResidentDeviceMemory, CudaResidentReadSource,
-    CudaRuntimeProbeError, GpuPrimaryContext, I32NeedlesHostGuard, PooledDeviceBufferOwned,
-    PooledStreamOwned, Probe,
+    validate_i32_posting_index_geometry, CudaI32BatchProjectionColumns, CudaResidentDeviceMemory,
+    CudaResidentReadSource, CudaRuntimeProbeError, GpuPrimaryContext, I32NeedlesHostGuard,
+    PooledDeviceBufferOwned, PooledStreamOwned, Probe,
 };
 
 #[cfg(test)]
@@ -42,7 +42,7 @@ pub struct CudaI32DenseBatchProjection {
 }
 
 impl CudaI32DenseBatchProjection {
-    /// Per-needle dense status: `1` found, `2` not found, `3` duplicate visible match / unique-route decline.
+    /// Per-needle dense status: `1` found, `2` not found, or `3` duplicate visible match / unique-route decline.
     pub fn status(&self) -> &[u8] {
         &self.status
     }
@@ -52,7 +52,7 @@ impl CudaI32DenseBatchProjection {
     }
 
     /// Decompose into `(values, projection_count, status)`. Status values are `1` found, `2` not found, and
-    /// `3` duplicate visible match / unique-route decline; compatibility completion maps `3` to
+    /// `3` duplicate visible match / unique-route decline; compatibility maps `3` to
     /// [`CudaRuntimeProbeError::DuplicatePointReadMatch`].
     pub fn into_parts(self) -> (Vec<i32>, usize, Vec<u8>) {
         (self.values, self.projection_count, self.status)
@@ -80,9 +80,9 @@ impl CudaI32DenseBatchProjection {
 /// multi-shard route uses the same submission owner and may additionally write `3` when multiple visible rows
 /// match and the unique route declines. Both avoid `atom.global.add`, needle/count/row-index outputs, and host
 /// random scatter. The non-unique scan keeps the atomic kernel and row indices. Gaps are guarded: status is
-/// initialized to zero, every in-bounds thread writes a definitive `1`, `2`, or (multi-shard only) `3`, and
-/// compatibility/engine consumers reject any remaining zero/unknown status while compact completion preserves
-/// the opaque byte for production decline handling.
+/// initialized to zero, every in-bounds thread writes a definitive `1`, `2`, or `3`, and compatibility/engine
+/// consumers reject any remaining zero/unknown status while compact completion preserves the opaque byte for
+/// production decline handling.
 pub struct CudaI32IndexProbeDenseSubmission {
     projection_count: usize,
     needles_len: usize,
@@ -251,6 +251,7 @@ PROBE:
 
 FOUND:
     cvt.u32.u64 %r14, %rd16;
+    and.b32 %r14, %r14, 2147483647;
     sub.u32 %r14, %r14, 1;
     setp.ge.u32 %p2, %r14, %r18;
     @%p2 bra NOTFOUND;
@@ -320,7 +321,7 @@ DONE:
             projection_offsets.len(),
         ));
     }
-    if row_count == 0 || row_count >= u32::MAX as u64 || index_ptr == 0 {
+    if row_count == 0 || row_count >= (1_u64 << 31) || index_ptr == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
     let primary = resident.primary_arc();
@@ -544,10 +545,17 @@ pub struct MultiShardProbeShard {
     pub projection_offsets: Vec<u64>,
     /// The shard's live row count (for the projection bounds check).
     pub row_count: u64,
+    /// Physical row capacity of the resident payload and posting-link table. A retained older plan may
+    /// observe a directory head published by a later append; it traverses such future rows without
+    /// projecting them until it reaches a row below `row_count`.
+    pub row_capacity: u64,
     /// Per-row birth/death stamps from the SAME published shard snapshot. `None` means born-visible/all-live.
     /// The Arcs pin these regions through completion; the descriptor passes only their device pointers.
     pub created_by: Option<Arc<CudaResidentDeviceMemory>>,
     pub deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
+    /// Device-authored monotone certification for this index allocation. False permits the
+    /// low-register singleton kernel; true requires full posting-chain traversal.
+    pub has_postings: bool,
     /// Zone map [min, max] of the FILTER column for this shard (from `resident_device_int4_column_stats`);
     /// the kernel skips this shard for a needle outside [min, max] (on-device prune). Pass `(i32::MIN,
     /// i32::MAX)` when the shard has no stat for the column -> always in-range (matches the scan, which keeps
@@ -569,6 +577,7 @@ pub struct CudaI32MultiShardProbePlan {
     projection_count: usize,
     shard_count: u32,
     binary_mode: bool,
+    has_postings: bool,
     descriptor_guard: PooledDeviceBufferOwned,
     _resource_guards: Vec<Arc<CudaResidentDeviceMemory>>,
 }
@@ -579,6 +588,7 @@ impl std::fmt::Debug for CudaI32MultiShardProbePlan {
             .field("projection_count", &self.projection_count)
             .field("shard_count", &self.shard_count)
             .field("binary_mode", &self.binary_mode)
+            .field("has_postings", &self.has_postings)
             .finish_non_exhaustive()
     }
 }
@@ -608,6 +618,7 @@ pub(super) fn prepare_cuda_resident_i32_multi_shard_index_probe_dense(
     }
     let shard_count = u32::try_from(shards.len())
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(shards.len()))?;
+    let has_postings = shards.iter().any(|shard| shard.has_postings);
     let descriptor_capacity = shards
         .len()
         .checked_mul(MULTI_SHARD_DESC_U64_PER_SHARD)
@@ -626,6 +637,8 @@ pub(super) fn prepare_cuda_resident_i32_multi_shard_index_probe_dense(
         }
         if shard.row_count == 0
             || shard.row_count >= u32::MAX as u64
+            || shard.row_capacity < shard.row_count
+            || shard.row_capacity >= (1_u64 << 31)
             || shard.resident.device_ptr() == 0
             || shard.index.device_ptr() == 0
             || shard.min > shard.max
@@ -637,10 +650,11 @@ pub(super) fn prepare_cuda_resident_i32_multi_shard_index_probe_dense(
         {
             return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
         }
-        validate_i32_index_geometry(
+        validate_i32_posting_index_geometry(
             shard.index.metadata().allocated_bytes,
             shard.table_mask,
             shard.hash_shift,
+            shard.row_capacity,
         )?;
         let allocated = shard.resident.metadata().allocated_bytes;
         for &byte_offset in &shard.projection_offsets {
@@ -685,7 +699,7 @@ pub(super) fn prepare_cuda_resident_i32_multi_shard_index_probe_dense(
                 desc.push(0);
             }
         }
-        desc.push(shard.row_count);
+        desc.push(shard.row_count | (shard.row_capacity << 32));
         resource_guards.push(Arc::clone(&shard.resident));
         resource_guards.push(Arc::clone(&shard.index));
     }
@@ -723,6 +737,7 @@ pub(super) fn prepare_cuda_resident_i32_multi_shard_index_probe_dense(
         projection_count,
         shard_count,
         binary_mode,
+        has_postings,
         descriptor_guard,
         _resource_guards: resource_guards,
     })
@@ -742,6 +757,7 @@ pub(super) fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
         plan,
         needles,
         read_snapshot,
+        false,
     )
 }
 
@@ -756,6 +772,7 @@ pub(super) fn submit_cuda_resident_i32_multi_shard_index_probe_dense_prepared(
     plan: Arc<CudaI32MultiShardProbePlan>,
     needles: &[i32],
     read_snapshot: u64,
+    force_posting_kernel: bool,
 ) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
     let probe = Probe::start();
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
@@ -778,7 +795,7 @@ pub(super) fn submit_cuda_resident_i32_multi_shard_index_probe_dense_prepared(
     // visible matches emits status=2, one emits values + status=1, and a second emits status=3 so the unique route
     // declines. It reuses the single-shard hash lookup and gather-address contract while adding descriptor reads,
     // linear/binary candidate routing, zone pruning, MVCC visibility, and duplicate detection. ASCII-only.
-    const PTX: &[u8] = br#"
+    const POSTING_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
 .address_size 64
@@ -795,7 +812,7 @@ pub(super) fn submit_cuda_resident_i32_multi_shard_index_probe_dense_prepared(
     .param .u64 read_snapshot
 )
 {
-    .reg .pred %p<9>;
+    .reg .pred %p<10>;
     .reg .b32 %r<40>;
     .reg .b64 %rd<48>;
 
@@ -931,9 +948,41 @@ NEXTSHARD:
 
 FOUND:
     cvt.u32.u64 %r16, %rd15;
+    // Bit 31 marks a singleton directory head: validate/gather it, then skip the dependent link load.
+    setp.lt.s32 %p9, %r16, 0;
+    and.b32 %r16, %r16, 2147483647;
+    setp.eq.u32 %p2, %r16, 0;
+    @%p2 bra BADINDEX;
+    // Descriptor word 10 packs captured row_count in low32 and physical index capacity in high32.
+    // A retained old plan may see a future head after in-place append: bound it by capacity, skip
+    // projection above captured row_count, and follow its posting link to the old visible version.
+    shr.u64 %rd12, %rd44, 32;
+    cvt.u32.u64 %r11, %rd12;
+    @!%p9 bra CHAININIT;
     sub.u32 %r16, %r16, 1;
+    setp.ge.u32 %p8, %r16, %r11;
+    @%p8 bra BADINDEX;
     setp.ge.u32 %p8, %r16, %r31;
-    @%p8 bra ADVANCEPROBE;
+    @%p8 bra NEXTSHARD;
+    bra ROW;
+CHAININIT:
+    add.u32 %r12, %r10, 1;
+    cvt.u64.u32 %rd13, %r12;
+    shl.b64 %rd13, %rd13, 3;
+    add.u64 %rd13, %rd10, %rd13;
+    mov.u32 %r14, 0;
+CHAIN:
+    setp.eq.u32 %p2, %r16, 0;
+    @%p2 bra NEXTSHARD;
+    setp.ge.u32 %p8, %r14, %r11;
+    @%p8 bra BADINDEX;
+    add.u32 %r14, %r14, 1;
+    sub.u32 %r16, %r16, 1;
+    setp.ge.u32 %p8, %r16, %r11;
+    @%p8 bra BADINDEX;
+    setp.ge.u32 %p8, %r16, %r31;
+    @%p8 bra CHAINNEXT;
+ROW:
     cvt.u64.u32 %rd17, %r16;
     mul.lo.u64 %rd39, %rd17, 8;
     setp.eq.u64 %p6, %rd37, 0;
@@ -941,14 +990,14 @@ FOUND:
     add.u64 %rd40, %rd37, %rd39;
     ld.global.u64 %rd41, [%rd40];
     setp.gt.u64 %p6, %rd41, %rd36;
-    @%p6 bra ADVANCEPROBE;
+    @%p6 bra CHAINNEXT;
 CREATEDOK:
     setp.eq.u64 %p7, %rd38, 0;
     @%p7 bra VISIBLE;
     add.u64 %rd42, %rd38, %rd39;
     ld.global.u64 %rd43, [%rd42];
     setp.le.u64 %p7, %rd43, %rd36;
-    @%p7 bra ADVANCEPROBE;
+    @%p7 bra CHAINNEXT;
 VISIBLE:
     setp.eq.u32 %p5, %r19, 1;
     @%p5 bra DUP;
@@ -999,6 +1048,12 @@ VISIBLE:
     st.global.s32 [%rd27], %r18;
 
 AFTEREMIT:
+CHAINNEXT:
+    @%p9 bra NEXTSHARD;
+    mul.wide.u32 %rd14, %r16, 4;
+    add.u64 %rd14, %rd13, %rd14;
+    ld.global.u32 %r16, [%rd14];
+    bra CHAIN;
 ADVANCEPROBE:
     add.u32 %r13, %r13, 1;
     add.u32 %r14, %r14, 1;
@@ -1010,6 +1065,13 @@ DUP:
     cvt.u64.u32 %rd18, %r7;
     add.u64 %rd20, %rd4, %rd18;
     mov.u32 %r17, 3;
+    st.global.u8 [%rd20], %r17;
+    bra DONE;
+
+BADINDEX:
+    cvt.u64.u32 %rd18, %r7;
+    add.u64 %rd20, %rd4, %rd18;
+    mov.u32 %r17, 4;
     st.global.u8 [%rd20], %r17;
     bra DONE;
 
@@ -1095,11 +1157,24 @@ DONE:
     let values_guard = primary.lease_device_buffer_owned(output_bytes)?;
     let status_guard = primary.lease_device_buffer_owned(status_bytes)?;
     let needles_host_guard = I32NeedlesHostGuard::stage(&primary, needles);
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
+    const SINGLETON_PTX: &[u8] = include_bytes!("point_read_dense_singleton.ptx");
+    let use_posting_kernel = force_posting_kernel || plan.has_postings;
+    let kernel_ptx = if use_posting_kernel {
+        POSTING_PTX
+    } else {
+        SINGLETON_PTX
+    };
+    let mut ptx = Vec::with_capacity(kernel_ptx.len() + 1);
+    ptx.extend_from_slice(kernel_ptx);
     ptx.push(0);
-    let function =
-        primary.cached_function(c"gpu_db_resident_multi_shard_i32_index_probe_dense", &ptx)?;
+    let function = if use_posting_kernel {
+        primary.cached_function(c"gpu_db_resident_multi_shard_i32_index_probe_dense", &ptx)?
+    } else {
+        primary.cached_function(
+            c"gpu_db_resident_multi_shard_i32_index_probe_dense_singleton",
+            &ptx,
+        )?
+    };
     probe.lap("point_multi_resource_prepare");
 
     let mut desc_arg = plan.descriptor_guard.ptr;
@@ -1351,6 +1426,13 @@ impl CudaI32IndexProbeDenseSubmission {
             .map_err(drain_err)?;
         }
         probe.lap("point_multi_result_host_copy");
+
+        if let Some(status) = status_bytes
+            .iter()
+            .find(|status| !matches!(**status, 1..=3))
+        {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(*status as usize));
+        }
 
         // Return the DENSE LAYOUT as-is (NO compaction here): `values_raw` is one slot per needle (gaps) +
         // `status`. The engine's `assemble_batched_rows` compacts it in ONE sequential pass — compacting here

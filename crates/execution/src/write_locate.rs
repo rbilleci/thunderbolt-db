@@ -53,6 +53,7 @@ fn validate_index_geometry(
     allocated_bytes: u64,
     table_mask: u32,
     hash_shift: u32,
+    row_count: u32,
 ) -> Result<(), CudaRuntimeProbeError> {
     let table_slots = u64::from(table_mask)
         .checked_add(1)
@@ -63,8 +64,7 @@ fn validate_index_geometry(
         ));
     }
     let expected_shift = 32 - table_slots.trailing_zeros();
-    let required_bytes = table_slots
-        .checked_mul(std::mem::size_of::<u64>() as u64)
+    let required_bytes = crate::resident_index_allocated_bytes(table_mask, u64::from(row_count))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     if hash_shift != expected_shift || required_bytes > allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
@@ -147,9 +147,9 @@ const VISIBLE_LOCATE_PTX: &[u8] = br#"
     .param .u64 out_latest_write_ptr
 )
 {
-    .reg .pred %p<12>;
-    .reg .b32 %r<21>;
-    .reg .b64 %rd<44>;
+    .reg .pred %p<13>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<48>;
 
     ld.param.u64 %rd1, [desc_array_ptr];
     ld.param.u32 %r1, [shard_count];
@@ -197,6 +197,10 @@ SHARD:
     ld.global.u64 %rd19, [%rd14+24];
     ld.global.u64 %rd20, [%rd14+32];
     ld.global.u32 %r19, [%rd14+40];
+    add.u32 %r21, %r12, 1;
+    cvt.u64.u32 %rd42, %r21;
+    shl.b64 %rd42, %rd42, 3;
+    add.u64 %rd42, %rd15, %rd42;
 
     mul.lo.u32 %r14, %r7, 2654435761;
     shr.u32 %r15, %r14, %r13;
@@ -214,6 +218,16 @@ PROBE:
     setp.ne.s32 %p2, %r17, %r7;
     @%p2 bra ADVANCE;
     cvt.u32.u64 %r18, %rd23;
+    // Bit 31 marks a singleton directory head: inspect it, then skip the dependent link load.
+    setp.lt.s32 %p12, %r18, 0;
+    and.b32 %r18, %r18, 2147483647;
+    mov.u32 %r22, 0;
+CHAIN:
+    setp.eq.u32 %p2, %r18, 0;
+    @%p2 bra NEXTSHARD;
+    setp.ge.u32 %p8, %r22, %r19;
+    @%p8 bra BADINDEX;
+    add.u32 %r22, %r22, 1;
     sub.u32 %r18, %r18, 1;
     setp.ge.u32 %p8, %r18, %r19;
     @%p8 bra BADINDEX;
@@ -242,9 +256,9 @@ DBLOADED:
 HISTORYDONE:
 
     setp.gt.u64 %p4, %rd27, %rd12;
-    @%p4 bra ADVANCE;
+    @%p4 bra CHAINNEXT;
     setp.le.u64 %p6, %rd29, %rd12;
-    @%p6 bra ADVANCE;
+    @%p6 bra CHAINNEXT;
 VISHIT:
     setp.ne.u32 %p7, %r8, 0;
     @%p7 bra VCOUNT;
@@ -257,7 +271,12 @@ VISHIT:
     ld.global.u64 %rd30, [%rd32];
 VCOUNT:
     add.u32 %r8, %r8, 1;
-    bra ADVANCE;
+CHAINNEXT:
+    @%p12 bra NEXTSHARD;
+    mul.wide.u32 %rd43, %r18, 4;
+    add.u64 %rd44, %rd42, %rd43;
+    ld.global.u32 %r18, [%rd44];
+    bra CHAIN;
 BADINDEX:
     mov.u32 %r8, 4294967295;
     bra WRITEOUT;
@@ -315,9 +334,9 @@ const WRITE_LOCATE_PTX: &[u8] = br#"
     .param .u64 out_count_ptr
 )
 {
-    .reg .pred %p<7>;
+    .reg .pred %p<8>;
     .reg .b32 %r<24>;
-    .reg .b64 %rd<24>;
+    .reg .b64 %rd<28>;
 
     ld.param.u64 %rd1, [desc_array_ptr];
     ld.param.u32 %r1, [shard_count];
@@ -353,6 +372,10 @@ SHARD:
     shr.u64 %rd12, %rd11, 32;
     cvt.u32.u64 %r12, %rd12;
     ld.global.u32 %r20, [%rd9+16];
+    add.u32 %r21, %r11, 1;
+    cvt.u64.u32 %rd21, %r21;
+    shl.b64 %rd21, %rd21, 3;
+    add.u64 %rd21, %rd10, %rd21;
 
     mul.lo.u32 %r13, %r8, 2654435761;
     shr.u32 %r14, %r13, %r12;
@@ -378,6 +401,16 @@ PROBE:
 
 FOUND:
     cvt.u32.u64 %r17, %rd15;
+    // Bit 31 marks a singleton directory head: emit it, then skip the dependent link load.
+    setp.lt.s32 %p7, %r17, 0;
+    and.b32 %r17, %r17, 2147483647;
+    mov.u32 %r22, 0;
+CHAIN:
+    setp.eq.u32 %p2, %r17, 0;
+    @%p2 bra NEXTSHARD;
+    setp.ge.u32 %p6, %r22, %r20;
+    @%p6 bra BADINDEX;
+    add.u32 %r22, %r22, 1;
     sub.u32 %r17, %r17, 1;
     setp.ge.u32 %p6, %r17, %r20;
     @%p6 bra BADINDEX;
@@ -391,16 +424,11 @@ FOUND:
     st.global.u32 [%rd20], %r17;
 INCCOUNT:
     add.u32 %r9, %r9, 1;
-    // F3/U4: ADVANCE past this match and keep probing THIS shard for MVCC version twins (the
-    // dup-tolerant index now holds an updated key's old + new physical rows in the same shard).
-    // Only an empty slot / 256-cap ends the shard. The caller resolves visibility across the
-    // returned hits exactly as it already does for the cross-shard (old-in-A, new-in-B) case.
-    add.u32 %r14, %r14, 1;
-    and.b32 %r14, %r14, %r11;
-    add.u32 %r15, %r15, 1;
-    setp.ge.u32 %p3, %r15, 256;
-    @%p3 bra NEXTSHARD;
-    bra PROBE;
+    @%p7 bra NEXTSHARD;
+    mul.wide.u32 %rd22, %r17, 4;
+    add.u64 %rd23, %rd21, %rd22;
+    ld.global.u32 %r17, [%rd23];
+    bra CHAIN;
 BADINDEX:
     mov.u32 %r9, 4294967294;
     bra WRITECOUNT;
@@ -463,11 +491,12 @@ impl CudaResidentDeviceMemory {
         if shards.is_empty() || needles.is_empty() {
             return Err(CudaRuntimeProbeError::InvalidInputLength(0));
         }
-        const MAX_PROBES_PER_SHARD: usize = 256;
         const INVALID_COUNT: u32 = u32::MAX - 1;
         let max_count = shards
-            .len()
-            .checked_mul(MAX_PROBES_PER_SHARD)
+            .iter()
+            .try_fold(0usize, |total, shard| {
+                total.checked_add(shard.row_count as usize)
+            })
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let max_count_u32 = u32::try_from(max_count)
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(max_count))?;
@@ -503,6 +532,7 @@ impl CudaResidentDeviceMemory {
                 shard.index.metadata().allocated_bytes,
                 shard.table_mask,
                 shard.hash_shift,
+                shard.row_count,
             )?;
             desc.push(shard.index.device_ptr());
             desc.push((shard.table_mask as u64) | ((shard.hash_shift as u64) << 32));
@@ -699,11 +729,12 @@ impl CudaResidentDeviceMemory {
         if shards.is_empty() || needles.is_empty() || needles.len() != snapshots.len() {
             return Err(CudaRuntimeProbeError::InvalidInputLength(needles.len()));
         }
-        const MAX_PROBES_PER_SHARD: usize = 256;
         const INVALID_COUNT: u32 = u32::MAX;
         let max_count = shards
-            .len()
-            .checked_mul(MAX_PROBES_PER_SHARD)
+            .iter()
+            .try_fold(0usize, |total, shard| {
+                total.checked_add(shard.row_count as usize)
+            })
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let max_count_u32 = u32::try_from(max_count)
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(max_count))?;
@@ -733,6 +764,7 @@ impl CudaResidentDeviceMemory {
                 shard.index.metadata().allocated_bytes,
                 shard.table_mask,
                 shard.hash_shift,
+                shard.row_count,
             )?;
             for region in [
                 shard.created_by.as_ref(),
@@ -947,10 +979,10 @@ mod tests {
 
     #[test]
     fn write_locate_geometry_requires_exact_power_of_two_addressing() {
-        validate_index_geometry(128, 15, 28).unwrap();
-        assert!(validate_index_geometry(127, 15, 28).is_err());
-        assert!(validate_index_geometry(128, 14, 28).is_err());
-        assert!(validate_index_geometry(128, 15, 27).is_err());
-        assert!(validate_index_geometry(u64::MAX, 0, 32).is_err());
+        validate_index_geometry(132, 15, 28, 1).unwrap();
+        assert!(validate_index_geometry(131, 15, 28, 1).is_err());
+        assert!(validate_index_geometry(132, 14, 28, 1).is_err());
+        assert!(validate_index_geometry(132, 15, 27, 1).is_err());
+        assert!(validate_index_geometry(u64::MAX, 0, 32, 1).is_err());
     }
 }

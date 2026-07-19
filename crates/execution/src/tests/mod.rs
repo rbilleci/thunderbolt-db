@@ -1,6 +1,13 @@
 use super::*;
 
 #[test]
+fn posting_index_allocation_reserves_singleton_head_bit() {
+    assert_eq!(resident_index_allocated_bytes(7, 3), Some(76));
+    assert!(resident_index_allocated_bytes(7, (1_u64 << 31) - 1).is_some());
+    assert_eq!(resident_index_allocated_bytes(7, 1_u64 << 31), None);
+}
+
+#[test]
 fn radix_input_validation_is_total_before_cuda() {
     let aligned = 0x1000_u64;
     assert_eq!(validate_i64_argsort_host_len(2), Ok((2, 16)));
@@ -437,15 +444,24 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         let mask = size - 1;
         let shift = 32 - size.trailing_zeros();
         let mut entries = vec![0_u64; size as usize];
-        for (slot, &key) in keys.iter().enumerate() {
+        let mut next = vec![0_u32; keys.len()];
+        for (row, &key) in keys.iter().enumerate() {
             let mut at = (key as u32).wrapping_mul(0x9E37_79B1) >> shift;
             at &= mask;
-            while entries[at as usize] != 0 {
+            while entries[at as usize] != 0 && (entries[at as usize] >> 32) as u32 != key as u32 {
                 at = (at + 1) & mask;
             }
-            entries[at as usize] = ((key as u32 as u64) << 32) | (slot as u64 + 1);
+            let prior = entries[at as usize] as u32;
+            if prior == 0 {
+                entries[at as usize] =
+                    ((key as u32 as u64) << 32) | ((row as u64 + 1) | (1_u64 << 31));
+            } else {
+                next[row] = prior & 0x7fff_ffff;
+                entries[at as usize] = ((key as u32 as u64) << 32) | (row as u64 + 1);
+            }
         }
-        let index_bytes: Vec<u8> = entries.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut index_bytes: Vec<u8> = entries.iter().flat_map(|v| v.to_le_bytes()).collect();
+        index_bytes.extend(next.iter().flat_map(|value| value.to_le_bytes()));
         let index = Arc::new(runtime.retain_device_memory_copy(0, &index_bytes).unwrap());
         (resident, index, mask, shift)
     };
@@ -460,8 +476,10 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         hash_shift: shift,
         projection_offsets: vec![0, 12],
         row_count: 2,
+        row_capacity: 3,
         created_by: None,
         deleted_by: None,
+        has_postings: false,
         min: 4,
         max: 3,
     };
@@ -478,8 +496,10 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         hash_shift: shift,
         projection_offsets: vec![resident.metadata().allocated_bytes],
         row_count: 2,
+        row_capacity: 3,
         created_by: None,
         deleted_by: None,
+        has_postings: false,
         min: 1,
         max: 3,
     };
@@ -501,8 +521,10 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         hash_shift: shift,
         projection_offsets: vec![0],
         row_count: 2,
+        row_capacity: 3,
         created_by: Some(short_created),
         deleted_by: None,
+        has_postings: false,
         min: 1,
         max: 3,
     };
@@ -519,8 +541,10 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         hash_shift: shift,
         projection_offsets: vec![0, 12],
         row_count: 2,
+        row_capacity: 3,
         created_by: None,
         deleted_by: None,
+        has_postings: false,
         min: 1,
         max: 3,
     };
@@ -558,7 +582,7 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         "ahead-index slot is outside captured row_count"
     );
 
-    // A dead and live version of the same key can occupy adjacent probe slots in one dup-tolerant index.
+    // A dead and live version of the same key occupy adjacent links in one dup-tolerant posting chain.
     // The kernel must advance past the invisible twin and gather the visible one.
     let (resident, index, mask, shift) = build(&[3, 3], &[30, 31]);
     let created_bytes: Vec<u8> = [1_u64, 5].iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -573,6 +597,7 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         hash_shift: shift,
         projection_offsets: vec![0, 8],
         row_count: 2,
+        row_capacity: 2,
         created_by: Some(Arc::new(
             runtime
                 .retain_device_memory_copy(0, &created_bytes)
@@ -583,6 +608,7 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
                 .retain_device_memory_copy(0, &deleted_bytes)
                 .unwrap(),
         )),
+        has_postings: true,
         min: 3,
         max: 3,
     };
@@ -597,6 +623,105 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         vec![3, 31],
         "visible twin gathered after dead twin"
     );
+
+    // A geometrically valid posting region can still be corrupt. A self-link must be bounded by
+    // logical row_count, surface as an invalid status, and leave the same prepared route reusable
+    // after the link is repaired.
+    let (cycle_resident, cycle_index, cycle_mask, cycle_shift) = build(&[11], &[110]);
+    let cycle_shard = MultiShardProbeShard {
+        resident: Arc::clone(&cycle_resident),
+        index: Arc::clone(&cycle_index),
+        table_mask: cycle_mask,
+        hash_shift: cycle_shift,
+        projection_offsets: vec![0, 4],
+        row_count: 1,
+        row_capacity: 1,
+        created_by: None,
+        deleted_by: None,
+        has_postings: true,
+        min: 11,
+        max: 11,
+    };
+    let cycle_plan = cycle_resident
+        .prepare_multi_shard_i32_index_probe_dense(&[cycle_shard])
+        .expect("prepare cyclic posting plan");
+    let next_offset = resident_index_hash_bytes(cycle_mask).unwrap();
+    let cycle_slot = ((11_u32.wrapping_mul(0x9E37_79B1) >> cycle_shift) & cycle_mask) as u64;
+    let directory_offset = cycle_slot * std::mem::size_of::<u64>() as u64;
+    cycle_index
+        .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+            byte_offset: directory_offset,
+            bytes: ((11_u64) << 32).to_le_bytes().to_vec(),
+        }))
+        .unwrap();
+    assert!(
+        cycle_resident
+            .submit_prepared_multi_shard_i32_index_probe_dense(&cycle_plan, &[11], 100)
+            .unwrap()
+            .complete_detached_columnar_compact()
+            .is_err(),
+        "matching zero head fails loudly"
+    );
+    cycle_index
+        .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+            byte_offset: directory_offset,
+            bytes: (((11_u64) << 32) | 2).to_le_bytes().to_vec(),
+        }))
+        .unwrap();
+    assert!(
+        cycle_resident
+            .submit_prepared_multi_shard_i32_index_probe_dense(&cycle_plan, &[11], 100)
+            .unwrap()
+            .complete_detached_columnar_compact()
+            .is_err(),
+        "matching head beyond physical capacity fails loudly"
+    );
+    cycle_index
+        .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+            byte_offset: directory_offset,
+            bytes: (((11_u64) << 32) | 1).to_le_bytes().to_vec(),
+        }))
+        .unwrap();
+    cycle_index
+        .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+            byte_offset: next_offset,
+            bytes: 2_u32.to_le_bytes().to_vec(),
+        }))
+        .unwrap();
+    assert!(
+        cycle_resident
+            .submit_prepared_multi_shard_i32_index_probe_dense(&cycle_plan, &[11], 100)
+            .unwrap()
+            .complete_detached_columnar_compact()
+            .is_err(),
+        "posting link beyond physical capacity fails loudly"
+    );
+    cycle_index
+        .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+            byte_offset: next_offset,
+            bytes: 1_u32.to_le_bytes().to_vec(),
+        }))
+        .unwrap();
+    assert!(
+        cycle_resident
+            .submit_prepared_multi_shard_i32_index_probe_dense(&cycle_plan, &[11], 100)
+            .unwrap()
+            .complete_detached_columnar_compact()
+            .is_err(),
+        "dense probe must terminate and reject a self-linked posting"
+    );
+    cycle_index
+        .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+            byte_offset: next_offset,
+            bytes: 0_u32.to_le_bytes().to_vec(),
+        }))
+        .unwrap();
+    let (repaired, _) = cycle_resident
+        .submit_prepared_multi_shard_i32_index_probe_dense(&cycle_plan, &[11], 100)
+        .unwrap()
+        .complete_detached_columnar_compact()
+        .unwrap();
+    assert_eq!(repaired.status(), &[1]);
 
     // Two separately valid shards may transiently expose the same visible key. Exercise the real multi-shard
     // kernel's status=3 contract directly: compact callers see the decline status, compatibility callers get a
@@ -613,8 +738,10 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
             hash_shift: duplicate_shift_0,
             projection_offsets: vec![0, 4],
             row_count: 1,
+            row_capacity: 1,
             created_by: None,
             deleted_by: None,
+            has_postings: false,
             min: 7,
             max: 7,
         },
@@ -625,8 +752,10 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
             hash_shift: duplicate_shift_1,
             projection_offsets: vec![0, 4],
             row_count: 1,
+            row_capacity: 1,
             created_by: None,
             deleted_by: None,
+            has_postings: false,
             min: 7,
             max: 7,
         },
@@ -660,8 +789,10 @@ fn cuda_multi_shard_dense_probe_honors_captured_rows_and_version_twins() {
         hash_shift: duplicate_shift_0,
         projection_offsets: vec![0, 4],
         row_count: 1,
+        row_capacity: 1,
         created_by: None,
         deleted_by: None,
+        has_postings: false,
         min: 7,
         max: 7,
     }];
