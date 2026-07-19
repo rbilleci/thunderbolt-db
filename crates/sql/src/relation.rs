@@ -831,7 +831,7 @@ fn parse_constraint_columns(rest: &str) -> Result<Vec<String>, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     let raw = split_csv(&rest[open + 1..close])?;
-    if raw.is_empty() {
+    if raw.is_empty() || raw.len() > 32 {
         return Err(ParseError::InvalidRelationalSql);
     }
     raw.iter()
@@ -1134,19 +1134,23 @@ fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
             table_target
         };
     let table = normalize_relation_identifier(table_target)?;
-    // The literal `CREATE INDEX ... (cols)` text form stays SINGLE-column for now (compound secondary
-    // indexes are out of scope); a multi-column list is a clean parse error. The compound-PK path builds
-    // `CreateIndex` internally (apply_add_primary_key) and carries `columns` there.
+    // PRODUCT-002: preserve the ordered key list for compound secondary indexes. The engine catalog and
+    // resident device-index layer already use this exact order for compound PRIMARY KEY / UNIQUE keys;
+    // PRODUCT-002 applies the same ordered descriptor to non-unique BENCH indexes.
     let raw = split_csv(&target[open + 1..close])?;
-    let [column] = raw.as_slice() else {
+    if raw.is_empty() || raw.len() > 32 {
         return Err(ParseError::InvalidRelationalSql);
-    };
-    let column = normalize_identifier(column.trim())?;
+    }
+    let columns = raw
+        .iter()
+        .map(|column| normalize_identifier(column.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let column = columns[0].clone();
     Ok(CreateIndex {
         name,
         table,
-        column: column.clone(),
-        columns: vec![column],
+        column,
+        columns,
         unique,
     })
 }

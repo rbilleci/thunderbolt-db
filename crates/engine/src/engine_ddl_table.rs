@@ -259,6 +259,14 @@ impl Engine {
         primary_key: bool,
         unique_constraint: bool,
     ) -> Result<(), EngineError> {
+        if create.columns.is_empty()
+            || create.columns.len() > 32
+            || create.columns.first() != Some(&create.column)
+        {
+            return Err(EngineError::ApplyFailed(
+                "indexes require between 1 and 32 ordered key columns".to_string(),
+            ));
+        }
         if cat
             .relational_catalog
             .values()

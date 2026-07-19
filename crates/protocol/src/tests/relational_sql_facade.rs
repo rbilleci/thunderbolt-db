@@ -1336,6 +1336,74 @@ default: Some(ColumnDefault::SequenceNextVal {
         })
     );
     assert_eq!(
+        parse_command("CREATE UNIQUE INDEX uq ON t USING btree (a, b)").unwrap(),
+        Command::CreateIndex(CreateIndex {
+            name: "uq".to_string(),
+            table: "t".to_string(),
+            column: "a".to_string(),
+            columns: vec!["a".to_string(), "b".to_string()],
+            unique: true,
+        })
+    );
+    let columns_32 = (0..32)
+        .map(|index| format!("c{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let columns_33 = (0..33)
+        .map(|index| format!("c{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parsed_32 = parse_command(&format!("CREATE INDEX i32 ON t ({columns_32})")).unwrap();
+    let Command::CreateIndex(parsed_32) = parsed_32 else {
+        panic!("expected CREATE INDEX");
+    };
+    assert_eq!(parsed_32.columns.len(), 32);
+    assert!(matches!(
+        parse_command(&format!("CREATE INDEX i33 ON t ({columns_33})")),
+        Err(ParseError::InvalidRelationalSql)
+    ));
+    assert_eq!(
+        parse_command(r#"CREATE INDEX quoted_idx ON t ("a,b", "a)", "a(")"#).unwrap(),
+        Command::CreateIndex(CreateIndex {
+            name: "quoted_idx".to_string(),
+            table: "t".to_string(),
+            column: "a,b".to_string(),
+            columns: vec!["a,b".to_string(), "a)".to_string(), "a(".to_string()],
+            unique: false,
+        })
+    );
+    assert_eq!(
+        parse_command(r#"CREATE INDEX escaped_idx ON t ("a""b", c)"#).unwrap(),
+        Command::CreateIndex(CreateIndex {
+            name: "escaped_idx".to_string(),
+            table: "t".to_string(),
+            column: "a\"b".to_string(),
+            columns: vec!["a\"b".to_string(), "c".to_string()],
+            unique: false,
+        })
+    );
+    for invalid in [
+        "CREATE INDEX bad ON t ()",
+        "CREATE INDEX bad ON t (a,)",
+        "CREATE INDEX bad ON t (,a)",
+        "CREATE INDEX bad ON t (a,,b)",
+        r#"CREATE INDEX bad ON t ("a" "b", c)"#,
+        r#"CREATE INDEX bad ON t ("a"junk", c)"#,
+        "CREATE INDEX bad ON t (public.a, b)",
+        "CREATE INDEX bad ON t ((a + b), c)",
+        "CREATE INDEX bad ON t (a, b) WHERE a > 0",
+        "CREATE INDEX bad ON t USING hash (a, b)",
+        "CREATE INDEX bad ON t (a, b) trailing",
+    ] {
+        assert!(
+            matches!(
+                parse_command(invalid),
+                Err(ParseError::InvalidRelationalSql)
+            ),
+            "accepted invalid CREATE INDEX: {invalid}"
+        );
+    }
+    assert_eq!(
         parse_command("CREATE INDEX people_name_idx ON public.people USING btree (name)").unwrap(),
         Command::CreateIndex(CreateIndex {
             name: "people_name_idx".to_string(),
@@ -1360,10 +1428,33 @@ default: Some(ColumnDefault::SequenceNextVal {
         parse_command("CREATE INDEX people_name_idx ON people USING hash (name)"),
         Err(ParseError::InvalidRelationalSql)
     ));
-    assert!(matches!(
-        parse_command("CREATE INDEX people_multi_idx ON people (id, name)"),
-        Err(ParseError::InvalidRelationalSql)
-    ));
+    assert_eq!(
+        parse_command("CREATE INDEX people_multi_idx ON people (id, name)").unwrap(),
+        Command::CreateIndex(CreateIndex {
+            name: "people_multi_idx".to_string(),
+            table: "people".to_string(),
+            column: "id".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            unique: false,
+        })
+    );
+    assert_eq!(
+        parse_command(
+            "CREATE INDEX accounts_by_status ON accounts (tenant_id, status, account_id)",
+        )
+        .unwrap(),
+        Command::CreateIndex(CreateIndex {
+            name: "accounts_by_status".to_string(),
+            table: "accounts".to_string(),
+            column: "tenant_id".to_string(),
+            columns: vec![
+                "tenant_id".to_string(),
+                "status".to_string(),
+                "account_id".to_string(),
+            ],
+            unique: false,
+        })
+    );
     assert_eq!(
         parse_command("DROP INDEX public.people_name_idx").unwrap(),
         Command::DropIndex(DropIndex {

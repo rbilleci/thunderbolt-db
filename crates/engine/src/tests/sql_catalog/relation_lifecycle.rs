@@ -111,6 +111,48 @@ fn relational_catalog_records_create_index_and_replays_from_wal() {
 }
 
 #[test]
+fn relational_catalog_preserves_compound_secondary_index_order_across_recovery() {
+    let e = Engine::new_local_test_engine();
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (tenant_id INT, account_id BIGINT, status SMALLINT)",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "CREATE INDEX accounts_by_status ON accounts (tenant_id, status, account_id)",
+    )
+    .unwrap();
+
+    let expected = RelationalIndex {
+        name: "accounts_by_status".to_string(),
+        table: "accounts".to_string(),
+        column: "tenant_id".to_string(),
+        key_columns: vec![
+            "tenant_id".to_string(),
+            "status".to_string(),
+            "account_id".to_string(),
+        ],
+        unique: false,
+        primary_key: false,
+        unique_constraint: false,
+    };
+    assert_eq!(
+        e.relational_catalog_table("accounts").unwrap().indexes,
+        vec![expected.clone()]
+    );
+
+    let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+    assert_eq!(
+        recovered
+            .relational_catalog_table("accounts")
+            .unwrap()
+            .indexes,
+        vec![expected]
+    );
+}
+
+#[test]
 fn relational_unique_index_rejects_duplicate_create_insert_update_and_replays_from_wal() {
     let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")

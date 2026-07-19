@@ -1508,7 +1508,29 @@ fn normalize_identifier(input: &str) -> Result<String, ParseError> {
         if quoted.is_empty() {
             return Err(ParseError::InvalidRelationalSql);
         }
-        return Ok(quoted.replace("\"\"", "\""));
+        let bytes = quoted.as_bytes();
+        let mut normalized = String::with_capacity(quoted.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'"' {
+                if bytes.get(index + 1) != Some(&b'"') {
+                    return Err(ParseError::InvalidRelationalSql);
+                }
+                normalized.push('"');
+                index += 2;
+                continue;
+            }
+            let ch = quoted[index..]
+                .chars()
+                .next()
+                .ok_or(ParseError::InvalidRelationalSql)?;
+            if ch == '\0' {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            normalized.push(ch);
+            index += ch.len_utf8();
+        }
+        return Ok(normalized);
     }
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
@@ -1560,25 +1582,33 @@ fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut depth = 0usize;
-    let mut in_quote = false;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
     let bytes = input.as_bytes();
     let mut idx = 0;
     while idx < bytes.len() {
         match bytes[idx] {
-            b'\'' => {
-                if in_quote && bytes.get(idx + 1) == Some(&b'\'') {
+            b'\'' if !in_double_quote => {
+                if in_single_quote && bytes.get(idx + 1) == Some(&b'\'') {
                     idx += 1;
                 } else {
-                    in_quote = !in_quote;
+                    in_single_quote = !in_single_quote;
                 }
             }
-            b'(' if !in_quote => depth += 1,
-            b')' if !in_quote => {
+            b'"' if !in_single_quote => {
+                if in_double_quote && bytes.get(idx + 1) == Some(&b'"') {
+                    idx += 1;
+                } else {
+                    in_double_quote = !in_double_quote;
+                }
+            }
+            b'(' if !in_single_quote && !in_double_quote => depth += 1,
+            b')' if !in_single_quote && !in_double_quote => {
                 depth = depth
                     .checked_sub(1)
                     .ok_or(ParseError::InvalidRelationalSql)?;
             }
-            b',' if !in_quote && depth == 0 => {
+            b',' if !in_single_quote && !in_double_quote && depth == 0 => {
                 let part = input[start..idx].trim();
                 if part.is_empty() {
                     return Err(ParseError::InvalidRelationalSql);
@@ -1590,7 +1620,7 @@ fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {
         }
         idx += 1;
     }
-    if in_quote || depth != 0 {
+    if in_single_quote || in_double_quote || depth != 0 {
         return Err(ParseError::InvalidRelationalSql);
     }
     let part = input[start..].trim();
@@ -1603,20 +1633,28 @@ fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {
 
 fn find_matching_paren(input: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
-    let mut in_quote = false;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
     let bytes = input.as_bytes();
     let mut idx = open;
     while idx < bytes.len() {
         match bytes[idx] {
-            b'\'' => {
-                if in_quote && bytes.get(idx + 1) == Some(&b'\'') {
+            b'\'' if !in_double_quote => {
+                if in_single_quote && bytes.get(idx + 1) == Some(&b'\'') {
                     idx += 2;
                     continue;
                 }
-                in_quote = !in_quote;
+                in_single_quote = !in_single_quote;
             }
-            b'(' if !in_quote => depth += 1,
-            b')' if !in_quote => {
+            b'"' if !in_single_quote => {
+                if in_double_quote && bytes.get(idx + 1) == Some(&b'"') {
+                    idx += 2;
+                    continue;
+                }
+                in_double_quote = !in_double_quote;
+            }
+            b'(' if !in_single_quote && !in_double_quote => depth += 1,
+            b')' if !in_single_quote && !in_double_quote => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
                     return Some(idx);
