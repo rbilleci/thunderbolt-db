@@ -151,7 +151,10 @@ fn validate_view(
     context_identity: usize,
     required_bytes: u64,
 ) -> Result<(), CudaRuntimeProbeError> {
-    if view.context_identity != context_identity || required_bytes > view.initialized_bytes {
+    if view.context_identity != context_identity
+        || view.coordinate_provenance.is_some()
+        || required_bytes > view.initialized_bytes
+    {
         return Err(invalid(required_bytes));
     }
     Ok(())

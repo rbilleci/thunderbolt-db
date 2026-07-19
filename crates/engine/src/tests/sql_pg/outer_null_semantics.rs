@@ -613,7 +613,8 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
         .unwrap();
     e.execute_text(
         2,
-        "INSERT INTO t (id,a,b) VALUES (1,5,1),(2,NULL,1),(3,2,1),(4,NULL,1)",
+        "INSERT INTO t (id,a,b) VALUES \
+         (1,5,1),(2,NULL,1),(3,2,1),(4,NULL,1),(5,NULL,2147483647)",
     )
     .unwrap();
     if e.populate_relational_residency_snapshot("t")
@@ -631,15 +632,23 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
             })
             .collect()
     };
-    // a+b: id1=6, id2=NULL, id3=3, id4=NULL. ASC default = NULLS LAST; the secondary `id` orders the
-    // (tied) NULL-result group deterministically -> [3 (=3), 1 (=6), 2 (NULL), 4 (NULL)].
+    // a+b: id1=6, id2=NULL, id3=3, id4=NULL, id5=NULL. ASC default = NULLS LAST; the secondary `id`
+    // orders the tied NULL-result group deterministically.
     let r = e
         .execute_resident_expr_select_sql("SELECT id FROM t ORDER BY a + b, id")
         .expect("nullable int4 expression ORDER BY");
     assert_eq!(
         ids(&r.rows),
-        vec![3, 1, 2, 4],
+        vec![3, 1, 2, 4, 5],
         "nullable a+b: non-NULL ascending, then NULL results last (PG default), on-device"
+    );
+    let null_overflow = e
+        .execute_resident_expr_select_sql("SELECT id FROM t WHERE id = 5 ORDER BY a + b + 1")
+        .expect("SQL-NULL ORDER expression row does not execute checked arithmetic");
+    assert_eq!(
+        ids(&null_overflow.rows),
+        vec![5],
+        "NULL propagation suppresses placeholder overflow before sentinel scatter"
     );
     // A nullable int8 expression clean-errors (the i64::MAX NULL sentinel could collide with a real bigint).
     e.execute_text(3, "CREATE TABLE t8 (id INT, a BIGINT, b BIGINT)")
@@ -656,12 +665,24 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
                 .is_err(),
             "nullable int8 expression ORDER BY clean-errors (sentinel collision)"
         );
+        assert!(
+            e.execute_resident_expr_select_sql("SELECT id FROM t8 WHERE id < 0 ORDER BY a + b",)
+                .is_err(),
+            "nullable int8 expression clean-errors even with no WHERE survivors"
+        );
     }
     // Explicit NULLS FIRST/LAST on a nullable expression clean-errors (value-sentinel only does default).
     assert!(
         e.execute_resident_expr_select_sql("SELECT id FROM t ORDER BY a + b NULLS FIRST")
             .is_err(),
         "explicit NULLS FIRST on a nullable expression clean-errors"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql(
+            "SELECT id FROM t WHERE id < 0 ORDER BY a + b NULLS FIRST",
+        )
+        .is_err(),
+        "explicit nullable-expression NULLS override clean-errors even with no survivors"
     );
 }
 

@@ -1,25 +1,10 @@
 use super::*;
 
-/// Shared actual-CUDA backend for MVCC-query and relational-SQL tests.
-///
-/// Its consumers are CUDA-gated and keep closed-form result assertions. This backend must never
-/// relabel CPU execution as GPU work.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct CudaDriverMvccBackend;
-
-impl MvccExecutionBackend for CudaDriverMvccBackend {
-    fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendDispatch {
-        let runtime =
-            CudaDriverRuntime::probe().unwrap_or_else(|_| CudaDriverRuntime::unavailable());
-        CudaMvccExecutionBackend::new(runtime, 0).execute(query, rows)
-    }
-}
-
 pub(crate) fn assert_gpu_mvcc_execution_required(engine: &Engine, error: ExecuteError) {
     assert!(
         error
             .to_string()
-            .contains("GPU execution is required for MVCC reads"),
+            .contains("generic KV MVCC queries require a device-resident result pipeline"),
         "unexpected error: {error}"
     );
     assert_eq!(engine.metrics().snapshot().fallback_total, 0);

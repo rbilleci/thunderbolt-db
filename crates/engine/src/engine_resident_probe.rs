@@ -1679,26 +1679,22 @@ impl Engine {
             self.rehydrate_elided_serialized(&select.table)
                 .map_err(ExecuteError::Engine)?;
         }
+        let execution = self.execute_relational_select_with_cuda_driver_probe(select)?;
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =
             self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
-        let result =
-            self.execute_mvcc_query_with_cuda_driver_probe_on_store(pin.store(), &query)?;
-        let MvccReadResult {
-            planned_target,
-            executed_target,
-            fallback_reason,
-            rows,
-        } = result;
+        let rows = self
+            .evaluate_mvcc_query_specification_on_pin(&pin, &query)?
+            .rows;
         let specification =
             self.finalize_relational_select_specification(select, table, bound, access_path, rows)?;
         Ok(RelationalSelectSpecificationFixture {
             specification,
             execution: MvccExecutionEvidence {
-                planned_target,
-                executed_target,
-                fallback_reason,
+                planned_target: execution.planned_target,
+                executed_target: execution.executed_target,
+                fallback_reason: execution.fallback_reason,
             },
         })
     }

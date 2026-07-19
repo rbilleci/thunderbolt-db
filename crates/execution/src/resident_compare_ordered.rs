@@ -209,6 +209,196 @@ pub(super) fn launch_cuda_owned_i32_compare_indices_ordered(
     Ok(i32_bits_into_u32(slots))
 }
 
+pub(super) struct DeviceOrderedIndices {
+    pub(super) values: Option<PooledDeviceBufferOwned>,
+    pub(super) row_count: u32,
+    pub(super) allocated_bytes: u64,
+}
+
+/// Device-retained counterpart of ordered mask compaction. Parallel block count and stable scatter
+/// own the O(rows) work; a device control scan prefixes at most 65,535 block counts, and only the
+/// final u64 cardinality crosses D2H before the exact output allocation.
+pub(super) fn launch_cuda_owned_i32_compare_indices_ordered_device(
+    resident: &CudaResidentDeviceMemory,
+    input: &PooledDeviceBufferOwned,
+    row_count: u32,
+    needle: i32,
+    comparison: u32,
+) -> Result<DeviceOrderedIndices, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    validate_ordered_i32_comparison(comparison, 5)?;
+    validate_ordered_i32_context_identity(
+        std::ptr::from_ref(resident.primary()).addr(),
+        std::sync::Arc::as_ptr(&input.primary).addr(),
+        input.capacity,
+    )?;
+    validate_ordered_i32_input_window(input.capacity as u64, 0, u64::from(row_count))?;
+    if row_count == 0 {
+        return Ok(DeviceOrderedIndices {
+            values: None,
+            row_count: 0,
+            allocated_bytes: 0,
+        });
+    }
+
+    const BLOCK: u32 = 256;
+    const CHUNK_ROWS: u64 = 256;
+    const MAX_GRID: u64 = 65_535;
+    let rows = u64::from(row_count);
+    let chunk = CHUNK_ROWS.max(rows.div_ceil(MAX_GRID));
+    let grid = u32::try_from(rows.div_ceil(chunk))
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(row_count as usize))?;
+    let scratch_bytes = grid as usize * std::mem::size_of::<u64>();
+
+    let primary = resident.primary_arc();
+    primary.set_current()?;
+    let launch = unsafe {
+        primary
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let dtoh = unsafe {
+        primary
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let memset = unsafe {
+        primary
+            .lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let counts = primary.lease_device_buffer_owned(scratch_bytes)?;
+    let bases = primary.lease_device_buffer_owned(scratch_bytes)?;
+    let total = primary.lease_device_buffer_owned(std::mem::size_of::<u64>())?;
+    check_cuda(unsafe { memset(counts.ptr, 0, scratch_bytes) })?;
+
+    let mut ptx = Vec::with_capacity(COMPARE_ORDERED_PTX.len() + 1);
+    ptx.extend_from_slice(COMPARE_ORDERED_PTX);
+    ptx.push(0);
+    let count_fn = primary.cached_function(c"gpu_db_resident_i32_compare_count_blocks", &ptx)?;
+    let scan_fn = primary.cached_function(c"gpu_db_exclusive_scan_u64_blocks", &ptx)?;
+    let scatter_fn =
+        primary.cached_function(c"gpu_db_resident_i32_compare_scatter_blocks", &ptx)?;
+    let launch_checked = |function, grid, block, args: &mut [*mut c_void]| {
+        let result = check_cuda(unsafe {
+            launch(
+                function,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        });
+        if result.is_err() {
+            let _ = resident.synchronize_default_stream();
+        }
+        result
+    };
+
+    let mut resident_ptr = input.ptr;
+    let mut byte_offset = 0_u64;
+    let mut rows_arg = rows;
+    let mut chunk_arg = chunk;
+    let mut needle_arg = needle;
+    let mut comparison_arg = comparison;
+    let mut counts_arg = counts.ptr;
+    let mut count_args = [
+        (&mut resident_ptr as *mut u64).cast::<c_void>(),
+        (&mut byte_offset as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut chunk_arg as *mut u64).cast::<c_void>(),
+        (&mut needle_arg as *mut i32).cast::<c_void>(),
+        (&mut comparison_arg as *mut u32).cast::<c_void>(),
+        (&mut counts_arg as *mut u64).cast::<c_void>(),
+    ];
+    launch_checked(count_fn, grid, BLOCK, &mut count_args)?;
+
+    let mut scan_counts = counts.ptr;
+    let mut scan_bases = bases.ptr;
+    let mut scan_blocks = grid;
+    let mut scan_total = total.ptr;
+    let mut scan_args = [
+        (&mut scan_counts as *mut u64).cast::<c_void>(),
+        (&mut scan_bases as *mut u64).cast::<c_void>(),
+        (&mut scan_blocks as *mut u32).cast::<c_void>(),
+        (&mut scan_total as *mut u64).cast::<c_void>(),
+    ];
+    launch_checked(scan_fn, 1, 1, &mut scan_args)?;
+
+    let mut output_count = 0_u64;
+    if let Err(err) = check_cuda(unsafe {
+        dtoh(
+            (&mut output_count as *mut u64).cast::<c_void>(),
+            total.ptr,
+            std::mem::size_of::<u64>(),
+        )
+    }) {
+        let _ = resident.synchronize_default_stream();
+        return Err(err);
+    }
+    if output_count > rows {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    let output_count = u32::try_from(output_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if output_count == 0 {
+        return Ok(DeviceOrderedIndices {
+            values: None,
+            row_count: 0,
+            allocated_bytes: 0,
+        });
+    }
+    let output_bytes = output_count as usize * std::mem::size_of::<u32>();
+    let output = primary.lease_device_buffer_owned(output_bytes)?;
+    let mut bases_arg = bases.ptr;
+    let mut output_arg = output.ptr;
+    let mut index_mode = 1_u32;
+    let mut scatter_args = [
+        (&mut resident_ptr as *mut u64).cast::<c_void>(),
+        (&mut byte_offset as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut chunk_arg as *mut u64).cast::<c_void>(),
+        (&mut needle_arg as *mut i32).cast::<c_void>(),
+        (&mut comparison_arg as *mut u32).cast::<c_void>(),
+        (&mut bases_arg as *mut u64).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut index_mode as *mut u32).cast::<c_void>(),
+    ];
+    launch_checked(scatter_fn, grid, BLOCK, &mut scatter_args)?;
+    resident.synchronize_default_stream()?;
+    Ok(DeviceOrderedIndices {
+        values: Some(output),
+        row_count: output_count,
+        allocated_bytes: output_bytes as u64,
+    })
+}
+
 /// TWO-INPUT (col-vs-col / expr-vs-expr) ordered compare-compaction: compare `lhs[i] <cmp> rhs[i]`
 /// elementwise and return the surviving ROW INDICES (`Vec<u32>`) in ASCENDING ORDER, with NO host
 /// sort. Mirrors `launch_cuda_resident_i32_compare_indices_ordered` (and shares the orchestration of

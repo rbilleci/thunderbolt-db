@@ -13,8 +13,41 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   generations, and the host write/commit/MVCC tuple-store path, `CachedShardPkIndex`, and host DML/constraint
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
-- Generic CUDA-MVCC host result post-processing remains under **RETIRE-003**. R3-002/R3-003 passed independent
-  adversarial acceptance on 2026-07-17.
+
+## RETIRE-003 generic result-postprocessing retirement — complete 2026-07-19
+
+- The generic KV/MVCC CUDA entry no longer resolves a source, launches a fabricated execution path, or performs
+  host relational post-processing. It preserves commit-wedge and leader-precedence errors, then fails loudly before
+  source resolution or GPU/fallback telemetry. The obsolete `mvcc_batch`, `staged_mvcc`, `point_read_rows`,
+  `mvcc_read_exec/cuda_filter`, and `mvcc_read_exec/query_capability` implementations and their fake-driver fixtures
+  are deleted; PERF-001's real prepared point route remains intact.
+- Ordinary resident SELECT now retains predicate survivors as device coordinates, evaluates checked arithmetic only
+  for those coordinates, performs stable ORDER/LIMIT/OFFSET on-device, and materializes a device result frame before
+  one contiguous terminal D2H. Direct and streaming joins use the same strict frame boundary; text offsets/lengths
+  remain device-resident apart from bounded layout scalars. The former host `non_grouped_order` and `projected_rows`
+  phases are deleted.
+- Result framing is fallible and total: provenance, CUDA context, extents, fixed-width alignment, nullable validity,
+  text spans, and launched-error drains are validated. Unsupported type/order/aggregate shapes fail independently of
+  result cardinality. Filtered-out or NULL expression rows cannot manufacture arithmetic overflow, and scalar
+  aggregate type validation occurs before empty-set NULL semantics.
+- Independent adversarial audit lanes covered each deletion/result-frame/ordinary-SELECT slice. Adopted findings
+  added coordinate provenance, exact mask/capacity/context validation, parallel stable compaction, 4-byte-aligned
+  wide-value materialization, empty-cardinality shape checks, and real transient-GPU integration evidence. Final
+  re-audits, including the narrow 120-second DDL/DML stress watchdog, are clean; the unchanged 50-repetition stress
+  workload passes in 52.53s alone and 74.46–75.01s under full-suite load.
+- Final gates pass on the formatted candidate: engine **948/948** including ignored GPU tests in **250.74s**;
+  execution **120/120** in **17.04s**; normal and all-feature workspace suites; workspace all-target/all-feature
+  check; strict all-target/all-feature Clippy; PTX assembly; scoped rustfmt; and diff whitespace. Three affected GPU
+  families each passed three sequential plus two simultaneous HAZARD runs with zero CUDA 700/716/717.
+- The canonical two-layer/two-cache card completed with exit 0. Layer-1 `sum_i32` reached **1,478.8 GB/s** in-L2
+  and **1,441.1 GB/s** out-of-L2; isolated gather reached **349.5/155.3 GB/s**, constant-mask fill reached
+  **1,151.8/1,465.7 GB/s**, and GROUP BY reached **1,674.9M elements/s**. Production compact point reads reached
+  **232.466M/s at p50 156us** in-L2 and **197.040M/s at p50 206us** out-of-L2. The 48M-row fixture built in
+  **1,683.3s** with zero late residency work, and all ratio/algorithmic regression signals remain green.
+- Common protocol validation passed the tokio-postgres, SQLx, and node-postgres smokes. The remaining local psql and
+  application-driver scripts were prerequisite-limited rather than product-failing: no libpq connection variables
+  were supplied, and the installed Python 3.14 lacks `pip`. An initial serialized GPU sweep also exhausted 511 GiB
+  of accumulated generated `target/tmp` WAL artifacts; after deleting only those artifacts, the exact rerun passed.
 
 ## RETIRE-001 test-oracle retirement — complete 2026-07-18
 
@@ -440,9 +473,13 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   **199.671M/s** arm; the 48M-row fixture built in **1,633.7s** without late conversion. Relative to the retired
   unified comparison only, the accepted residual gaps are **11.9% in-L2 / 27.8% out-of-L2**. Required transfers
   remain common to both representations, and fragmentation remains an inference rather than proven attribution.
-  PERF-001 is closed and removed from PLAN; **RETIRE-003** is promoted to NOW.
+  At that checkpoint PERF-001 closed and **RETIRE-003** was promoted; RETIRE-003 is now complete as recorded above.
 
 ## Structural decomposition
+
+The paragraphs in this section are chronological slice-time evidence. Statements such as “now lives,” “remains
+debt,” current line counts, and next-slice ownership describe the named historical checkpoint; later completion
+sections, the current source tree, `CODE_SIZE.md`, and `PLAN.md` govern present state.
 
 - **STRUCT-001** began with the execution facade. Device-routing policy now lives in `execution::routing`; its
   temporary host-reference iterator extraction and crate-root re-exports were later deleted by RETIRE-001. The
@@ -4253,7 +4290,6 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
 | Open-loop OLTP comparison against tuned PostgreSQL remains incomplete | **BENCH-001** |
 | Non-int4 O(1) point-lookup breadth | **READ-002** |
 | Reverse-gather/deauthorization/scan-build DDL and recovery repair | **RETIRE-002** |
-| Generic CUDA-MVCC host compaction, ordering, projection, and result assembly | **RETIRE-003** |
 | Persistent GPU catalog plus strict metadata-staging boundary | **PRODUCT-002** |
 | Two physical GPUs have not executed the scheduler, device-locate, or typed sidecar context gates | **MULTI-001**, **MULTI-002**, **MULTI-003** |
 | Filtered expression-overflow ordering and route-case behavior require current-tree disposition | **READ-001** |

@@ -5,75 +5,57 @@ This file records only the current boundary and where the next agent resumes. `P
 
 ## Current boundary
 
-- **R3-001 through R3-005, DUR-002, STRUCT-001, and RETIRE-001 are complete.** Production relational reads and
-  writes are GPU-required; unsupported execution fails loudly without host relational fallback or fabricated
-  fallback telemetry.
-- RETIRE-001 deleted the test CPU MVCC backend, fake parity backend, fallback adapter, host reference operators,
-  CPU-oracle constructor, and merged host SQL finalization fixtures. Host-neutral semantics now use rows-only
-  specification objects; actual CUDA metadata is separately typed execution evidence.
-- Explicit DDL/recovery/import/VACUUM reverse-gather and the bounded hot-to-cold representation transition remain
-  isolated under **RETIRE-002**. Generic CUDA-MVCC host result post-processing remains **RETIRE-003**.
-- **PERF-001 is complete.** The accepted tree removes shard-count-scaled descriptor preparation with exact-generation
-  prepared device plans and lock-free route reuse, while preserving fail-stop publication, hard-budget accounting,
-  immutable snapshot semantics, async CUDA ownership, and public result contracts. Three independent final lanes
-  accepted publication/accounting, CUDA ownership/contracts, and benchmark/evidence with no severity finding. The
-  canonical card completed both layers and cache regimes: production compact is **232.641M/s at p50 156us** in-L2
-  and **198.933M/s at p50 203us** out-of-L2. The archive owns the full remediation/audit chronology.
-- **RETIRE-003 is the sole NOW task.** Remove generic CUDA-MVCC host compaction, ordering, projection, and result
-  assembly while preserving the accepted PERF-001 prepared-route/result-path baseline.
+- **R3-001 through R3-005, DUR-002, STRUCT-001, RETIRE-001, RETIRE-003, and PERF-001 are complete.** Production
+  relational reads and writes are GPU-required; unsupported work fails loudly without host relational execution or
+  fabricated fallback telemetry.
+- RETIRE-003 deleted generic KV/MVCC fake-CUDA result execution and its host compaction/order/projection seams.
+  Ordinary SELECT and direct/streaming joins now retain coordinates, order/window, and result values on-device until
+  one strict terminal frame readback. Unsupported shapes fail independently of cardinality.
+- PERF-001's exact-generation prepared point routes, hard-budget accounting, duplicate-decline contract, async CUDA
+  ownership, and public result contracts remain intact. Explicit reverse-gather/deauthorization and DDL/recovery/
+  import repair remain isolated under blocked **RETIRE-002**.
 - Physical multi-GPU work remains user-parked under **MULTI-001/002/003**.
 
 ## Integrated baseline — preserve it
 
-- RETIRE-001's closed-form specifications cannot claim execution targets or enter backend dispatch. Relational
-  actual-CUDA fixtures call the engine's cached CUDA-driver dispatcher directly and assert execution evidence
-  separately from semantic rows/schema/access paths.
-- Shard-resident point-batch declines use the per-query GPU route directly; do not feed nullable `Ready` results
-  into the non-null flat-int4 batch ABI.
-- The production decline seams named for CPU compatibility execute no relational work and emit no fallback metric.
-  Do not restore host execution behind those names for a benchmark win or while later removing RETIRE-003
-  post-processing.
-- The pre-R3-004 late-converted unified snapshot reached **264.2M/s in-L2 and 275.7M/s out-of-L2** at batch 65,536.
-  Insert-published authoritative shards reached **89.6M/s and 3.29M/s**; RETIRE-001 reproduced **87.3M/s and
-  3.20M/s**. Accepted PERF-001 production-compact evidence is **232.641M/s at p50 156us** in-L2 and **198.933M/s
-  at p50 203us** out-of-L2. Required transfers are common to both representations and do not explain the remaining
-  **11.9%/27.8%** gaps; fragmentation is an inference, not proof.
-- `PLAN.md` is reconciled to one active path and `STATUS.md` owns completed evidence. Preserve that ownership split.
+- The generic KV/MVCC entry preserves commit-wedge and leader-precedence errors, then fails before source resolution
+  or GPU/fallback telemetry. Do not restore a host or fake-device implementation behind that compatibility name.
+- Ordinary SELECT survivors are device coordinates with same-context provenance. Predicate compaction, checked
+  arithmetic, ORDER/LIMIT/OFFSET, fixed/text/validity materialization, and terminal framing remain one device pipeline;
+  the host may decode the single bounded frame only for final protocol values.
+- Empty results do not bypass type, width, ORDER, timestamp, bool, or aggregate-shape validation. Launched errors
+  drain before pool reuse, and nullable or filtered-out rows cannot manufacture overflow.
+- The canonical report card is the result-path regression gate. The accepted RETIRE-003 card reached
+  **232.466M/s at p50 156us** in-L2 and **197.040M/s at p50 206us** out-of-L2 at batch 65,536. Layer-1 rooflines were
+  **1,478.8/1,441.1 GB/s**; the 48M-row fixture built in **1,683.3s** with zero late residency work.
 
 ## Resume here
 
-1. Pick up **RETIRE-003** from PLAN. Inventory the generic CUDA-MVCC host compaction/order/projection/result-assembly
-   seams and define the first bounded device-resident deletion slice.
-2. Preserve PERF-001's exact-generation prepared plans, allocation/stream ownership, duplicate-decline contract,
-   route accounting, and accepted report-card baseline. Run the standard card after any result-path change.
-3. Keep **RETIRE-002** repair outside the slice unless PLAN explicitly promotes it.
+1. Pick up **BENCH-001** from PLAN: reconcile the stale mutation-boundary wrapper with the live resident post-INSERT
+   fact, then run the immutable sustained and `B01`–`B10` PostgreSQL comparison in a quiet reproducible window.
+2. Take **DUR-001** next: add automatic intent-lane checkpoint cadence and timestamped lane records for archive/PITR,
+   retaining explicit operator checkpoint/refusal behavior until crash gates pass.
+3. Keep **RETIRE-002** outside either slice unless its device-native repair prerequisites are satisfied and PLAN
+   explicitly promotes it.
 
-## Last green evidence — 2026-07-18
+## Last green evidence — 2026-07-19
 
-- Engine library: **1,026/1,026** including ignored GPU tests on the exact candidate (397.69s).
-- Execution library: **129/129** including ignored GPU tests on the exact candidate (18.30s). Facade ordinary
-  all-target tests pass **39 with 8
-  GPU-ignored**; serialized concurrency passes **13 with 1 GPU-ignored**.
-- The PERF-001 nine-test point-read family passed three sequential and two simultaneous HAZARD invocations with no
-  device fault. It includes deterministic old-DELETE-boundary, invalidation-republish, NULL-generation, and
-  budget-publication interleavings in addition to byte/visibility and failure-phase coverage. The DELETE test runs
-  the failing current-route-first/old-reader-second order; the execution gate injects panics after H2D and D2H and
-  proves exact pool reuse. It also pauses a losing preparer and proves route retirement releases the replaced index
-  and the stale plan cannot displace the accounted semantic-superset route. A paused index build cannot republish
-  after DROP, and a separate fused/unfused append gate replaces the index after launch and proves Arc-identity
-  publication plus exact rebuild.
-- The final canonical card completed with exit 0. Production compact reached **232.641M/s at p50 156us** in-L2 and
-  **198.933M/s at p50 203us** out-of-L2; the 48M-row fixture built in **1,633.7s** with zero late residency work.
-  Layer-1 in/out-of-L2 rooflines were **1,313.7/1,433.8 GB/s**, isolated gather **349.5/155.3 GB/s**, and GROUP BY
-  **1,673.5M elements/s at p50 5.012ms**. All ratio/algorithmic regression signals are green.
-- Workspace all-target/all-feature check, strict Clippy, formatting, diff whitespace, and changed-source-size gates
-  pass. The latest proof-focused exact execution sweep is **129/129** in 18.20s; all three final audit lanes accept.
+- Engine library: **948/948** including ignored GPU tests on the exact candidate (**250.74s**). Execution library:
+  **120/120** (**17.04s**). Normal and all-feature workspace suites pass, as do workspace all-target/all-feature
+  check, strict Clippy, PTX assembly, scoped rustfmt, and diff whitespace.
+- Three affected GPU families each passed three sequential plus two simultaneous HAZARD runs with zero CUDA
+  700/716/717. Independent adversarial audits and re-audits are clean; every concrete finding was adopted.
+- The canonical two-layer/two-cache report card completed with exit 0. Production compact reached
+  **232.466M/s at p50 156us** in-L2 and **197.040M/s at p50 206us** out-of-L2; raw rooflines were
+  **1,478.8/1,441.1 GB/s**, isolated gather **349.5/155.3 GB/s**, and GROUP BY **1,674.9M elements/s**.
+- Tokio-postgres, SQLx, and node-postgres smokes pass. Full psql/application-driver harnesses were locally
+  prerequisite-limited by absent libpq connection variables and missing Python 3.14 `pip`, not by product failures.
 
 ## Required operations
 
 - Read `AGENTS.md`, `docs/CHARTER.md`, `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/PLAN.md`,
   `docs/STATUS.md`, and `docs/CODE_SIZE.md` before changing runtime, storage, or scheduling.
-- Never use `--gpu-reset`. Serialize ordinary GPU sweeps, use timeouts, and use workspace-local `target/tmp` rather
-  than `/tmp` for large generated artifacts.
+- Never use `--gpu-reset`. Serialize ordinary GPU sweeps, use timeouts, and clear stale generated `target/tmp`
+  artifacts before a long full-GPU run if disk headroom is low.
 - Run `scripts/benchmark_report_card.sh` after any read-kernel, residency-layout, or result-path change; compare
   ratios rather than absolute bandwidth.

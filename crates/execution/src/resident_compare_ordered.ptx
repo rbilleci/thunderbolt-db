@@ -415,6 +415,58 @@ iter_done:
     ret;
 }
 
+// Device-side exclusive scan of the bounded per-block count metadata. One control thread scans at
+// most 65,535 u64 entries; the O(rows) count/scatter passes remain fully parallel, and only the final
+// scalar total crosses D2H.
+.visible .entry gpu_db_exclusive_scan_u64_blocks(
+    .param .u64 counts_ptr,
+    .param .u64 bases_ptr,
+    .param .u32 block_count,
+    .param .u64 total_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %thread;
+    .reg .u32 %bid;
+    .reg .u32 %blocks;
+    .reg .u32 %i;
+    .reg .u64 %counts;
+    .reg .u64 %bases;
+    .reg .u64 %total;
+    .reg .u64 %running;
+    .reg .u64 %count;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    mov.u32 %thread, %tid.x;
+    mov.u32 %bid, %ctaid.x;
+    setp.ne.u32 %p, %thread, 0;
+    @%p bra scan_done;
+    setp.ne.u32 %p, %bid, 0;
+    @%p bra scan_done;
+    ld.param.u64 %counts, [counts_ptr];
+    ld.param.u64 %bases, [bases_ptr];
+    ld.param.u32 %blocks, [block_count];
+    ld.param.u64 %total, [total_ptr];
+    mov.u32 %i, 0;
+    mov.u64 %running, 0;
+scan_loop:
+    setp.ge.u32 %p, %i, %blocks;
+    @%p bra scan_store_total;
+    mul.wide.u32 %off, %i, 8;
+    add.u64 %addr, %counts, %off;
+    ld.global.u64 %count, [%addr];
+    add.u64 %addr, %bases, %off;
+    st.global.u64 [%addr], %running;
+    add.u64 %running, %running, %count;
+    add.u32 %i, %i, 1;
+    bra scan_loop;
+scan_store_total:
+    st.global.u64 [%total], %running;
+scan_done:
+    ret;
+}
+
 // ---- TWO-INPUT (col-vs-col) ordered compaction: compare lhs[i] <cmp> rhs[i], emit ASCENDING row
 // indices, no host sort. COPIED VERBATIM from the single-input `..._compare_count_blocks` /
 // `..._compare_scatter_blocks` above (the block partition, grid-stride, the entire two-level

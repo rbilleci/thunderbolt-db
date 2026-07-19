@@ -444,6 +444,56 @@ pub(super) fn run_resident_arith_program<'r>(
     elem: ResidentElemType,
     terminal: ExprTerminal,
 ) -> Result<Vec<PooledBufferLease<'r>>, CudaRuntimeProbeError> {
+    run_resident_arith_program_impl(resident, program, text_needles, n, elem, terminal, None)
+}
+
+/// Execute a value-only arithmetic program over a compact device coordinate list. Resident column
+/// loads dereference `indices[i]`, while every later arithmetic step runs over exactly the survivor
+/// count. This keeps checked-overflow semantics scoped to rows that survived WHERE without reading
+/// coordinates or values back to the host.
+pub(super) fn run_resident_arith_program_at_indices<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    indices_ptr: u64,
+    survivor_count: u64,
+    source_row_count: u64,
+    elem: ResidentElemType,
+) -> Result<Vec<PooledBufferLease<'r>>, CudaRuntimeProbeError> {
+    if survivor_count == 0
+        || survivor_count > source_row_count
+        || program.iter().any(|step| {
+            !matches!(
+                step,
+                ExprStep::LoadColumn { .. }
+                    | ExprStep::LoadColumnI64 { .. }
+                    | ExprStep::BufferBinary { .. }
+                    | ExprStep::ScalarBinary { .. }
+            )
+        })
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    run_resident_arith_program_impl(
+        resident,
+        program,
+        &[],
+        survivor_count,
+        elem,
+        ExprTerminal::Value,
+        Some((indices_ptr, source_row_count)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_resident_arith_program_impl<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    text_needles: &[Vec<u8>],
+    n: u64,
+    elem: ResidentElemType,
+    terminal: ExprTerminal,
+    indexed: Option<(u64, u64)>,
+) -> Result<Vec<PooledBufferLease<'r>>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -469,7 +519,7 @@ pub(super) fn run_resident_arith_program<'r>(
         resident.metadata().allocated_bytes,
         program,
         text_needles,
-        n,
+        indexed.map_or(n, |(_, source_row_count)| source_row_count),
         elem,
         terminal,
     )?;
@@ -537,21 +587,33 @@ pub(super) fn run_resident_arith_program<'r>(
     let (load_name, binary_name, scalar_name, compare_scalar_name, compare_buffers_name) =
         match elem {
             ResidentElemType::I32 => (
-                c"gpu_db_resident_i32_load_column",
+                if indexed.is_some() {
+                    c"gpu_db_resident_i32_load_column_indexed"
+                } else {
+                    c"gpu_db_resident_i32_load_column"
+                },
                 c"gpu_db_buffer_i32_binary",
                 c"gpu_db_buffer_i32_binary_scalar",
                 c"gpu_db_buffer_i32_compare_scalar_to_mask",
                 c"gpu_db_buffer_i32_compare_buffers_to_mask",
             ),
             ResidentElemType::I64 => (
-                c"gpu_db_resident_i64_load_column",
+                if indexed.is_some() {
+                    c"gpu_db_resident_i64_load_column_indexed"
+                } else {
+                    c"gpu_db_resident_i64_load_column"
+                },
                 c"gpu_db_buffer_i64_binary",
                 c"gpu_db_buffer_i64_binary_scalar",
                 c"gpu_db_buffer_i64_compare_scalar_to_mask",
                 c"gpu_db_buffer_i64_compare_buffers_to_mask",
             ),
             ResidentElemType::I128 => (
-                c"gpu_db_resident_i128_load_column",
+                if indexed.is_some() {
+                    c"gpu_db_resident_i128_load_column_indexed"
+                } else {
+                    c"gpu_db_resident_i128_load_column"
+                },
                 c"gpu_db_buffer_i128_binary",
                 c"gpu_db_buffer_i128_binary_scalar",
                 c"gpu_db_buffer_i128_compare_scalar_to_mask",
@@ -654,7 +716,14 @@ pub(super) fn run_resident_arith_program<'r>(
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
     let (i64_load_fn, i64_compare_scalar_mask_fn) = if has_i64_step {
         (
-            Some(primary.cached_function(c"gpu_db_resident_i64_load_column", &i64_ptx)?),
+            Some(primary.cached_function(
+                if indexed.is_some() {
+                    c"gpu_db_resident_i64_load_column_indexed"
+                } else {
+                    c"gpu_db_resident_i64_load_column"
+                },
+                &i64_ptx,
+            )?),
             Some(primary.cached_function(c"gpu_db_buffer_i64_compare_scalar_to_mask", &i64_ptx)?),
         )
     } else {
@@ -724,15 +793,28 @@ pub(super) fn run_resident_arith_program<'r>(
                 let out = primary.lease_device_buffer(byte_len)?;
                 let mut a0 = resident_base;
                 let mut a1 = byte_offset;
-                let mut a2 = n;
-                let mut a3 = out.ptr;
-                let mut args = [
-                    (&mut a0 as *mut u64).cast::<c_void>(),
-                    (&mut a1 as *mut u64).cast::<c_void>(),
-                    (&mut a2 as *mut u64).cast::<c_void>(),
-                    (&mut a3 as *mut u64).cast::<c_void>(),
-                ];
-                launch(load_fn, &mut args)?;
+                if let Some((mut indices_ptr, _)) = indexed {
+                    let mut a3 = n;
+                    let mut a4 = out.ptr;
+                    let mut args = [
+                        (&mut a0 as *mut u64).cast::<c_void>(),
+                        (&mut a1 as *mut u64).cast::<c_void>(),
+                        (&mut indices_ptr as *mut u64).cast::<c_void>(),
+                        (&mut a3 as *mut u64).cast::<c_void>(),
+                        (&mut a4 as *mut u64).cast::<c_void>(),
+                    ];
+                    launch(load_fn, &mut args)?;
+                } else {
+                    let mut a2 = n;
+                    let mut a3 = out.ptr;
+                    let mut args = [
+                        (&mut a0 as *mut u64).cast::<c_void>(),
+                        (&mut a1 as *mut u64).cast::<c_void>(),
+                        (&mut a2 as *mut u64).cast::<c_void>(),
+                        (&mut a3 as *mut u64).cast::<c_void>(),
+                    ];
+                    launch(load_fn, &mut args)?;
+                }
                 stack.push(out);
             }
             ExprStep::LoadColumnI64 { byte_offset } => {
@@ -742,15 +824,28 @@ pub(super) fn run_resident_arith_program<'r>(
                 let out = primary.lease_device_buffer(i64_byte_len)?;
                 let mut a0 = resident_base;
                 let mut a1 = byte_offset;
-                let mut a2 = n;
-                let mut a3 = out.ptr;
-                let mut args = [
-                    (&mut a0 as *mut u64).cast::<c_void>(),
-                    (&mut a1 as *mut u64).cast::<c_void>(),
-                    (&mut a2 as *mut u64).cast::<c_void>(),
-                    (&mut a3 as *mut u64).cast::<c_void>(),
-                ];
-                launch(i64_load_fn, &mut args)?;
+                if let Some((mut indices_ptr, _)) = indexed {
+                    let mut a3 = n;
+                    let mut a4 = out.ptr;
+                    let mut args = [
+                        (&mut a0 as *mut u64).cast::<c_void>(),
+                        (&mut a1 as *mut u64).cast::<c_void>(),
+                        (&mut indices_ptr as *mut u64).cast::<c_void>(),
+                        (&mut a3 as *mut u64).cast::<c_void>(),
+                        (&mut a4 as *mut u64).cast::<c_void>(),
+                    ];
+                    launch(i64_load_fn, &mut args)?;
+                } else {
+                    let mut a2 = n;
+                    let mut a3 = out.ptr;
+                    let mut args = [
+                        (&mut a0 as *mut u64).cast::<c_void>(),
+                        (&mut a1 as *mut u64).cast::<c_void>(),
+                        (&mut a2 as *mut u64).cast::<c_void>(),
+                        (&mut a3 as *mut u64).cast::<c_void>(),
+                    ];
+                    launch(i64_load_fn, &mut args)?;
+                }
                 stack.push(out);
             }
             ExprStep::BufferBinary { op } => {

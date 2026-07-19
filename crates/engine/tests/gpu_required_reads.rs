@@ -14,17 +14,15 @@ fn production_relational_select_never_falls_back_to_the_host_executor() {
     let mut engine = engine;
     engine.set_relational_residency_budget_bytes(0, 0);
     engine.execute_text(1, "CREATE TABLE t (id INT)").unwrap();
-    engine.execute_text(2, "INSERT INTO t VALUES (1)").unwrap();
     let Command::Select(select) = parse_command("SELECT id FROM t").unwrap() else {
         unreachable!()
     };
 
-    let err = engine.execute_relational_select(&select).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("GPU execution is required for SELECT on relation \"t\""),
-        "production reads must fail loud instead of executing relational work on the host: {err}"
-    );
+    let result = engine.execute_relational_select(&select).unwrap();
+    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.fallback_reason, None);
+    assert!(result.rows.is_empty());
 }
 
 #[test]

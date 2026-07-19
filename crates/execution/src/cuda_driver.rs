@@ -7,16 +7,11 @@ use crate::cuda_context::{
     check_cuda, gpu_primary_context, CudaDeviceAllocationGuard, GpuPrimaryContext,
     PendingCopyTransport,
 };
-use crate::staged_filter::{
-    launch_cuda_all_mask, launch_cuda_bytes_equal_mask, launch_cuda_bytes_range_mask,
-    launch_cuda_smoke_add_one, launch_cuda_u32_equal_mask,
-};
-use crate::staged_mvcc::{launch_cuda_mvcc_row_batch_lengths, launch_cuda_mvcc_visibility_mask};
+use crate::staged_filter::launch_cuda_smoke_add_one;
 use crate::{
-    CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDeviceSnapshot, CudaMvccRowBatch,
-    CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory, CudaRuntimeProbeError,
-    CudaRuntimeSnapshot, GpuFallbackReason, GpuRuntime, PendingCudaResidentDeviceCopy, PlannedOp,
-    RecompactFill, RecompactSegment,
+    CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDeviceSnapshot, CudaOwnedDeviceMemoryChunk,
+    CudaResidentDeviceMemory, CudaRuntimeProbeError, CudaRuntimeSnapshot, GpuFallbackReason,
+    GpuRuntime, PendingCudaResidentDeviceCopy, PlannedOp, RecompactFill, RecompactSegment,
 };
 
 #[derive(Debug, Clone)]
@@ -68,74 +63,6 @@ impl CudaDriverRuntime {
         }
 
         launch_cuda_smoke_add_one(input)
-    }
-
-    pub fn filter_equal_u32_mask(
-        &self,
-        input: &[u32],
-        needle: u32,
-    ) -> Result<Vec<bool>, CudaRuntimeProbeError> {
-        if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
-            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
-        }
-
-        launch_cuda_u32_equal_mask(input, needle)
-    }
-
-    pub fn filter_all_mask(&self, row_count: usize) -> Result<Vec<bool>, CudaRuntimeProbeError> {
-        if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
-            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
-        }
-
-        launch_cuda_all_mask(row_count)
-    }
-
-    pub fn filter_equal_bytes_mask(
-        &self,
-        input: &[&[u8]],
-        needle: &[u8],
-    ) -> Result<Vec<bool>, CudaRuntimeProbeError> {
-        if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
-            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
-        }
-
-        launch_cuda_bytes_equal_mask(input, needle)
-    }
-
-    pub fn filter_bytes_range_mask(
-        &self,
-        input: &[&[u8]],
-        start_inclusive: &[u8],
-        end_exclusive: &[u8],
-    ) -> Result<Vec<bool>, CudaRuntimeProbeError> {
-        if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
-            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
-        }
-
-        launch_cuda_bytes_range_mask(input, start_inclusive, end_exclusive)
-    }
-
-    pub fn mvcc_row_batch_lengths(
-        &self,
-        batch: &CudaMvccRowBatch,
-    ) -> Result<Vec<(u32, u32)>, CudaRuntimeProbeError> {
-        if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
-            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
-        }
-
-        launch_cuda_mvcc_row_batch_lengths(batch)
-    }
-
-    pub fn mvcc_visibility_mask(
-        &self,
-        batch: &CudaMvccRowBatch,
-        read_txn_id: u64,
-    ) -> Result<Vec<bool>, CudaRuntimeProbeError> {
-        if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
-            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
-        }
-
-        launch_cuda_mvcc_visibility_mask(batch, read_txn_id)
     }
 
     pub fn verify_device_memory_copy(

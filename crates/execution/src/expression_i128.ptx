@@ -351,6 +351,73 @@ done_ld128:
     ret;
 }
 
+// out[i] = column[indices[i]] : compact device-indexed b128 load with 4-byte-safe reads.
+.visible .entry gpu_db_resident_i128_load_column_indexed(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %row;
+    .reg .b32 %w0;
+    .reg .b32 %w1;
+    .reg .b32 %w2;
+    .reg .b32 %w3;
+    .reg .u64 %src;
+    .reg .u64 %indices;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    ld.param.u64 %src, [resident_ptr];
+    ld.param.u64 %addr, [byte_offset];
+    add.u64 %src, %src, %addr;
+    ld.param.u64 %indices, [indices_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+indexed_ld128_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra indexed_ld128_done;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %indices, %off;
+    ld.global.u32 %row, [%addr];
+    mul.wide.u32 %off, %row, 16;
+    add.u64 %addr, %src, %off;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    ld.global.u32 %w2, [%addr+8];
+    ld.global.u32 %w3, [%addr+12];
+    mul.lo.u64 %off, %i, 16;
+    add.u64 %addr, %out, %off;
+    st.global.u32 [%addr], %w0;
+    st.global.u32 [%addr+4], %w1;
+    st.global.u32 [%addr+8], %w2;
+    st.global.u32 [%addr+12], %w3;
+    add.u64 %i, %i, %stride;
+    bra indexed_ld128_loop;
+indexed_ld128_done:
+    ret;
+}
+
 // out[i] = a[i] <op> b[i] : checked int128 add/sub over two i128 buffers. op 0=add 1=sub.
 .visible .entry gpu_db_buffer_i128_binary(
     .param .u64 a_ptr,

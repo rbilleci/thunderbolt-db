@@ -110,6 +110,36 @@ impl CudaPredicateMaskI32 {
     pub fn allocated_bytes(&self) -> u64 {
         self.mask.capacity as u64
     }
+
+    pub(super) fn device_ptr(&self) -> u64 {
+        self.mask.ptr
+    }
+}
+
+pub(super) fn retain_predicate_mask_i32(
+    resident: &CudaResidentDeviceMemory,
+    mask: PooledBufferLease<'_>,
+    row_count: u32,
+) -> Result<CudaPredicateMaskI32, CudaRuntimeProbeError> {
+    let required = row_count as usize * std::mem::size_of::<i32>();
+    if mask.capacity < required
+        || mask.primary_identity() != std::ptr::from_ref(resident.primary()).addr()
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(required));
+    }
+    let ptr = mask.ptr;
+    let capacity = mask.capacity;
+    let tracker = mask.tracker.clone();
+    std::mem::forget(mask);
+    Ok(CudaPredicateMaskI32 {
+        mask: PooledDeviceBufferOwned {
+            primary: resident.primary_arc(),
+            ptr,
+            capacity,
+            tracker,
+        },
+        row_count,
+    })
 }
 
 /// Compact a leased 0/1 mask buffer to matching row indices ascending. The terminal of the boolean
@@ -197,19 +227,7 @@ fn launch_cuda_resident_expr_predicate_mask(
     }
     // Transfer the pool lease without a device copy. The owned guard keeps the shared primary
     // context alive and returns exactly the same bucket to the pool on drop.
-    let ptr = mask.ptr;
-    let capacity = mask.capacity;
-    let tracker = mask.tracker.clone();
-    std::mem::forget(mask);
-    Ok(CudaPredicateMaskI32 {
-        mask: PooledDeviceBufferOwned {
-            primary: resident.primary_arc(),
-            ptr,
-            capacity,
-            tracker,
-        },
-        row_count: n,
-    })
+    retain_predicate_mask_i32(resident, mask, n)
 }
 
 fn launch_cuda_row_range_mask_u32(

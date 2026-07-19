@@ -3,7 +3,8 @@ use std::os::raw::c_void;
 
 use super::resident_window::{validate_aligned_window, validate_text_windows, CudaGroupTextSource};
 use super::{
-    check_cuda, launch_on_pooled_stream, run_resident_arith_program, CudaResidentDeviceMemory,
+    check_cuda, launch_on_pooled_stream, retain_predicate_mask_i32, run_resident_arith_program,
+    run_resident_arith_program_at_indices, CudaJoinCoordinatesU32, CudaResidentDeviceMemory,
     CudaRuntimeProbeError, ExprStep, ExprTerminal, PooledBufferLease, ResidentElemType,
 };
 
@@ -12,6 +13,7 @@ pub struct CudaGroupDeviceView<'a> {
     pub(super) ptr: u64,
     pub(super) initialized_bytes: u64,
     pub(super) context_identity: usize,
+    pub(super) coordinate_provenance: Option<(u64, u32)>,
     _owner: PhantomData<&'a ()>,
 }
 
@@ -21,6 +23,7 @@ impl CudaGroupDeviceView<'_> {
             ptr,
             initialized_bytes,
             context_identity,
+            coordinate_provenance: None,
             _owner: PhantomData,
         }
     }
@@ -65,16 +68,37 @@ pub struct DeviceArithBuffer<'a> {
     _lease: PooledBufferLease<'a>,
     ptr: u64,
     initialized_bytes: u64,
+    coordinate_provenance: Option<(u64, u32)>,
 }
 
 impl DeviceArithBuffer<'_> {
-    fn new(lease: PooledBufferLease<'_>, initialized_bytes: usize) -> DeviceArithBuffer<'_> {
+    pub(super) fn new(
+        lease: PooledBufferLease<'_>,
+        initialized_bytes: usize,
+    ) -> DeviceArithBuffer<'_> {
         debug_assert!(initialized_bytes <= lease.capacity);
         let ptr = lease.ptr;
         DeviceArithBuffer {
             _lease: lease,
             ptr,
             initialized_bytes: initialized_bytes as u64,
+            coordinate_provenance: None,
+        }
+    }
+
+    fn new_for_coordinates(
+        lease: PooledBufferLease<'_>,
+        initialized_bytes: usize,
+        coordinate_ptr: u64,
+        coordinate_row_count: u32,
+    ) -> DeviceArithBuffer<'_> {
+        debug_assert!(initialized_bytes <= lease.capacity);
+        let ptr = lease.ptr;
+        DeviceArithBuffer {
+            _lease: lease,
+            ptr,
+            initialized_bytes: initialized_bytes as u64,
+            coordinate_provenance: Some((coordinate_ptr, coordinate_row_count)),
         }
     }
 
@@ -89,6 +113,14 @@ impl DeviceArithBuffer<'_> {
             self.initialized_bytes,
             self._lease.primary_identity(),
         )
+        .with_coordinate_provenance(self.coordinate_provenance)
+    }
+}
+
+impl CudaGroupDeviceView<'_> {
+    fn with_coordinate_provenance(mut self, provenance: Option<(u64, u32)>) -> Self {
+        self.coordinate_provenance = provenance;
+        self
     }
 }
 
@@ -128,6 +160,248 @@ pub(super) fn launch_cuda_arith_value_column_device<'r>(
         .checked_mul(elem.elem_size())
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
     Ok(DeviceArithBuffer::new(value, initialized_bytes))
+}
+
+/// Evaluate checked arithmetic only at a one-relation device coordinate set, then scatter the
+/// compact values back to source-row positions for the existing coordinate sorter. Filtered-out
+/// rows never execute arithmetic and therefore cannot contribute a false overflow verdict.
+pub(super) fn launch_cuda_arith_value_column_device_at_coordinates<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    coordinates: &'r CudaJoinCoordinatesU32,
+    source_row_count: u32,
+    elem: ResidentElemType,
+) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("device_fill.ptx");
+
+    let (indices_ptr, survivor_count) =
+        coordinates.single_relation_device_indices(resident, source_row_count)?;
+    let mut stack = run_resident_arith_program_at_indices(
+        resident,
+        program,
+        indices_ptr,
+        survivor_count,
+        u64::from(source_row_count),
+        elem,
+    )?;
+    let value = stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !stack.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    let out_bytes = (source_row_count as usize)
+        .checked_mul(elem.elem_size())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(
+            source_row_count as usize,
+        ))?;
+    let out = resident.primary().lease_device_buffer(out_bytes.max(1))?;
+    let launch = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let function = resident.primary().cached_function(
+        match elem {
+            ResidentElemType::I32 => c"gpu_db_scatter_i32_at_indices",
+            ResidentElemType::I64 => c"gpu_db_scatter_i64_at_indices",
+            ResidentElemType::I128 => c"gpu_db_scatter_i128_at_indices",
+        },
+        &ptx,
+    )?;
+    let mut a0 = value.ptr;
+    let mut a1 = indices_ptr;
+    let mut a2 = out.ptr;
+    let mut a3 = survivor_count;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _| unsafe {
+        launch(
+            function,
+            survivor_count.div_ceil(256).clamp(1, 65_535) as u32,
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    drop(value);
+    Ok(DeviceArithBuffer::new_for_coordinates(
+        out,
+        out_bytes,
+        indices_ptr,
+        coordinates.row_count(),
+    ))
+}
+
+/// Nullable int4 counterpart of the coordinate-scoped arithmetic path. The source validity mask is
+/// intersected with WHERE survivor coordinates on-device before checked arithmetic runs, so neither
+/// filtered-out rows nor SQL-NULL expression rows can contribute an overflow verdict.
+pub(super) fn launch_cuda_arith_value_column_device_at_coordinates_nullable<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    validity_program: &[ExprStep],
+    coordinates: &'r CudaJoinCoordinatesU32,
+    source_row_count: u32,
+) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("device_fill.ptx");
+
+    let (survivor_indices_ptr, survivor_count) =
+        coordinates.single_relation_device_indices(resident, source_row_count)?;
+    let mut validity_stack = run_resident_arith_program(
+        resident,
+        validity_program,
+        &[],
+        u64::from(source_row_count),
+        ResidentElemType::I32,
+        ExprTerminal::Mask,
+    )?;
+    let validity = validity_stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !validity_stack.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            validity_program.len(),
+        ));
+    }
+    let validity = retain_predicate_mask_i32(resident, validity, source_row_count)?;
+    let valid_coordinates =
+        resident.filter_join_coordinates(coordinates, &[Some(&validity)], &[None])?;
+    let out_bytes = (source_row_count as usize)
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(
+            source_row_count as usize,
+        ))?;
+    let out = resident.primary().lease_device_buffer(out_bytes.max(1))?;
+    let launch = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = PTX.to_vec();
+    ptx.push(0);
+    let fill = resident
+        .primary()
+        .cached_function(c"gpu_db_fill_i64_sentinel_at_indices", &ptx)?;
+    let blend = resident
+        .primary()
+        .cached_function(c"gpu_db_blend_widen_null_sentinel_at_indices", &ptx)?;
+    let mut fill_a0 = survivor_indices_ptr;
+    let mut fill_a1 = out.ptr;
+    let mut fill_a2 = survivor_count;
+    let mut fill_args = [
+        (&mut fill_a0 as *mut u64).cast::<c_void>(),
+        (&mut fill_a1 as *mut u64).cast::<c_void>(),
+        (&mut fill_a2 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _| unsafe {
+        launch(
+            fill,
+            survivor_count.div_ceil(256).clamp(1, 65_535) as u32,
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            stream,
+            fill_args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+
+    if valid_coordinates.row_count() > 0 {
+        let (valid_indices_ptr, valid_count) =
+            valid_coordinates.single_relation_device_indices(resident, source_row_count)?;
+        let mut value_stack = run_resident_arith_program_at_indices(
+            resident,
+            program,
+            valid_indices_ptr,
+            valid_count,
+            u64::from(source_row_count),
+            ResidentElemType::I32,
+        )?;
+        let value = value_stack
+            .pop()
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+        if !value_stack.is_empty() {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+        }
+        let mut a0 = value.ptr;
+        let mut a1 = validity.device_ptr();
+        let mut a2 = valid_indices_ptr;
+        let mut a3 = out.ptr;
+        let mut a4 = valid_count;
+        let mut args = [
+            (&mut a0 as *mut u64).cast::<c_void>(),
+            (&mut a1 as *mut u64).cast::<c_void>(),
+            (&mut a2 as *mut u64).cast::<c_void>(),
+            (&mut a3 as *mut u64).cast::<c_void>(),
+            (&mut a4 as *mut u64).cast::<c_void>(),
+        ];
+        launch_on_pooled_stream(resident, None, |stream, _| unsafe {
+            launch(
+                blend,
+                valid_count.div_ceil(256).clamp(1, 65_535) as u32,
+                1,
+                1,
+                256,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        drop(value);
+    }
+    drop(validity);
+    Ok(DeviceArithBuffer::new_for_coordinates(
+        out,
+        out_bytes,
+        survivor_indices_ptr,
+        coordinates.row_count(),
+    ))
 }
 
 /// Run `gpu_db_resident_bool_to_mask` (negate=0) into a leased int4 buffer (it writes 0/1 per row) and
@@ -586,6 +860,7 @@ fn validate_wide_key_descriptor_parts(
                     .checked_mul(4)
                     .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
                 if buffer.context_identity != context_identity
+                    || buffer.coordinate_provenance.is_some()
                     || buffer.initialized_bytes < required
                     || derived_ptr.is_some_and(|ptr| ptr != buffer.ptr)
                 {
@@ -601,6 +876,7 @@ fn validate_wide_key_descriptor_parts(
                     .checked_mul(8)
                     .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
                 if buffer.context_identity != context_identity
+                    || buffer.coordinate_provenance.is_some()
                     || buffer.initialized_bytes < required
                     || derived_ptr.is_some_and(|ptr| ptr != buffer.ptr)
                 {

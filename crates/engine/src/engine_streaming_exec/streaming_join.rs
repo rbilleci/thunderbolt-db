@@ -727,6 +727,11 @@ impl Engine {
                         ))))
                     }
                 };
+                drop(specs);
+                drop(keys);
+                drop(ordered);
+                drop(identity);
+                drop(run);
                 output_rows = match self.decode_materialized_join_run(
                     &sorted,
                     columns.as_slice(),
@@ -1348,6 +1353,11 @@ impl Engine {
                         ))))
                     }
                 };
+                drop(specs);
+                drop(keys);
+                drop(ordered);
+                drop(identity);
+                drop(run);
                 output_rows = match self.decode_materialized_join_run(
                     &sorted_run,
                     columns.as_slice(),

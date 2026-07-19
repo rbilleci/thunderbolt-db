@@ -458,9 +458,9 @@ fn p8_sharded_resident_multi_column_lookup_merges_projected_rows_and_rejects_mis
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn p8_sharded_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_per_shard() {
-    // Coverage-gap closer (engine side) for the resident row-index host-sort fix. The
+    // Engine-side coverage for the RETIRE-003 device-ordered row-index replacement. The
     // sharded multi-column route iterates shards in order and, within each shard,
-    // materializes one output row per entry of `match_i32_equal_row_indices_from_payload(..)` in
+    // materializes one output row per device-compacted match in
     // that vector's order via a strictly positional gather. The CPU/non-resident reference emits
     // a shard's matching rows in ASCENDING row order. The resident kernel, however, appends
     // matches in `atom.global.add` SCHEDULE order, which is ascending only while all matches in
@@ -468,14 +468,9 @@ fn p8_sharded_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_
     // that boundary (<= 2 matches per shard), so this is the first test that puts MORE THAN
     // ONE WARP of matches in a SINGLE shard.
     //
-    // Why this is non-vacuous (would fail/flake WITHOUT the host sort in
-    // `launch_cuda_resident_i32_equal_row_indices`): with > 32 interleaved matches in a
-    // shard, the kernel's cross-warp append order is non-deterministic and is essentially
-    // never ascending, so the positional gather would emit that shard's rows in a
-    // non-deterministic, non-ascending order — diverging from the ascending reference asserted
-    // below and breaking the sharded ascending-merge. It passes only because the route now
-    // sorts the [0, count) indices host-side. The loop re-runs the query so a sort-less route
-    // surfaces a wrong ordering on at least one iteration.
+    // More than 32 interleaved matches make this non-vacuous: a regression to the retired atomic
+    // append plus host-sort seam would no longer exercise the predicate VM's ordered compactor,
+    // while an unordered append without repair would diverge from the exact rows below.
     let mut e = Engine::new_local_test_engine();
     e.execute_text(
             1,
@@ -601,7 +596,7 @@ fn p8_sharded_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_
         assert_eq!(
             result.rows, expected_rows,
             "sharded multi-warp resident rows were not in ascending reference order on \
-                 iteration {iter} — the resident route's host sort over [0, count) is missing?"
+                 iteration {iter} — ordered device compaction regressed"
         );
     }
 }
@@ -611,8 +606,8 @@ fn p8_sharded_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_
 fn p8_batched_multi_column_projection_matches_per_query_for_more_than_one_warp_of_matches() {
     // Thread-3 Stage-4 ordered-parity gate (multi-column all-int4). The batched submit/complete
     // path scatters rows per needle in the `equal_any` kernel's `atom.global.add` SCHEDULE
-    // order; the per-query path (`execute_relational_select` -> the multi-column probe) now sorts
-    // its fused `equal_project` output ascending-by-row_index. Both must return the SAME rows in
+    // order; the per-query path (`execute_relational_select` -> the multi-column probe) uses the
+    // general predicate VM's ordered device compactor. Both must return the SAME rows in
     // the SAME (ascending) order for a MULTI-WARP match count (>32, where the atomic-append
     // order is non-deterministic), so the batched output is byte-identical to the per-query path.
     //

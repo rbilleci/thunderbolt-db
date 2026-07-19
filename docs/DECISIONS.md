@@ -119,8 +119,8 @@ chronology or future sequencing. The full pre-unification record is archived at
 - **Decision:** No host relational implementation may become a permanent product path. Parity ultimately uses
   GPU-native or specification-derived oracles; the engine requires a GPU.
 - **Consequence:** Production read fallback and host write/store/index authority are gone. Test-oracle deletion
-  completed under historical **RETIRE-001**; repair-operator deletion is **RETIRE-002**; generic CUDA-MVCC result
-  post-processing is **RETIRE-003**.
+  completed under historical **RETIRE-001**, and generic CUDA-MVCC result post-processing completed under
+  historical **RETIRE-003**. Repair-operator deletion remains **RETIRE-002**.
 
 ## ADR-006 — GPU required; no CPU steady-state fallback
 

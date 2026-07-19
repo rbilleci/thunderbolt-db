@@ -7,8 +7,6 @@ use std::sync::Arc;
 use libloading::Library;
 pub mod probe;
 pub use probe::Probe;
-mod mvcc_batch;
-pub use mvcc_batch::CudaMvccRowBatch;
 mod routing;
 pub use routing::{
     DeviceRouter, DeviceTarget, GpuFallbackReason, GpuRuntime, GpuRuntimeSnapshot, MockGpuRuntime,
@@ -35,7 +33,6 @@ mod cuda_driver;
 use cuda_driver::launch_cuda_resident_device_memory;
 pub use cuda_driver::CudaDriverRuntime;
 mod staged_filter;
-mod staged_mvcc;
 
 mod resident_memory;
 use resident_memory::CudaResidentReadSource;
@@ -81,13 +78,16 @@ use resident_compare_ordered::{
 };
 use resident_compare_ordered::{
     launch_cuda_buffer_i32_compare_indices_ordered, launch_cuda_owned_i32_compare_indices_ordered,
+    launch_cuda_owned_i32_compare_indices_ordered_device,
     launch_cuda_resident_i32_compare_indices_ordered, launch_cuda_resident_i32_compare_project,
 };
 mod resident_scalar;
 mod resident_text;
 pub use resident_scalar::CudaI32Stats;
 mod expression_vm;
-use expression_vm::{run_resident_arith_program, ExprTerminal};
+use expression_vm::{
+    run_resident_arith_program, run_resident_arith_program_at_indices, ExprTerminal,
+};
 pub use expression_vm::{ExprStep, ResidentElemType};
 mod expression_filter;
 use expression_filter::{
@@ -97,19 +97,20 @@ use expression_filter::{
 };
 mod derived_column;
 use derived_column::{
-    launch_cuda_arith_value_column_device, launch_cuda_bool_to_int4_column_device,
-    launch_cuda_build_wide_key_device, launch_cuda_mark_new_distinct_device,
-    launch_cuda_mark_new_distinct_text_device, launch_cuda_pack_two_cols_i128_device,
-    launch_cuda_pack_two_int4_cols_device, launch_cuda_upload_u64_device,
-    launch_cuda_widen_col_to_i64_device,
+    launch_cuda_arith_value_column_device, launch_cuda_arith_value_column_device_at_coordinates,
+    launch_cuda_arith_value_column_device_at_coordinates_nullable,
+    launch_cuda_bool_to_int4_column_device, launch_cuda_build_wide_key_device,
+    launch_cuda_mark_new_distinct_device, launch_cuda_mark_new_distinct_text_device,
+    launch_cuda_pack_two_cols_i128_device, launch_cuda_pack_two_int4_cols_device,
+    launch_cuda_upload_u64_device, launch_cuda_widen_col_to_i64_device,
 };
 pub use derived_column::{
     CudaGroupDeviceView, CudaWideKeyDescriptor, CudaWideKeySource, CudaWideKeyValidity,
     DeviceArithBuffer,
 };
 mod predicate_mask;
-use predicate_mask::compact_mask_i32_to_indices;
 pub use predicate_mask::CudaPredicateMaskI32;
+use predicate_mask::{compact_mask_i32_to_indices, retain_predicate_mask_i32};
 mod version_conflict;
 pub use version_conflict::CudaVersionConflictVerdict;
 mod resident_gather;
@@ -144,13 +145,15 @@ pub use group_input::{
     CudaGroupTextDescriptors, CudaGroupValueSource, CudaGroupWideSource,
 };
 mod join_contract;
-pub use join_contract::{CudaJoinCoordinatesU32, CudaJoinOrderKey, CudaJoinPayloadKey};
+pub use join_contract::{
+    CudaJoinCoordinatesU32, CudaJoinOrderKey, CudaJoinPayloadKey, CudaJoinSortKey,
+};
 mod join_filter;
 mod join_fixed;
 mod join_materialize;
 pub use join_materialize::{
     CudaMaterializeJoinColumn, CudaMaterializedColumnKind, CudaMaterializedColumnLayout,
-    CudaMaterializedRelation,
+    CudaMaterializedRelation, CudaMaterializedResultFrame,
 };
 mod join_outer;
 pub use join_outer::CudaMatchBitmapU32;
@@ -174,8 +177,7 @@ mod unique_coordinate;
 use unique_coordinate::launch_cuda_unique_coordinate_threshold;
 mod point_read_submit;
 use point_read_submit::{
-    launch_cuda_resident_i32_equal_project, submit_cuda_resident_i32_equal_any_project,
-    submit_cuda_resident_i32_index_probe,
+    submit_cuda_resident_i32_equal_any_project, submit_cuda_resident_i32_index_probe,
 };
 mod point_read_dense;
 use point_read_dense::{
@@ -193,8 +195,6 @@ use point_read_bloom::probe_cuda_chunk_blooms;
 pub use point_read_bloom::ChunkBloomProbeShard;
 mod point_read_text;
 use point_read_text::launch_cuda_resident_i32_equal_any_project_text;
-mod point_read_rows;
-use point_read_rows::launch_cuda_resident_i32_equal_row_indices;
 mod point_read_submission;
 use point_read_submission::{validate_i32_index_geometry, I32NeedlesHostGuard};
 pub use point_read_submission::{
@@ -534,6 +534,41 @@ impl CudaResidentDeviceMemory {
         elem: ResidentElemType,
     ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
         launch_cuda_arith_value_column_device(self, program, n_rows, elem)
+    }
+
+    /// Evaluate a checked arithmetic sort key only for the one-relation coordinates that survived
+    /// filtering, then retain a source-row-addressable device key for coordinate sorting.
+    pub fn arith_value_column_device_at_coordinates<'a>(
+        &'a self,
+        program: &[ExprStep],
+        coordinates: &'a CudaJoinCoordinatesU32,
+        source_row_count: u32,
+        elem: ResidentElemType,
+    ) -> Result<DeviceArithBuffer<'a>, CudaRuntimeProbeError> {
+        launch_cuda_arith_value_column_device_at_coordinates(
+            self,
+            program,
+            coordinates,
+            source_row_count,
+            elem,
+        )
+    }
+
+    /// Nullable-int4 counterpart of [`Self::arith_value_column_device_at_coordinates`].
+    pub fn arith_value_column_device_at_coordinates_nullable<'a>(
+        &'a self,
+        program: &[ExprStep],
+        validity_program: &[ExprStep],
+        coordinates: &'a CudaJoinCoordinatesU32,
+        source_row_count: u32,
+    ) -> Result<DeviceArithBuffer<'a>, CudaRuntimeProbeError> {
+        launch_cuda_arith_value_column_device_at_coordinates_nullable(
+            self,
+            program,
+            validity_program,
+            coordinates,
+            source_row_count,
+        )
     }
 
     /// Materialize a BOOL column (1-bit-per-row bitmap) into a derived int4 (0/1) device column. The
@@ -1209,15 +1244,6 @@ impl CudaResidentDeviceMemory {
         )
     }
 
-    pub fn match_project_i32_equal_from_payload(
-        &self,
-        filters: &[(u64, i32)],
-        projection_offsets: &[u64],
-        row_count: u64,
-    ) -> Result<Vec<Vec<i32>>, CudaRuntimeProbeError> {
-        launch_cuda_resident_i32_equal_project(self, filters, projection_offsets, row_count)
-    }
-
     pub fn match_project_i32_equal_any_from_payload(
         &self,
         filter_offset: u64,
@@ -1344,14 +1370,6 @@ impl CudaResidentDeviceMemory {
         needles: &[i32],
     ) -> Result<Vec<Vec<u32>>, CudaRuntimeProbeError> {
         probe_cuda_chunk_blooms(self, blooms, needles)
-    }
-
-    pub fn match_i32_equal_row_indices_from_payload(
-        &self,
-        filters: &[(u64, i32)],
-        row_count: u64,
-    ) -> Result<Vec<u64>, CudaRuntimeProbeError> {
-        launch_cuda_resident_i32_equal_row_indices(self, filters, row_count)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1687,7 +1705,7 @@ where
     // their buffers to the shared pool while the GPU is still reading/writing them (a cross-thread
     // use-after-free for the next leaser). `drain_err` blocking-syncs the stream FIRST (before the
     // error propagates and any caller lease Drops), then yields the original error. This gives the
-    // un-migrated direct callers (row_count / equal_count / equal_project) and the migrated routes'
+    // un-migrated direct callers (row_count / equal_count) and the migrated routes'
     // blocking fallbacks the same drain-before-release guarantee the per-op `drain_err` callers
     // already have. Success-path cost is zero (`map_err` skips the closure on `Ok`, so the single
     // covering sync below stays the only success-path sync — no redundant drain).

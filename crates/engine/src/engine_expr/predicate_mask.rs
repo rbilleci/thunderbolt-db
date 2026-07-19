@@ -5,8 +5,8 @@
 use super::execution_source::ResidentVisibility;
 use super::join_source::JoinNullPadMask;
 use super::predicate_compiler::{
-    compile_numeric_predicate_program, compile_predicate_program, mixed_width_i32_elem,
-    predicate_vm_elem_type,
+    collect_expr_columns, compile_numeric_predicate_program, compile_predicate_program,
+    mixed_width_i32_elem, predicate_vm_elem_type,
 };
 use super::predicate_operands::expr_mentions_numeric;
 use crate::engine_expr_ir::ResidentExpr;
@@ -15,8 +15,79 @@ use crate::{Engine, ExecuteError};
 use gpu_db_execution::{
     CudaAllocationScope, CudaPredicateMaskI32, CudaResidentDeviceMemory, ResidentElemType,
 };
-use gpu_db_sql::SqlValue;
+use gpu_db_sql::{SqlType, SqlValue};
 use gpu_db_types::EngineError;
+
+fn validate_temporal_predicate_types(
+    predicate: &ResidentExpr,
+    table: &RelationalTable,
+) -> Result<(), ExecuteError> {
+    let ResidentExpr::Binary { op, lhs, rhs } = predicate else {
+        return Ok(());
+    };
+    if matches!(
+        op,
+        crate::engine_expr_ir::ResidentBinaryOp::And | crate::engine_expr_ir::ResidentBinaryOp::Or
+    ) {
+        validate_temporal_predicate_types(lhs, table)?;
+        return validate_temporal_predicate_types(rhs, table);
+    }
+    let column_type = |expr: &ResidentExpr| match expr {
+        ResidentExpr::Column(column) => table.columns.get(*column).map(|column| column.ty),
+        _ => None,
+    };
+    let mut columns = Vec::new();
+    collect_expr_columns(predicate, &mut columns);
+    let mentions_timestamp = columns.iter().any(|&column| {
+        table.columns.get(column).map(|column| column.ty) == Some(SqlType::Timestamp)
+    });
+    if mentions_timestamp {
+        let valid = match (lhs.as_ref(), rhs.as_ref()) {
+            (ResidentExpr::Column(_), ResidentExpr::Column(_)) => {
+                column_type(lhs) == Some(SqlType::Timestamp)
+                    && column_type(rhs) == Some(SqlType::Timestamp)
+            }
+            (ResidentExpr::Column(_), ResidentExpr::TextLiteral(_))
+            | (ResidentExpr::Column(_), ResidentExpr::Int8Literal(_)) => {
+                column_type(lhs) == Some(SqlType::Timestamp)
+            }
+            (ResidentExpr::TextLiteral(_), ResidentExpr::Column(_))
+            | (ResidentExpr::Int8Literal(_), ResidentExpr::Column(_)) => {
+                column_type(rhs) == Some(SqlType::Timestamp)
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a timestamp column compares only to a timestamp literal or another timestamp column"
+                    .to_string(),
+            )));
+        }
+    }
+    let mentions_date = columns
+        .iter()
+        .any(|&column| table.columns.get(column).map(|column| column.ty) == Some(SqlType::Date));
+    if mentions_date {
+        let valid = match (lhs.as_ref(), rhs.as_ref()) {
+            (ResidentExpr::Column(_), ResidentExpr::Column(_)) => {
+                column_type(lhs) == Some(SqlType::Date) && column_type(rhs) == Some(SqlType::Date)
+            }
+            (ResidentExpr::Column(_), ResidentExpr::TextLiteral(_)) => {
+                column_type(lhs) == Some(SqlType::Date)
+            }
+            (ResidentExpr::TextLiteral(_), ResidentExpr::Column(_)) => {
+                column_type(rhs) == Some(SqlType::Date)
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a date column compares only to a date literal or another date column".to_string(),
+            )));
+        }
+    }
+    Ok(())
+}
 
 impl Engine {
     /// Compile a per-relation WHERE predicate over an OUTER join's synthetic all-NULL pad into a
@@ -73,7 +144,21 @@ impl Engine {
         let mut program = Vec::new();
         let mut needles = Vec::new();
         let elem = if let Some(predicate) = predicate {
+            validate_temporal_predicate_types(predicate, table)?;
+            let mut columns = Vec::new();
+            collect_expr_columns(predicate, &mut columns);
             if expr_mentions_numeric(predicate, table) {
+                if columns.iter().any(|&column| {
+                    !matches!(
+                        table.columns.get(column).map(|column| column.ty),
+                        Some(SqlType::Numeric { .. })
+                    )
+                }) {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "mixed numeric/non-numeric resident predicate is not yet supported by device lowering"
+                            .to_string(),
+                    )));
+                }
                 compile_numeric_predicate_program(predicate, table, descriptor, &mut program)?;
                 ResidentElemType::I128
             } else {
@@ -86,7 +171,39 @@ impl Engine {
                 )?;
                 predicate_vm_elem_type(predicate, table)
                     .or_else(|| mixed_width_i32_elem(predicate, table))
-                    .unwrap_or(ResidentElemType::I32)
+                    .or_else(|| {
+                        (!columns.is_empty()
+                            && columns.iter().all(|&column| {
+                                matches!(
+                                    table.columns.get(column).map(|column| column.ty),
+                                    Some(SqlType::Int8 | SqlType::Timestamp)
+                                )
+                            }))
+                        .then_some(ResidentElemType::I64)
+                    })
+                    .or_else(|| {
+                        (!columns.is_empty()
+                            && columns.iter().all(|&column| {
+                                matches!(
+                                    table.columns.get(column).map(|column| column.ty),
+                                    Some(
+                                        SqlType::Int2
+                                            | SqlType::Int4
+                                            | SqlType::Date
+                                            | SqlType::Text
+                                            | SqlType::Bool
+                                            | SqlType::Uuid
+                                    )
+                                )
+                            }))
+                        .then_some(ResidentElemType::I32)
+                    })
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "resident predicate uses incompatible device element widths"
+                                .to_string(),
+                        ))
+                    })?
             }
         } else {
             ResidentElemType::I64

@@ -15,7 +15,7 @@ use crate::relational_model::{
 };
 use crate::{Engine, ExecuteError};
 use gpu_db_execution::DeviceTarget;
-use gpu_db_sql::{Decimal128, SqlType, SqlValue};
+use gpu_db_sql::{SqlType, SqlValue};
 use gpu_db_types::EngineError;
 use std::sync::Arc;
 
@@ -284,85 +284,81 @@ impl Engine {
             }
             columns.push(output);
         }
-        if let Some(out) = materialized_out {
-            let mut specs = Vec::with_capacity(projection.len());
-            for &(relation, column) in projection {
-                let entry = &sides[relation].0;
-                let payload = sides[relation].1.mem();
-                let validity = resident_device_null_column_offset(
-                    &entry.descriptor,
-                    &tables[relation],
-                    column,
-                )?;
-                specs.push(match tables[relation].columns[column].ty {
-                    SqlType::Text => {
-                        let layout = resident_device_text_column_layout(
-                            &entry.descriptor,
-                            &tables[relation],
-                            column,
-                        )?;
-                        gpu_db_execution::CudaMaterializeJoinColumn::Text {
-                            relation: relation as u32,
-                            payload,
-                            offsets_byte_offset: layout.offsets_byte_offset,
-                            bytes_byte_offset: layout.bytes_byte_offset,
-                            bytes_len: layout.bytes_len,
-                            validity_bitmap_offset: validity,
-                        }
-                    }
-                    SqlType::Bool => gpu_db_execution::CudaMaterializeJoinColumn::Bool {
+        let mut specs = Vec::with_capacity(projection.len());
+        for &(relation, column) in projection {
+            let entry = &sides[relation].0;
+            let payload = sides[relation].1.mem();
+            let validity =
+                resident_device_null_column_offset(&entry.descriptor, &tables[relation], column)?;
+            specs.push(match tables[relation].columns[column].ty {
+                SqlType::Text => {
+                    let layout = resident_device_text_column_layout(
+                        &entry.descriptor,
+                        &tables[relation],
+                        column,
+                    )?;
+                    gpu_db_execution::CudaMaterializeJoinColumn::Text {
                         relation: relation as u32,
                         payload,
-                        bitmap_byte_offset: resident_device_bool_column_offset(
-                            &entry.descriptor,
-                            &tables[relation],
-                            column,
-                        )?,
+                        offsets_byte_offset: layout.offsets_byte_offset,
+                        bytes_byte_offset: layout.bytes_byte_offset,
+                        bytes_len: layout.bytes_len,
                         validity_bitmap_offset: validity,
-                    },
-                    ty => {
-                        let (byte_offset, width) = match ty {
-                            SqlType::Int8 | SqlType::Timestamp => (
-                                resident_device_int8_column_offset(
-                                    &entry.descriptor,
-                                    &tables[relation],
-                                    column,
-                                )?,
-                                8,
-                            ),
-                            SqlType::Numeric { .. } | SqlType::Uuid => (
-                                resident_device_numeric_column_offset(
-                                    &entry.descriptor,
-                                    &tables[relation],
-                                    column,
-                                )?,
-                                16,
-                            ),
-                            SqlType::Int2 | SqlType::Int4 | SqlType::Date => (
-                                resident_device_int4_column_offset(
-                                    &entry.descriptor,
-                                    &tables[relation],
-                                    column,
-                                )?,
-                                4,
-                            ),
-                            SqlType::Text | SqlType::Bool => unreachable!(),
-                        };
-                        gpu_db_execution::CudaMaterializeJoinColumn::Fixed {
-                            relation: relation as u32,
-                            payload,
-                            byte_offset,
-                            validity_bitmap_offset: validity,
-                            width,
-                        }
                     }
-                });
-            }
-            *out = Some(
-                context
-                    .materialize_join_coordinates(&coordinates, &specs)
-                    .map_err(map_err)?,
-            );
+                }
+                SqlType::Bool => gpu_db_execution::CudaMaterializeJoinColumn::Bool {
+                    relation: relation as u32,
+                    payload,
+                    bitmap_byte_offset: resident_device_bool_column_offset(
+                        &entry.descriptor,
+                        &tables[relation],
+                        column,
+                    )?,
+                    validity_bitmap_offset: validity,
+                },
+                ty => {
+                    let (byte_offset, width) = match ty {
+                        SqlType::Int8 | SqlType::Timestamp => (
+                            resident_device_int8_column_offset(
+                                &entry.descriptor,
+                                &tables[relation],
+                                column,
+                            )?,
+                            8,
+                        ),
+                        SqlType::Numeric { .. } | SqlType::Uuid => (
+                            resident_device_numeric_column_offset(
+                                &entry.descriptor,
+                                &tables[relation],
+                                column,
+                            )?,
+                            16,
+                        ),
+                        SqlType::Int2 | SqlType::Int4 | SqlType::Date => (
+                            resident_device_int4_column_offset(
+                                &entry.descriptor,
+                                &tables[relation],
+                                column,
+                            )?,
+                            4,
+                        ),
+                        SqlType::Text | SqlType::Bool => unreachable!(),
+                    };
+                    gpu_db_execution::CudaMaterializeJoinColumn::Fixed {
+                        relation: relation as u32,
+                        payload,
+                        byte_offset,
+                        validity_bitmap_offset: validity,
+                        width,
+                    }
+                }
+            });
+        }
+        let materialized = context
+            .materialize_join_coordinates(&coordinates, &specs)
+            .map_err(map_err)?;
+        if let Some(out) = materialized_out {
+            *out = Some(materialized);
             return Ok(RelationalSelectResult {
                 columns: Arc::new(columns),
                 rows: Vec::<Vec<SqlValue>>::new().into(),
@@ -372,147 +368,8 @@ impl Engine {
                 access_path: Arc::new(RelationalAccessPath::FullTableScan),
             });
         }
-
-        let mut projected_values: Vec<Vec<SqlValue>> = Vec::with_capacity(projection.len());
-        for &(relation, column) in projection {
-            let _projection_scope = gpu_db_execution::Probe::scope("join_projection_column");
-            if sides[relation].2 == 0 {
-                projected_values.push(vec![SqlValue::Null; coordinates.row_count() as usize]);
-                continue;
-            }
-            let entry = &sides[relation].0;
-            let payload = sides[relation].1.mem();
-            let validity =
-                resident_device_null_column_offset(&entry.descriptor, &tables[relation], column)?;
-            let values = match tables[relation].columns[column].ty {
-                SqlType::Text => {
-                    let layout = resident_device_text_column_layout(
-                        &entry.descriptor,
-                        &tables[relation],
-                        column,
-                    )?;
-                    context
-                        .project_text_from_join_coordinates(
-                            &coordinates,
-                            relation as u32,
-                            payload,
-                            layout.offsets_byte_offset,
-                            layout.bytes_byte_offset,
-                            layout.bytes_len,
-                            validity,
-                        )
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(|value| value.map_or(SqlValue::Null, SqlValue::Text))
-                        .collect()
-                }
-                SqlType::Bool => {
-                    let offset = resident_device_bool_column_offset(
-                        &entry.descriptor,
-                        &tables[relation],
-                        column,
-                    )?;
-                    context
-                        .project_bool_from_join_coordinates(
-                            &coordinates,
-                            relation as u32,
-                            payload,
-                            offset,
-                            validity,
-                        )
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(|value| value.map_or(SqlValue::Null, SqlValue::Bool))
-                        .collect()
-                }
-                ty => {
-                    let (offset, width) = match ty {
-                        SqlType::Int8 | SqlType::Timestamp => (
-                            resident_device_int8_column_offset(
-                                &entry.descriptor,
-                                &tables[relation],
-                                column,
-                            )?,
-                            8_u8,
-                        ),
-                        SqlType::Numeric { .. } | SqlType::Uuid => (
-                            resident_device_numeric_column_offset(
-                                &entry.descriptor,
-                                &tables[relation],
-                                column,
-                            )?,
-                            16_u8,
-                        ),
-                        SqlType::Int4 | SqlType::Int2 | SqlType::Date => (
-                            resident_device_int4_column_offset(
-                                &entry.descriptor,
-                                &tables[relation],
-                                column,
-                            )?,
-                            4_u8,
-                        ),
-                        SqlType::Text | SqlType::Bool => unreachable!(),
-                    };
-                    let (raw, valid) = context
-                        .project_fixed_from_join_coordinates(
-                            &coordinates,
-                            relation as u32,
-                            payload,
-                            offset,
-                            validity,
-                            width,
-                        )
-                        .map_err(map_err)?;
-                    raw.chunks_exact(width as usize)
-                        .zip(valid)
-                        .map(|(bytes, valid)| {
-                            if !valid {
-                                return SqlValue::Null;
-                            }
-                            match ty {
-                                SqlType::Int4 => SqlValue::Int4(i32::from_le_bytes(
-                                    bytes.try_into().expect("4-byte int4"),
-                                )),
-                                SqlType::Int2 => SqlValue::Int2(i32::from_le_bytes(
-                                    bytes.try_into().expect("4-byte int2"),
-                                )
-                                    as i16),
-                                SqlType::Date => SqlValue::Date(i32::from_le_bytes(
-                                    bytes.try_into().expect("4-byte date"),
-                                )),
-                                SqlType::Int8 => SqlValue::Int8(i64::from_le_bytes(
-                                    bytes.try_into().expect("8-byte int8"),
-                                )),
-                                SqlType::Timestamp => SqlValue::Timestamp(i64::from_le_bytes(
-                                    bytes.try_into().expect("8-byte timestamp"),
-                                )),
-                                SqlType::Numeric { scale, .. } => {
-                                    SqlValue::Numeric(Decimal128::new(
-                                        i128::from_le_bytes(
-                                            bytes.try_into().expect("16-byte numeric"),
-                                        ),
-                                        scale,
-                                    ))
-                                }
-                                SqlType::Uuid => {
-                                    SqlValue::Uuid(bytes.try_into().expect("16-byte uuid"))
-                                }
-                                SqlType::Text | SqlType::Bool => unreachable!(),
-                            }
-                        })
-                        .collect()
-                }
-            };
-            projected_values.push(values);
-        }
-        let result_rows = (0..coordinates.row_count() as usize)
-            .map(|row| {
-                projected_values
-                    .iter()
-                    .map(|column| column[row].clone())
-                    .collect()
-            })
-            .collect::<Vec<Vec<SqlValue>>>();
+        let frame = materialized.read_result_frame().map_err(map_err)?;
+        let result_rows = self.decode_materialized_result_frame(&frame, &columns)?;
         Ok(RelationalSelectResult {
             columns: Arc::new(columns),
             rows: result_rows.into(),

@@ -337,11 +337,18 @@ impl Engine {
         offset: u32,
         limit: Option<u32>,
     ) -> Result<Vec<Vec<SqlValue>>, ExecuteError> {
-        use gpu_db_execution::CudaMaterializedColumnKind;
-
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
+        if columns.len() > run.columns().len() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "streaming JOIN run schema does not match its result columns".to_string(),
+            )));
+        }
+        if offset == 0 && limit.is_none() && columns.len() == run.columns().len() {
+            let frame = run.read_result_frame().map_err(map_err)?;
+            return self.decode_materialized_result_frame(&frame, columns);
+        }
         let identity = run
             .memory()
             .identity_join_coordinates(run.row_count(), None)
@@ -350,89 +357,13 @@ impl Engine {
             .memory()
             .window_join_coordinates(&identity, offset, limit)
             .map_err(map_err)?;
-        let row_count = window.row_count() as usize;
-        let mut rows = vec![Vec::with_capacity(columns.len()); row_count];
-        for (column_index, column) in columns.iter().enumerate() {
-            let layout = run.columns().get(column_index).ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(
-                    "streaming JOIN run schema does not match its result columns".to_string(),
-                ))
-            })?;
-            let values = match layout.kind {
-                CudaMaterializedColumnKind::Text => run
-                    .memory()
-                    .project_text_from_join_coordinates(
-                        &window,
-                        0,
-                        run.memory(),
-                        layout.value_byte_offset,
-                        layout.text_bytes_byte_offset.expect("text bytes layout"),
-                        layout.text_bytes_len,
-                        Some(layout.validity_bitmap_offset),
-                    )
-                    .map_err(map_err)?
-                    .into_iter()
-                    .map(|value| value.map_or(SqlValue::Null, SqlValue::Text))
-                    .collect::<Vec<_>>(),
-                CudaMaterializedColumnKind::Fixed { width } => {
-                    let (raw, valid) = run
-                        .memory()
-                        .project_fixed_from_join_coordinates(
-                            &window,
-                            0,
-                            run.memory(),
-                            layout.value_byte_offset,
-                            Some(layout.validity_bitmap_offset),
-                            width,
-                        )
-                        .map_err(map_err)?;
-                    raw.chunks_exact(width as usize)
-                        .zip(valid)
-                        .map(|(bytes, valid)| {
-                            if !valid {
-                                return SqlValue::Null;
-                            }
-                            match column.ty {
-                                SqlType::Bool => SqlValue::Bool(
-                                    i32::from_le_bytes(bytes.try_into().expect("bool width")) != 0,
-                                ),
-                                SqlType::Int2 => SqlValue::Int2(i32::from_le_bytes(
-                                    bytes.try_into().expect("int2 width"),
-                                )
-                                    as i16),
-                                SqlType::Int4 => SqlValue::Int4(i32::from_le_bytes(
-                                    bytes.try_into().expect("int4 width"),
-                                )),
-                                SqlType::Date => SqlValue::Date(i32::from_le_bytes(
-                                    bytes.try_into().expect("date width"),
-                                )),
-                                SqlType::Int8 => SqlValue::Int8(i64::from_le_bytes(
-                                    bytes.try_into().expect("int8 width"),
-                                )),
-                                SqlType::Timestamp => SqlValue::Timestamp(i64::from_le_bytes(
-                                    bytes.try_into().expect("timestamp width"),
-                                )),
-                                SqlType::Numeric { scale, .. } => {
-                                    SqlValue::Numeric(gpu_db_sql::Decimal128::new(
-                                        i128::from_le_bytes(
-                                            bytes.try_into().expect("numeric width"),
-                                        ),
-                                        scale,
-                                    ))
-                                }
-                                SqlType::Uuid => {
-                                    SqlValue::Uuid(bytes.try_into().expect("uuid width"))
-                                }
-                                SqlType::Text => unreachable!(),
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                }
-            };
-            for (row, value) in rows.iter_mut().zip(values) {
-                row.push(value);
-            }
-        }
-        Ok(rows)
+        drop(identity);
+        let specs = Self::materialized_join_run_specs(run);
+        let terminal = run
+            .memory()
+            .materialize_join_coordinates(&window, &specs[..columns.len()])
+            .map_err(map_err)?;
+        let frame = terminal.read_result_frame().map_err(map_err)?;
+        self.decode_materialized_result_frame(&frame, columns)
     }
 }

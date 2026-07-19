@@ -330,8 +330,11 @@ fn gpu_order_by_expression_overflow_is_pg_error() {
     // arithmetic on-device), NOT a wrapped value, NOT a CPU re-execution.
     let mut e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a, b) VALUES (2147483647, 1), (1, 1)")
-        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a, b) VALUES (2147483647, 1), (1, 1), (2, 1)",
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -344,6 +347,88 @@ fn gpu_order_by_expression_overflow_is_pg_error() {
         msg.contains("out of range") || msg.contains("overflow"),
         "expected integer out of range, got: {err:?}"
     );
+
+    // WHERE survivors define the expression domain just as they do in PostgreSQL. The excluded
+    // overflowing row must not set the VM's checked-arithmetic verdict; the two survivors still sort
+    // by their device-evaluated keys.
+    let filtered = e
+        .execute_relational_select_text("SELECT a FROM t WHERE a < 2147483647 ORDER BY a + b DESC")
+        .expect("filtered-out overflow does not abort survivor ORDER evaluation");
+    assert_eq!(
+        filtered.rows,
+        vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(1)]],
+        "only post-WHERE survivor coordinates execute checked ORDER arithmetic"
+    );
+
+    // Cardinality must not suppress expression evaluation: even a one-row result evaluates its
+    // checked ORDER key before the sort's <=1-row no-op.
+    e.execute_text(3, "CREATE TABLE one_row (a INT, b INT)")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO one_row (a, b) VALUES (2147483647, 1)")
+        .unwrap();
+    e.populate_relational_residency_snapshot("one_row").unwrap();
+    let one_err = e
+        .execute_relational_select_text("SELECT a FROM one_row ORDER BY a + b")
+        .expect_err("one-row ORDER BY expression overflow must still be evaluated");
+    let one_msg = format!("{one_err:?}").to_lowercase();
+    assert!(
+        one_msg.contains("out of range") || one_msg.contains("overflow"),
+        "expected one-row integer out of range, got: {one_err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_empty_order_result_still_validates_unsupported_shape() {
+    let mut e = Engine::new_local_test_engine();
+    e.execute_text(1, "CREATE TABLE t (id INT, flag BOOL)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO t (id, flag) VALUES (1, true)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    assert!(
+        e.execute_relational_select_text("SELECT id FROM t WHERE id = 0 ORDER BY flag")
+            .is_err(),
+        "unsupported ORDER shape fails loud even when WHERE has no survivors"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_order_expression_width_domain_rejects_before_cardinality() {
+    let mut e = Engine::new_local_test_engine();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (id INT, wide BIGINT, narrow INT, small SMALLINT, ts TIMESTAMP)",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (id, wide, narrow, small, ts) VALUES \
+         (1, 10, 2, 32767, '2026-01-01 00:00:00')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    for sql in [
+        "SELECT id FROM t ORDER BY wide + narrow",
+        "SELECT id FROM t ORDER BY wide + small",
+        "SELECT id FROM t ORDER BY small + small",
+        "SELECT id FROM t ORDER BY ts - ts",
+        "SELECT id FROM t WHERE id = 0 ORDER BY wide + narrow",
+        "SELECT id FROM t WHERE id = 0 ORDER BY small + small",
+        "SELECT id FROM t WHERE id = 0 ORDER BY ts - ts",
+    ] {
+        assert!(
+            e.execute_relational_select_text(sql).is_err(),
+            "unsupported arithmetic width/domain must clean-error before cardinality: {sql}"
+        );
+    }
 }
 
 #[test]

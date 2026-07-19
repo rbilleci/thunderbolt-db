@@ -164,34 +164,8 @@ fn unavailable_cuda_driver_runtime_rejects_smoke_launch() {
 }
 
 #[test]
-fn unavailable_cuda_driver_runtime_rejects_filter_launch() {
+fn unavailable_cuda_driver_runtime_rejects_device_memory_launch() {
     let runtime = CudaDriverRuntime::unavailable();
-
-    assert_eq!(
-        runtime.filter_equal_u32_mask(&[7, 8, 7], 7),
-        Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
-    );
-    assert_eq!(
-        runtime.filter_equal_bytes_mask(&[b"open".as_slice()], b"open"),
-        Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
-    );
-    assert_eq!(
-        runtime.filter_bytes_range_mask(&[b"acct:1".as_slice()], b"acct:", b"acct:9"),
-        Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
-    );
-    assert_eq!(
-        runtime.filter_all_mask(3),
-        Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
-    );
-    let batch = CudaMvccRowBatch::from_key_values([(b"k".as_slice(), b"v".as_slice())]).unwrap();
-    assert_eq!(
-        runtime.mvcc_visibility_mask(&batch, 1),
-        Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
-    );
-    assert_eq!(
-        runtime.mvcc_row_batch_lengths(&batch),
-        Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
-    );
     assert_eq!(
         runtime.verify_device_memory_copy(0, b"resident-snapshot"),
         Err(CudaRuntimeProbeError::DriverLibraryUnavailable)

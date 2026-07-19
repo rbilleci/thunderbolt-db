@@ -2,8 +2,10 @@
 use std::os::raw::c_void;
 
 #[cfg(test)]
-use super::{check_cuda, CudaRuntimeProbeError};
-use super::{CudaResidentDeviceMemory, PooledDeviceBufferOwned};
+use super::check_cuda;
+use super::{
+    CudaGroupDeviceView, CudaResidentDeviceMemory, CudaRuntimeProbeError, PooledDeviceBufferOwned,
+};
 
 /// One fixed-width equi-join key read directly from a resident payload.  The descriptor is host-side
 /// launch metadata only: key bytes and NULL validity remain in the referenced device allocation.
@@ -31,6 +33,20 @@ pub struct CudaJoinOrderKey<'a> {
     pub lexicographic_16: bool,
 }
 
+/// One ordered coordinate comparator source. Resident columns dereference their published payload;
+/// derived arithmetic keys borrow a typed same-context device buffer owned by the caller.
+#[derive(Debug, Clone, Copy)]
+pub enum CudaJoinSortKey<'a> {
+    Resident(CudaJoinOrderKey<'a>),
+    Derived {
+        relation: u32,
+        values: CudaGroupDeviceView<'a>,
+        width: u8,
+        descending: bool,
+        nulls_first: bool,
+    },
+}
+
 /// Device-resident row coordinates produced by a relational join. Coordinates are row-major:
 /// `[tuple0.rel0, tuple0.rel1, ..., tuple1.rel0, ...]`; `u32::MAX` is an OUTER NULL pad.  The type is
 /// deliberately opaque outside this crate so host code cannot turn an intermediate relation into a
@@ -39,6 +55,7 @@ pub struct CudaJoinCoordinatesU32 {
     pub(super) coordinates: Option<PooledDeviceBufferOwned>,
     pub(super) row_count: u32,
     pub(super) relation_count: u32,
+    pub(super) relation_row_counts: Vec<u32>,
     pub(super) allocated_bytes: u64,
 }
 
@@ -53,6 +70,33 @@ impl CudaJoinCoordinatesU32 {
 
     pub fn allocated_bytes(&self) -> u64 {
         self.allocated_bytes
+    }
+
+    pub(super) fn single_relation_device_indices(
+        &self,
+        resident: &CudaResidentDeviceMemory,
+        source_row_count: u32,
+    ) -> Result<(u64, u64), CudaRuntimeProbeError> {
+        if self.relation_count != 1
+            || self.row_count == 0
+            || self.relation_row_counts.as_slice() != [source_row_count]
+        {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                self.relation_count as usize,
+            ));
+        }
+        let indices = self
+            .coordinates
+            .as_ref()
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+        let required = self.row_count as usize * std::mem::size_of::<u32>();
+        if indices.capacity < required
+            || std::ptr::from_ref(indices.primary.as_ref()).addr()
+                != std::ptr::from_ref(resident.primary()).addr()
+        {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(required));
+        }
+        Ok((indices.ptr, u64::from(self.row_count)))
     }
 
     #[cfg(test)]

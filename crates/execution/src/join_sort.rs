@@ -4,8 +4,8 @@ use std::os::raw::c_void;
 
 use super::join_window::launch_cuda_window_join_coordinates;
 use super::{
-    check_cuda, CudaJoinCoordinatesU32, CudaJoinOrderKey, CudaResidentDeviceMemory,
-    CudaResidentReadSource, CudaRuntimeProbeError,
+    check_cuda, CudaJoinCoordinatesU32, CudaJoinOrderKey, CudaJoinSortKey,
+    CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError,
 };
 
 impl CudaResidentDeviceMemory {
@@ -17,6 +17,19 @@ impl CudaResidentDeviceMemory {
         coordinates: &CudaJoinCoordinatesU32,
         order: &[CudaJoinOrderKey<'_>],
     ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
+        let order = order
+            .iter()
+            .copied()
+            .map(CudaJoinSortKey::Resident)
+            .collect::<Vec<_>>();
+        launch_cuda_sort_join_coordinates(self, coordinates, &order)
+    }
+
+    pub fn sort_join_coordinates_with_keys(
+        &self,
+        coordinates: &CudaJoinCoordinatesU32,
+        order: &[CudaJoinSortKey<'_>],
+    ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
         launch_cuda_sort_join_coordinates(self, coordinates, order)
     }
 }
@@ -24,7 +37,7 @@ impl CudaResidentDeviceMemory {
 fn launch_cuda_sort_join_coordinates(
     ctx: &CudaResidentDeviceMemory,
     coordinates: &CudaJoinCoordinatesU32,
-    order: &[CudaJoinOrderKey<'_>],
+    order: &[CudaJoinSortKey<'_>],
 ) -> Result<CudaJoinCoordinatesU32, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -63,11 +76,15 @@ fn launch_cuda_sort_join_coordinates(
     mov.u32 %r6, %ntid.x;
     mad.lo.u32 %r7, %r5, %r6, %r4;
     cvt.u64.u32 %rd5, %r7;
+    mov.u32 %r29, %nctaid.x;
+    mul.lo.u32 %r29, %r29, %r6;
+    cvt.u64.u32 %rd65, %r29;
     mul.lo.u64 %rd6, %rd3, 2;
+MERGE_SETUP:
     mul.lo.u64 %rd7, %rd5, %rd6;
     cvt.u64.u32 %rd8, %r1;
     setp.ge.u64 %p1, %rd7, %rd8;
-    @%p1 bra DONE;
+    @%p1 bra ALL_DONE;
     add.u64 %rd9, %rd7, %rd3;
     min.u64 %rd9, %rd9, %rd8;
     add.u64 %rd10, %rd7, %rd6;
@@ -77,7 +94,7 @@ fn launch_cuda_sort_join_coordinates(
     mov.u64 %rd13, %rd7;
 MERGE_LOOP:
     setp.ge.u64 %p2, %rd13, %rd10;
-    @%p2 bra DONE;
+    @%p2 bra MERGE_NEXT;
     setp.ge.u64 %p3, %rd11, %rd9;
     @%p3 bra TAKE_RIGHT;
     setp.ge.u64 %p4, %rd12, %rd10;
@@ -291,7 +308,10 @@ COPY_LOOP:
 COPY_DONE:
     add.u64 %rd13, %rd13, 1;
     bra MERGE_LOOP;
-DONE:
+MERGE_NEXT:
+    add.u64 %rd5, %rd5, %rd65;
+    bra MERGE_SETUP;
+ALL_DONE:
     ret;
 }
 "#;
@@ -303,37 +323,131 @@ DONE:
             Some(coordinates.row_count),
         );
     }
-    if order.iter().any(|key| {
-        key.relation >= coordinates.relation_count
-            || !matches!(key.key.width, 4 | 8 | 16 | 255)
-            || key.key.payload.metadata.gpu_id != ctx.metadata.gpu_id
-    }) {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(order.len()));
-    }
-    let source = coordinates
+    let coordinate_buffer = coordinates
         .coordinates
         .as_ref()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !std::ptr::eq(coordinate_buffer.primary.as_ref(), ctx.primary()) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            coordinates.row_count as usize,
+        ));
+    }
+    let context_identity = std::ptr::from_ref(ctx.primary()).addr();
+    let descriptor = order
+        .iter()
+        .map(|item| match *item {
+            CudaJoinSortKey::Resident(item) => {
+                if item.relation >= coordinates.relation_count
+                    || !matches!(item.key.width, 4 | 8 | 16 | 255)
+                    || !std::ptr::eq(item.key.payload.primary(), ctx.primary())
+                {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(order.len()));
+                }
+                let source_rows = u64::from(
+                    *coordinates
+                        .relation_row_counts
+                        .get(item.relation as usize)
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(order.len()))?,
+                );
+                let allocation_bytes = item.key.payload.metadata.allocated_bytes;
+                let values_end = if item.key.width == 255 {
+                    item.key.byte_offset.checked_add(
+                        source_rows
+                            .checked_add(1)
+                            .and_then(|rows| rows.checked_mul(8))
+                            .ok_or(CudaRuntimeProbeError::InvalidInputLength(order.len()))?,
+                    )
+                } else {
+                    item.key.byte_offset.checked_add(
+                        source_rows
+                            .checked_mul(u64::from(item.key.width))
+                            .ok_or(CudaRuntimeProbeError::InvalidInputLength(order.len()))?,
+                    )
+                }
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(order.len()))?;
+                let validity_end = item.key.validity_bitmap_offset.and_then(|offset| {
+                    source_rows
+                        .div_ceil(32)
+                        .checked_mul(4)
+                        .and_then(|bytes| offset.checked_add(bytes))
+                });
+                let text_end = item
+                    .key
+                    .text_bytes_byte_offset
+                    .and_then(|offset| offset.checked_add(item.key.text_bytes_len));
+                if values_end > allocation_bytes
+                    || item
+                        .key
+                        .validity_bitmap_offset
+                        .is_some_and(|_| validity_end.is_none_or(|end| end > allocation_bytes))
+                    || item.key.width == 255
+                        && (item.key.text_bytes_byte_offset.is_none()
+                            || text_end.is_none_or(|end| end > allocation_bytes))
+                    || item.key.width != 255
+                        && (item.key.text_bytes_byte_offset.is_some()
+                            || item.key.text_bytes_len != 0)
+                {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(order.len()));
+                }
+                Ok([
+                    item.key.payload.device_ptr,
+                    item.key.byte_offset,
+                    item.key
+                        .validity_bitmap_offset
+                        .map_or(u64::MAX, |off| item.key.payload.device_ptr + off),
+                    u64::from(item.key.width),
+                    item.key.text_bytes_byte_offset.unwrap_or(0),
+                    u64::from(item.relation),
+                    u64::from(item.descending),
+                    u64::from(item.nulls_first),
+                    u64::from(item.lexicographic_16),
+                ])
+            }
+            CudaJoinSortKey::Derived {
+                relation,
+                values,
+                width,
+                descending,
+                nulls_first,
+            } => {
+                let source_rows = *coordinates
+                    .relation_row_counts
+                    .get(relation as usize)
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(order.len()))?;
+                let required = u64::from(source_rows)
+                    .checked_mul(u64::from(width))
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(order.len()))?;
+                if relation >= coordinates.relation_count
+                    || !matches!(width, 4 | 8 | 16)
+                    || values.context_identity != context_identity
+                    || required > values.initialized_bytes
+                    || values.coordinate_provenance.is_some_and(
+                        |(coordinate_ptr, coordinate_rows)| {
+                            coordinate_ptr != coordinate_buffer.ptr
+                                || coordinate_rows != coordinates.row_count
+                        },
+                    )
+                {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(order.len()));
+                }
+                Ok([
+                    values.ptr,
+                    0,
+                    u64::MAX,
+                    u64::from(width),
+                    0,
+                    u64::from(relation),
+                    u64::from(descending),
+                    u64::from(nulls_first),
+                    0,
+                ])
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let source = coordinate_buffer;
     let primary = ctx.primary_arc();
     primary.set_current()?;
-    let descriptor: Vec<u64> = order
-        .iter()
-        .flat_map(|item| {
-            [
-                item.key.payload.device_ptr,
-                item.key.byte_offset,
-                item.key
-                    .validity_bitmap_offset
-                    .map_or(u64::MAX, |off| item.key.payload.device_ptr + off),
-                u64::from(item.key.width),
-                item.key.text_bytes_byte_offset.unwrap_or(0),
-                u64::from(item.relation),
-                u64::from(item.descending),
-                u64::from(item.nulls_first),
-                u64::from(item.lexicographic_16),
-            ]
-        })
-        .collect();
+    let descriptor = descriptor.into_iter().flatten().collect::<Vec<_>>();
     let desc_bytes = std::mem::size_of_val(descriptor.as_slice());
     let desc = primary.lease_device_buffer_owned(desc_bytes)?;
     let htod = unsafe {
@@ -382,7 +496,7 @@ DONE:
             (&mut a5 as *mut u64).cast(),
             (&mut a6 as *mut u32).cast(),
         ];
-        check_cuda(unsafe {
+        if let Err(err) = check_cuda(unsafe {
             launch(
                 function,
                 merge_count.div_ceil(256).clamp(1, 65_535) as u32,
@@ -396,7 +510,10 @@ DONE:
                 args.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
-        })?;
+        }) {
+            let _ = ctx.synchronize_default_stream();
+            return Err(err);
+        }
         src_ptr = dst_ptr;
         pass += 1;
         width = width.saturating_mul(2);
@@ -406,10 +523,12 @@ DONE:
     } else {
         b.take().unwrap()
     };
+    ctx.synchronize_default_stream()?;
     Ok(CudaJoinCoordinatesU32 {
         coordinates: Some(output),
         row_count: coordinates.row_count,
         relation_count: coordinates.relation_count,
+        relation_row_counts: coordinates.relation_row_counts.clone(),
         // Only the selected output buffer is retained; the alternate merge buffer and descriptor
         // are returned to their pools before this coordinate relation escapes.
         allocated_bytes: bytes as u64,

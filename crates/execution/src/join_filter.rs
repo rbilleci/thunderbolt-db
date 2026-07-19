@@ -3,8 +3,8 @@
 use std::os::raw::c_void;
 
 use super::{
-    check_cuda, CudaJoinCoordinatesU32, CudaPredicateMaskI32, CudaResidentDeviceMemory,
-    CudaResidentReadSource, CudaRuntimeProbeError,
+    check_cuda, launch_cuda_owned_i32_compare_indices_ordered_device, CudaJoinCoordinatesU32,
+    CudaPredicateMaskI32, CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError,
 };
 
 impl CudaResidentDeviceMemory {
@@ -47,54 +47,42 @@ fn launch_cuda_identity_join_coordinates(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     const PTX: &[u8] = br#"
 .version 6.0
 .target sm_60
 .address_size 64
-.visible .entry gpu_db_identity_join_coordinates(
-    .param .u32 rows, .param .u64 mask, .param .u64 out, .param .u64 cursor)
+.visible .entry gpu_db_identity_join_coordinates_all(
+    .param .u32 rows, .param .u64 out)
 {
-    .reg .pred %p<5>;
-    .reg .b32 %r<16>;
-    .reg .b64 %rd<16>;
+    .reg .pred %p;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<5>;
     ld.param.u32 %r1, [rows];
-    ld.param.u64 %rd1, [mask];
-    ld.param.u64 %rd2, [out];
-    ld.param.u64 %rd3, [cursor];
+    ld.param.u64 %rd1, [out];
     mov.u32 %r2, %tid.x;
     mov.u32 %r3, %ctaid.x;
     mov.u32 %r4, %ntid.x;
     mov.u32 %r5, %nctaid.x;
     mad.lo.u32 %r6, %r3, %r4, %r2;
     mul.lo.u32 %r7, %r5, %r4;
-LOOP:
-    setp.ge.u32 %p1, %r6, %r1;
-    @%p1 bra DONE;
-    mov.u64 %rd4, 18446744073709551615;
-    setp.eq.u64 %p2, %rd1, %rd4;
-    @%p2 bra KEEP;
-    mul.wide.u32 %rd5, %r6, 4;
-    add.u64 %rd6, %rd1, %rd5;
-    ld.global.u32 %r8, [%rd6];
-    setp.eq.u32 %p3, %r8, 0;
-    @%p3 bra NEXT;
-KEEP:
-    atom.global.add.u64 %rd7, [%rd3], 1;
-    setp.eq.u64 %p4, %rd2, 0;
-    @%p4 bra NEXT;
-    mul.lo.u64 %rd8, %rd7, 4;
-    add.u64 %rd9, %rd2, %rd8;
-    st.global.u32 [%rd9], %r6;
-NEXT:
+ALL_LOOP:
+    setp.ge.u32 %p, %r6, %r1;
+    @%p bra ALL_DONE;
+    mul.wide.u32 %rd2, %r6, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r6;
     add.u32 %r6, %r6, %r7;
-    bra LOOP;
-DONE:
+    bra ALL_LOOP;
+ALL_DONE:
     ret;
 }
 "#;
     if eligibility.is_some_and(|mask| mask.row_count != row_count) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            row_count as usize,
+        ));
+    }
+    if eligibility.is_some_and(|mask| !std::ptr::eq(mask.mask.primary.as_ref(), ctx.primary())) {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             row_count as usize,
         ));
@@ -104,7 +92,24 @@ DONE:
             coordinates: None,
             row_count: 0,
             relation_count: 1,
+            relation_row_counts: vec![row_count],
             allocated_bytes: 0,
+        });
+    }
+    if let Some(eligibility) = eligibility {
+        let compact = launch_cuda_owned_i32_compare_indices_ordered_device(
+            ctx,
+            &eligibility.mask,
+            row_count,
+            0,
+            5,
+        )?;
+        return Ok(CudaJoinCoordinatesU32 {
+            coordinates: compact.values,
+            row_count: compact.row_count,
+            relation_count: 1,
+            relation_row_counts: vec![row_count],
+            allocated_bytes: compact.allocated_bytes,
         });
     }
     let primary = ctx.primary_arc();
@@ -115,74 +120,38 @@ DONE:
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let dtoh = unsafe {
-        primary
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let memset = unsafe {
-        primary
-            .lib()
-            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
-            .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cursor = primary.lease_device_buffer_owned(8)?;
     let mut ptx = PTX.to_vec();
     ptx.push(0);
-    let function = primary.cached_function(c"gpu_db_identity_join_coordinates", &ptx)?;
-    let run = |out: u64| -> Result<(), CudaRuntimeProbeError> {
-        let mut a0 = row_count;
-        let mut a1 = eligibility.map_or(u64::MAX, |mask| mask.mask.ptr);
-        let mut a2 = out;
-        let mut a3 = cursor.ptr;
-        let mut args = [
-            (&mut a0 as *mut u32).cast(),
-            (&mut a1 as *mut u64).cast(),
-            (&mut a2 as *mut u64).cast(),
-            (&mut a3 as *mut u64).cast(),
-        ];
-        check_cuda(unsafe {
-            launch(
-                function,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                0,
-                std::ptr::null_mut(),
-                args.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        })
-    };
-    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
-    run(0)?;
-    let mut count = 0_u64;
-    check_cuda(unsafe { dtoh((&mut count as *mut u64).cast(), cursor.ptr, 8) })?;
-    if count == 0 {
-        return Ok(CudaJoinCoordinatesU32 {
-            coordinates: None,
-            row_count: 0,
-            relation_count: 1,
-            allocated_bytes: 0,
-        });
-    }
-    let count_u32 =
-        u32::try_from(count).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let bytes = count_u32 as usize * 4;
+    let bytes = row_count as usize * 4;
     let output = primary.lease_device_buffer_owned(bytes)?;
-    check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
-    run(output.ptr)?;
+    let function = primary.cached_function(c"gpu_db_identity_join_coordinates_all", &ptx)?;
+    let mut a0 = row_count;
+    let mut a1 = output.ptr;
+    let mut args = [(&mut a0 as *mut u32).cast(), (&mut a1 as *mut u64).cast()];
+    if let Err(err) = check_cuda(unsafe {
+        launch(
+            function,
+            row_count.div_ceil(256).clamp(1, 65_535),
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    }) {
+        let _ = ctx.synchronize_default_stream();
+        return Err(err);
+    }
+    ctx.synchronize_default_stream()?;
     Ok(CudaJoinCoordinatesU32 {
         coordinates: Some(output),
-        row_count: count_u32,
+        row_count,
         relation_count: 1,
-        // The scalar compaction cursor is temporary and has already been released.
+        relation_row_counts: vec![row_count],
         allocated_bytes: bytes as u64,
     })
 }
@@ -299,18 +268,38 @@ DONE:
     ret;
 }
 "#;
-    if masks.len() != coordinates.relation_count as usize
-        || pad_masks.len() != masks.len()
-        || masks.iter().flatten().any(|mask| mask.row_count == 0)
-        || pad_masks.iter().flatten().any(|mask| mask.row_count != 1)
+    let relation_count = coordinates.relation_count as usize;
+    let context_identity = std::ptr::from_ref(ctx.primary()).addr();
+    if relation_count == 0
+        || masks.len() != relation_count
+        || pad_masks.len() != relation_count
+        || coordinates.relation_row_counts.len() != relation_count
     {
         return Err(CudaRuntimeProbeError::InvalidInputLength(masks.len()));
     }
+    for (relation, (&mask, &pad)) in masks.iter().zip(pad_masks).enumerate() {
+        let source_rows = coordinates.relation_row_counts[relation];
+        if mask.is_some_and(|mask| {
+            mask.row_count != source_rows
+                || mask.mask.capacity < source_rows as usize * std::mem::size_of::<i32>()
+                || std::ptr::from_ref(mask.mask.primary.as_ref()).addr() != context_identity
+        }) || pad.is_some_and(|pad| {
+            pad.row_count != 1
+                || pad.mask.capacity < std::mem::size_of::<i32>()
+                || std::ptr::from_ref(pad.mask.primary.as_ref()).addr() != context_identity
+        }) {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(relation));
+        }
+    }
     if coordinates.row_count == 0 {
+        if coordinates.coordinates.is_some() {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
         return Ok(CudaJoinCoordinatesU32 {
             coordinates: None,
             row_count: 0,
             relation_count: coordinates.relation_count,
+            relation_row_counts: coordinates.relation_row_counts.clone(),
             allocated_bytes: 0,
         });
     }
@@ -318,6 +307,15 @@ DONE:
         .coordinates
         .as_ref()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let coordinate_bytes = (coordinates.row_count as usize)
+        .checked_mul(relation_count)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if source.capacity < coordinate_bytes
+        || std::ptr::from_ref(source.primary.as_ref()).addr() != context_identity
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(coordinate_bytes));
+    }
     let primary = ctx.primary_arc();
     primary.set_current()?;
     let htod = unsafe {
@@ -398,9 +396,18 @@ DONE:
         })
     };
     check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
-    run(0)?;
+    run(0).inspect_err(|_| {
+        let _ = ctx.synchronize_default_stream();
+    })?;
     let mut total = 0_u64;
-    check_cuda(unsafe { dtoh((&mut total as *mut u64).cast(), cursor.ptr, 8) })?;
+    check_cuda(unsafe { dtoh((&mut total as *mut u64).cast(), cursor.ptr, 8) }).inspect_err(
+        |_| {
+            let _ = ctx.synchronize_default_stream();
+        },
+    )?;
+    if total > u64::from(coordinates.row_count) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
     let total_u32 =
         u32::try_from(total).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     if total == 0 {
@@ -408,6 +415,7 @@ DONE:
             coordinates: None,
             row_count: 0,
             relation_count: coordinates.relation_count,
+            relation_row_counts: coordinates.relation_row_counts.clone(),
             allocated_bytes: 0,
         });
     }
@@ -418,11 +426,15 @@ DONE:
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     let output = primary.lease_device_buffer_owned(output_bytes)?;
     check_cuda(unsafe { memset(cursor.ptr, 0, 8) })?;
-    run(output.ptr)?;
+    run(output.ptr).inspect_err(|_| {
+        let _ = ctx.synchronize_default_stream();
+    })?;
+    ctx.synchronize_default_stream()?;
     Ok(CudaJoinCoordinatesU32 {
         coordinates: Some(output),
         row_count: total_u32,
         relation_count: coordinates.relation_count,
-        allocated_bytes: output_bytes as u64 + desc_bytes as u64 + 8,
+        relation_row_counts: coordinates.relation_row_counts.clone(),
+        allocated_bytes: output_bytes as u64,
     })
 }

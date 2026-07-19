@@ -193,6 +193,9 @@ NEXT:add.u32 %r4,%r4,1;bra ROW_LOOP;DONE:ret;
             coordinates: None,
             row_count: 0,
             relation_count,
+            relation_row_counts: (0..relation_count)
+                .map(|relation| u32::from(relation == real_relation) * row_count)
+                .collect(),
             allocated_bytes: 0,
         });
     }
@@ -204,6 +207,9 @@ NEXT:add.u32 %r4,%r4,1;bra ROW_LOOP;DONE:ret;
         coordinates: Some(output),
         row_count: count,
         relation_count,
+        relation_row_counts: (0..relation_count)
+            .map(|relation| u32::from(relation == real_relation) * row_count)
+            .collect(),
         allocated_bytes: bytes as u64 + 8,
     })
 }
@@ -300,6 +306,11 @@ DONE:
             coordinates: None,
             row_count: 0,
             relation_count: accumulated.relation_count + 1,
+            relation_row_counts: {
+                let mut counts = accumulated.relation_row_counts.clone();
+                counts.push(0);
+                counts
+            },
             allocated_bytes: 0,
         });
     }
@@ -375,6 +386,11 @@ DONE:
             coordinates: None,
             row_count: 0,
             relation_count: accumulated.relation_count + 1,
+            relation_row_counts: {
+                let mut counts = accumulated.relation_row_counts.clone();
+                counts.push(0);
+                counts
+            },
             allocated_bytes: 0,
         });
     }
@@ -386,6 +402,11 @@ DONE:
         coordinates: Some(output),
         row_count: count,
         relation_count: accumulated.relation_count + 1,
+        relation_row_counts: {
+            let mut counts = accumulated.relation_row_counts.clone();
+            counts.push(0);
+            counts
+        },
         allocated_bytes: bytes as u64,
     })
 }

@@ -45,8 +45,8 @@ use super::{
     resolved_mvcc_row_provenance_bundle_occurrence_offset,
     resolved_mvcc_row_provenance_bundle_segments, resolved_mvcc_row_provenance_tuple,
     resolved_tuple_identity, summarize_mvcc_row_provenance_bundle,
-    summarize_mvcc_row_provenance_path, CudaMvccRowBatch, MvccProjection, MvccProvenanceSummary,
-    MvccReadFilter, MvccReadOrder, MvccReadRow, ResolvedMvccRow, ResolvedMvccRowIdentity,
+    summarize_mvcc_row_provenance_path, MvccProjection, MvccProvenanceSummary, MvccReadFilter,
+    MvccReadOrder, MvccReadRow, ResolvedMvccRow, ResolvedMvccRowIdentity,
 };
 
 pub(crate) fn project_mvcc_row(row: ResolvedMvccRow, projection: &MvccProjection) -> MvccReadRow {
@@ -189,28 +189,6 @@ pub(crate) fn project_mvcc_row(row: ResolvedMvccRow, projection: &MvccProjection
             value: provenance_value,
         },
     }
-}
-
-pub(crate) fn mvcc_read_row_size(row: &MvccReadRow) -> u64 {
-    row.source_key
-        .as_ref()
-        .map_or(0, |value| value.len() as u64)
-        + row.key.as_ref().map_or(0, |value| value.len() as u64)
-        + row.value.as_ref().map_or(0, |value| value.len() as u64)
-}
-
-pub(crate) fn cuda_mvcc_row_batch_transfer_bytes(rows: &[ResolvedMvccRow]) -> u64 {
-    CudaMvccRowBatch::from_key_values_with_metadata(rows.iter().map(|row| {
-        (
-            row.tuple.key.as_bytes(),
-            row.tuple.value.as_bytes(),
-            row.tuple.created_by,
-            row.tuple.deleted_by.unwrap_or(u64::MAX),
-            None,
-        )
-    }))
-    .map(|batch| batch.transfer_bytes() as u64)
-    .unwrap_or(u64::MAX)
 }
 
 pub(crate) fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bool {

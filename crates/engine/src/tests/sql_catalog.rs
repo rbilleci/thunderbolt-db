@@ -936,6 +936,7 @@ fn relational_sql_cuda_probe_reuses_cached_unavailable_snapshot_and_fails_loud()
     let Command::Select(select) = parse_command("SELECT * FROM people").unwrap() else {
         panic!("expected SELECT plan");
     };
+    let fallback_before = e.metrics().snapshot().fallback_total;
     let first = e
         .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap_err();
@@ -943,8 +944,15 @@ fn relational_sql_cuda_probe_reuses_cached_unavailable_snapshot_and_fails_loud()
         .evaluate_relational_select_specification_with_cuda_driver(&select)
         .unwrap_err();
 
-    assert_gpu_mvcc_execution_required(&e, first);
-    assert_gpu_mvcc_execution_required(&e, second);
+    for error in [first, second] {
+        assert!(
+            error
+                .to_string()
+                .contains("has no retained resident device memory"),
+            "unexpected error: {error}"
+        );
+    }
+    assert_eq!(e.metrics().snapshot().fallback_total, fallback_before);
     assert_eq!(
         e.cached_cuda_probe_runtime.get().unwrap().snapshot(),
         CudaDriverRuntime::unavailable().snapshot()

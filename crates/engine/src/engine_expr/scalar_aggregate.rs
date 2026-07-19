@@ -26,6 +26,45 @@ pub(super) fn execute_scalar_aggregate(
     indices: &[u32],
     indices_u64: &[u64],
 ) -> Result<RelationalSelectResult, ExecuteError> {
+    // Capability is a property of the SQL shape, never of result cardinality. Validate the value
+    // domain before the empty-set NULL fast path so an unsupported aggregate cannot appear
+    // GPU-served merely because WHERE removed every row.
+    match &select.projection {
+        SelectProjection::Sum { column } => {
+            let col_idx = relational_column_index(table, column)?;
+            if !matches!(
+                table.columns[col_idx].ty,
+                SqlType::Int4 | SqlType::Int8 | SqlType::Numeric { .. }
+            ) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "SUM supports int4 / int8 / numeric columns on the Expr path".to_string(),
+                )));
+            }
+        }
+        SelectProjection::Avg { column } => {
+            let col_idx = relational_column_index(table, column)?;
+            if !matches!(
+                table.columns[col_idx].ty,
+                SqlType::Int4 | SqlType::Int8 | SqlType::Numeric { .. }
+            ) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "AVG supports int4 / int8 / numeric columns on the Expr path".to_string(),
+                )));
+            }
+        }
+        SelectProjection::Min { column } | SelectProjection::Max { column } => {
+            let col_idx = relational_column_index(table, column)?;
+            if !matches!(
+                table.columns[col_idx].ty,
+                SqlType::Int4 | SqlType::Int8 | SqlType::Numeric { .. }
+            ) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "MIN / MAX support int4 / int8 / numeric columns on the Expr path".to_string(),
+                )));
+            }
+        }
+        _ => {}
+    }
     // PG: an aggregate over ZERO surviving rows -- SUM/AVG/MIN/MAX are SQL NULL (COUNT(*) and
     // COUNT(DISTINCT) are 0, handled in their arms below). NULL support is present now, so this
     // resolves the former "the engine cannot represent NULL yet (M3)" hard-error. The result

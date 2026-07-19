@@ -120,6 +120,303 @@ bws_done:
     ret;
 }
 
+// Scatter compact checked-arithmetic values back to their source-row positions so the ordinary
+// coordinate sorter can continue dereferencing keys by original resident row id.
+.visible .entry gpu_db_scatter_i32_at_indices(
+    .param .u64 values_ptr,
+    .param .u64 indices_ptr,
+    .param .u64 out_ptr,
+    .param .u64 n
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %row;
+    .reg .u32 %value;
+    .reg .u64 %values;
+    .reg .u64 %indices;
+    .reg .u64 %out;
+    .reg .u64 %n;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    ld.param.u64 %values, [values_ptr];
+    ld.param.u64 %indices, [indices_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %n, [n];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+scatter_i32_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra scatter_i32_done;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %values, %off;
+    ld.global.u32 %value, [%addr];
+    add.u64 %addr, %indices, %off;
+    ld.global.u32 %row, [%addr];
+    mul.wide.u32 %off, %row, 4;
+    add.u64 %addr, %out, %off;
+    st.global.u32 [%addr], %value;
+    add.u64 %i, %i, %stride;
+    bra scatter_i32_loop;
+scatter_i32_done:
+    ret;
+}
+
+.visible .entry gpu_db_scatter_i64_at_indices(
+    .param .u64 values_ptr,
+    .param .u64 indices_ptr,
+    .param .u64 out_ptr,
+    .param .u64 n
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %row;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u64 %values;
+    .reg .u64 %indices;
+    .reg .u64 %out;
+    .reg .u64 %n;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    ld.param.u64 %values, [values_ptr];
+    ld.param.u64 %indices, [indices_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %n, [n];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+scatter_i64_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra scatter_i64_done;
+    mul.lo.u64 %off, %i, 8;
+    add.u64 %addr, %values, %off;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %indices, %off;
+    ld.global.u32 %row, [%addr];
+    mul.wide.u32 %off, %row, 8;
+    add.u64 %addr, %out, %off;
+    st.global.u32 [%addr], %w0;
+    st.global.u32 [%addr+4], %w1;
+    add.u64 %i, %i, %stride;
+    bra scatter_i64_loop;
+scatter_i64_done:
+    ret;
+}
+
+.visible .entry gpu_db_scatter_i128_at_indices(
+    .param .u64 values_ptr,
+    .param .u64 indices_ptr,
+    .param .u64 out_ptr,
+    .param .u64 n
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %row;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %w2;
+    .reg .u32 %w3;
+    .reg .u64 %values;
+    .reg .u64 %indices;
+    .reg .u64 %out;
+    .reg .u64 %n;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    ld.param.u64 %values, [values_ptr];
+    ld.param.u64 %indices, [indices_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %n, [n];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+scatter_i128_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra scatter_i128_done;
+    mul.lo.u64 %off, %i, 16;
+    add.u64 %addr, %values, %off;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    ld.global.u32 %w2, [%addr+8];
+    ld.global.u32 %w3, [%addr+12];
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %indices, %off;
+    ld.global.u32 %row, [%addr];
+    mul.wide.u32 %off, %row, 16;
+    add.u64 %addr, %out, %off;
+    st.global.u32 [%addr], %w0;
+    st.global.u32 [%addr+4], %w1;
+    st.global.u32 [%addr+8], %w2;
+    st.global.u32 [%addr+12], %w3;
+    add.u64 %i, %i, %stride;
+    bra scatter_i128_loop;
+scatter_i128_done:
+    ret;
+}
+
+// Initialize only the source-row positions named by `indices` to the nullable-expression sentinel.
+.visible .entry gpu_db_fill_i64_sentinel_at_indices(
+    .param .u64 indices_ptr,
+    .param .u64 out_ptr,
+    .param .u64 n
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %row;
+    .reg .u64 %indices;
+    .reg .u64 %out;
+    .reg .u64 %n;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .u64 %sentinel;
+
+    ld.param.u64 %indices, [indices_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %n, [n];
+    mov.u64 %sentinel, 0x7FFFFFFFFFFFFFFF;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+fill_sentinel_indices_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra fill_sentinel_indices_done;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %indices, %off;
+    ld.global.u32 %row, [%addr];
+    mul.wide.u32 %off, %row, 8;
+    add.u64 %addr, %out, %off;
+    st.global.u64 [%addr], %sentinel;
+    add.u64 %i, %i, %stride;
+    bra fill_sentinel_indices_loop;
+fill_sentinel_indices_done:
+    ret;
+}
+
+// Blend a compact nullable int4 arithmetic value with the source-aligned validity mask, then scatter
+// the widened/sentinel key to the source row. Only survivor coordinates are inspected.
+.visible .entry gpu_db_blend_widen_null_sentinel_at_indices(
+    .param .u64 values_ptr,
+    .param .u64 validity_ptr,
+    .param .u64 indices_ptr,
+    .param .u64 out_ptr,
+    .param .u64 n
+)
+{
+    .reg .pred %p;
+    .reg .pred %p_null;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %row;
+    .reg .u32 %valid;
+    .reg .s32 %value32;
+    .reg .s64 %value64;
+    .reg .u64 %values;
+    .reg .u64 %validity;
+    .reg .u64 %indices;
+    .reg .u64 %out;
+    .reg .u64 %n;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    ld.param.u64 %values, [values_ptr];
+    ld.param.u64 %validity, [validity_ptr];
+    ld.param.u64 %indices, [indices_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %n, [n];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+blend_scatter_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra blend_scatter_done;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %indices, %off;
+    ld.global.u32 %row, [%addr];
+    mul.wide.u32 %off, %row, 4;
+    add.u64 %addr, %validity, %off;
+    ld.global.u32 %valid, [%addr];
+    setp.eq.u32 %p_null, %valid, 0;
+    @%p_null bra blend_scatter_null;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %values, %off;
+    ld.global.s32 %value32, [%addr];
+    cvt.s64.s32 %value64, %value32;
+    bra blend_scatter_store;
+blend_scatter_null:
+    mov.u64 %value64, 0x7FFFFFFFFFFFFFFF;
+blend_scatter_store:
+    mul.wide.u32 %off, %row, 8;
+    add.u64 %addr, %out, %off;
+    st.global.u64 [%addr], %value64;
+    add.u64 %i, %i, %stride;
+    bra blend_scatter_loop;
+blend_scatter_done:
+    ret;
+}
+
 // Fill a [b128; n] array with the 128-bit value (vhi:vlo) -- used to init slot_keys_i128 to EMPTY128
 // (i128::MIN = vlo=0, vhi=i64::MIN), since that bit pattern is not a uniform-byte memset.
 .visible .entry gpu_db_fill_i128(

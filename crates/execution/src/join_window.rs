@@ -473,6 +473,11 @@ FINAL_DONE: ret;
         .coordinates
         .as_ref()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !std::ptr::eq(source.primary.as_ref(), ctx.primary()) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            coordinates.row_count as usize,
+        ));
+    }
     let pack = |keys: &[CudaJoinOrderKey<'_>]| {
         keys.iter()
             .flat_map(|item| {
@@ -554,7 +559,7 @@ FINAL_DONE: ret;
         (&mut a6 as *mut u32).cast(),
         (&mut a7 as *mut u64).cast(),
     ];
-    check_cuda(unsafe {
+    if let Err(err) = check_cuda(unsafe {
         launch(
             boundary_fn,
             coordinates.row_count.div_ceil(256).clamp(1, 65_535),
@@ -568,7 +573,10 @@ FINAL_DONE: ret;
             args.as_mut_ptr(),
             std::ptr::null_mut(),
         )
-    })?;
+    }) {
+        let _ = ctx.synchronize_default_stream();
+        return Err(err);
+    }
     let mut src_ptr = output.as_ref().expect("rank output").ptr;
     let mut dst_ptr = scratch.as_ref().expect("rank scratch").ptr;
     let mut stride = 1_u32;
@@ -838,6 +846,7 @@ DONE:
             coordinates: None,
             row_count: 0,
             relation_count: coordinates.relation_count,
+            relation_row_counts: coordinates.relation_row_counts.clone(),
             allocated_bytes: 0,
         });
     }
@@ -845,7 +854,7 @@ DONE:
         key.relation >= coordinates.relation_count
             || !matches!(key.key.width, 4 | 8 | 16 | 255)
             || (key.key.width == 255 && key.key.text_bytes_byte_offset.is_none())
-            || key.key.payload.metadata.gpu_id != ctx.metadata.gpu_id
+            || !std::ptr::eq(key.key.payload.primary(), ctx.primary())
     }) {
         return Err(CudaRuntimeProbeError::InvalidInputLength(partition.len()));
     }
@@ -853,6 +862,11 @@ DONE:
         .coordinates
         .as_ref()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !std::ptr::eq(source.primary.as_ref(), ctx.primary()) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            coordinates.row_count as usize,
+        ));
+    }
     let primary = ctx.primary_arc();
     primary.set_current()?;
     let descriptors = partition
@@ -936,6 +950,7 @@ DONE:
         coordinates: Some(output),
         row_count: coordinates.row_count,
         relation_count: coordinates.relation_count,
+        relation_row_counts: coordinates.relation_row_counts.clone(),
         allocated_bytes: bytes as u64,
     })
 }
@@ -1016,6 +1031,7 @@ DONE:
             coordinates: None,
             row_count: 0,
             relation_count: coordinates.relation_count,
+            relation_row_counts: coordinates.relation_row_counts.clone(),
             allocated_bytes: 0,
         });
     }
@@ -1027,6 +1043,9 @@ DONE:
         .coordinates
         .as_ref()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !std::ptr::eq(source.primary.as_ref(), ctx.primary()) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(rows as usize));
+    }
     let primary = ctx.primary_arc();
     primary.set_current()?;
     let bytes = rows as usize * coordinates.relation_count as usize * 4;
@@ -1052,7 +1071,7 @@ DONE:
         (&mut a3 as *mut u32).cast(),
         (&mut a4 as *mut u64).cast(),
     ];
-    check_cuda(unsafe {
+    if let Err(err) = check_cuda(unsafe {
         launch(
             function,
             rows.div_ceil(256).clamp(1, 65_535),
@@ -1066,11 +1085,19 @@ DONE:
             args.as_mut_ptr(),
             std::ptr::null_mut(),
         )
-    })?;
+    }) {
+        let _ = ctx.synchronize_default_stream();
+        return Err(err);
+    }
+    // The returned guard owns only `output`; the borrowed source may be returned to the shared
+    // pool by the caller immediately after this function returns. Complete the D2D read before that
+    // ownership boundary (and drain a deferred CUDA fault while every operand is still alive).
+    ctx.synchronize_default_stream()?;
     Ok(CudaJoinCoordinatesU32 {
         coordinates: Some(output),
         row_count: rows,
         relation_count: coordinates.relation_count,
+        relation_row_counts: coordinates.relation_row_counts.clone(),
         allocated_bytes: bytes as u64,
     })
 }

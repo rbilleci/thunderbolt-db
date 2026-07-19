@@ -2557,16 +2557,25 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
     else {
         panic!("expected SELECT plan");
     };
-    let max_result = e
+    let max_error = e
         .evaluate_relational_select_specification_with_cuda_driver(&max_select)
-        .unwrap();
-    assert_eq!(
-        max_result.specification.rows,
-        vec![vec![SqlValue::Text("Grace".to_string())]]
+        .expect_err("scalar MAX(text) has no device operator and must fail loud");
+    assert!(
+        max_error.to_string().contains("MIN / MAX support"),
+        "unexpected unsupported scalar MAX(text) error: {max_error}"
     );
-    assert_eq!(max_result.execution.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(max_result.execution.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(max_result.execution.fallback_reason, None);
+    let Command::Select(empty_max_select) =
+        parse_command("SELECT MAX(name) FROM people WHERE id < 0").unwrap()
+    else {
+        panic!("expected SELECT plan");
+    };
+    let empty_max_error = e
+        .evaluate_relational_select_specification_with_cuda_driver(&empty_max_select)
+        .expect_err("zero survivors must not hide unsupported scalar MAX(text)");
+    assert!(
+        empty_max_error.to_string().contains("MIN / MAX support"),
+        "unexpected empty unsupported scalar MAX(text) error: {empty_max_error}"
+    );
 }
 
 #[test]

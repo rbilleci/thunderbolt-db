@@ -972,18 +972,30 @@ UNMATCHED_DONE:
         ));
     }
     if left_n == 0 && !outer_right {
+        let mut relation_row_counts = accumulated.map_or_else(
+            || vec![left_row_count],
+            |coordinates| coordinates.relation_row_counts.clone(),
+        );
+        relation_row_counts.push(right_row_count);
         return Ok(CudaJoinCoordinatesU32 {
             coordinates: None,
             row_count: 0,
             relation_count: left_rels + 1,
+            relation_row_counts,
             allocated_bytes: 0,
         });
     }
     if right_row_count == 0 && !outer_left {
+        let mut relation_row_counts = accumulated.map_or_else(
+            || vec![left_row_count],
+            |coordinates| coordinates.relation_row_counts.clone(),
+        );
+        relation_row_counts.push(right_row_count);
         return Ok(CudaJoinCoordinatesU32 {
             coordinates: None,
             row_count: 0,
             relation_count: left_rels + 1,
+            relation_row_counts,
             allocated_bytes: 0,
         });
     }
@@ -1280,10 +1292,16 @@ UNMATCHED_DONE:
     let total_u32 =
         u32::try_from(total).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     if total == 0 {
+        let mut relation_row_counts = accumulated.map_or_else(
+            || vec![left_row_count],
+            |coordinates| coordinates.relation_row_counts.clone(),
+        );
+        relation_row_counts.push(right_row_count);
         return Ok(CudaJoinCoordinatesU32 {
             coordinates: None,
             row_count: 0,
             relation_count: left_rels + 1,
+            relation_row_counts,
             allocated_bytes: 0,
         });
     }
@@ -1300,10 +1318,16 @@ UNMATCHED_DONE:
     if emitted != total {
         return Err(CudaRuntimeProbeError::InvalidInputLength(emitted as usize));
     }
+    let mut relation_row_counts = accumulated.map_or_else(
+        || vec![left_row_count],
+        |coordinates| coordinates.relation_row_counts.clone(),
+    );
+    relation_row_counts.push(right_row_count);
     Ok(CudaJoinCoordinatesU32 {
         coordinates: Some(output),
         row_count: total_u32,
         relation_count: left_rels + 1,
+        relation_row_counts,
         allocated_bytes: output_bytes as u64,
     })
 }

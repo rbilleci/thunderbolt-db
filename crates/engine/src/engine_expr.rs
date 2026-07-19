@@ -38,10 +38,8 @@ mod grouped_count_distinct;
 use grouped_count_distinct::count_distinct_groups;
 mod scalar_aggregate;
 use scalar_aggregate::execute_scalar_aggregate;
-mod projected_rows;
-use projected_rows::materialize_projected_rows;
-mod non_grouped_order;
-use non_grouped_order::order_and_window_indices;
+mod device_result_select;
+use device_result_select::execute_device_result_select;
 
 mod execution_source;
 pub(crate) use execution_source::{
@@ -166,30 +164,12 @@ impl Engine {
             }
         }
 
-        // We discard `_query` and keep only `access_path` (metadata). Computing it for an ORDER BY /
-        // LIMIT select would run a full CPU ordered table sort (relational_ordered_table_keys) whose
-        // result we throw away -- a charter violation (the GPU does the sort here) + 2x work. The CPU
-        // sort keys off `bound.order` (set at bind from order_by.first()), which the planner below reads
-        // -- NOT `ap_select.order_by` -- so clearing ap_select alone is INEFFECTIVE. Clear bound.order:
-        // that alone stops the CPU sort. bound.order is read nowhere else on this path (the GPU/grouped
-        // sort uses select.order_by + order_by_exprs), so this is safe. The ap_select clear keeps the
-        // synthesized path unordered/unlimited; the GPU sort + host OFFSET/LIMIT own ordering+windowing.
+        // This resident executor is itself a device scan. Do not call the legacy MVCC query builder to
+        // synthesize metadata: that helper resolves host keys and evaluates WHERE predicates before
+        // returning a row query, even though this path would discard it and execute the same predicate
+        // again on the GPU. Report the honest physical access path directly.
         let mut bound = bound;
-        bound.order = None;
-        let mut ap_select = select.clone();
-        ap_select.order_by.clear();
-        ap_select.limit = None;
-        ap_select.offset = None;
-        // The access-path planner resolves the projection's group COLUMN; an expression GROUP BY has
-        // none (the placeholder "(expr)" is not a column), so synthesize a scan path for it. The query
-        // is discarded metadata anyway; the grouped GPU aggregation/sort owns execution.
-        let access_path = if group_key_expr.is_some() {
-            RelationalAccessPath::FullTableScan
-        } else {
-            let (_query, access_path) =
-                self.relational_select_mvcc_query_pinned(&ap_select, table, &bound, copin_s)?;
-            access_path
-        };
+        let access_path = RelationalAccessPath::FullTableScan;
         // The table payload the kernels read: the published device buffer + the catalog/GPU descriptor
         // (its `row_count` + `resident_device_*` section vectors define every column byte-offset) + the
         // row count. `None` looks these up by name in the SINGLE resident store -- byte-identical to the
@@ -328,6 +308,23 @@ impl Engine {
                 None => validity,
             });
         let predicate = augmented_predicate.as_ref().or(predicate);
+
+        if !is_grouped && !is_aggregate {
+            return execute_device_result_select(
+                self,
+                select,
+                table,
+                bound,
+                access_path,
+                &snapshot,
+                &device_memory,
+                row_count,
+                predicate,
+                visibility,
+                order_by_exprs,
+                order_by_nulls_first,
+            );
+        }
 
         // Evaluate the predicate on the GPU -> surviving row indices (ascending). With no WHERE clause
         // every row survives, so the indices are the full 0..row_count scan (the aggregate + projection
@@ -2398,24 +2395,6 @@ impl Engine {
             );
         }
 
-        let indices_u64 = order_and_window_indices(
-            select,
-            table,
-            order_by_exprs,
-            order_by_nulls_first,
-            &snapshot,
-            &device_memory,
-            row_count,
-            indices_u64,
-        )?;
-        materialize_projected_rows(
-            table,
-            bound,
-            access_path,
-            &snapshot,
-            &device_memory,
-            row_count,
-            indices_u64,
-        )
+        unreachable!("plain SELECT returned through the device result-frame pipeline")
     }
 }

@@ -16,8 +16,8 @@ The engine has three planes:
   volatile and reconstructible; it is never the sole durable copy of acknowledged data.
 
 The CPU must not become a co-equal relational execution tier. RETIRE-001 completed the temporary test-oracle
-retirement; remaining repair and generic result-postprocessing debt is named only in **RETIRE-002** and
-**RETIRE-003** in `PLAN.md`.
+retirement and RETIRE-003 completed generic result-postprocessing retirement. The remaining host relational repair
+debt is named only in **RETIRE-002** in `PLAN.md`.
 
 ## 2. Layering and ownership
 
@@ -70,7 +70,9 @@ and result-value decisions execute on-device.
 - Scalar aggregates, GROUP BY, HAVING, DISTINCT, ORDER BY, LIMIT/OFFSET, inner/outer joins, and supported windows
   execute on-device.
 - Checked integer arithmetic reports overflow rather than wrapping or falling back.
-- Row-producing paths return framed/columnar device results for one bounded final readback.
+- Row-producing SELECT and join paths compact, order/window, and materialize framed columnar results on-device,
+  then perform one bounded terminal readback for host protocol framing. Text offsets and lengths remain on-device
+  apart from bounded layout metadata.
 
 ### Operator contract
 
@@ -78,9 +80,9 @@ Every operator receives a typed device source, snapshot/visibility boundary, pro
 scratch/result budget. It returns a device result or a typed failure. No operator may silently substitute host
 relational work.
 
-Measured result/scan improvements are admitted only through **PERF-001** and the report-card gate. Wider point
-indexes are **READ-002**. The generic CUDA-MVCC path's remaining host compaction/order/projection is
-**RETIRE-003**.
+Measured result/scan improvements are admitted only through the report-card gate; the accepted PERF-001 contracts
+remain the point-read baseline. Wider point indexes are **READ-002**. The retired generic KV/MVCC entry fails loudly
+before source resolution or execution telemetry rather than reconstructing relational results on the host.
 
 ## 5. Residency and STRATA
 

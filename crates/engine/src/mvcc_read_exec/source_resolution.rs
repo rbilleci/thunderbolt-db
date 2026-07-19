@@ -376,25 +376,3 @@ pub(crate) fn resolve_mvcc_source(
         }
     }
 }
-
-pub(crate) fn resolve_mvcc_all_versions(
-    store: &InMemoryTupleStore,
-    visibility: StorageVisibility,
-) -> Result<Vec<ResolvedMvccRow>, StorageError> {
-    if visibility.read_txn_id == 0 {
-        return Err(StorageError::InvalidVisibility);
-    }
-
-    Ok(store
-        .all_versions()
-        .into_iter()
-        .map(|tuple| ResolvedMvccRow {
-            branch_label: None,
-            source_key: None,
-            source_tuple: None,
-            provenance_path: None,
-            terminal_input_index: None,
-            tuple,
-        })
-        .collect())
-}

@@ -54,6 +54,11 @@ const THREADS: usize = 8;
 /// generous cap whose ONLY job is to convert a (rare, load-dependent) deadlock into a VISIBLE test
 /// failure instead of an infinite silent park (see [`with_deadline`]).
 const TEST_DEADLINE_SECS: u64 = 60;
+/// The DDL-vs-DML stress case retains the same 50-repetition workload but needs a wider watchdog:
+/// device-authoritative table publication makes a clean standalone run approach the common cap,
+/// and full-suite contention can push it past 60 seconds. The bound still converts a real wedge
+/// into a visible failure without weakening the interleaving coverage.
+const DDL_DML_TEST_DEADLINE_SECS: u64 = 120;
 
 // ----- helpers -------------------------------------------------------------------------------
 
@@ -1243,7 +1248,7 @@ fn instrumented_reader_straddling_a_shape_change_decodes_at_its_pinned_generatio
 #[test]
 fn ddl_racing_dml_on_the_same_table_never_corrupts_or_wedges() {
     with_deadline(
-        TEST_DEADLINE_SECS,
+        DDL_DML_TEST_DEADLINE_SECS,
         "ddl_racing_dml_on_the_same_table_never_corrupts_or_wedges",
         || {
             for rep in 0..REPS {

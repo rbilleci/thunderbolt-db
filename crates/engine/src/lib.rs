@@ -11,10 +11,9 @@ use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CudaCompoundFoldColumn, CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime,
     CudaI32BatchProjectionColumns, CudaI32Comparison, CudaI32EqualAnyProjectSubmission,
-    CudaI32IndexProbeDenseSubmission, CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk,
+    CudaI32IndexProbeDenseSubmission, CudaI32Stats, CudaOwnedDeviceMemoryChunk,
     CudaResidentDeviceMemory, CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget,
-    MockGpuRuntime, PlannedOp, ResidentElemType, RouteDecision, VisibleLocateShard,
-    WriteLocateShard,
+    MockGpuRuntime, ResidentElemType, RouteDecision, VisibleLocateShard, WriteLocateShard,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -41,8 +40,10 @@ use gpu_db_sql::{
     SqlValue, TablePrivilege, TablespacePrivilege, TruncateTable, Update,
     NUMERIC_DEFAULT_PRECISION,
 };
+#[cfg(test)]
+use gpu_db_storage::TupleVersion;
 use gpu_db_storage::{
-    InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleId, TupleStore, TupleVersion,
+    InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleId, TupleStore,
     Visibility as StorageVisibility,
 };
 use gpu_db_txn::{TxnError, TxnManager, TxnState};
@@ -75,7 +76,9 @@ mod mvcc_read_model;
 pub use mvcc_read_model::*;
 mod relational_model;
 pub use relational_model::*;
+#[cfg(test)]
 mod mvcc_read_exec;
+#[cfg(test)]
 pub(crate) use mvcc_read_exec::*;
 mod engine_state;
 pub use engine_state::*;
@@ -108,6 +111,7 @@ mod engine_lifecycle;
 mod engine_mvcc_dispatch;
 mod engine_residency;
 mod engine_resident_probe;
+mod engine_result_frame;
 mod engine_result_sort;
 mod engine_retained_read;
 mod engine_select_bind;

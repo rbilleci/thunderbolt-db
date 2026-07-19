@@ -20,14 +20,12 @@ task ID here or be explicitly historical.
 
 Maintain one active priority path; do not start another feature slice while its acceptance is unresolved.
 
-1. **RETIRE-003 — delete generic CUDA-MVCC host result post-processing.** Inventory the current host selection
-   compaction, ordering, projection, and result-assembly seams, then choose the first bounded deletion slice that
-   keeps intermediates device-resident until one final readback. Unsupported shapes fail loud; do not restore CPU
-   relational execution or weaken PERF-001's exact-generation plans, publication/accounting, async ownership,
-   duplicate-decline contract, or accepted two-cache report-card baseline.
+1. **BENCH-001 — complete the immutable OLTP comparison.** First reconcile the stale mutation-boundary wrapper
+   with the live post-INSERT resident route, then run the sustained and `B01`–`B10` cohorts against tuned PostgreSQL
+   in a quiet, reproducible window. Preserve the fixed arrival schedule, durability contract, per-class latency
+   gates, and exact host/PostgreSQL configuration.
 
-**BENCH-001** is opportunistic parallel evidence only when a quiet, reproducible PostgreSQL window is available;
-fix its stale mutation-boundary wrapper before accepting results. **CFG-001** is touch-triggered: reckon a flag when
+**DUR-001** is next after the benchmark acceptance is resolved. **CFG-001** is touch-triggered: reckon a flag when
 its owning subsystem is already being changed, rather than opening a separate competing workstream.
 
 Physical multi-GPU work (**MULTI-001/002/003**) is user-deferred until every non-MULTI plan item is complete or
@@ -61,6 +59,10 @@ Critical outliers over 5,000 lines receive priority; a pure structural move uses
 while any runtime/kernel/residency/result-path change also uses the full applicable `AGENTS.md` gates.
 
 ### Ordered inventory
+
+Completed disposition cells preserve slice-time line counts and paths as historical evidence; later retirements
+may delete a listed module. The fresh inventory command and `CODE_SIZE.md` exception registry are the current size
+authorities, while completed deletion facts live in `STATUS.md`.
 
 **Wave 1 — critical production context and dependency hubs.** Analyze facades and embedded implementation first
 so extraction preserves crate APIs, GPU/kernel ownership, cache behavior, and stable symbol ABIs.
@@ -132,9 +134,8 @@ the final acceptance source.
 
 | ID | State | Priority | Outcome and acceptance gate | Dependencies / trigger | Design or evidence |
 |---|---|---:|---|---|---|
-| **BENCH-001** | NEXT | P0 | First reconcile the protocol-boundary wrapper's hardcoded `post_mutation_residency_invalidated=true` with the live probe's false fact and accepted post-INSERT resident route. Then run the immutable workload's complete sustained and `B01`–`B10` cohort gates against tuned PostgreSQL on the same host, reporting per-class p50/p99/p99.9/p99.99, committed TPS, logical operations/s, producer slip, queueing, WAL, saturation, and drain. Accepted artifacts exclude warm-up, preserve the fixed arrival schedule and mix, and publish the exact durability/PostgreSQL/host configuration. | Quiet benchmark window and reproducible PostgreSQL config; opportunistic alongside the correctness path | ADR-008; `docs/design/oltp-benchmark-workload-v1.md`; ARCHITECTURE §§6, 10; STRUCT-001LM closeout audit |
+| **BENCH-001** | NOW | P0 | First reconcile the protocol-boundary wrapper's hardcoded `post_mutation_residency_invalidated=true` with the live probe's false fact and accepted post-INSERT resident route. Then run the immutable workload's complete sustained and `B01`–`B10` cohort gates against tuned PostgreSQL on the same host, reporting per-class p50/p99/p99.9/p99.99, committed TPS, logical operations/s, producer slip, queueing, WAL, saturation, and drain. Accepted artifacts exclude warm-up, preserve the fixed arrival schedule and mix, and publish the exact durability/PostgreSQL/host configuration. | Quiet benchmark window and reproducible PostgreSQL config | ADR-008; `docs/design/oltp-benchmark-workload-v1.md`; ARCHITECTURE §§6, 10; STRUCT-001LM closeout audit |
 | **RETIRE-002** | BLOCKED | P1 | Replace chunk reverse-gather, deauthorization, and scan-build repair with device-native DDL/recovery/import repair; then delete those host relational repair operators. Acked commits remain recoverable after every injected repair failure. | Device-native DDL validation and recovery repair | ADR-006; STRATA repair boundary |
-| **RETIRE-003** | NOW | P1 | Remove host relational post-processing from the generic CUDA-MVCC source path: selection compaction, ordering, projection, and result assembly stay device-resident until the one bounded final readback. Delete the host compaction/sort/project helpers and make unsupported shapes fail loud rather than return a CPU-computed result. | None — PERF-001 accepted the production point-read recovery; preserve its device-resident result contracts and report-card baseline | ADR-006/007; PERF-001 closeout evidence in STATUS/archive |
 | **DUR-001** | NEXT | P1 | Add an automatic intent-lane checkpoint policy and timestamped lane records sufficient for archive/PITR. Keep explicit operator checkpointing and refusal behavior until both are crash-gated. | Cadence and timestamp format decision | Archived durable-path handover and write-conveyor record |
 | **HA-001** | BLOCKED | P1 | Wire engine sequencing to replicated log indices; lane claims reserve Raft log-index ranges and client acknowledgement waits for quorum commit. Add follower rejection, catch-up, promotion/fencing, and snapshot-install gates. | R3 sequencing contract and multi-node runtime | ADR-001/004/005 |
 | **READ-001** | VERIFY | P1 | Reproduce or close the remaining filtered-expression overflow-ordering and route-gate case findings against the current tree. R3-004 closeout resolved the previously ignored facade shape-changing-DDL/read and elided-DML races with statement generation retention, representation-safe rebinding, and commit-time FK revalidation; the complete 14-test concurrency integration suite now passes. Every remaining live defect receives a focused GPU/spec regression, while invalid CPU-era fixtures are rewritten around supported GPU routes. | None | STATUS known-debt facts and R3-004 facade stress evidence |
@@ -158,7 +159,6 @@ the final acceptance source.
 
 | Remaining host surface | Owning task | Deletion boundary |
 |---|---|---|
-| Generic CUDA-MVCC host compaction, sorting, projection, and result assembly | **RETIRE-003** | Device-resident result pipeline reaches the single final readback; unsupported work fails loud |
 | Reverse gather, deauthorization, scan-build, and DDL/recovery/import repair | **RETIRE-002** | Device-native repair preserves RPO under injected failures before host repair deletion |
 | Catalog construction boundary | **PRODUCT-002** | Host retains bookkeeping and deterministic encoding/upload only; all relational catalog decisions execute on-device |
 

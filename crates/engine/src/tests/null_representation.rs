@@ -341,6 +341,15 @@ fn null_literal_is_accepted_for_every_column_type() {
     )
     .unwrap();
 
+    for column in ["i", "t8", "n", "b", "s"] {
+        let Command::Select(single) = parse_command(&format!("SELECT {column} FROM t")).unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        e.execute_relational_select(&single)
+            .unwrap_or_else(|error| panic!("NULL {column} projection failed: {error}"));
+    }
+
     let Command::Select(select) = parse_command("SELECT i, t8, n, b, s FROM t").unwrap() else {
         panic!("expected SELECT");
     };
@@ -353,6 +362,36 @@ fn null_literal_is_accepted_for_every_column_type() {
             SqlValue::Null,
             SqlValue::Null,
             SqlValue::Null
+        ]]
+    );
+}
+
+#[test]
+fn device_result_materialization_reads_four_byte_aligned_wide_values() {
+    // One row in the leading int4 section places both following wide sections at 4 mod 8. The
+    // terminal device materializer must copy them as aligned u32 words, never misaligned u64 loads.
+    let e = Engine::new_local_test_engine();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (pad INT, wide BIGINT, exact NUMERIC(10,2))",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (pad, wide, exact) VALUES (7, 9000000000, 123.45)",
+    )
+    .unwrap();
+
+    let Command::Select(select) = parse_command("SELECT pad, wide, exact FROM t").unwrap() else {
+        panic!("expected SELECT");
+    };
+    let result = e.execute_relational_select(&select).unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            SqlValue::Int4(7),
+            SqlValue::Int8(9_000_000_000),
+            SqlValue::Numeric(gpu_db_sql::Decimal128::new(12_345, 2)),
         ]]
     );
 }
