@@ -39,11 +39,13 @@ pub use copy::{
     CopyToStdout,
 };
 mod decimal;
+mod parameter;
 mod relation;
 mod scalar;
 mod select;
 
 pub use decimal::{Decimal128, NumericOverflow};
+pub use parameter::lower_sql_parameters;
 pub mod datetime;
 pub use scalar::{
     SqlType, SqlValue, NUMERIC_DEFAULT_PRECISION, NUMERIC_DEFAULT_SCALE, SUPPORTED_SQL_TYPES,
@@ -74,6 +76,10 @@ pub enum ParseError {
     InvalidGet,
     #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), CREATE [UNIQUE] INDEX name ON table (column), DROP INDEX [IF EXISTS] name, INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [HAVING grouped_column|count|sum|avg|min|max (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
+    #[error("invalid SQL parameter reference")]
+    InvalidParameterReference,
+    #[error("SQL parameter count mismatch: expected {expected}, got {actual}")]
+    InvalidParameterCount { expected: usize, actual: usize },
     #[error("LIMIT must not be negative")]
     NegativeLimit,
     #[error("OFFSET must not be negative")]

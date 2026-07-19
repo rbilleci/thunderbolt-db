@@ -33,7 +33,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpu_db_engine::{Engine, ExecuteError, RelationalColumn};
-use gpu_db_sql::{parse_command, Command, Decimal128, ParseError, Select, SqlType, SqlValue};
+use gpu_db_sql::{
+    lower_sql_parameters, parse_command, Command, Decimal128, ParseError, Select, SqlType, SqlValue,
+};
 
 pub mod pg_adapter;
 mod point_lookup_batcher;
@@ -282,6 +284,27 @@ impl EngineFacade {
         execute_on_engine_with_transaction(&mut self.engine, statement_txn_id, active_txn_id, sql)
     }
 
+    /// Execute an unchanged PostgreSQL-style `$n` SQL template with neutral typed parameters.
+    /// Parameter lowering is quote/comment-aware and renders values canonically, so parameter text
+    /// cannot alter the parsed SQL structure. Protocol adapters decode their wire values before this
+    /// boundary; the engine remains free of OIDs and format codes.
+    pub fn execute_parameterized(
+        &mut self,
+        session: SessionId,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<QueryOutcome, DbError> {
+        if !self.sessions.contains_key(&session.0) {
+            return Err(DbError {
+                category: ErrorCategory::Internal,
+                message: format!("unknown session {}", session.0),
+            });
+        }
+        let params = params.iter().map(map_db_value).collect::<Vec<_>>();
+        let lowered = lower_sql_parameters(sql, &params).map_err(map_parse_error)?;
+        self.execute(session, &lowered)
+    }
+
     fn set_active_txn_id(&mut self, session: SessionId, txn_id: Option<u64>) {
         if let Some(state) = self.sessions.get_mut(&session.0) {
             state.active_txn_id = txn_id;
@@ -310,6 +333,19 @@ pub fn execute_on_engine(
     sql: &str,
 ) -> Result<QueryOutcome, DbError> {
     execute_on_engine_with_transaction(engine, txn_id, None, sql)
+}
+
+/// Stateless typed-parameter twin of [`execute_on_engine`]. The SQL template remains unchanged at
+/// the caller boundary; only typed canonical literals reach the existing parser and GPU planner.
+pub fn execute_on_engine_parameterized(
+    engine: &mut Engine,
+    txn_id: u64,
+    sql: &str,
+    params: &[DbValue],
+) -> Result<QueryOutcome, DbError> {
+    let params = params.iter().map(map_db_value).collect::<Vec<_>>();
+    let lowered = lower_sql_parameters(sql, &params).map_err(map_parse_error)?;
+    execute_on_engine(engine, txn_id, &lowered)
 }
 
 fn execute_on_engine_with_transaction(
@@ -1002,6 +1038,21 @@ fn map_value(value: SqlValue) -> DbValue {
     }
 }
 
+fn map_db_value(value: &DbValue) -> SqlValue {
+    match value {
+        DbValue::Null => SqlValue::Null,
+        DbValue::Int2(value) => SqlValue::Int2(*value),
+        DbValue::Int4(value) => SqlValue::Int4(*value),
+        DbValue::Int8(value) => SqlValue::Int8(*value),
+        DbValue::Numeric(value) => SqlValue::Numeric(*value),
+        DbValue::Bool(value) => SqlValue::Bool(*value),
+        DbValue::Text(value) => SqlValue::Text(value.clone()),
+        DbValue::Date(value) => SqlValue::Date(*value),
+        DbValue::Timestamp(value) => SqlValue::Timestamp(*value),
+        DbValue::Uuid(value) => SqlValue::Uuid(*value),
+    }
+}
+
 fn command_tag(command: &Command) -> CommandTag {
     match command {
         Command::CreateTable(_) => CommandTag::CreateTable,
@@ -1016,6 +1067,29 @@ fn command_tag(command: &Command) -> CommandTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameterized_execution_rejects_shape_before_claiming_a_transaction() {
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        let missing = facade
+            .execute_parameterized(session, "SELECT $1", &[])
+            .unwrap_err();
+        assert_eq!(missing.category, ErrorCategory::Syntax);
+        assert_eq!(facade.next_txn_id, 1, "parameter failure claims no txn id");
+
+        let quoted_only = facade
+            .execute_parameterized(session, "SELECT '$1'", &[DbValue::Int4(7)])
+            .unwrap_err();
+        assert_eq!(quoted_only.category, ErrorCategory::Syntax);
+        assert_eq!(facade.next_txn_id, 1);
+
+        let unknown = facade
+            .execute_parameterized(SessionId(u64::MAX), "SELECT $1", &[])
+            .unwrap_err();
+        assert_eq!(unknown.category, ErrorCategory::Internal);
+        assert!(unknown.message.contains("unknown session"));
+    }
 
     #[test]
     fn durable_wal_segment_env_decode_is_unset_for_missing_or_blank() {

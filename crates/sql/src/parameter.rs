@@ -1,0 +1,381 @@
+use crate::{ParseError, SqlValue};
+
+/// Lower PostgreSQL-style `$n` parameters to canonical SQL literals without interpreting
+/// placeholders inside quoted strings, quoted identifiers, dollar-quoted bodies, or comments.
+///
+/// This is the typed control-plane boundary used before the existing SQL parser. Values are rendered
+/// from [`SqlValue`], never copied from untrusted text, so a text parameter cannot change SQL structure.
+/// The highest parameter number must equal `params.len()`; repeated and out-of-order references are
+/// accepted, while `$0`, missing values, surplus values, and numeric overflow fail loudly.
+pub fn lower_sql_parameters(input: &str, params: &[SqlValue]) -> Result<String, ParseError> {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut at = 0;
+    let mut highest = 0_usize;
+
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => {
+                let backslash_escapes = is_escape_string_prefix(input, at);
+                copy_single_quoted(input, &mut at, &mut output, backslash_escapes)?;
+            }
+            b'"' => copy_double_quoted(input, &mut at, &mut output)?,
+            b'-' if bytes.get(at + 1) == Some(&b'-') => {
+                copy_line_comment(input, &mut at, &mut output)
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                copy_block_comment(input, &mut at, &mut output)?
+            }
+            b'$' => {
+                let follows_identifier = at > 0 && is_identifier_continuation_byte(bytes[at - 1]);
+                if follows_identifier {
+                    output.push('$');
+                    at += 1;
+                } else if let Some((delimiter, end)) = dollar_quote_delimiter(input, at) {
+                    copy_dollar_quoted(input, &mut at, &mut output, delimiter, end)?;
+                } else if bytes.get(at + 1).is_some_and(u8::is_ascii_digit) {
+                    let digits_start = at + 1;
+                    let mut end = digits_start;
+                    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                        end += 1;
+                    }
+                    let number = input[digits_start..end]
+                        .parse::<usize>()
+                        .map_err(|_| ParseError::InvalidParameterReference)?;
+                    if number == 0 {
+                        return Err(ParseError::InvalidParameterReference);
+                    }
+                    let value =
+                        params
+                            .get(number - 1)
+                            .ok_or(ParseError::InvalidParameterCount {
+                                expected: number,
+                                actual: params.len(),
+                            })?;
+                    highest = highest.max(number);
+                    output.push_str(&render_parameter(value));
+                    at = end;
+                } else {
+                    output.push('$');
+                    at += 1;
+                }
+            }
+            _ => {
+                let ch = input[at..].chars().next().expect("at is inside the input");
+                output.push(ch);
+                at += ch.len_utf8();
+            }
+        }
+    }
+
+    if highest != params.len() {
+        return Err(ParseError::InvalidParameterCount {
+            expected: highest,
+            actual: params.len(),
+        });
+    }
+    Ok(output)
+}
+
+fn render_parameter(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Null => "NULL".to_string(),
+        SqlValue::Int2(value) => format!("{value}::int2"),
+        SqlValue::Int4(value) => format!("{value}::int4"),
+        SqlValue::Int8(value) => format!("{value}::int8"),
+        SqlValue::Numeric(value) => format!(
+            "{}::numeric({},{})",
+            value.to_decimal_string(),
+            crate::NUMERIC_DEFAULT_PRECISION,
+            value.scale
+        ),
+        SqlValue::Bool(value) => format!("{}::bool", if *value { "TRUE" } else { "FALSE" }),
+        SqlValue::Text(value) => format!("{}::text", quote_literal(value)),
+        SqlValue::Date(value) => format!(
+            "{}::date",
+            quote_literal(&crate::datetime::format_date(*value))
+        ),
+        SqlValue::Timestamp(value) => format!(
+            "{}::timestamp",
+            quote_literal(&crate::datetime::format_timestamp(*value))
+        ),
+        SqlValue::Uuid(value) => {
+            format!("{}::uuid", quote_literal(&crate::uuid::format_uuid(value)))
+        }
+    }
+}
+
+fn quote_literal(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        quoted.push(ch);
+        if ch == '\'' {
+            quoted.push('\'');
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn is_escape_string_prefix(input: &str, quote_at: usize) -> bool {
+    let bytes = input.as_bytes();
+    quote_at > 0
+        && matches!(bytes[quote_at - 1], b'e' | b'E')
+        && (quote_at == 1 || !is_identifier_continuation_byte(bytes[quote_at - 2]))
+}
+
+fn copy_single_quoted(
+    input: &str,
+    at: &mut usize,
+    output: &mut String,
+    backslash_escapes: bool,
+) -> Result<(), ParseError> {
+    let bytes = input.as_bytes();
+    let start = *at;
+    *at += 1;
+    while *at < bytes.len() {
+        match bytes[*at] {
+            b'\'' if bytes.get(*at + 1) == Some(&b'\'') => *at += 2,
+            b'\'' => {
+                *at += 1;
+                output.push_str(&input[start..*at]);
+                return Ok(());
+            }
+            b'\\' if backslash_escapes && bytes.get(*at + 1).is_some() => {
+                *at += 1;
+                *at += input[*at..]
+                    .chars()
+                    .next()
+                    .expect("backslash has a following character")
+                    .len_utf8();
+            }
+            _ => *at += input[*at..].chars().next().expect("valid UTF-8").len_utf8(),
+        }
+    }
+    Err(ParseError::InvalidParameterReference)
+}
+
+fn copy_double_quoted(input: &str, at: &mut usize, output: &mut String) -> Result<(), ParseError> {
+    let bytes = input.as_bytes();
+    let start = *at;
+    *at += 1;
+    while *at < bytes.len() {
+        match bytes[*at] {
+            b'"' if bytes.get(*at + 1) == Some(&b'"') => *at += 2,
+            b'"' => {
+                *at += 1;
+                output.push_str(&input[start..*at]);
+                return Ok(());
+            }
+            _ => *at += input[*at..].chars().next().expect("valid UTF-8").len_utf8(),
+        }
+    }
+    Err(ParseError::InvalidParameterReference)
+}
+
+fn copy_line_comment(input: &str, at: &mut usize, output: &mut String) {
+    let start = *at;
+    *at = input[*at..]
+        .find(['\r', '\n'])
+        .map_or(input.len(), |offset| *at + offset + 1);
+    output.push_str(&input[start..*at]);
+}
+
+fn copy_block_comment(input: &str, at: &mut usize, output: &mut String) -> Result<(), ParseError> {
+    let bytes = input.as_bytes();
+    let start = *at;
+    *at += 2;
+    let mut depth = 1_u32;
+    while *at < bytes.len() {
+        if bytes.get(*at..*at + 2) == Some(b"/*") {
+            depth = depth
+                .checked_add(1)
+                .ok_or(ParseError::InvalidParameterReference)?;
+            *at += 2;
+        } else if bytes.get(*at..*at + 2) == Some(b"*/") {
+            depth -= 1;
+            *at += 2;
+            if depth == 0 {
+                output.push_str(&input[start..*at]);
+                return Ok(());
+            }
+        } else {
+            *at += input[*at..].chars().next().expect("valid UTF-8").len_utf8();
+        }
+    }
+    Err(ParseError::InvalidParameterReference)
+}
+
+fn dollar_quote_delimiter(input: &str, at: usize) -> Option<(&str, usize)> {
+    let tail = &input.as_bytes()[at + 1..];
+    let tag_end = tail.iter().position(|byte| *byte == b'$')?;
+    let tag = &tail[..tag_end];
+    if tag
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_alphabetic() && *byte != b'_' && *byte < 0x80)
+        || tag
+            .iter()
+            .skip(1)
+            .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_' && *byte < 0x80)
+    {
+        return None;
+    }
+    let end = at + 1 + tag_end;
+    Some((&input[at..=end], end + 1))
+}
+
+fn is_identifier_continuation_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80
+}
+
+fn copy_dollar_quoted(
+    input: &str,
+    at: &mut usize,
+    output: &mut String,
+    delimiter: &str,
+    body_start: usize,
+) -> Result<(), ParseError> {
+    let end = input[body_start..]
+        .find(delimiter)
+        .map(|offset| body_start + offset + delimiter.len())
+        .ok_or(ParseError::InvalidParameterReference)?;
+    output.push_str(&input[*at..end]);
+    *at = end;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowers_typed_parameters_without_changing_sql_structure() {
+        let uuid = crate::uuid::parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let lowered = lower_sql_parameters(
+            "SELECT '$1', \"$2\", $tag$ $3 $tag$, $1, $2, $3, $4 -- $5\n/* $6 */",
+            &[
+                SqlValue::Int4(7),
+                SqlValue::Int8(-9),
+                SqlValue::Text("x'); DROP TABLE accounts; --".to_string()),
+                SqlValue::Uuid(uuid),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            lowered,
+            "SELECT '$1', \"$2\", $tag$ $3 $tag$, 7::int4, -9::int8, \
+             'x''); DROP TABLE accounts; --'::text, \
+             '550e8400-e29b-41d4-a716-446655440000'::uuid -- $5\n/* $6 */"
+        );
+    }
+
+    #[test]
+    fn repeated_out_of_order_parameters_are_allowed_but_count_is_exact() {
+        assert_eq!(
+            lower_sql_parameters("SELECT $2, $1, $2", &[SqlValue::Int4(1), SqlValue::Int4(2)])
+                .unwrap(),
+            "SELECT 2::int4, 1::int4, 2::int4"
+        );
+        assert!(matches!(
+            lower_sql_parameters("SELECT $2", &[SqlValue::Int4(1)]),
+            Err(ParseError::InvalidParameterCount {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert!(matches!(
+            lower_sql_parameters("SELECT 1", &[SqlValue::Int4(1)]),
+            Err(ParseError::InvalidParameterCount {
+                expected: 0,
+                actual: 1
+            })
+        ));
+        assert!(matches!(
+            lower_sql_parameters("SELECT $0", &[]),
+            Err(ParseError::InvalidParameterReference)
+        ));
+    }
+
+    #[test]
+    fn nested_comments_and_quoted_utf8_are_preserved() {
+        assert_eq!(
+            lower_sql_parameters(
+                "SELECT 'héllo $1', \"名$2\", $é$ $4 $é$, /* outer /* $3 */ done */ $1",
+                &[SqlValue::Bool(true)]
+            )
+            .unwrap(),
+            "SELECT 'héllo $1', \"名$2\", $é$ $4 $é$, /* outer /* $3 */ done */ TRUE::bool"
+        );
+    }
+
+    #[test]
+    fn postgres_identifier_boundaries_do_not_manufacture_parameters_or_dollar_quotes() {
+        assert_eq!(
+            lower_sql_parameters(
+                "SELECT foo$tag$bar$tag$, foo$1, $e\u{301}$ $2 $e\u{301}$, $1",
+                &[SqlValue::Int4(9)]
+            )
+            .unwrap(),
+            "SELECT foo$tag$bar$tag$, foo$1, $e\u{301}$ $2 $e\u{301}$, 9::int4"
+        );
+    }
+
+    #[test]
+    fn backslash_before_multibyte_utf8_never_splits_a_character() {
+        assert_eq!(
+            lower_sql_parameters("SELECT '\\é', $1", &[SqlValue::Int4(7)]).unwrap(),
+            "SELECT '\\é', 7::int4"
+        );
+        assert_eq!(
+            lower_sql_parameters("SELECT '\\名', $1", &[SqlValue::Int4(8)]).unwrap(),
+            "SELECT '\\名', 8::int4"
+        );
+    }
+
+    #[test]
+    fn postgres_escape_strings_and_cr_line_comments_keep_parameter_scope_exact() {
+        assert_eq!(
+            lower_sql_parameters("SELECT '\\', $1", &[SqlValue::Int4(7)]).unwrap(),
+            "SELECT '\\', 7::int4"
+        );
+        assert_eq!(
+            lower_sql_parameters("SELECT E'\\\'', $1", &[SqlValue::Int4(8)]).unwrap(),
+            "SELECT E'\\\'', 8::int4"
+        );
+        assert_eq!(
+            lower_sql_parameters("SELECT 1 -- $2\r WHERE id = $1", &[SqlValue::Int4(9)]).unwrap(),
+            "SELECT 1 -- $2\r WHERE id = 9::int4"
+        );
+    }
+
+    #[test]
+    fn supported_non_null_parameter_variants_keep_explicit_sql_types() {
+        let values = [
+            SqlValue::Int2(7),
+            SqlValue::Int4(7),
+            SqlValue::Int8(7),
+            SqlValue::Numeric(crate::Decimal128::new(700, 2)),
+            SqlValue::Bool(true),
+        ];
+        assert_eq!(
+            lower_sql_parameters("SELECT $1, $2, $3, $4, $5", &values).unwrap(),
+            "SELECT 7::int2, 7::int4, 7::int8, 7.00::numeric(38,2), TRUE::bool"
+        );
+    }
+
+    #[test]
+    fn canonical_point_read_casts_reparse_as_the_declared_types() {
+        let lowered = lower_sql_parameters(
+            "SELECT balance_cents, version, status FROM accounts \
+             WHERE tenant_id = $1 AND account_id = $2",
+            &[SqlValue::Int4(7), SqlValue::Int8(70_001)],
+        )
+        .unwrap();
+        let crate::Command::Select(select) = crate::parse_command(&lowered).unwrap() else {
+            panic!("canonical R1 must remain a SELECT")
+        };
+        assert_eq!(select.filters[0].value, SqlValue::Int4(7));
+        assert_eq!(select.filters[1].value, SqlValue::Int8(70_001));
+    }
+}
