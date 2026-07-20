@@ -709,6 +709,8 @@ dependencies = [
 name = "gpu_db_server"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures-util",
  "gpu_db_engine",
  "gpu_db_execution",
  "gpu_db_facade",

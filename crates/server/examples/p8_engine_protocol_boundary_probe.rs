@@ -284,7 +284,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let copy_sql =
         "COPY order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) FROM STDIN WITH (FORMAT csv)";
 
-    let mut engine = Engine::new_local();
+    let engine = Engine::new_local();
     match parse_command(create_sql)? {
         Command::CreateTable(_) => {
             engine.execute_text(1, create_sql)?;

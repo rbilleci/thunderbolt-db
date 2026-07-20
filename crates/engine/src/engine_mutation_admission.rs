@@ -210,13 +210,43 @@ impl PredeclaredTransaction {
 #[allow(clippy::large_enum_variant)]
 pub enum TransactionRequest {
     Statement(MutationRequest),
+    Copy(CopyMutationRequest),
     Predeclared(PredeclaredTransaction),
     Prepared(BoundPreparedTransactionRoute),
+}
+
+/// One typed COPY FROM STDIN mutation admitted through [`Engine::submit_transaction`].
+///
+/// The pgwire adapter owns framing and row decoding; this request keeps the parsed COPY target and
+/// typed cells together at the engine's sole product-facing mutation boundary. Autocommit COPY may
+/// use the private current-apply strategy, while an explicit transaction stages the same rows in
+/// its private GPU generation and publishes them only at COMMIT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyMutationRequest {
+    copy: CopyFromStdin,
+    rows: Vec<Vec<SqlValue>>,
+    target: CopyTargetProof,
+}
+
+impl CopyMutationRequest {
+    pub fn new(copy: CopyFromStdin, rows: Vec<Vec<SqlValue>>, target: CopyTargetProof) -> Self {
+        Self { copy, rows, target }
+    }
+
+    fn into_parts(self) -> (CopyFromStdin, Vec<Vec<SqlValue>>, CopyTargetProof) {
+        (self.copy, self.rows, self.target)
+    }
 }
 
 impl From<MutationRequest> for TransactionRequest {
     fn from(request: MutationRequest) -> Self {
         Self::Statement(request)
+    }
+}
+
+impl From<CopyMutationRequest> for TransactionRequest {
+    fn from(request: CopyMutationRequest) -> Self {
+        Self::Copy(request)
     }
 }
 
@@ -289,6 +319,7 @@ impl Engine {
     ) -> Result<TransactionAdmissionResult, ExecuteError> {
         match request.into() {
             TransactionRequest::Statement(request) => self.submit_statement(txn_id, request),
+            TransactionRequest::Copy(request) => self.submit_copy(txn_id, request),
             TransactionRequest::Predeclared(transaction) => self
                 .submit_predeclared_transaction(txn_id, transaction)
                 .map(TransactionAdmissionResult::Predeclared),
@@ -296,6 +327,26 @@ impl Engine {
                 .submit_bound_prepared_transaction(txn_id, transaction)
                 .map(TransactionAdmissionResult::Predeclared),
         }
+    }
+
+    fn submit_copy(
+        &self,
+        txn_id: TxnId,
+        request: CopyMutationRequest,
+    ) -> Result<TransactionAdmissionResult, ExecuteError> {
+        let (copy, rows, target) = request.into_parts();
+        if self.transaction_snapshot_handle(txn_id).is_some() {
+            let insert = self.relational_copy_insert(&copy, rows);
+            let result =
+                self.execute_copy_in_transaction_with_result(txn_id, insert, &copy, &target)?;
+            return Ok(TransactionAdmissionResult::Dml(result));
+        }
+        let (rows_affected, _profile) =
+            self.execute_relational_copy_rows_profiled_with_target(txn_id, &copy, rows, &target)?;
+        Ok(TransactionAdmissionResult::Dml(DmlExecutionResult {
+            rows_affected: rows_affected as u64,
+            returning: None,
+        }))
     }
 
     fn submit_statement(

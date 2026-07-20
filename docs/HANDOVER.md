@@ -125,6 +125,17 @@ This file records only the current boundary and where the next agent resumes. `P
   cache regimes. Five independent rejection rounds drove every repair above; the sixth fresh read-only re-audit
   confirmed syntax/parameter/COPY precedence, semantic-error ordering, exact transaction modes, GPU evidence, and
   sole-owner boundaries, and returned **ACCEPT**.
+- The PRODUCT-001 COPY compatibility slice is **accepted** after one independent rejection and a fresh adversarial
+  re-audit. Simple and extended text/CSV COPY FROM/TO now run on both canonical ingresses. COPY FROM retains an
+  opaque exact engine/transaction/relation proof through Parse, Describe, Execute, zero-row completion, and CopyDone;
+  definitive constraints repeat under the commit mutex before WAL, and every nonempty mutation crosses
+  `SharedEngine::submit` into the existing canonical claimant. Simple COPY TO synthesizes its exact parsed SELECT;
+  extended COPY TO executes its exact retained bound SELECT AST. Raw phase/ABA/failed-state/confused-deputy/whole-
+  message-precedence tests, same-key WAL sabotage, recovery, and three sequential plus two overlapping live-GPU
+  lifetime cases pass. The relocated tokio-postgres smoke now targets `gpu-db-engine-server`. Final Layer-2 results
+  are **231.468M/s at p50 156us** in-L2 and **198.067M/s at p50 205us** out-of-L2; Layer-1 rooflines are
+  **1,418.1/1,440.2 GB/s**, GROUP BY is **1,674.9M elements/s**, and the 48M-row build is **2,061.6s + 0.0s
+  residency**. The frozen-tree re-audit verdict is **ACCEPT**.
 - Physical multi-GPU work remains user-parked under **MULTI-001/002/003**.
 
 ## Integrated baseline — preserve it
@@ -145,11 +156,11 @@ This file records only the current boundary and where the next agent resumes. `P
 
 ## Resume here
 
-1. Continue **PRODUCT-001** with the next compatibility slice: migrate COPY through the typed
-   `SharedEngine::submit` transaction boundary and move its canonical tokio-postgres/pgwire coverage onto the
-   engine-backed server without adding another claimant. Obtain a fresh independent ACCEPT before taking TLS/SCRAM,
-   cancellation, node-postgres, psql/catalog, or pg_dump/restore slices. Delete the legacy server and P8 endpoint only
-   after every named compatibility gate is accepted. Broader transactional DDL and the conservative
+1. Continue **PRODUCT-001** with the next compatibility slice: migrate the production TLS/SCRAM security posture
+   onto `gpu-db-engine-server` without adding an execution or commit boundary, and move the live security preflight
+   to that canonical target. Obtain a fresh independent ACCEPT before taking cancellation, node-postgres,
+   psql/catalog, or pg_dump/restore slices. Delete the legacy server and P8 endpoint only after every named
+   compatibility gate is accepted. Broader transactional DDL and the conservative
    full-catalog conflict remain PRODUCT-001-owned gaps. Reduce the PLAN-owned 2,070-line
    `engine_dml_concurrent.rs` below 2,000 lines before PRODUCT-001 closes. Every independently reviewable slice needs
    a fresh read-only adversarial audit and re-audit to ACCEPT; the final whole-tree audit must prove one product
@@ -163,8 +174,16 @@ This file records only the current boundary and where the next agent resumes. `P
 4. Keep **RETIRE-002** outside these slices unless its device-native repair prerequisites are satisfied and PLAN
    explicitly promotes it.
 
-## Last green evidence — 2026-07-20
+## Last green evidence — 2026-07-21
 
+- The accepted canonical COPY slice passes engine **502/536 ignored**, SQL **49**, protocol **71 + 127**, facade
+  **66/10 ignored** plus concurrency **13/1 ignored**, canonical server **31/4 ignored**, pgwire **4/2 ignored**,
+  SQLx **1**, and canonical tokio-postgres **1**, plus strict affected Clippy, formatting, diff, and source-size
+  gates. Raw blocking/async syntax precedence, phase timing, target ABA, zero-row, same-key concurrency, recovery,
+  and confused-deputy sabotage pass. The live COPY lifetime gate passes three sequential plus two overlapping GPU
+  cases. The final card records **231.468M/s at p50 156us** in-L2 and **198.067M/s at p50 205us** out-of-L2,
+  **1,418.1/1,440.2 GB/s** rooflines, **1,674.9M elements/s** GROUP BY, and a **2,061.6s + 0.0s residency** 48M-row
+  build. One independent rejection plus the fresh frozen-tree re-audit closed every finding and returned **ACCEPT**.
 - The accepted PRODUCT-001 parsed-admission plus General atomic resource-envelope foundations pass engine
   **475/506**, facade **44/9**, server pgwire **3/1**, and concurrency **13/1** CPU/ignored gates plus strict affected
   Clippy, scoped rustfmt, source-size, and diff-whitespace checks. Three sequential and two overlapping fresh GPU

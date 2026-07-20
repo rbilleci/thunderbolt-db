@@ -1054,14 +1054,20 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn commit_mutation_at_with_current_apply<F>(
+    pub(crate) fn commit_mutation_at_with_current_apply<V, F>(
         &self,
         txn_id: u64,
         payload: std::sync::Arc<[u8]>,
         timestamp_micros: u64,
+        mut validate_current: V,
         mut apply_current: F,
     ) -> Result<(CommitToken, u128), EngineError>
     where
+        // This is the definitive validation point for the direct-current strategy: it runs after
+        // all earlier waves have published, while owning `commit_mutex`, and before any sequence
+        // or WAL claim.  COPY uses it to re-check its exact relation proof and every INSERT
+        // constraint, closing both concurrent-key and intervening-DDL races.
+        V: FnMut(&Self, Index) -> Result<(), EngineError>,
         // `apply_current` receives the commit sequence (the replicator-assigned commit `Index`) so
         // the directly-applied current entry stamps versions with the SAME commit-seq that
         // `apply_mvcc_entry` derives from `entry.index` on replay — keeping the live COPY hot path
@@ -1104,6 +1110,8 @@ impl Engine {
                 "transaction id {txn_id} is already owned by transaction state {state:?}"
             )));
         }
+        let commit_seq = commit.repl.peek_next_index();
+        self.skip_leader_check_during_internal_read(|engine| validate_current(engine, commit_seq))?;
         let affected_rows = Self::canonical_affected_rows(&payload)?;
         let token = {
             let wal_len_before = commit.wal.len();
@@ -1300,6 +1308,42 @@ impl Engine {
         self.metrics.inc_commit();
 
         Ok((token, residency_invalidation_micros))
+    }
+
+    /// Run an effect-free validation at the same serialized current-state boundary used by a
+    /// direct-current commit, without claiming a sequence, replication slot, WAL record, or
+    /// publication. Empty COPY uses this to make its exact-target decision linearizable with DDL.
+    pub(crate) fn validate_effect_free_at_current_commit_boundary<V>(
+        &self,
+        txn_id: u64,
+        mut validate_current: V,
+    ) -> Result<(), EngineError>
+    where
+        V: FnMut(&Self, Index) -> Result<(), EngineError>,
+    {
+        if self.transaction_snapshot_handle(txn_id).is_some() {
+            return Err(EngineError::ApplyFailed(format!(
+                "transaction id {txn_id} is active and cannot use the autocommit validation boundary"
+            )));
+        }
+        self.legacy_lane_history_write_guard()?;
+        self.ensure_commit_path_available()?;
+        if self.repl_role() != Role::Leader {
+            return Err(EngineError::NotLeader);
+        }
+
+        let commit = self.commit_state_after_wave_quiescence()?;
+        self.legacy_lane_history_write_guard()?;
+        self.ensure_commit_path_available()?;
+        if let Some(state) = commit.txn_manager.state(txn_id) {
+            return Err(EngineError::ApplyFailed(format!(
+                "transaction id {txn_id} is already owned by transaction state {state:?}"
+            )));
+        }
+        let prospective_commit_seq = commit.repl.peek_next_index();
+        self.skip_leader_check_during_internal_read(|engine| {
+            validate_current(engine, prospective_commit_seq)
+        })
     }
 
     /// Global (stop-the-world) residency invalidation: invalidate every resident

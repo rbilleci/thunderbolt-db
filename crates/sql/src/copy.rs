@@ -53,6 +53,7 @@ pub struct CopyFromStdin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CopyToStdout {
     pub table: String,
+    pub columns: Option<Vec<String>>,
     pub options: CopyOptions,
 }
 
@@ -150,7 +151,7 @@ pub fn parse_copy_to_stdout_table(statement: &str) -> Option<CopyToStdout> {
     let canonical = canonical_copy_sql(statement);
     let target = canonical.strip_prefix("copy ")?.trim();
     let (target, options) = parse_copy_target_and_options(target, "to stdout")?;
-    let table = if let Some(open) = target.find('(') {
+    let (table, columns) = if let Some(open) = target.find('(') {
         let close = target.rfind(')')?;
         if close <= open || !target[close + 1..].trim().is_empty() {
             return None;
@@ -167,9 +168,12 @@ pub fn parse_copy_to_stdout_table(statement: &str) -> Option<CopyToStdout> {
         {
             return None;
         }
-        table
+        (
+            table,
+            Some(columns.into_iter().map(str::to_string).collect()),
+        )
     } else {
-        target
+        (target, None)
     };
     if table.is_empty()
         || table
@@ -179,6 +183,7 @@ pub fn parse_copy_to_stdout_table(statement: &str) -> Option<CopyToStdout> {
     }
     Some(CopyToStdout {
         table: table.strip_prefix("public.").unwrap_or(table).to_string(),
+        columns,
         options,
     })
 }

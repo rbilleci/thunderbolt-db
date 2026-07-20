@@ -16,6 +16,23 @@ impl Engine {
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         self.ensure_dml_device_generation(cmd)?;
+        self.preflight_constraints_against_current_device_generation(cmd, txn_id)
+    }
+
+    /// Run the state-sensitive constraint pass against an already-established device generation.
+    ///
+    /// This seam exists for callers that already own `commit_mutex`: calling
+    /// [`Self::ensure_dml_device_generation`] there could re-enter the non-reentrant commit lock
+    /// whenever admission is required. Such callers must first invoke
+    /// [`Self::ensure_dml_device_generation_with_catalog`] while holding the catalog latch in the
+    /// canonical `commit_mutex -> catalog` order, then call this method before claiming WAL. A
+    /// concurrently retired generation still fails closed in the device probes; this method never
+    /// falls back to host relational validation.
+    pub(crate) fn preflight_constraints_against_current_device_generation(
+        &self,
+        cmd: &Command,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
         let cat = self.catalog_snapshot();
         match cmd {
             Command::CreateSchema(create) => {

@@ -79,9 +79,13 @@ does not delay the architecture evidence gate. The active sequence now starts at
    narrow and published targets retain their generation proof. The independently accepted SQLx/simple-query slice
    moves SQLx onto the canonical server, executes bounded literal/NULL projections on GPU, gives every idle
    multi-statement segment exact PostgreSQL transaction-control and whole-message syntax precedence, and retains one
-   exact quote/comment/dollar-aware scanner plus original WAL source identity. Full PostgreSQL compatibility still
-   requires broader transactional DDL and relaxation of the conservative full-generation conflict that serializes a
-   staged CREATE
+   exact quote/comment/dollar-aware scanner plus original WAL source identity. The independently accepted COPY slice
+   moves simple and extended text/CSV COPY FROM/TO plus tokio-postgres coverage onto the canonical server. COPY FROM
+   retains an exact engine/transaction/relation proof through zero-row or nonempty completion, repeats definitive
+   constraint validation under the commit lock before WAL, and enters the sole facade admission and canonical
+   publication owner. Simple COPY TO synthesizes its exact parsed SELECT, while extended COPY TO retains and
+   executes its exact bound SELECT AST. Full PostgreSQL compatibility still requires broader transactional DDL and
+   relaxation of the conservative full-generation conflict that serializes a staged CREATE
    after any intervening commit. The remaining SQLSTATE/type-codec breadth and named client suites remain open too.
    Product server/P8
    migration and same-slice deletion of superseded targets follow those proofs. Bounded/offloaded response streaming

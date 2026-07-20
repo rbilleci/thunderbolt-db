@@ -26,13 +26,13 @@ fn free_local_port() -> u16 {
 
 fn start_server() -> ServerGuard {
     let port = free_local_port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gpu-db-server"))
-        .args(["--listen", &format!("127.0.0.1:{port}")])
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gpu-db-engine-server"))
+        .arg(format!("127.0.0.1:{port}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn gpu-db-server");
+        .expect("spawn gpu-db-engine-server");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -43,7 +43,7 @@ fn start_server() -> ServerGuard {
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("gpu-db-server did not start listening on 127.0.0.1:{port}");
+    panic!("gpu-db-engine-server did not start listening on 127.0.0.1:{port}");
 }
 
 async fn connect(port: u16) -> Result<Client, tokio_postgres::Error> {
@@ -60,7 +60,7 @@ async fn connect(port: u16) -> Result<Client, tokio_postgres::Error> {
 }
 
 #[tokio::test]
-async fn tokio_postgres_supported_subset_smoke_with_unsupported_recovery(
+async fn canonical_server_tokio_postgres_copy_and_recovery_smoke(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server = start_server();
     let client = connect(server.port).await?;
@@ -109,8 +109,7 @@ async fn tokio_postgres_supported_subset_smoke_with_unsupported_recovery(
         .await?;
     pin_mut!(copy_sink);
     copy_sink.send_all(&mut copy_stream).await?;
-    let copied = copy_sink.finish().await?;
-    assert_eq!(copied, 2);
+    assert_eq!(copy_sink.finish().await?, 2);
 
     let copied_rows = client
         .query(

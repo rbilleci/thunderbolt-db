@@ -351,6 +351,7 @@ pub fn error_sqlstate(category: ErrorCategory) -> &'static str {
         ErrorCategory::Unsupported => "0A000",
         ErrorCategory::UndefinedRelation => "42P01",
         ErrorCategory::UndefinedColumn => "42703",
+        ErrorCategory::DuplicateColumn => "42701",
         ErrorCategory::IndeterminateDatatype => "42P18",
         ErrorCategory::DatatypeMismatch => "42804",
         ErrorCategory::InvalidRequest => "08P01",
@@ -390,8 +391,10 @@ pub fn command_complete_tag(outcome: &QueryOutcome) -> String {
             CommandTag::Insert => format!("INSERT 0 {}", rows_affected.unwrap_or(0)),
             CommandTag::Update => format!("UPDATE {}", rows_affected.unwrap_or(0)),
             CommandTag::Delete => format!("DELETE {}", rows_affected.unwrap_or(0)),
+            CommandTag::Copy => format!("COPY {}", rows_affected.unwrap_or(0)),
             CommandTag::Other(label) => label.clone(),
         },
+        QueryOutcome::CopyIn { .. } => String::new(),
     }
 }
 
@@ -405,6 +408,7 @@ fn command_tag_label(tag: &CommandTag) -> &str {
         CommandTag::Insert => "INSERT",
         CommandTag::Update => "UPDATE",
         CommandTag::Delete => "DELETE",
+        CommandTag::Copy => "COPY",
         CommandTag::Other(label) => label,
     }
 }
@@ -530,6 +534,7 @@ mod tests {
     fn maps_neutral_error_categories_to_sqlstate() {
         assert_eq!(error_sqlstate(ErrorCategory::Syntax), "42601");
         assert_eq!(error_sqlstate(ErrorCategory::Unsupported), "0A000");
+        assert_eq!(error_sqlstate(ErrorCategory::DuplicateColumn), "42701");
         assert_eq!(error_sqlstate(ErrorCategory::UniqueViolation), "23505");
         assert_eq!(error_sqlstate(ErrorCategory::Engine), "XX000");
     }

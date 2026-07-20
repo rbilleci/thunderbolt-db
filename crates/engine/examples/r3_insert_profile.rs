@@ -195,7 +195,7 @@ fn run_path_a(rows: usize) -> Result<WallSamples, Box<dyn Error>> {
 /// Path B: the apply+commit decomposition. Same single-row commits, but from pre-materialized SqlValue
 /// rows (so no SQL parse), capturing the 11-stage profile per row.
 fn run_path_b(rows: usize) -> Result<(WallSamples, StageTotals), Box<dyn Error>> {
-    let mut engine = Engine::new_local();
+    let engine = Engine::new_local();
     engine.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")?;
 
     let copy = CopyFromStdin {

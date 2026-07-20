@@ -38,6 +38,7 @@ fn copy_to_stdout_table_detection_is_narrow() {
         parse_copy_to_stdout_table("COPY public.people TO STDOUT;"),
         Some(gpu_db_protocol::CopyToStdout {
             table: "people".to_string(),
+            columns: None,
             options: CopyOptions::TEXT,
         })
     );
@@ -45,6 +46,7 @@ fn copy_to_stdout_table_detection_is_narrow() {
         parse_copy_to_stdout_table("/* comment */ COPY people TO STDOUT"),
         Some(gpu_db_protocol::CopyToStdout {
             table: "people".to_string(),
+            columns: None,
             options: CopyOptions::TEXT,
         })
     );
@@ -52,6 +54,7 @@ fn copy_to_stdout_table_detection_is_narrow() {
         parse_copy_to_stdout_table("COPY people TO STDOUT WITH CSV"),
         Some(gpu_db_protocol::CopyToStdout {
             table: "people".to_string(),
+            columns: None,
             options: CopyOptions::CSV,
         })
     );
@@ -59,6 +62,7 @@ fn copy_to_stdout_table_detection_is_narrow() {
         parse_copy_to_stdout_table("COPY people TO STDOUT WITH CSV HEADER"),
         Some(gpu_db_protocol::CopyToStdout {
             table: "people".to_string(),
+            columns: None,
             options: CopyOptions::CSV_HEADER,
         })
     );
@@ -68,6 +72,7 @@ fn copy_to_stdout_table_detection_is_narrow() {
         ),
         Some(gpu_db_protocol::CopyToStdout {
             table: "people".to_string(),
+            columns: None,
             options: CopyOptions {
                 format: CopyFormat::Csv,
                 header: true,
@@ -83,6 +88,7 @@ fn copy_to_stdout_table_detection_is_narrow() {
         ),
         Some(gpu_db_protocol::CopyToStdout {
             table: "people".to_string(),
+            columns: None,
             options: CopyOptions {
                 format: CopyFormat::Csv,
                 header: true,
@@ -96,6 +102,7 @@ fn copy_to_stdout_table_detection_is_narrow() {
         parse_copy_to_stdout_table("COPY people TO STDOUT WITH (FORMAT csv, QUOTE '|')"),
         Some(gpu_db_protocol::CopyToStdout {
             table: "people".to_string(),
+            columns: None,
             options: CopyOptions {
                 format: CopyFormat::Csv,
                 header: false,
@@ -103,6 +110,14 @@ fn copy_to_stdout_table_detection_is_narrow() {
                 quote: '|',
                 escape: '|',
             }
+        })
+    );
+    assert_eq!(
+        parse_copy_to_stdout_table("COPY people (name, id) TO STDOUT"),
+        Some(gpu_db_protocol::CopyToStdout {
+            table: "people".to_string(),
+            columns: Some(vec!["name".to_string(), "id".to_string()]),
+            options: CopyOptions::TEXT,
         })
     );
     assert_eq!(parse_copy_to_stdout_table("COPY people FROM STDIN"), None);

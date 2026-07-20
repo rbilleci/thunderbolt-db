@@ -467,6 +467,85 @@ fn new_durable_shared_engine_fsyncs_commits_and_recovers_after_restart() {
 }
 
 #[test]
+fn durable_typed_copy_recovers_through_the_canonical_facade_boundary() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-facade-copy-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let segment_path = dir.join("copy.wal");
+    let copy = CopyFromStdin {
+        table: "copy_recovery".to_string(),
+        columns: Some(vec!["id".to_string(), "name".to_string()]),
+        options: gpu_db_sql::CopyOptions::CSV,
+    };
+
+    let shared = SharedEngine::new_durable(&segment_path).unwrap();
+    let mut session = shared.open_session();
+    submit_session_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE copy_recovery (id INT, name TEXT)",
+    )
+    .unwrap();
+    let QueryOutcome::CopyIn { target } = shared
+        .submit(&mut session, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("COPY start must return a target proof")
+    };
+    let wal_before = shared.read_engine().unwrap().durable_wal_records().len();
+    assert_eq!(
+        shared
+            .submit(
+                &mut session,
+                SubmissionRequest::CopyFrom {
+                    target: &target,
+                    rows: vec![
+                        vec![DbValue::Int4(1), DbValue::Null],
+                        vec![DbValue::Int4(2), DbValue::Text(String::new())],
+                    ],
+                },
+            )
+            .into_immediate()
+            .unwrap(),
+        QueryOutcome::Command {
+            tag: CommandTag::Copy,
+            rows_affected: Some(2),
+        }
+    );
+    assert_eq!(
+        shared.read_engine().unwrap().durable_wal_records().len(),
+        wal_before + 1,
+        "one COPY request appends one canonical WAL record"
+    );
+    drop(session);
+    drop(shared);
+
+    let recovered = SharedEngine::new_durable(&segment_path).unwrap();
+    let outcome =
+        submit_ephemeral_text(&recovered, "SELECT id, name FROM copy_recovery ORDER BY id")
+            .unwrap();
+    let QueryOutcome::Rows { rows, .. } = outcome else {
+        panic!("expected recovered COPY rows")
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![DbValue::Int4(1), DbValue::Null],
+            vec![DbValue::Int4(2), DbValue::Text(String::new())],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn null_maps_through_the_value_model_to_a_wire_null() {
     // M3 slice 1: SqlValue::Null → DbValue::Null → the wire boundary returns `None`
     // (the protocol's `-1` DataRow field length), while every typed value still

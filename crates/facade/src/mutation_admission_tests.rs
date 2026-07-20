@@ -65,3 +65,636 @@ fn nonconcurrent_returning_remains_unsupported_and_pre_effect() {
     assert_eq!(engine.visible_up_to(), visible_before);
     assert_eq!(engine.durable_wal_records().len(), wal_before);
 }
+
+#[test]
+fn typed_copy_uses_canonical_admission_and_explicit_transaction_publication() {
+    let shared = SharedEngine::new();
+    let mut writer = shared.open_session();
+    let mut observer = shared.open_session();
+    submit_text(
+        &shared,
+        &mut writer,
+        "CREATE TABLE copy_people (id INT, name TEXT)",
+    )
+    .unwrap();
+    let copy = CopyFromStdin {
+        table: "copy_people".to_string(),
+        columns: Some(vec!["id".to_string(), "name".to_string()]),
+        options: gpu_db_sql::CopyOptions::CSV,
+    };
+
+    let described = shared
+        .submit(&mut writer, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap();
+    let QueryOutcome::CopyIn { target } = described else {
+        panic!("COPY start must return typed input columns")
+    };
+    assert_eq!(
+        target
+            .columns()
+            .iter()
+            .map(|column| (&*column.name, column.logical_type))
+            .collect::<Vec<_>>(),
+        vec![("id", LogicalType::Int4), ("name", LogicalType::Text)]
+    );
+
+    let (visible_before, wal_before) = {
+        let engine = shared.read_engine().unwrap();
+        (engine.visible_up_to(), engine.durable_wal_records().len())
+    };
+    assert_eq!(
+        shared
+            .submit(
+                &mut writer,
+                SubmissionRequest::CopyFrom {
+                    target: &target,
+                    rows: vec![vec![DbValue::Int4(1), DbValue::Text("Ada".to_string())]],
+                },
+            )
+            .into_immediate()
+            .unwrap(),
+        QueryOutcome::Command {
+            tag: CommandTag::Copy,
+            rows_affected: Some(1),
+        }
+    );
+    let engine = shared.read_engine().unwrap();
+    assert_eq!(engine.durable_wal_records().len(), wal_before + 1);
+    assert_eq!(engine.visible_up_to(), visible_before + 1);
+
+    submit_text(&shared, &mut writer, "BEGIN").unwrap();
+    let wal_before_private = shared.read_engine().unwrap().durable_wal_records().len();
+    shared
+        .submit(
+            &mut writer,
+            SubmissionRequest::CopyFrom {
+                target: &target,
+                rows: vec![vec![DbValue::Int4(2), DbValue::Null]],
+            },
+        )
+        .into_immediate()
+        .unwrap();
+    let QueryOutcome::Rows { rows, .. } = submit_text(
+        &shared,
+        &mut writer,
+        "SELECT name FROM copy_people WHERE id = 2",
+    )
+    .unwrap() else {
+        panic!("writer COPY row must be readable in its private GPU generation")
+    };
+    assert_eq!(rows, vec![vec![DbValue::Null]]);
+    let QueryOutcome::Rows { rows, .. } = submit_text(
+        &shared,
+        &mut observer,
+        "SELECT name FROM copy_people WHERE id = 2",
+    )
+    .unwrap() else {
+        panic!("observer SELECT must return rows outcome")
+    };
+    assert!(rows.is_empty(), "uncommitted COPY must not publish");
+    assert_eq!(
+        shared.read_engine().unwrap().durable_wal_records().len(),
+        wal_before_private,
+        "staged COPY claims no WAL"
+    );
+    submit_text(&shared, &mut writer, "ROLLBACK").unwrap();
+    assert_eq!(
+        shared.read_engine().unwrap().durable_wal_records().len(),
+        wal_before_private
+    );
+
+    submit_text(&shared, &mut writer, "BEGIN").unwrap();
+    shared
+        .submit(
+            &mut writer,
+            SubmissionRequest::CopyFrom {
+                target: &target,
+                rows: vec![vec![DbValue::Int4(3), DbValue::Text(String::new())]],
+            },
+        )
+        .into_immediate()
+        .unwrap();
+    submit_text(&shared, &mut writer, "COMMIT").unwrap();
+    assert_eq!(
+        shared.read_engine().unwrap().durable_wal_records().len(),
+        wal_before_private + 1,
+        "COMMIT owns the sole WAL claim for staged COPY"
+    );
+    let QueryOutcome::Rows { rows, .. } = submit_text(
+        &shared,
+        &mut observer,
+        "SELECT name FROM copy_people WHERE id = 3",
+    )
+    .unwrap() else {
+        panic!("observer SELECT must return rows outcome")
+    };
+    assert_eq!(rows, vec![vec![DbValue::Text(String::new())]]);
+}
+
+#[test]
+fn copy_description_errors_are_pre_effect_and_fail_an_explicit_transaction() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    submit_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE valid_copy_target (id INT PRIMARY KEY)",
+    )
+    .unwrap();
+    let valid = CopyFromStdin {
+        table: "valid_copy_target".to_string(),
+        columns: None,
+        options: gpu_db_sql::CopyOptions::TEXT,
+    };
+    let QueryOutcome::CopyIn {
+        target: valid_target,
+    } = shared
+        .submit(&mut session, SubmissionRequest::CopyFromStart(&valid))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("valid COPY start must return a target")
+    };
+    let missing = CopyFromStdin {
+        table: "missing_copy_target".to_string(),
+        columns: None,
+        options: gpu_db_sql::CopyOptions::TEXT,
+    };
+    let before = {
+        let engine = shared.read_engine().unwrap();
+        (engine.visible_up_to(), engine.durable_wal_records().len())
+    };
+    let error = shared
+        .submit(&mut session, SubmissionRequest::CopyFromStart(&missing))
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::UndefinedRelation);
+    let engine = shared.read_engine().unwrap();
+    assert_eq!(
+        (engine.visible_up_to(), engine.durable_wal_records().len()),
+        before
+    );
+
+    submit_text(&shared, &mut session, "BEGIN").unwrap();
+    let error = shared
+        .submit(&mut session, SubmissionRequest::CopyFromStart(&missing))
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::UndefinedRelation);
+    assert_eq!(
+        session.transaction_status(),
+        SessionTransactionStatus::FailedTransaction
+    );
+    let error = shared
+        .revalidate_copy_target(&session, &valid_target)
+        .unwrap_err();
+    assert_eq!(
+        error.category,
+        ErrorCategory::InFailedTransaction,
+        "failed-transaction precedence must outrank target/catalog revalidation"
+    );
+    submit_text(&shared, &mut session, "ROLLBACK").unwrap();
+    let engine = shared.read_engine().unwrap();
+    assert_eq!(
+        (engine.visible_up_to(), engine.durable_wal_records().len()),
+        before
+    );
+}
+
+#[test]
+fn copy_target_proof_rejects_drop_recreate_before_any_copy_effect() {
+    let shared = SharedEngine::new();
+    let mut copy_session = shared.open_session();
+    let mut ddl_session = shared.open_session();
+    submit_text(
+        &shared,
+        &mut ddl_session,
+        "CREATE TABLE copy_generation (id INT PRIMARY KEY, name TEXT)",
+    )
+    .unwrap();
+    let copy = CopyFromStdin {
+        table: "copy_generation".to_string(),
+        columns: Some(vec!["id".to_string(), "name".to_string()]),
+        options: gpu_db_sql::CopyOptions::CSV,
+    };
+    let QueryOutcome::CopyIn { target } = shared
+        .submit(&mut copy_session, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("COPY start must retain its target proof")
+    };
+
+    submit_text(&shared, &mut ddl_session, "DROP TABLE copy_generation").unwrap();
+    submit_text(
+        &shared,
+        &mut ddl_session,
+        "CREATE TABLE copy_generation (id INT PRIMARY KEY, name TEXT)",
+    )
+    .unwrap();
+    let before_copy = {
+        let engine = shared.read_engine().unwrap();
+        (engine.visible_up_to(), engine.durable_wal_records().len())
+    };
+    let error = shared
+        .submit(
+            &mut copy_session,
+            SubmissionRequest::CopyFrom {
+                target: &target,
+                rows: Vec::new(),
+            },
+        )
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Serialization);
+    {
+        let engine = shared.read_engine().unwrap();
+        assert_eq!(
+            (engine.visible_up_to(), engine.durable_wal_records().len()),
+            before_copy,
+            "stale COPY 0 must fail before sequence, WAL, or publication"
+        );
+    }
+    let error = shared
+        .submit(
+            &mut copy_session,
+            SubmissionRequest::CopyFrom {
+                target: &target,
+                rows: vec![vec![DbValue::Int4(9), DbValue::Text("stale".to_string())]],
+            },
+        )
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Serialization);
+    let engine = shared.read_engine().unwrap();
+    assert_eq!(
+        (engine.visible_up_to(), engine.durable_wal_records().len()),
+        before_copy,
+        "a stale COPY target must fail before sequence, WAL, or publication"
+    );
+    let QueryOutcome::Rows { rows, .. } =
+        submit_text(&shared, &mut copy_session, "SELECT id FROM copy_generation").unwrap()
+    else {
+        panic!("replacement table SELECT must return rows")
+    };
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn explicit_transaction_copy_revalidates_its_target_before_staging_empty_rows() {
+    let shared = SharedEngine::new();
+    let mut copy_session = shared.open_session();
+    let mut ddl_session = shared.open_session();
+    submit_text(
+        &shared,
+        &mut ddl_session,
+        "CREATE TABLE copy_txn_stale (id INT PRIMARY KEY, name TEXT)",
+    )
+    .unwrap();
+    submit_text(&shared, &mut copy_session, "BEGIN").unwrap();
+    let copy = CopyFromStdin {
+        table: "copy_txn_stale".to_string(),
+        columns: Some(vec!["id".to_string(), "name".to_string()]),
+        options: gpu_db_sql::CopyOptions::CSV,
+    };
+    let QueryOutcome::CopyIn { target } = shared
+        .submit(&mut copy_session, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("transaction COPY start must return a target")
+    };
+    assert_eq!(
+        target.transaction_identity, None,
+        "a published target remains portable but must be revalidated against the transaction"
+    );
+    for ddl in [
+        "DROP TABLE copy_txn_stale",
+        "CREATE TABLE copy_txn_stale (id INT PRIMARY KEY, name TEXT)",
+    ] {
+        submit_text(&shared, &mut ddl_session, ddl).unwrap();
+    }
+    let before_copy = {
+        let engine = shared.read_engine().unwrap();
+        (engine.visible_up_to(), engine.durable_wal_records().len())
+    };
+    let error = shared
+        .submit(
+            &mut copy_session,
+            SubmissionRequest::CopyFrom {
+                target: &target,
+                rows: Vec::new(),
+            },
+        )
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Serialization);
+    assert_eq!(
+        copy_session.transaction_status(),
+        SessionTransactionStatus::FailedTransaction
+    );
+    let engine = shared.read_engine().unwrap();
+    assert_eq!(
+        (engine.visible_up_to(), engine.durable_wal_records().len()),
+        before_copy,
+        "stale explicit COPY 0 must not stage a delta, claim WAL, or publish"
+    );
+    submit_text(&shared, &mut copy_session, "ROLLBACK").unwrap();
+}
+
+#[test]
+fn prepared_copy_to_rejects_a_mutating_bound_owner_before_any_effect() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    submit_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE copy_to_owner_guard (id INT PRIMARY KEY)",
+    )
+    .unwrap();
+    let mutating = shared
+        .prepare_statement(
+            &session,
+            "INSERT INTO copy_to_owner_guard (id) VALUES (7) RETURNING id",
+            &[],
+        )
+        .unwrap()
+        .bind_values(&[])
+        .unwrap();
+    let copy = CopyToStdout {
+        table: "copy_to_owner_guard".to_string(),
+        columns: Some(vec!["id".to_string()]),
+        options: gpu_db_sql::CopyOptions::CSV,
+    };
+    let before = {
+        let engine = shared.read_engine().unwrap();
+        (engine.visible_up_to(), engine.durable_wal_records().len())
+    };
+    let error = shared
+        .submit(
+            &mut session,
+            SubmissionRequest::PreparedCopyTo {
+                copy: &copy,
+                bound: &mutating,
+            },
+        )
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::InvalidRequest);
+    let engine = shared.read_engine().unwrap();
+    assert_eq!(
+        (engine.visible_up_to(), engine.durable_wal_records().len()),
+        before,
+        "mismatched prepared COPY TO owner must fail before mutation admission"
+    );
+    let QueryOutcome::Rows { rows, .. } =
+        submit_text(&shared, &mut session, "SELECT id FROM copy_to_owner_guard").unwrap()
+    else {
+        panic!("guard table SELECT must return rows")
+    };
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn copy_target_is_bound_to_the_shared_engine_that_described_it() {
+    let source = SharedEngine::new();
+    let destination = SharedEngine::new();
+    let mut source_session = source.open_session();
+    let mut destination_session = destination.open_session();
+    for (shared, session) in [
+        (&source, &mut source_session),
+        (&destination, &mut destination_session),
+    ] {
+        submit_text(
+            shared,
+            session,
+            "CREATE TABLE copy_engine_owner (id INT PRIMARY KEY, name TEXT)",
+        )
+        .unwrap();
+    }
+    let copy = CopyFromStdin {
+        table: "copy_engine_owner".to_string(),
+        columns: Some(vec!["id".to_string(), "name".to_string()]),
+        options: gpu_db_sql::CopyOptions::CSV,
+    };
+    let QueryOutcome::CopyIn {
+        target: source_target,
+    } = source
+        .submit(&mut source_session, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("source COPY start must return a target")
+    };
+    let QueryOutcome::CopyIn {
+        target: destination_target,
+    } = destination
+        .submit(
+            &mut destination_session,
+            SubmissionRequest::CopyFromStart(&copy),
+        )
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("destination COPY start must return a target")
+    };
+    assert_eq!(
+        source_target.proof, destination_target.proof,
+        "the regression requires independently built engines with value-identical relation proofs"
+    );
+    assert_ne!(source_target, destination_target);
+
+    let before = {
+        let engine = destination.read_engine().unwrap();
+        (engine.visible_up_to(), engine.durable_wal_records().len())
+    };
+    let error = destination
+        .revalidate_copy_target(&destination_session, &source_target)
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::InvalidRequest);
+    let error = destination
+        .submit(
+            &mut destination_session,
+            SubmissionRequest::CopyFrom {
+                target: &source_target,
+                rows: vec![vec![
+                    DbValue::Int4(9),
+                    DbValue::Text("wrong engine".to_string()),
+                ]],
+            },
+        )
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::InvalidRequest);
+    let engine = destination.read_engine().unwrap();
+    assert_eq!(
+        (engine.visible_up_to(), engine.durable_wal_records().len()),
+        before,
+        "cross-engine COPY must fail before transaction identity, WAL, or publication"
+    );
+    let QueryOutcome::Rows { rows, .. } = submit_text(
+        &destination,
+        &mut destination_session,
+        "SELECT id FROM copy_engine_owner",
+    )
+    .unwrap() else {
+        panic!("destination table SELECT must return rows")
+    };
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn copy_target_is_bound_to_its_transaction_catalog_context() {
+    let shared = SharedEngine::new();
+    let mut session = shared.open_session();
+    submit_text(&shared, &mut session, "BEGIN").unwrap();
+    submit_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE copy_txn_owner (id INT PRIMARY KEY, name TEXT)",
+    )
+    .unwrap();
+    let copy = CopyFromStdin {
+        table: "copy_txn_owner".to_string(),
+        columns: Some(vec!["id".to_string(), "name".to_string()]),
+        options: gpu_db_sql::CopyOptions::CSV,
+    };
+    let QueryOutcome::CopyIn { target: stale } = shared
+        .submit(&mut session, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("transaction-private COPY start must return a target")
+    };
+    let private_txn_id = stale
+        .transaction_identity
+        .expect("target must retain its private transaction identity");
+    submit_text(&shared, &mut session, "ROLLBACK").unwrap();
+    submit_text(
+        &shared,
+        &mut session,
+        "CREATE TABLE copy_txn_owner (id INT PRIMARY KEY, name TEXT)",
+    )
+    .unwrap();
+    let QueryOutcome::CopyIn { target: current } = shared
+        .submit(&mut session, SubmissionRequest::CopyFromStart(&copy))
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("published COPY start must return a target")
+    };
+    assert_eq!(
+        stale.proof, current.proof,
+        "the regression requires rollback/recreate to reuse a value-identical relation proof"
+    );
+    assert_eq!(current.transaction_identity, None);
+    assert_eq!(stale.transaction_identity, Some(private_txn_id));
+
+    let before = {
+        let engine = shared.read_engine().unwrap();
+        (engine.visible_up_to(), engine.durable_wal_records().len())
+    };
+    let error = shared.revalidate_copy_target(&session, &stale).unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Serialization);
+    let error = shared
+        .submit(
+            &mut session,
+            SubmissionRequest::CopyFrom {
+                target: &stale,
+                rows: vec![vec![
+                    DbValue::Int4(9),
+                    DbValue::Text("stale transaction".to_string()),
+                ]],
+            },
+        )
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Serialization);
+    let engine = shared.read_engine().unwrap();
+    assert_eq!(
+        (engine.visible_up_to(), engine.durable_wal_records().len()),
+        before,
+        "a transaction-bound target must fail before WAL or publication after rollback"
+    );
+}
+
+#[test]
+fn private_and_published_value_identical_targets_keep_overlay_provenance() {
+    let shared = SharedEngine::new();
+    let mut private_session = shared.open_session();
+    let mut published_session = shared.open_session();
+    submit_text(&shared, &mut private_session, "BEGIN").unwrap();
+    submit_text(
+        &shared,
+        &mut private_session,
+        "CREATE TABLE copy_overlay_twin (id INT PRIMARY KEY, name TEXT)",
+    )
+    .unwrap();
+    let copy = CopyFromStdin {
+        table: "copy_overlay_twin".to_string(),
+        columns: Some(vec!["id".to_string(), "name".to_string()]),
+        options: gpu_db_sql::CopyOptions::CSV,
+    };
+    let QueryOutcome::CopyIn {
+        target: private_target,
+    } = submit_copy_from_start_with_hook(&shared, &mut private_session, &copy, || {
+        submit_text(
+            &shared,
+            &mut published_session,
+            "CREATE TABLE copy_overlay_twin (id INT PRIMARY KEY, name TEXT)",
+        )
+        .unwrap();
+    })
+    .unwrap()
+    else {
+        panic!("private COPY start must return a target")
+    };
+    let QueryOutcome::CopyIn {
+        target: published_target,
+    } = shared
+        .submit(
+            &mut published_session,
+            SubmissionRequest::CopyFromStart(&copy),
+        )
+        .into_immediate()
+        .unwrap()
+    else {
+        panic!("published COPY start must return a target")
+    };
+    assert_eq!(
+        private_target.proof, published_target.proof,
+        "the adversarial private/global twin must have value-identical metadata"
+    );
+    assert!(
+        private_target.transaction_identity.is_some(),
+        "overlay provenance, not proof equality, must bind the private target"
+    );
+    assert_eq!(published_target.transaction_identity, None);
+
+    submit_text(&shared, &mut private_session, "ROLLBACK").unwrap();
+    let before = {
+        let engine = shared.read_engine().unwrap();
+        (engine.visible_up_to(), engine.durable_wal_records().len())
+    };
+    let error = shared
+        .submit(
+            &mut published_session,
+            SubmissionRequest::CopyFrom {
+                target: &private_target,
+                rows: vec![vec![
+                    DbValue::Int4(9),
+                    DbValue::Text("must not cross overlay".to_string()),
+                ]],
+            },
+        )
+        .into_immediate()
+        .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Serialization);
+    let engine = shared.read_engine().unwrap();
+    assert_eq!(
+        (engine.visible_up_to(), engine.durable_wal_records().len()),
+        before,
+        "rolled-back overlay target must not mutate its published value-identical twin"
+    );
+}

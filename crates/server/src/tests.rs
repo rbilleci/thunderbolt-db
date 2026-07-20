@@ -93,6 +93,29 @@ fn blocking_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
     assert_error_sqlstate(&pending_syntax, b"C42601\0");
     assert_eq!(pending_syntax[1].1, vec![b'I']);
 
+    // COPY's protocol classification must not outrank whole-message syntax analysis. The invalid
+    // ordinary span wins with 42601, and the prefix DDL is never executed.
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload(
+                "CREATE TABLE blocking_copy_preflight_must_not_publish (id int4); \
+                 SELECT FROM; \
+                 COPY blocking_copy_preflight_must_not_publish FROM STDIN",
+            ),
+        ))
+        .unwrap();
+    let copy_syntax = read_messages(&mut client, 2);
+    assert_error_sqlstate(&copy_syntax, b"C42601\0");
+    assert_eq!(copy_syntax[1].1, vec![b'I']);
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE blocking_copy_preflight_must_not_publish (id int4)"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut client, 2), vec![b'C', b'Z']);
+
     client
         .write_all(&tagged(
             b'Q',
@@ -461,6 +484,29 @@ async fn async_multi_statement_simple_query_is_atomic_and_emits_one_ready() {
     let pending_syntax = read_messages_async(&mut client, 2).await;
     assert_error_sqlstate(&pending_syntax, b"C42601\0");
     assert_eq!(pending_syntax[1].1, vec![b'I']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload(
+                "CREATE TABLE async_copy_preflight_must_not_publish (id int4); \
+                 SELECT FROM; \
+                 COPY async_copy_preflight_must_not_publish FROM STDIN",
+            ),
+        ))
+        .await
+        .unwrap();
+    let copy_syntax = read_messages_async(&mut client, 2).await;
+    assert_error_sqlstate(&copy_syntax, b"C42601\0");
+    assert_eq!(copy_syntax[1].1, vec![b'I']);
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE async_copy_preflight_must_not_publish (id int4)"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_tags_async(&mut client, 2).await, vec![b'C', b'Z']);
 
     client
         .write_all(&tagged(
@@ -1549,6 +1595,389 @@ async fn tokio_postgres_drives_the_async_extended_ingress() {
     connection.await.unwrap();
     server.abort();
     let _ = server.await;
+}
+
+#[test]
+fn blocking_simple_copy_from_to_abort_and_transaction_boundaries() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let engine = SharedEngine::new();
+        handle_connection(&mut stream, &engine).unwrap();
+    });
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client.write_all(&startup_frame()).unwrap();
+    let _ = read_messages(&mut client, 6);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE copy_simple (id INT, name TEXT)"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut client, 2), vec![b'C', b'Z']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("COPY copy_simple (id, name) FROM STDIN WITH CSV"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut client, 1), vec![b'G']);
+    client
+        .write_all(&tagged(b'd', b"1,Ada\n2,\n3,\"\"\n"))
+        .unwrap();
+    client.write_all(&tagged(b'c', &[])).unwrap();
+    let copied = read_messages(&mut client, 2);
+    assert_eq!(copied[0], (b'C', b"COPY 3\0".to_vec()));
+    assert_eq!(copied[1], (b'Z', vec![b'I']));
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("COPY copy_simple (name, id) TO STDOUT WITH CSV HEADER"),
+        ))
+        .unwrap();
+    let copy_out = read_messages(&mut client, 7);
+    assert_eq!(
+        copy_out.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+        vec![b'H', b'd', b'd', b'd', b'd', b'c', b'C']
+    );
+    assert_eq!(copy_out[1].1, b"name,id\n");
+    assert_eq!(copy_out[2].1, b"Ada,1\n");
+    assert_eq!(copy_out[3].1, b",2\n");
+    assert_eq!(copy_out[4].1, b"\"\",3\n");
+    assert_eq!(read_messages(&mut client, 1), vec![(b'Z', vec![b'I'])]);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("COPY copy_simple (id, name) FROM STDIN WITH CSV"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut client, 1), vec![b'G']);
+    client
+        .write_all(&tagged(b'd', b"4,must-not-publish\n"))
+        .unwrap();
+    client.write_all(&tagged(b'f', b"client abort\0")).unwrap();
+    let aborted = read_messages(&mut client, 2);
+    assert_error_sqlstate(&aborted, b"C57014\0");
+
+    client
+        .write_all(&tagged(b'Q', &query_payload("BEGIN")))
+        .unwrap();
+    assert_eq!(read_messages(&mut client, 2)[1].1, vec![b'T']);
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("COPY copy_simple (id, name) FROM STDIN WITH CSV"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut client, 1), vec![b'G']);
+    client.write_all(&tagged(b'd', b"5,priv\xc3")).unwrap();
+    client.write_all(&tagged(b'd', b"\xa9\n")).unwrap();
+    client.write_all(&tagged(b'c', &[])).unwrap();
+    let private = read_messages(&mut client, 2);
+    assert_eq!(private[0], (b'C', b"COPY 1\0".to_vec()));
+    assert_eq!(private[1], (b'Z', vec![b'T']));
+    client
+        .write_all(&tagged(b'Q', &query_payload("ROLLBACK")))
+        .unwrap();
+    assert_eq!(read_messages(&mut client, 2)[1].1, vec![b'I']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload(
+                "CREATE TABLE copy_prefix_must_not_publish (id INT); \
+                 COPY copy_simple FROM STDIN",
+            ),
+        ))
+        .unwrap();
+    let multi = read_messages(&mut client, 2);
+    assert_error_sqlstate(&multi, b"C0A000\0");
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE copy_prefix_must_not_publish (id INT)"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut client, 2), vec![b'C', b'Z']);
+
+    client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("SELECT COUNT(*) FROM copy_simple"),
+        ))
+        .unwrap();
+    let count = read_messages(&mut client, 4);
+    assert_eq!(
+        count.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+        vec![b'T', b'D', b'C', b'Z']
+    );
+    assert!(
+        count[1].1.ends_with(b"3"),
+        "unexpected COUNT row: {:?}",
+        count[1]
+    );
+
+    client.write_all(&tagged(b'X', &[])).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn copy_parse_and_completion_bind_to_the_analyzed_relation_generation() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let engine = std::sync::Arc::new(SharedEngine::new());
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let engine = std::sync::Arc::clone(&engine);
+            workers.push(std::thread::spawn(move || {
+                handle_connection(&mut stream, &engine).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    let mut copy_client = TcpStream::connect(address).unwrap();
+    let mut ddl_client = TcpStream::connect(address).unwrap();
+    for client in [&copy_client, &ddl_client] {
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+    }
+    copy_client.write_all(&startup_frame()).unwrap();
+    ddl_client.write_all(&startup_frame()).unwrap();
+    let _ = read_messages(&mut copy_client, 6);
+    let _ = read_messages(&mut ddl_client, 6);
+
+    let mut missing_parse = tagged(
+        b'P',
+        &parse_payload(
+            "missing_copy",
+            "COPY copy_parse_missing (id) FROM STDIN WITH CSV",
+            &[],
+        ),
+    );
+    missing_parse.extend(tagged(b'S', &[]));
+    copy_client.write_all(&missing_parse).unwrap();
+    let missing = read_messages(&mut copy_client, 2);
+    assert_eq!(
+        missing.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+        vec![b'E', b'Z']
+    );
+    assert_error_sqlstate(&missing, b"C42P01\0");
+
+    ddl_client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("CREATE TABLE copy_generation_wire (id INT PRIMARY KEY, name TEXT)"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut ddl_client, 2), vec![b'C', b'Z']);
+
+    copy_client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("COPY copy_generation_wire (id, name) FROM STDIN WITH CSV"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut copy_client, 1), vec![b'G']);
+    for ddl in [
+        "DROP TABLE copy_generation_wire",
+        "CREATE TABLE copy_generation_wire (id INT PRIMARY KEY, name TEXT)",
+    ] {
+        ddl_client
+            .write_all(&tagged(b'Q', &query_payload(ddl)))
+            .unwrap();
+        assert_eq!(read_tags(&mut ddl_client, 2), vec![b'C', b'Z']);
+    }
+    copy_client
+        .write_all(&tagged(b'd', b"9,must-not-land\n"))
+        .unwrap();
+    copy_client.write_all(&tagged(b'c', &[])).unwrap();
+    let stale_done = read_messages(&mut copy_client, 2);
+    assert_error_sqlstate(&stale_done, b"C40001\0");
+    assert_eq!(stale_done[1], (b'Z', vec![b'I']));
+
+    let mut valid_parse = tagged(
+        b'P',
+        &parse_payload(
+            "stale_copy_description",
+            "COPY copy_generation_wire (id, name) FROM STDIN WITH CSV",
+            &[],
+        ),
+    );
+    valid_parse.extend(tagged(b'S', &[]));
+    copy_client.write_all(&valid_parse).unwrap();
+    assert_eq!(read_tags(&mut copy_client, 2), vec![b'1', b'Z']);
+    for ddl in [
+        "DROP TABLE copy_generation_wire",
+        "CREATE TABLE copy_generation_wire (id INT PRIMARY KEY, name TEXT)",
+    ] {
+        ddl_client
+            .write_all(&tagged(b'Q', &query_payload(ddl)))
+            .unwrap();
+        assert_eq!(read_tags(&mut ddl_client, 2), vec![b'C', b'Z']);
+    }
+    let mut describe = tagged(b'D', &describe_payload(b'S', "stale_copy_description"));
+    describe.extend(tagged(b'S', &[]));
+    copy_client.write_all(&describe).unwrap();
+    let stale_description = read_messages(&mut copy_client, 2);
+    assert_error_sqlstate(&stale_description, b"C40001\0");
+    assert_eq!(stale_description[1], (b'Z', vec![b'I']));
+
+    let mut execute_stale_parse = tagged(
+        b'P',
+        &parse_payload(
+            "stale_copy_execute",
+            "COPY copy_generation_wire (id, name) FROM STDIN WITH CSV",
+            &[],
+        ),
+    );
+    execute_stale_parse.extend(tagged(b'S', &[]));
+    copy_client.write_all(&execute_stale_parse).unwrap();
+    assert_eq!(read_tags(&mut copy_client, 2), vec![b'1', b'Z']);
+    for ddl in [
+        "DROP TABLE copy_generation_wire",
+        "CREATE TABLE copy_generation_wire (id INT PRIMARY KEY, name TEXT)",
+    ] {
+        ddl_client
+            .write_all(&tagged(b'Q', &query_payload(ddl)))
+            .unwrap();
+        assert_eq!(read_tags(&mut ddl_client, 2), vec![b'C', b'Z']);
+    }
+    let mut execute_stale = tagged(
+        b'B',
+        &bind_payload("stale_copy_execute_portal", "stale_copy_execute"),
+    );
+    execute_stale.extend(tagged(
+        b'E',
+        &execute_payload("stale_copy_execute_portal", 0),
+    ));
+    execute_stale.extend(tagged(b'S', &[]));
+    copy_client.write_all(&execute_stale).unwrap();
+    let stale_execute = read_messages(&mut copy_client, 3);
+    assert_eq!(
+        stale_execute
+            .iter()
+            .map(|(tag, _)| *tag)
+            .collect::<Vec<_>>(),
+        vec![b'2', b'E', b'Z'],
+        "stale COPY FROM Execute must fail before CopyInResponse (G)"
+    );
+    assert!(stale_execute[1]
+        .1
+        .windows(b"C40001\0".len())
+        .any(|window| window == b"C40001\0"));
+
+    let mut copy_to_parse_bind = tagged(
+        b'P',
+        &parse_payload(
+            "stale_copy_to",
+            "COPY copy_generation_wire TO STDOUT WITH CSV",
+            &[],
+        ),
+    );
+    copy_to_parse_bind.extend(tagged(
+        b'B',
+        &bind_payload("stale_copy_to_portal", "stale_copy_to"),
+    ));
+    copy_client.write_all(&copy_to_parse_bind).unwrap();
+    assert_eq!(read_tags(&mut copy_client, 2), vec![b'1', b'2']);
+    ddl_client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("ALTER TABLE copy_generation_wire ADD COLUMN extra INT DEFAULT 0"),
+        ))
+        .unwrap();
+    assert_eq!(read_tags(&mut ddl_client, 2), vec![b'C', b'Z']);
+    let mut stale_copy_to_execute = tagged(b'E', &execute_payload("stale_copy_to_portal", 0));
+    stale_copy_to_execute.extend(tagged(b'S', &[]));
+    copy_client.write_all(&stale_copy_to_execute).unwrap();
+    let stale_copy_to = read_messages(&mut copy_client, 2);
+    assert_eq!(
+        stale_copy_to
+            .iter()
+            .map(|(tag, _)| *tag)
+            .collect::<Vec<_>>(),
+        vec![b'E', b'Z'],
+        "stale COPY TO must fail before CopyOutResponse (H)"
+    );
+    assert!(
+        stale_copy_to[0]
+            .1
+            .windows(b"C0A000\0".len())
+            .any(|window| window == b"C0A000\0"),
+        "unexpected stale COPY TO error: {stale_copy_to:?}"
+    );
+
+    ddl_client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("COPY copy_generation_wire (id, id) TO STDOUT WITH CSV"),
+        ))
+        .unwrap();
+    let simple_duplicate = read_messages(&mut ddl_client, 2);
+    assert_error_sqlstate(&simple_duplicate, b"C42701\0");
+
+    let mut extended_duplicate = tagged(
+        b'P',
+        &parse_payload(
+            "duplicate_copy_to",
+            "COPY copy_generation_wire (id, id) TO STDOUT WITH CSV",
+            &[],
+        ),
+    );
+    extended_duplicate.extend(tagged(
+        b'B',
+        &bind_payload("duplicate_copy_to_portal", "duplicate_copy_to"),
+    ));
+    extended_duplicate.extend(tagged(
+        b'E',
+        &execute_payload("duplicate_copy_to_portal", 0),
+    ));
+    extended_duplicate.extend(tagged(b'S', &[]));
+    copy_client.write_all(&extended_duplicate).unwrap();
+    let extended_duplicate = read_messages(&mut copy_client, 4);
+    assert_eq!(
+        extended_duplicate
+            .iter()
+            .map(|(tag, _)| *tag)
+            .collect::<Vec<_>>(),
+        vec![b'1', b'2', b'E', b'Z'],
+        "duplicate extended COPY TO must fail before H/data frames"
+    );
+    assert!(extended_duplicate[2]
+        .1
+        .windows(b"C42701\0".len())
+        .any(|window| window == b"C42701\0"));
+
+    ddl_client
+        .write_all(&tagged(
+            b'Q',
+            &query_payload("SELECT COUNT(*) FROM copy_generation_wire"),
+        ))
+        .unwrap();
+    let count = read_messages(&mut ddl_client, 4);
+    assert!(
+        count[1].1.ends_with(b"0"),
+        "stale COPY published a row: {count:?}"
+    );
+
+    copy_client.write_all(&tagged(b'X', &[])).unwrap();
+    ddl_client.write_all(&tagged(b'X', &[])).unwrap();
+    drop(copy_client);
+    drop(ddl_client);
+    server.join().unwrap();
 }
 
 fn startup_frame() -> Vec<u8> {

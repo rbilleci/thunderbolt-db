@@ -112,7 +112,7 @@ fn relational_sql_create_insert_select_uses_mvcc_execution_path() {
 
 #[test]
 fn relational_copy_rows_commit_through_engine_wal_mvcc() {
-    let mut e = Engine::new_local_test_engine();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE people (id INT PRIMARY KEY, name TEXT DEFAULT 'unknown'::text)",
@@ -227,8 +227,214 @@ fn relational_copy_rows_commit_through_engine_wal_mvcc() {
 }
 
 #[test]
+fn concurrent_copy_same_key_revalidates_before_wal_and_keeps_engine_writable() {
+    let engine = Arc::new(Engine::new_local_test_engine());
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE copy_same_key (id INT PRIMARY KEY, name TEXT)",
+        )
+        .unwrap();
+    let copy = gpu_db_sql::parse_copy_from_stdin(
+        "COPY copy_same_key (id, name) FROM STDIN WITH (FORMAT csv)",
+    )
+    .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let wal_before = engine.durable_wal_records().len();
+
+    let writers = [100_u64, 101_u64].map(|txn_id| {
+        let engine = Arc::clone(&engine);
+        let copy = copy.clone();
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            engine.execute_relational_copy_rows_instrumented(
+                txn_id,
+                &copy,
+                vec![vec![
+                    SqlValue::Int4(7),
+                    SqlValue::Text(format!("writer-{txn_id}")),
+                ]],
+                move || {
+                    barrier.wait();
+                },
+            )
+        })
+    });
+    let outcomes = writers.map(|writer| writer.join().unwrap());
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    let loser = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .expect("one same-key COPY must lose before WAL");
+    assert!(
+        loser.to_string().contains("duplicate key value"),
+        "the loser must be the definitive unique check: {loser}"
+    );
+    assert_eq!(
+        engine.durable_wal_records().len(),
+        wal_before + 1,
+        "only the valid same-key winner may claim WAL"
+    );
+
+    assert_eq!(
+        engine
+            .execute_relational_copy_rows(
+                102,
+                &copy,
+                vec![vec![
+                    SqlValue::Int4(8),
+                    SqlValue::Text("still-writable".to_string()),
+                ]],
+            )
+            .unwrap(),
+        1,
+        "a rejected COPY must not wedge the canonical commit path"
+    );
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    let Command::Select(select) =
+        parse_command("SELECT id FROM copy_same_key ORDER BY id").unwrap()
+    else {
+        panic!("expected SELECT")
+    };
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Int4(7)], vec![SqlValue::Int4(8)]]
+    );
+}
+
+#[test]
+fn copy_admits_an_absent_device_generation_without_reentering_commit_lock() {
+    let engine = Arc::new(Engine::new_local_test_engine());
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE copy_cold_admission (id INT PRIMARY KEY, name TEXT)",
+        )
+        .unwrap();
+    forget_test_relational_residency(&engine, "copy_cold_admission");
+    assert!(
+        !engine.table_has_live_dml_generation("copy_cold_admission"),
+        "the regression must begin without a device generation"
+    );
+    let copy = gpu_db_sql::parse_copy_from_stdin(
+        "COPY copy_cold_admission (id, name) FROM STDIN WITH (FORMAT csv)",
+    )
+    .unwrap();
+    let wal_before = engine.durable_wal_records().len();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            sender
+                .send(engine.execute_relational_copy_rows(
+                    2,
+                    &copy,
+                    vec![vec![
+                        SqlValue::Int4(7),
+                        SqlValue::Text("admitted".to_string()),
+                    ]],
+                ))
+                .unwrap();
+        })
+    };
+    let copied = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("COPY must not self-deadlock while admitting its device generation")
+        .unwrap();
+    worker.join().unwrap();
+
+    assert_eq!(copied, 1);
+    assert!(engine.table_has_live_dml_generation("copy_cold_admission"));
+    assert_eq!(engine.durable_wal_records().len(), wal_before + 1);
+    let recovered = Engine::recover_from_durable_wal(&engine.durable_wal_records()).unwrap();
+    let Command::Select(select) =
+        parse_command("SELECT id FROM copy_cold_admission ORDER BY id").unwrap()
+    else {
+        panic!("expected SELECT")
+    };
+    assert_eq!(
+        recovered.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Int4(7)]]
+    );
+}
+
+#[test]
+fn empty_copy_holds_the_current_boundary_across_target_check_and_return() {
+    let engine = Arc::new(Engine::new_local_test_engine());
+    engine
+        .execute_text(
+            1,
+            "CREATE TABLE copy_empty_linearized (id INT PRIMARY KEY, name TEXT)",
+        )
+        .unwrap();
+    let copy = gpu_db_sql::parse_copy_from_stdin(
+        "COPY copy_empty_linearized (id, name) FROM STDIN WITH (FORMAT csv)",
+    )
+    .unwrap();
+    let wal_before = engine.durable_wal_records().len();
+    let visible_before = engine.visible_up_to();
+    let (validated_sender, validated_receiver) = std::sync::mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+    let copy_worker = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            engine.execute_relational_empty_copy_instrumented(2, &copy, move || {
+                validated_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+            })
+        })
+    };
+    validated_receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("empty COPY must reach its under-lock target validation");
+
+    let (ddl_started_sender, ddl_started_receiver) = std::sync::mpsc::sync_channel(1);
+    let (ddl_done_sender, ddl_done_receiver) = std::sync::mpsc::sync_channel(1);
+    let ddl_worker = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            ddl_started_sender.send(()).unwrap();
+            engine
+                .execute_text(3, "DROP TABLE copy_empty_linearized")
+                .unwrap();
+            engine
+                .execute_text(
+                    4,
+                    "CREATE TABLE copy_empty_linearized (id INT PRIMARY KEY, name TEXT)",
+                )
+                .unwrap();
+            ddl_done_sender.send(()).unwrap();
+        })
+    };
+    ddl_started_receiver.recv().unwrap();
+    assert!(
+        ddl_done_receiver
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "DROP/recreate must not enter after the exact-target check while COPY owns the boundary"
+    );
+    release_sender.send(()).unwrap();
+    assert_eq!(copy_worker.join().unwrap().unwrap().0, 0);
+    ddl_done_receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("DDL must resume after empty COPY releases the boundary");
+    ddl_worker.join().unwrap();
+
+    assert_eq!(
+        engine.durable_wal_records().len(),
+        wal_before + 2,
+        "only DROP and CREATE may claim WAL; COPY 0 is effect-free"
+    );
+    assert_eq!(
+        engine.visible_up_to(),
+        visible_before + 2,
+        "COPY 0 must not advance the publication frontier"
+    );
+}
+
+#[test]
 fn relational_copy_retry_is_exact_and_mismatch_is_rejected_without_a_second_commit() {
-    let mut engine = Engine::new_local_test_engine();
+    let engine = Engine::new_local_test_engine();
     engine
         .execute_text(1, "CREATE TABLE copy_retry (id INT PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -282,7 +488,7 @@ fn relational_copy_retry_is_exact_and_mismatch_is_rejected_without_a_second_comm
 fn relational_copy_ingests_null_marker_and_selects_back_null() {
     // M3 (doc 21) Slice G: the COPY NULL marker ingests as a SQL NULL. TEXT format: the unquoted `\N`.
     // CSV format: an UNQUOTED empty field (a QUOTED empty field is the empty STRING, not NULL).
-    let mut e = Engine::new_local_test_engine();
+    let e = Engine::new_local_test_engine();
     e.execute_text(1, "CREATE TABLE t (id INT, name TEXT)")
         .unwrap();
 
@@ -360,7 +566,7 @@ fn relational_copy_round_trips_all_column_types_and_null() {
     // round-trips every value AND a `\N` NULL per type through the COPY-to-engine bridge
     // (render_sql_value_literal -> re-parsed INSERT -> store). Previously the render errored on any
     // non-int4/text/Null column ("supports int4/text rows only").
-    let mut e = Engine::new_local_test_engine();
+    let e = Engine::new_local_test_engine();
     e.execute_text(
         1,
         "CREATE TABLE tt (id INT, big BIGINT, amt NUMERIC(12,2), flag BOOL, d DATE, ts TIMESTAMP, u UUID)",

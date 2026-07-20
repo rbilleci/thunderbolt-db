@@ -6,6 +6,8 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread;
 
+use bytes::{Bytes, BytesMut};
+use futures_util::{stream, SinkExt, TryStreamExt};
 use gpu_db_engine::Engine;
 use gpu_db_execution::{CudaDriverRuntime, DeviceTarget};
 use gpu_db_facade::SharedEngine;
@@ -236,6 +238,282 @@ async fn async_ingress_server_round_trips_over_pgwire() {
         }
     }
     assert_eq!(rows, 1);
+}
+
+/// PRODUCT-001 COPY slice: async ingress uses the same facade-owned typed admission as blocking
+/// ingress. Explicit rollback, CSV NULL-vs-empty, COPY TO, parse failure, and client abort all prove
+/// that no buffered host rows become a second publication owner.
+#[tokio::test]
+async fn async_ingress_copy_is_transactional_typed_and_recovers() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = gpu_db_server::serve_async(listener).await;
+    });
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=postgres dbname=postgres"),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute("CREATE TABLE copy_t (id INT, name TEXT)")
+        .await
+        .unwrap();
+
+    client.batch_execute("BEGIN").await.unwrap();
+    let mut rollback_data = stream::iter(vec![Ok::<_, tokio_postgres::Error>(Bytes::from_static(
+        b"9,rolled back\n",
+    ))]);
+    let rollback_sink = client
+        .copy_in("COPY copy_t (id, name) FROM STDIN WITH CSV")
+        .await
+        .unwrap();
+    futures_util::pin_mut!(rollback_sink);
+    rollback_sink.send_all(&mut rollback_data).await.unwrap();
+    assert_eq!(rollback_sink.finish().await.unwrap(), 1);
+    assert_eq!(
+        client
+            .query_one("SELECT COUNT(*) FROM copy_t", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    client.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT COUNT(*) FROM copy_t", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+
+    let mut typed_data = stream::iter(vec![Ok::<_, tokio_postgres::Error>(Bytes::from_static(
+        b"1,\n2,\"\"\n",
+    ))]);
+    let typed_sink = client
+        .copy_in("COPY copy_t (id, name) FROM STDIN WITH CSV")
+        .await
+        .unwrap();
+    futures_util::pin_mut!(typed_sink);
+    typed_sink.send_all(&mut typed_data).await.unwrap();
+    assert_eq!(typed_sink.finish().await.unwrap(), 2);
+    let typed_rows = client
+        .query("SELECT id, name FROM copy_t ORDER BY id", &[])
+        .await
+        .unwrap();
+    assert_eq!(typed_rows[0].get::<_, Option<String>>(1), None);
+    assert_eq!(
+        typed_rows[1].get::<_, Option<String>>(1),
+        Some(String::new())
+    );
+
+    let copy_out_statement = client
+        .prepare("COPY copy_t TO STDOUT WITH CSV")
+        .await
+        .unwrap();
+    let copy_out = client
+        .copy_out(&copy_out_statement)
+        .await
+        .unwrap()
+        .try_fold(BytesMut::new(), |mut output, chunk| async move {
+            output.extend_from_slice(&chunk);
+            Ok(output)
+        })
+        .await
+        .unwrap();
+    assert_eq!(&copy_out[..], b"1,\n2,\"\"\n");
+
+    let mut invalid_data = stream::iter(vec![Ok::<_, tokio_postgres::Error>(Bytes::from_static(
+        b"not-an-int,bad\n",
+    ))]);
+    let invalid_sink = client
+        .copy_in("COPY copy_t (id, name) FROM STDIN WITH CSV")
+        .await
+        .unwrap();
+    futures_util::pin_mut!(invalid_sink);
+    invalid_sink.send_all(&mut invalid_data).await.unwrap();
+    let invalid = invalid_sink.finish().await.unwrap_err();
+    assert_eq!(invalid.code().map(|code| code.code()), Some("22P02"));
+
+    let mut abort_sink = Box::pin(
+        client
+            .copy_in("COPY copy_t (id, name) FROM STDIN WITH CSV")
+            .await
+            .unwrap(),
+    );
+    abort_sink
+        .send(Bytes::from_static(b"3,must-not-publish\n"))
+        .await
+        .unwrap();
+    abort_sink.flush().await.unwrap();
+    drop(abort_sink);
+
+    assert_eq!(
+        client
+            .query_one("SELECT COUNT(*) FROM copy_t", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        2
+    );
+}
+
+/// Device-lifetime hazard gate for canonical COPY: three sequential wire copies followed by two
+/// truly overlapping copies, then concurrent NULL-vs-zero point reads from the retained device
+/// generation. Counters make both mutation publication and GPU read routing non-vacuous.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+async fn canonical_copy_survives_sequential_and_concurrent_gpu_lifetime_hazard() {
+    let Ok(runtime) = CudaDriverRuntime::probe() else {
+        return;
+    };
+    let runtime = runtime.snapshot();
+    if !runtime.driver_available || runtime.device_count == 0 {
+        return;
+    }
+
+    let engine = Engine::new_local();
+    engine.set_shard_residency_enabled(true);
+    engine.set_shard_size_target(64);
+    engine.set_shard_index_probe_enabled(true);
+    engine.set_shard_batched_point_read_enabled(true);
+    engine.set_auto_admit_on_commit(true);
+    engine
+        .execute_text(1, "CREATE TABLE copy_hazard (id INT PRIMARY KEY, note INT)")
+        .unwrap();
+    let seed = (0..128)
+        .map(|id| format!("({id}, {id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute_text(
+            2,
+            &format!("INSERT INTO copy_hazard (id, note) VALUES {seed}"),
+        )
+        .unwrap();
+    let warm = engine
+        .execute_relational_select_text("SELECT note FROM copy_hazard WHERE id = 64")
+        .unwrap();
+    assert_eq!(warm.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(warm.fallback_reason, None);
+
+    let shared = Arc::new(SharedEngine::from_engine(engine));
+    let before = shared.gpu_native_activity_snapshot("copy_hazard");
+    assert!(
+        before.resident_shards > 0,
+        "fixture must be device resident"
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = Arc::clone(&shared);
+    tokio::spawn(async move {
+        let _ = gpu_db_server::serve_async_with_engine_batching(listener, served, 64, true).await;
+    });
+    let conn = format!("host=127.0.0.1 port={port} user=postgres dbname=postgres");
+
+    let (pre_client, pre_connection) = tokio_postgres::connect(&conn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = pre_connection.await;
+    });
+    pre_client
+        .simple_query("SELECT id FROM copy_hazard WHERE id = 64")
+        .await
+        .unwrap();
+    let pre_copy_route = shared.gpu_native_activity_snapshot("copy_hazard");
+    assert!(
+        pre_copy_route.sharded_gpu_probe_batches > before.sharded_gpu_probe_batches,
+        "fixture must reach the GPU point route before COPY: before={before:?} pre={pre_copy_route:?}"
+    );
+
+    copy_one_hazard_row(&conn, 1_001, None).await;
+    copy_one_hazard_row(&conn, 1_002, Some(0)).await;
+    copy_one_hazard_row(&conn, 1_003, Some(7)).await;
+    let left = copy_one_hazard_row(&conn, 1_004, None);
+    let right = copy_one_hazard_row(&conn, 1_005, Some(0));
+    tokio::join!(left, right);
+
+    // Prove that the generation published by the five COPY commits remains usable by the retained
+    // GPU point route. Newly appended keys intentionally live outside the dense index's prepared
+    // key range, so their NULL-vs-zero checks below prove content while this original key makes
+    // execution-target non-vacuity explicit.
+    let (probe_client, probe_connection) = tokio_postgres::connect(&conn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = probe_connection.await;
+    });
+    let probe = probe_client
+        .simple_query("SELECT id FROM copy_hazard WHERE id = 64")
+        .await
+        .unwrap();
+    assert!(probe.iter().any(|message| {
+        matches!(message, SimpleQueryMessage::Row(row) if row.get(0) == Some("64"))
+    }));
+
+    let mut readers = Vec::new();
+    for (id, expected) in [
+        (1_001, None),
+        (1_002, Some(0)),
+        (1_003, Some(7)),
+        (1_004, None),
+        (1_005, Some(0)),
+    ] {
+        let conn = conn.clone();
+        readers.push(tokio::spawn(async move {
+            let (client, connection) = tokio_postgres::connect(&conn, NoTls).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let sql = format!("SELECT note FROM copy_hazard WHERE id = {id}");
+            let messages = client.simple_query(&sql).await.unwrap();
+            let actual = messages
+                .into_iter()
+                .find_map(|message| match message {
+                    SimpleQueryMessage::Row(row) => {
+                        Some(row.get(0).map(|value| value.parse::<i32>().unwrap()))
+                    }
+                    _ => None,
+                })
+                .expect("point query returned one row");
+            assert_eq!(actual, expected);
+        }));
+    }
+    for reader in readers {
+        reader.await.unwrap();
+    }
+
+    let after = shared.gpu_native_activity_snapshot("copy_hazard");
+    assert!(
+        after.open_shard_append_commits > before.open_shard_append_commits
+            || after.device_authoritative_commits > before.device_authoritative_commits,
+        "COPY must publish a device-maintained generation: before={before:?} after={after:?}"
+    );
+    assert!(
+        after.sharded_gpu_probe_batches > pre_copy_route.sharded_gpu_probe_batches,
+        "the COPY-published generation must remain on the GPU point route: pre={pre_copy_route:?} after={after:?}"
+    );
+}
+
+async fn copy_one_hazard_row(connection: &str, id: i32, note: Option<i32>) {
+    let (client, driver) = tokio_postgres::connect(connection, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let note = note.map_or_else(String::new, |value| value.to_string());
+    let mut input = stream::iter(vec![Ok::<_, tokio_postgres::Error>(Bytes::from(format!(
+        "{id},{note}\n"
+    )))]);
+    let sink = client
+        .copy_in("COPY copy_hazard (id, note) FROM STDIN WITH CSV")
+        .await
+        .unwrap();
+    futures_util::pin_mut!(sink);
+    sink.send_all(&mut input).await.unwrap();
+    assert_eq!(sink.finish().await.unwrap(), 1);
 }
 
 /// P1-M5: many connections are served concurrently as lightweight tasks (no thread per

@@ -6,6 +6,26 @@
 
 use super::*;
 
+/// Opaque identity of the exact relation definition accepted when COPY FROM begins.
+///
+/// The facade carries this value from COPY-in response through final row admission.  Its fields
+/// intentionally remain private: protocol code may transport the proof, but only the engine may
+/// compare it with a transaction or published catalog generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyTargetProof {
+    table: Arc<RelationalTable>,
+}
+
+/// Structural origin of a COPY target resolved inside an explicit transaction.
+///
+/// A private CREATE and a concurrent published CREATE can receive value-identical table metadata,
+/// so facade ownership must consume this provenance instead of inferring it from proof equality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionCopyTargetOrigin {
+    SnapshotBase,
+    TransactionOverlay,
+}
+
 impl Engine {
     // --- Catalog introspection accessors (test/admin only; no production callers reach these). ---
     // They read the DDL working catalog under the catalog latch and return OWNED clones: a `MutexGuard`
@@ -15,24 +35,154 @@ impl Engine {
         self.ddl_catalog().relational_catalog.get(table).cloned()
     }
 
-    pub fn relational_copy_columns(&self, table: &str) -> Result<Vec<CopyColumn>, EngineError> {
-        self.ensure_commit_path_available()?;
-        let cat = self.ddl_catalog();
-        let table = cat.relational_catalog.get(table).ok_or_else(|| {
-            EngineError::ApplyFailed(format!("relation \"{}\" does not exist", table))
-        })?;
-        Ok(table
-            .columns
-            .iter()
-            .map(|column| CopyColumn {
-                name: column.name.clone(),
-                ty: column.ty,
-            })
-            .collect())
+    pub fn relational_copy_columns(&self, table: &str) -> Result<Vec<CopyColumn>, ExecuteError> {
+        self.relational_copy_target(table)
+            .map(|(columns, _proof)| columns)
+    }
+
+    /// Resolve COPY input columns and retain the exact target relation definition.  Completion
+    /// must carry the returned proof back through `submit_transaction`; a DROP/recreate or
+    /// shape-changing DDL between COPY-in response and CopyDone then fails before WAL.
+    pub fn relational_copy_target(
+        &self,
+        table: &str,
+    ) -> Result<(Vec<CopyColumn>, CopyTargetProof), ExecuteError> {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        copy_target_from_catalog(&self.catalog_snapshot(), table)
+    }
+
+    /// Resolve COPY input columns against an explicit transaction's exact catalog generation.
+    /// This is description only: the caller must still submit the typed rows through
+    /// `submit_transaction`, which revalidates and stages them under the transaction statement
+    /// lock.
+    pub fn relational_copy_columns_in_transaction(
+        &self,
+        txn_id: TxnId,
+        table: &str,
+    ) -> Result<Vec<CopyColumn>, ExecuteError> {
+        self.relational_copy_target_in_transaction(txn_id, table)
+            .map(|(columns, _proof)| columns)
+    }
+
+    /// Transaction-private counterpart of [`Self::relational_copy_target`].
+    pub fn relational_copy_target_in_transaction(
+        &self,
+        txn_id: TxnId,
+        table: &str,
+    ) -> Result<(Vec<CopyColumn>, CopyTargetProof), ExecuteError> {
+        self.relational_copy_target_in_transaction_with_origin(txn_id, table)
+            .map(|(columns, proof, _origin)| (columns, proof))
+    }
+
+    /// Resolve a transaction target and report whether the selected relation came from its base
+    /// snapshot or from a transaction-private catalog overlay.
+    pub fn relational_copy_target_in_transaction_with_origin(
+        &self,
+        txn_id: TxnId,
+        table: &str,
+    ) -> Result<
+        (
+            Vec<CopyColumn>,
+            CopyTargetProof,
+            TransactionCopyTargetOrigin,
+        ),
+        ExecuteError,
+    > {
+        self.ensure_commit_path_available()
+            .map_err(ExecuteError::Engine)?;
+        let snapshot = self
+            .transaction_snapshot_handle(txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+        self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
+        let statement_lock = Arc::clone(&snapshot.statement_lock);
+        let _statement = statement_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
+        let transaction_catalog = snapshot.transaction_catalog();
+        let origin = {
+            let delta = snapshot
+                .delta
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if delta.catalog_overlay.as_ref().is_some_and(|overlay| {
+                overlay.relational_catalog.get(table)
+                    != snapshot.catalog.relational_catalog.get(table)
+            }) {
+                TransactionCopyTargetOrigin::TransactionOverlay
+            } else {
+                TransactionCopyTargetOrigin::SnapshotBase
+            }
+        };
+        copy_target_from_catalog(&transaction_catalog, table)
+            .map(|(columns, proof)| (columns, proof, origin))
+    }
+
+    pub(crate) fn copy_target_matches_catalog(
+        &self,
+        catalog: &CatalogSnapshot,
+        copy: &CopyFromStdin,
+        proof: &CopyTargetProof,
+    ) -> bool {
+        copy.table == proof.table.name
+            && catalog
+                .relational_catalog
+                .get(&copy.table)
+                .is_some_and(|table| table == proof.table.as_ref())
+    }
+
+    pub(crate) fn execute_copy_in_transaction_with_result(
+        &self,
+        txn_id: TxnId,
+        insert: Insert,
+        copy: &CopyFromStdin,
+        target: &CopyTargetProof,
+    ) -> Result<DmlExecutionResult, ExecuteError> {
+        let snapshot = self
+            .transaction_snapshot_handle(txn_id)
+            .ok_or(ExecuteError::Txn(TxnError::NotFound(txn_id)))?;
+        self.ensure_transaction_not_program_owned(txn_id, &snapshot)?;
+        let statement_lock = Arc::clone(&snapshot.statement_lock);
+        let _statement = statement_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_transaction_snapshot_current(txn_id, &snapshot)?;
+        let snapshot = self.refresh_transaction_snapshot_for_statement(txn_id, &snapshot)?;
+        let transaction_catalog = snapshot.transaction_catalog();
+        if !self.copy_target_matches_catalog(&transaction_catalog, copy, target) {
+            return Err(stale_copy_target(&copy.table));
+        }
+        if insert.rows.is_empty() {
+            let _scope = self.enter_transaction_read(Arc::clone(&snapshot));
+            let next_row_id = snapshot
+                .delta
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .next_row_id;
+            self.prepare_dml(
+                &Command::Insert(insert),
+                DmlReadSnapshot {
+                    commit_seq: snapshot.boundary,
+                    next_row_id,
+                },
+                InsertPrepareValidation::Full,
+            )?;
+            return Ok(DmlExecutionResult {
+                rows_affected: 0,
+                returning: None,
+            });
+        }
+        self.execute_parsed_dml_in_transaction_statement_locked(
+            txn_id,
+            Command::Insert(insert),
+            &snapshot,
+        )
     }
 
     pub fn execute_relational_copy_rows(
-        &mut self,
+        &self,
         txn_id: u64,
         copy: &CopyFromStdin,
         rows: Vec<Vec<SqlValue>>,
@@ -42,40 +192,137 @@ impl Engine {
     }
 
     pub fn execute_relational_copy_rows_profiled(
-        &mut self,
+        &self,
         txn_id: u64,
         copy: &CopyFromStdin,
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError> {
+        let (_columns, proof) = self.relational_copy_target(&copy.table)?;
+        self.execute_relational_copy_rows_profiled_with_target(txn_id, copy, rows, &proof)
+    }
+
+    pub(crate) fn execute_relational_copy_rows_profiled_with_target(
+        &self,
+        txn_id: u64,
+        copy: &CopyFromStdin,
+        rows: Vec<Vec<SqlValue>>,
+        proof: &CopyTargetProof,
+    ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError> {
+        self.execute_relational_copy_rows_profiled_with_target_and_hook(
+            txn_id,
+            copy,
+            rows,
+            proof,
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_relational_copy_rows_instrumented(
+        &self,
+        txn_id: u64,
+        copy: &CopyFromStdin,
+        rows: Vec<Vec<SqlValue>>,
+        on_precommit: impl FnOnce(),
+    ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError> {
+        let (_columns, proof) = self.relational_copy_target(&copy.table)?;
+        self.execute_relational_copy_rows_profiled_with_target_and_hook(
+            txn_id,
+            copy,
+            rows,
+            &proof,
+            on_precommit,
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_relational_empty_copy_instrumented(
+        &self,
+        txn_id: u64,
+        copy: &CopyFromStdin,
+        on_target_validated: impl FnOnce(),
+    ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError> {
+        let (_columns, proof) = self.relational_copy_target(&copy.table)?;
+        self.execute_relational_copy_rows_profiled_with_target_and_hook(
+            txn_id,
+            copy,
+            Vec::new(),
+            &proof,
+            || {},
+            on_target_validated,
+        )
+    }
+
+    fn execute_relational_copy_rows_profiled_with_target_and_hook<P, Z>(
+        &self,
+        txn_id: u64,
+        copy: &CopyFromStdin,
+        rows: Vec<Vec<SqlValue>>,
+        proof: &CopyTargetProof,
+        on_precommit: P,
+        on_zero_target_validated: Z,
+    ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError>
+    where
+        P: FnOnce(),
+        Z: FnOnce(),
+    {
         self.ensure_commit_path_available()
             .map_err(ExecuteError::Engine)?;
-        if rows.is_empty() {
-            return Ok((0, RelationalCopyAdmissionProfile::default()));
+        let mut normalized_copy = copy.clone();
+        if normalized_copy.columns.is_none() {
+            normalized_copy.columns = Some(
+                proof
+                    .table
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect(),
+            );
         }
-        let columns = copy.columns.clone().unwrap_or_else(|| {
-            self.catalog_snapshot()
-                .relational_catalog
-                .get(&copy.table)
-                .map(|table| {
-                    table
-                        .columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect()
-                })
-                .unwrap_or_default()
-        });
-        let row_count = rows.len();
-        let insert = Insert {
-            table: copy.table.clone(),
-            columns,
-            rows,
-            returning: Vec::new(),
-        };
+        let insert = self.relational_copy_insert(&normalized_copy, rows);
+        let row_count = insert.rows.len();
         let mut profile = RelationalCopyAdmissionProfile {
             rows: row_count,
             ..RelationalCopyAdmissionProfile::default()
         };
+        if row_count == 0 {
+            let preflight_started = Instant::now();
+            let command = Command::Insert(insert);
+            let mut target_changed = false;
+            let mut on_target_validated = Some(on_zero_target_validated);
+            let result = self.validate_effect_free_at_current_commit_boundary(
+                txn_id,
+                |engine, _prospective_commit_seq| {
+                    let catalog = engine.catalog_snapshot();
+                    if !engine.copy_target_matches_catalog(&catalog, &normalized_copy, proof) {
+                        target_changed = true;
+                        return Err(EngineError::ApplyFailed(format!(
+                            "COPY target relation \"{}\" changed after COPY began",
+                            normalized_copy.table
+                        )));
+                    }
+                    on_target_validated
+                        .take()
+                        .expect("zero-row validation hook must run once")();
+                    {
+                        let mut catalog = engine.ddl_catalog();
+                        engine.ensure_dml_device_generation_with_catalog(&command, &mut catalog)?;
+                    }
+                    engine.preflight_constraints_against_current_device_generation(&command, txn_id)
+                },
+            );
+            profile.unique_preflight_micros = preflight_started.elapsed().as_micros();
+            match result {
+                Ok(()) => {}
+                Err(_error) if target_changed => {
+                    return Err(stale_copy_target(&normalized_copy.table));
+                }
+                Err(error) => return Err(ExecuteError::Engine(error)),
+            }
+            return Ok((0, profile));
+        }
         let render_started = Instant::now();
         let sql = render_relational_insert(&insert).map_err(ExecuteError::Engine)?;
         profile.render_sql_wal_payload_micros = render_started.elapsed().as_micros();
@@ -110,39 +357,75 @@ impl Engine {
             Ok(false) => {}
         }
         drop(commit);
-        let unique_preflight_started = Instant::now();
-        self.preflight_unique_index_constraints(&Command::Insert(insert.clone()), txn_id)
-            .map_err(ExecuteError::Engine)?;
-        profile.unique_preflight_micros += unique_preflight_started.elapsed().as_micros();
+        on_precommit();
         let timestamp_micros = self.next_commit_timestamp_micros();
         let mut apply_profile = RelationalCopyAdmissionProfile::default();
         let mut current_apply_total_micros = 0;
+        let mut locked_preflight_micros = 0;
+        let mut target_changed = false;
+        let validation_insert = insert.clone();
+        let validation_copy = normalized_copy.clone();
+        let validation_proof = proof.clone();
         let commit_started = Instant::now();
-        let (_token, residency_invalidation_micros) = self
-            .commit_mutation_at_with_current_apply(
-                txn_id,
-                payload,
-                timestamp_micros,
-                |engine, cat, commit_seq| {
-                    let apply_started = Instant::now();
-                    // Stamp with the commit sequence (commit `Index`), NOT the façade txn_id, so the
-                    // live COPY apply produces the same `created_by` a WAL replay would (Stage 0). The
-                    // held catalog latch (`cat`) carries any working-map mutation (sequence advance).
-                    let result = engine.apply_insert_with_profile(
-                        cat,
-                        insert.clone(),
-                        commit_seq,
-                        Some(&mut apply_profile),
-                    );
-                    current_apply_total_micros += apply_started.elapsed().as_micros();
-                    result
-                },
-            )
-            .map_err(ExecuteError::Engine)?;
+        let commit_result = self.commit_mutation_at_with_current_apply(
+            txn_id,
+            payload,
+            timestamp_micros,
+            |engine, _commit_seq| {
+                let preflight_started = Instant::now();
+                let catalog = engine.catalog_snapshot();
+                if !engine.copy_target_matches_catalog(
+                    &catalog,
+                    &validation_copy,
+                    &validation_proof,
+                ) {
+                    target_changed = true;
+                    return Err(EngineError::ApplyFailed(format!(
+                        "COPY target relation \"{}\" changed after COPY began",
+                        validation_copy.table
+                    )));
+                }
+                let command = Command::Insert(validation_insert.clone());
+                // We already own `commit_mutex`. Establish any missing device generation with
+                // the catalog latch acquired in the canonical order, then run the definitive
+                // constraint pass through the no-admission seam. Calling the ordinary preflight
+                // here could re-enter `commit_state()` when admission is required.
+                {
+                    let mut catalog = engine.ddl_catalog();
+                    engine.ensure_dml_device_generation_with_catalog(&command, &mut catalog)?;
+                }
+                let result = engine
+                    .preflight_constraints_against_current_device_generation(&command, txn_id);
+                locked_preflight_micros += preflight_started.elapsed().as_micros();
+                result
+            },
+            |engine, cat, commit_seq| {
+                let apply_started = Instant::now();
+                // Stamp with the commit sequence (commit `Index`), NOT the facade txn_id, so the
+                // live COPY apply produces the same `created_by` a WAL replay would (Stage 0). The
+                // held catalog latch (`cat`) carries any working-map mutation (sequence advance).
+                let result = engine.apply_insert_with_profile(
+                    cat,
+                    insert.clone(),
+                    commit_seq,
+                    Some(&mut apply_profile),
+                );
+                current_apply_total_micros += apply_started.elapsed().as_micros();
+                result
+            },
+        );
+        let (_token, residency_invalidation_micros) = match commit_result {
+            Ok(committed) => committed,
+            Err(_error) if target_changed => {
+                return Err(stale_copy_target(&normalized_copy.table));
+            }
+            Err(error) => return Err(ExecuteError::Engine(error)),
+        };
         profile.commit_total_micros = commit_started.elapsed().as_micros();
         profile.current_apply_total_micros = current_apply_total_micros;
         profile.row_prepare_micros = apply_profile.row_prepare_micros;
-        profile.unique_preflight_micros += apply_profile.unique_preflight_micros;
+        profile.unique_preflight_micros =
+            locked_preflight_micros.saturating_add(apply_profile.unique_preflight_micros);
         profile.check_preflight_micros = apply_profile.check_preflight_micros;
         profile.foreign_key_preflight_micros = apply_profile.foreign_key_preflight_micros;
         profile.mvcc_insert_micros = apply_profile.mvcc_insert_micros;
@@ -153,6 +436,32 @@ impl Engine {
             .saturating_sub(profile.current_apply_total_micros)
             .saturating_sub(profile.residency_invalidation_micros);
         Ok((row_count, profile))
+    }
+
+    pub(crate) fn relational_copy_insert(
+        &self,
+        copy: &CopyFromStdin,
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Insert {
+        let columns = copy.columns.clone().unwrap_or_else(|| {
+            self.catalog_snapshot()
+                .relational_catalog
+                .get(&copy.table)
+                .map(|table| {
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        Insert {
+            table: copy.table.clone(),
+            columns,
+            rows,
+            returning: Vec::new(),
+        }
     }
 
     pub fn relational_table_acl(
@@ -436,4 +745,34 @@ impl Engine {
             })
             .cloned()
     }
+}
+
+fn copy_target_from_catalog(
+    catalog: &CatalogSnapshot,
+    table_name: &str,
+) -> Result<(Vec<CopyColumn>, CopyTargetProof), ExecuteError> {
+    let table = catalog
+        .relational_catalog
+        .get(table_name)
+        .ok_or_else(|| ExecuteError::UndefinedRelation(table_name.to_string()))?;
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| CopyColumn {
+            name: column.name.clone(),
+            ty: column.ty,
+        })
+        .collect();
+    Ok((
+        columns,
+        CopyTargetProof {
+            table: Arc::new(table.clone()),
+        },
+    ))
+}
+
+pub(crate) fn stale_copy_target(table: &str) -> ExecuteError {
+    ExecuteError::Serialization(format!(
+        "COPY target relation \"{table}\" changed after COPY began; restart COPY"
+    ))
 }

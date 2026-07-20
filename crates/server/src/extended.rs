@@ -3,16 +3,20 @@
 use std::collections::HashMap;
 use std::io;
 
+use crate::copy::{classify_copy_statement, CopyClassification, CopyStatement};
 use gpu_db_facade::{
-    pg_adapter, BoundPreparedStatement, ColumnMeta, CommandTag, DbError, LogicalType,
-    PreparedStatement, QueryOutcome, SessionTransactionStatus, SharedEngine, SharedSession,
+    pg_adapter, BoundPreparedStatement, ColumnMeta, CommandTag, CopyTarget, DbError, ErrorCategory,
+    LogicalType, PreparedStatement, QueryOutcome, SessionTransactionStatus, SharedEngine,
+    SharedSession, SubmissionRequest,
 };
 use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
-use gpu_db_protocol::{parse_frontend_message, DescribeTarget, FrontendMessage};
+use gpu_db_protocol::{parse_frontend_message, CopyToStdout, DescribeTarget, FrontendMessage};
 
 #[derive(Debug, Clone)]
 struct Statement {
     prepared: PreparedStatement,
+    copy: Option<CopyStatement>,
+    copy_target: Option<CopyTarget>,
     parameter_oids: Vec<u32>,
     columns: Vec<ColumnMeta>,
 }
@@ -22,6 +26,8 @@ struct Portal {
     statement_name: String,
     transaction_exit: bool,
     bound: BoundPreparedStatement,
+    copy: Option<CopyStatement>,
+    copy_target: Option<CopyTarget>,
     columns: Vec<ColumnMeta>,
     result_formats: Vec<i16>,
     outcome: Option<Result<QueryOutcome, DbError>>,
@@ -30,17 +36,38 @@ struct Portal {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExecutionRequest {
-    pub bound: BoundPreparedStatement,
+pub(crate) enum ExecutionRequest {
+    Query(Box<BoundPreparedStatement>),
+    Copy {
+        statement: CopyStatement,
+        target: Option<CopyTarget>,
+        bound: Box<BoundPreparedStatement>,
+    },
+}
+
+impl ExecutionRequest {
+    #[cfg(test)]
+    pub(crate) fn query_bound(&self) -> &BoundPreparedStatement {
+        match self {
+            Self::Query(bound) => bound,
+            Self::Copy { .. } => panic!("test expected a regular query execution request"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PrepareRequest {
     pub statement_name: String,
     pub parsed: PreparedStatement,
+    pub(crate) copy: Option<CopyStatement>,
     #[cfg(test)]
     pub query: String,
     pub parameter_type_hints: Vec<Option<LogicalType>>,
+}
+
+pub(crate) struct PrepareAnalysis {
+    prepared: PreparedStatement,
+    copy_target: Option<CopyTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +88,7 @@ pub(crate) struct BindCompletion {
 #[derive(Clone)]
 pub(crate) enum DescriptionOwner {
     Cached,
+    Copy(CopyTarget),
     Statement(Box<PreparedStatement>),
     Portal(Box<BoundPreparedStatement>),
 }
@@ -130,7 +158,7 @@ pub(crate) struct ExtendedError {
 }
 
 impl ExtendedError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -250,7 +278,7 @@ impl ExtendedSession {
         };
         if transaction_status == SessionTransactionStatus::FailedTransaction
             && !portal.transaction_exit
-            && !portal.bound.is_empty()
+            && (!portal.bound.is_empty() || portal.copy.is_some())
         {
             return Dispatch::Response(Err(ExtendedError::in_failed_transaction()));
         }
@@ -419,7 +447,12 @@ impl ExtendedSession {
             parameter_type_oids,
             SessionTransactionStatus::Idle,
         )?;
-        let prepared = prepare(&request.query, &request.parameter_type_hints);
+        let prepared = prepare(&request.query, &request.parameter_type_hints).map(|prepared| {
+            PrepareAnalysis {
+                prepared,
+                copy_target: None,
+            }
+        });
         self.complete_parse(request, prepared)
     }
 
@@ -435,9 +468,30 @@ impl ExtendedSession {
         }
         // Parse syntax before the failed-transaction gate. PostgreSQL still reports malformed SQL
         // in an aborted transaction, and an empty Parse is permitted there.
-        let parsed = PreparedStatement::parse(&query).map_err(ExtendedError::from)?;
+        let copy = match classify_copy_statement(&query) {
+            CopyClassification::NotCopy => None,
+            CopyClassification::Supported(copy) => Some(copy),
+            CopyClassification::Unsupported => {
+                return Err(ExtendedError::new(
+                    "0A000",
+                    "COPY statement is not supported by the canonical product server",
+                ));
+            }
+        };
+        if copy.is_some() && !parameter_type_oids.is_empty() {
+            return Err(ExtendedError::new(
+                "08P01",
+                "COPY Parse message has too many parameter type OIDs",
+            ));
+        }
+        let analysis_sql = match &copy {
+            Some(CopyStatement::From(_)) => String::new(),
+            Some(CopyStatement::To(copy)) => copy_to_validation_sql(copy),
+            None => query.clone(),
+        };
+        let parsed = PreparedStatement::parse(&analysis_sql).map_err(ExtendedError::from)?;
         if transaction_status == SessionTransactionStatus::FailedTransaction
-            && !parsed.is_empty()
+            && (copy.is_some() || !parsed.is_empty())
             && !parsed.is_transaction_exit()
         {
             return Err(ExtendedError::in_failed_transaction());
@@ -457,25 +511,65 @@ impl ExtendedSession {
         Ok(PrepareRequest {
             statement_name,
             parsed,
+            copy,
             #[cfg(test)]
             query,
             parameter_type_hints,
         })
     }
 
+    /// Perform effect-free catalog analysis for one already syntax-classified Parse request.
+    /// COPY FROM obtains an opaque target proof here; COPY TO describes its synthesized SELECT
+    /// template.  Neither path starts wire COPY mode or admits a mutation.
+    pub(crate) fn analyze_prepare(
+        engine: &SharedEngine,
+        session: &mut SharedSession,
+        request: &PrepareRequest,
+    ) -> Result<PrepareAnalysis, DbError> {
+        let prepared = engine.describe_prepared_statement(
+            session,
+            request.parsed.clone(),
+            &request.parameter_type_hints,
+        )?;
+        let copy_target = match &request.copy {
+            Some(CopyStatement::From(copy)) => {
+                let outcome = engine
+                    .submit(session, SubmissionRequest::CopyFromStart(copy))
+                    .into_immediate()?;
+                let QueryOutcome::CopyIn { target } = outcome else {
+                    return Err(DbError {
+                        category: ErrorCategory::Internal,
+                        message: "COPY FROM Parse analysis returned the wrong facade outcome"
+                            .to_string(),
+                    });
+                };
+                Some(target)
+            }
+            Some(CopyStatement::To(_)) | None => None,
+        };
+        Ok(PrepareAnalysis {
+            prepared,
+            copy_target,
+        })
+    }
+
     pub(crate) fn complete_parse(
         &mut self,
         request: PrepareRequest,
-        prepared: Result<PreparedStatement, DbError>,
+        analysis: Result<PrepareAnalysis, DbError>,
     ) -> Result<Vec<u8>, ExtendedError> {
         let PrepareRequest {
             statement_name,
             parsed: _,
+            copy,
             #[cfg(test)]
                 query: _,
             parameter_type_hints: _,
         } = request;
-        let prepared = prepared.map_err(ExtendedError::from)?;
+        let PrepareAnalysis {
+            prepared,
+            copy_target,
+        } = analysis.map_err(ExtendedError::from)?;
         let parameter_types = prepared
             .parameter_types()
             .ok_or_else(|| ExtendedError::new("XX000", "prepared statement was not described"))?;
@@ -484,10 +578,21 @@ impl ExtendedSession {
             .copied()
             .map(pg_adapter::logical_type_oid)
             .collect();
-        let columns = prepared
+        let described_columns = prepared
             .result_columns()
             .ok_or_else(|| ExtendedError::new("XX000", "prepared statement was not described"))?
             .to_vec();
+        let columns = if copy.is_some() {
+            Vec::new()
+        } else {
+            described_columns
+        };
+        if matches!(copy, Some(CopyStatement::From(_))) && copy_target.is_none() {
+            return Err(ExtendedError::new(
+                "XX000",
+                "COPY FROM Parse analysis did not retain a target proof",
+            ));
+        }
         // A named duplicate is checked only after syntax parsing and catalog analysis have
         // succeeded, matching PostgreSQL's store-prepared-plan point.
         if !statement_name.is_empty() && self.statements.contains_key(&statement_name) {
@@ -500,6 +605,8 @@ impl ExtendedSession {
             statement_name,
             Statement {
                 prepared,
+                copy,
+                copy_target,
                 parameter_oids,
                 columns,
             },
@@ -530,7 +637,9 @@ impl ExtendedSession {
             })?;
         validate_bind_shape(&statement, &parameter_format_codes, &parameters)?;
         if transaction_status == SessionTransactionStatus::FailedTransaction
-            && (!statement.prepared.is_transaction_exit() || !parameters.is_empty())
+            && (statement.copy.is_some()
+                || !statement.prepared.is_transaction_exit()
+                || !parameters.is_empty())
         {
             return Err(ExtendedError::in_failed_transaction());
         }
@@ -564,6 +673,8 @@ impl ExtendedSession {
             result_format_codes,
         } = request;
         let transaction_exit = statement.prepared.is_transaction_exit();
+        let copy = statement.copy.clone();
+        let copy_target = statement.copy_target.clone();
         let params = parameters
             .iter()
             .enumerate()
@@ -593,6 +704,8 @@ impl ExtendedSession {
                 statement_name,
                 transaction_exit,
                 bound,
+                copy,
+                copy_target,
                 columns: statement.columns,
                 result_formats: result_format_codes,
                 outcome: None,
@@ -720,6 +833,15 @@ impl ExtendedSession {
                 if transaction_status == SessionTransactionStatus::FailedTransaction {
                     return Ok(DescriptionOwner::Cached);
                 }
+                if matches!(statement.copy, Some(CopyStatement::From(_))) {
+                    return statement
+                        .copy_target
+                        .clone()
+                        .map(DescriptionOwner::Copy)
+                        .ok_or_else(|| {
+                            ExtendedError::new("XX000", "COPY FROM statement lost its target proof")
+                        });
+                }
                 Ok(DescriptionOwner::Statement(Box::new(
                     statement.prepared.clone(),
                 )))
@@ -736,6 +858,15 @@ impl ExtendedSession {
                 if transaction_status == SessionTransactionStatus::FailedTransaction {
                     return Ok(DescriptionOwner::Cached);
                 }
+                if matches!(portal.copy, Some(CopyStatement::From(_))) {
+                    return portal
+                        .copy_target
+                        .clone()
+                        .map(DescriptionOwner::Copy)
+                        .ok_or_else(|| {
+                            ExtendedError::new("XX000", "COPY FROM portal lost its target proof")
+                        });
+                }
                 Ok(DescriptionOwner::Portal(Box::new(portal.bound.clone())))
             }
         }
@@ -748,6 +879,9 @@ impl ExtendedSession {
     ) -> Result<(), ExtendedError> {
         match owner {
             DescriptionOwner::Cached => Ok(()),
+            DescriptionOwner::Copy(target) => engine
+                .revalidate_copy_target(session, &target)
+                .map_err(ExtendedError::from),
             DescriptionOwner::Statement(prepared) => engine
                 .revalidate_prepared_description(session, &prepared)
                 .map_err(ExtendedError::from),
@@ -784,9 +918,40 @@ impl ExtendedSession {
         let portal = self.portals.get(portal_name).ok_or_else(|| {
             ExtendedError::new("34000", format!("portal \"{portal_name}\" does not exist"))
         })?;
-        Ok(portal.outcome.is_none().then(|| ExecutionRequest {
-            bound: portal.bound.clone(),
-        }))
+        if portal.command_completed && portal.copy.is_some() {
+            return Err(ExtendedError::new(
+                "55000",
+                format!("portal \"{portal_name}\" cannot be run"),
+            ));
+        }
+        if portal.command_completed {
+            return Ok(None);
+        }
+        Ok(match &portal.copy {
+            Some(copy) => Some(ExecutionRequest::Copy {
+                statement: copy.clone(),
+                target: portal.copy_target.clone(),
+                bound: Box::new(portal.bound.clone()),
+            }),
+            None if portal.outcome.is_none() => {
+                Some(ExecutionRequest::Query(Box::new(portal.bound.clone())))
+            }
+            None => None,
+        })
+    }
+
+    pub(crate) fn complete_copy_execute(&mut self, portal_name: &str) -> Result<(), ExtendedError> {
+        let portal = self.portals.get_mut(portal_name).ok_or_else(|| {
+            ExtendedError::new("34000", format!("portal \"{portal_name}\" does not exist"))
+        })?;
+        if portal.copy.is_none() {
+            return Err(ExtendedError::new(
+                "XX000",
+                "non-COPY portal entered COPY completion",
+            ));
+        }
+        portal.command_completed = true;
+        Ok(())
     }
 
     pub(crate) fn portal_ends_transaction(&self, portal_name: &str) -> bool {
@@ -812,6 +977,12 @@ impl ExtendedSession {
         let portal = self.portals.get_mut(portal_name).ok_or_else(|| {
             ExtendedError::new("34000", format!("portal \"{portal_name}\" does not exist"))
         })?;
+        if portal.copy.is_some() {
+            return Err(ExtendedError::new(
+                "XX000",
+                "COPY portal must be encoded by the COPY wire owner",
+            ));
+        }
         if portal.outcome.is_none() {
             portal.outcome = Some(outcome);
         }
@@ -833,6 +1004,12 @@ impl ExtendedSession {
         let outcome = outcome
             .as_ref()
             .map_err(|error| ExtendedError::from(error.clone()))?;
+        if matches!(outcome, QueryOutcome::CopyIn { .. }) {
+            return Err(ExtendedError::new(
+                "XX000",
+                "COPY start outcome reached the ordinary portal encoder",
+            ));
+        }
         if portal.command_completed && matches!(outcome, QueryOutcome::Command { .. }) {
             return Err(ExtendedError::new(
                 "55000",
@@ -1004,6 +1181,14 @@ fn backend_columns(columns: &[ColumnMeta]) -> Vec<BackendColumn> {
             )
         })
         .collect()
+}
+
+fn copy_to_validation_sql(copy: &CopyToStdout) -> String {
+    let projection = copy
+        .columns
+        .as_ref()
+        .map_or_else(|| "*".to_string(), |columns| columns.join(", "));
+    format!("SELECT {projection} FROM {}", copy.table)
 }
 
 fn write_description<W: io::Write + ?Sized>(

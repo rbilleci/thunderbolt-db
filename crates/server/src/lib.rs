@@ -10,8 +10,9 @@
 //!
 //! - **Simple query plus engine-backed extended query.** Parse/Bind/Describe/Execute/Close share
 //!   one connection-local lifecycle and execute prepared R1/W1 commands through the same façade
-//!   session as simple Query. COPY, auth (SCRAM/TLS), and the catalog/introspection surface remain
-//!   outside this canonical server until their compatibility migration slices.
+//!   session as simple Query. COPY FROM/TO uses the same session and facade mutation/read boundary;
+//!   auth (SCRAM/TLS) and the catalog/introspection surface remain outside this canonical server
+//!   until their compatibility migration slices.
 //!   A multi-statement simple `Query` uses the shared SQL splitter, executes statements in order,
 //!   and emits one final ReadyForQuery. Each idle segment runs in one implicit transaction; exact
 //!   BEGIN characteristics promote that segment, while COMMIT/ROLLBACK divide it. A failing
@@ -42,9 +43,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
 use gpu_db_facade::{
-    pg_adapter, BoundPreparedStatement, CommandTag, DbError, PointLookupBatcher, PreparedStatement,
-    QueryOutcome, SessionTransactionStatus, SharedEngine, SharedSession, SubmissionDispatch,
-    SubmissionRequest,
+    pg_adapter, BoundPreparedStatement, CommandTag, DbError, ErrorCategory, PointLookupBatcher,
+    PreparedStatement, QueryOutcome, SessionTransactionStatus, SharedEngine, SharedSession,
+    SubmissionDispatch, SubmissionRequest,
 };
 use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
 use gpu_db_protocol::{
@@ -52,16 +53,25 @@ use gpu_db_protocol::{
     StartupPacket, TransactionStatus as WireTransactionStatus,
 };
 
+mod copy;
+use copy::{
+    begin_copy_from, begin_copy_from_async, begin_prepared_copy_from,
+    begin_prepared_copy_from_async, classify_copy_statement, copy_lifecycle_error,
+    copy_lifecycle_success, encode_copy_error, execute_copy_to, execute_copy_to_async,
+    execute_prepared_copy_to, execute_prepared_copy_to_async, handle_copy_frame_async,
+    handle_copy_frame_blocking, mark_shared_session_failed, CopyClassification, CopyInState,
+    CopyStatement, CopyWireError,
+};
 mod extended;
 use extended::{
-    Dispatch as ExtendedDispatch, ExtendedSession, MalformedFrameAction, SkippingFrameAction,
-    TransactionAction,
+    Dispatch as ExtendedDispatch, ExecutionRequest, ExtendedSession, MalformedFrameAction,
+    SkippingFrameAction, TransactionAction,
 };
 
 /// Maximum accepted pgwire frame length (DoS guard): a malicious/huge length prefix would
 /// otherwise `resize` a buffer to that size before reading a byte — reachable pre-auth, and
 /// more exposed now that async ingress holds many untrusted connections. 64 MiB is far above
-/// any reasonable simple-query statement (bulk payloads belong in COPY, out of scope here).
+/// any reasonable simple-query statement and bounds each individual COPY data frame.
 const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 /// Serve connections **concurrently** on `listener`: one engine shared across a
@@ -208,16 +218,24 @@ fn outcome_is_transaction_control(outcome: &Result<QueryOutcome, DbError>) -> bo
     )
 }
 
-fn preflight_simple_query<S: AsRef<str>>(statements: &[S]) -> Result<(), DbError> {
+fn preflight_simple_query<S: AsRef<str>>(
+    statements: &[S],
+    copy_statements: &[CopyClassification],
+) -> Result<(), DbError> {
     if statements.len() <= 1 {
         return Ok(());
     }
+    debug_assert_eq!(statements.len(), copy_statements.len());
     // PostgreSQL performs lexical/syntactic analysis of the complete simple Query before running
     // any statement. Parse and zero-arity Bind every executable span up front so a later syntax or
     // unbound-parameter error cannot follow an already-published explicit COMMIT. Catalog lookup,
-    // constraints, and other semantic work remain in execution order through the facade.
-    for statement in statements {
-        PreparedStatement::parse(statement.as_ref())?.bind_values(&[])?;
+    // constraints, and other semantic work remain in execution order through the facade. COPY has
+    // its own parser; a supported classification is its syntax proof, while unsupported COPY is a
+    // semantic decision deliberately deferred until every ordinary span has been checked.
+    for (statement, copy) in statements.iter().zip(copy_statements) {
+        if matches!(copy, CopyClassification::NotCopy) {
+            PreparedStatement::parse(statement.as_ref())?.bind_values(&[])?;
+        }
     }
     Ok(())
 }
@@ -260,6 +278,7 @@ fn execute_simple_query_blocking(
     engine: &SharedEngine,
     session: &mut SharedSession,
     extended: &mut ExtendedSession,
+    copy_in: &mut Option<CopyInState>,
     sql: &str,
 ) -> io::Result<Vec<u8>> {
     extended.clear_unnamed_for_simple_query();
@@ -273,7 +292,11 @@ fn execute_simple_query_blocking(
         response.extend_from_slice(&encode_ready(status)?);
         return Ok(response);
     }
-    if let Err(error) = preflight_simple_query(&statements) {
+    let copy_statements = statements
+        .iter()
+        .map(|statement| classify_copy_statement(statement))
+        .collect::<Vec<_>>();
+    if let Err(error) = preflight_simple_query(&statements, &copy_statements) {
         session.mark_transaction_failed();
         let outcome = Err(error);
         let mut response = encode_outcome_messages(outcome.clone())?;
@@ -283,7 +306,99 @@ fn execute_simple_query_blocking(
         response.extend_from_slice(&encode_ready(status)?);
         return Ok(response);
     }
-
+    if statements.len() != 1
+        && copy_statements
+            .iter()
+            .any(|copy| !matches!(copy, CopyClassification::NotCopy))
+    {
+        let error = DbError {
+            category: ErrorCategory::Unsupported,
+            message: "COPY must be the only statement in a simple Query message".to_string(),
+        };
+        session.mark_transaction_failed();
+        let outcome = Err(error);
+        let mut response = encode_outcome_messages(outcome.clone())?;
+        complete_simple_query_action_blocking(engine, session, extended, &outcome, &mut response)?;
+        let status = session.transaction_status();
+        extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+        response.extend_from_slice(&encode_ready(status)?);
+        return Ok(response);
+    }
+    if let Some(copy) = copy_statements.into_iter().next() {
+        match copy {
+            CopyClassification::NotCopy => {}
+            CopyClassification::Unsupported => {
+                let error = DbError {
+                    category: ErrorCategory::Unsupported,
+                    message: CopyWireError::unsupported().message,
+                };
+                session.mark_transaction_failed();
+                let outcome = Err(error);
+                let mut response = encode_outcome_messages(outcome.clone())?;
+                complete_simple_query_action_blocking(
+                    engine,
+                    session,
+                    extended,
+                    &outcome,
+                    &mut response,
+                )?;
+                let status = session.transaction_status();
+                extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+                response.extend_from_slice(&encode_ready(status)?);
+                return Ok(response);
+            }
+            CopyClassification::Supported(CopyStatement::To(copy)) => {
+                let result = execute_copy_to(engine, session, &copy);
+                let lifecycle = result
+                    .as_ref()
+                    .map(|_| copy_lifecycle_success())
+                    .map_err(copy_lifecycle_error);
+                if result.is_err() {
+                    session.mark_transaction_failed();
+                }
+                let mut response = match result {
+                    Ok(response) => response,
+                    Err(error) => encode_copy_error(&error),
+                };
+                complete_simple_query_action_blocking(
+                    engine,
+                    session,
+                    extended,
+                    &lifecycle,
+                    &mut response,
+                )?;
+                let status = session.transaction_status();
+                extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+                response.extend_from_slice(&encode_ready(status)?);
+                return Ok(response);
+            }
+            CopyClassification::Supported(CopyStatement::From(copy)) => {
+                return match begin_copy_from(engine, session, copy, true) {
+                    Ok((state, response)) => {
+                        *copy_in = Some(state);
+                        Ok(response)
+                    }
+                    Err(error) => {
+                        session.mark_transaction_failed();
+                        let lifecycle = Err(copy_lifecycle_error(&error));
+                        let mut response = encode_copy_error(&error);
+                        complete_simple_query_action_blocking(
+                            engine,
+                            session,
+                            extended,
+                            &lifecycle,
+                            &mut response,
+                        )?;
+                        let status = session.transaction_status();
+                        extended
+                            .finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+                        response.extend_from_slice(&encode_ready(status)?);
+                        Ok(response)
+                    }
+                };
+            }
+        }
+    }
     let mut response = Vec::new();
     let mut last_outcome = Ok(QueryOutcome::Empty);
     for (index, statement) in statements.iter().enumerate() {
@@ -360,7 +475,21 @@ fn run_shared_query_loop(
     session: &mut SharedSession,
 ) -> Result<(), String> {
     let mut extended = ExtendedSession::default();
+    let mut copy_in = None;
     while let Some(frame) = read_tagged_frame(stream).map_err(|err| err.to_string())? {
+        if copy_in.is_some() {
+            if !handle_copy_frame_blocking(
+                stream,
+                engine,
+                session,
+                &mut extended,
+                &mut copy_in,
+                &frame,
+            )? {
+                break;
+            }
+            continue;
+        }
         match extended.skipping_frame_action(frame[0]) {
             SkippingFrameAction::Parse => {}
             SkippingFrameAction::Discard => continue,
@@ -438,15 +567,11 @@ fn run_shared_query_loop(
         }
         let response = match extended.dispatch(message, session.transaction_status()) {
             ExtendedDispatch::SimpleQuery(sql) => {
-                execute_simple_query_blocking(engine, session, &mut extended, &sql)
+                execute_simple_query_blocking(engine, session, &mut extended, &mut copy_in, &sql)
                     .map_err(encode_io_error)
             }
             ExtendedDispatch::Prepare(request) => {
-                let prepared = engine.describe_prepared_statement(
-                    session,
-                    request.parsed.clone(),
-                    &request.parameter_type_hints,
-                );
+                let prepared = ExtendedSession::analyze_prepare(engine, session, &request);
                 extended
                     .complete_parse(*request, prepared)
                     .map_err(encode_extended_error)
@@ -486,8 +611,45 @@ fn run_shared_query_loop(
                 let transaction_ended = extended.portal_ends_transaction(&portal_name);
                 let result = (|| {
                     if let Some(request) = extended.execution_request(&portal_name)? {
-                        let outcome = submit_prepared(engine, session, &request.bound);
-                        extended.set_execution_outcome(&portal_name, outcome)?;
+                        match request {
+                            ExecutionRequest::Query(bound) => {
+                                let outcome = submit_prepared(engine, session, &bound);
+                                extended.set_execution_outcome(&portal_name, outcome)?;
+                            }
+                            ExecutionRequest::Copy {
+                                statement: CopyStatement::To(copy),
+                                target: _,
+                                bound,
+                            } => {
+                                let response =
+                                    execute_prepared_copy_to(engine, session, &bound, &copy)
+                                        .map_err(|error| {
+                                            extended::ExtendedError::new(error.code, error.message)
+                                        })?;
+                                extended.complete_copy_execute(&portal_name)?;
+                                return Ok(response);
+                            }
+                            ExecutionRequest::Copy {
+                                statement: CopyStatement::From(copy),
+                                target,
+                                bound: _,
+                            } => {
+                                let target = target.ok_or_else(|| {
+                                    extended::ExtendedError::new(
+                                        "XX000",
+                                        "COPY FROM portal lost its target proof",
+                                    )
+                                })?;
+                                let (state, response) =
+                                    begin_prepared_copy_from(engine, session, copy, target, false)
+                                        .map_err(|error| {
+                                            extended::ExtendedError::new(error.code, error.message)
+                                        })?;
+                                extended.complete_copy_execute(&portal_name)?;
+                                copy_in = Some(state);
+                                return Ok(response);
+                            }
+                        }
                     }
                     extended.encode_execute(&portal_name, max_rows)
                 })();
@@ -535,6 +697,12 @@ fn encode_outcome_messages(outcome: Result<QueryOutcome, DbError>) -> io::Result
             // the wire protocol.
             Ok(QueryOutcome::Empty) => {
                 writer.empty_query_response()?;
+            }
+            Ok(QueryOutcome::CopyIn { .. }) => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "COPY start outcome reached the ordinary simple-query encoder",
+                ));
             }
             Ok(outcome) => {
                 let tag = pg_adapter::command_complete_tag(&outcome);
@@ -857,7 +1025,24 @@ async fn run_async_query_loop(
     session: &Arc<std::sync::Mutex<SharedSession>>,
 ) -> Result<(), String> {
     let mut extended = ExtendedSession::default();
+    let mut copy_in = None;
     while let Some(frame) = read_tagged_frame_async(stream).await? {
+        if copy_in.is_some() {
+            if !handle_copy_frame_async(
+                stream,
+                Arc::clone(engine),
+                Arc::clone(session),
+                executor,
+                &mut extended,
+                &mut copy_in,
+                frame,
+            )
+            .await?
+            {
+                break;
+            }
+            continue;
+        }
         let frame_tag = frame[0];
         match extended.skipping_frame_action(frame_tag) {
             SkippingFrameAction::Parse => {}
@@ -975,6 +1160,7 @@ async fn run_async_query_loop(
                 executor,
                 batcher.cloned(),
                 &mut extended,
+                &mut copy_in,
                 sql,
             )
             .await
@@ -983,13 +1169,12 @@ async fn run_async_query_loop(
                 let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
                 let engine = Arc::clone(engine);
                 let session = Arc::clone(session);
-                let parsed = request.parsed.clone();
-                let hints = request.parameter_type_hints.clone();
+                let request_for_analysis = request.clone();
                 let prepared = tokio::task::spawn_blocking(move || {
-                    let session = session
+                    let mut session = session
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    engine.describe_prepared_statement(&session, parsed, &hints)
+                    ExtendedSession::analyze_prepare(&engine, &mut session, &request_for_analysis)
                 })
                 .await
                 .map_err(|err| err.to_string())?;
@@ -1077,7 +1262,7 @@ async fn run_async_query_loop(
                 let transaction_ended = extended.portal_ends_transaction(&portal_name);
                 let result = match extended.execution_request(&portal_name) {
                     Err(error) => Err(encode_extended_error(error)),
-                    Ok(Some(request)) => {
+                    Ok(Some(ExecutionRequest::Query(bound))) => {
                         let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
                         let engine = Arc::clone(engine);
                         let session = Arc::clone(session);
@@ -1085,7 +1270,7 @@ async fn run_async_query_loop(
                             let mut session = session
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            submit_prepared(&engine, &mut session, &request.bound)
+                            submit_prepared(&engine, &mut session, &bound)
                         })
                         .await
                         .map_err(|err| err.to_string())?;
@@ -1094,6 +1279,62 @@ async fn run_async_query_loop(
                             .and_then(|()| extended.encode_execute(&portal_name, max_rows))
                             .map_err(encode_extended_error)
                     }
+                    Ok(Some(ExecutionRequest::Copy {
+                        statement: CopyStatement::To(copy),
+                        target: _,
+                        bound,
+                    })) => {
+                        match execute_prepared_copy_to_async(
+                            Arc::clone(engine),
+                            Arc::clone(session),
+                            executor,
+                            *bound,
+                            copy,
+                        )
+                        .await?
+                        {
+                            Ok(response) => extended
+                                .complete_copy_execute(&portal_name)
+                                .map(|()| response)
+                                .map_err(encode_extended_error),
+                            Err(error) => Err(encode_extended_error(extended::ExtendedError::new(
+                                error.code,
+                                error.message,
+                            ))),
+                        }
+                    }
+                    Ok(Some(ExecutionRequest::Copy {
+                        statement: CopyStatement::From(copy),
+                        target,
+                        bound: _,
+                    })) => match target {
+                        None => Err(encode_extended_error(extended::ExtendedError::new(
+                            "XX000",
+                            "COPY FROM portal lost its target proof",
+                        ))),
+                        Some(target) => match begin_prepared_copy_from_async(
+                            Arc::clone(engine),
+                            Arc::clone(session),
+                            executor,
+                            copy,
+                            target,
+                            false,
+                        )
+                        .await?
+                        {
+                            Ok((state, response)) => extended
+                                .complete_copy_execute(&portal_name)
+                                .map(|()| {
+                                    copy_in = Some(state);
+                                    response
+                                })
+                                .map_err(encode_extended_error),
+                            Err(error) => Err(encode_extended_error(extended::ExtendedError::new(
+                                error.code,
+                                error.message,
+                            ))),
+                        },
+                    },
                     Ok(None) => extended
                         .encode_execute(&portal_name, max_rows)
                         .map_err(encode_extended_error),
@@ -1145,6 +1386,7 @@ async fn execute_simple_query_async(
     executor: &Arc<tokio::sync::Semaphore>,
     batcher: Option<Arc<PointLookupBatcher>>,
     extended: &mut ExtendedSession,
+    copy_in: &mut Option<CopyInState>,
     sql: String,
 ) -> Result<Vec<u8>, String> {
     extended.clear_unnamed_for_simple_query();
@@ -1170,11 +1412,12 @@ async fn execute_simple_query_async(
         response.extend_from_slice(&encode_ready(status).map_err(|error| error.to_string())?);
         return Ok(response);
     }
-    if let Err(error) = preflight_simple_query(&statements) {
-        session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .mark_transaction_failed();
+    let copy_statements = statements
+        .iter()
+        .map(|statement| classify_copy_statement(statement))
+        .collect::<Vec<_>>();
+    if let Err(error) = preflight_simple_query(&statements, &copy_statements) {
+        mark_shared_session_failed(&session);
         let outcome = Err(error);
         let mut response =
             encode_outcome_messages(outcome.clone()).map_err(|error| error.to_string())?;
@@ -1191,6 +1434,131 @@ async fn execute_simple_query_async(
         extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
         response.extend_from_slice(&encode_ready(status).map_err(|error| error.to_string())?);
         return Ok(response);
+    }
+    if statements.len() != 1
+        && copy_statements
+            .iter()
+            .any(|copy| !matches!(copy, CopyClassification::NotCopy))
+    {
+        let outcome = Err(DbError {
+            category: ErrorCategory::Unsupported,
+            message: "COPY must be the only statement in a simple Query message".to_string(),
+        });
+        mark_shared_session_failed(&session);
+        let mut response =
+            encode_outcome_messages(outcome.clone()).map_err(|error| error.to_string())?;
+        complete_simple_query_action_async(
+            Arc::clone(&engine),
+            Arc::clone(&session),
+            executor,
+            extended,
+            &outcome,
+            &mut response,
+        )
+        .await?;
+        let status = shared_session_transaction_status(&session);
+        extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+        response.extend_from_slice(&encode_ready(status).map_err(|error| error.to_string())?);
+        return Ok(response);
+    }
+    if let Some(copy) = copy_statements.into_iter().next() {
+        match copy {
+            CopyClassification::NotCopy => {}
+            CopyClassification::Unsupported => {
+                let outcome = Err(DbError {
+                    category: ErrorCategory::Unsupported,
+                    message: CopyWireError::unsupported().message,
+                });
+                mark_shared_session_failed(&session);
+                let mut response =
+                    encode_outcome_messages(outcome.clone()).map_err(|error| error.to_string())?;
+                complete_simple_query_action_async(
+                    Arc::clone(&engine),
+                    Arc::clone(&session),
+                    executor,
+                    extended,
+                    &outcome,
+                    &mut response,
+                )
+                .await?;
+                let status = shared_session_transaction_status(&session);
+                extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+                response
+                    .extend_from_slice(&encode_ready(status).map_err(|error| error.to_string())?);
+                return Ok(response);
+            }
+            CopyClassification::Supported(CopyStatement::To(copy)) => {
+                let result = execute_copy_to_async(
+                    Arc::clone(&engine),
+                    Arc::clone(&session),
+                    executor,
+                    copy,
+                )
+                .await?;
+                let lifecycle = result
+                    .as_ref()
+                    .map(|_| copy_lifecycle_success())
+                    .map_err(copy_lifecycle_error);
+                if result.is_err() {
+                    mark_shared_session_failed(&session);
+                }
+                let mut response = match result {
+                    Ok(response) => response,
+                    Err(error) => encode_copy_error(&error),
+                };
+                complete_simple_query_action_async(
+                    Arc::clone(&engine),
+                    Arc::clone(&session),
+                    executor,
+                    extended,
+                    &lifecycle,
+                    &mut response,
+                )
+                .await?;
+                let status = shared_session_transaction_status(&session);
+                extended.finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+                response
+                    .extend_from_slice(&encode_ready(status).map_err(|error| error.to_string())?);
+                return Ok(response);
+            }
+            CopyClassification::Supported(CopyStatement::From(copy)) => {
+                return match begin_copy_from_async(
+                    Arc::clone(&engine),
+                    Arc::clone(&session),
+                    executor,
+                    copy,
+                    true,
+                )
+                .await?
+                {
+                    Ok((state, response)) => {
+                        *copy_in = Some(state);
+                        Ok(response)
+                    }
+                    Err(error) => {
+                        mark_shared_session_failed(&session);
+                        let lifecycle = Err(copy_lifecycle_error(&error));
+                        let mut response = encode_copy_error(&error);
+                        complete_simple_query_action_async(
+                            Arc::clone(&engine),
+                            Arc::clone(&session),
+                            executor,
+                            extended,
+                            &lifecycle,
+                            &mut response,
+                        )
+                        .await?;
+                        let status = shared_session_transaction_status(&session);
+                        extended
+                            .finish_transaction_boundary(status != SessionTransactionStatus::Idle);
+                        response.extend_from_slice(
+                            &encode_ready(status).map_err(|error| error.to_string())?,
+                        );
+                        Ok(response)
+                    }
+                };
+            }
+        }
     }
     let single_statement = statements.len() == 1;
     let single_can_batch = single_statement

@@ -1,7 +1,9 @@
 //! Protocol-neutral prepared statement ownership.
 
 use gpu_db_engine::Engine;
-use gpu_db_sql::{ParsedCommand, PreparedCommand, SqlType};
+use gpu_db_sql::{
+    Command, CopyToStdout, ParsedCommand, PreparedCommand, Select, SelectProjection, SqlType,
+};
 
 use super::{
     map_column, map_db_value, map_execute_error, map_logical_type, map_parse_error, ColumnMeta,
@@ -47,6 +49,32 @@ impl BoundPreparedStatement {
                 gpu_db_sql::Command::Commit { .. } | gpu_db_sql::Command::Rollback { .. }
             )
         })
+    }
+
+    /// Prove that this opaque bound owner is exactly the parameter-free SELECT synthesized for
+    /// one COPY TO statement. This inspects the retained AST directly; it never reparses SQL.
+    pub(super) fn is_exact_copy_to_select(&self, copy: &CopyToStdout) -> bool {
+        let expected = Select {
+            table: copy.table.clone(),
+            distinct: false,
+            projection: copy
+                .columns
+                .as_ref()
+                .map_or(SelectProjection::All, |columns| {
+                    SelectProjection::Columns(columns.clone())
+                }),
+            group_by: None,
+            having_groups: Vec::new(),
+            filter: None,
+            filters: Vec::new(),
+            filter_groups: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        self.parsed
+            .as_ref()
+            .is_some_and(|parsed| parsed.command() == &Command::Select(expected))
     }
 
     fn validate_for_execution(

@@ -14,6 +14,41 @@ gap points to a stable ID in [`PLAN.md`](PLAN.md).
   probes are deleted. Explicit reverse-gather repair and the bounded hot-to-cold representation transition remain
   isolated under **RETIRE-002**; neither evaluates host relational decisions or results.
 
+## PRODUCT-001 canonical COPY compatibility — accepted 2026-07-21
+
+- Blocking and async canonical ingresses now own the same simple and extended text/CSV COPY FROM/TO lifecycle.
+  COPY FROM resolves typed columns and an opaque exact-relation proof before `CopyInResponse`, decodes only staging
+  rows on the host, and submits one `CopyMutationRequest` through `SharedEngine::submit` and the existing canonical
+  transaction/WAL/publication owner. Simple COPY TO synthesizes and parses its exact SELECT through the same facade;
+  extended/prepared COPY TO validates and executes its exact retained bound SELECT AST. It cannot substitute an
+  unrelated bound mutation, and duplicate projection names fail before `CopyOutResponse`.
+- A COPY target is bound to its exact engine, relation definition, and when applicable transaction-private catalog
+  overlay. Parse resolves that proof; statement/portal Describe, Execute, zero-row completion, and nonempty CopyDone
+  revalidate it. Drop/recreate ABA, cross-engine use, rollback/recreate, private/published value-identical twins,
+  and stale Bind-to-Execute catalog changes fail before a COPY response or mutation effect. Failed transactions
+  preserve `25P02` precedence.
+- Definitive unique/primary-key constraint validation repeats under `commit_mutex` after wave quiescence and before
+  WAL. Concurrent same-key COPY therefore produces one durable winner and one pre-WAL loser without wedging the
+  engine; missing device generations are admitted under canonical catalog/commit lock order. Empty COPY validates
+  the same target and constraints at an effect-free current-commit boundary without claiming sequence, WAL, or
+  publication. Recovery and later writes remain usable after every rejection.
+- Whole-message simple-query syntax and zero-arity Bind preflight now understands recognized COPY spans and runs
+  before the COPY-only semantic rule. Raw blocking and async sabotage proves a malformed ordinary span returns
+  `42601`, emits no prefix completion, and leaves its prefix DDL unpublished even when a later COPY is present.
+  The unchanged tokio-postgres COPY/recovery test moved from the legacy protocol target to
+  `gpu-db-engine-server`; raw pgwire tests also cover simple/extended phase timing, abort, generation ABA, and
+  transaction publication.
+- Final gates pass engine **502/536 ignored**, SQL **49**, protocol **71 + 127**, facade **66/10 ignored** plus
+  concurrency **13/1 ignored**, canonical server **31/4 ignored**, pgwire **4/2 ignored**, SQLx **1**, and canonical
+  tokio-postgres **1**, plus strict affected all-target Clippy, formatting, diff, and source-size checks. The live
+  COPY lifetime gate passes three sequential plus two overlapping GPU cases. The standard card records
+  **231.468M/s at p50 156us** in-L2 and **198.067M/s at p50 205us** out-of-L2, rooflines
+  **1,418.1/1,440.2 GB/s**, GROUP BY **1,674.9M elements/s**, and a **2,061.6s + 0.0s residency** 48M-row build.
+  The first independent audit rejected commit-lock validation, relation-generation ownership, Parse/Describe
+  timing, and stale inventory. A fresh re-audit drove further exact-proof, zero-row, prepared COPY TO, failed-state,
+  and whole-message-precedence repairs; its frozen-tree verdict is **ACCEPT**. Legacy/P8 deletion and the
+  2,070-line `engine_dml_concurrent.rs` remain later **PRODUCT-001** work.
+
 ## PRODUCT-001 SQLx/simple-query compatibility — accepted 2026-07-20
 
 - The unchanged supported SQLx smoke now targets `gpu-db-engine-server`; the legacy protocol-crate copy is deleted

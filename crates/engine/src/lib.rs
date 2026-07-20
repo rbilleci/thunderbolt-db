@@ -89,6 +89,7 @@ pub(crate) use resident_storage::*;
 mod resident_route;
 pub(crate) use resident_route::*;
 mod engine_catalog;
+pub use engine_catalog::{CopyTargetProof, TransactionCopyTargetOrigin};
 mod engine_commit;
 mod engine_commit_coordinator;
 mod engine_commit_residency;
@@ -114,7 +115,7 @@ mod engine_join_ir;
 mod engine_lifecycle;
 mod engine_mutation_admission;
 pub use engine_mutation_admission::{
-    MutationRequest, PredeclaredOperationResult, PredeclaredTransaction,
+    CopyMutationRequest, MutationRequest, PredeclaredOperationResult, PredeclaredTransaction,
     PredeclaredTransactionResult, TransactionAdmissionResult, TransactionClass, TransactionRequest,
     TransactionResources,
 };

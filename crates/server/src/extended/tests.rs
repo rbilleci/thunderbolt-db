@@ -202,7 +202,7 @@ fn private_parse_bind_execute_reads_its_write_and_commits_once() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        submit_prepared(&engine, &mut creator, &insert.bound).unwrap(),
+        submit_prepared(&engine, &mut creator, insert.query_bound()).unwrap(),
         QueryOutcome::Returning { rows, rows_affected: 1, .. }
             if rows == vec![vec![DbValue::Int8(99)]]
     ));
@@ -243,7 +243,7 @@ fn private_parse_bind_execute_reads_its_write_and_commits_once() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        submit_prepared(&engine, &mut creator, &select.bound).unwrap(),
+        submit_prepared(&engine, &mut creator, select.query_bound()).unwrap(),
         QueryOutcome::Rows { rows, .. }
             if rows == vec![vec![DbValue::Int8(99)]]
     ));
@@ -271,7 +271,7 @@ fn private_parse_bind_execute_reads_its_write_and_commits_once() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        submit_prepared(&engine, &mut observer, &observer_select.bound).unwrap(),
+        submit_prepared(&engine, &mut observer, observer_select.query_bound()).unwrap(),
         QueryOutcome::Rows { rows, .. }
             if rows == vec![vec![DbValue::Int8(99)]]
     ));
@@ -471,7 +471,7 @@ fn empty_extended_statement_reaches_empty_query_response() {
         .bind("empty_portal".to_string(), "empty", &[], &[], &[])
         .unwrap();
     let request = extended.execution_request("empty_portal").unwrap().unwrap();
-    let outcome = submit_prepared(&engine, &mut session, &request.bound);
+    let outcome = submit_prepared(&engine, &mut session, request.query_bound());
     extended
         .set_execution_outcome("empty_portal", outcome)
         .unwrap();
@@ -586,11 +586,8 @@ fn failed_transaction_preserves_postgresql_message_precedence() {
     ) else {
         panic!("an empty Parse must bypass the failed-transaction gate");
     };
-    let empty_prepared = engine.describe_prepared_statement(
-        &engine_session,
-        empty_request.parsed.clone(),
-        &empty_request.parameter_type_hints,
-    );
+    let empty_prepared =
+        ExtendedSession::analyze_prepare(&engine, &mut engine_session, &empty_request);
     assert!(extended
         .complete_parse(*empty_request, empty_prepared)
         .is_ok());
@@ -1120,7 +1117,7 @@ fn ddl_changed_returning_type_fails_before_the_prepared_write() {
         .unwrap_err();
     assert_eq!(portal_error.code, "0A000");
     let request = extended.execution_request("stale_portal").unwrap().unwrap();
-    let error = submit_prepared(&engine, &mut session, &request.bound).unwrap_err();
+    let error = submit_prepared(&engine, &mut session, request.query_bound()).unwrap_err();
     assert_eq!(error.category, gpu_db_facade::ErrorCategory::Unsupported);
 
     let QueryOutcome::Rows { rows, .. } =
@@ -1220,7 +1217,7 @@ fn prepared_w1_executes_once_through_engine_session_and_returns_typed_rows() {
         )
         .unwrap();
     let request = extended.execution_request("w1_portal").unwrap().unwrap();
-    let outcome = submit_prepared(&engine, &mut session, &request.bound);
+    let outcome = submit_prepared(&engine, &mut session, request.query_bound());
     assert!(matches!(
         &outcome,
         Ok(QueryOutcome::Returning { rows, rows_affected: 1, .. })

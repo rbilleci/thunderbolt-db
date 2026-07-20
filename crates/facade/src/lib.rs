@@ -32,10 +32,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpu_db_engine::{
-    Engine, ExecuteError, MutationRequest, RelationalColumn, TransactionAdmissionResult,
+    CopyMutationRequest, CopyTargetProof, Engine, ExecuteError, MutationRequest, RelationalColumn,
+    TransactionAdmissionResult, TransactionCopyTargetOrigin,
 };
 use gpu_db_sql::{
-    parse_command, Command, Decimal128, ParseError, ParsedCommand, Select, SqlType, SqlValue,
+    parse_command, Command, CopyFromStdin, CopyToStdout, Decimal128, ParseError, ParsedCommand,
+    Select, SqlType, SqlValue,
 };
 
 #[cfg(test)]
@@ -94,6 +96,46 @@ pub struct ColumnMeta {
     pub logical_type: LogicalType,
 }
 
+/// Neutral COPY input metadata. Numeric typmod is retained because COPY text decoding must round
+/// at the table's declared scale before mutation admission; non-numeric columns carry `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyColumnMeta {
+    pub name: String,
+    pub logical_type: LogicalType,
+    pub numeric_typmod: Option<(u8, u8)>,
+}
+
+/// Opaque, protocol-neutral COPY FROM target retained from description through final admission.
+///
+/// Wire adapters may inspect only the input columns.  The normalized SQL target and exact engine
+/// relation proof remain facade-owned so CopyDone cannot be redirected to a DROP/recreated table.
+#[derive(Debug, Clone)]
+pub struct CopyTarget {
+    copy: CopyFromStdin,
+    columns: Vec<CopyColumnMeta>,
+    proof: CopyTargetProof,
+    engine_identity: Arc<()>,
+    transaction_identity: Option<u64>,
+}
+
+impl CopyTarget {
+    pub fn columns(&self) -> &[CopyColumnMeta] {
+        &self.columns
+    }
+}
+
+impl PartialEq for CopyTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.copy == other.copy
+            && self.columns == other.columns
+            && self.proof == other.proof
+            && Arc::ptr_eq(&self.engine_identity, &other.engine_identity)
+            && self.transaction_identity == other.transaction_identity
+    }
+}
+
+impl Eq for CopyTarget {}
+
 /// Neutral command classification. Adapters format the protocol-specific
 /// completion tag (e.g. the PostgreSQL `INSERT 0 N`) from this.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +148,7 @@ pub enum CommandTag {
     Insert,
     Update,
     Delete,
+    Copy,
     Other(String),
 }
 
@@ -126,6 +169,9 @@ pub enum QueryOutcome {
         tag: CommandTag,
         rows_affected: Option<u64>,
     },
+    /// COPY FROM STDIN was validated and needs typed wire rows. The neutral columns are in COPY
+    /// target order and carry no PostgreSQL format or framing state.
+    CopyIn { target: CopyTarget },
     /// The statement was empty (e.g. `""`, `";"`, only whitespace/comments). Wire
     /// adapters must reply with their empty-query signal (PostgreSQL's
     /// `EmptyQueryResponse`), not a syntax error.
@@ -140,6 +186,7 @@ pub enum ErrorCategory {
     Unsupported,
     UndefinedRelation,
     UndefinedColumn,
+    DuplicateColumn,
     IndeterminateDatatype,
     DatatypeMismatch,
     InvalidRequest,
@@ -201,6 +248,21 @@ pub enum SubmissionRequest<'a> {
     BatchedText {
         sql: &'a str,
         batcher: &'a PointLookupBatcher,
+    },
+    /// Validate a COPY FROM STDIN target and return its neutral typed input columns.
+    CopyFromStart(&'a CopyFromStdin),
+    /// Admit decoded COPY FROM STDIN rows through the same transaction boundary as ordinary DML.
+    CopyFrom {
+        target: &'a CopyTarget,
+        rows: Vec<Vec<DbValue>>,
+    },
+    /// Read a COPY TO STDOUT table from the session's exact GPU-native snapshot.
+    CopyTo(&'a CopyToStdout),
+    /// Execute an extended COPY TO through its retained bound prepared owner while preserving
+    /// COPY-specific column validation from the original statement.
+    PreparedCopyTo {
+        copy: &'a CopyToStdout,
+        bound: &'a BoundPreparedStatement,
     },
     /// Deterministic test seam for rendezvousing after concurrent DML preparation.
     #[doc(hidden)]
@@ -350,6 +412,18 @@ impl SharedEngine {
             SubmissionRequest::BatchedText { sql, batcher } => {
                 submit_batched_text_inner(self, session, batcher, sql)
             }
+            SubmissionRequest::CopyFromStart(copy) => {
+                SubmissionDispatch::Immediate(submit_copy_from_start(self, session, copy))
+            }
+            SubmissionRequest::CopyFrom { target, rows } => {
+                SubmissionDispatch::Immediate(submit_copy_from(self, session, target, rows))
+            }
+            SubmissionRequest::CopyTo(copy) => {
+                SubmissionDispatch::Immediate(submit_copy_to(self, session, copy))
+            }
+            SubmissionRequest::PreparedCopyTo { copy, bound } => {
+                SubmissionDispatch::Immediate(submit_prepared_copy_to(self, session, copy, bound))
+            }
             SubmissionRequest::InstrumentedDml { sql, on_prepared } => {
                 SubmissionDispatch::Immediate(
                     submit_instrumented_dml(self, session, sql, on_prepared)
@@ -458,6 +532,279 @@ impl SharedEngine {
     pub(crate) fn read_engine(&self) -> Result<&Engine, ()> {
         Ok(&self.engine)
     }
+
+    /// Revalidate an already-described COPY target without executing or admitting a mutation.
+    /// Extended-protocol Describe/Execute use this before emitting cached COPY metadata; final
+    /// CopyDone still repeats the same proof under the engine's transaction/commit lock.
+    pub fn revalidate_copy_target(
+        &self,
+        session: &SharedSession,
+        target: &CopyTarget,
+    ) -> Result<(), DbError> {
+        self.ensure_session_owner(session)?;
+        if session.transaction_failed {
+            return Err(in_failed_transaction_error());
+        }
+        self.ensure_copy_target_owner(session, target)?;
+        let current = match session.active_txn_id {
+            Some(txn_id) => self
+                .engine
+                .relational_copy_target_in_transaction(txn_id, &target.copy.table),
+            None => self.engine.relational_copy_target(&target.copy.table),
+        }
+        .map_err(map_execute_error)?
+        .1;
+        if current != target.proof {
+            return Err(stale_copy_target_error(&target.copy.table));
+        }
+        Ok(())
+    }
+
+    fn ensure_copy_target_owner(
+        &self,
+        session: &SharedSession,
+        target: &CopyTarget,
+    ) -> Result<(), DbError> {
+        if !Arc::ptr_eq(&self.identity, &target.engine_identity) {
+            return Err(DbError {
+                category: ErrorCategory::InvalidRequest,
+                message: "COPY target belongs to a different SharedEngine".to_string(),
+            });
+        }
+        if target
+            .transaction_identity
+            .is_some_and(|required| session.active_txn_id != Some(required))
+        {
+            return Err(DbError {
+                category: ErrorCategory::Serialization,
+                message:
+                    "COPY target belongs to a different transaction/catalog generation context"
+                        .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn submit_copy_from_start(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    copy: &CopyFromStdin,
+) -> Result<QueryOutcome, DbError> {
+    submit_copy_from_start_with_hook(shared, session, copy, || {})
+}
+
+fn submit_copy_from_start_with_hook(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    copy: &CopyFromStdin,
+    on_target_resolved: impl FnOnce(),
+) -> Result<QueryOutcome, DbError> {
+    if session.transaction_failed {
+        return Err(in_failed_transaction_error());
+    }
+    let was_active = session.in_transaction();
+    let result = (|| {
+        let (table_columns, proof, origin) = match session.active_txn_id {
+            Some(txn_id) => shared
+                .engine
+                .relational_copy_target_in_transaction_with_origin(txn_id, &copy.table),
+            None => shared
+                .engine
+                .relational_copy_target(&copy.table)
+                .map(|(columns, proof)| {
+                    (columns, proof, TransactionCopyTargetOrigin::SnapshotBase)
+                }),
+        }
+        .map_err(map_execute_error)?;
+        on_target_resolved();
+        let (column_names, columns) = match &copy.columns {
+            None => (
+                table_columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect(),
+                table_columns.iter().map(map_copy_column).collect(),
+            ),
+            Some(requested) => {
+                let mut seen = std::collections::BTreeSet::new();
+                let mut columns = Vec::with_capacity(requested.len());
+                for name in requested {
+                    if !seen.insert(name) {
+                        return Err(DbError {
+                            category: ErrorCategory::DuplicateColumn,
+                            message: format!("COPY column \"{name}\" was specified more than once"),
+                        });
+                    }
+                    let column = table_columns
+                        .iter()
+                        .find(|column| column.name == *name)
+                        .ok_or_else(|| DbError {
+                            category: ErrorCategory::UndefinedColumn,
+                            message: format!("column \"{name}\" does not exist"),
+                        })?;
+                    columns.push(map_copy_column(column));
+                }
+                (requested.clone(), columns)
+            }
+        };
+        let mut normalized_copy = copy.clone();
+        normalized_copy.columns = Some(column_names);
+        // A target equal to the currently published relation is portable across session
+        // transaction cycles: final admission still revalidates it against the destination
+        // transaction catalog. A private CREATE/shape or an older snapshot-only relation has no
+        // published equivalent and must remain bound to the exact transaction that described it,
+        // closing rollback/recreate ABA without breaking Parse/Sync/Execute lifecycle semantics.
+        let transaction_identity = session.active_txn_id.and_then(|txn_id| {
+            if origin == TransactionCopyTargetOrigin::TransactionOverlay {
+                return Some(txn_id);
+            }
+            let published_matches = shared
+                .engine
+                .relational_copy_target(&normalized_copy.table)
+                .is_ok_and(|(_columns, published)| published == proof);
+            (!published_matches).then_some(txn_id)
+        });
+        Ok(QueryOutcome::CopyIn {
+            target: CopyTarget {
+                copy: normalized_copy,
+                columns,
+                proof,
+                engine_identity: Arc::clone(&shared.identity),
+                transaction_identity,
+            },
+        })
+    })();
+    if result.is_err() && was_active {
+        session.mark_transaction_failed();
+    }
+    result
+}
+
+fn submit_copy_from(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    target: &CopyTarget,
+    rows: Vec<Vec<DbValue>>,
+) -> Result<QueryOutcome, DbError> {
+    if session.transaction_failed {
+        return Err(in_failed_transaction_error());
+    }
+    let was_active = session.in_transaction();
+    if let Err(error) = shared.ensure_copy_target_owner(session, target) {
+        if was_active {
+            session.mark_transaction_failed();
+        }
+        return Err(error);
+    }
+    let txn_id = session
+        .active_txn_id
+        .unwrap_or_else(|| shared.take_txn_id());
+    let rows = rows
+        .iter()
+        .map(|row| row.iter().map(map_db_value_to_sql).collect())
+        .collect();
+    let result = shared
+        .engine
+        .submit_transaction(
+            txn_id,
+            CopyMutationRequest::new(target.copy.clone(), rows, target.proof.clone()),
+        )
+        .map_err(map_execute_error)
+        .and_then(|admitted| match admitted {
+            TransactionAdmissionResult::Dml(result) if result.returning.is_none() => {
+                Ok(QueryOutcome::Command {
+                    tag: CommandTag::Copy,
+                    rows_affected: Some(result.rows_affected),
+                })
+            }
+            _ => Err(invalid_mutation_result("COPY FROM STDIN")),
+        });
+    if result.is_err() && was_active {
+        session.mark_transaction_failed();
+    }
+    result
+}
+
+fn submit_copy_to(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    copy: &CopyToStdout,
+) -> Result<QueryOutcome, DbError> {
+    if session.transaction_failed {
+        return Err(in_failed_transaction_error());
+    }
+    if let Err(error) = validate_copy_to_columns(copy) {
+        if session.in_transaction() {
+            session.mark_transaction_failed();
+        }
+        return Err(error);
+    }
+    let projection = match &copy.columns {
+        Some(columns) => columns.join(", "),
+        None => "*".to_string(),
+    };
+    let source = format!("SELECT {projection} FROM {}", copy.table);
+    let parsed = ParsedCommand::parse(&source).map_err(map_parse_error)?;
+    let outcome = submit_parsed(shared, session, parsed)?;
+    match outcome {
+        QueryOutcome::Rows { .. } => Ok(outcome),
+        _ => Err(DbError {
+            category: ErrorCategory::Internal,
+            message: "COPY TO STDOUT did not produce a relational row result".to_string(),
+        }),
+    }
+}
+
+fn submit_prepared_copy_to(
+    shared: &SharedEngine,
+    session: &mut SharedSession,
+    copy: &CopyToStdout,
+    bound: &BoundPreparedStatement,
+) -> Result<QueryOutcome, DbError> {
+    if session.transaction_failed {
+        return Err(in_failed_transaction_error());
+    }
+    if let Err(error) = validate_copy_to_columns(copy) {
+        if session.in_transaction() {
+            session.mark_transaction_failed();
+        }
+        return Err(error);
+    }
+    if !bound.is_exact_copy_to_select(copy) {
+        let error = DbError {
+            category: ErrorCategory::InvalidRequest,
+            message: "bound prepared owner does not match the exact COPY TO projection".to_string(),
+        };
+        if session.in_transaction() {
+            session.mark_transaction_failed();
+        }
+        return Err(error);
+    }
+    let outcome = prepared::submit_prepared_inner(shared, session, bound)?;
+    match outcome {
+        QueryOutcome::Rows { .. } => Ok(outcome),
+        _ => Err(DbError {
+            category: ErrorCategory::Internal,
+            message: "prepared COPY TO STDOUT did not produce a relational row result".to_string(),
+        }),
+    }
+}
+
+fn validate_copy_to_columns(copy: &CopyToStdout) -> Result<(), DbError> {
+    let Some(columns) = &copy.columns else {
+        return Ok(());
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for column in columns {
+        if !seen.insert(column) {
+            return Err(DbError {
+                category: ErrorCategory::DuplicateColumn,
+                message: format!("COPY column \"{column}\" was specified more than once"),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Default for SharedEngine {
@@ -1028,6 +1375,13 @@ fn invalid_mutation_result(command: &str) -> DbError {
     }
 }
 
+fn stale_copy_target_error(table: &str) -> DbError {
+    DbError {
+        category: ErrorCategory::Serialization,
+        message: format!("COPY target relation \"{table}\" changed after COPY began; restart COPY"),
+    }
+}
+
 fn stateless_transaction_control_error() -> DbError {
     DbError {
         category: ErrorCategory::Unsupported,
@@ -1106,6 +1460,17 @@ fn map_column(column: &RelationalColumn) -> ColumnMeta {
     }
 }
 
+fn map_copy_column(column: &gpu_db_sql::CopyColumn) -> CopyColumnMeta {
+    CopyColumnMeta {
+        name: column.name.clone(),
+        logical_type: map_logical_type(column.ty),
+        numeric_typmod: match column.ty {
+            SqlType::Numeric { precision, scale } => Some((precision, scale)),
+            _ => None,
+        },
+    }
+}
+
 fn map_relational_result(result: gpu_db_engine::RelationalSelectResult) -> QueryOutcome {
     let columns = result.columns.iter().map(map_column).collect();
     let rows = result
@@ -1150,6 +1515,21 @@ fn map_value(value: SqlValue) -> DbValue {
         SqlValue::Parameter { .. } => {
             unreachable!("facade results never contain unbound prepared parameters")
         }
+    }
+}
+
+fn map_db_value_to_sql(value: &DbValue) -> SqlValue {
+    match value {
+        DbValue::Null => SqlValue::Null,
+        DbValue::Int4(value) => SqlValue::Int4(*value),
+        DbValue::Int8(value) => SqlValue::Int8(*value),
+        DbValue::Numeric(value) => SqlValue::Numeric(*value),
+        DbValue::Bool(value) => SqlValue::Bool(*value),
+        DbValue::Text(value) => SqlValue::Text(value.clone()),
+        DbValue::Date(value) => SqlValue::Date(*value),
+        DbValue::Timestamp(value) => SqlValue::Timestamp(*value),
+        DbValue::Uuid(value) => SqlValue::Uuid(*value),
+        DbValue::Int2(value) => SqlValue::Int2(*value),
     }
 }
 
